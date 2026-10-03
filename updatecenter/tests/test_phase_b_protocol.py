@@ -15,10 +15,10 @@ def _request(**changes):
 
 
 class StrictProtocolTests(SimpleTestCase):
-    def test_runtime_v10_bridges_wire_protocol_v3_and_v4(self):
+    def test_runtime_v11_bridges_wire_protocol_v3_and_v4(self):
         self.assertEqual(PROTOCOL_VERSION, 4)
         self.assertEqual(SUPPORTED_WIRE_PROTOCOLS, (3, 4))
-        self.assertEqual(RUNTIME_VERSION, 10)
+        self.assertEqual(RUNTIME_VERSION, 11)
 
     def test_protocol_v3_remains_usable_for_legacy_actions(self):
         decoded = decode_request(json.dumps({"protocol_version": 3, "action": "PING"}).encode())

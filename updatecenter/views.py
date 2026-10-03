@@ -265,6 +265,7 @@ def job_status(request, job_id):
         "failure_detail": job.failure_detail[:4000],
         "requires_manual_intervention": job.requires_manual_intervention,
         "has_migration_plan_review": bool(job.migration_plan_review),
+        "migration_recovery": job.migration_recovery,
         "created_at": job.created_at.isoformat(),
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,

@@ -171,6 +171,8 @@ def _reconcile_response(job: UpdateJob, response: dict, *, backend: UpdaterClien
     job.failure_detail = str(root_job.get("failure_detail", ""))[:10000]
     review = root_job.get("migration_plan_review")
     job.migration_plan_review = review if isinstance(review, dict) else None
+    recovery = root_job.get("migration_recovery")
+    job.migration_recovery = recovery if isinstance(recovery, dict) else None
     terminal = job.state in UpdateJobState.TERMINAL
     job.requires_manual_intervention = job.state == UpdateJobState.MANUAL_INTERVENTION_REQUIRED
     if terminal:

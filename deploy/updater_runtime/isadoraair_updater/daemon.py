@@ -370,6 +370,7 @@ class UpdaterDaemon:
                     # the immutable historical r0089 job) -- those must
                     # keep working unchanged, never rewritten to backfill it.
                     "migration_plan_review": state.get("migration_plan_review"),
+                    "migration_recovery": state.get("migration_recovery"),
                 },
             }
         if request.action == "GET_JOB_LOG":

@@ -131,6 +131,9 @@ class UpdateJob(models.Model):
     # "detail"}, ...]}. See MigrationPlanApproval below and
     # docs/UPDATE_CENTER.md's "Reviewed migration approval" section.
     migration_plan_review = models.JSONField(null=True, blank=True, default=None)
+    # Protected updater evidence for an exact, retryable migration prefix.
+    # This is an audit mirror only; root-owned job state remains authority.
+    migration_recovery = models.JSONField(null=True, blank=True, default=None)
 
     # Durable copy of the daemon's own log for this job, written once
     # at completion (success OR failure) -- the live, in-progress log

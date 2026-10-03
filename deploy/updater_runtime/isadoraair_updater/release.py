@@ -44,6 +44,8 @@ RELEASE_ID_RE = re.compile(r"^r[0-9]{4,}$")
 MIGRATION_RE = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
 UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:service|timer)$")
 PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*$")
+PREFLIGHT_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+AUTHORIZATION_PATH_RE = re.compile(r"^deploy/migration_authorizations/r[0-9]{4,}\.json$")
 CORE_SERVICES = frozenset({
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",
     "isadoraair-monitoring", "isadoraair-rbds",
@@ -155,6 +157,7 @@ KNOWN_FIELDS = frozenset({
     "minimum_supported_release_id",
     "manual_bootstrap_required",
     "protected_runtime",
+    "migration_authorization", "migration_preflight_checks",
 })
 FORBIDDEN_FIELDS = frozenset({
     "pre_update_hooks", "post_update_hooks", "hooks", "commands", "shell",
@@ -191,6 +194,8 @@ class Manifest:
     minimum_supported_release_id: str | None
     manual_bootstrap_required: bool
     protected_runtime: ProtectedRuntimeField | None
+    migration_authorization: str | None = None
+    migration_preflight_checks: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,6 +242,8 @@ class TrustedPlan:
     minimum_updater_protocol_version: int
     manual_bootstrap_required: bool
     fingerprint: str
+    migration_authorization: str | None = None
+    migration_preflight_checks: tuple[str, ...] = ()
     # The newest protected-runtime transition in releases_in_plan, if
     # any. It may belong to the final target (legacy/direct case) or
     # to an intermediate release crossed on the way to that target.
@@ -273,26 +280,34 @@ class TrustedPlan:
         )
         transition = self.protected_runtime_transition
         if transition is None:
-            return execution_fingerprint_payload(**values)
-        runtime_values = dict(
-            **values,
-            protected_runtime_generation=transition.field.generation,
-            protected_runtime_descriptor_sha256=transition.field.descriptor_sha256,
-            protected_runtime_minimum_bootstrap_protocol_version=transition.field.minimum_bootstrap_protocol_version,
-            protected_runtime_runtime_version=transition.field.runtime_version,
-            protected_runtime_manifest_protocol_version=transition.field.manifest_protocol_version,
-            protected_runtime_supported_wire_protocols=transition.field.supported_wire_protocols,
-        )
-        if transition.release_id == self.target_release_id:
-            # Bootstrap invariant: old generation-3/4 workers use this
-            # exact v3 payload for a direct protected target.
-            return protected_runtime_fingerprint_payload(**runtime_values)
-        return intermediate_protected_runtime_fingerprint_payload(
-            **runtime_values,
-            protected_runtime_release_id=transition.release_id,
-            protected_runtime_previous_release_id=transition.previous_release_id,
-            protected_runtime_commit=transition.commit,
-        )
+            base = execution_fingerprint_payload(**values)
+        else:
+            runtime_values = dict(
+                **values,
+                protected_runtime_generation=transition.field.generation,
+                protected_runtime_descriptor_sha256=transition.field.descriptor_sha256,
+                protected_runtime_minimum_bootstrap_protocol_version=transition.field.minimum_bootstrap_protocol_version,
+                protected_runtime_runtime_version=transition.field.runtime_version,
+                protected_runtime_manifest_protocol_version=transition.field.manifest_protocol_version,
+                protected_runtime_supported_wire_protocols=transition.field.supported_wire_protocols,
+            )
+            if transition.release_id == self.target_release_id:
+                base = protected_runtime_fingerprint_payload(**runtime_values)
+            else:
+                base = intermediate_protected_runtime_fingerprint_payload(
+                    **runtime_values,
+                    protected_runtime_release_id=transition.release_id,
+                    protected_runtime_previous_release_id=transition.previous_release_id,
+                    protected_runtime_commit=transition.commit,
+                )
+        if self.migration_authorization is None and not self.migration_preflight_checks:
+            return base
+        return {
+            **{key: value for key, value in base.items() if key != "contract_version"},
+            "contract_version": 5,
+            "migration_authorization": self.migration_authorization,
+            "migration_preflight_checks": list(self.migration_preflight_checks),
+        }
 
 
 def execution_fingerprint_payload(**values) -> dict:
@@ -324,6 +339,67 @@ def execution_fingerprint_payload(**values) -> dict:
 def fingerprint(payload: dict) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+_AUTHORIZATION_FIELDS = frozenset({
+    "schema_version", "release_id", "target_commit", "manifest_sha256",
+    "migration_plan_digest", "manual_operations", "trusted_plan_fingerprint",
+})
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def load_central_migration_authorization(
+    repository: "TrustedRepository", trusted_tip: str, plan: TrustedPlan, *,
+    manifest_sha256: str, migration_plan_digest: str, manual_operations: list[dict],
+) -> dict | None:
+    """Return an exact trusted companion authorization, or None on mismatch.
+
+    The companion is introduced by a later metadata-only commit because a
+    release commit cannot contain its own commit SHA or manifest digest. Git's
+    protected canonical ancestry supplies the trust chain; the artifact binds
+    every independently recomputed execution fact.
+    """
+    path = plan.migration_authorization
+    if path is None:
+        return None
+    raw = repository.read_file(trusted_tip, path, maximum=65536)
+    introducing = repository.introducing_commit(path, trusted_tip)
+    if raw is None or introducing is None:
+        return None
+    if (repository.is_ancestor(plan.target_commit, introducing) is not True
+            or introducing == plan.target_commit
+            or repository.is_ancestor(introducing, trusted_tip) is not True):
+        raise ReleaseError("migration authorization provenance is not a later immutable trusted commit")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ReleaseError("migration authorization is not valid UTF-8 JSON") from exc
+    if not isinstance(record, dict) or set(record) != _AUTHORIZATION_FIELDS or record.get("schema_version") != 1:
+        raise ReleaseError("migration authorization has an invalid closed schema")
+    if not all(isinstance(record.get(key), str) for key in (
+        "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
+        "trusted_plan_fingerprint",
+    )):
+        raise ReleaseError("migration authorization identity fields must be strings")
+    if not re.fullmatch(r"[0-9a-f]{40}", record["target_commit"]):
+        raise ReleaseError("migration authorization target_commit is invalid")
+    if any(not _HEX64.fullmatch(record[key]) for key in (
+        "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
+    )):
+        raise ReleaseError("migration authorization digest field is invalid")
+    if not isinstance(record.get("manual_operations"), list):
+        raise ReleaseError("migration authorization manual_operations must be a list")
+    expected = {
+        "release_id": plan.target_release_id,
+        "target_commit": plan.target_commit,
+        "manifest_sha256": manifest_sha256,
+        "migration_plan_digest": migration_plan_digest,
+        "manual_operations": manual_operations,
+        "trusted_plan_fingerprint": plan.fingerprint,
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        return None
+    return record
 
 
 def protected_runtime_fingerprint_payload(**values) -> dict:
@@ -407,6 +483,7 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
     required = KNOWN_FIELDS - {
         "bootstrap_commit", "summary", "migration_compatibility", "requirements_sha256",
         "minimum_supported_release_id", "manual_bootstrap_required", "protected_runtime",
+        "migration_authorization", "migration_preflight_checks",
     }
     if required - set(data):
         raise ReleaseError(f"{label}: missing fields: {sorted(required - set(data))!r}")
@@ -470,6 +547,19 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
         )
     except ProtectedRuntimeFieldError as exc:
         raise ReleaseError(f"{label}: {exc}") from exc
+    migration_authorization = data.get("migration_authorization")
+    if migration_authorization is not None:
+        expected = f"deploy/migration_authorizations/{release_id}.json"
+        if (not isinstance(migration_authorization, str)
+                or not AUTHORIZATION_PATH_RE.fullmatch(migration_authorization)
+                or migration_authorization != expected):
+            raise ReleaseError(f"{label}: migration_authorization must be exactly {expected!r}")
+    preflights = _list(data.get("migration_preflight_checks", []), "migration_preflight_checks", PREFLIGHT_RE)
+    if migration_authorization is not None or preflights:
+        if not migrations:
+            raise ReleaseError(f"{label}: migration authorization/preflight requires migrations")
+        if minimum_protocol < 6:
+            raise ReleaseError(f"{label}: migration authorization/preflight requires protocol 6")
     return Manifest(
         release_id, previous, bootstrap, minimum_protocol, migrations,
         compatibility, requirements_changed, requirements_hash,
@@ -477,7 +567,7 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
         units_changed, units_required, units_optional, units_removed,
         data["collectstatic_required"], restarts, data["nginx_changed"],
         data["runtime_components_changed"], minimum_release, manual_bootstrap_required,
-        protected_runtime,
+        protected_runtime, migration_authorization, preflights,
     )
 
 
@@ -933,6 +1023,10 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
     removed: list[str] = []
     restart_set: set[str] = set()
     compatibility: set[str] = set()
+    # Only the final target may authorize this aggregate plan. Companion
+    # artifacts on skipped intermediate releases bind their own targets.
+    migration_authorization = target.manifest.migration_authorization
+    migration_preflight_checks: list[str] = []
     for entry in transitions:
         item = entry.manifest
         for source, destination in (
@@ -946,6 +1040,9 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         restart_set.update(item.services_requiring_restart)
         if item.migrations_required:
             compatibility.add(item.migration_compatibility)
+        for check_id in item.migration_preflight_checks:
+            if check_id not in migration_preflight_checks:
+                migration_preflight_checks.append(check_id)
     overall = "destructive" if "destructive" in compatibility else ("additive" if compatibility else None)
     values = dict(
         installed_release_id=installed.manifest.release_id,
@@ -967,6 +1064,8 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         runtime_components_changed=any(entry.manifest.runtime_components_changed for entry in transitions),
         minimum_updater_protocol_version=max(entry.manifest.minimum_updater_protocol_version for entry in transitions),
         manual_bootstrap_required=any(entry.manifest.manual_bootstrap_required for entry in transitions),
+        migration_authorization=migration_authorization,
+        migration_preflight_checks=tuple(migration_preflight_checks),
     )
     # Select the newest protected transition the installed station has
     # not yet crossed. A later ordinary final target does not erase the

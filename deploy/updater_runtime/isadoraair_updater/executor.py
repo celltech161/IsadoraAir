@@ -17,7 +17,8 @@ from .config import StationConfig
 from .jobs import JobError, JobStore
 from .process import CommandRunner, ProcessResult
 from .release import (
-    GIT, ReleaseError, TrustedPlan, TrustedRepository, derive_plan, load_chain, manual_blockers,
+    GIT, ReleaseError, TrustedPlan, TrustedRepository, derive_plan, load_chain,
+    load_central_migration_authorization, manual_blockers,
     resolve_known_managed_units,
 )
 from .runtime_handoff import (
@@ -139,6 +140,9 @@ _REVIEW_PROBE_KEYS = _LEGACY_PROBE_KEYS | frozenset({
     "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
     "manual_operations", "approval",
 })
+_RECOVERY_PROBE_KEYS = _REVIEW_PROBE_KEYS | frozenset({
+    "recovery_plan", "recovery_migration_plan_digest", "recovery_manual_operations",
+})
 
 
 def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
@@ -183,11 +187,11 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
         raise ExecutionError("PROBE_INVALID", "migration probe did not emit strict JSON") from exc
     keys = set(payload) if isinstance(payload, dict) else set()
     if review_context:
-        shape_ok = keys == _REVIEW_PROBE_KEYS
+        shape_ok = keys in (_REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
         has_review_fields = True
     else:
-        shape_ok = keys in (_LEGACY_PROBE_KEYS, _REVIEW_PROBE_KEYS)
-        has_review_fields = keys == _REVIEW_PROBE_KEYS
+        shape_ok = keys in (_LEGACY_PROBE_KEYS, _REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
+        has_review_fields = keys in (_REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
     if not isinstance(payload, dict) or not shape_ok or payload.get("schema_version") != 1 or payload.get("status") != "ok":
         raise ExecutionError("PROBE_INVALID", "migration probe schema/status mismatch")
     if not isinstance(payload["plan"], list) or not isinstance(payload["nodes"], dict) or not isinstance(payload["applied"], list):
@@ -209,6 +213,9 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
             payload["release_id"] is not None or payload["target_commit"] is not None
             or payload["manifest_sha256"] is not None or payload["migration_plan_digest"] is not None
             or payload["manual_operations"] or payload["approval"] is not None
+            or payload.get("recovery_plan") is not None
+            or payload.get("recovery_migration_plan_digest") is not None
+            or payload.get("recovery_manual_operations")
         ):
             raise ExecutionError("PROBE_INVALID", "migration probe reported review evidence without review context")
     refs = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
@@ -241,6 +248,27 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
             raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
         if payload["approval"] is not None and not payload["manual_operations"]:
             raise ExecutionError("PROBE_INVALID", "migration probe reported an approval with no manual operations")
+    if keys == _RECOVERY_PROBE_KEYS:
+        recovery_plan = payload["recovery_plan"]
+        recovery_digest = payload["recovery_migration_plan_digest"]
+        recovery_manual = payload["recovery_manual_operations"]
+        if recovery_plan is None:
+            if recovery_digest is not None or recovery_manual:
+                raise ExecutionError("PROBE_INVALID", "migration probe reported partial recovery evidence")
+        else:
+            if not review_context or not isinstance(recovery_plan, list):
+                raise ExecutionError("PROBE_INVALID", "migration recovery plan has an invalid context/type")
+            if not isinstance(recovery_digest, str) or not _HEX64.fullmatch(recovery_digest):
+                raise ExecutionError("PROBE_INVALID", "migration recovery digest is invalid")
+            recovery_refs = set()
+            for item in recovery_plan:
+                if (not isinstance(item, dict)
+                        or set(item) != {"ref", "dependencies", "operations", "migration_file_sha256"}
+                        or item["ref"] in recovery_refs or item["ref"] not in payload["nodes"]):
+                    raise ExecutionError("PROBE_INVALID", "migration recovery plan item is invalid")
+                recovery_refs.add(item["ref"])
+            if not _valid_manual_operations(recovery_manual, plan_refs=recovery_refs):
+                raise ExecutionError("PROBE_INVALID", "migration recovery manual operations are invalid")
     return payload
 
 
@@ -346,11 +374,14 @@ class Executor:
         )
         return result, settings
 
-    def _probe(self, source: Path, *, release_id: str | None = None, target_commit: str | None = None) -> dict:
+    def _probe(self, source: Path, *, release_id: str | None = None, target_commit: str | None = None,
+               recovery_plan_refs: tuple[str, ...] = ()) -> dict:
         review_context = release_id is not None or target_commit is not None
         arguments = ["updatecenter_probe", "--skip-checks"]
         if review_context:
             arguments += ["--release-id", release_id, "--target-commit", target_commit]
+        for ref in recovery_plan_refs:
+            arguments += ["--recovery-plan-ref", ref]
         result, settings = self._run_app(source, arguments, timeout=120)
         if not result.ok:
             raise ExecutionError("PROBE_FAILED", _decode(result, settings))
@@ -406,8 +437,99 @@ class Executor:
             raise ExecutionError("CURRENT_SCHEMA_UNHEALTHY", f"current source has migration conflicts/replacements/pending work: {pending!r}")
         return payload
 
+    def _run_migration_preflights(self, source: Path, check_ids: tuple[str, ...]) -> dict:
+        if not check_ids:
+            return {"schema_version": 1, "status": "ok", "checks": []}
+        arguments = ["updatecenter_migration_preflight", "--skip-checks"]
+        for check_id in check_ids:
+            arguments += ["--check", check_id]
+        result, settings = self._run_app(source, arguments, timeout=300)
+        if not result.ok or len(result.stdout) > 65536:
+            raise ExecutionError("MIGRATION_PREFLIGHT_FAILED", _decode(result, settings), manual=True)
+        try:
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ExecutionError("MIGRATION_PREFLIGHT_INVALID", "preflight did not emit strict JSON") from exc
+        if (not isinstance(payload, dict) or set(payload) != {"schema_version", "status", "checks"}
+                or payload.get("schema_version") != 1 or payload.get("status") not in {"ok", "failed"}
+                or not isinstance(payload.get("checks"), list)):
+            raise ExecutionError("MIGRATION_PREFLIGHT_INVALID", "preflight response schema is invalid")
+        returned = []
+        for item in payload["checks"]:
+            if (not isinstance(item, dict) or set(item) != {"id", "status", "evidence"}
+                    or not isinstance(item.get("id"), str)
+                    or item.get("status") not in {"passed", "failed", "unknown"}
+                    or not isinstance(item.get("evidence"), dict)):
+                raise ExecutionError("MIGRATION_PREFLIGHT_INVALID", "preflight check result is invalid")
+            returned.append(item["id"])
+        if returned != list(check_ids):
+            raise ExecutionError("MIGRATION_PREFLIGHT_INVALID", "preflight check identities/order differ from the trusted plan")
+        if payload["status"] != "ok" or any(item["status"] != "passed" for item in payload["checks"]):
+            raise ExecutionError(
+                "MIGRATION_PREFLIGHT_BLOCKED",
+                json.dumps(payload["checks"], sort_keys=True, separators=(",", ":"))[:4000],
+                manual=True,
+            )
+        return payload
+
+    def _find_partial_recovery(self, plan: TrustedPlan, payload: dict, current_payload: dict) -> dict | None:
+        if "nodes" not in current_payload:
+            # Compatibility for unit-test/legacy internal callers. A real
+            # probe always supplies nodes; recovery is never inferred without it.
+            return None
+        closure = _dependency_closure(payload["nodes"], plan.migrations_required)
+        transition = closure - set(current_payload["nodes"])
+        applied_transition = transition & set(payload["applied"])
+        if not applied_transition:
+            return None
+        required = {
+            "schema_version", "classification", "evidence_job_id", "prior_job_id", "release_id", "target_commit",
+            "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
+            "ordered_target_plan", "successful_prefix", "checkpoint", "failure_classification",
+            "failure_detail", "continued_from_job_id", "authorization_source", "finalized",
+            "first_remaining_migration", "exact_plan_authorization_matches", "permitted_action",
+        }
+        candidates = []
+        for state in self.store.list_states():
+            evidence = state.get("migration_recovery")
+            if (not isinstance(evidence, dict) or set(evidence) != required
+                    or evidence.get("schema_version") != 1 or evidence.get("finalized") is not True
+                    or evidence.get("classification") != "UPDATER_OWNED_PARTIAL_PREFIX"):
+                continue
+            plan_refs = evidence.get("ordered_target_plan")
+            prefix = evidence.get("successful_prefix")
+            if (not isinstance(plan_refs, list) or not plan_refs
+                    or any(not isinstance(ref, str) for ref in plan_refs)
+                    or len(plan_refs) != len(set(plan_refs))
+                    or not isinstance(prefix, list) or not prefix
+                    or prefix != plan_refs[:len(prefix)] or len(prefix) >= len(plan_refs)):
+                continue
+            identity_matches = (
+                evidence.get("release_id") == plan.target_release_id
+                and evidence.get("target_commit") == plan.target_commit
+                and evidence.get("manifest_sha256") == payload["manifest_sha256"]
+                and evidence.get("trusted_plan_fingerprint") == plan.fingerprint
+                and evidence.get("evidence_job_id") == state.get("job_id")
+            )
+            if (not identity_matches or set(plan_refs) != transition
+                    or set(prefix) != applied_transition
+                    or not verify_checkpoint(self.config.checkpoint_root, evidence.get("checkpoint"))):
+                continue
+            checkpoint = evidence["checkpoint"]
+            if (checkpoint.get("target_release_id") != plan.target_release_id
+                    or checkpoint.get("target_commit") != plan.target_commit
+                    or checkpoint.get("installed_release_id") != plan.installed_release_id
+                    or checkpoint.get("installed_commit") != plan.installed_commit):
+                continue
+            candidates.append((len(prefix), state.get("updated_at", ""), evidence))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][2]
+
     def _validate_target_schema(self, plan: TrustedPlan, payload: dict, current_payload: dict, job_id: str,
-                                *, migration_already_started: bool) -> tuple[str, ...]:
+                                *, migration_already_started: bool,
+                                recovery: dict | None = None, trusted_tip: str | None = None) -> tuple[str, ...]:
         if payload["conflicts"]:
             raise ExecutionError("TARGET_MIGRATION_CONFLICT", "target migration graph reports conflicts")
         if payload["replacements"]:
@@ -421,11 +543,17 @@ class Executor:
                 "TARGET_MIGRATION_MISMATCH",
                 f"target plan differs from manifest dependency closure; expected={sorted(expected_actual)!r}, actual={list(actual)!r}",
             )
-        already_applied_explicit = set(plan.migrations_required) & set(current_payload["applied"])
-        if already_applied_explicit and not migration_already_started:
+        if "nodes" in current_payload:
+            transition = closure - set(current_payload["nodes"])
+            already_applied_transition = transition & applied
+        else:
+            # Preserve the pre-protocol-6 direct-call contract; protected
+            # recovery itself requires the full current probe graph above.
+            already_applied_transition = set(plan.migrations_required) & set(current_payload.get("applied", []))
+        if already_applied_transition and not migration_already_started and recovery is None:
             raise ExecutionError(
                 "TARGET_MIGRATION_PREAPPLIED",
-                f"target transition migration(s) were applied outside this job: {sorted(already_applied_explicit)!r}",
+                f"target transition migration(s) lack exact protected-updater evidence: {sorted(already_applied_transition)!r}",
                 manual=True,
             )
         if actual and plan.migration_compatibility != "additive":
@@ -442,13 +570,36 @@ class Executor:
         # against the staged target we just fetched -- never a digest
         # supplied by Django/a browser) already reports a match for.
         # See docs/UPDATE_CENTER.md's "Reviewed migration approval".
-        if payload["manual_operations"]:
+        authorization_payload = payload
+        if recovery is not None:
+            if (payload.get("recovery_plan") is None
+                    or [item["ref"] for item in payload["recovery_plan"]] != recovery["ordered_target_plan"]
+                    or payload.get("recovery_migration_plan_digest") != recovery["migration_plan_digest"]):
+                raise ExecutionError("TARGET_MIGRATION_PREAPPLIED", "reconstructed recovery plan does not match durable evidence", manual=True)
+            authorization_payload = {
+                **payload,
+                "plan": payload["recovery_plan"],
+                "migration_plan_digest": payload["recovery_migration_plan_digest"],
+                "manual_operations": payload["recovery_manual_operations"],
+            }
+        if authorization_payload["manual_operations"]:
+            central = None
+            if getattr(plan, "migration_authorization", None) is not None and trusted_tip is not None:
+                central = load_central_migration_authorization(
+                    self.repository, trusted_tip, plan,
+                    manifest_sha256=authorization_payload["manifest_sha256"],
+                    migration_plan_digest=authorization_payload["migration_plan_digest"],
+                    manual_operations=authorization_payload["manual_operations"],
+                )
+            if central is not None:
+                self.store.append_log(job_id, "exact centrally trusted migration authorization matched; proceeding")
+                return actual
             try:
                 identity = approval_identity(
-                    target_release_id=payload["release_id"],
-                    target_commit=payload["target_commit"],
-                    target_manifest_sha256=payload["manifest_sha256"],
-                    migration_plan_digest=payload["migration_plan_digest"],
+                    target_release_id=authorization_payload["release_id"],
+                    target_commit=authorization_payload["target_commit"],
+                    target_manifest_sha256=authorization_payload["manifest_sha256"],
+                    migration_plan_digest=authorization_payload["migration_plan_digest"],
                     trusted_plan_fingerprint=plan.fingerprint,
                 )
                 approval = self.approval_store.find(identity)
@@ -462,23 +613,23 @@ class Executor:
                 self.store.append_log(
                     job_id,
                     f"reviewed migration approval {approval['approval_id']} (by {approval['approved_by_username']} at "
-                    f"{approval['approved_at']}) matched digest {payload['migration_plan_digest']} -- proceeding",
+                    f"{approval['approved_at']}) matched digest {authorization_payload['migration_plan_digest']} -- proceeding",
                 )
             else:
                 raise ExecutionError(
                     "MIGRATION_OPERATION_MANUAL",
                     "; ".join(
                         f"{entry['ref']} contains {entry['operation']}: {entry['detail']}"
-                        for entry in payload["manual_operations"]
+                        for entry in authorization_payload["manual_operations"]
                     ),
                     manual=True,
                     migration_plan_review={
-                        "release_id": payload["release_id"],
-                        "target_commit": payload["target_commit"],
-                        "manifest_sha256": payload["manifest_sha256"],
-                        "migration_plan_digest": payload["migration_plan_digest"],
+                        "release_id": authorization_payload["release_id"],
+                        "target_commit": authorization_payload["target_commit"],
+                        "manifest_sha256": authorization_payload["manifest_sha256"],
+                        "migration_plan_digest": authorization_payload["migration_plan_digest"],
                         "trusted_plan_fingerprint": plan.fingerprint,
-                        "manual_operations": payload["manual_operations"],
+                        "manual_operations": authorization_payload["manual_operations"],
                     },
                 )
         return actual
@@ -1122,15 +1273,26 @@ class Executor:
             target_payload = self._probe(
                 staged.source_root, release_id=plan.target_release_id, target_commit=plan.target_commit,
             )
+            recovery = self._find_partial_recovery(plan, target_payload, current_payload)
+            if recovery is not None:
+                target_payload = self._probe(
+                    staged.source_root,
+                    release_id=plan.target_release_id,
+                    target_commit=plan.target_commit,
+                    recovery_plan_refs=tuple(recovery["ordered_target_plan"]),
+                )
             actual_migrations = self._validate_target_schema(
                 plan, target_payload, current_payload, job_id,
                 migration_already_started="migration_started" in milestones,
+                recovery=recovery, trusted_tip=trusted_tip,
             )
             self.store.milestone(job_id, "target_schema_validated")
 
             if actual_migrations and "database_verified" not in milestones:
+                self._run_migration_preflights(staged.source_root, plan.migration_preflight_checks)
+                self.store.milestone(job_id, "migration_preflight_passed")
                 self._require_mutation_allowed(plan, milestones)
-                checkpoint = state.get("checkpoint")
+                checkpoint = recovery["checkpoint"] if recovery is not None else state.get("checkpoint")
                 if not checkpoint or not verify_checkpoint(self.config.checkpoint_root, checkpoint):
                     checkpoint = create_checkpoint(
                         self.config, self.runner, job_id=job_id,
@@ -1139,15 +1301,86 @@ class Executor:
                         target_release=plan.target_release_id,
                         target_commit=plan.target_commit,
                     )
-                    self.store.update(job_id, checkpoint=checkpoint)
+                self.store.update(job_id, checkpoint=checkpoint)
                 self.store.milestone(job_id, "checkpoint_created")
+                full_plan = (
+                    list(recovery["ordered_target_plan"])
+                    if recovery is not None
+                    else [item["ref"] for item in target_payload["plan"]]
+                )
+                successful_prefix = list(recovery["successful_prefix"]) if recovery is not None else []
+                digest = (
+                    target_payload["recovery_migration_plan_digest"]
+                    if recovery is not None else target_payload["migration_plan_digest"]
+                )
+                recovery_record = {
+                    "schema_version": 1,
+                    "classification": "UPDATER_OWNED_PARTIAL_PREFIX",
+                    "evidence_job_id": job_id,
+                    "prior_job_id": recovery["evidence_job_id"] if recovery is not None else None,
+                    "release_id": plan.target_release_id,
+                    "target_commit": plan.target_commit,
+                    "manifest_sha256": target_payload["manifest_sha256"],
+                    "migration_plan_digest": digest,
+                    "trusted_plan_fingerprint": plan.fingerprint,
+                    "ordered_target_plan": full_plan,
+                    "successful_prefix": successful_prefix,
+                    "checkpoint": checkpoint,
+                    "failure_classification": "",
+                    "failure_detail": "",
+                    "continued_from_job_id": recovery["evidence_job_id"] if recovery is not None else None,
+                    "authorization_source": (
+                        "central_or_exact_local" if target_payload.get("manual_operations")
+                        or target_payload.get("recovery_manual_operations") else "mechanical_additive"
+                    ),
+                    "first_remaining_migration": full_plan[len(successful_prefix)],
+                    "exact_plan_authorization_matches": True,
+                    "permitted_action": "retry_same_exact_release",
+                    "finalized": False,
+                }
+                self.store.update(job_id, migration_recovery=recovery_record)
                 self.store.milestone(job_id, "migration_started")
-                result, settings = self._run_app(staged.source_root, ["migrate", "--noinput", "--skip-checks"], timeout=1800)
-                if not result.ok:
-                    raise ExecutionError("MIGRATION_FAILED", _decode(result, settings), manual=True)
+                for ref in actual_migrations:
+                    expected_after_command = [*successful_prefix, ref]
+                    app_label, migration_name = ref.split(".", 1)
+                    result, settings = self._run_app(
+                        staged.source_root,
+                        ["migrate", app_label, migration_name, "--noinput", "--skip-checks"],
+                        timeout=1800,
+                    )
+                    observed = self._probe(staged.source_root)
+                    if observed["conflicts"] or observed["replacements"]:
+                        raise ExecutionError(
+                            "MIGRATION_STATE_DRIFT", "migration command left conflicts/replacements",
+                            manual=True,
+                        )
+                    observed_prefix = [item for item in full_plan if item in set(observed["applied"])]
+                    if observed_prefix != full_plan[:len(observed_prefix)]:
+                        raise ExecutionError(
+                            "MIGRATION_STATE_DRIFT", "applied target migrations are not a contiguous trusted prefix",
+                            manual=True,
+                        )
+                    if len(observed_prefix) > len(successful_prefix):
+                        successful_prefix = observed_prefix
+                        recovery_record["successful_prefix"] = list(successful_prefix)
+                        recovery_record["first_remaining_migration"] = (
+                            full_plan[len(successful_prefix)] if len(successful_prefix) < len(full_plan) else None
+                        )
+                        self.store.update(job_id, migration_recovery=recovery_record)
+                    if not result.ok:
+                        raise ExecutionError("MIGRATION_FAILED", _decode(result, settings), manual=True)
+                    if successful_prefix != expected_after_command:
+                        raise ExecutionError(
+                            "MIGRATION_VERIFY_FAILED", "migration command did not produce its exact trusted prefix",
+                            manual=True,
+                        )
                 verified = self._probe(staged.source_root)
                 if verified["conflicts"] or verified["replacements"] or verified["plan"]:
                     raise ExecutionError("MIGRATION_VERIFY_FAILED", "target schema is not clean after migration", manual=True)
+                recovery_record["finalized"] = True
+                recovery_record["first_remaining_migration"] = None
+                recovery_record["permitted_action"] = "none"
+                self.store.update(job_id, migration_recovery=recovery_record)
             self.store.milestone(job_id, "database_verified")
 
             if "source_advanced" not in milestones:
@@ -1211,6 +1444,21 @@ class Executor:
             return self.store.succeed(job_id)
         except ExecutionError as exc:
             cleanup_staging()
+            current = self.store.load(job_id)
+            evidence = current.get("migration_recovery")
+            if isinstance(evidence, dict) and evidence.get("finalized") is False:
+                prefix = evidence.get("successful_prefix")
+                full = evidence.get("ordered_target_plan")
+                if (isinstance(prefix, list) and prefix
+                        and isinstance(full, list) and len(prefix) < len(full)
+                        and prefix == full[:len(prefix)]):
+                    evidence = dict(evidence)
+                    evidence["failure_classification"] = exc.classification[:64]
+                    evidence["failure_detail"] = " ".join(exc.detail.split())[:4000]
+                    evidence["first_remaining_migration"] = full[len(prefix)]
+                    evidence["permitted_action"] = "retry_same_exact_release"
+                    evidence["finalized"] = True
+                    self.store.update(job_id, migration_recovery=evidence)
             return self.store.fail(
                 job_id, exc.classification, exc.detail, manual=exc.manual,
                 migration_plan_review=exc.migration_plan_review,
@@ -1249,6 +1497,8 @@ def dataclass_to_dict(plan: TrustedPlan) -> dict:
         "runtime_components_changed": plan.runtime_components_changed,
         "minimum_updater_protocol_version": plan.minimum_updater_protocol_version,
         "manual_bootstrap_required": plan.manual_bootstrap_required,
+        "migration_authorization": plan.migration_authorization,
+        "migration_preflight_checks": list(plan.migration_preflight_checks),
         "fingerprint": plan.fingerprint,
     }
     transition = plan.protected_runtime_transition

@@ -1577,6 +1577,57 @@ for Update Center operations; the web route adds the existing authenticated
 superuser/CSRF boundary. The bootstrap CLI adds the stronger local root check
 because r0088 cannot render the new UI.
 
+### Protocol-6 central authorization, preflight, and partial-prefix recovery
+
+Protocol 6 adds two optional release-manifest fields. A release with migrations
+may name `migration_preflight_checks`, a list of identifiers from the protected
+closed registry, and may reference exactly
+`deploy/migration_authorizations/<release-id>.json`. Both require protocol 6;
+old manifests omit them and retain their byte-for-byte legacy fingerprint.
+
+The authorization is deliberately a companion artifact, not an inline manifest
+object. The release commit cannot contain its own commit SHA, and putting the
+manifest's SHA-256 inside the manifest would be self-referential. Authoring is
+therefore a two-commit operation: commit A introduces the immutable release
+manifest and source; a later metadata-only commit B introduces the companion.
+The protected repository proves B is a unique, never-modified file on canonical
+trusted ancestry, strictly after A. Its closed schema binds the release ID,
+commit A, manifest SHA-256, complete migration-plan digest, complete normalized
+manual-operation list, and trusted-plan fingerprint. A mismatch authorizes
+nothing and the existing exact station-local approval path remains available.
+There is no wildcard or subset match.
+
+Preflight identifiers are data, never module paths or commands. The staged
+target's `updatecenter_migration_preflight` command maps each identifier through
+a closed registry, enters one PostgreSQL `READ ONLY` transaction, returns
+bounded structured evidence, and always rolls the transaction back. It runs
+after target plan/authorization validation but before checkpoint creation and
+`migration_started`. Unknown checks, malformed output, or a failed check stop
+the job before any migration command. The initial registered check detects the
+duplicate recurring/specific-date ScheduleBlock condition that caused the
+r0097-style M1-then-M2 data conflict.
+
+Migration execution is now deliberately one migration target at a time. Before
+the first command, root-owned job state records the exact plan identity and
+checkpoint. After every command--including a nonzero exit--the worker re-probes
+the recorder and persists only an observed contiguous successful prefix. A
+fresh job may classify existing target migrations as
+`UPDATER_OWNED_PARTIAL_PREFIX` only when release, target commit, manifest hash,
+original digest, fingerprint, ordered full plan, currently applied prefix, and
+verified checkpoint all match immutable evidence from a prior failed protected
+job. The staged target independently reconstructs the original full plan so a
+digest is stable even though the ordinary forward plan now contains only the
+remaining suffix. Preflights and exact central/local authorization are rerun;
+execution starts at the first remaining migration. Any missing, corrupt,
+non-contiguous, extra, or mismatched evidence remains
+`TARGET_MIGRATION_PREAPPLIED`. Migration records are never faked, rewritten, or
+rolled back.
+
+Update Center mirrors this root evidence for display: prior/evidence job,
+applied prefix, checkpoint digest, blocking reason, and the only permitted
+operator action--correct the underlying problem and retry the same exact
+release.
+
 ### Migration declaration completeness (r0092+)
 
 Both application release cross-checking and the protected executor now compare

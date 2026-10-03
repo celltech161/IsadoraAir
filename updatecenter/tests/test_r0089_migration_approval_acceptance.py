@@ -39,7 +39,12 @@ R0092_LIBRARY_LEAF = ("library", "0085_remote_dj_queue_set_next_access")
 
 
 def _r0092_leaf_nodes(nodes):
-    return [R0092_LIBRARY_LEAF if node[0] == "library" else node for node in nodes]
+    return [
+        R0092_LIBRARY_LEAF if node[0] == "library"
+        else ("updatecenter", "0003_updatejob_migration_plan_review_and_more")
+        if node[0] == "updatecenter" else node
+        for node in nodes
+    ]
 
 
 def r0092_tree_probe(**kwargs):
@@ -108,9 +113,10 @@ class RecordingSystemd:
 class ProductionStateExecutor(Executor):
     """Real execute() state machine with only host mutations test-doubled."""
 
-    def __init__(self, *args, leaf_targets, **kwargs):
+    def __init__(self, *args, leaf_targets, transition_refs, **kwargs):
         super().__init__(*args, **kwargs)
         self.leaf_targets = leaf_targets
+        self.transition_refs = set(transition_refs)
         self.live_head = R0088_COMMIT
         self.migrate_calls = 0
         self.source_advance_calls = 0
@@ -125,17 +131,26 @@ class ProductionStateExecutor(Executor):
         self.assert_current_probe_was_legacy = set(self.legacy_current) == {
             "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
         }
-        return self.legacy_current
+        # The subprocess fixture proves the legacy wire shape, while this
+        # graph models the real r0088 source boundary for protocol-6 prefix
+        # ownership checks (the tiny fixture intentionally has only 3 nodes).
+        target_nodes = r0092_tree_probe()["nodes"]
+        return {
+            **self.legacy_current,
+            "nodes": {ref: deps for ref, deps in target_nodes.items() if ref not in self.transition_refs},
+        }
 
-    def _probe(self, source, *, release_id=None, target_commit=None):
+    def _probe(self, source, *, release_id=None, target_commit=None, recovery_plan_refs=()):
+        if recovery_plan_refs:
+            raise AssertionError("historical r0092 acceptance does not enter partial-prefix recovery")
         if release_id is not None:
             return r0092_tree_probe(release_id=release_id, target_commit=target_commit)
         return r0092_tree_probe()
 
     def _run_app(self, source, arguments, *, timeout):
-        if arguments[:2] == ["migrate", "--noinput"]:
+        if arguments and arguments[0] == "migrate":
             self.migrate_calls += 1
-            MigrationExecutor(connection).migrate(self.leaf_targets)
+            MigrationExecutor(connection).migrate([(arguments[1], arguments[2])])
             return ProcessResult(tuple(arguments), 0, b"", b""), {}
         raise AssertionError(f"unexpected application mutation: {arguments!r}")
 
@@ -219,7 +234,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         )
         self.executor = ProductionStateExecutor(
             self.config, self.store, CommandRunner(), systemd_manager=self.systemd,
-            leaf_targets=self.leaf_targets,
+            leaf_targets=self.leaf_targets, transition_refs=self.migration_refs,
         )
         self.executor.repository.fetch = lambda: R0092_TARGET_COMMIT
         PersistentSupervisor.active_generation = 7
@@ -282,7 +297,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         self.addCleanup(candidate_store.close)
         candidate = ProductionStateExecutor(
             self.config, candidate_store, CommandRunner(), systemd_manager=self.systemd,
-            leaf_targets=self.leaf_targets,
+            leaf_targets=self.leaf_targets, transition_refs=self.migration_refs,
             expected_handoff_generation=8,
             expected_handoff_descriptor_sha256=R0092_DESCRIPTOR,
             expected_resumable_job_uuid=job_a,
@@ -295,6 +310,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
                 mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"schema_version": 1}), \
                 mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=False):
             result_a = candidate.execute(job_a)
+
 
         self.assertEqual(result_a["state"], "manual_intervention_required")
         self.assertEqual(result_a["failure_classification"], "MIGRATION_OPERATION_MANUAL")
@@ -323,7 +339,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         self.assertNotEqual(job_a, job_b)
         job_b_executor = ProductionStateExecutor(
             self.config, self.store, CommandRunner(), systemd_manager=self.systemd,
-            leaf_targets=self.leaf_targets,
+            leaf_targets=self.leaf_targets, transition_refs=self.migration_refs,
         )
         job_b_executor.repository.fetch = lambda: R0092_TARGET_COMMIT
         with mock.patch("isadoraair_updater.executor.SupervisorClient", PersistentSupervisor), \
@@ -337,7 +353,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
             result_b = job_b_executor.execute(job_b)
 
         self.assertEqual(result_b["state"], "succeeded")
-        self.assertEqual(job_b_executor.migrate_calls, 1)
+        self.assertEqual(job_b_executor.migrate_calls, len(self.migration_refs))
         self.assertEqual(job_b_executor.source_advance_calls, 1)
         self.assertEqual(self.systemd.reconciled, 1)
         self.assertEqual(self.systemd.restarted, ["isadoraair-gunicorn", "isadoraair-engine"])

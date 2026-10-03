@@ -136,12 +136,13 @@ class Gen7HeterogeneousProbeCompatibilityTests(TransactionTestCase):
 
         # 4-5-6: target-schema probe runs the NEW script (this checkout, in
         # process, same DB) WITH real release/target review context, over
-        # the real r0089 migration graph, and emits the full 13-key shape.
+        # the real r0089 migration graph, and emits the protocol-6 shape.
         target_raw = json.dumps(
             build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
         ).encode("utf-8")
         target_payload = _strict_probe(target_raw, review_context=True)
-        self.assertEqual(set(target_payload), _REVIEW_PROBE_KEYS)
+        self.assertTrue(_REVIEW_PROBE_KEYS.issubset(set(target_payload)))
+        self.assertEqual(target_payload["recovery_plan"], None)
         self.assertEqual(target_payload["release_id"], "r0089")
         self.assertEqual(target_payload["target_commit"], R0089_TARGET_COMMIT)
         self.assertTrue(target_payload["manual_operations"], "r0089's real manual operations must be discovered")

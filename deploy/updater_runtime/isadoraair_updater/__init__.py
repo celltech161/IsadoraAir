@@ -97,7 +97,11 @@ HANDOFF_WIRE_PROTOCOL = SUPPORTED_WIRE_PROTOCOLS[0]
 # descriptor mismatches and lower targets remain hard failures. Genuine forward
 # candidates are independently verified in .staging before the inactive slot is
 # replaced.
-RUNTIME_VERSION = 10
+#
+# 10 -> 11 (P1 1.17): protocol-6 trusted companion migration authorization,
+# closed read-only data preflights, and exact protected-job partial-prefix
+# continuation. The daemon wire protocol remains v4.
+RUNTIME_VERSION = 11
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared
@@ -133,7 +137,7 @@ RUNTIME_VERSION = 10
 # transition repairs the existing Phase-D execution meaning. Raising this
 # value would make the generation-3 WRJE worker reject the bridge before it
 # could activate the corrected generation-5 runtime.
-MANIFEST_PROTOCOL_VERSION = 5
+MANIFEST_PROTOCOL_VERSION = 6
 
 # The BOOTSTRAP SUPERVISOR protocol (Update Center Phase D, [P1] 1.16
 # D1) -- how a future stable, rarely-changing supervisor process and a

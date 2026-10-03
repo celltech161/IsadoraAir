@@ -194,6 +194,9 @@ class JobStore:
             # state files (immutable evidence, never rewritten) remain
             # readable unchanged.
             "migration_plan_review": None,
+            # Protocol-6 partial-prefix evidence. This is updater-owned,
+            # bounded JSON and remains readable across worker restarts.
+            "migration_recovery": None,
         }
         self._atomic_write(path, state)
         self.append_log(job_id, "job accepted")
@@ -205,9 +208,16 @@ class JobStore:
             "state", "current_step", "failure_classification", "failure_detail",
             "trusted_plan", "checkpoint", "protected_runtime_candidate",
             "protected_runtime_satisfaction", "migration_plan_review",
+            "migration_recovery",
         }
         if set(changes) - allowed:
             raise JobError("attempt to write unknown job-state fields")
+        existing_recovery = state.get("migration_recovery")
+        if (isinstance(existing_recovery, dict)
+                and existing_recovery.get("finalized") is True
+                and "migration_recovery" in changes
+                and changes["migration_recovery"] != existing_recovery):
+            raise JobError("finalized migration recovery evidence is immutable")
         state.update(changes)
         state["updated_at"] = _now()
         self._atomic_write(self._state_path(job_id), state)

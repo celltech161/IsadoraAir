@@ -228,7 +228,39 @@ def compute_migration_plan_digest(*, release_id: str, target_commit: str, manife
     return hashlib.sha256(raw).hexdigest()
 
 
-def build_probe_payload(*, release_id: str | None = None, target_commit: str | None = None):
+def _serialize_exact_plan(loader, refs: list[str]) -> list[dict]:
+    """Rebuild a prior full plan independent of current applied state."""
+    result = []
+    seen = set()
+    for ref in refs:
+        if ref in seen or "." not in ref:
+            raise RuntimeError("recovery plan contains a duplicate or malformed migration reference")
+        seen.add(ref)
+        key = tuple(ref.split(".", 1))
+        migration = loader.disk_migrations.get(key)
+        if migration is None:
+            raise RuntimeError(f"recovery migration {ref!r} is absent from the target graph")
+        node = loader.graph.node_map[key]
+        state = loader.project_state(key, at_end=False)
+        operations = []
+        for operation in migration.operations:
+            before_state = state.clone() if operation.__class__.__name__ == "AlterField" else None
+            operation.state_forwards(migration.app_label, state)
+            operations.append(_classify_operation(
+                operation, app_label=migration.app_label,
+                before_state=before_state, after_state=state,
+            ))
+        result.append({
+            "ref": ref,
+            "dependencies": sorted(_ref(parent.key) for parent in node.parents),
+            "migration_file_sha256": _migration_file_sha256(migration),
+            "operations": operations,
+        })
+    return result
+
+
+def build_probe_payload(*, release_id: str | None = None, target_commit: str | None = None,
+                        recovery_plan_refs: list[str] | None = None):
     executor = MigrationExecutor(connection)
     loader = executor.loader
     conflicts = loader.detect_conflicts()
@@ -290,6 +322,9 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
         # (the executor's approval gate) only ever calls this WITH both.
         "manual_operations": [],
         "approval": None,
+        "recovery_plan": None,
+        "recovery_migration_plan_digest": None,
+        "recovery_manual_operations": [],
     }
     if release_id is not None and target_commit is not None:
         manifest_path = Path("deploy") / "releases" / f"{release_id}.json"
@@ -301,6 +336,14 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
         payload["manifest_sha256"] = manifest_sha256
         payload["migration_plan_digest"] = digest
         payload["manual_operations"] = extract_manual_operations(plan)
+        if recovery_plan_refs:
+            recovery_plan = _serialize_exact_plan(loader, recovery_plan_refs)
+            payload["recovery_plan"] = recovery_plan
+            payload["recovery_migration_plan_digest"] = compute_migration_plan_digest(
+                release_id=release_id, target_commit=target_commit,
+                manifest_sha256=manifest_sha256, plan=recovery_plan,
+            )
+            payload["recovery_manual_operations"] = extract_manual_operations(recovery_plan)
     return payload
 
 
@@ -314,6 +357,10 @@ class Command(BaseCommand):
                  "probe call supplies this; enables migration_plan_digest computation.",
         )
         parser.add_argument(
+            "--recovery-plan-ref", action="append", default=[],
+            help="Protected-updater-only exact prior plan reference used for partial-prefix reconciliation.",
+        )
+        parser.add_argument(
             "--target-commit", default=None,
             help="Target release's trusted commit SHA, as already independently resolved by the "
                  "caller. Embedded in the digest verbatim; this command does not itself verify it.",
@@ -322,6 +369,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         payload = build_probe_payload(
             release_id=options.get("release_id"), target_commit=options.get("target_commit"),
+            recovery_plan_refs=options.get("recovery_plan_ref") or [],
         )
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         if len(raw.encode("utf-8")) > 1024 * 1024:

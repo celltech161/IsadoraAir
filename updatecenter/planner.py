@@ -29,8 +29,12 @@ from django.db import connection
 from . import cross_check, git_adapter, manifest as manifest_mod, release_chain, schema_health as schema_health_mod
 from .execution_contract import (
     execution_fingerprint,
+    execution_fingerprint_payload,
     intermediate_protected_runtime_execution_fingerprint,
+    intermediate_protected_runtime_fingerprint_payload,
+    migration_hardening_execution_fingerprint,
     protected_runtime_execution_fingerprint,
+    protected_runtime_fingerprint_payload,
 )
 
 # Deliberately matches ARCHITECTURE_REPORT.md §15's restart ordering,
@@ -169,6 +173,8 @@ class Plan:
     schema_health_detail: str
     target_schema_validation_status: str
     target_schema_validation_detail: str
+    migration_authorization: str | None = None
+    migration_preflight_checks: tuple[str, ...] = ()
 
     def to_serializable(self) -> dict:
         """A plain-dict, JSON-safe shape -- used both for /updates/'s
@@ -199,6 +205,8 @@ class Plan:
             "runtime_components_changed": self.runtime_components_changed,
             "minimum_updater_protocol_version": self.minimum_updater_protocol_version,
             "manual_bootstrap_required": self.manual_bootstrap_required,
+            "migration_authorization": self.migration_authorization,
+            "migration_preflight_checks": list(self.migration_preflight_checks),
             "schema_health_status": self.schema_health_status,
             "schema_pending_migrations": list(self.schema_pending_migrations),
             "target_schema_validation_status": self.target_schema_validation_status,
@@ -238,6 +246,7 @@ def _safe(safety_status: str, detail: str, schema_health: schema_health_mod.Sche
         nginx_changed=False, runtime_components_changed=False,
         minimum_updater_protocol_version=manifest_mod.UPDATER_PROTOCOL_VERSION,
         manual_bootstrap_required=False,
+        migration_authorization=None, migration_preflight_checks=(),
         cross_check_findings=(),
         schema_health_status=schema_health.status,
         schema_pending_migrations=schema_health.pending_migrations,
@@ -555,6 +564,10 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
     compatibility_seen: set[str] = set()
     minimum_protocol = 1
     manual_bootstrap_required = False
+    # Only the final target can authorize the aggregate station->target
+    # plan. An intermediate release's companion binds a different target.
+    migration_authorization = latest.manifest.migration_authorization
+    migration_preflight_checks: list[str] = []
 
     for chained in releases_in_plan:
         m = chained.manifest
@@ -580,6 +593,9 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         runtime_components_changed = runtime_components_changed or m.runtime_components_changed
         minimum_protocol = max(minimum_protocol, m.minimum_updater_protocol_version)
         manual_bootstrap_required = manual_bootstrap_required or m.manual_bootstrap_required
+        for check_id in m.migration_preflight_checks:
+            if check_id not in migration_preflight_checks:
+                migration_preflight_checks.append(check_id)
         if m.migrations_required:
             compatibility_seen.add(m.migration_compatibility)
 
@@ -653,6 +669,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         None,
     )
     if protected_chained is None:
+        base_fp_payload = execution_fingerprint_payload(**_fingerprint_values)
         execution_fp = execution_fingerprint(**_fingerprint_values)
     else:
         protected_runtime = protected_chained.manifest.protected_runtime
@@ -666,14 +683,27 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
             protected_runtime_supported_wire_protocols=protected_runtime.supported_wire_protocols,
         )
         if protected_chained.manifest.release_id == latest.manifest.release_id:
+            base_fp_payload = protected_runtime_fingerprint_payload(**protected_values)
             execution_fp = protected_runtime_execution_fingerprint(**protected_values)
         else:
+            base_fp_payload = intermediate_protected_runtime_fingerprint_payload(
+                **protected_values,
+                protected_runtime_release_id=protected_chained.manifest.release_id,
+                protected_runtime_previous_release_id=protected_chained.manifest.previous_release_id,
+                protected_runtime_commit=release_commits[protected_chained.manifest.release_id],
+            )
             execution_fp = intermediate_protected_runtime_execution_fingerprint(
                 **protected_values,
                 protected_runtime_release_id=protected_chained.manifest.release_id,
                 protected_runtime_previous_release_id=protected_chained.manifest.previous_release_id,
                 protected_runtime_commit=release_commits[protected_chained.manifest.release_id],
             )
+    if migration_authorization is not None or migration_preflight_checks:
+        execution_fp = migration_hardening_execution_fingerprint(
+            base_fp_payload,
+            migration_authorization=migration_authorization,
+            migration_preflight_checks=tuple(migration_preflight_checks),
+        )
 
     return Plan(
         safety_status=safety_status, safety_detail=safety_detail,
@@ -693,6 +723,8 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         runtime_components_changed=runtime_components_changed,
         minimum_updater_protocol_version=minimum_protocol,
         manual_bootstrap_required=manual_bootstrap_required,
+        migration_authorization=migration_authorization,
+        migration_preflight_checks=tuple(migration_preflight_checks),
         cross_check_findings=(),
         fingerprint=execution_fp,
         schema_health_status=schema_health.status,

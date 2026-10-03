@@ -242,7 +242,10 @@ class ExecutorOrderingTests(SimpleTestCase):
         current = mock.patch.object(self.executor, "_validate_current_schema", side_effect=current_error, return_value={"applied": ["sample.0001_initial"]})
         cleanup_patch = mock.patch("isadoraair_updater.executor.cleanup")
         stage = mock.patch("isadoraair_updater.executor.materialize", return_value=self.staged)
-        target_probe = mock.patch.object(self.executor, "_probe", side_effect=[probe(), probe(plan=False), probe(plan=False)])
+        target_probe = mock.patch.object(
+            self.executor, "_probe",
+            side_effect=[probe(), probe(plan=False), probe(plan=False), probe(plan=False)],
+        )
         compare = mock.patch.object(self.executor, "_validate_target_schema", return_value=("sample.0002_add",))
         checkpoint = mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"valid": True, "dump_file": "x", "size_bytes": 1, "sha256": "d" * 64})
         migrate_result = ProcessResult(("python",), 0 if migration_success else 1, b"ok" if migration_success else b"", b"failed" if not migration_success else b"")

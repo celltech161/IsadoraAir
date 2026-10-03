@@ -305,6 +305,22 @@
       to see exactly what it found and, if appropriate, record a reviewed approval.
     </p>
     {% endif %}
+    {% if shown_job.migration_recovery and shown_job.migration_recovery.successful_prefix %}
+    <div class="uc-note">
+      <strong>UPDATER_OWNED_PARTIAL_PREFIX</strong>: the protected updater proved that this
+      exact job applied a contiguous prefix for {{ shown_job.migration_recovery.release_id }}.
+      Retry the same exact release after correcting the reported failure; do not edit migration
+      records manually.
+      <div class="uc-row"><span class="k">Evidence job</span><span class="v">{{ shown_job.migration_recovery.evidence_job_id }}</span></div>
+      <div class="uc-row"><span class="k">Prior job</span><span class="v">{{ shown_job.migration_recovery.prior_job_id|default:"—" }}</span></div>
+      <div class="uc-row"><span class="k">Applied prefix</span><span class="v">{{ shown_job.migration_recovery.successful_prefix|join:", " }}</span></div>
+      <div class="uc-row"><span class="k">First remaining</span><span class="v">{{ shown_job.migration_recovery.first_remaining_migration|default:"—" }}</span></div>
+      <div class="uc-row"><span class="k">Checkpoint</span><span class="v">{{ shown_job.migration_recovery.checkpoint.sha256|default:"unavailable" }}</span></div>
+      <div class="uc-row"><span class="k">Exact plan/authorization</span><span class="v">{% if shown_job.migration_recovery.exact_plan_authorization_matches %}matched{% else %}not proven{% endif %}</span></div>
+      <div class="uc-row"><span class="k">Permitted action</span><span class="v">{{ shown_job.migration_recovery.permitted_action }}</span></div>
+      <div class="uc-row"><span class="k">Blocking reason</span><span class="v">{{ shown_job.migration_recovery.failure_classification }} {{ shown_job.migration_recovery.failure_detail }}</span></div>
+    </div>
+    {% endif %}
     <details class="uc-details">
       <summary>Last update details</summary>
       <div class="uc-details-body">
