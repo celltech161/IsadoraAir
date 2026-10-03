@@ -148,7 +148,9 @@ deploy/restore/
                           a restore itself.
   20-application.sh       Git clone/SHA checkout, .env + app-tree restore from app.tar.gz.
   30-postgresql.sh        PG bootstrap + pg_restore.
-  40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/waveforms/etc).
+  40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/production-media/
+                          waveforms/etc). production-media/media is restored; its transient
+                          incoming/ work/ locks/ are recreated empty.
   50-native-deps.sh       Backup-based DR: delegates to Foundation E4's real prepare/
                           publish authority using the embedded recovery payload --
                           prepare always unprivileged, publish onto a real (non-
@@ -220,7 +222,7 @@ deviation — see the 2026-08-29 note below:
   v
 30-postgresql  PG bootstrap + pg_restore
   v
-40-station-content  /srv/isadoraair carts/voicetracks/waveforms/etc
+40-station-content  /srv/isadoraair carts/voicetracks/production-media/waveforms/etc
   v
 60-python      IsadoraAir venv + requirements.txt
   v

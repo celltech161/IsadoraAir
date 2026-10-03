@@ -7,6 +7,13 @@
 #   Restored from the backup archive (srv-content/ inside it):
 #     carts/         FXCart audio -- DB rows reference these files directly.
 #     voicetracks/   recorded VT audio -- same, irreplaceable.
+#     production-media/media/
+#                    iPortal immutable ProductionMedia bytes (PRODUCTION_MEDIA_ROOT,
+#                    default /srv/isadoraair/production-media) -- DB rows reference
+#                    these by system-generated key; irreplaceable. Its transient
+#                    siblings incoming/ work/ locks/ are recreated EMPTY (never
+#                    backed up). After a restore, `manage.py production_reconcile`
+#                    reports any row whose bytes are missing or inconsistent.
 #
 #   Recreated empty (regenerable / transient, never backed up):
 #     waveforms/     rebuilt by `manage.py analyze_tracks` from the (restored)
@@ -184,6 +191,47 @@ for sub in carts voicetracks; do
     log_warn "$sub: archive has no srv-content/$sub entries -- directory created empty (may be legitimate, e.g. a station with no operator-recorded content yet)."
   fi
 done
+
+# ---- 1b. iPortal production media (PRODUCTION_MEDIA_ROOT) -----------------
+# Durable bytes live in <root>/media; incoming/ work/ locks/ are transient and
+# are recreated EMPTY. The root honours PRODUCTION_MEDIA_ROOT from the restored
+# .env (same optional-key pattern as REPORTS_ROOT below), else the default.
+PRODUCTION_MEDIA_ROOT="/srv/isadoraair/production-media"
+PM_ENV_FILE="$RESTORE_TARGET_ROOT/.env"
+if [ -f "$PM_ENV_FILE" ]; then
+  ENV_PRODUCTION_MEDIA_ROOT=$(grep -E '^PRODUCTION_MEDIA_ROOT=' "$PM_ENV_FILE" | head -1 | cut -d= -f2- || true)
+  [ -n "$ENV_PRODUCTION_MEDIA_ROOT" ] && PRODUCTION_MEDIA_ROOT="$ENV_PRODUCTION_MEDIA_ROOT"
+fi
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  PRODUCTION_MEDIA_ROOT="$RESTORE_STAGING_ROOT${PRODUCTION_MEDIA_ROOT}"
+fi
+log_info "Production media root: $PRODUCTION_MEDIA_ROOT"
+for dir in "$PRODUCTION_MEDIA_ROOT" "$PRODUCTION_MEDIA_ROOT/media" "$PRODUCTION_MEDIA_ROOT/incoming" \
+           "$PRODUCTION_MEDIA_ROOT/work" "$PRODUCTION_MEDIA_ROOT/locks"; do
+  ensure_dir "$dir"
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    do_or_plan chmod 0750 "$dir"
+  else
+    do_or_plan sudo chmod 0750 "$dir"
+  fi
+done
+if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
+  if [ "$RESTORE_MODE" = "apply" ]; then
+    log_apply "restoring srv-content/production-media/media -> $PRODUCTION_MEDIA_ROOT/media"
+    # ./srv-content/production-media/media/... : strip "." + "srv-content" +
+    # "production-media" so "media/..." lands directly under the root.
+    tar -xzf "$RESTORE_ARCHIVE" -C "$PRODUCTION_MEDIA_ROOT" --strip-components=3 "./srv-content/production-media/media"
+    if [ -z "$RESTORE_STAGING_ROOT" ]; then
+      sudo chown -R "$OWNER" "$PRODUCTION_MEDIA_ROOT"
+    fi
+    PM_FILE_COUNT=$(find "$PRODUCTION_MEDIA_ROOT/media" -type f | wc -l)
+    log_info "production media: restored, $PM_FILE_COUNT file(s); incoming/ work/ locks/ recreated empty. Run 'manage.py production_reconcile' to verify every ProductionMedia row still resolves to its bytes."
+  else
+    log_plan "tar -xzf <archive> -C $PRODUCTION_MEDIA_ROOT --strip-components=3 ./srv-content/production-media/media"
+  fi
+else
+  log_warn "production media: archive has no srv-content/production-media/media entries -- directories created empty (legitimate on a station that has not used iPortal yet)."
+fi
 
 # ---- 2. Recreated-empty (regenerable/transient) subtrees -----------------
 for sub in waveforms aircheck rip_staging; do

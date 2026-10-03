@@ -23,6 +23,11 @@
 #     reprovisioned, see docs/DISASTER_RECOVERY.md).
 #   - Small, operator-created /srv/isadoraair content (FX Cart audio,
 #     voicetracks) and royalty/SoundExchange report filings, if present.
+#   - The iPortal production-media store's DURABLE part: only
+#     PRODUCTION_MEDIA_ROOT/media/ (default
+#     /srv/isadoraair/production-media/media/), via
+#     deploy/stage_production_media.sh. incoming/ (partial uploads), work/
+#     (scratch) and locks/ are transient and are never backed up.
 #   - If configured (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE): age-encrypted
 #     copies of ~/.iasboxbu.cred, ~/.syndicated_ingest.cred,
 #     ~/.ogremote_ingest.cred, and secret-bearing ~/.stereo_tool.rc,
@@ -712,6 +717,14 @@ for sub in carts voicetracks; do
 done
 echo "  $(du -sh "$WORKDIR/srv-content" 2>/dev/null | cut -f1) of station content"
 
+CURRENT_STAGE="production_media"
+echo "Copying iPortal production media (durable media/ only)..."
+# Same optional-.env-key pattern (and same pipefail gotcha) as REPORTS_ROOT
+# below. The helper names ONLY <root>/media as a copy source -- see its header.
+PRODUCTION_MEDIA_ROOT=$(grep -E '^PRODUCTION_MEDIA_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+PRODUCTION_MEDIA_ROOT="${PRODUCTION_MEDIA_ROOT:-/srv/isadoraair/production-media}"
+"$SCRIPT_DIR/stage_production_media.sh" "$PRODUCTION_MEDIA_ROOT" "$WORKDIR/srv-content"
+
 CURRENT_STAGE="reports"
 echo "Copying royalty/SoundExchange report filings, if present..."
 # 2026-09-10 (r0060) bugfix: same `set -o pipefail` gotcha as the
@@ -960,6 +973,7 @@ Contents of this archive:
   stereotool/provenance.json            non-secret external runtime identity; binary/runtime state are NOT bundled
   srv-content/carts/                     FX Cart audio (operator-uploaded)
   srv-content/voicetracks/               recorded voicetrack audio (operator-created)
+  srv-content/production-media/media/    iPortal immutable production media (permanent bytes only)
   reports/                               SoundExchange/royalty report filings (if present)
   runtime-recovery/                      Runtime Foundation E7 disaster-recovery payload (if configured -- see below)
   runtime-recovery-archive.json          machine-readable archive/recovery classification
@@ -971,6 +985,7 @@ Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
   /srv/isadoraair/aircheck     high-growth, own retention policy
   /srv/isadoraair/rip_staging  transient working directory
   /srv/isadoraair/mitd_artbell 44+ GB syndicated-show staging, own future sizing decision
+  /srv/isadoraair/production-media/{incoming,work,locks}  partial uploads / scratch / locks (transient)
   .git/, venv/, __pycache__/, staticfiles/, media/album_art_cache/
   .env.bak, .env.lock                    stray local files, not restore-relevant (.env itself IS included)
 

@@ -30,7 +30,7 @@ clean Ubuntu 26.04
   v  deploy/restore/10-packages.sh     -- apt packages (+ optional offline apt/snap closure -- see below)
   v  deploy/restore/20-application.sh  -- git clone + SHA checkout, .env + media/
   v  deploy/restore/30-postgresql.sh   -- role/DB bootstrap, pg_restore
-  v  deploy/restore/40-station-content.sh -- carts/voicetracks/reports/StereoTool profile
+  v  deploy/restore/40-station-content.sh -- carts/voicetracks/production-media/reports/StereoTool profile
   v  deploy/restore/60-python.sh       -- IsadoraAir venv, + in-tree weather_ingest/venv (r0048+ modern target)
   v  deploy/restore/50-native-deps.sh  -- native fdkaac (see "Runtime recovery payload" below)
   v  deploy/restore/70-tts.sh          -- Kokoro + Piper (see "Runtime recovery payload" below)

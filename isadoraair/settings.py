@@ -75,6 +75,7 @@ INSTALLED_APPS = [
     'webrequests',
     'aircheck',
     'updatecenter',
+    'production',
     'axes',
 ]
 
@@ -229,6 +230,16 @@ REPORTS_ROOT = config('REPORTS_ROOT', default='/var/lib/isadoraair/reports')
 
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
+
+# iPortal shared production-media store (the `production` app). Permanent,
+# immutable ProductionMedia bytes live under <root>/media/ and are part of the
+# station backup; <root>/incoming, /work and /locks are transient and are not.
+# Deliberately NOT exposed through nginx and NOT registered as an admin-UI
+# editable setting: every ProductionMedia row resolves relative to this root,
+# so repointing it from a web form would strand permanent media. Changing it is
+# an operator action (move the directory, then edit .env). Read at call time
+# by production.services.layout, never cached at import.
+PRODUCTION_MEDIA_ROOT = config('PRODUCTION_MEDIA_ROOT', default='/srv/isadoraair/production-media')
 
 # Where the GW3000/Ecowitt weather receiver writes latest_weather.json,
 # wind_history.json, and smoothed_wind.json -- read by the /wx/ views and

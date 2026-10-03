@@ -228,6 +228,7 @@ check_optional_dir "systemd units (etc-live)"      'etc-live/isadoraair-.*\.serv
 check_optional_dir "StereoTool unit (etc-live)"    'etc-live/stereotool\.service$'
 check_optional_dir "StereoTool profile (.sts)"     'stereotool/.*\.sts$'
 check_optional_dir "Station content (srv-content)" 'srv-content/'
+check_optional_dir "iPortal production media"      'srv-content/production-media/media/'
 check_optional_dir "Reports"                       'reports/'
 
 

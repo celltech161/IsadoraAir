@@ -90,6 +90,11 @@ station backup-v3 archive — has not been done yet either.
 - Small, operator-created `/srv/isadoraair` content: `carts/`
   (FX Cart audio, admin-uploaded) and `voicetracks/` (recorded
   voicetrack audio).
+- The iPortal production-media store's permanent bytes:
+  `PRODUCTION_MEDIA_ROOT/media/` (default
+  `/srv/isadoraair/production-media/media/`) — see "Production media"
+  below and `docs/PRODUCTION_MEDIA.md`. Its `incoming/`, `work/` and
+  `locks/` siblings are transient and are NOT backed up.
 - Royalty/SoundExchange report filings (`REPORTS_ROOT`, default
   `/var/lib/isadoraair/reports`) — see "Reports" below for why these
   are treated as backup-required rather than regenerable.
@@ -294,9 +299,28 @@ before relying on these for a real restore, they'll have grown):
 | `waveforms/` | 5.7 GB, 36k files | Regenerable | No | `manage.py analyze_tracks` rebuilds it from the (backed-up) audio catalog + (not-backed-up) audio itself |
 | `carts/` | 1.9 MB, 1 file | Operator-created | **Yes** | `FXCart.filepath` DB rows reference these files directly; not regenerable |
 | `voicetracks/` | ~12 KB, currently empty (2 empty dated subfolders) | Operator-created | **Yes** | Same reasoning as carts — empty today, structurally will contain irreplaceable recordings |
+| `production-media/media/` | 0 today (iPortal Phase A deployed unused) | Operator/talent-created, immutable | **Yes** | `ProductionMedia` rows (PostgreSQL) reference these bytes by a system-generated key; recordings cannot be regenerated. Restored to `PRODUCTION_MEDIA_ROOT/media/` with mode `0440` preserved |
+| `production-media/{incoming,work,locks}/` | transient | Partial uploads / processing scratch / locks | No | Never backed up (structurally: `deploy/stage_production_media.sh` only ever names `media/`). Recreated **empty** by restore; `manage.py production_reconcile` reclaims anything stale |
 | `aircheck/` | 132 KB currently, 2 files | High-growth / policy-dependent | No | Small today but explicitly high-growth by design (continuous on-air recording); own retention policy is the right home for this, not the core DR backup — not silently excluded, this is a deliberate call |
 | `rip_staging/` | ~4 KB, empty | Transient working directory | No | CD-rip staging area, cleared once processing completes |
 | `mitd_artbell/` | 44 GB, 382 files, root-owned | Large syndicated-show staging | No | Fed by `manage.py prep_mitd_show` / `isadoraair-mitd-prep.timer`; too large for this pass's "small/medium" scope, own future sizing decision, not silently dropped |
+
+**Production media (iPortal, P1 2.22A).** `ProductionMedia` is durable station
+content: the PostgreSQL row (hash, size, facts, provenance) is in the database
+dump, and the immutable bytes it points at are in the archive under
+`srv-content/production-media/media/`. After a restore:
+
+1. stage 40 restores `media/` (modes preserved, `0440`) and recreates `incoming/`,
+   `work/` and `locks/` empty with mode `0750`;
+2. run `manage.py production_reconcile` (dry-run by default) — it reports any
+   present row whose bytes are missing or the wrong size (`--deep` also
+   re-hashes) and any purged media still referenced by a domain row. It never
+   "repairs" a missing recording; that content can only come from backup.
+
+The backup stages the store through `deploy/stage_production_media.sh`, which
+copies `media/` into the working directory before the archive is tarred, so the
+temporary space needed grows with the size of `media/` (negligible today).
+Revisit that when spoken-content volumes are known.
 
 ## Reports (`/var/lib/isadoraair/reports`)
 
