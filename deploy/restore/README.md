@@ -81,8 +81,8 @@ Two more guards apply regardless of the above:
   what `30-postgresql.sh`'s own bootstrap step produces) does NOT count
   as non-empty, so the normal create-then-restore flow never needs the
   flag.
-- **Reports root path safety** (`content_root_safety.py`, P0 1.2):
-  `REPORTS_ROOT` is read from the restored `.env` exactly as
+- **Station content-root path safety** (`content_root_safety.py`, P0 1.2):
+  `REPORTS_ROOT` and `WEATHER_DATA_DIR` are each read from the restored `.env` exactly as
   python-decouple reads it (last assignment wins), canonicalized, and
   refused — before `40-station-content.sh` mutates anything, in
   `--plan`, `--apply` and `--staging-root` runs alike — if it is `/`, a
@@ -101,6 +101,15 @@ Two more guards apply regardless of the above:
   Archive members under `reports/` must be plain relative regular
   files/directories; links or special files fail the stage before
   extraction.
+  `WEATHER_DATA_DIR` is judged the same way (after the r0043 known-legacy
+  value is recognized and replaced by `/var/lib/isadoraair/weather`, the
+  value actually used is the one validated), and is then created and given
+  its owner and `0755` mode by `content_root_safety.py establish` -- that
+  one directory only, never recursively, through no-follow directory
+  descriptors. A dedicated `/var/lib/isadoraair/weather`,
+  `/srv/isadoraair/weather` or `/mnt/stationdata/weather` is accepted;
+  `/etc`, `/srv/isadoraair`, `/mnt`, the reports or library root, or an
+  ancestor of either, is refused.
 
 **The music library is different: there is no override, ever.** No
 stage writes to `/srv/isadoraair/music` under any flag combination —

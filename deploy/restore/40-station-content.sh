@@ -121,6 +121,30 @@ if ! REPORTS_ROOT=$(python3 "$CONTENT_ROOT_SAFETY" "${REPORTS_CHECK_ARGS[@]}"); 
 fi
 log_info "Reports root validated: $REPORTS_ROOT"
 
+# WEATHER_DATA_DIR gets the same treatment (P0 1.2 follow-up -- a restored
+# WEATHER_DATA_DIR=/etc previously led to `sudo chown $OWNER /etc` and
+# `sudo chmod 0755 /etc`). Resolved here with decouple semantics, then the
+# r0043 known-legacy recognition (section 5) decides which value will be
+# used: a recognized legacy value is replaced by the canonical location,
+# so that is the value judged. Either way the path is validated -- live
+# value, in every mode -- before anything below runs.
+CANONICAL_WEATHER_DATA_DIR="/var/lib/isadoraair/weather"
+LEGACY_WEATHER_NAMESPACE="$(restore_default_companions_root)/weather-ingest"
+WEATHER_DATA_DIR_VALUE=$(python3 "$CONTENT_ROOT_SAFETY" value --key WEATHER_DATA_DIR --env-file "$ENV_FILE")
+WEATHER_IS_LEGACY=0
+case "$WEATHER_DATA_DIR_VALUE" in
+  "$LEGACY_WEATHER_NAMESPACE"|"$LEGACY_WEATHER_NAMESPACE"/*) WEATHER_IS_LEGACY=1 ;;
+esac
+WEATHER_CHECK_ARGS=(check --key WEATHER_DATA_DIR --env-file "$ENV_FILE"
+  --target-root "$RESTORE_TARGET_ROOT" --tooling-root "$TOOLING_ROOT")
+[ -n "$RESTORE_STAGING_ROOT" ] && WEATHER_CHECK_ARGS+=(--staging-root "$RESTORE_STAGING_ROOT")
+[ "$WEATHER_IS_LEGACY" -eq 1 ] && WEATHER_CHECK_ARGS+=(--value "$CANONICAL_WEATHER_DATA_DIR")
+if ! WEATHER_DATA_DIR=$(python3 "$CONTENT_ROOT_SAFETY" "${WEATHER_CHECK_ARGS[@]}"); then
+  log_error "Refusing: WEATHER_DATA_DIR from $ENV_FILE failed restore path-safety validation (see above). This stage has created, changed and extracted nothing. Correct WEATHER_DATA_DIR in $ENV_FILE to a dedicated weather-data directory and re-run."
+  exit 1
+fi
+log_info "Weather data directory validated: $WEATHER_DATA_DIR"
+
 ensure_dir() {
   local path="$1"
   guard_never_touch_music_library "$path"
@@ -266,16 +290,13 @@ fi
 # project's own checkout is not a legitimate runtime-data home in the
 # current architecture), never merely an artifact of --staging-root.
 # See docs/DISASTER_RECOVERY_STATUS.md for the full incident record.
-CANONICAL_WEATHER_DATA_DIR="/var/lib/isadoraair/weather"
-WEATHER_DATA_DIR="$CANONICAL_WEATHER_DATA_DIR"
-if [ -f "$ENV_FILE" ]; then
-  ENV_WEATHER_DATA_DIR=$(grep -E '^WEATHER_DATA_DIR=' "$ENV_FILE" | tail -1 | cut -d= -f2- || true)
-  [ -n "$ENV_WEATHER_DATA_DIR" ] && WEATHER_DATA_DIR="$ENV_WEATHER_DATA_DIR"
-fi
-LEGACY_WEATHER_NAMESPACE="$(restore_default_companions_root)/weather-ingest"
-case "$WEATHER_DATA_DIR" in
-  "$LEGACY_WEATHER_NAMESPACE"|"$LEGACY_WEATHER_NAMESPACE"/*)
-    log_warn "WEATHER_DATA_DIR=$WEATHER_DATA_DIR is a known legacy value inside the weather-ingest companion's own source-checkout namespace ($LEGACY_WEATHER_NAMESPACE) -- normalizing $ENV_FILE to the canonical runtime-data location $CANONICAL_WEATHER_DATA_DIR before Stage 60's first Django import can materialize it (r0043 -- see docs/DISASTER_RECOVERY_STATUS.md)."
+# P0 1.2: the value, its legacy recognition and its path safety were all
+# resolved in section 0 (CANONICAL_WEATHER_DATA_DIR, LEGACY_WEATHER_NAMESPACE,
+# WEATHER_DATA_DIR_VALUE, WEATHER_IS_LEGACY, and the validated, effective
+# WEATHER_DATA_DIR -- already staging-prefixed where applicable).
+case "$WEATHER_IS_LEGACY" in
+  1)
+    log_warn "WEATHER_DATA_DIR=$WEATHER_DATA_DIR_VALUE is a known legacy value inside the weather-ingest companion's own source-checkout namespace ($LEGACY_WEATHER_NAMESPACE) -- normalizing $ENV_FILE to the canonical runtime-data location $CANONICAL_WEATHER_DATA_DIR before Stage 60's first Django import can materialize it (r0043 -- see docs/DISASTER_RECOVERY_STATUS.md)."
     if [ "$RESTORE_MODE" = "apply" ] && [ -f "$ENV_FILE" ]; then
       WEATHER_ENV_TMP="$(mktemp)"
       grep -vE '^WEATHER_DATA_DIR=' "$ENV_FILE" > "$WEATHER_ENV_TMP" || true
@@ -286,27 +307,26 @@ case "$WEATHER_DATA_DIR" in
     else
       log_plan "normalize WEATHER_DATA_DIR in $ENV_FILE to $CANONICAL_WEATHER_DATA_DIR"
     fi
-    WEATHER_DATA_DIR="$CANONICAL_WEATHER_DATA_DIR"
     ;;
   *)
-    log_info "WEATHER_DATA_DIR=$WEATHER_DATA_DIR is not a recognized legacy value -- left unchanged."
+    log_info "WEATHER_DATA_DIR=$WEATHER_DATA_DIR_VALUE is not a recognized legacy value -- left unchanged."
     ;;
 esac
-if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  WEATHER_DATA_DIR="$RESTORE_STAGING_ROOT${WEATHER_DATA_DIR}"
-fi
 log_info "Weather data directory: $WEATHER_DATA_DIR"
-ensure_dir "$WEATHER_DATA_DIR"
-# Explicit, deterministic mode -- ensure_dir's own plain `mkdir -p`
-# leaves a freshly-created directory at whatever 0777-minus-umask
-# happens to produce (the exact class of bug r0041/r0042 already fixed
-# for other restore-tooling destinations); asserted here independent of
-# ambient umask, every run, whether the directory is fresh or
-# pre-existing (matching ensure_dir's own unconditional chown).
+guard_never_touch_music_library "$WEATHER_DATA_DIR"
+# Explicit, deterministic mode -- a plain `mkdir -p` leaves a freshly-
+# created directory at whatever 0777-minus-umask happens to produce (the
+# exact class of bug r0041/r0042 already fixed for other restore-tooling
+# destinations); asserted here independent of ambient umask, every run,
+# whether the directory is fresh or pre-existing. P0 1.2: creation,
+# ownership and mode go through content_root_safety.py's `establish`,
+# which touches exactly this one validated directory (never recursively)
+# through no-follow directory descriptors, so neither it nor any ancestor
+# can be a symlink redirecting the change into another tree.
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  do_or_plan chmod 0755 "$WEATHER_DATA_DIR"
+  do_or_plan python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$WEATHER_DATA_DIR" --mode 0755
 else
-  do_or_plan sudo chmod 0755 "$WEATHER_DATA_DIR"
+  do_or_plan sudo python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$WEATHER_DATA_DIR" --owner "$OWNER" --mode 0755
 fi
 
 # ---- 6. StereoTool .sts processing profile(s) -----------------------------

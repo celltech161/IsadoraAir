@@ -9,16 +9,30 @@ value with no validation at all. A wrong, stale or hostile value
 (`/`, `/etc`, `/srv/isadoraair`, the application checkout, an ancestor
 of the music library, a symlink to any of those) would have handed
 ownership of a whole system or station tree to the service account.
+WEATHER_DATA_DIR had the same defect in a non-recursive form: a restored
+WEATHER_DATA_DIR=/etc produced `sudo chown $OWNER /etc` and
+`sudo chmod 0755 /etc`. Both roots now go through this one primitive.
 
 Contract (stdlib only, so it runs on a bare-metal host before Stage 60
 has built any virtualenv):
 
-  check          Resolve one root from the restored .env with
-                 python-decouple's own semantics (last assignment wins,
-                 one pair of surrounding quotes stripped), canonicalize
-                 it, and fail closed unless it is a dedicated content
-                 directory. Prints the single effective path the caller
-                 must operate on. Never creates or changes anything.
+  value          Print one key's effective value from the restored .env
+                 with python-decouple's own semantics (last assignment
+                 wins, one pair of surrounding quotes stripped; an
+                 assigned-but-empty value stays empty, exactly as Django
+                 sees it), or the managed default when unassigned.
+  check          Resolve one root that way (or judge an explicit
+                 --value the restore itself is about to write into .env),
+                 canonicalize it, and fail closed unless it is a
+                 dedicated content directory. Prints the single
+                 effective path the caller must operate on. Never
+                 creates or changes anything.
+  establish      Create (if missing) exactly one already-checked root and
+                 set its owner and/or mode, walking every path component
+                 with O_NOFOLLOW directory file descriptors so neither
+                 the root nor any ancestor can be a symlink redirecting
+                 the change; ownership/mode are applied to the open
+                 directory descriptor itself. Never recursive.
   members        Validate an archive's members under one top-level
                  prefix (relative names only, no `..`, no control
                  characters, regular files/directories only) and write
@@ -76,6 +90,10 @@ ANCHORS = (
 )
 
 # Equal / inside / containing are all refused.
+# The defaults of the managed keys below (music, waveforms, reports,
+# weather, encoders) are deliberately NOT listed here: they are protected
+# through MANAGED_ROOT_DEFAULTS for every key except their own, so judging
+# a key never refuses that key's own default location.
 FIXED_PROTECTED_ROOTS = (
     "/opt/isadoraair",
     "/opt/isadoraair-runtime",
@@ -85,15 +103,16 @@ FIXED_PROTECTED_ROOTS = (
     "/srv/isadoraair/carts",
     "/srv/isadoraair/lost+found",
     "/srv/isadoraair/mitd_artbell",
-    "/srv/isadoraair/music",
     "/srv/isadoraair/rip_staging",
     "/srv/isadoraair/voicetracks",
-    "/srv/isadoraair/waveforms",
-    "/var/lib/isadoraair/encoders",
     "/var/lib/isadoraair/restore",
     "/var/lib/isadoraair/runtime-recovery",
     "/var/lib/isadoraair/tts",
-    "/var/lib/isadoraair/weather",
+)
+
+# Protected beneath the operator's $HOME (the backup/verify service user).
+HOME_PROTECTED_RELATIVE = (
+    ".local/state/isadoraair",  # backup-assurance receipts (isadoraair/backup_assurance.py)
 )
 
 # Every managed station root a restored .env can relocate (mirrors
@@ -132,6 +151,12 @@ def read_decouple_env(path: Path) -> dict[str, str]:
                 value = value[1:-1]
             data[key] = value
     return data
+
+
+def effective_value(env: dict[str, str], key: str) -> str:
+    """decouple's config(key, default=...): an assigned value -- even an
+    empty one -- wins over the default."""
+    return env[key] if key in env else MANAGED_ROOT_DEFAULTS[key]
 
 
 def _has_control_chars(value: str) -> bool:
@@ -212,8 +237,8 @@ def build_protected(
     for other_key, default in MANAGED_ROOT_DEFAULTS.items():
         if other_key == key:
             continue
-        add(env.get(other_key) or default, f"managed station root {other_key}")
-        if env.get(other_key) and env.get(other_key) != default:
+        add(effective_value(env, other_key), f"managed station root {other_key}")
+        if effective_value(env, other_key) != default:
             add(default, f"default station root {other_key}")
     if home:
         try:
@@ -222,6 +247,8 @@ def build_protected(
             normalized_home = None
         if normalized_home:
             extra_anchors.update(_forms(normalized_home, resolve=True))
+            for relative in HOME_PROTECTED_RELATIVE:
+                add(posixpath.join(normalized_home, relative), "protected service-user state root")
     return protected, extra_anchors
 
 
@@ -234,9 +261,10 @@ def check_root(
     tooling_root: str,
     staging_root: str | None,
     home: str | None,
+    value: str | None = None,
 ) -> str:
     env = read_decouple_env(env_file)
-    raw = env.get(key) or default
+    raw = value if value is not None else (env[key] if key in env else default)
     live = normalize_absolute(raw, label=key)
     live_mode = not staging_root
     protected, home_anchors = build_protected(
@@ -308,6 +336,32 @@ def _open_dir_nofollow(path: str) -> int:
     return fd
 
 
+def establish_root(root: str, owner: str | None, mode: int | None) -> None:
+    if root != posixpath.normpath(root) or not root.startswith("/") or root == "/":
+        raise UnsafeRootError(f"--root {root!r} must be an absolute, normalized, non-root path")
+    uid, gid = _resolve_owner(owner) if owner else (-1, -1)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open("/", flags)
+    try:
+        for part in PurePosixPath(root).parts[1:]:
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        if owner:
+            os.fchown(fd, uid, gid)
+        if mode is not None:
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def _resolve_owner(owner: str) -> tuple[int, int]:
     user, sep, group = owner.partition(":")
     if not user:
@@ -367,6 +421,16 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("--target-root", required=True)
     p_check.add_argument("--tooling-root", required=True)
     p_check.add_argument("--staging-root")
+    p_check.add_argument("--value", help="Judge this value (which the restore is about to write) instead of .env's.")
+
+    p_value = sub.add_parser("value")
+    p_value.add_argument("--key", required=True, choices=sorted(MANAGED_ROOT_DEFAULTS))
+    p_value.add_argument("--env-file", required=True, type=Path)
+
+    p_establish = sub.add_parser("establish")
+    p_establish.add_argument("--root", required=True)
+    p_establish.add_argument("--owner")
+    p_establish.add_argument("--mode", type=lambda v: int(v, 8))
 
     p_members = sub.add_parser("members")
     p_members.add_argument("--archive", required=True, type=Path)
@@ -390,8 +454,13 @@ def main(argv: list[str] | None = None) -> int:
                     tooling_root=args.tooling_root,
                     staging_root=args.staging_root or None,
                     home=os.environ.get("HOME"),
+                    value=args.value,
                 )
             )
+        elif args.command == "value":
+            print(effective_value(read_decouple_env(args.env_file), args.key))
+        elif args.command == "establish":
+            establish_root(args.root, args.owner, args.mode)
         elif args.command == "members":
             members = validate_members(args.archive, args.prefix)
             args.output.write_bytes(b"".join(m.encode("utf-8") + b"\0" for m in members))
