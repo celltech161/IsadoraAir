@@ -94,7 +94,15 @@ Two more guards apply regardless of the above:
   any of those. There is no override flag: correct `.env` and re-run. A
   dedicated directory such as `/var/lib/isadoraair/reports`,
   `/srv/isadoraair/reports` or a separately mounted
-  `/mnt/stationdata/reports` is accepted. Ownership is then changed only
+  `/mnt/stationdata/reports` is accepted. Under `--staging-root` the
+  *resolved* staged path must additionally stay separate from the
+  resolved staged equivalent of every other managed/protected root — a
+  symlink inside the staging tree (e.g. `reports -> library`) is refused,
+  not followed. The directory is created and given its owner by
+  `content_root_safety.py establish` (never `mkdir -p`/`chown`), which
+  walks every ancestor with no-follow directory descriptors, so an
+  ancestor swapped for a symlink after validation fails closed before
+  anything is created. Ownership is then changed only
   on that directory itself (non-recursive) and on each restored archive
   member, through no-follow directory descriptors — never `chown -R`, so
   pre-existing content the restore did not write is left untouched.

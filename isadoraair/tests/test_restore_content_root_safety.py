@@ -339,9 +339,9 @@ class ChownMembersTests(_TmpCase):
             crs.chown_members(str(root), OWNER, ["absent.csv"])
 
 
-class Stage40LiveModeTrapTests(_TmpCase):
-    """Real subprocess runs of 40-station-content.sh in LIVE mode (no
-    --staging-root, explicit temporary --target-root)."""
+class _Stage40Harness(_TmpCase):
+    """Real subprocess runs of 40-station-content.sh (explicit temporary
+    --target-root, PATH shims, RESTORE_RECOVERY_RECEIPT_ROOT seam)."""
 
     def setUp(self):
         super().setUp()
@@ -364,8 +364,10 @@ class Stage40LiveModeTrapTests(_TmpCase):
             path.chmod(0o755)
         return shims
 
-    def _run(self, *extra, sudo_script: str | None = None, staging: Path | None = None, mode="--apply"):
+    def _run(self, *extra, sudo_script: str | None = None, staging: Path | None = None, mode="--apply",
+             extra_env: dict[str, str] | None = None):
         env = dict(os.environ)
+        env.update(extra_env or {})
         env["PATH"] = f"{self._shims(sudo_script)}:{env['PATH']}"
         env["SHIM_LOG"] = str(self.log)
         env["SHIM_ALLOW_PREFIX"] = str(self.tmp)
@@ -380,6 +382,10 @@ class Stage40LiveModeTrapTests(_TmpCase):
 
     def _snapshot(self) -> set[str]:
         return {str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*") if "shims" not in p.parts}
+
+
+class Stage40LiveModeTrapTests(_Stage40Harness):
+    """LIVE mode (no --staging-root) unless a test passes one."""
 
     def test_hostile_live_values_issue_zero_mutating_commands(self):
         link = self.tmp / "etc-link"
@@ -450,8 +456,9 @@ class Stage40LiveModeTrapTests(_TmpCase):
         self.assertNotIn(" -R", log)
         self.assertNotIn("/etc", log)
         executed = [line for line in log.splitlines() if line.startswith("sudo ") and str(self.tmp) in line]
-        self.assertIn(f"sudo mkdir -p -- {reports}", executed)
-        self.assertIn(f"sudo chown -h -- {OWNER} {reports}", executed)
+        self.assertIn(f"sudo python3 -I {HELPER} establish --root {reports} --owner {OWNER}", executed)
+        reports_lines = [line for line in executed if str(reports) in line]
+        self.assertFalse(any(" mkdir " in f" {line} " or "chown -h" in line for line in reports_lines), log)
         self.assertTrue(any("chown-members" in line and f"--root {reports}" in line for line in executed), log)
         for line in log.splitlines():
             if line.startswith("SKIPPED"):
@@ -760,3 +767,234 @@ class WeatherStage40LiveModeTrapTests(Stage40LiveModeTrapTests):
         self.assertTrue(staged.is_dir())
         self.assertEqual(staged.stat().st_mode & 0o7777, 0o755)
         self.assertEqual(self.log.read_text(), "")
+
+
+# ---------------------------------------------------------------------------
+# P0 1.2 final corrective pass (Codex blockers).
+# 1. Staged managed-root aliasing: a symlink INSIDE the staging tree could
+#    alias one staged managed root onto another (reports -> library), and
+#    stage 40 extracted reports into the staged library / chmodded it.
+# 2. REPORTS_ROOT establishment used `mkdir -p` + `chown -h` after
+#    validation, so an ancestor swapped for a symlink in between made
+#    `mkdir -p` create a directory inside the symlink's target.
+# ---------------------------------------------------------------------------
+
+STAGED_ENV = (
+    "LIBRARY_ROOT=/mnt/stationdata/library\n"
+    "WAVEFORMS_DIR=/mnt/stationdata/waveforms\n"
+    "REPORTS_ROOT=/mnt/stationdata/reports\n"
+    "WEATHER_DATA_DIR=/mnt/stationdata/weather\n"
+)
+
+
+def _fingerprint(root: Path) -> dict[str, tuple[int, int, int]]:
+    """mode/ctime/size of a directory and everything beneath it -- any
+    extraction, chmod, chown or creation inside it changes this."""
+    entries = [root, *sorted(root.rglob("*"))]
+    return {
+        str(p.relative_to(root)): (p.lstat().st_mode, p.lstat().st_ctime_ns, p.lstat().st_size)
+        for p in entries
+    }
+
+
+class StagedManagedRootAliasTests(_Stage40Harness):
+    """Real stage-40 entry point, --staging-root --apply, real tools (only
+    sudo is shimmed; a staged run must never call it)."""
+
+    def _tree(self, name: str) -> tuple[Path, Path]:
+        staging = self.tmp / name
+        base = staging / "mnt" / "stationdata"
+        library = base / "library"
+        library.mkdir(parents=True)
+        (library / "track.flac").write_bytes(b"audio")
+        library.chmod(0o750)
+        return staging, base
+
+    def _run_staged(self, staging: Path):
+        self.env_file.write_text(STAGED_ENV, encoding="utf-8")
+        return self._run(staging=staging, sudo_script=SELECTIVE_SUDO)
+
+    def _assert_refused_and_untouched(self, result, victim: Path, before):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("failed restore path-safety validation", result.stderr)
+        self.assertEqual(_fingerprint(victim), before)
+        self.assertFalse(any(victim.rglob("*.csv")), "report content reached the aliased root")
+        self.assertEqual(self.log.read_text(), "")
+
+    def test_staged_reports_symlink_to_staged_library_is_refused(self):
+        staging, base = self._tree("s-reports-library")
+        (base / "reports").symlink_to(base / "library")
+        before = _fingerprint(base / "library")
+        time.sleep(0.02)
+        result = self._run_staged(staging)
+        self._assert_refused_and_untouched(result, base / "library", before)
+        self.assertIn("REPORTS_ROOT", result.stderr)
+        self.assertIn("LIBRARY_ROOT", result.stderr)
+
+    def test_staged_weather_symlink_to_staged_library_is_refused(self):
+        staging, base = self._tree("s-weather-library")
+        (base / "reports").mkdir()
+        (base / "weather").symlink_to(base / "library")
+        before = _fingerprint(base / "library")
+        time.sleep(0.02)
+        result = self._run_staged(staging)
+        self._assert_refused_and_untouched(result, base / "library", before)
+        self.assertIn("WEATHER_DATA_DIR", result.stderr)
+        self.assertEqual((base / "library").stat().st_mode & 0o7777, 0o750)
+
+    def test_representative_cross_managed_aliases_are_refused(self):
+        cases = {
+            "reports-to-weather": ("reports", "weather"),
+            "weather-to-reports": ("weather", "reports"),
+            "reports-to-waveforms": ("reports", "waveforms"),
+            "weather-to-voicetracks": ("weather", None),
+            "reports-to-ancestor-of-library": ("reports", ".."),
+        }
+        for name, (link, target) in cases.items():
+            with self.subTest(name):
+                staging, base = self._tree(f"s-{name}")
+                if target is None:
+                    victim = staging / "srv" / "isadoraair" / "voicetracks"
+                elif target == "..":
+                    victim = staging / "mnt"
+                else:
+                    victim = base / target
+                victim.mkdir(parents=True, exist_ok=True)
+                (victim / "keep.dat").write_bytes(b"keep")
+                for real in ("reports", "weather", "waveforms"):
+                    if real != link and not (base / real).exists():
+                        (base / real).mkdir()
+                (base / link).symlink_to(victim)
+                before = _fingerprint(victim) if target != ".." else _fingerprint(base / "library")
+                self.log.write_text("")
+                time.sleep(0.02)
+                result = self._run_staged(staging)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("failed restore path-safety validation", result.stderr)
+                self.assertEqual(
+                    _fingerprint(victim) if target != ".." else _fingerprint(base / "library"), before
+                )
+                self.assertFalse(any(victim.rglob("*.csv")))
+
+    def test_safe_staged_distinct_directories_still_succeed(self):
+        staging, base = self._tree("s-safe")
+        for real in ("reports", "weather"):
+            (base / real).mkdir()
+        before = _fingerprint(base / "library")
+        time.sleep(0.02)
+        result = self._run_staged(staging)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((base / "reports" / "royalty-2026-09.csv").is_file())
+        self.assertTrue((base / "reports" / "q3" / "soundexchange.csv").is_file())
+        self.assertEqual((base / "weather").stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(_fingerprint(base / "library"), before)
+        self.assertEqual(self.log.read_text(), "")
+
+
+# Live sudo shim that reproduces Codex's interleaving: the FIRST privileged
+# command naming the already-validated reports root swaps one of its
+# ancestors for a symlink to a victim directory, then runs the command.
+SWAP_SUDO = """#!/bin/bash
+printf 'sudo %s\\n' "$*" >> "$SHIM_LOG"
+for arg in "$@"; do
+  if [ "$arg" = "$SWAP_TRIGGER" ] && [ ! -e "$SWAP_MARKER" ]; then
+    mv "$SWAP_PARENT" "$SWAP_PARENT.orig"
+    ln -s "$SWAP_VICTIM" "$SWAP_PARENT"
+    : > "$SWAP_MARKER"
+    printf 'SWAPPED %s -> %s\\n' "$SWAP_PARENT" "$SWAP_VICTIM" >> "$SHIM_LOG"
+  fi
+done
+for arg in "$@"; do
+  case "$arg" in
+    /*)
+      case "$arg" in
+        "$SHIM_ALLOW_PREFIX"/*|"$SHIM_ALLOW_HELPER") ;;
+        *) printf 'SKIPPED sudo %s\\n' "$*" >> "$SHIM_LOG"; exit 0 ;;
+      esac
+      ;;
+  esac
+done
+exec "$@"
+"""
+
+
+class ReportsRootEstablishmentRaceTests(_Stage40Harness):
+    def test_ancestor_swapped_after_validation_creates_nothing_in_the_victim(self):
+        parent = self.tmp / "stationdata" / "parent"
+        parent.mkdir(parents=True)
+        reports = parent / "reports"
+        victim = self.tmp / "victim"
+        victim.mkdir()
+        victim.chmod(0o700)
+        victim_before = (victim.stat().st_mode, victim.stat().st_uid, victim.stat().st_ctime_ns)
+        self.env_file.write_text(f"REPORTS_ROOT={reports}\n", encoding="utf-8")
+        marker = self.tmp / "swap.done"
+        time.sleep(0.02)
+
+        result = self._run(sudo_script=SWAP_SUDO, extra_env={
+            "SWAP_TRIGGER": str(reports), "SWAP_PARENT": str(parent),
+            "SWAP_VICTIM": str(victim), "SWAP_MARKER": str(marker),
+        })
+
+        self.assertIn("Reports root validated", result.stdout)  # initial validation DID pass
+        self.assertTrue(marker.exists(), "the adversarial swap was never exercised")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((victim / "reports").exists() or (victim / "reports").is_symlink())
+        self.assertEqual(list(victim.iterdir()), [])
+        self.assertEqual((victim.stat().st_mode, victim.stat().st_uid, victim.stat().st_ctime_ns), victim_before)
+        self.assertFalse(any(self.tmp.rglob("royalty-2026-09.csv")), "archive was extracted")
+        self.assertNotIn("chown-members", self.log.read_text())
+
+    def test_safe_live_reports_root_is_established_by_descriptor_primitive(self):
+        reports = self.tmp / "stationdata" / "reports"
+        self.env_file.write_text(f"REPORTS_ROOT={reports}\n", encoding="utf-8")
+        result = self._run(sudo_script=SELECTIVE_SUDO)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(reports.is_dir())
+        self.assertTrue((reports / "royalty-2026-09.csv").is_file())
+        lines = [line for line in self.log.read_text().splitlines() if str(reports) in line]
+        self.assertEqual(lines[0], f"sudo python3 -I {HELPER} establish --root {reports} --owner {OWNER}")
+        self.assertFalse(any("mkdir" in line or "chown -h" in line for line in lines), lines)
+
+
+class StagedAliasPolicyTests(_TmpCase):
+    """Helper-level companions to the entry-point regressions above."""
+
+    def _staged(self, staging: Path, key: str, env: str) -> str:
+        self.env_file.write_text(env, encoding="utf-8")
+        return crs.check_root(key=key, default=crs.MANAGED_ROOT_DEFAULTS[key], env_file=self.env_file,
+                              target_root=str(self.app), tooling_root=str(REPO_ROOT),
+                              staging_root=str(staging), home=os.environ.get("HOME"))
+
+    def test_protected_staged_root_aliased_onto_candidate_is_refused(self):
+        """The reverse direction: the LIBRARY staged root is the symlink."""
+        staging = self.tmp / "staging"
+        base = staging / "mnt" / "stationdata"
+        (base / "reports").mkdir(parents=True)
+        (base / "library").symlink_to(base / "reports")
+        with self.assertRaises(crs.UnsafeRootError):
+            self._staged(staging, "REPORTS_ROOT", STAGED_ENV)
+
+    def test_staged_alias_into_staged_system_tree_or_anchor_is_refused(self):
+        for target in ("etc", "srv/isadoraair", "opt/isadoraair"):
+            with self.subTest(target=target):
+                staging = self.tmp / f"staging-{target.replace('/', '-')}"
+                (staging / target).mkdir(parents=True)
+                (staging / "mnt" / "stationdata").mkdir(parents=True)
+                (staging / "mnt" / "stationdata" / "reports").symlink_to(staging / target)
+                with self.assertRaises(crs.UnsafeRootError):
+                    self._staged(staging, "REPORTS_ROOT", STAGED_ENV)
+
+    def test_staged_alias_onto_host_target_checkout_is_refused(self):
+        staging = self.tmp / "staging"
+        (staging / "mnt" / "stationdata").mkdir(parents=True)
+        (staging / "mnt" / "stationdata" / "reports").symlink_to(self.app)
+        with self.assertRaises(crs.UnsafeRootError):
+            self._staged(staging, "REPORTS_ROOT", STAGED_ENV)
+
+    def test_ordinary_staged_roots_are_accepted(self):
+        staging = self.tmp / "staging"
+        for key, rel in (("REPORTS_ROOT", "reports"), ("WEATHER_DATA_DIR", "weather")):
+            with self.subTest(key=key):
+                self.assertEqual(self._staged(staging, key, STAGED_ENV),
+                                 f"{staging}/mnt/stationdata/{rel}")

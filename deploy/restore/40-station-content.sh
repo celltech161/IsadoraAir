@@ -215,12 +215,21 @@ log_warn "music/: created as an EMPTY mountpoint only. The 717+ GB library itsel
 # archive member extracted into it. There is deliberately no `chown -R`:
 # a pre-existing dedicated reports directory (e.g. on its own mounted
 # filesystem) keeps every file this restore did not write untouched.
+#
+# Establishment goes through content_root_safety.py's `establish` (the
+# same primitive as WEATHER_DATA_DIR), never `mkdir -p` + `chown`: path-
+# based tools re-resolve every ancestor at the moment they run, so an
+# ancestor swapped for a symlink after section 0's validation would have
+# made `mkdir -p` create a directory inside the symlink's target before
+# the later re-check could refuse. `establish` walks every component with
+# O_NOFOLLOW directory descriptors (a swapped ancestor fails with ELOOP
+# before anything is created) and applies ownership to the opened
+# directory itself.
 log_info "Reports root: $REPORTS_ROOT"
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  do_or_plan mkdir -p -- "$REPORTS_ROOT"
+  do_or_plan python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$REPORTS_ROOT"
 else
-  do_or_plan sudo mkdir -p -- "$REPORTS_ROOT"
-  do_or_plan sudo chown -h -- "$OWNER" "$REPORTS_ROOT"
+  do_or_plan sudo python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$REPORTS_ROOT" --owner "$OWNER"
 fi
 if grep -qE '^(\./)?reports/' <<< "$LISTING"; then
   if [ "$RESTORE_MODE" = "apply" ]; then

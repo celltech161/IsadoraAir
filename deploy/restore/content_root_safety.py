@@ -252,6 +252,48 @@ def build_protected(
     return protected, extra_anchors
 
 
+HOST_SPACE_WHY = ("the restore target application root", "the restore tooling checkout")
+
+
+def judge_staged(
+    *, key: str, effective: str, staging: str, protected: dict[str, str], host_roots: dict[str, str]
+) -> None:
+    """Managed-root separation inside a staging tree.
+
+    Judging the LIVE value proves the configuration is acceptable; it does
+    not prove the staged tree honours it -- a symlink inside the staging
+    root can alias one staged managed root onto another (e.g.
+    <staging>/mnt/stationdata/reports -> <staging>/mnt/stationdata/library).
+    So the RESOLVED staged candidate is compared with the RESOLVED staged
+    equivalent of every protected/managed root (equal, inside or
+    containing -> refused), with the host-side target/tooling checkouts,
+    and its staging-relative live equivalent is put back through the
+    system-tree/anchor policy.
+    """
+    for root, why in sorted(protected.items()):
+        if why in HOST_SPACE_WHY:
+            continue  # host paths, not live-space paths -- compared directly below
+        staged_root = os.path.realpath(os.path.join(staging, root.lstrip("/")))
+        if not PurePosixPath(staged_root).is_relative_to(staging):
+            continue  # resolves outside the staging tree; cannot alias a staged candidate
+        rel = _relation(effective, staged_root)
+        if rel:
+            raise UnsafeRootError(
+                f"staged {key} resolves to {effective}, which {rel} the staged {why} {root} ({staged_root})"
+            )
+    for root, why in host_roots.items():
+        try:
+            normalized = normalize_absolute(root, label=why)
+        except UnsafeRootError:
+            continue
+        for form in _forms(normalized, resolve=True):
+            rel = _relation(effective, form)
+            if rel:
+                raise UnsafeRootError(f"staged {key} resolves to {effective}, which {rel} {why} {form}")
+    live_equivalent = "/" + os.path.relpath(effective, staging)
+    judge({live_equivalent}, protected={}, label=f"staged {key} (live equivalent)")
+
+
 def check_root(
     *,
     key: str,
@@ -287,6 +329,11 @@ def check_root(
             raise UnsafeRootError(
                 f"staged {key} {effective} does not resolve strictly inside the staging root {staging}"
             )
+        judge_staged(
+            key=key, effective=effective, staging=staging, protected=protected,
+            host_roots={target_root: "the restore target application root",
+                        tooling_root: "the restore tooling checkout"},
+        )
     if os.path.lexists(effective) and not os.path.isdir(effective):
         raise UnsafeRootError(f"{key} {effective} exists and is not a directory")
     return effective
