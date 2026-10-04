@@ -98,6 +98,29 @@ else
 fi
 log_info "Station-content root: $SRV_ROOT (owner: $OWNER)"
 
+# ---- 0. REPORTS_ROOT path safety -- BEFORE this stage mutates anything ----
+# P0 1.2: REPORTS_ROOT comes from the restored .env, so it is data, not
+# trusted configuration. content_root_safety.py reads it with python-
+# decouple's own semantics (last assignment wins -- exactly what Django
+# will run with), canonicalizes it, and refuses /, system trees, shared
+# anchors (/srv, /var/lib, /srv/isadoraair, $HOME, ...) and their
+# ancestors, every application/tooling checkout, every other managed
+# station root, and symlinks resolving into any of those. Under
+# --staging-root the LIVE value is judged identically, so a staged
+# rehearsal fails closed on the same .env a real restore would. Nothing
+# in sections 1-6 runs unless this passes.
+ENV_FILE="$RESTORE_TARGET_ROOT/.env"
+CONTENT_ROOT_SAFETY="$SCRIPT_DIR/content_root_safety.py"
+TOOLING_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPORTS_CHECK_ARGS=(check --key REPORTS_ROOT --env-file "$ENV_FILE"
+  --target-root "$RESTORE_TARGET_ROOT" --tooling-root "$TOOLING_ROOT")
+[ -n "$RESTORE_STAGING_ROOT" ] && REPORTS_CHECK_ARGS+=(--staging-root "$RESTORE_STAGING_ROOT")
+if ! REPORTS_ROOT=$(python3 "$CONTENT_ROOT_SAFETY" "${REPORTS_CHECK_ARGS[@]}"); then
+  log_error "Refusing: REPORTS_ROOT from $ENV_FILE failed restore path-safety validation (see above). This stage has created, changed and extracted nothing. Correct REPORTS_ROOT in $ENV_FILE to a dedicated reports directory and re-run."
+  exit 1
+fi
+log_info "Reports root validated: $REPORTS_ROOT"
+
 ensure_dir() {
   local path="$1"
   guard_never_touch_music_library "$path"
@@ -162,32 +185,48 @@ else
 fi
 log_warn "music/: created as an EMPTY mountpoint only. The 717+ GB library itself is NOT restored by this tooling -- mount the real media disk at $SRV_ROOT/music separately (see docs/DISASTER_RECOVERY_RESTORE.md's 'Persistent storage mount' section) before considering the station ready to air. The database restore (stage 30) already brought back the full Track catalog; those rows will correctly point at files that don't exist here until the disk is attached."
 
-# ---- 4. Reports (REPORTS_ROOT) -------------------------------------------
-REPORTS_ROOT="/var/lib/isadoraair/reports"
-ENV_FILE="$RESTORE_TARGET_ROOT/.env"
-if [ -f "$ENV_FILE" ]; then
-  ENV_REPORTS_ROOT=$(grep -E '^REPORTS_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
-  [ -n "$ENV_REPORTS_ROOT" ] && REPORTS_ROOT="$ENV_REPORTS_ROOT"
-fi
-if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  REPORTS_ROOT="$RESTORE_STAGING_ROOT${REPORTS_ROOT}"
-fi
+# ---- 4. Reports (REPORTS_ROOT, validated in section 0) --------------------
+# Ownership is scoped to exactly what this stage restores: the reports
+# directory itself (non-recursive, never through a symlink) and each
+# archive member extracted into it. There is deliberately no `chown -R`:
+# a pre-existing dedicated reports directory (e.g. on its own mounted
+# filesystem) keeps every file this restore did not write untouched.
 log_info "Reports root: $REPORTS_ROOT"
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  do_or_plan mkdir -p "$REPORTS_ROOT"
+  do_or_plan mkdir -p -- "$REPORTS_ROOT"
 else
-  do_or_plan sudo mkdir -p "$REPORTS_ROOT"
-  do_or_plan sudo chown "$OWNER" "$REPORTS_ROOT"
+  do_or_plan sudo mkdir -p -- "$REPORTS_ROOT"
+  do_or_plan sudo chown -h -- "$OWNER" "$REPORTS_ROOT"
 fi
 if grep -qE '^(\./)?reports/' <<< "$LISTING"; then
   if [ "$RESTORE_MODE" = "apply" ]; then
+    # Re-judge after establishing the directory (closes a swap between
+    # section 0 and here), then validate every member before extraction.
+    REVALIDATED_REPORTS_ROOT=$(python3 "$CONTENT_ROOT_SAFETY" "${REPORTS_CHECK_ARGS[@]}")
+    if [ "$REVALIDATED_REPORTS_ROOT" != "$REPORTS_ROOT" ]; then
+      log_error "Refusing: REPORTS_ROOT now resolves to $REVALIDATED_REPORTS_ROOT, not the validated $REPORTS_ROOT -- nothing extracted."
+      exit 1
+    fi
+    REPORTS_MEMBERS_FILE="$(mktemp)"
+    trap 'rm -f -- "$REPORTS_MEMBERS_FILE"' EXIT
+    python3 "$CONTENT_ROOT_SAFETY" members --archive "$RESTORE_ARCHIVE" --prefix reports \
+      --output "$REPORTS_MEMBERS_FILE" > /dev/null
     log_apply "restoring reports/ -> $REPORTS_ROOT"
     tar -xzf "$RESTORE_ARCHIVE" -C "$REPORTS_ROOT" --strip-components=2 './reports'
-    [ -z "$RESTORE_STAGING_ROOT" ] && sudo chown -R "$OWNER" "$REPORTS_ROOT"
+    if [ -z "$RESTORE_STAGING_ROOT" ]; then
+      log_apply "sudo chown (no-follow, exact restored members only) $OWNER under $REPORTS_ROOT"
+      sudo python3 -I "$CONTENT_ROOT_SAFETY" chown-members --root "$REPORTS_ROOT" --owner "$OWNER" \
+        --members-file "$REPORTS_MEMBERS_FILE" > /dev/null
+    fi
+    rm -f -- "$REPORTS_MEMBERS_FILE"
     REPORT_FILE_COUNT=$(find "$REPORTS_ROOT" -type f | wc -l)
     log_info "reports: restored, $REPORT_FILE_COUNT file(s) -- durable royalty/SoundExchange filings, not treated as cache (see docs/DISASTER_RECOVERY.md's 'Reports' section for why)."
   else
+    log_plan "validate archive reports/ members (plain relative regular files/directories only)"
     log_plan "tar -xzf <archive> -C $REPORTS_ROOT --strip-components=2 ./reports"
+    if [ -z "$RESTORE_STAGING_ROOT" ]; then
+      log_plan "sudo chown (no-follow, exact restored members only) $OWNER under $REPORTS_ROOT"
+    fi
   fi
 else
   log_warn "reports: archive has no reports/ entries -- may be legitimate (no filings generated yet)."

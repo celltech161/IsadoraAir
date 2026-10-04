@@ -1909,6 +1909,65 @@ Re-run the validator in `committed` mode on the release commit before any
 publication. The r0090/r0091/r0092 releases satisfy it; r0093 is rejected with
 production's exact error.
 
+### Publication never advances the live checkout (P0 1.2)
+
+Invariant: **publishing or signing a candidate may advance canonical
+repository metadata, but must never advance the production application
+checkout. Only the protected Update Center installation path may advance
+`/opt/isadoraair`.**
+
+Why this needs stating: every development worktree on the station host
+shares one Git repository with the production checkout, and that
+checkout has `main` checked out. `refs/heads/main` is therefore not "a
+local publication ref" -- it *is* the live checkout's branch. During the
+r0105 publication (2026-10-03, 14:04:18 CDT) the publishing agent ran
+`git merge --ff-only <r0105 SHA>` in the production checkout in order to
+push `main:main`, which advanced the live application source about eight
+minutes before the Update Center was asked to install it. The operator
+reset it at 14:10:55; the Update Center's own install fast-forward
+followed at 14:12:33. No versioned tool did this -- the publication
+procedure itself fast-forwarded and then verified local `main`.
+
+Canonical publication, from the release worktree (never from
+`/opt/isadoraair`), pushing the exact approved SHA without touching any
+local branch:
+
+```bash
+LIVE_BEFORE="$(git -C /opt/isadoraair rev-parse HEAD refs/heads/main)"
+git push github-write <release-sha>:refs/heads/main
+git ls-remote github-write refs/heads/main
+git ls-remote origin refs/heads/main
+test "$(git -C /opt/isadoraair rev-parse HEAD refs/heads/main)" = "$LIVE_BEFORE" \
+  && test -z "$(git -C /opt/isadoraair status --porcelain)" \
+  && echo "publication invariant held: /opt/isadoraair unchanged"
+```
+
+Both `ls-remote` lines must print exactly the release SHA. A plain
+(non-`--force`) push is refused unless it is a fast-forward of the
+remote branch, so no local fast-forward is needed to get that
+guarantee. `git fetch` into the shared repository is fine (it updates
+only `refs/remotes/*`). Never, as part of publication: `git merge`,
+`git pull`, `git reset`, `git checkout`/`switch`, `git branch -f main`
+or `git update-ref refs/heads/main` -- in or against the production
+checkout, or from any worktree sharing its repository. Likewise never
+make "local `main` equals the release SHA" a publication acceptance
+check: before the Update Center installs, local `main` correctly stays
+at the installed release.
+
+### Post-install obligation: protected-runtime generation changes
+
+A release that changes `deploy/updater_runtime/protected-runtime-descriptor.json`
+(its manifest declares `protected_runtime` with a new generation) leaves
+every station's activated disaster-recovery payload stale the moment the
+Update Center installs it, and the next nightly backup fails closed by
+design. The operator must, on every station that installed it, refresh
+and activate the Phase-D recovery payload -- see
+`docs/RUNTIME_BACKUP_PAYLOAD.md`, "Publishing a schema-2 Phase-D recovery
+payload", "When to re-run this" -- then run a backup and a round-trip
+verification before treating the station's recovery assurance as
+restored. r0105 (generation 10 -> 11) was the first release where this
+step was omitted.
+
 ### Remaining limitations
 
 - The classifier itself is unchanged and deliberately conservative -- a

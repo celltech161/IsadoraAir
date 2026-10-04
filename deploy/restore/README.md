@@ -81,6 +81,26 @@ Two more guards apply regardless of the above:
   what `30-postgresql.sh`'s own bootstrap step produces) does NOT count
   as non-empty, so the normal create-then-restore flow never needs the
   flag.
+- **Reports root path safety** (`content_root_safety.py`, P0 1.2):
+  `REPORTS_ROOT` is read from the restored `.env` exactly as
+  python-decouple reads it (last assignment wins), canonicalized, and
+  refused — before `40-station-content.sh` mutates anything, in
+  `--plan`, `--apply` and `--staging-root` runs alike — if it is `/`, a
+  system tree (`/etc`, `/usr`, …), a shared anchor or an ancestor of one
+  (`/srv`, `/var/lib`, `/srv/isadoraair`, `/var/lib/isadoraair`, the
+  operator's `$HOME`), an application or tooling checkout, another
+  managed station root (music library, waveforms, weather, encoders,
+  runtime recovery, …) or an ancestor of one, or a symlink resolving to
+  any of those. There is no override flag: correct `.env` and re-run. A
+  dedicated directory such as `/var/lib/isadoraair/reports`,
+  `/srv/isadoraair/reports` or a separately mounted
+  `/mnt/stationdata/reports` is accepted. Ownership is then changed only
+  on that directory itself (non-recursive) and on each restored archive
+  member, through no-follow directory descriptors — never `chown -R`, so
+  pre-existing content the restore did not write is left untouched.
+  Archive members under `reports/` must be plain relative regular
+  files/directories; links or special files fail the stage before
+  extraction.
 
 **The music library is different: there is no override, ever.** No
 stage writes to `/srv/isadoraair/music` under any flag combination —

@@ -556,13 +556,32 @@ sudo venv/bin/python manage.py prepare_runtime_recovery_payload \
   --activate --base-root /var/lib/isadoraair/runtime-recovery --payload-id <id from --apply>
 ```
 
-**When to re-run this.** Whenever the currently-activated payload's
-`protected_updater` component should represent a NEW active/previous
-generation pair -- i.e., after any legitimate protected-runtime
-generation change (an ordinary signed candidate promotion), if the
-disaster-recovery payload should reflect it. Nothing does this
-automatically; the recovery payload is a deliberate, operator-refreshed
-DR artifact, not a live mirror of the protected runtime's own state.
+**When to re-run this -- mandatory after every installed protected-runtime
+generation change.** Since the protected-updater freshness check
+(`isadoraair.recovery_freshness`), the automatic/current-station policy
+requires the activated payload's captured *active* generation and
+descriptor to equal this checkout's committed
+`deploy/updater_runtime/protected-runtime-descriptor.json`. After the
+Update Center installs a release that advances the protected runtime
+(for example r0105, generation 10 -> 11), the still-activated payload is
+STALE and the nightly backup's
+`validate_runtime_recovery_payload ... --current --json --require-current-station-policy`
+fails closed: no archive is produced and Backup Recovery Assurance goes
+CRITICAL until the refresh above is run (`--plan`, `--apply`,
+`--activate`) on **every station that installed the release**. That is
+the correct, intended behavior -- never weaken the policy or point
+`current` at an older payload to make a backup pass. Nothing does the
+refresh automatically; the recovery payload is a deliberate, operator-
+refreshed DR artifact, not a live mirror of the protected runtime's own
+state. The refresh's `--plan` must report the new generation as
+*active* and the generation it replaced as *previous*; the payload it
+supersedes stays under `payloads/` and remains a valid `--activate`
+rollback target. Confirm afterwards, as the service user:
+
+```bash
+venv/bin/python manage.py validate_runtime_recovery_payload \
+  --base-root /var/lib/isadoraair/runtime-recovery --current --json --require-current-station-policy
+```
 Publication alone never activates anything -- `--activate` remains a
 separate, deliberate step, and both together never touch the live
 protected runtime itself (no new generation, no state change, no
