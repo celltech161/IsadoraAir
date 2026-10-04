@@ -15,15 +15,29 @@ machinery a later policy will call:
 * ``purge_media`` -- refuses while anything references the media; otherwise
   marks the row ``purged`` (with ``purged_at``) and then removes the bytes.
 
-The binding contract (important): Django creates foreign keys DEFERRABLE
-INITIALLY DEFERRED, so a referrer INSERT that has not committed yet holds NO
-lock on the media row and is invisible to a purge. The guard alone therefore
-cannot stop a domain from referencing media that is being purged. Every
-consuming domain MUST call ``lock_for_binding`` inside the transaction that
-creates its reference: it takes the same row lock as ``purge_media``, so either
-the purge waits and then sees the committed reference, or the bind sees the
-purge and refuses. A domain that skips it can end up referencing purged media;
-``reconcile.find_purged_media_still_referenced`` reports exactly that.
+THE BINDING RULE (mandatory for every reference to ProductionMedia)
+------------------------------------------------------------------
+Any code that creates or changes a durable foreign key / reference to a
+ProductionMedia MUST, inside the SAME database transaction that writes the
+reference, first call ``lock_for_binding(media)`` and use the row it returns:
+
+    with transaction.atomic():
+        media = retention.lock_for_binding(media_id)   # locks + re-reads + proves present/valid
+        voice_track.media = media                      # (Phase B: VoiceTrack.media)
+        voice_track.save()
+
+Why a plain FK is NOT enough: Django creates foreign keys DEFERRABLE INITIALLY
+DEFERRED, so a referrer INSERT that has not committed yet holds no lock on the
+media row and is invisible to a purge (proven by
+test_retention.PurgeRaceTests). ``lock_for_binding`` takes the same row lock as
+``purge_media``: either the purge waits and then sees the committed reference
+and refuses, or the bind waits, sees the purge, and refuses. Inside production
+the only reference creator, ``intake.ingest_derivative`` (``derived_from``),
+follows this rule. A future consumer must route every binding through one
+service that does the same -- never a naked FK assignment in a view or model.
+References through GenericForeignKey, or from another database, are NOT
+supported and must not be used: they are invisible to ``find_references``.
+``reconcile.find_purged_media_still_referenced`` reports any violation.
 
 Crash ordering: the state change commits first; the bytes are unlinked after
 the commit (``transaction.on_commit``). A crash in between leaves a purged row
@@ -40,7 +54,8 @@ from dataclasses import dataclass
 from django.db import transaction
 from django.utils import timezone
 
-from ..errors import MediaNotValidated, MediaPurged, PurgeRefused
+from .. import transitions
+from ..errors import MediaInconsistent, MediaNotValidated, MediaPurged, PurgeRefused
 from ..models import ProductionMedia
 from . import layout
 
@@ -106,27 +121,28 @@ def purge_media(media, *, now=None) -> ProductionMedia:
                 "media is still referenced and its bytes cannot be purged",
                 references=[(ref.model_label, ref.field_name, ref.count) for ref in references],
             )
-        ProductionMedia.objects.filter(pk=pk, retention_state=ProductionMedia.RETENTION_PRESENT).update(
-            retention_state=ProductionMedia.RETENTION_PURGED, purged_at=now or timezone.now(),
-        )
+        if transitions.mark_purged(pk, now or timezone.now()) != 1:
+            # Impossible under the row lock; never pretend it happened.
+            raise MediaInconsistent("purge transition did not apply", code="purge_not_applied")
         storage_key = row.storage_key
         transaction.on_commit(lambda: _unlink_bytes(storage_key))
     return ProductionMedia.objects.get(pk=pk)
 
 
 def lock_for_binding(media, *, require_valid=True) -> ProductionMedia:
-    """For a CONSUMING DOMAIN, inside its own ``transaction.atomic()``, just
-    before it creates a row that references this media.
+    """THE canonical binding lock (see "THE BINDING RULE" above).
 
-    Locks the media row (the same lock purge_media takes) and refuses a purged
-    -- or, by default, not-yet-valid -- media. This closes the one race the
-    purge guard cannot close alone: a purge that commits between "the domain
-    checked the media was present" and "the domain inserted its reference".
-    Either the purge waits for the domain's transaction and then sees the new
-    reference, or the domain sees the purge and refuses to bind."""
+    Call inside the ``transaction.atomic()`` that writes the reference, and
+    reference the returned row. Takes the same row lock purge_media takes,
+    RE-READS the authoritative row (a stale in-memory object passed in is used
+    only for its identity), and refuses a purged -- or, by default, not-valid --
+    media with MediaPurged / MediaNotValidated."""
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("lock_for_binding must be called inside transaction.atomic()")
-    row = ProductionMedia.objects.select_for_update(of=("self",)).get(pk=getattr(media, "pk", media))
+    try:
+        row = ProductionMedia.objects.select_for_update(of=("self",)).get(pk=getattr(media, "pk", media))
+    except ProductionMedia.DoesNotExist as exc:
+        raise MediaInconsistent("no such production media", code="unknown_media") from exc
     if row.retention_state != ProductionMedia.RETENTION_PRESENT:
         raise MediaPurged("media bytes have been purged")
     if require_valid and not row.is_valid:

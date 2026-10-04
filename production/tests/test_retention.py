@@ -405,8 +405,8 @@ class PurgeRaceTests(DiscoveredReferenceTests):
                 ProductionMedia.objects.select_for_update(of=("self",)).get(pk=media.pk)
                 purging.set()
                 release.wait(WAIT)
-                ProductionMedia.objects.filter(pk=media.pk).update(
-                    retention_state="purged", purged_at=timezone.now())
+                from production import transitions
+                transitions.mark_purged(media.pk, timezone.now())
 
         def bind():
             with transaction.atomic():

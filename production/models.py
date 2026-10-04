@@ -10,23 +10,31 @@ domains that reference it (Voice Tracking, spoken/produced content,
 urgent/public-address), each through its own PROTECT foreign key. There is no
 generic foreign key, no job, no assignment and no workflow state here.
 
-Immutability contract (enforced here in Python, backed by the database
-constraints below; there is deliberately no database trigger because that
-would need a manual migration):
+Immutability contract -- the application trust boundary. Every ordinary
+Django write path fails closed; privileged raw SQL is outside the boundary.
+There is deliberately no database trigger (that would need a manual migration).
 
-* identity, bytes identity (storage_key / sha256 / byte_size), kind, owner
-  custody, display metadata and derivation provenance never change after the
-  row is created;
-* the *technical facts* and validation verdict are written once, by
-  production.services.validation, while the row is still ``unvalidated``, and
-  are frozen as soon as the verdict is ``valid`` or ``invalid``;
-* ``retention_state`` only ever moves present -> purged, together with
-  ``purged_at``; the row (hashes, size, probe facts, provenance) outlives a
-  byte purge;
-* editing audio means a NEW ProductionMedia with ``derived_from`` pointing at
+* A row is created once (``objects.create()`` / an instance ``save()`` while
+  adding). After that NO generic ORM path may change it:
+  - instance ``save()`` compares every loaded field against the AUTHORITATIVE
+    row re-read from the database (so a deferred/``only()`` instance cannot
+    smuggle a change past it) and refuses any difference;
+  - ``QuerySet.update()`` -- default manager, ``_base_manager`` (pointed at the
+    same guarded queryset by ``Meta.base_manager_name``) and every reverse
+    related manager -- refuses everything except the one Django-owned
+    operation ``update(owner=None)``: the ``SET_NULL`` a User deletion performs
+    (also ``user.production_media.clear()``). It only unlinks custody; the
+    ``owner_username`` snapshot keeps it understandable, and reassigning custody
+    to another user is refused;
+  - ``bulk_update()`` and ``bulk_create(update_conflicts=True)`` refuse;
+  - ``delete()`` on instances and on every queryset refuses: purge removes
+    bytes, never rows.
+* The only legitimate state changes are the explicit, state-qualified
+  transitions in ``production.transitions`` (a validation verdict recorded once
+  on an ``unvalidated`` row; an infrastructure-attempt note on an
+  ``unvalidated`` row; ``present -> purged``). There is no ``purged -> present``.
+* Editing audio means a NEW ProductionMedia with ``derived_from`` pointing at
   the original -- never an in-place overwrite.
-
-Rows are never deleted by application code; purge removes bytes only.
 """
 from __future__ import annotations
 
@@ -46,16 +54,29 @@ STORAGE_KEY_PATTERN = r"^[0-9a-f]{2}/[0-9a-f]{32}$"
 
 
 class ProductionMediaQuerySet(models.QuerySet):
-    """Refuses bulk operations that would bypass the immutability contract."""
+    """Fails closed on every generic bulk mutation (see the module docstring).
 
-    # Columns a service may change with a conditional UPDATE (the model's own
-    # save() additionally enforces the one-way rules for instance saves).
-    MUTABLE_COLUMNS = frozenset({
-        "container", "codec", "sample_rate", "channels",
-        "decoded_duration_seconds", "header_duration_seconds", "probe",
-        "validation_state", "validation_code", "validated_at",
-        "retention_state", "purged_at",
-    })
+    Used as the default AND the base manager (``Meta.base_manager_name``), so
+    ``_base_manager``, the deletion collector and reverse related managers all
+    get it. Legitimate transitions live in ``production.transitions``."""
+
+    def update(self, **kwargs):
+        # Exactly the SET_NULL Django performs when a User is deleted (and the
+        # reverse manager's clear()). Nothing else, and never a reassignment.
+        if len(kwargs) == 1 and next(iter(kwargs)) in ("owner", "owner_id") and next(iter(kwargs.values())) is None:
+            return super().update(**kwargs)
+        raise ImmutableMediaError(
+            f"ProductionMedia is immutable; refusing a generic update of {sorted(kwargs)}. "
+            "State changes go through production.transitions.",
+        )
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ImmutableMediaError("ProductionMedia is immutable; bulk_update is refused.")
+
+    def bulk_create(self, objs, *args, update_conflicts=False, **kwargs):
+        if update_conflicts:
+            raise ImmutableMediaError("ProductionMedia is immutable; bulk_create(update_conflicts=True) is refused.")
+        return super().bulk_create(objs, *args, update_conflicts=update_conflicts, **kwargs)
 
     def delete(self):
         raise ImmutableMediaError(
@@ -63,13 +84,7 @@ class ProductionMediaQuerySet(models.QuerySet):
             "(production.services.retention.purge_media).",
         )
 
-    def update(self, **kwargs):
-        illegal = sorted(set(kwargs) - self.MUTABLE_COLUMNS)
-        if illegal:
-            raise ImmutableMediaError(
-                f"ProductionMedia is immutable; refusing to bulk-update {illegal}.",
-            )
-        return super().update(**kwargs)
+    delete.queryset_only = True
 
 
 class ProductionMedia(models.Model):
@@ -175,21 +190,11 @@ class ProductionMedia(models.Model):
 
     objects = ProductionMediaQuerySet.as_manager()
 
-    # Frozen from the moment the row exists.
-    FROZEN_ALWAYS = (
-        "kind", "owner_id", "owner_username", "storage_key", "sha256", "byte_size",
-        "original_filename", "declared_content_type", "derived_from_id",
-        "recipe_key", "recipe_version", "recipe_params_digest", "toolchain", "created_at",
-    )
-    # Written once by validation; frozen once the verdict is valid/invalid.
-    FROZEN_AFTER_VERDICT = (
-        "container", "codec", "sample_rate", "channels", "decoded_duration_seconds",
-        "header_duration_seconds", "probe", "validation_state", "validation_code",
-        "validated_at",
-    )
-
     class Meta:
         ordering = ["-created_at"]
+        # _base_manager (deletion collector, reverse managers, Model.save
+        # internals) must be the guarded queryset too, not a plain Manager.
+        base_manager_name = "objects"
         verbose_name = "production media"
         verbose_name_plural = "production media"
         constraints = [
@@ -253,59 +258,41 @@ class ProductionMedia(models.Model):
         return self.validation_state == self.VALIDATION_VALID
 
     # -- immutability enforcement ---------------------------------------------
-    _TRACKED = FROZEN_ALWAYS + FROZEN_AFTER_VERDICT + ("retention_state", "purged_at")
+    def _changed_fields(self) -> list[str]:
+        """Loaded fields whose value differs from the AUTHORITATIVE database row.
 
-    @classmethod
-    def from_db(cls, db, field_names, values):
-        instance = super().from_db(db, field_names, values)
-        instance._capture_original()
-        return instance
-
-    def _capture_original(self):
-        # Only attributes actually loaded (deferred fields are skipped).
-        loaded = self.__dict__
-        self._original = {name: loaded[name] for name in self._TRACKED if name in loaded}
-
-    def refresh_from_db(self, using=None, fields=None, **kwargs):
-        super().refresh_from_db(using=using, fields=fields, **kwargs)
-        self._capture_original()
-
-    def _check_mutation_allowed(self):
-        original = getattr(self, "_original", None)
-        if original is None:
-            raise ImmutableMediaError(
-                "refusing to save a ProductionMedia instance with no loaded baseline",
-            )
-        changed = {
-            name for name, before in original.items()
-            if name in self.__dict__ and self.__dict__[name] != before
-        }
-        frozen = set(self.FROZEN_ALWAYS) & changed
-        if original.get("validation_state", self.VALIDATION_UNVALIDATED) != self.VALIDATION_UNVALIDATED:
-            frozen |= set(self.FROZEN_AFTER_VERDICT) & changed
-        if {"retention_state", "purged_at"} & changed:
-            # The only legal retention move is present -> purged, with purged_at.
-            legal = (
-                original.get("retention_state") == self.RETENTION_PRESENT
-                and self.retention_state == self.RETENTION_PURGED
-                and self.purged_at is not None
-            )
-            if not legal:
-                frozen |= {"retention_state", "purged_at"} & changed
-        if frozen:
-            raise ImmutableMediaError(
-                f"ProductionMedia is immutable; refusing to change {sorted(frozen)}. "
-                "Create a derived ProductionMedia instead of editing in place.",
-            )
+        Re-reads the row rather than trusting anything captured when this
+        instance was loaded, so a deferred field assigned after an ``only()``
+        load, or a stale instance, is compared against the truth."""
+        concrete = [field for field in self._meta.concrete_fields if field.attname in self.__dict__]
+        current = type(self)._base_manager.filter(pk=self.pk).values(*[f.attname for f in concrete]).first()
+        if current is None:
+            raise ImmutableMediaError("refusing to save a ProductionMedia whose row does not exist")
+        changed = []
+        for field in concrete:
+            try:
+                mine = field.to_python(self.__dict__[field.attname])
+                theirs = field.to_python(current[field.attname])
+            except Exception:           # noqa: BLE001 -- an unparseable value is a change
+                changed.append(field.name)
+                continue
+            if mine != theirs:
+                changed.append(field.name)
+        return changed
 
     def save(self, *args, **kwargs):
         if self._state.adding:
             if self.owner_id and not self.owner_username:
                 self.owner_username = self.owner.get_username()[:150]
-        else:
-            self._check_mutation_allowed()
-        super().save(*args, **kwargs)
-        self._capture_original()
+            super().save(*args, **kwargs)
+            return
+        changed = self._changed_fields()
+        if changed:
+            raise ImmutableMediaError(
+                f"ProductionMedia is immutable; refusing to change {changed}. "
+                "Create a derived ProductionMedia instead, or use production.transitions.",
+            )
+        # Nothing differs: there is nothing to write (never issue an UPDATE).
 
     def delete(self, *args, **kwargs):
         raise ImmutableMediaError(

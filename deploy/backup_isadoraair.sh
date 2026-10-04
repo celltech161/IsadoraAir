@@ -719,11 +719,15 @@ echo "  $(du -sh "$WORKDIR/srv-content" 2>/dev/null | cut -f1) of station conten
 
 CURRENT_STAGE="production_media"
 echo "Copying iPortal production media (durable media/ only)..."
-# Same optional-.env-key pattern (and same pipefail gotcha) as REPORTS_ROOT
-# below. The helper names ONLY <root>/media as a copy source -- see its header.
-PRODUCTION_MEDIA_ROOT=$(grep -E '^PRODUCTION_MEDIA_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
-PRODUCTION_MEDIA_ROOT="${PRODUCTION_MEDIA_ROOT:-/srv/isadoraair/production-media}"
-"$SCRIPT_DIR/stage_production_media.sh" "$PRODUCTION_MEDIA_ROOT" "$WORKDIR/srv-content"
+# The root is resolved from .env by production/root_policy.py itself (the same
+# last-assignment-wins parsing python-decouple uses at runtime, and the same
+# safety policy) -- never by grep. A failing policy aborts the backup (set -e)
+# rather than archiving the wrong tree. The helper names ONLY <root>/media as a
+# copy source and re-checks the root -- see its header.
+PRODUCTION_MEDIA_ROOT=$(python3 "$SCRIPT_DIR/../production/root_policy.py" check-env \
+  --env-file "$ENV_FILE" --app-root "$PROJECT_DIR" --protected "$WORKDIR" --protected "$RECOVERY_PAYLOAD_ROOT")
+"$SCRIPT_DIR/stage_production_media.sh" "$PRODUCTION_MEDIA_ROOT" "$WORKDIR/srv-content" \
+  --protected "$PROJECT_DIR" --protected "$WORKDIR" --protected "$RECOVERY_PAYLOAD_ROOT"
 
 CURRENT_STAGE="reports"
 echo "Copying royalty/SoundExchange report filings, if present..."

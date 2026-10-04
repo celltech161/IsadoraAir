@@ -121,35 +121,27 @@ class ImmutabilityGuardTests(IsolatedMediaRootMixin, TestCase):
         with self.assertRaises(ImmutableMediaError):
             row.save(update_fields=["sha256"])
 
-    def test_technical_facts_are_written_once_then_frozen_by_the_verdict(self):
-        row = ProductionMedia.objects.get(pk=make_row().pk)
-        row.container, row.codec = "wav", "pcm_s16le"       # allowed while unvalidated
-        row.save()
-        for key, value in VALID_FACTS.items():
-            setattr(row, key, value)
-        row.validated_at = timezone.now()
-        row.save()                                          # the single verdict write
-        for field, value in (("container", "flac"), ("codec", "flac"), ("sample_rate", 48000),
-                             ("channels", 2), ("decoded_duration_seconds", "9.000000"),
-                             ("validation_state", "invalid"), ("validation_code", "x"),
-                             ("probe", {"changed": True})):
+    def test_no_instance_save_can_write_facts_or_verdict_even_while_unvalidated(self):
+        # Facts/verdict are written ONLY by production.transitions.record_verdict.
+        for field, value in (("container", "wav"), ("codec", "pcm_s16le"), ("sample_rate", 44100),
+                             ("channels", 1), ("probe", {"x": 1}), ("validation_code", "probe_timeout"),
+                             ("validation_state", "invalid")):
             with self.subTest(field=field):
-                again = ProductionMedia.objects.get(pk=row.pk)
-                setattr(again, field, value)
+                row = ProductionMedia.objects.get(pk=make_row().pk)
+                setattr(row, field, value)
                 with self.assertRaises(ImmutableMediaError):
-                    again.save()
+                    row.save()
 
-    def test_retention_only_moves_present_to_purged(self):
+    def test_retention_cannot_be_changed_through_save_in_either_direction(self):
         row = ProductionMedia.objects.get(pk=make_row().pk)
-        row.retention_state = "purged"                      # without purged_at: refused
-        with self.assertRaises(ImmutableMediaError):
-            row.save()
-        row.refresh_from_db()
         row.retention_state, row.purged_at = "purged", timezone.now()
-        row.save()
-        row.retention_state, row.purged_at = "present", None
         with self.assertRaises(ImmutableMediaError):
             row.save()
+        purged = make_row(retention_state="purged", purged_at=timezone.now())
+        purged = ProductionMedia.objects.get(pk=purged.pk)
+        purged.retention_state, purged.purged_at = "present", None
+        with self.assertRaises(ImmutableMediaError):
+            purged.save()
 
     def test_rows_are_never_deleted(self):
         row = make_row()
@@ -161,15 +153,6 @@ class ImmutabilityGuardTests(IsolatedMediaRootMixin, TestCase):
             ProductionMedia.objects.all().delete()
         self.assertTrue(ProductionMedia.objects.filter(pk=row.pk).exists())
 
-    def test_bulk_update_is_limited_to_the_mutable_columns(self):
-        row = make_row()
-        queryset = ProductionMedia.objects.filter(pk=row.pk)
-        for field, value in (("sha256", "b" * 64), ("storage_key", "ab/" + "c" * 32), ("byte_size", 5),
-                             ("kind", "bed"), ("owner_username", "x"), ("created_at", timezone.now())):
-            with self.subTest(field=field), self.assertRaises(ImmutableMediaError):
-                queryset.update(**{field: value})
-        self.assertEqual(queryset.update(validation_code="probe_timeout"), 1)
-
     def test_constructing_an_instance_with_an_existing_pk_cannot_overwrite_the_row(self):
         row = make_row()
         with self.assertRaises(IntegrityError), transaction.atomic():
@@ -178,9 +161,10 @@ class ImmutabilityGuardTests(IsolatedMediaRootMixin, TestCase):
         row.refresh_from_db()
         self.assertEqual(row.sha256, SHA_A)
 
-    def test_refresh_resets_the_baseline(self):
-        row = make_row()
-        ProductionMedia.objects.filter(pk=row.pk).update(validation_code="probe_timeout")
-        row.refresh_from_db()
-        row.validation_code = "probe_timeout"
-        row.save()          # unchanged relative to the refreshed baseline
+    def test_an_unchanged_save_writes_nothing(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        row = ProductionMedia.objects.get(pk=make_row().pk)
+        with CaptureQueriesContext(connection) as queries:
+            row.save()
+        self.assertFalse([q for q in queries.captured_queries if q["sql"].lstrip().upper().startswith("UPDATE")])

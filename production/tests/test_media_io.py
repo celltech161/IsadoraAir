@@ -8,7 +8,7 @@ from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged,
 from production.models import ProductionMedia
 from production.services import intake, layout, media_io, validation
 
-from .support import IsolatedMediaRootMixin, fixture
+from .support import mark_purged_leaving_bytes, IsolatedMediaRootMixin, fixture
 
 
 class FileLike:
@@ -60,7 +60,7 @@ class OpenMediaTests(IsolatedMediaRootMixin, TestCase):
 
     def test_purged_media_fails_safely_even_if_bytes_linger(self):
         media = valid_media()
-        ProductionMedia.objects.filter(pk=media.pk).update(retention_state="purged", purged_at=media.created_at)
+        mark_purged_leaving_bytes(media)
         self.assertTrue(layout.resolve_storage_path(media.storage_key).exists())
         with self.assertRaises(MediaPurged):
             media_io.open_media(media)
@@ -131,7 +131,6 @@ class OpenMediaTests(IsolatedMediaRootMixin, TestCase):
 
     def test_a_corrupted_stored_key_can_not_traverse(self):
         media = valid_media()
-        ProductionMedia.objects.filter(pk=media.pk).update()          # (no-op; storage_key is frozen)
         row = ProductionMedia.objects.get(pk=media.pk)
         row.__dict__["storage_key"] = "../../../etc/passwd"           # simulate an impossible DB value
         from production.errors import IntakeError
@@ -157,7 +156,7 @@ class IntegrityTests(IsolatedMediaRootMixin, TestCase):
 
     def test_verify_integrity_of_purged_media(self):
         media = valid_media()
-        ProductionMedia.objects.filter(pk=media.pk).update(retention_state="purged", purged_at=media.created_at)
+        mark_purged_leaving_bytes(media)
         with self.assertRaises(MediaPurged):
             media_io.verify_integrity(media)
 

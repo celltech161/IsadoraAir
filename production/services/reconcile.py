@@ -53,6 +53,9 @@ class SweepReport:
 def _grace(grace: timedelta) -> timedelta:
     if grace < MIN_GRACE:
         raise ValueError("grace period must be at least one hour")
+    # Every sweep deletes: refuse to run at all against an unsafe or
+    # non-dedicated root (production.root_policy; raises ImproperlyConfigured).
+    layout.media_root(dedicated=True)
     return grace
 
 

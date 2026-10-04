@@ -127,11 +127,16 @@ class PathSafetyTests(IsolatedMediaRootMixin, TestCase):
                 layout.resolve_storage_path(bad)
 
     def test_layout_refuses_a_symlinked_subdirectory(self):
+        from django.core.exceptions import ImproperlyConfigured
         layout.ensure_layout()
         os.rmdir(self.root / "media")
         os.symlink("/tmp", self.root / "media")
-        with self.assertRaises(IntakeError):
+        # Refused by the root policy's dedicated-directory rule (and, beneath
+        # it, by ensure_durable_dir's own symlink check).
+        with self.assertRaises((ImproperlyConfigured, IntakeError)):
             layout.ensure_layout()
+        with self.assertRaises(IntakeError):
+            layout.ensure_durable_dir(self.root / "media")
 
     def test_a_relative_or_traversing_root_is_refused(self):
         from django.core.exceptions import ImproperlyConfigured

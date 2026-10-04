@@ -172,6 +172,13 @@ def fixture(name: str) -> bytes:
         for offset in range(middle, middle + 400):
             data[offset] ^= 0xA5
         path.write_bytes(bytes(data))
+    elif name == "lying_fmt.wav":
+        # A WAV whose fmt chunk claims MP3 (0x0055) over PCM data: GStreamer
+        # reports STREAM WRONG_TYPE -- a genuine media (not capability) error.
+        import struct
+        data = bytearray(fixture("wav16_mono.wav"))
+        struct.pack_into("<H", data, 20, 0x0055)
+        path.write_bytes(bytes(data))
     elif name == "garbage.bin":
         path.write_bytes(bytes((index * 37 + 11) % 256 for index in range(4096)))
     elif name == "text.wav":
@@ -229,3 +236,14 @@ VALID_FACTS = dict(
     container="wav", codec="pcm_s16le", sample_rate=44100, channels=1,
     decoded_duration_seconds="2.000000", validation_state="valid", validation_code="ok",
 )
+
+
+def mark_purged_leaving_bytes(media, when=None):
+    """Put a row into the 'purged' state through the real explicit transition,
+    WITHOUT unlinking its bytes -- i.e. exactly the state a crash between the
+    purge commit and its on_commit unlink leaves behind."""
+    from django.utils import timezone
+
+    from production import transitions
+
+    assert transitions.mark_purged(media.pk, when or timezone.now()) == 1

@@ -37,8 +37,6 @@ reliable measurement needs unbounded tool output.
 """
 from __future__ import annotations
 
-import functools
-import importlib.util
 import json
 import os
 import re
@@ -49,7 +47,7 @@ from pathlib import Path
 
 from django.utils import timezone
 
-from .. import formats, policy
+from .. import formats, policy, transitions
 from ..errors import MediaInconsistent, MediaPurged
 from ..models import ProductionMedia
 from . import layout
@@ -72,6 +70,7 @@ INFRASTRUCTURE_CODES = frozenset({
     "probe_output_invalid", "decoder_unavailable", "decode_unavailable",
     "decode_timeout", "decode_killed", "decode_output_invalid",
     "engine_probe_unavailable", "engine_probe_timeout", "engine_probe_failed",
+    "engine_capability_unavailable",
     "validation_interrupted",
 })
 
@@ -82,6 +81,11 @@ CAPABILITY_TIMEOUT_SECONDS = 10.0
 FFMPEG_TIMEOUT_SECONDS = 300.0
 GSTREAMER_CHILD_TIMEOUT_SECONDS = 120.0
 GSTREAMER_HARD_TIMEOUT_SECONDS = 125.0
+# Production's OWN isolated probe (production/services/gst_probe.py), with a
+# structured media-vs-capability taxonomy. The interpreter is a tuple so the
+# tests can run it the way a host without GI bindings would (python -S).
+GSTREAMER_PROBE_SCRIPT = str(Path(__file__).with_name("gst_probe.py"))
+GSTREAMER_PROBE_INTERPRETER = (sys.executable,)
 VALIDATOR_VERSION = 1
 
 _PROBE_ENTRIES = (
@@ -191,14 +195,6 @@ def _decoder_available(name, stop_event=None):
     available = result.get("stdout", "").lstrip().startswith(f"Decoder {name}")
     _DECODER_CACHE[name] = available
     return available
-
-
-@functools.lru_cache(maxsize=1)
-def _gstreamer_probe_script():
-    """Path of the existing isolated GStreamer decode probe (no Django, no gi
-    import here -- find_spec does not execute the module)."""
-    spec = importlib.util.find_spec("library.services.media_gst_probe")
-    return spec.origin if spec is not None and spec.origin else None
 
 
 # -- parsing helpers ----------------------------------------------------------
@@ -371,37 +367,54 @@ def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutc
 
     # 6. the engine's own decoder -------------------------------------------------------
     if require_engine_decode:
-        script = _gstreamer_probe_script()
-        if script is None:
-            return _infrastructure("engine_probe_unavailable")
-        result = _run(
-            [sys.executable, script, "--timeout", str(GSTREAMER_CHILD_TIMEOUT_SECONDS), str(path)],
-            timeout_seconds=GSTREAMER_HARD_TIMEOUT_SECONDS, stop_event=stop_event,
-        )
-        if result.get("status") != "ok":
-            failure = _run_failure(result, "engine_probe")
-            # A child that exits non-zero without a verdict is a broken probe
-            # environment (e.g. no GStreamer bindings), not a bad file.
-            return failure if failure is not None else _infrastructure("engine_probe_failed")
-        try:
-            verdict = json.loads(result["stdout"])
-            status = verdict["status"]
-        except (ValueError, KeyError, TypeError):
-            return _infrastructure("engine_probe_failed")
-        engine = {"status": str(status)[:24]}
-        if isinstance(verdict.get("buffers"), int):
-            engine["buffers"] = verdict["buffers"]
-        evidence["engine_decode"] = engine
-        if status == "error":
-            return _invalid("engine_decode_failed", facts)
-        if status == "timeout":
-            return _infrastructure("engine_probe_timeout")
-        if status != "eos":
-            return _infrastructure("engine_probe_failed")
+        failure = _engine_decode(path, evidence, facts, stop_event)
+        if failure is not None:
+            return failure
     else:
         evidence["engine_decode"] = {"status": "skipped"}
 
     return ValidationOutcome(STATUS_VALID, "ok", facts)
+
+
+def _engine_decode(path, evidence, facts, stop_event):
+    """Run the GStreamer parity probe. None on success; otherwise the outcome.
+
+    Only a ``media_error`` (the runtime is capable, these bytes do not decode)
+    becomes an ``invalid`` verdict. A ``capability_error`` (missing decoder,
+    plugin, element or GI) and every other failure are retryable
+    infrastructure -- valid media is never condemned for what the station
+    runtime lacks."""
+    result = _run(
+        [*GSTREAMER_PROBE_INTERPRETER, GSTREAMER_PROBE_SCRIPT,
+         "--timeout", str(GSTREAMER_CHILD_TIMEOUT_SECONDS), str(path)],
+        timeout_seconds=GSTREAMER_HARD_TIMEOUT_SECONDS, stop_event=stop_event,
+    )
+    if result.get("status") != "ok":
+        failure = _run_failure(result, "engine_probe")
+        # A child that exits non-zero without a verdict is a broken probe
+        # environment, not a bad file.
+        return failure if failure is not None else _infrastructure("engine_probe_failed")
+    try:
+        verdict = json.loads(result["stdout"])
+        status = verdict["status"]
+    except (ValueError, KeyError, TypeError):
+        return _infrastructure("engine_probe_failed")
+    engine = {"status": str(status)[:24], "reason": str(verdict.get("reason", ""))[:40]}
+    for key in ("buffers", "error_code"):
+        if isinstance(verdict.get(key), int) and not isinstance(verdict.get(key), bool):
+            engine[key] = verdict[key]
+    if verdict.get("error_domain"):
+        engine["error_domain"] = str(verdict["error_domain"])[:64]
+    evidence["engine_decode"] = engine
+    if status == "eos":
+        return None
+    if status == "media_error":
+        return _invalid("engine_decode_failed", facts)
+    if status == "capability_error":
+        return _infrastructure("engine_capability_unavailable")
+    if status == "timeout":
+        return _infrastructure("engine_probe_timeout")
+    return _infrastructure("engine_probe_failed")
 
 
 # -- persistence ---------------------------------------------------------------------
@@ -448,13 +461,22 @@ def validate_media(media, *, require_engine_decode=True, now=None, stop_event=No
         raise MediaInconsistent("media bytes do not match the recorded size", code="size_mismatch")
     outcome = _analyze_path(path, require_engine_decode=require_engine_decode, stop_event=stop_event)
     now = now or timezone.now()
-    queryset = ProductionMedia.objects.filter(
-        pk=row.pk, validation_state=ProductionMedia.VALIDATION_UNVALIDATED,
-        retention_state=ProductionMedia.RETENTION_PRESENT,
-    )
     if outcome.status in (STATUS_VALID, STATUS_INVALID):
-        if queryset.update(**verdict_columns(outcome, now)) == 0:
-            return outcome_from_row(ProductionMedia.objects.get(pk=row.pk))
-    else:
-        queryset.update(validation_code=outcome.code)
+        if transitions.record_verdict(row.pk, verdict_columns(outcome, now)) == 1:
+            return outcome
+        # The one-time transition did not apply: someone else recorded a
+        # verdict first, or the media was purged while we analysed it.
+        # Report what is actually true -- never assume.
+        current = ProductionMedia.objects.get(pk=row.pk)
+        if current.retention_state != ProductionMedia.RETENTION_PRESENT:
+            raise MediaPurged("media bytes were purged during validation")
+        if current.validation_state != ProductionMedia.VALIDATION_UNVALIDATED:
+            return outcome_from_row(current)
+        raise MediaInconsistent("the verdict could not be recorded", code="verdict_not_recorded")
+    if transitions.record_infrastructure_attempt(row.pk, outcome.code) == 0:
+        current = ProductionMedia.objects.get(pk=row.pk)
+        if current.retention_state != ProductionMedia.RETENTION_PRESENT:
+            raise MediaPurged("media bytes were purged during validation")
+        if current.validation_state != ProductionMedia.VALIDATION_UNVALIDATED:
+            return outcome_from_row(current)
     return outcome

@@ -47,6 +47,7 @@ class Migration(migrations.Migration):
                 ('owner', models.ForeignKey(blank=True, help_text='Custody of the bytes, not authority over any workflow.', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='production_media', to=settings.AUTH_USER_MODEL)),
             ],
             options={
+                'base_manager_name': 'objects',
                 'verbose_name': 'production media',
                 'verbose_name_plural': 'production media',
                 'ordering': ['-created_at'],

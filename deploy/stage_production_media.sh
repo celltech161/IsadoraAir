@@ -20,18 +20,33 @@
 # encrypt_recovery_credentials.sh) so the exact inclusion/exclusion rule can
 # be executed in tests without production secrets or a network.
 #
+# The root is validated by production/root_policy.py -- the SAME policy the
+# Django runtime and the restore tooling use -- before anything is read: it
+# must be a dedicated production-media directory (never /, a system tree, a
+# broad anchor such as /srv or /var, station content, or code). Extra protected
+# paths may be passed as further arguments (the backup script passes the
+# station content roots from .env, the application root and its own workdir).
+#
 # Exit status: 0 copied, or nothing to copy (no store yet is legitimate);
-#              2 bad usage / unsafe path; 3 media/ exists but is not a real
-#              directory (misconfiguration: fail closed rather than silently
-#              skip durable content).
+#              2 bad usage; 3 media/ exists but is not a real directory, or
+#              the root fails the safety policy (misconfiguration: fail closed
+#              rather than silently skip durable content or read the wrong tree).
 set -euo pipefail
 
-if [ $# -ne 2 ]; then
-  echo "usage: $0 <PRODUCTION_MEDIA_ROOT> <destination-directory>" >&2
+if [ $# -lt 2 ]; then
+  echo "usage: $0 <PRODUCTION_MEDIA_ROOT> <destination-directory> [--protected PATH ...]" >&2
   exit 2
 fi
 ROOT="$1"
 DEST="$2"
+shift 2
+EXTRA_PROTECTED=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --protected) EXTRA_PROTECTED+=(--protected "${2:?--protected needs a path}"); shift 2 ;;
+    *) echo "usage: $0 <PRODUCTION_MEDIA_ROOT> <destination-directory> [--protected PATH ...]" >&2; exit 2 ;;
+  esac
+done
 
 case "$ROOT" in
   /*) ;;
@@ -43,6 +58,12 @@ esac
 if [ ! -d "$DEST" ]; then
   echo "error: destination directory does not exist: $DEST" >&2
   exit 2
+fi
+TOOLING_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+POLICY="$TOOLING_ROOT/production/root_policy.py"
+if ! python3 "$POLICY" check --root "$ROOT" --dedicated --app-root "$TOOLING_ROOT" "${EXTRA_PROTECTED[@]}" >/dev/null; then
+  echo "error: refusing to back up from an unsafe production media root: $ROOT" >&2
+  exit 3
 fi
 
 SRC="$ROOT/media"

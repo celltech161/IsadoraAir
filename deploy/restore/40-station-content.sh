@@ -163,6 +163,43 @@ ensure_dir() {
   fi
 }
 
+# ---- 0. iPortal production-media root: judged BEFORE any mutation ----------
+# PRODUCTION_MEDIA_ROOT comes from the restored .env, which a restore must not
+# trust blindly: a corrupted or hostile value such as "/" or "/etc" would
+# otherwise drive mkdir/tar/chown into system locations. The root is resolved
+# and judged by production/root_policy.py -- the SAME policy the runtime and
+# the backup use (python-decouple last-assignment-wins parsing included) -- and
+# this stage stops here, before touching anything, if it is refused.
+#   * the LIVE decision is always made on the logical value as it will be
+#     used on the restored station (even under --staging-root);
+#   * the dedicated-directory rule is applied to the location actually
+#     written (the staged copy under --staging-root).
+require_cmd python3
+PM_POLICY="$SCRIPT_DIR/../../production/root_policy.py"
+# The checkout this restore tooling itself runs from is source code too.
+PM_TOOLING_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+PM_ENV_FILE="$RESTORE_TARGET_ROOT/.env"
+PM_LIVE_TARGET_ROOT="$RESTORE_TARGET_ROOT"
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  PM_LIVE_TARGET_ROOT="${RESTORE_TARGET_ROOT#"$RESTORE_STAGING_ROOT"}"
+fi
+if ! PM_LOGICAL_ROOT=$(python3 "$PM_POLICY" check-env --env-file "$PM_ENV_FILE" \
+    --app-root "$PM_LIVE_TARGET_ROOT" --app-root /opt/isadoraair --app-root "$PM_TOOLING_ROOT"); then
+  log_error "Refusing: PRODUCTION_MEDIA_ROOT from $PM_ENV_FILE is not a safe dedicated production-media directory (see the reason above). Nothing has been changed by this stage. Fix the value in the restored .env and re-run."
+  exit 1
+fi
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  PRODUCTION_MEDIA_ROOT="$RESTORE_STAGING_ROOT$PM_LOGICAL_ROOT"
+else
+  PRODUCTION_MEDIA_ROOT="$PM_LOGICAL_ROOT"
+fi
+if ! python3 "$PM_POLICY" check --root "$PM_LOGICAL_ROOT" --dedicated-path "$PRODUCTION_MEDIA_ROOT" \
+    --app-root "$PM_LIVE_TARGET_ROOT" --app-root /opt/isadoraair --app-root "$PM_TOOLING_ROOT" >/dev/null; then
+  log_error "Refusing: $PRODUCTION_MEDIA_ROOT exists but is not a dedicated production-media directory (see the reason above). Nothing has been changed by this stage."
+  exit 1
+fi
+log_info "Production media root: $PRODUCTION_MEDIA_ROOT (accepted by production/root_policy.py)"
+
 # ---- 1. Restored-from-backup subtrees ------------------------------------
 LISTING=$(tar -tzf "$RESTORE_ARCHIVE" 2>&1)
 for sub in carts voicetracks; do
@@ -192,20 +229,11 @@ for sub in carts voicetracks; do
   fi
 done
 
-# ---- 1b. iPortal production media (PRODUCTION_MEDIA_ROOT) -----------------
+# ---- 1b. iPortal production media (root judged in section 0) -------------
 # Durable bytes live in <root>/media; incoming/ work/ locks/ are transient and
-# are recreated EMPTY. The root honours PRODUCTION_MEDIA_ROOT from the restored
-# .env (same optional-key pattern as REPORTS_ROOT below), else the default.
-PRODUCTION_MEDIA_ROOT="/srv/isadoraair/production-media"
-PM_ENV_FILE="$RESTORE_TARGET_ROOT/.env"
-if [ -f "$PM_ENV_FILE" ]; then
-  ENV_PRODUCTION_MEDIA_ROOT=$(grep -E '^PRODUCTION_MEDIA_ROOT=' "$PM_ENV_FILE" | head -1 | cut -d= -f2- || true)
-  [ -n "$ENV_PRODUCTION_MEDIA_ROOT" ] && PRODUCTION_MEDIA_ROOT="$ENV_PRODUCTION_MEDIA_ROOT"
-fi
-if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  PRODUCTION_MEDIA_ROOT="$RESTORE_STAGING_ROOT${PRODUCTION_MEDIA_ROOT}"
-fi
-log_info "Production media root: $PRODUCTION_MEDIA_ROOT"
+# are recreated EMPTY. Ownership is applied ONLY to the exact managed tree:
+# the root and its four subdirectories non-recursively (ensure_dir), and
+# recursively to media/ alone -- never `chown -R` over the configured root.
 for dir in "$PRODUCTION_MEDIA_ROOT" "$PRODUCTION_MEDIA_ROOT/media" "$PRODUCTION_MEDIA_ROOT/incoming" \
            "$PRODUCTION_MEDIA_ROOT/work" "$PRODUCTION_MEDIA_ROOT/locks"; do
   ensure_dir "$dir"
@@ -222,7 +250,7 @@ if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
     # "production-media" so "media/..." lands directly under the root.
     tar -xzf "$RESTORE_ARCHIVE" -C "$PRODUCTION_MEDIA_ROOT" --strip-components=3 "./srv-content/production-media/media"
     if [ -z "$RESTORE_STAGING_ROOT" ]; then
-      sudo chown -R "$OWNER" "$PRODUCTION_MEDIA_ROOT"
+      sudo chown -R -P "$OWNER" "$PRODUCTION_MEDIA_ROOT/media"
     fi
     PM_FILE_COUNT=$(find "$PRODUCTION_MEDIA_ROOT/media" -type f | wc -l)
     log_info "production media: restored, $PM_FILE_COUNT file(s); incoming/ work/ locks/ recreated empty. Run 'manage.py production_reconcile' to verify every ProductionMedia row still resolves to its bytes."

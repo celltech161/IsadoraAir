@@ -14,6 +14,15 @@ system-generated shape.
 
 The root is read from settings at call time (never cached at import) so tests
 and operators can repoint it safely. The root is not served by nginx.
+
+Root safety: every use goes through production.root_policy -- the SAME rules
+the backup and restore tooling apply. ``media_root()`` enforces the path rules
+(never /, a system tree, a broad anchor, station content or code);
+``media_root(dedicated=True)`` -- used by every destructive entry point
+(directory creation, intake, sweeps) -- also refuses an existing root holding
+anything but the managed subtrees.
+
+Durability: see ``ensure_durable_dir`` and production.services.intake.
 """
 from __future__ import annotations
 
@@ -26,6 +35,7 @@ from pathlib import Path
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
+from .. import root_policy
 from ..errors import IntakeError
 
 SUBDIRECTORIES = ("media", "incoming", "work", "locks")
@@ -37,12 +47,23 @@ PART_NAME_RE = re.compile(r"^[0-9a-f]{32}\.part$")
 WORK_NAME_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def media_root() -> Path:
+def _protected_paths() -> list[str]:
+    """Station content and code the root must never equal, contain or sit in."""
+    values = [getattr(settings, name, None) for name in root_policy.STATION_PATH_SETTINGS]
+    values += [getattr(settings, name, None) for name in ("BASE_DIR", "STATIC_ROOT", "MEDIA_ROOT")]
+    return [str(value) for value in values if value]
+
+
+def media_root(*, dedicated: bool = False) -> Path:
+    """The validated production-media root (see production.root_policy)."""
     raw = getattr(settings, "PRODUCTION_MEDIA_ROOT", "")
-    root = Path(str(raw)) if raw else None
-    if root is None or not root.is_absolute() or ".." in root.parts:
-        raise ImproperlyConfigured("PRODUCTION_MEDIA_ROOT must be a clean absolute path")
-    return root
+    try:
+        accepted = root_policy.check_root(
+            raw, protected=_protected_paths(), dedicated_path=(raw if dedicated else None),
+        )
+    except root_policy.RootPolicyError as exc:
+        raise ImproperlyConfigured(f"unsafe PRODUCTION_MEDIA_ROOT ({exc.code}): {exc.message}") from exc
+    return Path(accepted)
 
 
 def media_dir() -> Path:
@@ -61,22 +82,60 @@ def locks_dir() -> Path:
     return media_root() / "locks"
 
 
-def ensure_dir(path: Path) -> None:
-    """Create ``path`` (0750) if needed; tighten a directory WE own whose
-    mode is wider than 0750. Never touches a directory owned by someone else."""
-    path.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
-    info = path.lstat()
+def fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def ensure_durable_dir(path: Path) -> None:
+    """Make ``path`` an existing, real, 0750 directory whose ENTRY is durable.
+
+    Creates missing ancestors one level at a time; for every directory it
+    creates or adopts it sets the mode BEFORE syncing, fsyncs the directory and
+    then fsyncs its parent (so the directory entry itself survives power loss).
+    Already-existing directories get the same parent fsync -- an earlier
+    process may have created one and died before syncing it -- which is cheap
+    and makes the result independent of who created what. Never touches a
+    directory owned by someone else beyond reading it; refuses a symlink or a
+    non-directory."""
+    path = Path(path)
+    missing = []
+    probe = path
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, DIR_MODE)
+        except FileExistsError:
+            pass
+    info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise IntakeError(f"{path.name} exists but is not a directory", code="layout_invalid")
     if info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) != DIR_MODE:
-        path.chmod(DIR_MODE)
+        os.chmod(path, DIR_MODE)
+    for directory in reversed(missing[1:]):        # created ancestors, outermost first
+        fsync_directory(directory)
+        fsync_directory(directory.parent)
+    fsync_directory(path)
+    fsync_directory(path.parent)
+
+
+def ensure_dir(path: Path) -> None:
+    """Backwards-compatible name for ensure_durable_dir."""
+    ensure_durable_dir(path)
 
 
 def ensure_layout() -> Path:
-    root = media_root()
-    ensure_dir(root)
+    root = media_root(dedicated=True)
+    ensure_durable_dir(root)
     for name in SUBDIRECTORIES:
-        ensure_dir(root / name)
+        ensure_durable_dir(root / name)
     return root
 
 
@@ -112,11 +171,3 @@ def create_work_dir() -> Path:
     path = work_root() / uuid.uuid4().hex
     path.mkdir(mode=DIR_MODE)
     return path
-
-
-def fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)

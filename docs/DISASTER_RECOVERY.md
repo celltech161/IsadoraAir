@@ -310,8 +310,12 @@ content: the PostgreSQL row (hash, size, facts, provenance) is in the database
 dump, and the immutable bytes it points at are in the archive under
 `srv-content/production-media/media/`. After a restore:
 
-1. stage 40 restores `media/` (modes preserved, `0440`) and recreates `incoming/`,
-   `work/` and `locks/` empty with mode `0750`;
+1. stage 40 first judges `PRODUCTION_MEDIA_ROOT` from the restored `.env` with
+   `production/root_policy.py` and stops, before any change, if it is not a
+   safe dedicated directory (e.g. `/`, `/etc`, `/srv`, the music library);
+   then it restores `media/` (modes preserved, `0440`) and recreates
+   `incoming/`, `work/` and `locks/` empty with mode `0750`. Recursive
+   ownership is applied to `media/` only;
 2. run `manage.py production_reconcile` (dry-run by default) — it reports any
    present row whose bytes are missing or the wrong size (`--deep` also
    re-hashes) and any purged media still referenced by a domain row. It never

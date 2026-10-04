@@ -16,7 +16,7 @@ from production.models import ProductionMedia
 from production.policy import MediaPolicy
 from production.services import intake, layout, validation
 
-from .support import IsolatedMediaRootMixin, fixture
+from .support import mark_purged_leaving_bytes, IsolatedMediaRootMixin, fixture
 
 
 class FileLike:
@@ -232,7 +232,7 @@ class PolicyTests(Base):
                 MediaPolicy(**kwargs)
 
     def test_engine_decode_can_be_skipped_by_a_consumer_that_never_airs_the_media(self):
-        with mock.patch.object(validation, "_gstreamer_probe_script", side_effect=AssertionError("must not run")):
+        with mock.patch.object(validation, "_engine_decode", side_effect=AssertionError("must not run")):
             media = ingest("flac.flac", validate=True, policy=MediaPolicy(require_engine_decode=False)).media
         self.assertEqual(media.probe["engine_decode"], {"status": "skipped"})
 
@@ -333,7 +333,7 @@ class InfrastructureFailureTests(Base):
     def test_the_engine_rejecting_a_file_ffmpeg_decoded_is_a_media_verdict(self):
         media = self.stored("flac.flac")
         with self.fail_tool(lambda a: "--timeout" in a,
-                            {"status": "ok", "stdout": json.dumps({"status": "error", "error": "no decoder"}), "stderr": ""}):
+                            {"status": "ok", "stdout": json.dumps({"status": "media_error", "reason": "stream_undecodable"}), "stderr": ""}):
             outcome = validation.validate_media(media)
         self.assertEqual((outcome.status, outcome.code), ("invalid", "engine_decode_failed"))
         self.assertEqual(ProductionMedia.objects.get(pk=media.pk).validation_code, "engine_decode_failed")
@@ -370,19 +370,42 @@ class ValidateMediaSemanticsTests(Base):
 
         def racing(path, **kwargs):
             outcome = real(path, **kwargs)
-            ProductionMedia.objects.filter(pk=media.pk).update(
-                validation_state="invalid", validation_code="decode_error",
-                validated_at=media.created_at,
-            )                                              # another worker got there first
+            from production import transitions
+            transitions.record_verdict(media.pk, dict(
+                validation_state="invalid", validation_code="decode_error", validated_at=media.created_at,
+            ))                                             # another worker got there first
             return outcome
         with mock.patch.object(validation, "_analyze_path", side_effect=racing):
             outcome = validation.validate_media(media)
         self.assertEqual((outcome.status, outcome.code), ("invalid", "decode_error"))
         self.assertEqual(ProductionMedia.objects.get(pk=media.pk).validation_code, "decode_error")
 
+    def test_a_purge_committed_during_validation_is_a_typed_outcome_never_an_assertion(self):
+        """Codex nonblocking finding: validation racing a purge used to hit a
+        bare assertion. It is now a deterministic MediaPurged, for a verdict
+        and for an infrastructure outcome alike, and nothing is recorded."""
+        from production.services import retention
+        for analysis in ("verdict", "infrastructure"):
+            with self.subTest(analysis=analysis):
+                media = self.stored("flac.flac")
+                real = validation._analyze_path
+
+                def purge_meanwhile(path, **kwargs):
+                    outcome = real(path, **kwargs) if analysis == "verdict" else \
+                        validation.ValidationOutcome("infrastructure_error", "decode_timeout", {})
+                    with self.captureOnCommitCallbacks(execute=True):
+                        retention.purge_media(media)
+                    return outcome
+                with mock.patch.object(validation, "_analyze_path", side_effect=purge_meanwhile), \
+                        self.assertRaises(MediaPurged):
+                    validation.validate_media(media)
+                row = ProductionMedia.objects.get(pk=media.pk)
+                self.assertEqual((row.retention_state, row.validation_state, row.validation_code),
+                                 ("purged", "unvalidated", ""))
+
     def test_a_purged_media_cannot_be_validated(self):
         media = self.stored("flac.flac")
-        ProductionMedia.objects.filter(pk=media.pk).update(retention_state="purged", purged_at=media.created_at)
+        mark_purged_leaving_bytes(media)
         with self.assertRaises(MediaPurged):
             validation.validate_media(media)
 

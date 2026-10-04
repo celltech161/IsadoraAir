@@ -13,7 +13,7 @@ from django.utils import timezone
 from production.models import ProductionMedia
 from production.services import intake, layout, reconcile
 
-from .support import IsolatedMediaRootMixin, fixture
+from .support import mark_purged_leaving_bytes, IsolatedMediaRootMixin, fixture
 
 
 class FileLike:
@@ -113,7 +113,7 @@ class OrphanMediaTests(IsolatedMediaRootMixin, TestCase):
 
     def test_leftover_bytes_of_a_purged_row_are_swept(self):
         media = stored()
-        ProductionMedia.objects.filter(pk=media.pk).update(retention_state="purged", purged_at=timezone.now())
+        mark_purged_leaving_bytes(media)
         report = reconcile.sweep_orphan_media(apply=True, now=far())
         self.assertEqual(report.removed, [f"media/{media.storage_key}"])
         self.assertEqual(ProductionMedia.objects.get(pk=media.pk).retention_state, "purged")    # row survives
@@ -220,7 +220,7 @@ class InconsistentMediaTests(IsolatedMediaRootMixin, TestCase):
 
     def test_purged_rows_and_the_limit(self):
         gone = stored()
-        ProductionMedia.objects.filter(pk=gone.pk).update(retention_state="purged", purged_at=timezone.now())
+        mark_purged_leaving_bytes(gone)
         layout.resolve_storage_path(gone.storage_key).unlink()
         self.assertEqual(reconcile.find_inconsistent_media(), [])
         for _ in range(3):

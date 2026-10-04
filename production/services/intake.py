@@ -1,21 +1,42 @@
-"""Streaming, crash-safe intake of production media.
+"""Streaming, crash-safe, durable intake of production media.
 
-Ordering is the whole crash-safety argument -- bytes become permanent BEFORE
-the row exists, so a committed row can never point at missing data:
+Three distinct guarantees, deliberately not conflated:
 
-    1. stream the source into incoming/<32hex>.part (0600), hashing and
-       counting as it goes; a hard byte cap aborts the stream; fsync;
-    2. (optional) validate the .part file -- the verdict, or a refusal, is known
-       before anything becomes permanent;
-    3. promote with link(2) then unlink: atomic, same filesystem, and it can
-       NEVER overwrite an existing permanent file (EEXIST is an error);
-       permanent bytes are mode 0440;
-    4. commit the ProductionMedia row (its storage key is system generated).
+1. ATOMIC NAMESPACE PROMOTION. A permanent name appears all at once via
+   link(2) from the fully-written staging file, and can never overwrite an
+   existing permanent file (EEXIST is an error).
+2. PROCESS-CRASH SAFETY. Bytes become permanent BEFORE the row exists, so a
+   process dying at any point leaves either a stale .part (no row), an orphan
+   permanent file (no row), or a complete row. A committed row never points at
+   missing data. Orphans and stale parts are reclaimed by
+   production.services.reconcile.
+3. SUDDEN-POWER-LOSS DURABILITY. The ``present`` row is committed only after
+   the bytes, their final metadata and every directory entry on the path to
+   them have been made durable, in this exact order:
 
-A crash after 1 leaves a stale .part and no row; after 3 an orphan permanent
-file and no row; after 4 a complete, consistent row. Orphans and stale parts
-are reclaimed by production.services.reconcile. Whole files are never buffered
-in memory (one CHUNK_SIZE at a time) and nothing is staged in /tmp.
+     a. layout: root, media/, incoming/ exist as real 0750 directories, each
+        fsynced together with its parent (layout.ensure_durable_dir);
+     b. write every byte to incoming/<32hex>.part (O_EXCL, 0600);
+     c. fchmod the part to its FINAL mode 0440, THEN fsync the file -- the
+        sync covers the content and the final metadata;
+     d. ensure the shard media/<2hex>/ (created 0750 if missing), fsync the
+        shard and fsync its parent media/ so the shard entry is durable;
+     e. link(part -> media/<2hex>/<32hex>) and fsync the shard directory -- the
+        permanent entry is now durable;
+     f. unlink the part and fsync incoming/;
+     g. only now: in one transaction (for a derivative, holding the parent's
+        binding lock) INSERT the row, and commit.
+
+   Assumptions: a POSIX filesystem on Linux where fsync() of a file persists
+   its data and inode metadata and fsync() of a directory persists its entries
+   (ext4/xfs with default journaling), incoming/ and media/ on the same
+   filesystem (link(2) requires it), PostgreSQL's own fsync enabled, and
+   storage that honours cache flushes. Nothing stronger is claimed: e.g. a
+   power loss between (e) and (g) leaves a durable orphan file and no row,
+   which reconciliation removes.
+
+Whole files are never buffered in memory (one CHUNK_SIZE at a time) and nothing
+is staged in /tmp.
 
 Callers should commit promptly: rows created inside a caller's still-open
 transaction are, to the orphan sweeper, indistinguishable from "no row yet" for
@@ -34,9 +55,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from .. import policy as policy_mod
-from ..errors import IntakeError, MediaRejected
+from ..errors import IntakeError, MediaNotValidated, MediaPurged, MediaRejected
 from ..models import ProductionMedia
-from . import layout, validation
+from . import layout, retention, validation
 
 CHUNK_SIZE = 1024 * 1024
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -113,8 +134,9 @@ def _stream_to_part(source, part: Path, max_bytes: int):
                 raise IntakeError("could not write the upload", code="storage_write_failed") from exc
         if total == 0:
             raise MediaRejected("empty", "upload contained no data")
-        os.fsync(fd)
+        # Final metadata FIRST, then one fsync that covers content + metadata.
         os.fchmod(fd, layout.MEDIA_FILE_MODE)
+        os.fsync(fd)
     except Exception:
         os.close(fd)
         _unlink_quiet(part)
@@ -124,16 +146,19 @@ def _stream_to_part(source, part: Path, max_bytes: int):
 
 
 def _promote(part: Path, destination: Path) -> None:
-    layout.ensure_dir(destination.parent)
+    """Durable, atomic, non-overwriting publication (steps d-f above)."""
+    shard = destination.parent
+    layout.ensure_durable_dir(shard)              # shard 0750 + fsync shard + fsync media/
     try:
-        os.link(part, destination)            # atomic; never overwrites
+        os.link(part, destination)                # atomic; never overwrites
     except FileExistsError as exc:
         raise IntakeError("permanent storage identity already exists", code="storage_collision") from exc
     except OSError as exc:
         raise IntakeError("could not promote the upload", code="promotion_failed") from exc
     try:
+        layout.fsync_directory(shard)             # the permanent entry is durable
         os.unlink(part)
-        layout.fsync_directory(destination.parent)
+        layout.fsync_directory(part.parent)       # the staging entry is gone durably
     except OSError as exc:
         _unlink_quiet(destination)
         raise IntakeError("could not finalize the upload", code="promotion_failed") from exc
@@ -157,6 +182,8 @@ def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe
         raise IntakeError("recipe version must be a non-negative integer", code="invalid_recipe")
     parent = None
     if derived:
+        # Advisory fast-fail before streaming. NOT authoritative: the parent is
+        # re-read under its binding lock in the final transaction.
         parent = ProductionMedia.objects.filter(pk=getattr(derived_from, "pk", None)).first()
         if parent is None or not parent.is_present or not parent.is_valid:
             raise IntakeError("the parent media is missing, purged or not valid", code="parent_not_usable")
@@ -220,6 +247,18 @@ def ingest_stream(
             else:
                 columns["validation_code"] = outcome.code
         with transaction.atomic():
+            if parent is not None:
+                # THE binding rule (see retention.lock_for_binding): the parent
+                # is re-read and locked in the SAME transaction that creates the
+                # derived_from reference, so a concurrent purge either waits and
+                # then sees this child, or wins first and this bind refuses. The
+                # lock is held only for this short insert, never while streaming.
+                try:
+                    columns["derived_from"] = retention.lock_for_binding(parent, require_valid=True)
+                except MediaPurged as exc:
+                    raise IntakeError("the parent media was purged", code="parent_purged") from exc
+                except MediaNotValidated as exc:
+                    raise IntakeError("the parent media is not valid", code="parent_not_valid") from exc
             media = ProductionMedia.objects.create(**columns)
     except Exception:
         # Not a hard kill: tidy up. (A hard kill is covered by the reconciler.)

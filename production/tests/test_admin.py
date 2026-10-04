@@ -8,7 +8,7 @@ from production.admin import ProductionMediaAdmin
 from production.models import ProductionMedia
 from production.services import intake, layout
 
-from .support import IsolatedMediaRootMixin, fixture
+from .support import mark_purged_leaving_bytes, IsolatedMediaRootMixin, fixture
 
 
 class FileLike:
@@ -59,7 +59,7 @@ class AdminDiagnosticsTests(IsolatedMediaRootMixin, TestCase):
         self.assertIn("SIZE MISMATCH", admin_instance.storage_status(self.media))
         path.unlink()
         self.assertEqual(admin_instance.storage_status(self.media), "MISSING")
-        ProductionMedia.objects.filter(pk=self.media.pk).update(retention_state="purged", purged_at=self.media.created_at)
+        mark_purged_leaving_bytes(self.media)
         purged = ProductionMedia.objects.get(pk=self.media.pk)
         self.assertEqual(admin_instance.storage_status(purged), "purged (no bytes expected)")
 

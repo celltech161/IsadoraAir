@@ -65,8 +65,9 @@ def build_store(root: Path, *, media=True, transient=True):
 
 
 class StageHelperFunctionalTests(TempDirCase):
-    def stage(self, root, dest):
-        return subprocess.run([str(STAGE_HELPER), str(root), str(dest)], capture_output=True, text=True, timeout=30)
+    def stage(self, root, dest, *extra):
+        return subprocess.run([str(STAGE_HELPER), str(root), str(dest), *extra],
+                              capture_output=True, text=True, timeout=30)
 
     def test_the_helper_is_executable_with_valid_syntax(self):
         self.assertTrue(os.access(STAGE_HELPER, os.X_OK))
@@ -135,9 +136,19 @@ class StageHelperFunctionalTests(TempDirCase):
         for root in ("relative/path", "/srv/../etc", ""):
             with self.subTest(root=root):
                 self.assertEqual(self.stage(root, dest).returncode, 2)
+        # Absolute but unsafe roots are refused by the shared root policy (exit 3)
+        # before anything is read or copied.
+        for root in ("/", "/etc", "/srv", "/srv/isadoraair", "/var", "/home", str(DEPLOY_DIR.parent)):
+            with self.subTest(root=root):
+                result = self.stage(root, dest)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn("unsafe production media root", result.stderr)
+        result = self.stage("/data/station/pm", dest, "--protected", "/data/station")
+        self.assertEqual(result.returncode, 3)
         self.assertEqual(self.stage(self.tmp, self.tmp / "no-such-destination").returncode, 2)
         self.assertEqual(subprocess.run([str(STAGE_HELPER)], capture_output=True).returncode, 2)
         self.assertEqual(subprocess.run([str(STAGE_HELPER), "/a", "/b", "/c"], capture_output=True).returncode, 2)
+        self.assertEqual(subprocess.run([str(STAGE_HELPER), "/a", "/b", "--bogus"], capture_output=True).returncode, 2)
         self.assertEqual(listing(dest), [])
 
     def test_staging_twice_into_the_same_destination_never_nests(self):
@@ -176,10 +187,11 @@ class BackupScriptWiringTests(SimpleTestCase):
     def test_script_syntax_is_valid(self):
         subprocess.run(["bash", "-n", str(BACKUP_SCRIPT)], check=True)
 
-    def test_it_stages_only_through_the_helper_with_the_configured_root(self):
+    def test_it_stages_only_through_the_helper_with_the_policy_resolved_root(self):
         self.assertIn('"$SCRIPT_DIR/stage_production_media.sh" "$PRODUCTION_MEDIA_ROOT" "$WORKDIR/srv-content"', self.text)
-        self.assertIn("grep -E '^PRODUCTION_MEDIA_ROOT=' \"$ENV_FILE\"", self.text)
-        self.assertIn('PRODUCTION_MEDIA_ROOT="${PRODUCTION_MEDIA_ROOT:-/srv/isadoraair/production-media}"', self.text)
+        # The root is resolved AND judged by the shared policy, never grepped.
+        self.assertIn('PRODUCTION_MEDIA_ROOT=$(python3 "$SCRIPT_DIR/../production/root_policy.py" check-env', self.text)
+        self.assertNotIn("grep -E '^PRODUCTION_MEDIA_ROOT=", self.text)
 
     def test_the_whole_root_is_never_a_copy_source(self):
         for lineno, line in enumerate(self.text.splitlines(), start=1):

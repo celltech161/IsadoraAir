@@ -30,7 +30,9 @@ A future work queue will aggregate domain work through read models.
 | `ProductionMedia` model, migration `production.0001` | `production/models.py`, `migrations/0001_initial.py` |
 | Layout + path generation | `production/services/layout.py` |
 | Streaming intake, promotion, derivation | `production/services/intake.py` |
-| Validation | `production/services/validation.py`, `formats.py`, `policy.py` |
+| Validation | `production/services/validation.py`, `gst_probe.py`, `formats.py`, `policy.py` |
+| Root safety policy (runtime, backup, restore) | `production/root_policy.py` |
+| Explicit state transitions | `production/transitions.py` |
 | Safe open / range primitives | `production/services/media_io.py` |
 | Purge guard, `lock_for_binding` | `production/services/retention.py` |
 | Reconcile / sweeps, `production_reconcile` command | `production/services/reconcile.py` |
@@ -70,16 +72,37 @@ traverse); `byte_size > 0`; `edit`/`rendition` require `derived_from`;
 `valid` row carries its evidence. No other indexes beyond the unique key and
 foreign keys: none are needed by Phase A.
 
-### Immutability
+### Immutability (the application trust boundary)
 
-Enforced in Python (no database trigger, which would need a manual migration):
-`save()` refuses a changed frozen field; `delete()` and `QuerySet.delete()`
-always raise; `QuerySet.update()` accepts only the mutable columns. Identity,
-bytes identity, kind, custody, display metadata and provenance never change.
-Technical facts and the verdict are written once while `unvalidated`, then
-frozen. Retention only moves `present → purged`. **Editing audio creates a new
-`ProductionMedia` with `derived_from` set; nothing is ever overwritten.** Rows
-are never deleted — purge removes bytes only.
+Every ordinary Django write path fails closed; deliberate privileged raw SQL is
+outside the boundary. There is no database trigger (it would need a manual
+migration).
+
+| Path | Behaviour |
+|---|---|
+| instance `save()` of an existing row | compares every loaded field with the **authoritative row re-read from the database** and refuses any difference -- so a deferred / `only()` / stale instance cannot smuggle a change; an unchanged save writes nothing |
+| `QuerySet.update()` -- default manager, `_base_manager`, reverse related managers | refused, **except** exactly `update(owner=None)`: the `SET_NULL` Django performs when a User is deleted (and `user.production_media.clear()`). It only unlinks custody (the `owner_username` snapshot keeps it understandable); reassigning custody is refused |
+| `bulk_update()`, `bulk_create(update_conflicts=True)` | refused |
+| `update_or_create()` on an existing row | refused (it goes through `save()`) |
+| `delete()` -- instance, any queryset, `_base_manager` | refused: purge removes bytes, never rows |
+
+`Meta.base_manager_name = "objects"` makes `_base_manager` (used by the deletion
+collector, reverse managers and `Model.save` internals) the same guarded
+queryset.
+
+The **only** legitimate state changes are the explicit, state-qualified
+transitions in `production/transitions.py`, each a single conditional UPDATE
+whose WHERE clause carries the rule:
+
+* `record_verdict` -- facts + verdict, once, on a present `unvalidated` row,
+  fact/verdict columns only;
+* `record_infrastructure_attempt` -- the code of a failed attempt, on a present
+  `unvalidated` row, `validation_code` only;
+* `mark_purged` -- `present → purged` with `purged_at`.
+
+There is no `purged → present`, and no way to rewrite identity, bytes identity,
+custody, display metadata or provenance. **Editing audio creates a new
+`ProductionMedia` with `derived_from` set.**
 
 ## Storage
 
@@ -98,23 +121,67 @@ Not exposed through nginx. No client-supplied text (filename, title, username,
 MIME, URL, form field) ever becomes a path component; every path is generated
 from a UUID and re-validated against the exact shape before use.
 
-### Intake ordering (the crash-safety argument)
+### Root safety
 
-1. stream into `incoming/<32hex>.part` (`O_EXCL`, one 1 MiB chunk at a time,
-   hashed as it goes, hard byte cap, `fsync`);
-2. optionally validate the `.part` — the verdict, or a refusal, is known before
-   anything becomes permanent;
-3. promote with `link(2)` + `unlink` (atomic, same filesystem, **can never
-   overwrite**: `EEXIST` is an error) and fsync the directory;
-4. commit the row.
+`production/root_policy.py` is the ONE policy for the root, used by the runtime
+(layout, intake, sweeps), the nightly backup and the restore. It is stdlib-only
+so the shell tooling runs it with the system `python3`, and it reads `.env`
+exactly as python-decouple does (last assignment wins), so tooling judges the
+value the runtime will really use. The root is refused when -- lexically
+normalized **or** symlink-resolved -- it:
 
-Crash after 1: a stale `.part`, no row. After 3: an orphan permanent file, no
-row. After 4: complete and consistent. **A committed, non-purged row always
-points at complete bytes.** Orphans and stale parts are reclaimed by
-reconciliation after a grace period (minimum one hour, default 24 h).
+* is empty, relative, contains control characters or `..`, or is `/`;
+* equals, contains, or lies inside a system tree (`/etc`, `/usr`, `/bin`,
+  `/sbin`, `/lib*`, `/boot`, `/proc`, `/sys`, `/dev`, `/run`, `/snap`, `/root`,
+  `/var/log`, ...);
+* equals or contains a broad anchor (`/srv`, `/srv/isadoraair`, `/var`,
+  `/var/lib`, `/var/lib/isadoraair`, `/home`, `/tmp`, `/mnt`, `/media`, `/opt`,
+  any account's home directory, ...);
+* equals, contains, or lies inside protected station content or code
+  (`LIBRARY_ROOT`, `WAVEFORMS_DIR`, `REPORTS_ROOT`, `WEATHER_DATA_DIR`,
+  `ENCODER_STATE_ROOT`, carts, voicetracks, aircheck, rip staging, the
+  runtime-recovery payload, the application/repository root, the tooling's own
+  checkout, the backup working directory, and any configured value of those).
 
-Callers should commit promptly: a row created inside a long-open caller
-transaction looks to the orphan sweeper like "no row yet".
+At every destructive entry point it also applies the **dedicated-directory
+rule**: an existing root may hold only `media/`, `incoming/`, `work/`, `locks/`
+(plus `lost+found` for a dedicated mount), each a real directory. A genuinely
+dedicated directory is accepted anywhere sensible, e.g.
+`/srv/isadoraair/production-media` or `/mnt/stationdata/production-media`.
+
+The restore judges the logical root from the restored `.env` **before its first
+mutation** (in live and in staged mode alike) and never runs a recursive
+ownership change over the configured root: the root and its four
+subdirectories are chowned non-recursively and only `media/` recursively.
+
+### Intake ordering: three distinct guarantees
+
+1. **Atomic namespace promotion.** The permanent name appears at once via
+   `link(2)` from the fully written staging file and can never overwrite an
+   existing permanent file (`EEXIST` is an error).
+2. **Process-crash safety.** Bytes become permanent before the row exists:
+   a dead process leaves a stale `.part` (no row), an orphan permanent file
+   (no row), or a complete row. A committed row never points at missing data.
+3. **Sudden-power-loss durability.** The `present` row is committed only after
+   this exact sequence has completed:
+
+   | Step | Operation |
+   |---|---|
+   | a | root, `media/`, `incoming/`: real `0750` directories, each `fsync`ed together with its parent (`layout.ensure_durable_dir`) |
+   | b | stream every byte into `incoming/<32hex>.part` (`O_EXCL`, `0600`), hashing and capping |
+   | c | `fchmod` the part to its **final** mode `0440`, **then** `fsync` the file |
+   | d | ensure the shard `media/<2hex>/` (`0750`), `fsync` the shard and `fsync` its parent `media/` |
+   | e | `link(part → media/<2hex>/<32hex>)`, then `fsync` the shard |
+   | f | `unlink` the part, then `fsync` `incoming/` |
+   | g | one transaction (for a derivative, holding the parent's binding lock): `INSERT` the row, commit |
+
+   Assumptions, and no more: Linux POSIX semantics where `fsync()` of a file
+   persists its data and inode metadata and `fsync()` of a directory persists
+   its entries (ext4/xfs with default journaling); `incoming/` and `media/` on
+   one filesystem; PostgreSQL's own `fsync` enabled; storage that honours cache
+   flushes. A power loss between (e) and (g) leaves a durable orphan file and no
+   row, which reconciliation removes. `production/tests/test_durability.py`
+   proves the order with recorded syscalls; a later reordering fails it.
 
 ## Validation contract
 
@@ -131,9 +198,11 @@ output:
 3. **Full ffmpeg decode** with `-xerror`: the authoritative **decoded duration**
    (from the progress report). Exit code decides, never stderr text (a valid
    browser WebM logs an error-level line yet decodes).
-4. **Engine decode:** the existing isolated GStreamer probe
-   (`library/services/media_gst_probe.py`) — proves playout can decode it. A
-   consumer that never airs the media may skip it (`MediaPolicy`).
+4. **Engine decode:** production's own isolated GStreamer probe
+   (`production/services/gst_probe.py`, the same `decodebin` topology playout
+   relies on) — proves playout can decode it, with the structured
+   media-vs-capability taxonomy below. A consumer that never airs the media may
+   skip it (`MediaPolicy`).
 
 **Proven formats** (real ffmpeg-generated fixtures, decoded by both ffmpeg and
 GStreamer on this host): WAV/PCM (u8/16/24/32/f32), AIFF/PCM, FLAC, MP3,
@@ -150,8 +219,28 @@ code, persisted): `empty`, `unreadable_container`, `unsupported_container`,
 `truncated_or_inconsistent`, `empty_audio`, `engine_decode_failed`. An
 *infrastructure error* (never persisted as invalid; the row stays `unvalidated`
 with the code noted and validation is simply retried): `probe_*`, `decode_*`,
-`decoder_unavailable`, `engine_probe_*`, `storage_unreadable`,
-`validation_interrupted`.
+`decoder_unavailable`, `engine_capability_unavailable`, `engine_probe_*`,
+`storage_unreadable`, `validation_interrupted`.
+
+**GStreamer parity taxonomy.** Production runs its OWN isolated probe
+(`production/services/gst_probe.py`; the library's engine-incident probe is
+untouched) and classifies by structured evidence -- GError domain + code,
+missing-plugin messages (`GstPbutils`), element-factory failures -- never by
+localized text:
+
+| Probe result | Evidence | Mapped to |
+|---|---|---|
+| `eos` | decoded to end of stream with audio buffers | valid |
+| `media_error` | STREAM `DECODE` / `DEMUX` / `FORMAT` / `WRONG_TYPE` / `DECRYPT*`; an audio pad that produced no buffers | **invalid** `engine_decode_failed` |
+| `capability_error` | missing-plugin message; CORE `MISSING_PLUGIN` / `NEGOTIATION`; STREAM `CODEC_NOT_FOUND` / `TYPE_NOT_FOUND` / `NOT_IMPLEMENTED`; no audio pad; a required element missing; GI/GStreamer unavailable | infrastructure `engine_capability_unavailable` (retryable) |
+| `infrastructure_error` | RESOURCE / LIBRARY errors, generic STREAM `FAILED`, anything unclassified | infrastructure `engine_probe_failed` |
+| `timeout` | | infrastructure `engine_probe_timeout` |
+
+The bytes have already passed the allowlist, ffprobe and a full ffmpeg decode,
+so a GStreamer that cannot find a decoder for an allowlisted codec is a station
+runtime problem, not corrupt media. Proven with real conditions: a decoder
+demoted via `GST_PLUGIN_FEATURE_RANK`, an empty plugin registry, an interpreter
+without GI, and real undecodable files (`production/tests/test_gst_taxonomy.py`).
 
 **Domain fitness is the consumer's job.** Caller bounds (`MediaPolicy`:
 min/max duration, byte cap) refuse the *intake* — no row — and are never
@@ -168,9 +257,10 @@ persisted as `invalid`, because the same bytes may suit another consumer.
   otherwise is recorder/domain policy, and reliable measurement needs
   unbounded tool output or a custom decode pipeline. 2.22B's recorder and 2.22C
   can add it.
-* GStreamer evidence is a decode test, not a runtime-capability inventory; a
-  host lacking a GStreamer decoder fails validation (as an engine verdict or an
-  infrastructure error) rather than silently passing.
+* GStreamer evidence is a decode test, not a runtime-capability inventory. A
+  host lacking a GStreamer decoder, element or GI is reported as the retryable
+  infrastructure error `engine_capability_unavailable` -- never as an invalid
+  verdict, and never as a silent pass.
 
 ## Open, preview, derive
 
@@ -204,17 +294,41 @@ Crash order: the state change commits first, bytes are unlinked after commit
 (`transaction.on_commit`). A crash between leaves a purged row with harmless
 leftover bytes (swept), never a present row without bytes.
 
-### The binding contract (every consuming domain must follow it)
+### The binding rule (every reference to ProductionMedia must follow it)
 
-Django creates foreign keys `DEFERRABLE INITIALLY DEFERRED`, so an uncommitted
-referrer holds no lock on the media row and a purge cannot see it. **A domain
-must call `retention.lock_for_binding(media)` inside the same
-`transaction.atomic()` that creates its reference.** It takes the same row lock
-as `purge_media`: either the purge waits and then sees the committed reference,
-or the bind sees the purge and refuses (`MediaPurged`). This is proven with real
-concurrent sessions in `test_retention.PurgeRaceTests`; the same file records,
-as a characterization test, what happens to a domain that skips it, and
-`reconcile.find_purged_media_still_referenced()` reports it.
+**Any code that creates or changes a durable foreign key / reference to a
+`ProductionMedia` must acquire the media's binding lock inside the same
+database transaction that writes the reference.** The canonical helper is
+`production.services.retention.lock_for_binding`:
+
+```python
+with transaction.atomic():
+    media = retention.lock_for_binding(media_id)   # row lock + authoritative re-read + present/valid
+    voice_track.media = media                      # Phase B: VoiceTrack.media
+    voice_track.save()
+```
+
+A plain FK assignment is **not** sufficient: Django creates foreign keys
+`DEFERRABLE INITIALLY DEFERRED`, so an uncommitted referrer holds no lock on the
+media row and a concurrent purge cannot see it (a characterization test in
+`test_retention.PurgeRaceTests` records exactly that). `lock_for_binding` takes
+the same row lock as `purge_media`: either the purge waits, sees the committed
+reference and refuses, or the bind waits, sees the purge and refuses.
+
+Inside Phase A the only reference creator, `ingest_derivative` (`derived_from`),
+follows the rule: it streams and validates without any lock, then takes the
+parent's binding lock only in the short final transaction that inserts the
+child. If the parent was purged meanwhile the bind refuses (`parent_purged`)
+and the already-promoted child bytes are removed. Real separate-session tests
+cover both orderings, both rollbacks, a stale in-memory parent and a purge
+committed mid-stream (`test_binding_race.py`).
+
+For Phase B and later: a consumer must route every binding through ONE service
+that does the above -- never a naked FK assignment scattered across views or
+models. **GenericForeignKey references and references from another database are
+not supported and must not be used**: they are invisible to `find_references`,
+so the purge guard cannot protect them. `reconcile.find_purged_media_still_referenced()`
+reports any violation.
 
 ## Operations
 
@@ -253,3 +367,24 @@ zero manual operations by the protected runtime's own probe
 with the migration genuinely pending) — no companion authorization needed. Later
 schema evolution (e.g. an added constraint) is a legitimate use of the
 runtime-11 companion mechanism.
+
+## Carried-forward requirements (from the Phase-A Codex review)
+
+* **Resource confinement before browser exposure (Phase B).** Validation
+  subprocesses are shell-free, time-bounded, output-bounded and process-group
+  terminated, but they have no memory/cgroup limit. Before any arbitrary
+  browser upload is accepted, Phase B must define and prove a confinement
+  (e.g. a systemd-run/cgroup memory limit or a dedicated worker).
+* **No GenericForeignKey or cross-database references** to ProductionMedia
+  (see the binding rule).
+* **Commit promptly.** Intake and binding callers must not hide the final row
+  commit inside an unexpectedly long outer transaction: until it commits, the
+  orphan sweeper sees "no row" (after the 24 h minimum grace).
+* **Backup staging growth (before Phase C).** The backup copies `media/` into
+  its temporary staging area, so temporary space grows with the store. Fine
+  for Phase A volumes; correct it (e.g. stream into the archive) before
+  spoken-content volumes grow.
+* **Pre-existing, outside iPortal:** restore stage 40 applies `chown -R` to
+  `REPORTS_ROOT` read from the restored `.env` with no comparable safety check.
+  The same class of defect as the one fixed here for `PRODUCTION_MEDIA_ROOT`;
+  it predates this feature and is left for a separate fix.

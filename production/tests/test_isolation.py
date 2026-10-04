@@ -17,6 +17,14 @@ from .support import PRODUCTION_DEFAULT_ROOT, IsolatedMediaRootMixin
 # Pure-function / static-analysis classes that never read or write a media root.
 EXEMPT = {
     "production.tests.test_formats", "production.tests.test_migration", "production.tests.test_isolation",
+    # Policy/restore tests: pure checks or private temp trees; never a media root.
+    "production.tests.test_root_policy",
+}
+# Individually exempt classes (module.Class): GStreamer child/GError-table tests
+# that only read private temp fixture files.
+EXEMPT_CLASSES = {
+    "production.tests.test_gst_taxonomy.ProbeChildTaxonomyTests",
+    "production.tests.test_gst_taxonomy.ClassifyErrorTableTests",
 }
 
 
@@ -33,7 +41,8 @@ def test_classes():
 class IsolationTests(SimpleTestCase):
     def test_every_filesystem_or_database_test_class_uses_the_isolated_root(self):
         offenders = [f"{module}.{cls.__name__}" for module, cls in test_classes()
-                     if module not in EXEMPT and not issubclass(cls, IsolatedMediaRootMixin)]
+                     if module not in EXEMPT and f"{module}.{cls.__name__}" not in EXEMPT_CLASSES
+                     and not issubclass(cls, IsolatedMediaRootMixin)]
         self.assertEqual(offenders, [])
 
     def test_the_default_setting_is_the_documented_production_path_and_is_overridden_in_tests(self):
