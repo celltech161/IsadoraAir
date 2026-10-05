@@ -1990,6 +1990,50 @@ class FXBusConfig(models.Model):
         return obj
 
 
+class VoiceTrackQuerySet(models.QuerySet):
+    """2.22B: bulk paths may not touch the ProductionMedia binding -- see
+    library.voicetrack_guard. Everything else behaves exactly as before."""
+
+    def update(self, **kwargs):
+        from library import voicetrack_guard
+        if ({"media", "media_id"} & set(kwargs)) and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("QuerySet.update()")
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        from library import voicetrack_guard
+        if ({"media", "media_id"} & set(fields)) and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("bulk_update()")
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    def bulk_create(self, objs, *args, **kwargs):
+        from library import voicetrack_guard
+        objs = list(objs)
+        if any(getattr(obj, "media_id", None) for obj in objs) and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("bulk_create()")
+        update_fields = kwargs.get("update_fields") or (args[3] if len(args) > 3 else None) or ()
+        if ({"media", "media_id"} & set(update_fields)) and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("bulk_create(update_conflicts)")
+        return super().bulk_create(objs, *args, **kwargs)
+
+
+class VoiceTrackAudio:
+    """What the on-air engine needs to play one evergreen VoiceTrack."""
+
+    ORIGIN_PRODUCTION_MEDIA = "production_media"
+    ORIGIN_LEGACY = "legacy"
+
+    __slots__ = ("path", "duration_seconds", "origin")
+
+    def __init__(self, path, duration_seconds, origin):
+        self.path = path
+        self.duration_seconds = duration_seconds
+        self.origin = origin
+
+    def __repr__(self):
+        return f"VoiceTrackAudio({self.origin}, {self.path!r}, {self.duration_seconds})"
+
+
 class VoiceTrack(models.Model):
     """A DJ voice-over associated with a specific Track's intro or outro.
     At scheduled play time, the engine fires the outgoing track's
@@ -2006,12 +2050,17 @@ class VoiceTrack(models.Model):
     is already built, the change picks up on the next play with no
     log-regeneration required (association is by track, not LogItem).
 
-    Editing is destructive but undoable within the editor session --
-    Save-and-return writes a fresh file with trims baked in; the editor
-    keeps an undo stack while open, but nothing on disk survives
-    Discard except the original recording. Deliberate: a slip-up in an
-    edited take shouldn't be able to reach air just because the operator
-    forgot which version was current."""
+    2.22B (iPortal Phase B): the audio is an immutable ProductionMedia take
+    bound through ``media``. A re-record or an edit never overwrites
+    anything: it is ingested as a NEW validated ProductionMedia (an edit
+    records ``derived_from`` provenance) and the row's binding is repointed
+    atomically by library.services.voicetrack_media -- the ONLY code allowed
+    to change ``media`` (see library.voicetrack_guard). The row -- and so the
+    evergreen identity ``(track, position)`` -- stays the same; it is never
+    one row per take. Rows recorded before Phase B keep their legacy
+    ``filepath`` and stay airable exactly as before: ``playable_audio()``
+    prefers a valid bound ProductionMedia and otherwise falls back to the
+    legacy file. The engine only ever sees ``playable_audio()``."""
 
     POSITION_CHOICES = [
         ("outro", "Outro (plays after outgoing track's outro_starts)"),
@@ -2031,6 +2080,12 @@ class VoiceTrack(models.Model):
     filepath = models.CharField(
         max_length=512,
         help_text="Absolute path to the audio file (typically under /srv/isadoraair/voicetracks/).",
+    )   # 2.22B: LEGACY path -- empty for an iPortal-recorded VoiceTrack (see class docstring)
+    media = models.ForeignKey(
+        "production.ProductionMedia", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="evergreen_voicetracks",
+        help_text="The immutable ProductionMedia take this VoiceTrack airs (2.22B). Changed only "
+                    "through the locked binding service; NULL for a legacy-file VoiceTrack.",
     )
     duration_seconds = models.FloatField(
         null=True, blank=True, editable=False,
@@ -2055,6 +2110,8 @@ class VoiceTrack(models.Model):
         max_length=10, choices=SOURCE_CHOICES, default="browser",
     )
 
+    objects = VoiceTrackQuerySet.as_manager()
+
     class Meta:
         unique_together = [("track", "position")]
         ordering = ["track", "position"]
@@ -2064,10 +2121,23 @@ class VoiceTrack(models.Model):
     def __str__(self):
         return f"{self.track.title} [{self.position}] by {self.recorded_by or 'unknown'}"
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._loaded_media_id = instance.__dict__.get("media_id")
+        return instance
+
     def save(self, *args, **kwargs):
-        # Same mutagen auto-populate as FXCart -- non-fatal if the file
-        # is missing or unreadable.
-        if self.filepath:
+        from library import voicetrack_guard
+        loaded = getattr(self, "_loaded_media_id", None)
+        deferred = "media_id" not in self.__dict__
+        if not deferred and self.media_id != loaded and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("VoiceTrack.save()")
+        if self.media_id is None and self.filepath:
+            # Legacy file only: same mutagen auto-populate as FXCart --
+            # non-fatal if the file is missing or unreadable. A
+            # ProductionMedia-backed row takes its duration from the
+            # validated decode (set by the binding service).
             from pathlib import Path
             if Path(self.filepath).is_file():
                 try:
@@ -2078,11 +2148,50 @@ class VoiceTrack(models.Model):
                 except Exception:
                     self.duration_seconds = None
         super().save(*args, **kwargs)
+        if not deferred:
+            self._loaded_media_id = self.media_id
 
     @property
     def file_exists(self):
+        """Whether the row has audio the engine can play (bound media or legacy file)."""
+        return self.playable_audio() is not None
+
+    @property
+    def legacy_file_exists(self):
         from pathlib import Path
         return bool(self.filepath and Path(self.filepath).is_file())
+
+    @property
+    def is_production_media_backed(self):
+        return self.media_id is not None
+
+    def playable_audio(self):
+        """THE media resolver for the on-air engine (2.22B B11/B12):
+
+        1. a bound ProductionMedia that is present, valid and whose bytes are
+           on disk -> its immutable file and validated decoded duration;
+        2. otherwise the legacy file, exactly as before Phase B;
+        3. otherwise None (nothing to air -- the engine skips this VT, as it
+           always did for a missing file).
+
+        Never raises: a misconfigured or unreadable media store degrades to
+        the legacy path / None for this VoiceTrack only."""
+        from pathlib import Path
+        if self.media_id is not None:
+            try:
+                from production.services import layout
+                media = self.media
+                if media.is_present and media.is_valid:
+                    path = layout.resolve_storage_path(media.storage_key)
+                    if path.is_file():
+                        duration = media.decoded_duration_seconds
+                        return VoiceTrackAudio(str(path), float(duration) if duration is not None else None,
+                                               VoiceTrackAudio.ORIGIN_PRODUCTION_MEDIA)
+            except Exception:  # noqa: BLE001 -- the engine path must never crash on a lookup
+                pass
+        if self.filepath and Path(self.filepath).is_file():
+            return VoiceTrackAudio(self.filepath, self.duration_seconds, VoiceTrackAudio.ORIGIN_LEGACY)
+        return None
 
 
 class VoiceTrackConfig(models.Model):

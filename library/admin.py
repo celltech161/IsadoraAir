@@ -1763,11 +1763,17 @@ class VoiceTrackAdmin(admin.ModelAdmin):
     list_filter = ["position", "source"]
     search_fields = ["track__title", "track__artist__name", "filepath"]
     raw_id_fields = ["track"]
-    readonly_fields = ["duration_seconds", "recorded_at", "edited_at"]
+    # 2.22B: the ProductionMedia binding is read-only here; it changes only
+    # through the locked binding service (iPortal / library.services.voicetrack_media).
+    readonly_fields = ["duration_seconds", "recorded_at", "edited_at", "media"]
     ordering = ["-recorded_at"]
 
     @admin.display(description="")
     def _badge(self, obj):
+        if obj.media_id is not None:
+            if obj.file_exists:
+                return format_html('<span title="iPortal take (ProductionMedia)" style="color:#6c6;">&#9679;</span>')
+            return format_html('<span title="Bound take not playable" style="color:#e67;">&#9888;</span>')
         if not obj.filepath:
             return format_html('<span title="No file path" style="color:#e67;">&#9888;</span>')
         if not obj.file_exists:

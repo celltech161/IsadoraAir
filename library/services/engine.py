@@ -8869,6 +8869,17 @@ class PlaybackEngine:
         print(f"  VT fire {fire_id} ({kind}): {Path(filepath).name}")
         return fire_id
 
+    @staticmethod
+    def _vt_resolve_audio(voicetrack):
+        """(path, duration_seconds) for one evergreen VoiceTrack, or (None, 0.0).
+        The engine never knows about recording/editing lifecycles -- only this."""
+        if voicetrack is None:
+            return None, 0.0
+        audio = voicetrack.playable_audio()
+        if audio is not None:
+            return audio.path, audio.duration_seconds
+        return voicetrack.filepath, voicetrack.duration_seconds
+
     def _vt_maybe_enter(self, outgoing_deck):
         """Called from _poll_position when outgoing hits outro_starts.
         Looks up VTs for the outgoing and incoming tracks; if either
@@ -8880,7 +8891,7 @@ class PlaybackEngine:
             close_old_connections()
             outgoing_vt = VoiceTrack.objects.filter(
                 track=outgoing_deck.track, position="outro",
-            ).first()
+            ).select_related("media").first()
             next_item = self._peek_playable_at_cursor() if hasattr(self, "_peek_playable_at_cursor") else None
             incoming_vt = None
             incoming_track = None
@@ -8888,7 +8899,7 @@ class PlaybackEngine:
                 incoming_track = next_item.track
                 incoming_vt = VoiceTrack.objects.filter(
                     track=incoming_track, position="intro",
-                ).first()
+                ).select_related("media").first()
                 # A pending dedication supersedes the requested song's own
                 # incoming intro VT for this specific play -- the outgoing
                 # track's own outro VT, if any, is unaffected and still
@@ -8908,20 +8919,27 @@ class PlaybackEngine:
         if outgoing_vt is None and incoming_vt is None:
             return False   # no VTs; fall through to normal crossfade
 
+        # 2.22B: the ONLY change to the VT path is media resolution. A bound,
+        # valid ProductionMedia take resolves to its immutable file and its
+        # validated duration; anything else is exactly the pre-Phase-B
+        # legacy filepath/duration (a missing file still just skips the fire).
+        outgoing_path, _ = self._vt_resolve_audio(outgoing_vt)
+        incoming_path, incoming_duration = self._vt_resolve_audio(incoming_vt)
+
         cfg = VoiceTrackConfig.load()
         with self._vt_lock:
             self._vt = {
                 "phase": "outro_playing",
                 "outgoing_track_id": outgoing_deck.track.id,
-                "outgoing_vt_filepath": outgoing_vt.filepath if outgoing_vt else None,
+                "outgoing_vt_filepath": outgoing_path,
                 "outgoing_vt_gain": outgoing_vt.gain_db if outgoing_vt else 0.0,
                 "outgoing_vt_fire_id": None,
                 "outgoing_ended": False,
                 "incoming_track_id": incoming_track.id if incoming_track else None,
                 "incoming_track": incoming_track,
-                "incoming_vt_filepath": incoming_vt.filepath if incoming_vt else None,
+                "incoming_vt_filepath": incoming_path,
                 "incoming_vt_gain": incoming_vt.gain_db if incoming_vt else 0.0,
-                "incoming_vt_duration": incoming_vt.duration_seconds if incoming_vt else 0.0,
+                "incoming_vt_duration": incoming_duration if incoming_vt else 0.0,
                 "incoming_vt_fire_id": None,
                 "incoming_intro_until": (incoming_track.intro_until_seconds or 0.0) if incoming_track else 0.0,
                 "incoming_started": False,
@@ -8939,7 +8957,7 @@ class PlaybackEngine:
 
         if outgoing_vt is not None:
             fire_id = self._vt_fire_file(
-                outgoing_vt.filepath, outgoing_vt.gain_db, "outro",
+                outgoing_path, outgoing_vt.gain_db, "outro",
             )
             with self._vt_lock:
                 self._vt["outgoing_vt_fire_id"] = fire_id
