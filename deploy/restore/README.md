@@ -82,7 +82,8 @@ Two more guards apply regardless of the above:
   as non-empty, so the normal create-then-restore flow never needs the
   flag.
 - **Station content-root path safety** (`content_root_safety.py`, P0 1.2):
-  `REPORTS_ROOT` and `WEATHER_DATA_DIR` are each read from the restored `.env` exactly as
+  `REPORTS_ROOT`, `WEATHER_DATA_DIR` and (iPortal, 2.22A) `PRODUCTION_MEDIA_ROOT`
+  are each read from the restored `.env` exactly as
   python-decouple reads it (last assignment wins), canonicalized, and
   refused — before `40-station-content.sh` mutates anything, in
   `--plan`, `--apply` and `--staging-root` runs alike — if it is `/`, a
@@ -118,6 +119,13 @@ Two more guards apply regardless of the above:
   `/srv/isadoraair/weather` or `/mnt/stationdata/weather` is accepted;
   `/etc`, `/srv/isadoraair`, `/mnt`, the reports or library root, or an
   ancestor of either, is refused.
+  `PRODUCTION_MEDIA_ROOT` must additionally pass `production/root_policy.py`
+  (the ProductionMedia runtime authority, including its dedicated-directory
+  content rule), and is never allowed to alias another managed root. Its root
+  and `media/ incoming/ work/ locks/` are created via `establish` (mode
+  `0750`), `srv-content/production-media/media/` archive members are validated
+  before extraction, and ownership is applied to exactly the restored members
+  -- see `docs/PRODUCTION_MEDIA.md`, "Root safety".
 
 **The music library is different: there is no override, ever.** No
 stage writes to `/srv/isadoraair/music` under any flag combination —

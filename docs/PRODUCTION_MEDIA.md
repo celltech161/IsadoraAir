@@ -151,8 +151,21 @@ dedicated directory is accepted anywhere sensible, e.g.
 
 The restore judges the logical root from the restored `.env` **before its first
 mutation** (in live and in staged mode alike) and never runs a recursive
-ownership change over the configured root: the root and its four
-subdirectories are chowned non-recursively and only `media/` recursively.
+ownership change over the configured root. Since r0106 (reconciled onto the
+r0106 restore hardening) the root must also pass the restore-time
+station-content policy `deploy/restore/content_root_safety.py`, which treats
+`PRODUCTION_MEDIA_ROOT` as a managed station root alongside `REPORTS_ROOT` and
+`WEATHER_DATA_DIR`: an explicitly empty assignment fails closed, the resolved
+path is the one written to, and under `--staging-root` the resolved staged root
+may not alias (equal, sit inside, or contain) the resolved staged equivalent of
+any other managed root. The root and its four subdirectories are then created
+and given owner/mode `0750` one at a time by that helper's `establish`
+(no-follow directory descriptors, so an ancestor swapped for a symlink after
+validation creates nothing); archive members under
+`srv-content/production-media/media/` are validated (plain relative regular
+files/directories only) before extraction; and ownership is applied to exactly
+the restored members, never recursively. `production/root_policy.py` remains
+the runtime/backup authority and is still applied at restore, unchanged.
 
 ### Intake ordering: three distinct guarantees
 
@@ -384,7 +397,9 @@ runtime-11 companion mechanism.
   its temporary staging area, so temporary space grows with the store. Fine
   for Phase A volumes; correct it (e.g. stream into the archive) before
   spoken-content volumes grow.
-* **Pre-existing, outside iPortal:** restore stage 40 applies `chown -R` to
-  `REPORTS_ROOT` read from the restored `.env` with no comparable safety check.
-  The same class of defect as the one fixed here for `PRODUCTION_MEDIA_ROOT`;
-  it predates this feature and is left for a separate fix.
+* **Pre-existing, outside iPortal — fixed in r0106:** restore stage 40 used to
+  apply `chown -R` to `REPORTS_ROOT` read from the restored `.env` with no
+  comparable safety check. r0106 (P0 1.2) replaced it with the shared
+  `deploy/restore/content_root_safety.py` validation, no-follow establishment
+  and member-scoped ownership, which `PRODUCTION_MEDIA_ROOT`'s restore now
+  also uses.

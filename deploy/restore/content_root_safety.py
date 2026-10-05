@@ -124,6 +124,11 @@ MANAGED_ROOT_DEFAULTS = {
     "WAVEFORMS_DIR": "/srv/isadoraair/waveforms",
     "WEATHER_DATA_DIR": "/var/lib/isadoraair/weather",
     "ENCODER_STATE_ROOT": "/var/lib/isadoraair/encoders",
+    # iPortal ProductionMedia store (production/root_policy.py DEFAULT_ROOT).
+    # production/root_policy.py remains its runtime authority; listing it here
+    # makes restore-time station-content roots (reports, weather, and the
+    # media root itself) mutually protected, live and staged.
+    "PRODUCTION_MEDIA_ROOT": "/srv/isadoraair/production-media",
 }
 
 
@@ -340,7 +345,11 @@ def check_root(
 
 
 def validate_members(archive: Path, prefix: str) -> list[str]:
-    if not prefix or "/" in prefix or prefix in (".", ".."):
+    """``prefix`` is the archive-relative directory whose contents are restored
+    (e.g. ``reports`` or ``srv-content/production-media/media``)."""
+    prefix_parts = prefix.split("/") if prefix else []
+    if (not prefix_parts or any(part in ("", ".", "..") for part in prefix_parts)
+            or _has_control_chars(prefix)):
         raise UnsafeRootError(f"invalid member prefix {prefix!r}")
     found: set[str] = set()
     with tarfile.open(archive, "r|*") as tar:

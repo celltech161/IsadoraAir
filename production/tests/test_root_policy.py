@@ -30,6 +30,7 @@ from .support import IsolatedMediaRootMixin, fixture
 REPO = Path(__file__).resolve().parents[2]
 POLICY = REPO / "production" / "root_policy.py"
 STAGE_40 = REPO / "deploy" / "restore" / "40-station-content.sh"
+CONTENT_ROOT_SAFETY = REPO / "deploy" / "restore" / "content_root_safety.py"
 HOME = os.path.expanduser("~")
 
 
@@ -245,6 +246,7 @@ class _RestoreHarness(SimpleTestCase):
             env["PATH"] = f"{shims}:{env['PATH']}"
             env["SHIM_LOG"] = str(self.log)
             env["SHIM_ALLOW_PREFIX"] = str(self.tmp)
+            env["SHIM_ALLOW_HELPER"] = str(CONTENT_ROOT_SAFETY)
         argv = [str(STAGE_40), "--archive", str(self.archive), "--owner", self.owner, *args]
         if staging:
             argv += ["--staging-root", str(self.tmp / "stage")]
@@ -283,16 +285,21 @@ printf '%s %s\\n' "@NAME@" "$*" >> "$SHIM_LOG"
 exit 97
 """
 
-# Executes ONLY mkdir/chmod/chown whose every path operand lies inside the test
-# tree; records everything; silently skips anything else (e.g. /srv/isadoraair).
+# Executes ONLY mkdir/chmod/chown, or the restore content-root helper
+# (deploy/restore/content_root_safety.py, which r0106 restore code uses for
+# no-follow establishment and member-scoped ownership), whose every path
+# operand lies inside the test tree; records everything; silently skips
+# anything else (e.g. /srv/isadoraair).
 SELECTIVE_SUDO = """#!/bin/bash
 printf 'sudo %s\\n' "$*" >> "$SHIM_LOG"
 cmd="$1"; shift
-case "$cmd" in mkdir|chmod|chown) ;; *) exit 0 ;; esac
+case "$cmd" in mkdir|chmod|chown|python3) ;; *) exit 0 ;; esac
 for arg in "$@"; do
   case "$arg" in
     -*|*:*|[0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
     "$SHIM_ALLOW_PREFIX"/*) ;;
+    "$SHIM_ALLOW_HELPER") ;;
+    establish|chown-members) ;;
     *) exit 0 ;;
   esac
 done
@@ -310,7 +317,14 @@ class RestoreRefusalTests(_RestoreHarness):
                 self.write_env(root)
                 result = self.run_stage("--apply", shims=shims)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("Refusing: PRODUCTION_MEDIA_ROOT", result.stdout + result.stderr)
+                # r0106: PRODUCTION_MEDIA_ROOT is also a managed station root of the
+                # restore-time content policy, so a value such as "/" or "/var" that
+                # CONTAINS the default reports root may already be refused by the
+                # (earlier) REPORTS_ROOT check -- naming PRODUCTION_MEDIA_ROOT. Either
+                # refusal happens before any mutation, which is what matters here.
+                output = result.stdout + result.stderr
+                self.assertIn("Refusing:", output)
+                self.assertIn("PRODUCTION_MEDIA_ROOT", output)
                 self.assertEqual(self.recorded(), [])               # not one mutating command ran
 
     def test_live_mode_refuses_a_symlink_to_a_protected_root_and_an_ancestor_of_the_library(self):
@@ -361,12 +375,23 @@ class RestoreSafeLiveOwnershipTests(_RestoreHarness):
         self.assertEqual((root / "media" / "ab" / ("ab" + "0" * 30)).read_bytes(), b"BYTES")
         for name in ("media", "incoming", "work", "locks"):
             self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), 0o750, name)
-        chowns = [line for line in self.recorded() if line.startswith("sudo chown")]
-        recursive = [line for line in chowns if " -R" in line]
-        self.assertEqual(recursive, [f"sudo chown -R -P {self.owner} {root}/media"])
-        self.assertIn(f"sudo chown {self.owner} {root}", chowns)                  # the root itself: non-recursive
-        for line in recursive:
-            target = line.split()[-1]
-            self.assertTrue(target.startswith(str(root) + "/"), line)
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o750)
+        # r0106 reconciliation: the root and its four managed subdirectories are
+        # established one directory at a time through the no-follow descriptor
+        # primitive, and ownership of restored bytes is member-scoped -- there is
+        # no recursive chown at all any more, and no path-based mkdir/chown/chmod.
+        pm_lines = [line for line in self.recorded() if str(root) in line]
+        helper = str(CONTENT_ROOT_SAFETY)
+        for directory in (root, *(root / name for name in ("media", "incoming", "work", "locks"))):
+            self.assertIn(
+                f"sudo python3 -I {helper} establish --root {directory} --owner {self.owner} --mode 0750", pm_lines,
+            )
+        member_chowns = [line for line in pm_lines if " chown-members " in line]
+        self.assertEqual(len(member_chowns), 1, pm_lines)
+        self.assertTrue(member_chowns[0].startswith(
+            f"sudo python3 -I {helper} chown-members --root {root}/media --owner {self.owner} --members-file "
+        ), member_chowns)
+        for line in pm_lines:
+            self.assertNotRegex(line, r"^sudo (mkdir|chown|chmod) ", line)
         for line in self.recorded():
-            self.assertNotRegex(line, r"chown -R(?: -P)? \S+ /$")
+            self.assertNotIn("chown -R", line)

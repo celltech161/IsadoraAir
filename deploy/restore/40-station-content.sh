@@ -188,10 +188,22 @@ if ! PM_LOGICAL_ROOT=$(python3 "$PM_POLICY" check-env --env-file "$PM_ENV_FILE" 
   log_error "Refusing: PRODUCTION_MEDIA_ROOT from $PM_ENV_FILE is not a safe dedicated production-media directory (see the reason above). Nothing has been changed by this stage. Fix the value in the restored .env and re-run."
   exit 1
 fi
-if [ -n "$RESTORE_STAGING_ROOT" ]; then
-  PRODUCTION_MEDIA_ROOT="$RESTORE_STAGING_ROOT$PM_LOGICAL_ROOT"
-else
-  PRODUCTION_MEDIA_ROOT="$PM_LOGICAL_ROOT"
+# r0106 reconciliation: the same root must ALSO pass the restore-time station-
+# content policy (deploy/restore/content_root_safety.py) that guards
+# REPORTS_ROOT and WEATHER_DATA_DIR. production/root_policy.py stays the
+# ProductionMedia authority; this adds what r0106 established for every
+# restore-written content root: an explicitly empty assignment fails closed
+# (Django would see ''), the effective path is the RESOLVED one, and under
+# --staging-root the resolved staged path must stay separate from the
+# resolved staged equivalent of every other managed root (no staged
+# production-media -> reports/weather/carts/library symlink alias). Every
+# mutation below uses this effective path.
+PM_CHECK_ARGS=(check --key PRODUCTION_MEDIA_ROOT --env-file "$ENV_FILE"
+  --target-root "$RESTORE_TARGET_ROOT" --tooling-root "$TOOLING_ROOT")
+[ -n "$RESTORE_STAGING_ROOT" ] && PM_CHECK_ARGS+=(--staging-root "$RESTORE_STAGING_ROOT")
+if ! PRODUCTION_MEDIA_ROOT=$(python3 "$CONTENT_ROOT_SAFETY" "${PM_CHECK_ARGS[@]}"); then
+  log_error "Refusing: PRODUCTION_MEDIA_ROOT from $PM_ENV_FILE failed restore path-safety validation (see above). Nothing has been changed by this stage. Fix the value in the restored .env and re-run."
+  exit 1
 fi
 if ! python3 "$PM_POLICY" check --root "$PM_LOGICAL_ROOT" --dedicated-path "$PRODUCTION_MEDIA_ROOT" \
     --app-root "$PM_LIVE_TARGET_ROOT" --app-root /opt/isadoraair --app-root "$PM_TOOLING_ROOT" >/dev/null; then
@@ -231,31 +243,56 @@ done
 
 # ---- 1b. iPortal production media (root judged in section 0) -------------
 # Durable bytes live in <root>/media; incoming/ work/ locks/ are transient and
-# are recreated EMPTY. Ownership is applied ONLY to the exact managed tree:
-# the root and its four subdirectories non-recursively (ensure_dir), and
-# recursively to media/ alone -- never `chown -R` over the configured root.
+# are recreated EMPTY. Ownership is applied ONLY to the exact managed tree.
+# r0106 reconciliation (same contract as REPORTS_ROOT/WEATHER_DATA_DIR):
+#   * the root and its four subdirectories are created and given owner/mode
+#     by content_root_safety.py `establish` -- one directory each, walked from
+#     / with O_NOFOLLOW directory descriptors, owner/mode applied to the
+#     opened descriptor -- never path-based mkdir -p/chown/chmod, which would
+#     follow an ancestor swapped for a symlink after section 0's validation;
+#   * archive members under srv-content/production-media/media are validated
+#     (plain relative regular files/directories only) BEFORE extraction;
+#   * ownership of restored bytes is applied to exactly those members through
+#     no-follow directory descriptors (`chown-members`), not `chown -R`.
 for dir in "$PRODUCTION_MEDIA_ROOT" "$PRODUCTION_MEDIA_ROOT/media" "$PRODUCTION_MEDIA_ROOT/incoming" \
            "$PRODUCTION_MEDIA_ROOT/work" "$PRODUCTION_MEDIA_ROOT/locks"; do
-  ensure_dir "$dir"
+  guard_never_touch_music_library "$dir"
   if [ -n "$RESTORE_STAGING_ROOT" ]; then
-    do_or_plan chmod 0750 "$dir"
+    do_or_plan python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$dir" --mode 0750
   else
-    do_or_plan sudo chmod 0750 "$dir"
+    do_or_plan sudo python3 -I "$CONTENT_ROOT_SAFETY" establish --root "$dir" --owner "$OWNER" --mode 0750
   fi
 done
 if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
   if [ "$RESTORE_MODE" = "apply" ]; then
+    # Re-judge after establishment (closes a swap between section 0 and here).
+    PM_REVALIDATED_ROOT=$(python3 "$CONTENT_ROOT_SAFETY" "${PM_CHECK_ARGS[@]}")
+    if [ "$PM_REVALIDATED_ROOT" != "$PRODUCTION_MEDIA_ROOT" ]; then
+      log_error "Refusing: PRODUCTION_MEDIA_ROOT now resolves to $PM_REVALIDATED_ROOT, not the validated $PRODUCTION_MEDIA_ROOT -- nothing extracted."
+      exit 1
+    fi
+    PM_MEMBERS_FILE="$(mktemp)"
+    trap 'rm -f -- "$PM_MEMBERS_FILE"' EXIT
+    python3 "$CONTENT_ROOT_SAFETY" members --archive "$RESTORE_ARCHIVE" \
+      --prefix srv-content/production-media/media --output "$PM_MEMBERS_FILE" > /dev/null
     log_apply "restoring srv-content/production-media/media -> $PRODUCTION_MEDIA_ROOT/media"
     # ./srv-content/production-media/media/... : strip "." + "srv-content" +
     # "production-media" so "media/..." lands directly under the root.
     tar -xzf "$RESTORE_ARCHIVE" -C "$PRODUCTION_MEDIA_ROOT" --strip-components=3 "./srv-content/production-media/media"
     if [ -z "$RESTORE_STAGING_ROOT" ]; then
-      sudo chown -R -P "$OWNER" "$PRODUCTION_MEDIA_ROOT/media"
+      log_apply "sudo chown (no-follow, exact restored members only) $OWNER under $PRODUCTION_MEDIA_ROOT/media"
+      sudo python3 -I "$CONTENT_ROOT_SAFETY" chown-members --root "$PRODUCTION_MEDIA_ROOT/media" --owner "$OWNER" \
+        --members-file "$PM_MEMBERS_FILE" > /dev/null
     fi
+    rm -f -- "$PM_MEMBERS_FILE"
     PM_FILE_COUNT=$(find "$PRODUCTION_MEDIA_ROOT/media" -type f | wc -l)
     log_info "production media: restored, $PM_FILE_COUNT file(s); incoming/ work/ locks/ recreated empty. Run 'manage.py production_reconcile' to verify every ProductionMedia row still resolves to its bytes."
   else
+    log_plan "validate archive srv-content/production-media/media/ members (plain relative regular files/directories only)"
     log_plan "tar -xzf <archive> -C $PRODUCTION_MEDIA_ROOT --strip-components=3 ./srv-content/production-media/media"
+    if [ -z "$RESTORE_STAGING_ROOT" ]; then
+      log_plan "sudo chown (no-follow, exact restored members only) $OWNER under $PRODUCTION_MEDIA_ROOT/media"
+    fi
   fi
 else
   log_warn "production media: archive has no srv-content/production-media/media entries -- directories created empty (legitimate on a station that has not used iPortal yet)."
