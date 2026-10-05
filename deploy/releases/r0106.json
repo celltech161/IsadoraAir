@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "release_id": "r0106",
+  "previous_release_id": "r0105",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P0 DR restore-safety release. Restore stage 40 validates REPORTS_ROOT and WEATHER_DATA_DIR (python-decouple semantics) before any mutation via a shared content-root safety primitive, refusing system, anchor, checkout and managed-root paths, staged aliases and symlink escapes; roots are created via no-follow descriptors; report ownership is member-scoped, never recursive. Docs: recovery-payload refresh obligation; publication invariant. No runtime, migration, package, systemd or static changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
