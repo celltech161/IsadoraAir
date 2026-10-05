@@ -19,6 +19,9 @@ EXEMPT = {
     "production.tests.test_formats", "production.tests.test_migration", "production.tests.test_isolation",
     # Policy/restore tests: pure checks or private temp trees; never a media root.
     "production.tests.test_root_policy",
+    # 2.22B resource confinement: synthetic child processes and private temp
+    # files only; validation is run on a private temp WAV, never a media root.
+    "production.tests.test_confinement",
 }
 # Individually exempt classes (module.Class): GStreamer child/GError-table tests
 # that only read private temp fixture files.

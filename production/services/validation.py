@@ -70,8 +70,13 @@ INFRASTRUCTURE_CODES = frozenset({
     "probe_output_invalid", "decoder_unavailable", "decode_unavailable",
     "decode_timeout", "decode_killed", "decode_output_invalid",
     "engine_probe_unavailable", "engine_probe_timeout", "engine_probe_failed",
+    "engine_probe_killed",
     "engine_capability_unavailable",
     "validation_interrupted",
+    # 2.22B resource confinement (production.services.confinement): a tool
+    # stopped by a station resource limit, or validation that could not be
+    # confined at all. Station limits, never a verdict on the bytes.
+    "validation_resource_limit", "confinement_unavailable",
 })
 
 FFPROBE = "ffprobe"
@@ -131,18 +136,23 @@ def _infrastructure(code):
 # -- process boundary -------------------------------------------------------
 
 def _run(args, *, timeout_seconds, stop_event=None):
-    """Bounded, shell-free subprocess execution -- the library's own proven
-    runner (process-group termination, bounded output). Imported lazily so this
-    module's import graph does not depend on the library at load time (the
-    library itself will depend on production from 2.22B)."""
-    from library.services.media_health import run_bounded_command
-    return run_bounded_command(args, timeout_seconds=timeout_seconds, stop_event=stop_event)
+    """Bounded, shell-free, OS-confined subprocess execution (2.22B): every tool
+    that reads media bytes runs under kernel resource limits (memory, CPU,
+    file size, descriptors) in its own process group, reaped as a whole --
+    see production.services.confinement. If confinement cannot be applied the
+    tool is not run at all (fail closed)."""
+    from . import confinement
+    return confinement.run_confined(args, timeout_seconds=timeout_seconds, stop_event=stop_event)
 
 
 def _run_failure(result, prefix):
     """Map a non-ok bounded-run result to an outcome. Exit codes > 0 are the
     TOOL's verdict on the input (caller decides); everything else is infra."""
     status = result.get("status")
+    if status == "confinement_unavailable":
+        return _infrastructure("confinement_unavailable")
+    if status == "resource_limit":
+        return _infrastructure("validation_resource_limit")
     if status == "timeout":
         return _infrastructure(f"{prefix}_timeout")
     if status == "stopped":
