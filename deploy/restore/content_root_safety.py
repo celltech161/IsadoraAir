@@ -344,17 +344,81 @@ def check_root(
     return effective
 
 
-def validate_members(archive: Path, prefix: str) -> list[str]:
+def _plain_parts(value: str, label: str) -> list[str]:
+    parts = value.split("/") if value else []
+    if not parts or any(part in ("", ".", "..") for part in parts) or _has_control_chars(value):
+        raise UnsafeRootError(f"invalid member {label} {value!r}")
+    return parts
+
+
+def _is_under(parts: list[str], base: list[str]) -> bool:
+    return parts[: len(base)] == base
+
+
+def _judge_namespace_member(member: tarfile.TarInfo, namespace: list[str], prefix: list[str]) -> None:
+    """Strict-namespace rule for ONE archive member.
+
+    The archive namespace a restore domain owns (e.g. srv-content/
+    production-media) may contain nothing but the restored prefix's subtree
+    (judged by the caller's ordinary rules) and the plain directories on the
+    path to it. Any member that reaches the namespace by ANY spelling --
+    absolute, ``..`` traversal, ``.``/empty components, or a name that only
+    normalizes into it -- must be canonical, so tar's name matching and this
+    validation can never disagree about where it lands."""
+    name = member.name
+    loose = [part for part in name.split("/") if part not in ("", ".")]
+    normalized = [part for part in posixpath.normpath("/" + name).split("/") if part]
+    canonical_text = name[2:] if name.startswith("./") else name
+    canonical_text = canonical_text[:-1] if canonical_text.endswith("/") else canonical_text
+    canonical = canonical_text.split("/") if canonical_text else []
+    is_canonical = (
+        bool(canonical) and not canonical_text.startswith("/") and not _has_control_chars(name)
+        and not any(part in ("", ".", "..") for part in canonical)
+    )
+    touches = (
+        _is_under(loose, namespace) or _is_under(normalized, namespace)
+        or (is_canonical and _is_under(namespace, canonical))
+    )
+    if not touches:
+        return  # another domain's part of the archive (reports/, etc-live/, ...): not this caller's business
+    if not is_canonical:
+        raise UnsafeRootError(
+            f"archive member {name!r} reaches {'/'.join(namespace)}/ through a non-canonical name "
+            "(absolute, '..', '.' or empty component) -- refusing the archive"
+        )
+    if _is_under(canonical, prefix):
+        return  # judged by the ordinary prefix rules
+    if _is_under(prefix, canonical):
+        if not member.isdir():
+            raise UnsafeRootError(f"archive member {name!r} on the path to {'/'.join(prefix)}/ must be a directory")
+        return
+    raise UnsafeRootError(
+        f"unexpected archive member {name!r}: only {'/'.join(prefix)}/ is ever restored from "
+        f"{'/'.join(namespace)}/ -- refusing the archive"
+    )
+
+
+def validate_members(archive: Path, prefix: str, *, strict_namespace: str | None = None) -> list[str]:
     """``prefix`` is the archive-relative directory whose contents are restored
-    (e.g. ``reports`` or ``srv-content/production-media/media``)."""
-    prefix_parts = prefix.split("/") if prefix else []
-    if (not prefix_parts or any(part in ("", ".", "..") for part in prefix_parts)
-            or _has_control_chars(prefix)):
-        raise UnsafeRootError(f"invalid member prefix {prefix!r}")
+    (e.g. ``reports`` or ``srv-content/production-media/media``).
+
+    Members outside ``prefix`` are ignored by default: every caller is handed
+    the WHOLE backup archive (DB dump, app, etc-live/, other content trees).
+    ``strict_namespace`` (an ancestor-or-equal of ``prefix``) additionally
+    makes the archive fail closed if anything else, under any spelling,
+    claims that namespace -- see _judge_namespace_member."""
+    prefix_parts = _plain_parts(prefix, "prefix")
+    namespace_parts = None
+    if strict_namespace is not None:
+        namespace_parts = _plain_parts(strict_namespace, "namespace")
+        if not _is_under(prefix_parts, namespace_parts):
+            raise UnsafeRootError(f"member prefix {prefix!r} is not inside namespace {strict_namespace!r}")
     found: set[str] = set()
     with tarfile.open(archive, "r|*") as tar:
         for member in tar:
             name = member.name
+            if namespace_parts is not None:
+                _judge_namespace_member(member, namespace_parts, prefix_parts)
             stripped = name[2:] if name.startswith("./") else name
             if stripped != prefix and not stripped.startswith(prefix + "/"):
                 continue
@@ -492,6 +556,11 @@ def main(argv: list[str] | None = None) -> int:
     p_members.add_argument("--archive", required=True, type=Path)
     p_members.add_argument("--prefix", required=True)
     p_members.add_argument("--output", required=True, type=Path)
+    p_members.add_argument(
+        "--strict-namespace",
+        help="Fail closed if any member reaching this archive namespace (by any spelling) is not "
+             "canonical and inside --prefix (or a directory on the path to it).",
+    )
 
     p_chown = sub.add_parser("chown-members")
     p_chown.add_argument("--root", required=True)
@@ -518,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "establish":
             establish_root(args.root, args.owner, args.mode)
         elif args.command == "members":
-            members = validate_members(args.archive, args.prefix)
+            members = validate_members(args.archive, args.prefix, strict_namespace=args.strict_namespace)
             args.output.write_bytes(b"".join(m.encode("utf-8") + b"\0" for m in members))
             print(len(members))
         else:

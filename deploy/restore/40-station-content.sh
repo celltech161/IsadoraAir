@@ -211,6 +211,22 @@ if ! python3 "$PM_POLICY" check --root "$PM_LOGICAL_ROOT" --dedicated-path "$PRO
   exit 1
 fi
 log_info "Production media root: $PRODUCTION_MEDIA_ROOT (accepted by production/root_policy.py)"
+# The archive's ProductionMedia content is judged here too -- before this
+# stage's first mutation, in every mode -- so a rejected archive changes
+# nothing at all (no directory, owner or mode change, no extraction).
+# --strict-namespace: the backup only ever stages media/ beneath
+# srv-content/production-media/ (deploy/stage_production_media.sh), so ANY
+# other member reaching that namespace -- a sibling, an absolute, '..' or
+# otherwise non-canonical spelling, a link or a special file -- refuses the
+# archive. Members of other domains (reports/, etc-live/, ...) are not judged.
+PM_MEMBERS_FILE="$(mktemp)"
+trap 'rm -f -- "$PM_MEMBERS_FILE"' EXIT
+if ! python3 "$CONTENT_ROOT_SAFETY" members --archive "$RESTORE_ARCHIVE" \
+    --prefix srv-content/production-media/media --strict-namespace srv-content/production-media \
+    --output "$PM_MEMBERS_FILE" > /dev/null; then
+  log_error "Refusing: the archive's srv-content/production-media/ content failed member validation (see above). Nothing has been changed by this stage."
+  exit 1
+fi
 
 # ---- 1. Restored-from-backup subtrees ------------------------------------
 LISTING=$(tar -tzf "$RESTORE_ARCHIVE" 2>&1)
@@ -271,10 +287,7 @@ if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
       log_error "Refusing: PRODUCTION_MEDIA_ROOT now resolves to $PM_REVALIDATED_ROOT, not the validated $PRODUCTION_MEDIA_ROOT -- nothing extracted."
       exit 1
     fi
-    PM_MEMBERS_FILE="$(mktemp)"
-    trap 'rm -f -- "$PM_MEMBERS_FILE"' EXIT
-    python3 "$CONTENT_ROOT_SAFETY" members --archive "$RESTORE_ARCHIVE" \
-      --prefix srv-content/production-media/media --output "$PM_MEMBERS_FILE" > /dev/null
+    # $PM_MEMBERS_FILE: validated in section 0 (strict namespace).
     log_apply "restoring srv-content/production-media/media -> $PRODUCTION_MEDIA_ROOT/media"
     # ./srv-content/production-media/media/... : strip "." + "srv-content" +
     # "production-media" so "media/..." lands directly under the root.
@@ -284,11 +297,9 @@ if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
       sudo python3 -I "$CONTENT_ROOT_SAFETY" chown-members --root "$PRODUCTION_MEDIA_ROOT/media" --owner "$OWNER" \
         --members-file "$PM_MEMBERS_FILE" > /dev/null
     fi
-    rm -f -- "$PM_MEMBERS_FILE"
     PM_FILE_COUNT=$(find "$PRODUCTION_MEDIA_ROOT/media" -type f | wc -l)
     log_info "production media: restored, $PM_FILE_COUNT file(s); incoming/ work/ locks/ recreated empty. Run 'manage.py production_reconcile' to verify every ProductionMedia row still resolves to its bytes."
   else
-    log_plan "validate archive srv-content/production-media/media/ members (plain relative regular files/directories only)"
     log_plan "tar -xzf <archive> -C $PRODUCTION_MEDIA_ROOT --strip-components=3 ./srv-content/production-media/media"
     if [ -z "$RESTORE_STAGING_ROOT" ]; then
       log_plan "sudo chown (no-follow, exact restored members only) $OWNER under $PRODUCTION_MEDIA_ROOT/media"
@@ -297,6 +308,7 @@ if grep -qE '^(\./)?srv-content/production-media/media/' <<< "$LISTING"; then
 else
   log_warn "production media: archive has no srv-content/production-media/media entries -- directories created empty (legitimate on a station that has not used iPortal yet)."
 fi
+rm -f -- "$PM_MEMBERS_FILE"
 
 # ---- 2. Recreated-empty (regenerable/transient) subtrees -----------------
 for sub in waveforms aircheck rip_staging; do

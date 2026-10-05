@@ -225,7 +225,7 @@ class BackupScriptWiringTests(SimpleTestCase):
 class RestoreStageFunctionalTests(TempDirCase):
     """deploy/restore/40-station-content.sh, really executed under --staging-root."""
 
-    def archive(self, *, media=True, transient_in_archive=True, extra=()):
+    def archive(self, *, media=True, transient_in_archive=False, extra=()):
         path = self.tmp / "backup.tar.gz"
         with tarfile.open(path, "w:gz") as tar:
             def add(name, data=b"", mode=0o644, directory=False):
@@ -246,7 +246,10 @@ class RestoreStageFunctionalTests(TempDirCase):
                 add(f"./srv-content/production-media/media/{SHARD}", directory=True, mode=0o750)
                 add(f"./srv-content/production-media/media/{SHARD}/{KEY}", MEDIA_BYTES, mode=0o440)
             if transient_in_archive:
-                # An (illegitimate) archive carrying transient trees: restore must ignore them.
+                # An (illegitimate) archive carrying transient trees. A real backup
+                # never contains them (deploy/stage_production_media.sh names only
+                # media/); since the r0106 reconciliation (Codex review of 43c6a5f)
+                # restore REFUSES such an archive rather than silently ignoring it.
                 add("./srv-content/production-media/incoming/x.part", b"partial")
                 add("./srv-content/production-media/work/scratch", b"scratch")
                 add("./srv-content/production-media/locks/x.lock", b"")
@@ -292,6 +295,33 @@ class RestoreStageFunctionalTests(TempDirCase):
         _result, root = self.restore(self.archive(), "--apply")
         files = sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
         self.assertEqual(files, [f"media/{SHARD}/{KEY}"])
+
+    def test_an_archive_carrying_transient_trees_is_refused_before_any_change(self):
+        """Formerly "ignored"; the ProductionMedia archive namespace is now strict
+        (--strict-namespace): anything beside media/ fails the stage before its
+        first mutation."""
+        stage = self.tmp / "stage"
+        for transient in ("incoming/x.part", "work/scratch", "locks/x.lock"):
+            with self.subTest(transient=transient):
+                path = self.tmp / "transient.tar.gz"
+                with tarfile.open(path, "w:gz") as tar:
+                    for name in ("./srv-content", "./srv-content/production-media",
+                                 "./srv-content/production-media/media"):
+                        info = tarfile.TarInfo(name)
+                        info.type = tarfile.DIRTYPE
+                        info.mode = 0o750
+                        tar.addfile(info)
+                    info = tarfile.TarInfo(f"./srv-content/production-media/media/{SHARD}/{KEY}")
+                    info.size = len(MEDIA_BYTES)
+                    tar.addfile(info, io.BytesIO(MEDIA_BYTES))
+                    info = tarfile.TarInfo(f"./srv-content/production-media/{transient}")
+                    info.size = 1
+                    tar.addfile(info, io.BytesIO(b"x"))
+                result, root = self.restore(path, "--apply")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("failed member validation", result.stderr)
+                self.assertFalse(root.exists())
+                self.assertFalse((stage / "srv").exists())                       # nothing at all was created
 
     def test_the_existing_station_content_is_still_restored(self):
         result, _root = self.restore(self.archive(), "--apply")
