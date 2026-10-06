@@ -269,9 +269,13 @@ class RealGraphReconstructionTests(TransactionTestCase):
             MigrationExecutor(connection).migrate(before)
             original = build_probe_payload(**context)
             refs = [item["ref"] for item in original["plan"]]
-            self.assertEqual(refs, [
+            self.assertEqual(refs[:2], [
                 "library.0087_backfill_default_schedule_profile", "library.0088_enforce_schedule_profile_integrity",
             ])
+            # The REAL graph keeps growing: rolling library back to 0086 also
+            # unapplies every later library migration (2.22B: 0089), which the
+            # probe then correctly plans after the historical pair.
+            self.assertTrue(all(ref.startswith("library.") and ref > "library.0088" for ref in refs[2:]), refs)
             MigrationExecutor(connection).migrate(after_m1)
             resumed = build_probe_payload(**context, recovery_plan_refs=refs)
             self.assertNotEqual(resumed["migration_plan_digest"], original["migration_plan_digest"])
