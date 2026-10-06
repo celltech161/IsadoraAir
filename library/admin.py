@@ -3,6 +3,7 @@ from pathlib import Path
 from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, SortableTabularInline
 from django import forms
 from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
 from library.auth_forms import InviteCapablePasswordResetForm
 from django.contrib.auth.forms import UserChangeForm as DjangoUserChangeForm
 from django.contrib.auth.models import User
@@ -1752,11 +1753,17 @@ class FXBusConfigAdmin(admin.ModelAdmin):
 
 @admin.register(VoiceTrack)
 class VoiceTrackAdmin(admin.ModelAdmin):
-    """VT rows -- read-mostly. Primary create/edit path is the browser
-    recording + editor UI on /track/<pk>/ (and /voicetracks/ index).
-    Admin visibility here is for one-off inspection and delete;
-    admin-side add is allowed but the recorder UI is where the flow
-    naturally lives."""
+    """VT rows -- read-mostly. The create/edit/remove path is the iPortal
+    VoiceTrack studio (/voicetracks/studio/, linked from /track/<pk>/ and the
+    /voicetracks/ index). Admin visibility here is for one-off inspection;
+    admin-side add of a legacy-file row is still allowed.
+
+    2.22B: the ProductionMedia binding is read-only here, and a VoiceTrack is
+    NOT deleted from the admin -- "Remove from air" in iPortal is the
+    deliberate removal (optimistic revision, audit, confined legacy-file
+    cleanup; library.voicetrack_guard). Deleting the parent Track still
+    cascades to its VoiceTracks, so the per-object delete permission is left
+    as is for the Track admin's cascade check."""
 
     list_display = ["_badge", "track", "position", "duration_seconds",
                     "recorded_by", "recorded_at", "source"]
@@ -1767,6 +1774,24 @@ class VoiceTrackAdmin(admin.ModelAdmin):
     # through the locked binding service (iPortal / library.services.voicetrack_media).
     readonly_fields = ["duration_seconds", "recorded_at", "edited_at", "media"]
     ordering = ["-recorded_at"]
+
+    def get_actions(self, request):
+        actions = super().get_actions(request)
+        actions.pop("delete_selected", None)
+        return actions
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        return super().change_view(request, object_id, form_url,
+                                   extra_context={**(extra_context or {}), "show_delete": False})
+
+    def delete_view(self, request, object_id, extra_context=None):
+        raise PermissionDenied("Voice tracks are removed in iPortal (Remove from air), not in the admin.")
+
+    def delete_model(self, request, obj):
+        raise PermissionDenied("Voice tracks are removed in iPortal (Remove from air), not in the admin.")
+
+    def delete_queryset(self, request, queryset):
+        raise PermissionDenied("Voice tracks are removed in iPortal (Remove from air), not in the admin.")
 
     @admin.display(description="")
     def _badge(self, obj):

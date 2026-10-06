@@ -1990,31 +1990,70 @@ class FXBusConfig(models.Model):
         return obj
 
 
+_MEDIA_COLUMNS = frozenset({"media", "media_id"})
+_MEDIA_UNLOADED = object()          # VoiceTrack.media_id never loaded (deferred) on this instance
+
+
 class VoiceTrackQuerySet(models.QuerySet):
-    """2.22B: bulk paths may not touch the ProductionMedia binding -- see
-    library.voicetrack_guard. Everything else behaves exactly as before."""
+    """2.22B: no queryset path may write the ProductionMedia binding, and a
+    VoiceTrack is never deleted through a queryset outside the removal service
+    -- see library.voicetrack_guard. This is ALSO the base manager's queryset
+    (see after the VoiceTrack class), so Django's own instance saves, related
+    managers and ``_base_manager`` go through these checks too. Everything
+    else behaves exactly as before."""
 
     def update(self, **kwargs):
         from library import voicetrack_guard
-        if ({"media", "media_id"} & set(kwargs)) and not voicetrack_guard.binding_allowed():
+        if (_MEDIA_COLUMNS & set(kwargs)) and not voicetrack_guard.binding_allowed():
             voicetrack_guard.refuse("QuerySet.update()")
         return super().update(**kwargs)
 
+    update.alters_data = True
+
+    def _update(self, values):
+        # The field-object update Django uses for instance saves (and for anyone
+        # reaching for it directly). An instance save outside the binding scope
+        # never arrives here with the media column: VoiceTrack._do_update drops it.
+        from library import voicetrack_guard
+        if any(field.attname == "media_id" for field, _model, _value in values) \
+                and not voicetrack_guard.binding_allowed():
+            voicetrack_guard.refuse("QuerySet._update()")
+        return super()._update(values)
+
+    _update.alters_data = True
+    _update.queryset_only = False
+
     def bulk_update(self, objs, fields, batch_size=None):
         from library import voicetrack_guard
-        if ({"media", "media_id"} & set(fields)) and not voicetrack_guard.binding_allowed():
+        if (_MEDIA_COLUMNS & set(fields)) and not voicetrack_guard.binding_allowed():
             voicetrack_guard.refuse("bulk_update()")
         return super().bulk_update(objs, fields, batch_size=batch_size)
 
-    def bulk_create(self, objs, *args, **kwargs):
+    bulk_update.alters_data = True
+
+    def _insert(self, objs, fields, *args, **kwargs):
+        # Every INSERT: instance save, create(), bulk_create() -- including
+        # bulk_create(update_conflicts=True, update_fields=[...]).
         from library import voicetrack_guard
-        objs = list(objs)
-        if any(getattr(obj, "media_id", None) for obj in objs) and not voicetrack_guard.binding_allowed():
-            voicetrack_guard.refuse("bulk_create()")
-        update_fields = kwargs.get("update_fields") or (args[3] if len(args) > 3 else None) or ()
-        if ({"media", "media_id"} & set(update_fields)) and not voicetrack_guard.binding_allowed():
-            voicetrack_guard.refuse("bulk_create(update_conflicts)")
-        return super().bulk_create(objs, *args, **kwargs)
+        if not voicetrack_guard.binding_allowed():
+            if any(getattr(obj, "media_id", None) is not None for obj in objs):
+                voicetrack_guard.refuse("INSERT with a media binding")
+            update_fields = kwargs.get("update_fields") or (args[5] if len(args) > 5 else None) or ()
+            if any(getattr(field, "attname", field) in _MEDIA_COLUMNS for field in update_fields):
+                voicetrack_guard.refuse("bulk_create(update_conflicts)")
+        return super()._insert(objs, fields, *args, **kwargs)
+
+    _insert.alters_data = True
+    _insert.queryset_only = False
+
+    def delete(self):
+        from library import voicetrack_guard
+        if not voicetrack_guard.removal_allowed():
+            voicetrack_guard.refuse_removal("QuerySet.delete()")
+        return super().delete()
+
+    delete.alters_data = True
+    delete.queryset_only = True
 
 
 class VoiceTrackAudio:
@@ -2121,18 +2160,56 @@ class VoiceTrack(models.Model):
     def __str__(self):
         return f"{self.track.title} [{self.position}] by {self.recorded_by or 'unknown'}"
 
+    # -- 2.22B binding / removal enforcement (library.voicetrack_guard) --------
+
     @classmethod
     def from_db(cls, db, field_names, values):
         instance = super().from_db(db, field_names, values)
-        instance._loaded_media_id = instance.__dict__.get("media_id")
+        instance._loaded_media_id = instance.__dict__.get("media_id", _MEDIA_UNLOADED)
         return instance
 
-    def save(self, *args, **kwargs):
+    def refresh_from_db(self, using=None, fields=None, from_queryset=None):
+        super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
+        if fields is None or _MEDIA_COLUMNS & set(fields):
+            self._loaded_media_id = self.__dict__.get("media_id", _MEDIA_UNLOADED)
+
+    def _media_change_attempted(self):
+        current = self.__dict__.get("media_id", _MEDIA_UNLOADED)
+        if current is _MEDIA_UNLOADED:
+            return False                    # neither loaded nor assigned: never written
+        loaded = getattr(self, "_loaded_media_id", None)    # a new instance starts unbound
+        return loaded is _MEDIA_UNLOADED or current != loaded
+
+    def _save_table(self, *args, **kwargs):
+        # EVERY instance save arrives here: save(), save_base(),
+        # Model.save_base(self), create(), get_or_create(), update_or_create(),
+        # related add(bulk=False), ModelForm and admin.
         from library import voicetrack_guard
-        loaded = getattr(self, "_loaded_media_id", None)
-        deferred = "media_id" not in self.__dict__
-        if not deferred and self.media_id != loaded and not voicetrack_guard.binding_allowed():
-            voicetrack_guard.refuse("VoiceTrack.save()")
+        allowed = voicetrack_guard.binding_allowed()
+        if not allowed and self._media_change_attempted():
+            voicetrack_guard.refuse("VoiceTrack save")
+        updated = super()._save_table(*args, **kwargs)
+        if allowed and "media_id" in self.__dict__:
+            self._loaded_media_id = self.media_id
+        return updated
+
+    def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
+        # Outside the binding service an instance save never WRITES the media
+        # column at all, so a stale instance cannot put an old binding back.
+        from library import voicetrack_guard
+        if not voicetrack_guard.binding_allowed():
+            values = [entry for entry in values if entry[0].attname != "media_id"]
+        return super()._do_update(base_qs, using, pk_val, values, update_fields, forced_update)
+
+    def delete(self, *args, **kwargs):
+        from library import voicetrack_guard
+        if not voicetrack_guard.removal_allowed():
+            voicetrack_guard.refuse_removal("VoiceTrack.delete()")
+        return super().delete(*args, **kwargs)
+
+    delete.alters_data = True
+
+    def save(self, *args, **kwargs):
         if self.media_id is None and self.filepath:
             # Legacy file only: same mutagen auto-populate as FXCart --
             # non-fatal if the file is missing or unreadable. A
@@ -2148,8 +2225,6 @@ class VoiceTrack(models.Model):
                 except Exception:
                     self.duration_seconds = None
         super().save(*args, **kwargs)
-        if not deferred:
-            self._loaded_media_id = self.media_id
 
     @property
     def file_exists(self):
@@ -2192,6 +2267,16 @@ class VoiceTrack(models.Model):
         if self.filepath and Path(self.filepath).is_file():
             return VoiceTrackAudio(self.filepath, self.duration_seconds, VoiceTrackAudio.ORIGIN_LEGACY)
         return None
+
+
+# 2.22B: Django's base manager -- used for every instance save, related-object
+# access and related-manager write -- must be the guarded one too, or
+# ``VoiceTrack._base_manager.update(media=...)`` would bypass the binding
+# service. Set on _meta (it survives apps.clear_cache()) rather than in Meta so
+# it is not migration state: managers are not migrated, and historical models
+# in migrations keep Django's plain base manager.
+VoiceTrack._meta.base_manager_name = "objects"
+VoiceTrack._meta.__dict__.pop("base_manager", None)
 
 
 class VoiceTrackConfig(models.Model):

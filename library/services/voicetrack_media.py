@@ -226,9 +226,11 @@ def _legacy_file_to_remove(filepath):
 
 
 def remove_voicetrack(*, track_id, position, user, expected_revision):
-    """Delete the evergreen VoiceTrack (existing domain behavior). The bound
-    ProductionMedia is NOT deleted or unlinked -- it simply becomes
-    unreferenced; retention decides about its bytes later."""
+    """Delete the evergreen VoiceTrack (existing domain behavior) -- the ONLY
+    direct VoiceTrack deletion (library.voicetrack_guard.removal_scope; the
+    admin and generic deletes are refused). The bound ProductionMedia is NOT
+    deleted or unlinked -- it simply becomes unreferenced; retention decides
+    about its bytes later."""
     from library.models import VoiceTrack
     with transaction.atomic():
         vt = VoiceTrack.objects.select_for_update().filter(track_id=track_id, position=position) \
@@ -240,7 +242,8 @@ def remove_voicetrack(*, track_id, position, user, expected_revision):
         track, media_id = vt.track, vt.media_id
         legacy = _legacy_file_to_remove(vt.filepath)
         vt_id = vt.pk
-        vt.delete()
+        with voicetrack_guard.removal_scope():
+            vt.delete()
         if legacy is not None:
             transaction.on_commit(lambda: _unlink_quiet(legacy))
         transaction.on_commit(lambda: _audit("deleted", vt_id, track, position, user, None, media_id))
