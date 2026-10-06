@@ -77,6 +77,8 @@ INFRASTRUCTURE_CODES = frozenset({
     # stopped by a station resource limit, or validation that could not be
     # confined at all. Station limits, never a verdict on the bytes.
     "validation_resource_limit", "confinement_unavailable",
+    # The validation service is at its admission limit: retry later.
+    "validation_busy",
 })
 
 FFPROBE = "ffprobe"
@@ -147,8 +149,8 @@ def _run_failure(result, prefix):
     """Map a non-ok bounded-run result to an outcome. Exit codes > 0 are the
     TOOL's verdict on the input (caller decides); everything else is infra."""
     status = result.get("status")
-    if status == "confinement_unavailable":
-        return _infrastructure("confinement_unavailable")
+    if status in _SERVICE_REFUSALS:
+        return _infrastructure(_SERVICE_REFUSALS[status])
     if status == "resource_limit":
         return _infrastructure("validation_resource_limit")
     if status == "timeout":
@@ -168,7 +170,16 @@ class _Interrupted(Exception):
 
 
 class _Unconfined(Exception):
-    """The validation service / kernel boundary is unavailable: no tool can run."""
+    """The validation service / kernel boundary is unavailable, or the service
+    is at capacity: no tool ran. ``code`` is the infrastructure code."""
+
+    def __init__(self, code="confinement_unavailable"):
+        super().__init__(code)
+        self.code = code
+
+
+# Run statuses meaning the service did not (or could not safely) run the tool.
+_SERVICE_REFUSALS = {"confinement_unavailable": "confinement_unavailable", "busy": "validation_busy"}
 
 
 _TOOL_VERSIONS: dict[str, str] = {}
@@ -187,8 +198,8 @@ def _tool_version(binary, stop_event=None):
                   stop_event=stop_event)
     if result.get("status") == "stopped":
         raise _Interrupted
-    if result.get("status") == "confinement_unavailable":
-        raise _Unconfined
+    if result.get("status") in _SERVICE_REFUSALS:
+        raise _Unconfined(_SERVICE_REFUSALS[result["status"]])
     if result.get("status") != "ok":
         return None
     match = _VERSION_RE.match(result.get("stdout", ""))
@@ -205,8 +216,8 @@ def _decoder_available(name, stop_event=None):
                   timeout_seconds=CAPABILITY_TIMEOUT_SECONDS, stop_event=stop_event)
     if result.get("status") == "stopped":
         raise _Interrupted
-    if result.get("status") == "confinement_unavailable":
-        raise _Unconfined
+    if result.get("status") in _SERVICE_REFUSALS:
+        raise _Unconfined(_SERVICE_REFUSALS[result["status"]])
     if result.get("status") != "ok":
         return None
     available = result.get("stdout", "").lstrip().startswith(f"Decoder {name}")
@@ -258,8 +269,8 @@ def _analyze_path(path: Path, *, require_engine_decode=True, stop_event=None) ->
         return _analyze(path, require_engine_decode=require_engine_decode, stop_event=stop_event)
     except _Interrupted:
         return _infrastructure("validation_interrupted")
-    except _Unconfined:
-        return _infrastructure("confinement_unavailable")
+    except _Unconfined as exc:
+        return _infrastructure(exc.code)
 
 
 def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutcome:

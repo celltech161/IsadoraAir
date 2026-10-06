@@ -22,6 +22,11 @@ class Command(BaseCommand):
         parser.add_argument("--limit", action="append", default=[], metavar="FIELD=INTEGER",
                             help="Override one confinement.Limits field (service configuration; "
                                  "default: settings.PRODUCTION_VALIDATION_LIMITS).")
+        parser.add_argument("--max-active", type=int, default=None,
+                            help="Runs at once (default: settings.PRODUCTION_VALIDATION_MAX_ACTIVE or 2).")
+        parser.add_argument("--max-pending", type=int, default=None,
+                            help="Admitted requests waiting for a run slot (default: "
+                                 "settings.PRODUCTION_VALIDATION_MAX_PENDING or 4).")
 
     def handle(self, *args, **options):
         limits = confinement.configured_limits()
@@ -33,7 +38,12 @@ class Command(BaseCommand):
             overrides[name] = int(value)
         if overrides:
             limits = dataclasses.replace(limits, **overrides)
-        ValidationService(options["socket"] or confinement.socket_path(), limits=limits).serve_forever()
+        try:
+            service = ValidationService(options["socket"] or confinement.socket_path(), limits=limits,
+                                        max_active=options["max_active"], max_pending=options["max_pending"])
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
+        service.serve_forever()
         return None
 
     requires_system_checks = []           # no database involved; start fast, start always

@@ -38,7 +38,7 @@ def _manager(method: str, unit: str) -> None:
 
 
 class TransientValidationService:
-    def __init__(self, *, env=None, path_prefix=None, limits=None):
+    def __init__(self, *, env=None, path_prefix=None, limits=None, args=()):
         self.runtime = Path(tempfile.mkdtemp(prefix="isadoraair-validation-t.",
                                              dir=os.environ.get("XDG_RUNTIME_DIR") or None))
         self.runtime.chmod(0o700)
@@ -54,6 +54,7 @@ class TransientValidationService:
         command += [f"--setenv={name}={value}" for name, value in variables.items()]
         command += [sys.executable, str(REPO / "manage.py"), "production_validation_service"]
         command += [f"--limit={name}={value}" for name, value in (limits or {}).items()]
+        command += list(args)
         subprocess.run(command, check=True, capture_output=True, timeout=30)
         self.wait_ready()
 
@@ -64,12 +65,12 @@ class TransientValidationService:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             pid = self.main_pid()
-            if pid and pid != not_pid and self._accepts():
+            if pid and pid != not_pid and self.accepts():
                 return pid
             time.sleep(0.05)
         raise AssertionError(f"{self.unit} did not become ready")
 
-    def _accepts(self):
+    def accepts(self):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             probe.settimeout(1)

@@ -6,13 +6,18 @@ validation run; the web process is only its client.
   or limits; a private socket and a same-account peer;
 * fail closed without the service, and a clean retry once it is back;
 * the SERVICE's limits govern every run;
+* admission: a connection flood far beyond the bound never grows threads,
+  connections, media descriptors or runs past it; slow clients cannot hold
+  admission; excess is a retryable ``busy``, and the service then serves;
 * lifecycle (real systemd user units with the production unit's properties):
   the requesting worker SIGKILLed, a frozen client, the service SIGKILLed,
   stopped and restarted, and leftover leaves reaped at start-up -- in every
   case no validator task survives and no later request is needed.
 """
 import array
+import errno
 import io
+import shutil
 import json
 import os
 import signal
@@ -30,6 +35,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from production.models import ProductionMedia
 from production.services import confinement, intake, validation, validator_commands
+from production.services import validation_service as service_module
 from production.services.validation_service import ValidationService
 
 from .support import IsolatedMediaRootMixin, fixture
@@ -46,7 +52,7 @@ def _alive(pid: int) -> bool:
         return False
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (FileNotFoundError, IndexError):
+    except (OSError, IndexError):                 # gone meanwhile (ENOENT or ESRCH)
         return False
 
 
@@ -92,6 +98,40 @@ HANGS_WITH_A_DETACHED_DESCENDANT = """
 """
 
 
+def hang_while(testcase, flag: Path):
+    """``ffprobe`` that hangs (leaving a detached descendant) while ``flag``
+    exists, and is the real ffprobe otherwise."""
+    real = shutil.which("ffprobe")
+    testcase.assertTrue(real, "ffprobe is required")
+    return fake_tools(testcase, ffprobe=f"""
+        #!/bin/bash
+        if [ -e '{flag}' ]; then
+            setsid sleep 300 </dev/null >/dev/null 2>&1 &
+            exec sleep 300
+        fi
+        exec '{real}' "$@"
+    """)
+
+
+def _connects(path) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(1)
+        probe.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _private_socket_path(testcase) -> str:
+    directory = tempfile.mkdtemp(prefix="isadoraair-validation-ip.", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+    os.chmod(directory, 0o700)
+    testcase.addCleanup(shutil.rmtree, directory, True)
+    return os.path.join(directory, "v.sock")
+
+
 def raw_request(socket_path, payload: bytes, fds=()):
     """Speak the protocol directly (whatever a hostile local client could send)."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -99,7 +139,10 @@ def raw_request(socket_path, payload: bytes, fds=()):
     try:
         sock.connect(socket_path)
         ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", list(fds)))] if fds else []
-        sock.sendmsg([payload], ancillary)
+        try:
+            sock.sendmsg([payload], ancillary)
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                  # answered ``busy`` and closed before we sent: read it
         data = b""
         while True:
             try:
@@ -228,6 +271,8 @@ class ProtocolTests(SimpleTestCase):
             "limits": (request(limits={"group_memory_bytes": 1 << 40}), [media]),
             "a bad timeout": (request(timeout=-1), [media]),
             "a NaN timeout": (b'{"v": 1, "argv": %s, "timeout": NaN}\n' % json.dumps(probe).encode(), [media]),
+            "a timeout too large for a float": (
+                b'{"v": 1, "argv": %s, "timeout": 1%s}\n' % (json.dumps(probe).encode(), b"0" * 400), [media]),
             "an unknown version": (request(v=2), [media]),
             "not JSON": (b"ffprobe -version\n", []),
             "an oversized request": (b"[" + b"1," * 40000 + b"1]\n", []),
@@ -337,6 +382,252 @@ class FailClosedAndRetryTests(IsolatedMediaRootMixin, TestCase):
         with validation_service():
             validation.clear_capability_cache()
             self.assertEqual(validation.validate_media(media).status, "valid")
+
+
+    def test_a_service_at_capacity_answers_busy_retryably_and_serves_the_retry(self):
+        media = self.stored()
+        flag = Path(tempfile.mkdtemp(prefix="hang-flag-")) / "hang"
+        self.addCleanup(shutil.rmtree, flag.parent, True)
+        flag.touch()
+        with validation_service(path_prefix=hang_while(self, flag), args=["--max-active=1", "--max-pending=0"]) \
+                as service:
+            for _ in range(20):         # (the readiness probe's own connection may still hold the slot)
+                holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.addCleanup(holder.close)
+                holder.connect(service.socket)
+                holder.sendall(b'{"v": 1, "argv": ["ffprobe", "-version"], "timeout": 60}\n')
+                if _eventually(lambda: service.leaves(), 2):
+                    break
+                holder.close()
+            self.assertTrue(service.leaves(), "the occupying run never started")
+            outcome = validation.validate_media(media)
+            self.assertEqual((outcome.status, outcome.code), ("infrastructure_error", "validation_busy"))
+            self.assertEqual(ProductionMedia.objects.get(pk=media.pk).validation_state, "unvalidated")
+            holder.close()                                          # its run is cancelled; capacity returns
+            flag.unlink()
+            self.assertTrue(_eventually(lambda: not service.leaves(), 15))
+            validation.clear_capability_cache()
+            self.assertEqual(validation.validate_media(media).status, "valid")
+
+
+class AdmissionTests(SimpleTestCase):
+    """Codex 2.22B blocker 1: admission itself is bounded. Only an admitted
+    connection gets a handler thread; everything beyond max_active +
+    max_pending is answered ``busy`` from the accept loop and closed."""
+
+    FLOOD = 128
+    LIMIT = service_module.MAX_ACTIVE_RUNS + service_module.MAX_PENDING_REQUESTS
+
+    def setUp(self):
+        validation.clear_capability_cache()
+        self.addCleanup(validation.clear_capability_cache)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.wav = Path(tmp.name) / "tone.wav"
+        _tone(self.wav, 0.5)
+        self.flag = Path(tmp.name) / "hang"
+        self.media_fd = os.open(self.wav, os.O_RDONLY)
+        self.addCleanup(os.close, self.media_fd)
+
+    def test_the_defaults_are_small_and_explicit(self):
+        self.assertEqual((service_module.MAX_ACTIVE_RUNS, service_module.MAX_PENDING_REQUESTS), (2, 4))
+        self.assertLessEqual(service_module.REQUEST_READ_TIMEOUT_SECONDS, 5)
+        service = ValidationService("/nonexistent/v.sock")
+        self.assertEqual((service.max_active, service.max_pending), (2, 4))
+        with self.assertRaises(ValueError):
+            ValidationService("/nonexistent/v.sock", max_active=0)
+
+    # -- clients ------------------------------------------------------------------
+    @staticmethod
+    def _connect(path, sock, wait):
+        """``wait``: a blocking connect waits for room in the listen backlog (and
+        reaches the service); otherwise a full backlog refuses it with EAGAIN."""
+        if not wait:
+            sock.settimeout(60)
+        sock.connect(path)
+        sock.settimeout(60)
+
+    @classmethod
+    def _complete(cls, path, payload, fds, results, index, wait):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            cls._connect(path, sock, wait)
+            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", list(fds)))] if fds else []
+            try:
+                sock.sendmsg([payload], ancillary)
+            except OSError:
+                pass                                # a busy answer may have closed it already
+            data = b""
+            while not data.endswith(b"\n"):
+                try:
+                    chunk = sock.recv(65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            results[index] = json.loads(data)["status"] if data.endswith(b"\n") else "no-answer"
+        except OSError as exc:
+            results[index] = f"connect-error-{exc.errno}"
+        finally:
+            sock.close()
+
+    @classmethod
+    def _slow(cls, path, dribble, stop, results, index, wait=True):
+        """Connects and never completes a request: silent, or one byte at a time."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        def closed():
+            try:
+                data = sock.recv(65536, socket.MSG_DONTWAIT)
+            except OSError:
+                data = b""
+            return "busy" if b'"busy"' in data else "dropped"
+
+        try:
+            cls._connect(path, sock, wait)
+            started = time.monotonic()
+            while not stop.is_set():
+                if dribble:
+                    try:
+                        sock.send(b"{" if time.monotonic() - started < 0.1 else b" ")
+                    except OSError:
+                        results[index] = (closed(), time.monotonic() - started)
+                        return
+                readable, _, _ = __import__("select").select([sock], [], [], 0.25)
+                if readable:
+                    results[index] = (closed(), time.monotonic() - started)
+                    return
+            results[index] = ("still-open", time.monotonic() - started)
+        except OSError as exc:
+            results[index] = (f"connect-error-{exc.errno}", 0)
+        finally:
+            sock.close()
+
+    def _sample(self, service, stop, peaks):
+        while not stop.is_set():
+            pid = service.main_pid()
+            try:
+                threads = len(os.listdir(f"/proc/{pid}/task"))
+                sockets = media = 0
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    try:
+                        target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                    except OSError:
+                        continue
+                    sockets += target.startswith("socket:")
+                    media += target == str(self.wav)
+            except (OSError, TypeError):
+                time.sleep(0.005)
+                continue
+            leaves = len(service.leaves())
+            for name, value in (("threads", threads), ("sockets", sockets), ("media_fds", media),
+                                ("leaves", leaves)):
+                peaks[name] = max(peaks.get(name, 0), value)
+            peaks["samples"] = peaks.get("samples", 0) + 1
+            time.sleep(0.005)
+
+    def test_a_flood_far_beyond_the_bound_stays_bounded_and_the_service_then_serves(self):
+        self.flag.touch()
+        with validation_service(path_prefix=hang_while(self, self.flag)) as service:
+            pid = service.main_pid()
+            self.assertTrue(_eventually(lambda: len(os.listdir(f"/proc/{pid}/task")) == 1, 10))
+            baseline_sockets = sum(os.readlink(f"/proc/{pid}/fd/{fd}").startswith("socket:")
+                                   for fd in os.listdir(f"/proc/{pid}/fd"))
+            probe = (json.dumps({"v": 1, "argv": validator_commands.probe("ffprobe", "wav", validator_commands.MEDIA),
+                                 "timeout": 6}) + "\n").encode()
+            version = b'{"v": 1, "argv": ["ffprobe", "-version"], "timeout": 6}\n'
+            results, slow_results, peaks = {}, {}, {}
+            stop_slow, stop_sampling = threading.Event(), threading.Event()
+            sampler = threading.Thread(target=self._sample, args=(service, stop_sampling, peaks), daemon=True)
+            sampler.start()
+            clients, complete_clients = [], []
+            for index in range(self.FLOOD):
+                kind, wait = index % 8, index % 16 < 8      # half wait for backlog room, half do not
+                if kind < 3:      # 48 media requests, each passing a descriptor
+                    target, args = self._complete, (service.socket, probe, [self.media_fd], results, index, wait)
+                elif kind < 6:    # 48 plain requests
+                    target, args = self._complete, (service.socket, version, (), results, index, wait)
+                else:             # 32 slow clients: 16 silent, 16 dribbling a byte at a time
+                    target, args = self._slow, (service.socket, kind == 7, stop_slow, slow_results, index, wait)
+                clients.append(threading.Thread(target=target, args=args, daemon=True))
+                if target == self._complete:
+                    complete_clients.append(clients[-1])
+            for client in clients:
+                client.start()
+            for client in complete_clients:
+                client.join(60)
+            self.assertTrue(_eventually(lambda: len(slow_results) == 32, 15), slow_results)
+            stop_slow.set()
+            for client in clients:
+                client.join(10)
+            stop_sampling.set()
+            sampler.join(10)
+
+            # "busy" from the service, or EAGAIN from a full kernel backlog (also
+            # reported to the real client as busy) -- both bounded refusals
+            refused = ("busy", f"connect-error-{errno.EAGAIN}")
+            complete = list(results.values())
+            slow = [outcome for outcome, _ in slow_results.values()]
+            admitted = [o for o in complete if o not in refused] + [o for o in slow if o not in refused]
+            report = (f"flood={self.FLOOD} limit={self.LIMIT} peaks={peaks} baseline_sockets={baseline_sockets} "
+                      f"complete={ {s: complete.count(s) for s in set(complete)} } "
+                      f"slow={ {s: slow.count(s) for s in set(slow)} }")
+            if os.environ.get("VALIDATION_FLOOD_REPORT"):
+                sys.stderr.write(report + "\n")
+            self.assertEqual(len(complete), 96, report)
+            self.assertTrue(set(complete) <= {*refused, "timeout"}, report)   # every client got an answer
+            self.assertNotIn("still-open", slow, report)                       # no slow client kept a slot
+            self.assertLessEqual(len(admitted), self.LIMIT, report)
+            self.assertGreaterEqual(complete.count("busy") + slow.count("busy"), self.FLOOD // 4, report)
+            self.assertGreater(peaks.get("samples", 0), 50, report)
+            # one main thread, one per admitted connection, two output readers per run
+            self.assertLessEqual(peaks["threads"], 1 + self.LIMIT + 2 * service_module.MAX_ACTIVE_RUNS, report)
+            # admitted connections, plus the one being refused on the accept loop
+            self.assertLessEqual(peaks["sockets"] - baseline_sockets, self.LIMIT + 1, report)
+            self.assertLessEqual(peaks["media_fds"], self.LIMIT, report)
+            self.assertLessEqual(peaks["leaves"], service_module.MAX_ACTIVE_RUNS, report)
+
+            # load gone: a legitimate validation succeeds -- same service process
+            self.flag.unlink()
+            self.assertTrue(_eventually(lambda: not service.leaves(), 15))
+            outcome = validation._analyze_path(self.wav, require_engine_decode=True)
+            self.assertEqual(outcome.status, validation.STATUS_VALID, outcome)
+            self.assertEqual(service.main_pid(), pid, "the service restarted")
+            self.assertEqual(len(os.listdir(f"/proc/{pid}/task")), 1)
+
+    def test_a_full_accept_queue_is_busy_for_the_client_not_unavailable(self):
+        path = _private_socket_path(self)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(path)
+        listener.listen(0)                                          # never accepts: one queued connection fills it
+        queued = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(queued.close)
+        queued.connect(path)
+        with override_settings(PRODUCTION_VALIDATION_SOCKET=path):
+            result = confinement.run_confined(["ffprobe", "-version"], timeout_seconds=5)
+        self.assertEqual(result["status"], "busy", result)
+        self.assertEqual(validation._run_failure(result, "probe").code, "validation_busy")
+
+    def test_slow_clients_cannot_hold_admission(self):
+        with validation_service() as service:
+            stop, results = threading.Event(), {}
+            slow = [threading.Thread(target=self._slow, args=(service.socket, index % 2 == 1, stop, results, index),
+                                     daemon=True) for index in range(self.LIMIT)]
+            self.addCleanup(lambda: (stop.set(), [thread.join(10) for thread in slow]))
+            for thread in slow:
+                thread.start()
+            time.sleep(0.5)
+            self.assertEqual(raw_request(service.socket, b'{"v": 1, "argv": ["ffprobe", "-version"], '
+                                                         b'"timeout": 5}\n')["status"], "busy")
+            # the service drops them -- while they are still dribbling -- and serves again
+            limit = service_module.REQUEST_READ_TIMEOUT_SECONDS
+            self.assertTrue(_eventually(lambda: len(results) == self.LIMIT, limit + 5), results)
+            self.assertEqual({outcome for outcome, _ in results.values()}, {"dropped"}, results)
+            self.assertTrue(all(limit - 1 <= held <= limit + 3 for _, held in results.values()), results)
+            answer = raw_request(service.socket, b'{"v": 1, "argv": ["ffprobe", "-version"], "timeout": 5}\n')
+            self.assertEqual(answer["status"], "ok", answer)
 
 
 class LifecycleTests(WorkerMixin, SimpleTestCase):

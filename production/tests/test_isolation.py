@@ -32,6 +32,7 @@ EXEMPT_CLASSES = {
     # user-level services only; no database, never a media root.
     "production.tests.test_validation_service.ProtocolTests",
     "production.tests.test_validation_service.LifecycleTests",
+    "production.tests.test_validation_service.AdmissionTests",
 }
 
 

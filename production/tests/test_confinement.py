@@ -58,7 +58,7 @@ def _alive(pid: int) -> bool:
         return False
     try:                                  # a zombie still answers kill(0)
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (FileNotFoundError, IndexError):
+    except (OSError, IndexError):                 # gone meanwhile (ENOENT or ESRCH)
         return False
 
 
@@ -609,6 +609,25 @@ class ValidationFailureMappingTests(SimpleTestCase):
         outcome = validation._run_failure({"status": "failed", "returncode": -15}, "engine_probe")
         self.assertEqual((outcome.status, outcome.code), (validation.STATUS_INFRASTRUCTURE, "engine_probe_killed"))
         for status, code in (("resource_limit", "validation_resource_limit"),
-                             ("confinement_unavailable", "confinement_unavailable")):
+                             ("confinement_unavailable", "confinement_unavailable"),
+                             ("busy", "validation_busy")):
             outcome = validation._run_failure({"status": status, "returncode": None}, "decode")
-            self.assertEqual(outcome.code, code)
+            self.assertEqual((outcome.status, outcome.code), (validation.STATUS_INFRASTRUCTURE, code))
+
+    def test_a_busy_service_is_a_retryable_infrastructure_outcome_never_a_verdict(self):
+        busy = {"status": "busy", "returncode": None, "stdout": "", "stderr": "", "confined": True}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(confinement, "run_confined", return_value=busy):
+            wav = Path(directory) / "x.wav"
+            import wave
+            with wave.open(str(wav), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(48000)
+                handle.writeframes(b"\1\0" * 48000)
+            validation.clear_capability_cache()
+            outcome = validation._analyze_path(wav)
+        self.assertEqual((outcome.status, outcome.code), (validation.STATUS_INFRASTRUCTURE, "validation_busy"))
+        self.assertIn("validation_busy", validation.INFRASTRUCTURE_CODES)
+        self.assertNotIn("validation_busy", validation.MEDIA_VERDICT_CODES)
+

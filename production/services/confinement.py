@@ -47,7 +47,8 @@ Fail closed: no validation service, no delegated subtree, a missing cpu /
 memory / pids controller, no ``memory.swap.max`` or ``cgroup.kill``, Landlock
 or seccomp unavailable, a launcher step that cannot be verified, or a leaf that
 cannot be emptied -> ``confinement_unavailable`` (a retryable infrastructure
-error). A tool is never run outside the boundary.
+error). A tool is never run outside the boundary. A service at capacity
+answers ``busy`` (also retryable) without reading the request.
 """
 from __future__ import annotations
 
@@ -96,7 +97,7 @@ LIMIT_SIGNALS = frozenset({signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL, signa
 RESOURCE_LIMIT_MARKERS = ("Cannot allocate memory", "Out of memory", "MemoryError", "std::bad_alloc",
                           "File too large")
 STATUSES = frozenset({"ok", "failed", "timeout", "stopped", "unavailable", "infrastructure_error",
-                      "confinement_unavailable", "resource_limit"})
+                      "confinement_unavailable", "resource_limit", "busy"})
 
 
 class ConfinementUnavailable(Exception):
@@ -447,7 +448,8 @@ def run_confined(args, *, timeout_seconds, stop_event=None, media=None) -> dict:
     and sent as a descriptor; the request carries the command with a
     placeholder in its place. Same result shape as ``execute``. Any failure to
     reach a healthy service is ``confinement_unavailable`` (retryable); a
-    command the service does not recognise is ``unavailable``."""
+    service at capacity is ``busy`` (retryable); a command the service does not
+    recognise is ``unavailable``."""
     from . import validator_commands
 
     argv = [str(item) for item in args]
@@ -471,13 +473,19 @@ def run_confined(args, *, timeout_seconds, stop_event=None, media=None) -> dict:
     try:
         try:
             sock.settimeout(CONNECT_TIMEOUT_SECONDS)
-            sock.connect(socket_path())
+            try:
+                sock.connect(socket_path())
+            except BlockingIOError:         # EAGAIN: the service's accept queue is full
+                return {"status": "busy", "returncode": None, "stdout": "",
+                        "stderr": "the validation service's accept queue is full; retry later", "confined": True}
             if peer_uid(sock) != os.geteuid():
                 return _unavailable("the validation socket belongs to another account")
             fds = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [media_fd]))] if media_fd is not None else []
             sock.sendmsg([request], fds)    # the connection then stays open: closing it cancels the run
         except OSError as exc:
-            return _unavailable(f"validation service unavailable: {exc.strerror or exc}")
+            # A service at capacity answers ``busy`` and closes at once -- possibly
+            # before this request was even sent. Its answer may be waiting.
+            return _queued_answer(sock) or _unavailable(f"validation service unavailable: {exc.strerror or exc}")
         finally:
             if media_fd is not None:
                 os.close(media_fd)
@@ -505,12 +513,28 @@ def run_confined(args, *, timeout_seconds, stop_event=None, media=None) -> dict:
             reply.extend(chunk)
             if len(reply) > limit:
                 return _unavailable("oversized reply from the validation service")
-        try:
-            result = json.loads(bytes(reply).decode("utf-8"))
-            assert isinstance(result, dict) and result.get("status") in STATUSES
-        except (ValueError, AssertionError):
-            return _unavailable("the validation service ended the run without an answer")
-        result["confined"] = True
-        return result
+            if reply.endswith(b"\n"):
+                break                       # the service answers with exactly one line
+        return _answer(reply) or _unavailable("the validation service ended the run without an answer")
     finally:
         sock.close()
+
+
+def _answer(reply) -> dict | None:
+    try:
+        result = json.loads(bytes(reply).decode("utf-8"))
+    except ValueError:
+        return None
+    if not isinstance(result, dict) or result.get("status") not in STATUSES:
+        return None
+    result["confined"] = True
+    return result
+
+
+def _queued_answer(sock) -> dict | None:
+    """An answer already waiting on ``sock`` (never blocks)."""
+    try:
+        reply = sock.recv(65536, socket.MSG_DONTWAIT)
+    except OSError:
+        return None
+    return _answer(reply) if reply.endswith(b"\n") else None
