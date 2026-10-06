@@ -36,13 +36,15 @@
 # else the backup stages) and refuses otherwise, BEFORE writing a byte, so a
 # growing store can never fill the work area part-way through a backup and
 # starve the station. The refusal names the media size, the requirement, the
-# available space and the filesystem.
+# available space and the filesystem. The reserve must be 0..1 TiB; every
+# count is bounded (< 10^18) so the arithmetic cannot overflow, and a failed
+# or implausible du/df answer refuses rather than guesses.
 #
 # Exit status: 0 copied, or nothing to copy (no store yet is legitimate);
-#              2 bad usage; 3 media/ exists but is not a real directory, or
+#              2 bad usage or a bad reserve; 3 media/ exists but is not a real directory, or
 #              the root fails the safety policy (misconfiguration: fail closed
 #              rather than silently skip durable content or read the wrong tree);
-#              4 not enough staging space (nothing was copied).
+#              4 not enough staging space, or it cannot be measured (nothing was copied).
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -89,14 +91,44 @@ if [ -L "$SRC" ] || [ ! -d "$SRC" ]; then
 fi
 
 # ---- capacity preflight (before ANY write) -----------------------------------
-RESERVE_BYTES="${PRODUCTION_MEDIA_STAGING_RESERVE_BYTES:-1073741824}"
-case "$RESERVE_BYTES" in ''|*[!0-9]*) echo "error: PRODUCTION_MEDIA_STAGING_RESERVE_BYTES must be a byte count" >&2; exit 2 ;; esac
-MEDIA_BYTES=$(du -s -B1 --apparent-size "$SRC" | cut -f1)
+# Overflow-safe by construction: every byte count must be a plain decimal of
+# at most 18 digits (< 10^18), so 2 x media + reserve < 2^63 always holds in
+# bash's signed 64-bit arithmetic, and every value is read base-10 (10#) so a
+# leading zero is never octal. Anything else fails closed BEFORE staging.
+MAX_RESERVE_BYTES=1099511627776       # 1 TiB: the largest accepted reserve
+is_byte_count() { [[ "$1" =~ ^[0123456789]{1,18}$ ]]; }   # ASCII digits, whatever the locale
+
+RESERVE_RAW="${PRODUCTION_MEDIA_STAGING_RESERVE_BYTES:-1073741824}"
+if ! is_byte_count "$RESERVE_RAW" || (( 10#$RESERVE_RAW > MAX_RESERVE_BYTES )); then
+  echo "error: PRODUCTION_MEDIA_STAGING_RESERVE_BYTES must be a whole number of bytes from 0 to ${MAX_RESERVE_BYTES} (got '${RESERVE_RAW}'); refusing to stage" >&2
+  exit 2
+fi
+RESERVE_BYTES=$(( 10#$RESERVE_RAW ))
+
+if ! DU_OUT=$(du -s -B1 --apparent-size -- "$SRC"); then
+  echo "error: could not measure production media at $SRC; refusing to stage" >&2
+  exit 4
+fi
+MEDIA_RAW=${DU_OUT%%[[:space:]]*}
+if ! is_byte_count "$MEDIA_RAW"; then
+  echo "error: implausible production media size '${MEDIA_RAW}' at $SRC; refusing to stage" >&2
+  exit 4
+fi
+MEDIA_BYTES=$(( 10#$MEDIA_RAW ))
 REQUIRED_BYTES=$(( MEDIA_BYTES * 2 + RESERVE_BYTES ))
-AVAILABLE_BYTES=$(df -P -B1 "$DEST" | awk 'NR == 2 { print $4 }')
-STAGING_FS=$(df -P -B1 "$DEST" | awk 'NR == 2 { print $6 }')
-case "$AVAILABLE_BYTES" in ''|*[!0-9]*) echo "error: could not determine free space at $DEST; refusing to stage" >&2; exit 4 ;; esac
-if [ "$AVAILABLE_BYTES" -lt "$REQUIRED_BYTES" ]; then
+
+if ! DF_OUT=$(df -P -B1 -- "$DEST"); then
+  echo "error: could not determine free space at $DEST; refusing to stage" >&2
+  exit 4
+fi
+AVAILABLE_RAW=$(printf '%s\n' "$DF_OUT" | awk 'NR == 2 { print $4 }')
+STAGING_FS=$(printf '%s\n' "$DF_OUT" | awk 'NR == 2 { print $6 }')
+if ! is_byte_count "$AVAILABLE_RAW"; then
+  echo "error: could not determine free space at $DEST (got '${AVAILABLE_RAW}'); refusing to stage" >&2
+  exit 4
+fi
+AVAILABLE_BYTES=$(( 10#$AVAILABLE_RAW ))
+if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
   echo "error: not enough staging space for production media: media/ holds ${MEDIA_BYTES} bytes, staging it needs ${REQUIRED_BYTES} bytes (2 x media + ${RESERVE_BYTES} reserve) but only ${AVAILABLE_BYTES} bytes are available on ${STAGING_FS} (${DEST}). Nothing was copied. Free space there, or move the backup work area to a larger filesystem, before the next backup." >&2
   exit 4
 fi

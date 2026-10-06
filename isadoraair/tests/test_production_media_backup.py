@@ -178,9 +178,17 @@ class StageHelperFunctionalTests(TempDirCase):
 
 DF_SHIM = """#!/bin/bash
 # Test double for df -P -B1 <path>: a fixed filesystem with $FAKE_DF_AVAIL bytes free.
+[ -n "${FAKE_DF_FAIL:-}" ] && { echo "df: cannot read table of mounted file systems" >&2; exit 1; }
 printf 'Filesystem 1-blocks Used Available Capacity Mounted on\\n'
 printf 'stagingfs 100000000000 1 %s 1%% /fake/staging\\n' "$FAKE_DF_AVAIL"
 """
+# Test double for du: the real du unless $FAKE_DU_BYTES / $FAKE_DU_FAIL says otherwise.
+DU_SHIM = """#!/bin/bash
+[ -n "${FAKE_DU_FAIL:-}" ] && { echo "du: cannot read directory" >&2; exit 1; }
+[ -n "${FAKE_DU_BYTES:-}" ] && { printf '%s\\t%s\\n' "$FAKE_DU_BYTES" "${@: -1}"; exit 0; }
+exec REAL_DU "$@"
+"""
+MAX_RESERVE = 1 << 40
 
 
 class StagingCapacityTests(TempDirCase):
@@ -194,21 +202,32 @@ class StagingCapacityTests(TempDirCase):
         shims.mkdir()
         (shims / "df").write_text(DF_SHIM)
         (shims / "df").chmod(0o755)
+        (shims / "du").write_text(DU_SHIM.replace("REAL_DU", shutil.which("du")))
+        (shims / "du").chmod(0o755)
         self.shims = shims
         self.root, self.dest = self.tmp / "production-media", self.tmp / "dest"
         self.dest.mkdir()
         build_store(self.root, transient=False)
 
-    def stage(self, available, reserve=1000):
+    def stage(self, available, reserve=1000, **fake):
         env = {**os.environ, "PATH": f"{self.shims}:{os.environ['PATH']}", "FAKE_DF_AVAIL": str(available),
-               "PRODUCTION_MEDIA_STAGING_RESERVE_BYTES": str(reserve)}
+               "PRODUCTION_MEDIA_STAGING_RESERVE_BYTES": str(reserve),
+               **{f"FAKE_{key.upper()}": str(value) for key, value in fake.items()}}
         return subprocess.run([str(STAGE_HELPER), str(self.root), str(self.dest)],
                               capture_output=True, text=True, timeout=30, env=env)
 
-    def required(self, reserve=1000):
+    def media_bytes(self):
         out = subprocess.run(["du", "-s", "-B1", "--apparent-size", str(self.root / "media")],
                              capture_output=True, text=True, check=True).stdout
-        return int(out.split()[0]) * 2 + reserve
+        return int(out.split()[0])
+
+    def required(self, reserve=1000):
+        return self.media_bytes() * 2 + reserve
+
+    def assert_refused(self, result, code):
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        self.assertEqual(list(self.dest.iterdir()), [], "staged before a failed preflight")
+        self.assertNotIn("staging-space check", result.stdout)
 
     def test_sufficient_space_stages_and_reports_the_check(self):
         result = self.stage(self.required() + 1)
@@ -243,9 +262,57 @@ class StagingCapacityTests(TempDirCase):
         self.assertEqual(self.stage(10**12, reserve="lots").returncode, 2)
 
     def test_an_unreadable_free_space_answer_fails_closed(self):
-        result = self.stage("unknown")
-        self.assertEqual(result.returncode, 4)
-        self.assertEqual(list(self.dest.iterdir()), [])
+        for answer in ("unknown", "", "-5", "1e12", "1" + "0" * 18, "9" * 40):
+            with self.subTest(answer=answer):
+                self.assert_refused(self.stage(answer), 4)
+
+    def test_a_failed_df_or_du_fails_closed(self):
+        self.assert_refused(self.stage(10**12, df_fail=1), 4)
+        self.assert_refused(self.stage(10**12, du_fail=1), 4)
+
+    # -- 2.22B corrective: the arithmetic cannot overflow (Codex) ---------------
+
+    def test_codex_reproduction_huge_reserve_no_longer_overflows_into_staging(self):
+        """reserve = 2^63 - 1 with a one-byte store made 2*media + reserve
+        negative, so ANY free space 'sufficed' and staging proceeded."""
+        result = self.stage(10**12, reserve=9223372036854775807, du_bytes=1)
+        self.assert_refused(result, 2)
+        self.assertIn("PRODUCTION_MEDIA_STAGING_RESERVE_BYTES must be a whole number of bytes", result.stderr)
+
+    def test_the_reserve_domain_boundaries(self):
+        media = self.media_bytes()
+        cases = {
+            "0": 0, "1000": 1000, "08": 8, "000000000000001000": 1000, str(MAX_RESERVE): MAX_RESERVE,
+        }
+        for raw, value in cases.items():
+            with self.subTest(accepted=raw):
+                need = media * 2 + value
+                self.assert_refused(self.stage(need - 1, reserve=raw), 4)
+                result = self.stage(need, reserve=raw)                  # exact boundary: enough
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"need {need},", result.stdout)
+                shutil.rmtree(self.dest / "production-media")
+        for raw in (str(MAX_RESERVE + 1), "9223372036854775807", "9223372036854775808",
+                    "18446744073709551616", "9" * 19, "9" * 400, "1" + "0" * 4000):
+            with self.subTest(too_large=raw[:30]):
+                self.assert_refused(self.stage(10**17, reserve=raw), 2)
+        for raw in ("lots", "-1", "-9223372036854775808", "+5", "1e9", "1.5", "0x10", " 5", "5 ", "1 000",
+                    "\uff11\uff12", "5;rm -rf /"):
+            with self.subTest(malformed=raw):
+                self.assert_refused(self.stage(10**17, reserve=raw), 2)
+
+    def test_the_media_size_boundaries_cannot_overflow(self):
+        largest = 10**18 - 1                                      # the largest accepted byte count
+        need = largest * 2 + MAX_RESERVE                          # still far below 2^63
+        self.assertLess(need, 2**63 - 1)
+        result = self.stage(largest, reserve=MAX_RESERVE, du_bytes=largest)
+        self.assert_refused(result, 4)                            # no free-space answer can cover it
+        self.assertIn(f"needs {need} bytes", result.stderr)       # computed exactly, never wrapped
+        for implausible in (10**18, 2**62, 2**63 - 1, 2**63, 2**64, "9" * 30, "-1", "abc"):
+            with self.subTest(media=str(implausible)[:30]):
+                self.assert_refused(self.stage(10**17, du_bytes=implausible), 4)
+        result = self.stage(largest, reserve=0, du_bytes=(largest - 1) // 2)    # 2*media + 0 <= largest
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_the_backup_still_aborts_and_records_the_stage_on_refusal(self):
         text = BACKUP_SCRIPT.read_text()
