@@ -85,10 +85,15 @@ class LivePlanClassificationTests(TransactionTestCase):
         call_command("migrate", "production", "zero", verbosity=0)
         try:
             payload = probe.build_probe_payload()
-            self.assertEqual([item["ref"] for item in payload["plan"]], [REF])
+            refs = [item["ref"] for item in payload["plan"]]
+            # 2.22B: library.0089 (VoiceTrack.media) depends on production.0001,
+            # so unapplying production also unapplies it; production.0001 is
+            # still planned first and judged on its own.
+            self.assertEqual(refs[0], REF)
+            self.assertEqual(set(refs) - {REF}, {"library.0089_voicetrack_media"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:
-            call_command("migrate", "production", verbosity=0)
+            call_command("migrate", verbosity=0)           # every app back to its leaf, dependents included

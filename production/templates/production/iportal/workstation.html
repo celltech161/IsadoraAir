@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}{{ recording_context.title }} — iPortal — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .ip-wrap { max-width: 1100px; margin: 0 auto; }
+  .ip-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+  .ip-head h1 { margin: 0; font-size: 1.25rem; }
+  .ip-purpose { color: var(--text-muted); font-size: 0.85rem; margin: 0.25rem 0 0.75rem; }
+  .ip-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+  @media (max-width: 760px) { .ip-grid { grid-template-columns: 1fr; } }
+  .ip-panel { background: var(--bg-card, #1c1f26); border: 1px solid var(--border, #333); border-radius: 8px; padding: 0.75rem; }
+  .ip-panel h2 { margin: 0 0 0.5rem; font-size: 0.95rem; display: flex; gap: 0.5rem; align-items: center; }
+  .ip-badge { font-size: 0.65rem; font-weight: 700; letter-spacing: 0.06em; padding: 0.15rem 0.45rem; border-radius: 4px; }
+  .ip-badge.air { background: #b91c1c; color: #fff; }
+  .ip-badge.preview { background: #1d4ed8; color: #fff; }
+  .ip-badge.saved { background: #047857; color: #fff; }
+  .ip-display { width: 100%; font-size: 0.8rem; border-collapse: collapse; }
+  .ip-display th { text-align: left; color: var(--text-muted); font-weight: normal; padding: 0.15rem 0.5rem 0.15rem 0; white-space: nowrap; }
+  .ip-banner { padding: 0.5rem 0.75rem; border-radius: 6px; margin: 0.5rem 0; font-size: 0.85rem; }
+  .ip-banner.warn { background: #78350f; color: #fde68a; }
+  .ip-banner.error { background: #7f1d1d; color: #fecaca; }
+  .ip-banner.info { background: #1e3a5f; color: #bfdbfe; }
+  .ip-banner.ok { background: #064e3b; color: #a7f3d0; }
+  .ip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin: 0.4rem 0; }
+  .ip-btn { padding: 0.35rem 0.7rem; border-radius: 5px; border: 1px solid var(--border, #444); background: var(--bg-input, #222); color: var(--text, #eee); cursor: pointer; font-size: 0.85rem; }
+  .ip-btn.primary { background: var(--accent, #22c55e); color: #000; border-color: transparent; font-weight: 600; }
+  .ip-btn.rec { background: #dc2626; color: #fff; border-color: transparent; }
+  .ip-btn.danger { color: #f88; }
+  .ip-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+  .ip-meter { height: 10px; background: #111; border-radius: 4px; overflow: hidden; flex: 1; min-width: 120px; }
+  .ip-meter > div { height: 100%; width: 0; background: linear-gradient(90deg, #16a34a 0 70%, #eab308 70% 90%, #dc2626 90%); }
+  .ip-timer { font-variant-numeric: tabular-nums; font-size: 1.1rem; min-width: 7ch; }
+  .ip-timer.recording { color: #f87171; }
+  #ipWave { width: 100%; height: 160px; background: #0b0d10; border-radius: 6px; cursor: crosshair; display: block; }
+  .ip-small { font-size: 0.75rem; color: var(--text-muted); }
+  label.ip-inline { display: inline-flex; gap: 0.3rem; align-items: center; font-size: 0.8rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="ip-wrap" id="iportalWorkstation">
+  <div class="ip-head">
+    <h1 id="ipTitle">{{ recording_context.title }}</h1>
+    <a href="{{ recording_context.return_url|default:'/iportal/' }}" class="ip-small">&larr; Back</a>
+  </div>
+  <p class="ip-purpose" id="ipPurpose">{{ recording_context.purpose }}</p>
+
+  <div id="ipMessages" role="status" aria-live="polite"></div>
+  <div id="ipBlocked" class="ip-banner warn" hidden></div>
+  <div id="ipDraftBanner" class="ip-banner info" hidden>
+    <span id="ipDraftText"></span>
+    <button type="button" class="ip-btn" id="ipDraftRestore">Restore draft</button>
+    <button type="button" class="ip-btn" id="ipDraftDiscard">Discard draft</button>
+  </div>
+  <div id="ipConflict" class="ip-banner error" hidden>
+    <strong>Someone saved a newer version.</strong>
+    Your take was kept (not on air), and the newer version was not overwritten.
+    <button type="button" class="ip-btn" id="ipConflictReload">Load the current version</button>
+  </div>
+
+  <div class="ip-grid">
+    <div class="ip-panel" id="ipAirPanel">
+      <h2><span class="ip-badge air">ON AIR</span> <span id="ipAirLabel">{{ recording_context.air_label }}</span></h2>
+      <div id="ipAirCurrent"></div>
+      <table class="ip-display" id="ipDisplay"></table>
+    </div>
+
+    <div class="ip-panel" id="ipRecorderPanel">
+      <h2>Recorder</h2>
+      <div id="ipUnsupported" class="ip-banner warn" hidden></div>
+      <div class="ip-row">
+        <select id="ipDevice" aria-label="Microphone"><option value="">Default microphone</option></select>
+        <label class="ip-inline"><input type="checkbox" id="ipNoise"> Noise suppression</label>
+        <button type="button" class="ip-btn" id="ipArm">Enable microphone</button>
+      </div>
+      <div class="ip-row">
+        <label class="ip-inline" for="ipGain">Gain</label>
+        <input type="range" id="ipGain" min="-15" max="15" step="0.5" value="0" aria-label="Input gain (dB)">
+        <span id="ipGainLabel" class="ip-small">0.0 dB</span>
+        <button type="button" class="ip-btn" id="ipSetLevel" disabled>Set Level</button>
+      </div>
+      <div class="ip-row"><div class="ip-meter"><div id="ipMeter"></div></div></div>
+      <div class="ip-row">
+        <button type="button" class="ip-btn rec" id="ipRecord" disabled>&#9679; Record</button>
+        <button type="button" class="ip-btn" id="ipPause" disabled>Pause</button>
+        <button type="button" class="ip-btn" id="ipStop" disabled>&#9632; Stop</button>
+        <span class="ip-timer" id="ipTimer">0:00.0</span>
+        <span class="ip-small">max <span id="ipMax"></span></span>
+      </div>
+      <div class="ip-row">
+        <label class="ip-inline"><input type="checkbox" id="ipPunch"> Punch in at the playhead</label>
+        <label class="ip-inline"><input type="checkbox" id="ipPunchReplace"> Replace the rest (instead of insert)</label>
+      </div>
+      <div class="ip-row">
+        <button type="button" class="ip-btn" id="ipImportBtn">Import file…</button>
+        <input type="file" id="ipImport" accept="audio/*,.wav,.mp3,.flac,.ogg,.oga,.m4a,.aiff,.aif,.webm" hidden>
+        <button type="button" class="ip-btn" id="ipLoadCurrent" hidden>Edit the on-air take</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="ip-panel" style="margin-top:0.75rem;" id="ipEditorPanel">
+    <h2><span class="ip-badge preview">PREVIEW</span> Editor <span class="ip-small">— browser only; nothing here is on air until you save</span></h2>
+    <canvas id="ipWave" width="1060" height="160" aria-label="Waveform"></canvas>
+    <div class="ip-row ip-small"><span id="ipSelection">No audio yet.</span></div>
+    <div class="ip-row">
+      <button type="button" class="ip-btn" id="ipPlay" disabled>&#9654; Preview</button>
+      <button type="button" class="ip-btn" id="ipPlayStop" disabled>Stop</button>
+      <button type="button" class="ip-btn" id="ipZoomIn" disabled>Zoom +</button>
+      <button type="button" class="ip-btn" id="ipZoomOut" disabled>Zoom &minus;</button>
+      <button type="button" class="ip-btn" id="ipZoomFit" disabled>Fit</button>
+    </div>
+    <div class="ip-row">
+      <button type="button" class="ip-btn" id="ipKeep" disabled>Keep selection</button>
+      <button type="button" class="ip-btn" id="ipDelete" disabled>Delete selection</button>
+      <button type="button" class="ip-btn" id="ipNormalize" disabled>Normalize</button>
+      <input type="number" id="ipEditGain" min="-15" max="15" step="0.5" value="0" style="width:5em;" aria-label="Edit gain (dB)">
+      <button type="button" class="ip-btn" id="ipApplyGain" disabled>Apply gain</button>
+      <button type="button" class="ip-btn" id="ipUndo" disabled>Undo</button>
+      <button type="button" class="ip-btn" id="ipExport" disabled>Download WAV</button>
+    </div>
+    <div class="ip-row">
+      <button type="button" class="ip-btn primary" id="ipSave" disabled>Save &amp; put on air</button>
+      <button type="button" class="ip-btn" id="ipRetry" hidden>Retry validation</button>
+      <button type="button" class="ip-btn" id="ipCancelUpload" hidden>Cancel upload</button>
+      <button type="button" class="ip-btn" id="ipDiscard" disabled>Discard edit</button>
+      <span style="flex:1"></span>
+      <button type="button" class="ip-btn danger" id="ipRemove" hidden>Remove from air…</button>
+    </div>
+    <div class="ip-small" id="ipSaveState">No unsaved changes.</div>
+  </div>
+</div>
+{{ recording_context|json_script:"iportal-context" }}
+{{ api|json_script:"iportal-api" }}
+{% endblock %}
+
+{% block extra_js %}
+<script>window.IPORTAL_WORKLET_URL = "{% static 'production/iportal/capture_worklet.js' %}";</script>
+<script src="{% static 'production/iportal/audio_core.js' %}"></script>
+<script src="{% static 'production/iportal/recorder.js' %}"></script>
+<script src="{% static 'production/iportal/workstation.js' %}"></script>
+{% endblock %}

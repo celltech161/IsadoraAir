@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}iPortal — IsadoraAir{% endblock %}
+{% block content %}
+<div style="max-width: 900px; margin: 0 auto;">
+  <h1 style="font-size:1.3rem;">iPortal</h1>
+  <p style="color:var(--text-muted);">
+    The station's production workspace: one shared recorder/editor saving immutable, validated
+    production media. Each tool below keeps its own lifecycle.
+  </p>
+  {% if tools %}
+  <ul style="list-style:none; padding:0;">
+    {% for tool in tools %}
+    <li style="margin:0.75rem 0; padding:0.75rem; border:1px solid var(--border,#333); border-radius:8px;">
+      <a href="{{ tool.entry_url }}" style="font-weight:600; color:var(--accent);">{{ tool.label }}</a>
+      <div style="color:var(--text-muted); font-size:0.85rem;">{{ tool.description }}</div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No iPortal tools are available to your account.</p>
+  {% endif %}
+</div>
+{% endblock %}
