@@ -81,9 +81,13 @@ scratch non-VoiceTrack adapter).
   **Retry validation**; a stale revision shows a conflict ("someone saved a
   newer version") and never overwrites it; a cancelled or interrupted upload
   keeps the local draft.
-* **Drafts** — IndexedDB, browser-local, keyed by workspace + subject, saved
+* **Drafts** — IndexedDB, browser-local, keyed by a server-derived per-user
+  namespace + workspace + subject (another person on the same browser profile
+  is never offered them; drafts stored without a namespace are pruned), saved
   automatically after each change and before every upload, pruned after 7 days
-  and skipped above 300 MB. Reload offers *Restore / Discard*.
+  and skipped above 300 MB. Reload offers *Restore / Discard*. A draft keeps
+  the revision it was made against: saving a restored draft after someone
+  else saved is a conflict, never an overwrite (no automatic rebasing).
 * **Mobile / iOS** — the microphone is released before playback (an active
   capture track forces earpiece routing); a mono mic is captured mono and a
   silent second channel is collapsed; recording pauses when the page is
@@ -103,29 +107,69 @@ sweeper (24 h grace), triggered at most every 15 minutes by recorder uploads.
 ### Resource confinement (Phase-B prerequisite)
 
 Every validator tool (ffprobe, ffmpeg, the GStreamer parity child) runs through
-`production.services.confinement.run_confined`: a stdlib-only launcher
-(`confined_exec.py`) applies kernel `setrlimit` limits and then `exec`s the
-tool, so they bind it and everything it starts.
+`production.services.confinement.run_confined`, inside a kernel boundary that
+the tool tree cannot leave and that is destroyed after every run.
 
-| Limit | Default | Notes |
+**Where.** The web service's own *delegated* cgroup v2 subtree:
+`deploy/isadoraair-gunicorn.service` sets `Delegate=cpu memory pids` and
+`DelegateSubgroup=web`, so Gunicorn runs in `<unit>/web` and each validation
+gets a fresh leaf `<unit>/iportal-validation/run-<pid>-<id>` (or under
+`settings.PRODUCTION_VALIDATION_CGROUP`). No privilege, no sudo, no
+per-request root: systemd hands the subtree to the service account once, at
+unit start.
+
+**Aggregate limits** (the whole tool tree together), defaults calibrated on the
+real validators with 10-minute WAV/FLAC/Opus — measured peaks ≤ 22 MiB charged
+memory, ≤ 18 tasks, ~3 s CPU:
+
+| Limit | Default | Mechanism |
 | --- | --- | --- |
-| `RLIMIT_AS` (memory) | 1 GiB | measured validator minimum 384–512 MiB |
-| `RLIMIT_CPU` | 180 s (SIGXCPU), +5 s SIGKILL | a 10-min Opus decode costs ~2.5 s |
-| `RLIMIT_FSIZE` | 16 MiB | the tools write nothing |
-| `RLIMIT_NOFILE` | 256 | |
-| `RLIMIT_CORE` | 0 | |
-| wall clock | per tool (Phase A) | |
-| process tree | own session; whole group SIGKILLed on timeout, interruption **and after every exit** | |
+| memory | 512 MiB, no swap, OOM kills the whole tree | `memory.max`, `memory.swap.max` 0, `memory.oom.group` 1 |
+| tasks (processes + threads) | 64 | `pids.max` |
+| CPU rate | one CPU | `cpu.max` (when the cpu controller is delegated) |
+| CPU time | 180 s for the tree | parent monitor on `cpu.stat` |
+| wall clock | per tool (Phase A) | parent monitor |
 
-Override with `settings.PRODUCTION_VALIDATION_LIMITS` (a dict of the field
-names). `RLIMIT_NPROC` is deliberately not used: it counts every process of
-the service account (Gunicorn, the engine) and would either mean nothing or
-break unrelated services. No privilege, no sudo, no systemd dependency.
+**Per-process backstops**: `RLIMIT_AS` 1 GiB, `RLIMIT_CPU` 180 s (+5 s
+SIGKILL), `RLIMIT_FSIZE` 16 MiB, `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0. All
+are overridable with `settings.PRODUCTION_VALIDATION_LIMITS` (a dict of
+`confinement.Limits` fields).
 
-**Fail closed**: limits that cannot be applied (or a missing launcher) never
-run the tool unconfined — validation returns the retryable infrastructure code
-`confinement_unavailable`. A tool stopped by a limit is
-`validation_resource_limit`: a station limit, never an *invalid* verdict.
+**Why nothing escapes.** The trusted, stdlib-only launcher
+(`confined_exec.py`) moves itself into the leaf *before* anything untrusted
+runs, verifies the move, then sets `no_new_privs`, a **Landlock** policy (read
+and execute only — no file is writable anywhere except `/dev/null`, so
+`cgroup.procs`/`cgroup.threads` cannot be written; ptrace, signals and
+abstract sockets are scoped to the sandbox; no TCP), a **seccomp** filter
+(`clone3` → ENOSYS, so `CLONE_INTO_CGROUP` is unavailable; foreign-ABI
+syscalls kill) and the rlimits, and only then `exec`s the tool. Cgroup
+membership is inherited and is not changed by `setsid()`, `setpgid()`, double
+forking or a parent exiting. After every run — success, failure, timeout,
+interruption — the parent writes `cgroup.kill` (the kernel SIGKILLs every task
+in the leaf, race-free), waits for `populated 0` and removes the leaf; when
+`run_confined` returns, no task of that run is alive. Leaves left by a worker
+that died mid-run are destroyed by the next run.
+
+**Fail closed.** No delegated subtree, a missing controller, no `cgroup.kill`,
+Landlock or seccomp unavailable, a launcher step that cannot be verified, or a
+leaf that cannot be emptied → `confinement_unavailable`, a retryable
+infrastructure error; the tool never runs outside the boundary. A tool stopped
+by a limit is `validation_resource_limit`: a station limit, never an *invalid*
+verdict.
+
+**Deployment note.** The unit change takes effect at the next gunicorn
+restart after `daemon-reload`; until then (or on a host without cgroup v2
+delegation, Landlock or seccomp) uploads are kept as unvalidated takes that
+can be re-validated later. Management commands run from a login shell are
+not in the delegated subtree and also fail closed.
+
+**Tests** that run the real validators need the same delegated subtree:
+
+    systemd-run --user --scope -p Delegate=yes --quiet \
+        production/tests/run_delegated.sh python manage.py test production library ...
+
+Without it they fail (they do not skip): the absence of the boundary must
+never go unnoticed.
 
 ## Evergreen VoiceTrack adoption
 
@@ -138,9 +182,17 @@ run the tool unconfined — validation returns the retryable infrastructure code
   `/api/voicetrack/iportal/`. Authorization is the existing `voicetrack.record`
   capability; the talent role reaches it with its existing path grants.
 * **Binding** — `library.services.voicetrack_media.bind_media` is the only writer
-  of `VoiceTrack.media` (the model refuses instance saves, `update`,
-  `bulk_update`, `bulk_create`, `update_or_create` and reverse-manager updates
-  outside its scope; the admin shows the binding read-only). Its short
+  of `VoiceTrack.media` (`library.voicetrack_guard`). The guard covers the real
+  ORM surface: VoiceTrack's *base* manager — the one Django uses for instance
+  saves and related managers — is the guarded queryset, which refuses
+  `update`, `_update`, `bulk_update`, `_insert`/`bulk_create` (including
+  `update_conflicts`) writing the binding; every instance save (`save`,
+  `save_base`, `create`, `update_or_create`, related `add`, ModelForm,
+  admin) passes `_save_table`, which refuses a change of `media` — deferred
+  instances included — and outside the service never writes the column, so a
+  stale instance cannot restore an old binding. The scopes are context
+  variables (per call stack, reset on exceptions). Raw SQL and hand-built
+  `QuerySet(VoiceTrack)` objects are outside any ORM guard. Its short
   transaction: Phase-A `lock_for_binding` (refuses purged / not-valid media) →
   lock the Track and VoiceTrack rows → check the revision → repoint the same
   row → commit. No upload, decode, validation, waveform or transcode work runs
@@ -148,9 +200,14 @@ run the tool unconfined — validation returns the retryable infrastructure code
 * **Re-record / edit** — a new immutable take; edits record `derived_from`.
   The previous take (or legacy file) is untouched and simply unreferenced
   (reclaimable later by retention policy; Phase B adds no purge UI).
-* **Remove from air** — deletes the VoiceTrack row as before. ProductionMedia
-  bytes are never unlinked; a legacy file is removed only if it lives in the
-  voice-track directory, as before.
+* **Remove from air** — `remove_voicetrack` deletes the VoiceTrack row as
+  before, checked against the optimistic revision and audited. It is the only
+  direct deletion: `VoiceTrack.delete()`, queryset deletes and the admin are
+  refused outside its removal scope. Deleting the parent **Track** still
+  cascades to its VoiceTracks (the Track's lifecycle, unchanged), including
+  from the Track admin. ProductionMedia bytes are never unlinked — the take
+  simply becomes unreferenced for retention; a legacy file is removed only by
+  `remove_voicetrack` and only if it lives in the voice-track directory.
 * **Legacy compatibility** — `VoiceTrack.playable_audio()` prefers a present,
   valid bound take whose bytes exist, otherwise the legacy file exactly as
   before. No bulk migration: a legacy VoiceTrack becomes ProductionMedia-backed
@@ -171,8 +228,11 @@ The backup copies `media/` into its work area (`/tmp`, RAM-backed on a
 station) and builds the archive there, so peak use is about twice the store.
 `deploy/stage_production_media.sh` now requires
 `available >= 2 x media bytes + reserve` (1 GiB default,
-`PRODUCTION_MEDIA_STAGING_RESERVE_BYTES`) **before writing anything**, and
-otherwise exits 4 with the sizes and filesystem. The backup aborts in its
+`PRODUCTION_MEDIA_STAGING_RESERVE_BYTES`, accepted range 0..1 TiB) **before
+writing anything**, and otherwise exits 4 with the sizes and filesystem. The
+arithmetic cannot overflow: every byte count must be a plain decimal of at
+most 18 digits, so `2 x media + reserve < 2^63`; a malformed or out-of-range
+reserve exits 2, and a failing or implausible `du`/`df` answer exits 4. The backup aborts in its
 `production_media` stage and Backup Recovery Assurance reports "last backup
 attempt failed at stage 'production_media'". Streaming media straight into the
 archive remains the long-term fix before produced-content volumes.

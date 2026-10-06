@@ -200,10 +200,10 @@ the runtime/backup authority and is still applied at restore, unchanged.
 
 Nothing a client says is trusted — not the extension, not the browser MIME, not
 a reported duration. Four steps, each shell-free, hard-timed, with bounded
-output, and (since 2.22B) each under kernel resource limits in its own reaped
-process group — see "Resource confinement" in `docs/IPORTAL.md`; a station
-limit or unavailable confinement is a retryable infrastructure outcome, never
-an *invalid* verdict:
+output, and (since 2.22B) each inside its own kernel-limited, killable cgroup
+v2 leaf, sandboxed by Landlock and seccomp — see "Resource confinement" in
+`docs/IPORTAL.md`; a station limit or unavailable confinement is a retryable
+infrastructure outcome, never an *invalid* verdict:
 
 1. **Content sniff** picks exactly one allowlisted ffmpeg demuxer, forced for
    every tool call with only the `file` protocol allowed. An uploaded HLS/concat/
@@ -393,10 +393,13 @@ runtime-11 companion mechanism.
 Status after Phase B (2.22B, see `docs/IPORTAL.md`):
 
 * **Resource confinement before browser exposure — DONE (2.22B).** Every
-  validator tool now runs under kernel resource limits (memory, CPU, file
-  size, descriptors, no core) in its own process group that is reaped as a
-  whole, and validation fails closed (`confinement_unavailable`) if the limits
-  cannot be applied — `production.services.confinement`.
+  validator tool runs in its own per-run cgroup v2 leaf in the web service's
+  delegated subtree (aggregate memory, task and CPU limits; the whole tree is
+  killed with `cgroup.kill` after every run, so no descendant can outlive it),
+  sandboxed by Landlock and seccomp so it cannot migrate out, with
+  per-process rlimits as backstops; validation fails closed
+  (`confinement_unavailable`) if any of it cannot be established —
+  `production.services.confinement`.
 * **No GenericForeignKey or cross-database references** to ProductionMedia
   (see the binding rule). Upheld by Phase B: `VoiceTrack.media` is an
   ordinary `PROTECT` FK, and system check `library.E900/E901` refuses a
@@ -411,8 +414,9 @@ Status after Phase B (2.22B, see `docs/IPORTAL.md`):
 * **Backup staging growth — fail-safe in place (2.22B).** The backup still
   copies `media/` into its temporary staging area (about 2x the store at
   peak, on RAM-backed `/tmp` at a station), but the staging helper now refuses
-  before writing anything unless `2 x media + reserve` fits, and the backup
-  reports the failed stage. Streaming media into the archive remains the
+  before writing anything unless `2 x media + reserve` fits (overflow-safe,
+  bounded byte counts; reserve 0..1 TiB), and the backup reports the failed
+  stage. Streaming media into the archive remains the
   long-term fix before produced-content volumes.
 * **Pre-existing, outside iPortal — fixed in r0106:** restore stage 40 used to
   apply `chown -R` to `REPORTS_ROOT` read from the restored `.env` with no
