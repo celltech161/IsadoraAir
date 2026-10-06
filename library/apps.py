@@ -12,6 +12,9 @@ class LibraryConfig(AppConfig):
         # case where it's imported before AppConfig.ready runs, e.g.
         # inline test setup), and post_save.connect is idempotent
         # with weak=False plus the same receiver identity.
+        # 2.22B: VoiceTrack and ProductionMedia must share one database (B22).
+        from library import checks  # noqa: F401 -- registers the system check
+
         # 2.22B: evergreen VoiceTrack is the first iPortal recorder consumer.
         from production.recorder import registry as recorder_registry
         from library.iportal import ADAPTER as voicetrack_recorder_adapter

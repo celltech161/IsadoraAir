@@ -645,3 +645,29 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             self.assertIn("production.0001_initial", item["dependencies"])
         finally:
             call_command("migrate", verbosity=0)
+
+
+class SplitRouter:
+    """A deliberately wrong router: ProductionMedia on another database."""
+
+    def db_for_read(self, model, **hints):
+        return "other" if model._meta.app_label == "production" else None
+
+    db_for_write = db_for_read
+
+    def allow_relation(self, obj1, obj2, **hints):
+        labels = {obj1._meta.app_label, obj2._meta.app_label}
+        return False if labels == {"library", "production"} else None
+
+
+class CrossDatabaseCheckTests(TestCase):
+    def test_the_default_configuration_passes(self):
+        from library.checks import voicetrack_media_share_one_database
+        self.assertEqual(voicetrack_media_share_one_database(), [])
+
+    def test_a_router_that_splits_the_binding_fails_configuration(self):
+        from django.db.utils import ConnectionRouter
+        from library import checks as library_checks
+        with mock.patch.object(library_checks, "router", ConnectionRouter([SplitRouter()])):
+            ids = sorted(error.id for error in library_checks.voicetrack_media_share_one_database())
+        self.assertEqual(ids, ["library.E900", "library.E900", "library.E901"])
