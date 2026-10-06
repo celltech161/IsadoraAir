@@ -1,5 +1,7 @@
 from django.urls import path
 
+from production.recorder.urls import recorder_urlpatterns
+
 from . import views
 
 app_name = 'library'
@@ -80,10 +82,12 @@ urlpatterns = [
     path('api/fx/fire/', views.api_fx_fire, name='api-fx-fire'),
     path('api/fx/cart-upload/', views.api_fx_cart_upload, name='api-fx-cart-upload'),
     path('voicetracks/', views.voicetracks_page, name='voicetracks'),
-    path('api/voicetrack/upload/', views.api_voicetrack_upload, name='api-voicetrack-upload'),
+    # 2.22B: recording, editing, saving and removal go through the shared
+    # iPortal recorder (mounted below); the destructive pre-Phase-B
+    # upload / save-edited / delete endpoints are retired. The read-only
+    # preview of a VoiceTrack's current audio remains.
     path('api/voicetrack/<int:pk>/audio/', views.api_voicetrack_audio, name='api-voicetrack-audio'),
-    path('api/voicetrack/<int:pk>/delete/', views.api_voicetrack_delete, name='api-voicetrack-delete'),
-    path('api/voicetrack/<int:pk>/save-edited/', views.api_voicetrack_save_edited, name='api-voicetrack-save-edited'),
+    *recorder_urlpatterns("evergreen-voicetrack", page="voicetracks/studio/", api="api/voicetrack/iportal/"),
     path('remote-dj/', views.remote_dj_page, name='remote-dj'),
     path('reports/', views.reports_page, name='reports'),
     path('reports/<int:pk>/download/', views.reports_download, name='reports-download'),

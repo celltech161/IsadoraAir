@@ -115,6 +115,7 @@
         <th class="num">Duration</th>
         <th>Recorded by</th>
         <th>Recorded</th>
+        <th>Source</th>
         <th>Preview</th>
         <th></th>
       </tr>
@@ -128,10 +129,10 @@
         <td class="num">{{ vt.duration_seconds|floatformat:2 }}s</td>
         <td>{{ vt.recorded_by.username|default:"—" }}</td>
         <td>{{ vt.edited_at|date:"Y-m-d H:i"|default:vt.recorded_at|date:"Y-m-d H:i" }}</td>
+        <td>{% if vt.media_id %}iPortal take{% else %}legacy recording{% endif %}</td>
         <td><audio controls preload="none" src="{% url 'library:api-voicetrack-audio' vt.id %}" style="height:24px; max-width:180px;"></audio></td>
         <td class="vt-actions">
-          <button type="button" onclick="vtEditorOpen({{ vt.id }}, '{% url 'library:api-voicetrack-audio' vt.id %}', '{{ vt.track.title|escapejs }} — {{ vt.position }} VT', function () { window.location.reload(); })">Edit</button>
-          <button type="button" class="danger" onclick="vtDeleteRow({{ vt.id }}, this)">Delete</button>
+          <a class="btn" href="{% url 'library:iportal-evergreen-voicetrack-page' %}?track={{ vt.track.id }}&position={{ vt.position }}">Open in iPortal</a>
         </td>
       </tr>
       {% endfor %}
@@ -163,31 +164,5 @@
 {% endblock %}
 
 {% block extra_js %}
-{% include "library/_voicetrack_editor.html" %}
-<script>
-function getCookie(name) {
-  let val = null;
-  document.cookie.split(';').forEach(c => {
-    c = c.trim();
-    if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
-  });
-  return val;
-}
-
-async function vtDeleteRow(id, btn) {
-  if (!confirm('Delete this voice track? The audio file will be removed too.')) return;
-  btn.disabled = true;
-  const resp = await fetch(`/api/voicetrack/${id}/delete/`, {
-    method: 'POST',
-    headers: { 'X-CSRFToken': getCookie('csrftoken') },
-  });
-  if (!resp.ok) {
-    alert('Delete failed: HTTP ' + resp.status);
-    btn.disabled = false;
-    return;
-  }
-  const row = btn.closest('tr');
-  row.parentNode.removeChild(row);
-}
-</script>
+{# 2.22B: re-record, edit and delete happen in the shared iPortal recorder/editor. #}
 {% endblock %}

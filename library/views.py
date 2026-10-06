@@ -2845,7 +2845,6 @@ def remote_dj_page(request):
 
 
 FX_CART_UPLOAD_DIR = Path("/srv/isadoraair/carts")
-VOICETRACK_UPLOAD_DIR = Path("/srv/isadoraair/voicetracks")
 
 
 def _can_edit_voicetracks(user):
@@ -2894,218 +2893,33 @@ def voicetracks_page(request):
     })
 
 
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_voicetrack_upload(request):
-    """Save an audio file as a voice-track for a specific (track,
-    position) pair. Handles two upload flavors:
-
-      source='browser' (default) -- WAV blob from the browser's
-        MediaRecorder + audioBufferToWav path. Saved as .wav.
-      source='import' -- an arbitrary audio file the operator dropped
-        onto the slot. Any format the library normally accepts
-        (mp3/mp2/flac/wav/m4a/alac/ogg/aiff), preserved with its
-        original extension so decodebin can handle it at fire time.
-
-    Destructive overwrite either way -- one file per (track,
-    position) slot. If the previous take had a different extension
-    (e.g. was a browser recording .wav and the operator now imports
-    a .flac), the previous file is deleted after the new one is
-    written to avoid orphan bytes on disk.
-    """
-    from library.management.commands.import_songs import SUPPORTED_EXT
-    from library.models import Track, VoiceTrack
-
-    if not _can_edit_voicetracks(request.user):
-        return HttpResponseForbidden("Voice-track recording requires staff or remote_dj.")
-
-    f = request.FILES.get("file")
-    if f is None:
-        return JsonResponse({"error": "No file uploaded"}, status=400)
-    try:
-        track_id = int(request.POST.get("track_id", ""))
-    except (TypeError, ValueError):
-        return JsonResponse({"error": "track_id required"}, status=400)
-    position = request.POST.get("position", "")
-    if position not in ("intro", "outro"):
-        return JsonResponse({"error": "position must be 'intro' or 'outro'"}, status=400)
-
-    source = request.POST.get("source", "browser")
-    if source not in ("browser", "import"):
-        source = "browser"
-
-    track = get_object_or_404(Track, pk=track_id)
-
-    # Enforce the design constraint: outro-VT requires the outgoing
-    # track have outro_starts_seconds set; intro-VT requires the
-    # incoming track have intro_until_seconds. Reject at record/import
-    # time so an operator can't produce a VT that will never fire.
-    if position == "outro" and track.outro_starts_seconds is None:
-        return JsonResponse({
-            "error": "Track has no outro_starts marker set. Set it on the track detail "
-                        "page (or during analysis) before recording / importing an outro VT.",
-        }, status=400)
-    if position == "intro" and track.intro_until_seconds is None:
-        return JsonResponse({
-            "error": "Track has no intro_until marker set. Set it on the track detail "
-                        "page (or during analysis) before recording / importing an intro VT.",
-        }, status=400)
-
-    # Extension handling. Browser recordings are always .wav (the
-    # client-side audioBufferToWav path). Imports get whatever the
-    # user dropped, validated against the library's SUPPORTED_EXT so
-    # a stray .png or .txt can't sneak in. Unknown extensions on
-    # imports return 400.
-    if source == "browser":
-        ext = ".wav"
-    else:
-        original_name = f.name or ""
-        ext = Path(original_name).suffix.lower()
-        if ext not in SUPPORTED_EXT:
-            return JsonResponse({
-                "error": f"Unsupported extension {ext!r}. Allowed: {sorted(SUPPORTED_EXT)}",
-            }, status=400)
-
-    dest_dir = VOICETRACK_UPLOAD_DIR / str(track_id)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{position}{ext}"
-
-    # If the previous take exists AND at a different path (different
-    # extension), remove it after the new file writes cleanly. Same
-    # tmpfile-then-rename atomic pattern the editor's save-edited
-    # path uses -- can't leave a half-written file where the engine
-    # might read it.
-    try:
-        prev_vt = VoiceTrack.objects.get(track=track, position=position)
-        prev_filepath = prev_vt.filepath or ""
-    except VoiceTrack.DoesNotExist:
-        prev_vt = None
-        prev_filepath = ""
-
-    tmp = dest.with_suffix(dest.suffix + ".uploading")
-    with open(tmp, "wb") as out:
-        for chunk in f.chunks():
-            out.write(chunk)
-    tmp.replace(dest)
-
-    if prev_filepath and prev_filepath != str(dest):
-        try:
-            Path(prev_filepath).unlink(missing_ok=True)
-        except OSError:
-            # Orphan file is cheap; the row and the new file are what
-            # matters.
-            pass
-
-    if prev_vt is None:
-        vt = VoiceTrack.objects.create(
-            track=track, position=position,
-            filepath=str(dest), source=source,
-            recorded_by=request.user if request.user.is_authenticated else None,
-        )
-    else:
-        vt = prev_vt
-        vt.filepath = str(dest)
-        vt.source = source
-        if request.user and request.user.is_authenticated:
-            vt.recorded_by = request.user
-        vt.edited_at = timezone.now()
-        vt.save()  # save() re-populates duration_seconds via mutagen
-
-    return JsonResponse({
-        "ok": True,
-        "voicetrack_id": vt.id,
-        "duration_seconds": vt.duration_seconds,
-        "source": vt.source,
-        "audio_url": reverse("library:api-voicetrack-audio", args=[vt.id]),
-    })
-
-
 @require_http_methods(["GET"])
 def api_voicetrack_audio(request, pk):
-    """Serve a voice-track file for preview. Streams through Django (not
-    directly by nginx) so the access check is enforced -- an
-    accidentally-shared /media/... URL wouldn't apply, but the file lives
-    under /srv/ anyway, not under /media/. Access matches upload:
-    staff/superuser/remote_dj."""
+    """Read-only preview of a VoiceTrack's CURRENT audio (what airs). Streams
+    through Django so the access check is enforced. 2.22B: a VoiceTrack bound
+    to an iPortal take streams that immutable ProductionMedia through the
+    Phase-A safe open; a legacy VoiceTrack streams its legacy file as before.
+    Recording, editing, saving and removal live in the shared iPortal
+    recorder (/voicetracks/studio/) -- the destructive pre-Phase-B upload /
+    save-edited / delete endpoints are retired."""
     from django.http import FileResponse
     from library.models import VoiceTrack
+    from production.recorder.views import _stream_media
+    from production.services import media_io
 
     if not _can_edit_voicetracks(request.user):
         return HttpResponseForbidden("Not authorized.")
 
-    vt = get_object_or_404(VoiceTrack, pk=pk)
-    if not vt.file_exists:
-        return HttpResponseNotFound("Voice-track file missing on disk.")
-    return FileResponse(open(vt.filepath, "rb"), content_type="audio/wav")
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_voicetrack_save_edited(request, pk):
-    """Replace a VT's audio file with an edited WAV blob (from the
-    in-browser editor). Destructive per the design conversation: the
-    original file is overwritten and the row's edited_at is bumped.
-    The editor keeps an undo stack in-session; when this endpoint
-    lands, the operator has committed to the current take.
-
-    Same access model as upload/delete (staff/superuser/remote_dj).
-    Row must exist; if the caller sends an edit for a VT that got
-    deleted between the editor opening and Save, we 404 rather than
-    creating a stray file."""
-    from library.models import VoiceTrack
-    if not _can_edit_voicetracks(request.user):
-        return HttpResponseForbidden("Not authorized.")
-    vt = get_object_or_404(VoiceTrack, pk=pk)
-    f = request.FILES.get("file")
-    if f is None:
-        return JsonResponse({"error": "No file uploaded"}, status=400)
-
-    dest = Path(vt.filepath) if vt.filepath else None
-    if dest is None:
-        return JsonResponse({"error": "VoiceTrack has no filepath"}, status=500)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write to a sidecar tempfile then atomic-rename over the target
-    # so a crash mid-write can't leave a half-written file where the
-    # engine is going to try reading. Same pattern the Django FileField
-    # save() uses under the hood.
-    tmp = dest.with_suffix(dest.suffix + ".editing")
-    with open(tmp, "wb") as out:
-        for chunk in f.chunks():
-            out.write(chunk)
-    tmp.replace(dest)
-
-    vt.edited_at = timezone.now()
-    vt.save()   # re-populates duration_seconds via mutagen
-    return JsonResponse({
-        "ok": True,
-        "voicetrack_id": vt.id,
-        "duration_seconds": vt.duration_seconds,
-        "audio_url": reverse("library:api-voicetrack-audio", args=[vt.id]),
-    })
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_voicetrack_delete(request, pk):
-    """Delete a VT row + its file. Same access as upload."""
-    from library.models import VoiceTrack
-    if not _can_edit_voicetracks(request.user):
-        return HttpResponseForbidden("Not authorized.")
-    vt = get_object_or_404(VoiceTrack, pk=pk)
-    fp = vt.filepath
-    vt.delete()
-    if fp:
+    vt = get_object_or_404(VoiceTrack.objects.select_related("media"), pk=pk)
+    audio = vt.playable_audio()
+    if audio is None:
+        return HttpResponseNotFound("Voice-track audio missing.")
+    if audio.origin == "production_media":
         try:
-            Path(fp).unlink(missing_ok=True)
-        except OSError as exc:
-            # Row's already gone; a leftover file is cheap to clean up
-            # later. Log and continue.
-            return JsonResponse({
-                "ok": True,
-                "warning": f"Row deleted but file cleanup failed: {exc}",
-            })
-    return JsonResponse({"ok": True})
+            return _stream_media(request, media_io.open_media(vt.media, require_valid=True))
+        except Exception:  # noqa: BLE001 -- purged/inconsistent: nothing to preview
+            return HttpResponseNotFound("Voice-track audio missing.")
+    return FileResponse(open(audio.path, "rb"), content_type="audio/wav")
 
 
 @csrf_exempt

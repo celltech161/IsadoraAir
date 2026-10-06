@@ -624,3 +624,24 @@ class EngineEquivalenceTests(IsolatedMediaRootMixin, TestCase):
         stand, entered = self._enter()
         self.assertTrue(entered)
         self.assertEqual(stand.fired, [("/nonexistent/legacy.wav", 0.0, "outro")])   # fire skipped downstream
+
+
+class VoiceTrackMigrationClassificationTests(TransactionTestCase):
+    """B23: the runtime-11 probe, exactly as the protected updater runs it, with
+    library.0089 genuinely pending in a real database."""
+
+    def test_library_0089_is_one_additive_operation_with_no_manual_operations(self):
+        from django.core.management import call_command
+        from updatecenter.management.commands import updatecenter_probe as probe
+        call_command("migrate", "library", "0088", verbosity=0)
+        try:
+            payload = probe.build_probe_payload()
+            self.assertEqual([item["ref"] for item in payload["plan"]], ["library.0089_voicetrack_media"])
+            item = payload["plan"][0]
+            self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
+                             [("AddField", "additive")])
+            self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
+            self.assertEqual((payload["conflicts"], payload["replacements"]), ({}, []))
+            self.assertIn("production.0001_initial", item["dependencies"])
+        finally:
+            call_command("migrate", verbosity=0)

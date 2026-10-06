@@ -572,12 +572,10 @@
   <div class="detail-section" id="voicetrackSection">
     <h2>Voice Tracks
       <span style="font-size:0.68rem; color:var(--text-muted); font-weight:normal;">
-        Intro plays before Intro Until · Outro plays after Outro Starts
+        Intro plays before Intro Until · Outro plays after Outro Starts · recorded and edited in iPortal
       </span>
     </h2>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; margin-top:0.5rem;">
-      {% for position in "intro,outro"|slice:":10"|make_list %}{% endfor %}
-      <!-- INTRO -->
       <div class="vt-slot" data-position="intro" data-track-id="{{ track.id }}">
         <div class="vt-slot-header">
           <strong>Intro VT</strong>
@@ -592,28 +590,20 @@
           <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.intro.duration_seconds|floatformat:2 }}s ·
-            {{ voicetracks.intro.get_source_display }} ·
+            {% if voicetracks.intro.media_id %}iPortal take{% else %}legacy recording{% endif %} ·
             {{ voicetracks.intro.recorded_by.username|default:"anon" }} ·
             {{ voicetracks.intro.edited_at|date:"Y-m-d H:i"|default:voicetracks.intro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
-            <button type="button" id="vtRecordBtnIntro" class="vt-btn" onclick="vtRecord('intro')">Re-record</button>
-            <button type="button" class="vt-btn" onclick="document.getElementById('vtImportIntro').click()">Import file</button>
-            <input type="file" id="vtImportIntro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('intro', this.files[0])">
-            <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.intro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}', '{{ track.title|escapejs }} — intro VT', function () { window.location.reload(); })">Edit</button>
-            <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.intro.id }})">Delete</button>
+            <button type="button" id="vtStudioBtnIntro" class="vt-btn primary" onclick="vtOpenStudio('intro')">Re-record / edit in iPortal</button>
           </div>
         </div>
         {% else %}
-        <div class="vt-empty vt-dropzone" data-position="intro" ondragover="vtDzOver(event)" ondragleave="vtDzLeave(event)" ondrop="vtDzDrop(event, 'intro')">
-          <button type="button" id="vtRecordBtnIntro" class="vt-btn primary" onclick="vtRecord('intro')">Record Intro VT</button>
-          <button type="button" class="vt-btn" onclick="document.getElementById('vtImportIntro').click()">Import file</button>
-          <input type="file" id="vtImportIntro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('intro', this.files[0])">
-          <div style="font-size:0.7rem; color:var(--text-muted); grid-column:1/-1; margin-top:0.3rem;">…or drop an audio file here</div>
+        <div class="vt-empty">
+          <button type="button" id="vtStudioBtnIntro" class="vt-btn primary" onclick="vtOpenStudio('intro')">Record Intro VT in iPortal</button>
         </div>
         {% endif %}
       </div>
-      <!-- OUTRO -->
       <div class="vt-slot" data-position="outro" data-track-id="{{ track.id }}">
         <div class="vt-slot-header">
           <strong>Outro VT</strong>
@@ -628,45 +618,19 @@
           <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.outro.duration_seconds|floatformat:2 }}s ·
-            {{ voicetracks.outro.get_source_display }} ·
+            {% if voicetracks.outro.media_id %}iPortal take{% else %}legacy recording{% endif %} ·
             {{ voicetracks.outro.recorded_by.username|default:"anon" }} ·
             {{ voicetracks.outro.edited_at|date:"Y-m-d H:i"|default:voicetracks.outro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
-            <button type="button" id="vtRecordBtnOutro" class="vt-btn" onclick="vtRecord('outro')">Re-record</button>
-            <button type="button" class="vt-btn" onclick="document.getElementById('vtImportOutro').click()">Import file</button>
-            <input type="file" id="vtImportOutro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('outro', this.files[0])">
-            <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.outro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}', '{{ track.title|escapejs }} — outro VT', function () { window.location.reload(); })">Edit</button>
-            <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.outro.id }})">Delete</button>
+            <button type="button" id="vtStudioBtnOutro" class="vt-btn primary" onclick="vtOpenStudio('outro')">Re-record / edit in iPortal</button>
           </div>
         </div>
         {% else %}
-        <div class="vt-empty vt-dropzone" data-position="outro" ondragover="vtDzOver(event)" ondragleave="vtDzLeave(event)" ondrop="vtDzDrop(event, 'outro')">
-          <button type="button" id="vtRecordBtnOutro" class="vt-btn primary" onclick="vtRecord('outro')">Record Outro VT</button>
-          <button type="button" class="vt-btn" onclick="document.getElementById('vtImportOutro').click()">Import file</button>
-          <input type="file" id="vtImportOutro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('outro', this.files[0])">
-          <div style="font-size:0.7rem; color:var(--text-muted); grid-column:1/-1; margin-top:0.3rem;">…or drop an audio file here</div>
+        <div class="vt-empty">
+          <button type="button" id="vtStudioBtnOutro" class="vt-btn primary" onclick="vtOpenStudio('outro')">Record Outro VT in iPortal</button>
         </div>
         {% endif %}
-      </div>
-    </div>
-  </div>
-
-  <!-- Recording modal -->
-  <div class="vt-modal" id="vtModal" style="display:none;">
-    <div class="vt-modal-inner">
-      <h3 id="vtModalTitle">Record Voice Track</h3>
-      <div class="vt-modal-status" id="vtModalStatus">Ready to record</div>
-      <div class="vt-modal-timer" id="vtModalTimer">00:00</div>
-      <audio id="vtPreviewAudio" controls style="display:none; width:100%; margin:0.5rem 0;"></audio>
-      <div class="vt-modal-actions">
-        <button type="button" class="vt-btn primary" id="vtModalRecordBtn" onclick="vtModalRecord()">● Record</button>
-        <button type="button" class="vt-btn" id="vtModalStopBtn" onclick="vtModalStop()" style="display:none;">■ Stop</button>
-        <button type="button" class="vt-btn primary" id="vtModalSaveBtn" onclick="vtModalSave()" style="display:none;">Save VT</button>
-        <button type="button" class="vt-btn" onclick="vtModalClose()">Cancel</button>
-      </div>
-      <div class="vt-modal-hint">
-        Speak clearly; the recording auto-normalizes on save. Preview by scrubbing before saving.
       </div>
     </div>
   </div>
@@ -779,22 +743,15 @@
 {% endblock %}
 
 {% block extra_js %}
-{% if can_edit_voicetracks %}{% include "library/_voicetrack_editor.html" %}{% endif %}
 <script>
 const TRACK_ID = {{ track.id }};
 
 // ============================================================
-// Voice track recording
+// Voice tracks (2.22B): recording, editing, saving and removal happen in
+// the shared iPortal recorder/editor. This page only previews the current
+// take and opens the studio for a slot.
 // ============================================================
 {% if can_edit_voicetracks %}
-let vtCurrentPosition = null;   // 'intro' | 'outro'
-let vtMediaRecorder = null;
-let vtChunks = [];
-let vtBlob = null;
-let vtAudioContext = null;
-let vtTimerId = null;
-let vtStartTs = 0;
-
 // Initial (server-rendered) marker values. Used at record-click time
 // to decide whether to auto-save the form -- if the field value
 // differs from initial, the server's copy of the marker is stale and
@@ -817,11 +774,11 @@ function vtRefreshSlotStates() {
   const outroVal = document.getElementById('f_outro_starts_seconds').value;
 
   const cases = [
-    { position: 'intro', value: introVal, btnId: 'vtRecordBtnIntro',
+    { position: 'intro', value: introVal, btnId: 'vtStudioBtnIntro',
       marker: 'intro_until',
       liveText: (v) => `Fits within ${v.toFixed(1)}s intro window`,
       emptyText: 'No intro_until marker — set it above before recording' },
-    { position: 'outro', value: outroVal, btnId: 'vtRecordBtnOutro',
+    { position: 'outro', value: outroVal, btnId: 'vtStudioBtnOutro',
       marker: 'outro_starts',
       liveText: (v) => `Fires at ${v.toFixed(1)}s`,
       emptyText: 'No outro_starts marker — set it above before recording' },
@@ -878,260 +835,13 @@ async function vtEnsureMarkerCommitted(position) {
   }
 }
 
-async function vtRecord(position) {
-  // Auto-commit the marker if the operator typed a value but hasn't
-  // clicked Save Changes yet -- otherwise the upload endpoint's
-  // "marker required" check would 400 on stale server state. This
-  // is a silent side-effect save (saveTrack shows its own toast).
-  // If save fails we bail out of opening the modal.
+async function vtOpenStudio(position) {
+  // Commit an edited-but-unsaved marker first (as before Phase B): the
+  // studio checks the SERVER's marker before it allows a save.
   if (!await vtEnsureMarkerCommitted(position)) return;
-
-  vtCurrentPosition = position;
-  vtChunks = [];
-  vtBlob = null;
-  document.getElementById('vtModalTitle').textContent = `Record ${position === 'intro' ? 'Intro' : 'Outro'} VT`;
-  document.getElementById('vtModalStatus').textContent = 'Ready to record. Click ● Record to start.';
-  document.getElementById('vtModalTimer').textContent = '00:00';
-  document.getElementById('vtModalTimer').classList.remove('recording');
-  document.getElementById('vtPreviewAudio').style.display = 'none';
-  document.getElementById('vtPreviewAudio').src = '';
-  document.getElementById('vtModalRecordBtn').style.display = '';
-  document.getElementById('vtModalStopBtn').style.display = 'none';
-  document.getElementById('vtModalSaveBtn').style.display = 'none';
-  document.getElementById('vtModal').style.display = 'flex';
+  window.location.href = "{% url 'library:iportal-evergreen-voicetrack-page' %}?track={{ track.id }}&position=" + encodeURIComponent(position);
 }
 
-async function vtModalRecord() {
-  const status = document.getElementById('vtModalStatus');
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      // All three DSP passes forced OFF via the strict {exact: false}
-      // form. Browsers can silently ignore a plain `false` on an
-      // audio constraint and enable the DSP anyway ("we know better
-      // than you do"); {exact: false} is the strict-constraint form
-      // that forces them to honor it. Same pattern the remote-DJ
-      // mic capture on dashboard.html uses. Rationale: VT audio is
-      // going straight into the on-air chain -- automatic gain
-      // reshaping mid-take produces pumping, noise suppression
-      // gates sibilants unpredictably, and echo cancellation
-      // strips low-frequency room tone. Anything the operator
-      // wants adjusted is done deliberately in the editor.
-      audio: {
-        echoCancellation: { exact: false },
-        noiseSuppression: { exact: false },
-        autoGainControl:  { exact: false },
-      },
-    });
-    vtMediaRecorder = new MediaRecorder(stream);
-    vtMediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) vtChunks.push(e.data);
-    };
-    vtMediaRecorder.onstop = () => {
-      vtBlob = new Blob(vtChunks, { type: vtMediaRecorder.mimeType || 'audio/webm' });
-      const url = URL.createObjectURL(vtBlob);
-      const preview = document.getElementById('vtPreviewAudio');
-      preview.src = url;
-      preview.style.display = 'block';
-      document.getElementById('vtModalSaveBtn').style.display = '';
-      status.textContent = `Recorded ${(vtBlob.size / 1024).toFixed(1)} KB. Preview above, save to keep.`;
-      // Release the mic
-      stream.getTracks().forEach(t => t.stop());
-    };
-    vtMediaRecorder.start();
-    vtStartTs = Date.now();
-    vtTimerId = setInterval(vtUpdateTimer, 100);
-    document.getElementById('vtModalTimer').classList.add('recording');
-    document.getElementById('vtModalRecordBtn').style.display = 'none';
-    document.getElementById('vtModalStopBtn').style.display = '';
-    status.textContent = 'Recording…';
-  } catch (e) {
-    status.textContent = 'Microphone access denied or not available: ' + e.message;
-  }
-}
-
-function vtUpdateTimer() {
-  const elapsed = (Date.now() - vtStartTs) / 1000;
-  const m = Math.floor(elapsed / 60);
-  const s = Math.floor(elapsed % 60);
-  document.getElementById('vtModalTimer').textContent =
-    `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-function vtModalStop() {
-  if (vtMediaRecorder && vtMediaRecorder.state !== 'inactive') {
-    vtMediaRecorder.stop();
-  }
-  clearInterval(vtTimerId);
-  document.getElementById('vtModalTimer').classList.remove('recording');
-  document.getElementById('vtModalStopBtn').style.display = 'none';
-  document.getElementById('vtModalRecordBtn').style.display = '';
-  document.getElementById('vtModalRecordBtn').textContent = '● Re-record';
-}
-
-async function vtModalSave() {
-  const status = document.getElementById('vtModalStatus');
-  const saveBtn = document.getElementById('vtModalSaveBtn');
-  if (!vtBlob) { status.textContent = 'Nothing to save.'; return; }
-  saveBtn.disabled = true;
-  status.textContent = 'Decoding & encoding to WAV…';
-  try {
-    if (!vtAudioContext) vtAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-    const arrayBuf = await vtBlob.arrayBuffer();
-    const audioBuf = await vtAudioContext.decodeAudioData(arrayBuf);
-    const wavBlob = audioBufferToWav(audioBuf);
-
-    status.textContent = `Uploading ${(wavBlob.size / 1024).toFixed(1)} KB…`;
-    const fd = new FormData();
-    fd.append('file', wavBlob, 'voicetrack.wav');
-    fd.append('track_id', TRACK_ID);
-    fd.append('position', vtCurrentPosition);
-    const resp = await fetch("{% url 'library:api-voicetrack-upload' %}", {
-      method: 'POST',
-      headers: { 'X-CSRFToken': getCookie('csrftoken') },
-      body: fd,
-    });
-    const data = await resp.json();
-    if (!resp.ok || data.error) {
-      status.textContent = 'Upload failed: ' + (data.error || `HTTP ${resp.status}`);
-      saveBtn.disabled = false;
-      return;
-    }
-    status.textContent = `Saved (${data.duration_seconds.toFixed(2)}s). Reloading…`;
-    setTimeout(() => window.location.reload(), 700);
-  } catch (e) {
-    status.textContent = 'Save failed: ' + e.message;
-    saveBtn.disabled = false;
-  }
-}
-
-function vtModalClose() {
-  if (vtMediaRecorder && vtMediaRecorder.state !== 'inactive') {
-    try { vtMediaRecorder.stop(); } catch (e) {}
-    if (vtMediaRecorder.stream) {
-      vtMediaRecorder.stream.getTracks().forEach(t => t.stop());
-    }
-  }
-  clearInterval(vtTimerId);
-  document.getElementById('vtModal').style.display = 'none';
-  document.getElementById('vtModalRecordBtn').textContent = '● Record';
-  const preview = document.getElementById('vtPreviewAudio');
-  if (preview.src) URL.revokeObjectURL(preview.src);
-  preview.src = '';
-}
-
-// Drop-zone handlers (visual state + file drop dispatch to vtImportFile).
-function vtDzOver(e) {
-  e.preventDefault();
-  e.currentTarget.classList.add('dragover');
-}
-function vtDzLeave(e) {
-  e.currentTarget.classList.remove('dragover');
-}
-function vtDzDrop(e, position) {
-  e.preventDefault();
-  e.currentTarget.classList.remove('dragover');
-  if (!e.dataTransfer.files.length) return;
-  vtImportFile(position, e.dataTransfer.files[0]);
-}
-
-async function vtImportFile(position, file) {
-  if (!file) return;
-  // Same auto-save-marker-if-dirty guard the recording flow uses.
-  if (!await vtEnsureMarkerCommitted(position)) return;
-  const fd = new FormData();
-  fd.append('file', file, file.name);
-  fd.append('track_id', TRACK_ID);
-  fd.append('position', position);
-  fd.append('source', 'import');
-  // Repurpose the recording modal's status line as an in-page toast so
-  // the operator sees progress without a separate widget. Modal itself
-  // stays hidden.
-  const status = document.getElementById('vtModalStatus');
-  status.textContent = `Importing ${file.name} (${(file.size/1024).toFixed(1)} KB)...`;
-  try {
-    const resp = await fetch("{% url 'library:api-voicetrack-upload' %}", {
-      method: 'POST',
-      headers: { 'X-CSRFToken': getCookie('csrftoken') },
-      body: fd,
-    });
-    const data = await resp.json();
-    if (!resp.ok || data.error) {
-      alert('Import failed: ' + (data.error || `HTTP ${resp.status}`));
-      return;
-    }
-    window.location.reload();
-  } catch (e) {
-    alert('Import failed: ' + e.message);
-  }
-}
-
-async function vtDelete(vtId) {
-  if (!confirm('Delete this voice track? The audio file will be removed too.')) return;
-  const resp = await fetch(`/api/voicetrack/${vtId}/delete/`, {
-    method: 'POST',
-    headers: { 'X-CSRFToken': getCookie('csrftoken') },
-  });
-  const data = await resp.json();
-  if (!resp.ok || data.error) {
-    alert('Delete failed: ' + (data.error || `HTTP ${resp.status}`));
-    return;
-  }
-  window.location.reload();
-}
-
-// WAV encoder ported from OGRemote's editor.html audioBufferToWav.
-// 16-bit PCM, matches the pipeline's expected input format.
-function audioBufferToWav(buffer) {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const length = buffer.length;
-  const bytesPerSample = 2;
-  const blockAlign = numChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = length * blockAlign;
-  const bufferLength = 44 + dataSize;
-  const arrayBuffer = new ArrayBuffer(bufferLength);
-  const view = new DataView(arrayBuffer);
-  const writeString = (offset, str) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
-  let offset = 0;
-  writeString(offset, "RIFF"); offset += 4;
-  view.setUint32(offset, 36 + dataSize, true); offset += 4;
-  writeString(offset, "WAVE"); offset += 4;
-  writeString(offset, "fmt "); offset += 4;
-  view.setUint32(offset, 16, true); offset += 4;
-  view.setUint16(offset, 1, true); offset += 2;
-  view.setUint16(offset, numChannels, true); offset += 2;
-  view.setUint32(offset, sampleRate, true); offset += 4;
-  view.setUint32(offset, byteRate, true); offset += 4;
-  view.setUint16(offset, blockAlign, true); offset += 2;
-  view.setUint16(offset, 16, true); offset += 2;
-  writeString(offset, "data"); offset += 4;
-  view.setUint32(offset, dataSize, true); offset += 4;
-  const channelData = [];
-  for (let ch = 0; ch < numChannels; ch++) channelData.push(buffer.getChannelData(ch));
-  let writeOffset = offset;
-  for (let sampleIndex = 0; sampleIndex < length; sampleIndex++) {
-    for (let channelIndex = 0; channelIndex < numChannels; channelIndex++) {
-      let sample = channelData[channelIndex][sampleIndex];
-      sample = Math.max(-1, Math.min(1, sample));
-      const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-      view.setInt16(writeOffset, intSample, true);
-      writeOffset += 2;
-    }
-  }
-  return new Blob([arrayBuffer], { type: "audio/wav" });
-}
-
-function getCookie(name) {
-  let val = null;
-  document.cookie.split(';').forEach(c => {
-    c = c.trim();
-    if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
-  });
-  return val;
-}
 {% endif %}
 
 // Format duration display
