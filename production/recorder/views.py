@@ -27,6 +27,7 @@ from django.contrib.auth.decorators import login_required
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import render
 from django.urls import reverse
+from django.utils.crypto import salted_hmac
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
@@ -168,7 +169,18 @@ def workstation(request, adapter):
                       {"message": exc.message, "code": exc.code}, status=exc.status)
     return render(request, "production/iportal/workstation.html", {
         "recording_context": context.as_json(), "api": api_urls(request, adapter), "adapter": adapter_obj,
+        "page": {"draft_namespace": draft_namespace(request.user)},
     })
+
+
+def draft_namespace(user) -> str:
+    """An opaque, stable per-user prefix for the browser's local draft keys, so
+    two people sharing one browser profile never see each other's unsaved
+    audio. Derived server-side from the authenticated user (never from
+    anything the browser says). Isolation, not secrecy or authorization: the
+    drafts never leave the browser and every server action is authorized
+    on its own."""
+    return salted_hmac("production.recorder.draft-namespace", str(user.pk)).hexdigest()[:32]
 
 
 API_ENDPOINTS = ("context", "take", "revalidate", "commit", "remove", "source")

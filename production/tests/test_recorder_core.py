@@ -155,6 +155,31 @@ class RecorderCoreTests(IsolatedMediaRootMixin, TestCase):
         self.assertContains(page, "ON AIR")
         self.assertEqual(self.client.get("/scratch/?slot=BAD!").status_code, 404)
 
+    def test_the_page_carries_a_server_derived_per_user_draft_namespace(self):
+        """2.22B corrective: browser drafts are keyed per authenticated user, by a
+        value the SERVER derives -- stable across sessions, different per user,
+        revealing neither username nor id, and not influenced by the request."""
+        from production.recorder import views
+
+        def namespace(client, query="slot=a"):
+            page = client.get(f"/scratch/?{query}")
+            return page.context["page"]["draft_namespace"]
+
+        mine = namespace(self.client)
+        self.assertRegex(mine, r"^[0-9a-f]{32}$")
+        self.assertEqual(mine, views.draft_namespace(self.user))
+        again = Client()
+        again.force_login(self.user)                                # a new session, same user
+        self.assertEqual(namespace(again), mine)
+        self.assertEqual(namespace(self.client, "slot=a&draft_namespace=forged&user=other"), mine)
+        other = Client()
+        other_user = User.objects.create_user("producer-2", password="x", is_staff=True)
+        other.force_login(other_user)
+        self.assertNotEqual(namespace(other), mine)
+        for revealing in (self.user.username, str(self.user.pk)):
+            self.assertNotEqual(mine, revealing)
+        self.assertContains(self.client.get("/scratch/?slot=a"), f'"draft_namespace": "{mine}"')
+
     # -- intake ------------------------------------------------------------------------
     def test_a_recorded_take_streams_validates_and_never_binds(self):
         response = self.upload(fixture("wav16_mono.wav"))

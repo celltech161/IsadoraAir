@@ -205,8 +205,8 @@
     this.maxBytes = maxBytes || UNDO_MAX_BYTES;
     this.items = [];
   }
-  UndoStack.prototype.push = function (pcm, label) {
-    this.items.push({ pcm: pcm, label: label || "" });
+  UndoStack.prototype.push = function (pcm, label, meta) {
+    this.items.push({ pcm: pcm, label: label || "", meta: meta || null });
     while (this.items.length > this.maxSteps || (this.items.length > 1 && this.bytes() > this.maxBytes)) {
       this.items.shift();
     }

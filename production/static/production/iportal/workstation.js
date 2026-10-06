@@ -35,6 +35,8 @@
   var S = {
     ctx: JSON.parse($("iportal-context").textContent),
     api: JSON.parse($("iportal-api").textContent),
+    page: JSON.parse($("iportal-page").textContent),
+    baseRevision: null,            // the revision the editor content is based on (see commit)
     pcm: null, dirty: false, ops: [],
     sourceKind: "none",            // none | recording | import | edit-media | edit-legacy
     parentMediaId: null, importFile: null, importUnedited: false,
@@ -44,8 +46,17 @@
   };
   root.IPortalWorkstation = S;      // exposed for tests / debugging only
 
+  S.baseRevision = S.ctx.revision;
+
   function allowed(op) { return S.ctx.allowed_operations.indexOf(op) >= 0; }
-  function subjectKey() { return S.ctx.adapter + "|" + JSON.stringify(S.ctx.subject); }
+  // Drafts are keyed by the SERVER-provided per-user namespace + workspace +
+  // subject: another person using this browser profile never sees them.
+  var DRAFT_KEY_PREFIX = "u:" + S.page.draft_namespace + "|";
+  function subjectKey() { return DRAFT_KEY_PREFIX + S.ctx.adapter + "|" + JSON.stringify(S.ctx.subject); }
+  // Content that no longer derives from an older editing session (a fresh
+  // recording, an import, the on-air take just loaded) is based on what the
+  // page currently knows is on air.
+  function rebase() { S.baseRevision = S.ctx.revision; }
 
   function message(text, kind) {
     var box = $("ipMessages");
@@ -193,6 +204,7 @@
     } else {
       if (S.pcm) pushUndo("re-record");
       S.pcm = take;
+      rebase();
       S.sourceKind = "recording";
       S.parentMediaId = null;
       S.importFile = null;
@@ -205,7 +217,7 @@
   }
 
   // -- editor ------------------------------------------------------------------
-  function pushUndo(label) { if (S.pcm) S.undo.push(S.pcm, label); }
+  function pushUndo(label) { if (S.pcm) S.undo.push(S.pcm, label, { baseRevision: S.baseRevision }); }
 
   function markDirty() {
     S.dirty = !!S.pcm;
@@ -281,6 +293,7 @@
       }
       if (S.pcm) pushUndo("import");
       S.pcm = pcm; S.sourceKind = "import"; S.importFile = file; S.importUnedited = true;
+      rebase();
       S.parentMediaId = null; S.ops = []; S.selection = null; S.view = { start: 0, end: A.duration(pcm) };
       markDirty();
       message("Imported " + file.name + ". Edit it here, or save it as is.", "ok");
@@ -295,6 +308,7 @@
       if (!resp.ok) throw new Error("http " + resp.status);
       var pcm = await decodeToPcm(await resp.arrayBuffer());
       S.pcm = pcm;
+      rebase();
       S.sourceKind = S.ctx.current && S.ctx.current.origin === "production_media" ? "edit-media" : "edit-legacy";
       S.parentMediaId = S.sourceKind === "edit-media" ? S.ctx.current.media_id : null;
       S.importFile = null; S.ops = []; S.undo.clear(); S.selection = null;
@@ -357,7 +371,7 @@
   function saveDraft() {
     if (!S.pcm || !S.dirty || A.byteSize(S.pcm) > DRAFT_MAX_BYTES) return Promise.resolve();
     var draft = {
-      savedAt: Date.now(), revision: S.ctx.revision, sourceKind: S.sourceKind, parentMediaId: S.parentMediaId,
+      savedAt: Date.now(), revision: S.baseRevision, sourceKind: S.sourceKind, parentMediaId: S.parentMediaId,
       ops: S.ops.slice(), sampleRate: S.pcm.sampleRate, channels: S.pcm.channels,
     };
     return draftTx("readwrite", function (store) { return store.put(draft, subjectKey()); }).catch(function () {});
@@ -371,7 +385,10 @@
       req.onsuccess = function () {
         var cursor = req.result;
         if (!cursor) return;
-        if (!cursor.value || Date.now() - cursor.value.savedAt > DRAFT_MAX_AGE_MS) cursor.delete();
+        // Expired drafts of anyone, and drafts stored before keys were
+        // per-user (no "u:" prefix) -- those could belong to anybody.
+        if (!cursor.value || Date.now() - cursor.value.savedAt > DRAFT_MAX_AGE_MS
+            || String(cursor.key).indexOf("u:") !== 0) cursor.delete();
         cursor.continue();
       };
     }).catch(function () {});
@@ -389,6 +406,9 @@
     var d = S.draft;
     if (!d) return;
     S.pcm = A.make(d.sampleRate, d.channels);
+    // The draft was made against d.revision: saving it must be checked against
+    // THAT, so a newer save by someone else is a conflict, never overwritten.
+    S.baseRevision = d.revision;
     S.sourceKind = d.sourceKind === "import" ? "recording" : d.sourceKind;   // the original import bytes are not kept
     S.parentMediaId = d.parentMediaId; S.ops = d.ops || []; S.importFile = null; S.importUnedited = false;
     S.view = { start: 0, end: A.duration(S.pcm) }; S.selection = null;
@@ -478,7 +498,7 @@
   }
 
   async function commit(media) {
-    var data = await api(S.api.commit, { subject: S.ctx.subject, media_id: media.media_id, revision: S.ctx.revision });
+    var data = await api(S.api.commit, { subject: S.ctx.subject, media_id: media.media_id, revision: S.baseRevision });
     if (data._status === 409) {
       S.pendingTake = media;
       $("ipConflict").hidden = false;
@@ -494,6 +514,7 @@
       return;
     }
     S.ctx = data.context;
+    rebase();
     S.pendingTake = null;
     S.dirty = false;
     S.undo.clear();
@@ -517,15 +538,18 @@
     var resp = await fetch(S.api.context + "?" + query(S.ctx.subject), { credentials: "same-origin" });
     var data = await resp.json();
     if (data.ok) { S.ctx = data.context; renderContext(); }
+    if (!S.pcm) rebase();
     $("ipConflict").hidden = true;
   }
 
   async function removeFromAir() {
     if (!root.confirm("Remove this from air? The audio itself is kept by the station and can be recovered by an administrator.")) return;
-    var data = await api(S.api.remove, { subject: S.ctx.subject, revision: S.ctx.revision });
+    var before = S.ctx.revision;
+    var data = await api(S.api.remove, { subject: S.ctx.subject, revision: before });
     if (data._status === 409) { $("ipConflict").hidden = false; return; }
     if (!data.ok) { message(rejection(data), "error"); return; }
     S.ctx = data.context;
+    if (!S.pcm || S.baseRevision === before) rebase();          // only this user's own removal intervened
     renderContext();
     message("Removed from air.", "ok");
   }
@@ -621,6 +645,7 @@
       var item = S.undo.pop();
       if (!item) return;
       S.pcm = item.pcm; S.ops.pop(); S.selection = null; S.view = { start: 0, end: A.duration(S.pcm) };
+      if (item.meta) S.baseRevision = item.meta.baseRevision;     // the restored audio's own base
       markDirty();
     });
     $("ipExport").addEventListener("click", exportWav);
@@ -630,7 +655,7 @@
     $("ipDiscard").addEventListener("click", function () {
       if (S.dirty && !root.confirm("Discard your unsaved edit?")) return;
       S.pcm = null; S.dirty = false; S.ops = []; S.undo.clear(); S.sourceKind = "none";
-      deleteDraft(); draw(); refreshControls();
+      rebase(); deleteDraft(); draw(); refreshControls();
     });
     $("ipRemove").addEventListener("click", removeFromAir);
     $("ipConflictReload").addEventListener("click", function () {
