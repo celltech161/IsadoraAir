@@ -1,13 +1,13 @@
 #!/bin/bash
-# Run a command inside a delegated cgroup v2 subtree, the way production runs
-# Gunicorn (deploy/isadoraair-gunicorn.service: Delegate= + DelegateSubgroup=web).
+# Run a command inside a delegated cgroup v2 subtree -- the kind of subtree the
+# isadoraair-validation service gets from systemd (deploy/isadoraair-
+# validation.service: Delegate= + DelegateSubgroup=supervisor) -- with the
+# command in its "web" subgroup.
 #
-# Media validation (production.services.confinement) runs every tool in a
-# kernel-enforced per-run cgroup inside the CALLER's delegated subtree and fails
-# closed without one, so tests that run the real validators need this:
-#
-#   systemd-run --user --scope -p Delegate=yes --quiet \
-#       production/tests/run_delegated.sh python manage.py test production
+# Used by production/tests/run_with_validation_service.sh so that the
+# executor's own unit tests (production.tests.test_confinement) can create
+# validation leaves exactly as the service does. Run the suite through that
+# wrapper, not this script directly.
 #
 # Unprivileged: it only uses the invoking user's own systemd user manager.
 set -eu

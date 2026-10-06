@@ -1,0 +1,39 @@
+[Unit]
+Description=IsadoraAir iPortal media validation (sole owner of validator processes)
+Documentation=file://@@ISA_ROOT@@/docs/IPORTAL.md
+After=network.target
+# Restart forever: a crash loop must never leave validation runs unowned.
+StartLimitIntervalSec=0
+
+[Service]
+# Every ffprobe / ffmpeg / GStreamer run on uploaded media lives in a cgroup
+# leaf of THIS unit (production.services.validation_service). The web workers
+# only ask, over the socket below; this unit owns each run's limits, its hard
+# deadline and its destruction.
+Type=simple
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+EnvironmentFile=@@ISA_ROOT@@/.env
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py production_validation_service
+# The delegated subtree: the service process runs in <unit>/supervisor, each
+# validation in <unit>/iportal-validation/run-<id> with its own memory/pids/cpu
+# limits. No privilege beyond this delegation is ever used.
+Delegate=cpu memory pids
+DelegateSubgroup=supervisor
+# If the service process dies, systemd kills EVERYTHING left in the unit's
+# cgroup -- validation leaves included -- and restarts it; the new instance
+# destroys any leftover leaf before it accepts work. A stop does the same.
+KillMode=control-group
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+# The socket lives here: owned by the service account, closed to everyone
+# else (the web service runs as the same account; browsers never reach it).
+RuntimeDirectory=isadoraair-validation
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

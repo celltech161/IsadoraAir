@@ -50,7 +50,7 @@ from django.utils import timezone
 from .. import formats, policy, transitions
 from ..errors import MediaInconsistent, MediaPurged
 from ..models import ProductionMedia
-from . import layout
+from . import layout, validator_commands
 
 STATUS_VALID = "valid"
 STATUS_INVALID = "invalid"
@@ -93,11 +93,7 @@ GSTREAMER_PROBE_SCRIPT = str(Path(__file__).with_name("gst_probe.py"))
 GSTREAMER_PROBE_INTERPRETER = (sys.executable,)
 VALIDATOR_VERSION = 1
 
-_PROBE_ENTRIES = (
-    "format=format_name,duration,nb_streams:"
-    "stream=index,codec_type,codec_name,sample_rate,channels,channel_layout,duration:"
-    "stream_disposition=attached_pic"
-)
+_PROBE_ENTRIES = validator_commands.PROBE_ENTRIES
 _OUT_TIME_RE = re.compile(r"^out_time_us=(\d+)$", re.MULTILINE)
 _VERSION_RE = re.compile(r"^(?:ffprobe|ffmpeg) version (\S+)")
 _MICRO = Decimal("0.000001")
@@ -135,15 +131,16 @@ def _infrastructure(code):
 
 # -- process boundary -------------------------------------------------------
 
-def _run(args, *, timeout_seconds, stop_event=None):
-    """Bounded, shell-free, OS-confined subprocess execution (2.22B): every tool
-    that reads media bytes runs in its own kernel-limited cgroup (aggregate
-    memory, tasks, CPU), sandboxed by Landlock and seccomp, with per-process
-    rlimits, and the whole tree is killed when the run ends -- see
-    production.services.confinement. If the boundary cannot be established
-    the tool is not run at all (fail closed)."""
+def _run(args, *, timeout_seconds, stop_event=None, media=None):
+    """Bounded, shell-free, OS-confined execution (2.22B): every tool run is
+    handed to the isadoraair-validation service, which owns its kernel-limited
+    cgroup (aggregate memory, tasks, CPU), its Landlock/seccomp sandbox and its
+    hard deadline, and destroys the whole tree when the run ends -- even if
+    this process dies. ``media`` (the path inside ``args``) travels as an open
+    descriptor. If the service or the boundary is unavailable the tool is not
+    run at all (fail closed) -- see production.services.confinement."""
     from . import confinement
-    return confinement.run_confined(args, timeout_seconds=timeout_seconds, stop_event=stop_event)
+    return confinement.run_confined(args, timeout_seconds=timeout_seconds, stop_event=stop_event, media=media)
 
 
 def _run_failure(result, prefix):
@@ -170,6 +167,10 @@ class _Interrupted(Exception):
     """The caller's stop_event fired while a tool was running."""
 
 
+class _Unconfined(Exception):
+    """The validation service / kernel boundary is unavailable: no tool can run."""
+
+
 _TOOL_VERSIONS: dict[str, str] = {}
 _DECODER_CACHE: dict[str, bool] = {}
 
@@ -182,9 +183,12 @@ def clear_capability_cache():
 def _tool_version(binary, stop_event=None):
     if binary in _TOOL_VERSIONS:
         return _TOOL_VERSIONS[binary]
-    result = _run([binary, "-version"], timeout_seconds=CAPABILITY_TIMEOUT_SECONDS, stop_event=stop_event)
+    result = _run(validator_commands.tool_version(binary), timeout_seconds=CAPABILITY_TIMEOUT_SECONDS,
+                  stop_event=stop_event)
     if result.get("status") == "stopped":
         raise _Interrupted
+    if result.get("status") == "confinement_unavailable":
+        raise _Unconfined
     if result.get("status") != "ok":
         return None
     match = _VERSION_RE.match(result.get("stdout", ""))
@@ -197,10 +201,12 @@ def _decoder_available(name, stop_event=None):
     """True/False whether this ffmpeg has decoder ``name``; None if unknown."""
     if name in _DECODER_CACHE:
         return _DECODER_CACHE[name]
-    result = _run([FFMPEG, "-hide_banner", "-h", f"decoder={name}"],
+    result = _run(validator_commands.decoder_help(FFMPEG, name),
                   timeout_seconds=CAPABILITY_TIMEOUT_SECONDS, stop_event=stop_event)
     if result.get("status") == "stopped":
         raise _Interrupted
+    if result.get("status") == "confinement_unavailable":
+        raise _Unconfined
     if result.get("status") != "ok":
         return None
     available = result.get("stdout", "").lstrip().startswith(f"Decoder {name}")
@@ -252,6 +258,8 @@ def _analyze_path(path: Path, *, require_engine_decode=True, stop_event=None) ->
         return _analyze(path, require_engine_decode=require_engine_decode, stop_event=stop_event)
     except _Interrupted:
         return _infrastructure("validation_interrupted")
+    except _Unconfined:
+        return _infrastructure("confinement_unavailable")
 
 
 def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutcome:
@@ -272,8 +280,7 @@ def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutc
         os.close(fd)
     if sniffed is None:
         return _invalid("unsupported_container")
-    demuxer = formats.CONTAINERS[sniffed][0]
-    guard = ["-protocol_whitelist", "file", "-f", demuxer]
+    demuxer = formats.CONTAINERS[sniffed][0]          # the probe and decode force it, file protocol only
 
     probe_version = _tool_version(FFPROBE, stop_event)
     ffmpeg_version = _tool_version(FFMPEG, stop_event)
@@ -281,11 +288,8 @@ def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutc
         return _infrastructure("probe_unavailable")
 
     # 2. ffprobe ---------------------------------------------------------------
-    result = _run(
-        [FFPROBE, "-v", "error", "-hide_banner", *guard, "-show_entries", _PROBE_ENTRIES,
-         "-of", "json", str(path)],
-        timeout_seconds=FFPROBE_TIMEOUT_SECONDS, stop_event=stop_event,
-    )
+    result = _run(validator_commands.probe(FFPROBE, demuxer, path),
+                  timeout_seconds=FFPROBE_TIMEOUT_SECONDS, stop_event=stop_event, media=path)
     if result.get("status") != "ok":
         failure = _run_failure(result, "probe")
         return failure if failure is not None else _invalid("unreadable_container", {"container": sniffed})
@@ -353,12 +357,8 @@ def _analyze(path: Path, *, require_engine_decode, stop_event) -> ValidationOutc
         return _infrastructure("decoder_unavailable")
 
     # 5. full decode -> authoritative duration ----------------------------------------
-    result = _run(
-        [FFMPEG, "-nostdin", "-hide_banner", "-v", "error", "-xerror", "-nostats",
-         "-progress", "pipe:1", "-stats_period", "100000", "-threads", "1",
-         *guard, "-i", str(path), "-map", "0:a:0", "-f", "null", "-"],
-        timeout_seconds=FFMPEG_TIMEOUT_SECONDS, stop_event=stop_event,
-    )
+    result = _run(validator_commands.decode(FFMPEG, demuxer, path),
+                  timeout_seconds=FFMPEG_TIMEOUT_SECONDS, stop_event=stop_event, media=path)
     if result.get("status") != "ok":
         failure = _run_failure(result, "decode")
         return failure if failure is not None else _invalid("decode_error", facts)
@@ -395,11 +395,9 @@ def _engine_decode(path, evidence, facts, stop_event):
     plugin, element or GI) and every other failure are retryable
     infrastructure -- valid media is never condemned for what the station
     runtime lacks."""
-    result = _run(
-        [*GSTREAMER_PROBE_INTERPRETER, GSTREAMER_PROBE_SCRIPT,
-         "--timeout", str(GSTREAMER_CHILD_TIMEOUT_SECONDS), str(path)],
-        timeout_seconds=GSTREAMER_HARD_TIMEOUT_SECONDS, stop_event=stop_event,
-    )
+    result = _run(validator_commands.engine_decode(GSTREAMER_PROBE_INTERPRETER, GSTREAMER_PROBE_SCRIPT,
+                                                   GSTREAMER_CHILD_TIMEOUT_SECONDS, path),
+                  timeout_seconds=GSTREAMER_HARD_TIMEOUT_SECONDS, stop_event=stop_event, media=path)
     if result.get("status") != "ok":
         failure = _run_failure(result, "engine_probe")
         # A child that exits non-zero without a verdict is a broken probe

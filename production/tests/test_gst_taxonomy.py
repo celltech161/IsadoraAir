@@ -5,11 +5,18 @@ Real conditions, not mocks, wherever GStreamer can produce them:
 * a missing decoder -- the decoder's rank forced to NONE
   (GST_PLUGIN_FEATURE_RANK), so decodebin cannot autoplug it;
 * missing elements -- an empty private plugin registry;
-* no GI/GStreamer -- the probe interpreter run with ``-S`` (no site-packages);
+* no GI/GStreamer -- the probe interpreter run with ``-S`` (no site-packages),
+  or (for the full validator) a ``gi`` that cannot be imported;
 * genuinely undecodable bytes -- real structurally corrupt files.
 Every GStreamer environment override also points GST_REGISTRY at a private
 temporary file so the user's registry cache is never touched.
+
+Since the 2.22B lifecycle correction the full validator runs its tools in the
+isadoraair-validation SERVICE, so the station-runtime conditions are given to
+a dedicated (transient, user-level) validation service as ITS environment --
+which is where they live in production.
 """
+import contextlib
 import io
 import json
 import os
@@ -26,6 +33,7 @@ from production.models import ProductionMedia
 from production.services import gst_probe, intake, validation
 
 from .support import IsolatedMediaRootMixin, fixture
+from .validation_service_support import validation_service
 
 PROBE = Path(gst_probe.__file__)
 
@@ -37,7 +45,12 @@ class GstEnv:
         self.variables = {"GST_REGISTRY": str(self.dir / "registry.bin"), **variables}
 
     def patch(self):
-        return mock.patch.dict(os.environ, self.variables)
+        """This environment for GStreamer children of the test process AND for
+        a dedicated validation service the validator then uses."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, self.variables))
+        stack.enter_context(validation_service(env=self.variables))
+        return stack
 
 
 def no_flac_decoder(testcase):
@@ -168,7 +181,11 @@ class ParentMappingTests(IsolatedMediaRootMixin, TestCase):
 
     def test_4_no_gi_runtime_stays_retryable(self):
         media = self.stored()
-        with mock.patch.object(validation, "GSTREAMER_PROBE_INTERPRETER", (sys.executable, "-S")):
+        no_gi = Path(tempfile.mkdtemp(prefix="no-gi-"))
+        self.addCleanup(shutil.rmtree, no_gi, ignore_errors=True)
+        (no_gi / "gi").mkdir()
+        (no_gi / "gi" / "__init__.py").write_text("raise ImportError('no GI on this station')\n")
+        with GstEnv(self, PYTHONPATH=str(no_gi)).patch():
             self.assert_retryable(media, "engine_capability_unavailable")
 
     def test_5_missing_elements_stay_retryable(self):

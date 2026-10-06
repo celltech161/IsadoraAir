@@ -240,6 +240,11 @@ WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 # an operator action (move the directory, then edit .env). Read at call time
 # by production.services.layout, never cached at import.
 PRODUCTION_MEDIA_ROOT = config('PRODUCTION_MEDIA_ROOT', default='/srv/isadoraair/production-media')
+# iPortal media validation runs in the isadoraair-validation service
+# (deploy/isadoraair-validation.service), reached over this Unix socket in its
+# 0700 runtime directory. Without the service, validation fails closed.
+PRODUCTION_VALIDATION_SOCKET = config('PRODUCTION_VALIDATION_SOCKET',
+                                      default='/run/isadoraair-validation/validator.sock')
 
 # Where the GW3000/Ecowitt weather receiver writes latest_weather.json,
 # wind_history.json, and smoothed_wind.json -- read by the /wx/ views and

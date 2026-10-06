@@ -28,6 +28,10 @@ EXEMPT = {
 EXEMPT_CLASSES = {
     "production.tests.test_gst_taxonomy.ProbeChildTaxonomyTests",
     "production.tests.test_gst_taxonomy.ClassifyErrorTableTests",
+    # 2.22B validation service: private temp WAVs, fake tools and transient
+    # user-level services only; no database, never a media root.
+    "production.tests.test_validation_service.ProtocolTests",
+    "production.tests.test_validation_service.LifecycleTests",
 }
 
 

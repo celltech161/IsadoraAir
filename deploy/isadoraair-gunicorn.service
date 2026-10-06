@@ -1,6 +1,9 @@
 [Unit]
 Description=IsadoraAir Gunicorn
-After=network.target postgresql.service
+After=network.target postgresql.service isadoraair-validation.service
+# iPortal media validation is a separate service; without it, validation
+# fails closed (uploads are kept, unvalidated and retryable).
+Wants=isadoraair-validation.service
 
 [Service]
 User=@@ISA_USER@@
@@ -10,13 +13,6 @@ ExecStart=@@ISA_ROOT@@/venv/bin/gunicorn isadoraair.wsgi:application --bind 127.
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=@@ISA_ROOT@@/.env
-# iPortal media validation (2.22B): delegate this unit's cgroup subtree to the
-# service account and run Gunicorn in its "web" subgroup, so
-# production.services.confinement can run every validator in a kernel-limited,
-# killable per-run cgroup beside it (<unit>/iportal-validation/run-*), without
-# privilege. Without the delegation, validation fails closed.
-Delegate=cpu memory pids
-DelegateSubgroup=web
 
 [Install]
 WantedBy=multi-user.target
