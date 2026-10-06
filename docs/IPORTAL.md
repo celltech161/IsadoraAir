@@ -132,9 +132,15 @@ isadoraair-validation.service   (deploy/isadoraair-validation.service)
   later request is ever needed for cleanup.
 * **If the service dies**, systemd (`KillMode=control-group`) kills every
   process left in the unit's cgroup — validation leaves included — and
-  restarts it (`Restart=always`, no start limit); the new instance kills and
-  removes every leftover `run-*` leaf **before** it accepts work. Stopping or
-  restarting the service destroys its runs the same way.
+  restarts it (`Restart=always`, no start limit). Stopping or restarting the
+  service destroys its runs the same way.
+* **Start-up cleanup is a readiness gate.** Before it binds its socket, a
+  starting instance kills and removes every leftover `run-*` leaf and then
+  verifies the subtree is unpopulated (`confinement.reap_all`, all or
+  nothing). If the subtree cannot be scanned, a leaf cannot be killed, emptied
+  or removed, or anything is still alive afterwards, the process exits
+  non-zero **without ever listening**; systemd restarts it and it tries again.
+  Clients meanwhile get `confinement_unavailable`.
 * **No PID decides ownership.** Leaves are named by a random 128-bit id; the
   subtree belongs to the service alone, so every `run-*` leaf found at
   start-up or stop is a run of this service and is reaped.
@@ -151,7 +157,26 @@ variable or limit can be chosen by a client. The socket lives in the service's
 `0700` runtime directory (`/run/isadoraair-validation/validator.sock`,
 `settings.PRODUCTION_VALIDATION_SOCKET`), is `0600`, and both ends check
 `SO_PEERCRED` (same service account). Browsers never reach it. It is not a job
-system: one synchronous run per connection, at most four at a time.
+system: one synchronous run per connection.
+
+**Admission is bounded before anything is allocated.** At most
+`MAX_ACTIVE_RUNS` = **2** runs execute at once and at most
+`MAX_PENDING_REQUESTS` = **4** more admitted requests wait for a run slot
+(within their own deadline); settings `PRODUCTION_VALIDATION_MAX_ACTIVE` /
+`PRODUCTION_VALIDATION_MAX_PENDING` or the command's `--max-active` /
+`--max-pending` change them. The accept loop admits a connection only while
+fewer than 6 are admitted, and only an admitted connection gets a handler
+thread; any other connection is answered `{"status": "busy"}` at once and
+closed **without reading it** — whatever it sent, passed descriptors
+included, is discarded by the kernel with the connection. Beyond the listen
+backlog (16) the kernel itself refuses the connect (`EAGAIN`), which the
+client also reports as `busy`. An admitted client has
+`REQUEST_READ_TIMEOUT_SECONDS` = 5 s **in total** to deliver its request, so a
+silent or byte-at-a-time client cannot hold a slot. So the service's threads
+(≤ 1 + 6 + 2 output readers per run), connections, parsed requests, media
+descriptors and run leaves (≤ 2) are bounded whatever the request volume.
+`busy` maps to the retryable infrastructure code `validation_busy` — never a
+verdict on the media.
 
 **Guaranteed limits for one run** (defaults calibrated on the real validators
 with 10-minute WAV/FLAC/Opus — measured peaks ≤ 22 MiB charged memory, ≤ 18
@@ -165,13 +190,21 @@ tasks, ~3 s CPU; overridable only as service configuration,
 | OOM | kills the whole tree | kernel: `memory.oom.group` 1 |
 | tasks (processes + threads) | 64 | kernel: `pids.max` |
 | CPU rate | one CPU | kernel: `cpu.max` |
-| CPU time, whole tree | 180 s | service monitor (`cpu.stat`) |
+| CPU time, whole tree | 180 s | service monitor (`cpu.stat`, read strictly) |
 | wall clock | per tool: 10 s capability checks, 20 s probe, 300 s decode, 125 s GStreamer | service monitor |
 | tree destruction | after every run, on client loss, on service stop/death | `cgroup.kill` (service), then systemd |
 
 So one run can never use more than one CPU, nor more than 180 CPU-seconds, nor
 live longer than its command's cap — and each bound is enforced by the kernel
 or by the service whose own death destroys the tree.
+
+**The CPU-time counter fails closed.** `confinement.cpu_usage_usec` reads the
+leaf's `cpu.stat` to end of file and accepts exactly one `usage_usec` line
+holding a plain unsigned decimal. A missing or unreadable file, an I/O error,
+an incomplete read, an absent, repeated, signed or non-numeric field — or a
+counter that goes backwards during the run — ends the run at once: the tree is
+destroyed and the result is `confinement_unavailable` (retryable), never zero
+use and never a verdict on the media. The service stays up for the retry.
 
 **Per-process backstops**: `RLIMIT_AS` 1 GiB, `RLIMIT_CPU` 180 s (+5 s
 SIGKILL), `RLIMIT_FSIZE` 16 MiB, `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0.
@@ -192,9 +225,9 @@ the `cpu`, `memory` and `pids` controllers delegated and enabled
 (`confinement.establish_root`); in every leaf `cgroup.kill`, `memory.max`,
 `memory.swap.max`, `memory.oom.group`, `pids.max` and `cpu.max`, each written
 and read back (`confinement._prepare_leaf`); Landlock and seccomp
-(`confined_exec.py`, verified before `exec`). Any one missing, or no
-reachable service → `confinement_unavailable`, a retryable infrastructure
-error; the tool never runs outside the boundary. A tool stopped by a limit is
+(`confined_exec.py`, verified before `exec`); a readable CPU-time counter.
+Any one missing, or no reachable service → `confinement_unavailable`, a
+retryable infrastructure error; the tool never runs outside the boundary. A tool stopped by a limit is
 `validation_resource_limit`: a station limit, never an *invalid* verdict.
 
 **Deployment.** Install and enable `isadoraair-validation.service` (rendered

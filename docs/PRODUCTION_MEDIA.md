@@ -401,6 +401,10 @@ Status after Phase B (2.22B, see `docs/IPORTAL.md`):
   by systemd if the service itself dies), sandboxed by Landlock and seccomp so
   it cannot migrate out, with per-process rlimits as backstops; validation
   fails closed (`confinement_unavailable`) if any of it is unavailable —
+  including an unreadable CPU-time counter, and a service that has not
+  completed its start-up cleanup (it never listens until it has). Admission is
+  bounded (2 running, 4 waiting); excess requests get the retryable
+  `validation_busy` —
   `production.services.confinement`, `production.services.validation_service`.
 * **No GenericForeignKey or cross-database references** to ProductionMedia
   (see the binding rule). Upheld by Phase B: `VoiceTrack.media` is an
