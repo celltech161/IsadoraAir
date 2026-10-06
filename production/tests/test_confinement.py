@@ -1,12 +1,21 @@
-"""2.22B / B6 -- OS-enforced resource confinement of media validation.
+"""2.22B / B6 -- the kernel boundary around media validation.
 
-Synthetic helper programs (plain Python children) prove the KERNEL limits are
-really applied -- not merely requested -- and that every failure is a
-retryable infrastructure outcome, never a verdict on the media and never a
-risk to the calling (web) process.
+Synthetic helper programs (plain Python children run through the real
+launcher) prove the boundary is really established -- not merely requested:
+aggregate cgroup limits, per-process rlimits, Landlock and seccomp; that no
+task of a validation run survives ``run_confined`` however it re-parents,
+re-sessions or tries to migrate itself; that every failure is a retryable
+infrastructure outcome, never a verdict on the media; and that nothing ever
+runs outside the boundary.
+
+These tests need a delegated cgroup v2 subtree, exactly as production does
+(see production/tests/run_delegated.sh); without one they FAIL rather than
+skip -- the absence of the boundary is precisely what must never go unnoticed.
 """
 import os
 import resource
+import secrets
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -16,23 +25,97 @@ from unittest import mock
 
 from django.test import SimpleTestCase, override_settings
 
-from production.services import confinement, validation
+from production.services import confined_exec, confinement, validation
 from production.services.confinement import Limits, run_confined
 
 PY = sys.executable
 MIB = 1024 * 1024
+HOW_TO_RUN = ("no delegated cgroup v2 subtree for this test process -- run the suite through "
+              "`systemd-run --user --scope -p Delegate=yes --quiet production/tests/run_delegated.sh "
+              "python manage.py test ...` (production gets it from Delegate=/DelegateSubgroup= in "
+              "deploy/isadoraair-gunicorn.service)")
 
 
-def _script(body: str) -> list[str]:
-    return [PY, "-c", textwrap.dedent(body)]
+def _script(body: str, *argv) -> list[str]:
+    return [PY, "-c", textwrap.dedent(body), *map(str, argv)]
 
 
-class LimitsAreAppliedTests(SimpleTestCase):
-    def test_the_child_really_runs_under_every_configured_limit(self):
+def _proc_status(field: str, pid="self") -> str:
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith(field + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:                                  # a zombie still answers kill(0)
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, IndexError):
+        return False
+
+
+def _wait_dead(pids, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and any(_alive(pid) for pid in pids):
+        time.sleep(0.02)
+    return [pid for pid in pids if _alive(pid)]
+
+
+def _pids(stdout: str, tag: str) -> list[int]:
+    return [int(line.split()[1]) for line in stdout.splitlines() if line.startswith(tag + " ")]
+
+
+class ConfinementTestCase(SimpleTestCase):
+    def setUp(self):
+        super().setUp()
+        try:
+            self.root, self.enabled = confinement.establish_root()
+        except confinement.ConfinementUnavailable as exc:
+            self.fail(f"{HOW_TO_RUN}: {exc}")
+
+    def assert_scope_gone(self, result, pids=()):
+        """After run_confined returns: the leaf is gone (rmdir only succeeds on
+        an EMPTY cgroup) and every named task is dead."""
+        kernel = result["cgroup"]
+        self.assertTrue(kernel["cleaned"], result)
+        self.assertFalse(Path(kernel["path"]).exists(), kernel)
+        self.assertEqual([pid for pid in pids if _alive(pid)], [], "a validation task survived")
+
+
+class BoundaryIsEstablishedTests(ConfinementTestCase):
+    def test_this_test_process_has_a_delegated_validation_subtree(self):
+        self.assertTrue({"memory", "pids"} <= self.enabled, self.enabled)
+        self.assertEqual(self.root.name, confinement.VALIDATION_CGROUP_NAME)
+
+    def test_the_tree_runs_in_its_own_leaf_under_every_aggregate_limit(self):
+        limits = Limits(group_memory_bytes=300 * MIB, group_tasks=23, cpu_percent=50)
+        result = run_confined(_script("""
+            from pathlib import Path
+            leaf = "/sys/fs/cgroup" + open("/proc/self/cgroup").read().strip()[3:]
+            for name in ("memory.max", "memory.swap.max", "memory.oom.group", "pids.max", "cpu.max"):
+                p = Path(leaf, name)
+                print(name, p.read_text().strip() if p.exists() else "-")
+            print("leaf", leaf)
+        """), timeout_seconds=30, limits=limits)
+        self.assertEqual(result["status"], "ok", result)
+        seen = dict(line.split(" ", 1) for line in result["stdout"].splitlines())
+        self.assertEqual(seen["memory.max"], str(300 * MIB))
+        self.assertIn(seen["memory.swap.max"], ("0", "-"))
+        self.assertEqual((seen["memory.oom.group"], seen["pids.max"]), ("1", "23"))
+        if "cpu" in self.enabled:
+            self.assertEqual(seen["cpu.max"], "50000 100000")
+        self.assertEqual(Path(seen["leaf"]).parent, self.root)
+        self.assertEqual(seen["leaf"], result["cgroup"]["path"])
+        self.assert_scope_gone(result)
+
+    def test_the_child_runs_under_every_per_process_limit(self):
         limits = Limits(memory_bytes=700 * MIB, cpu_seconds=17, file_size_bytes=3 * MIB, open_files=99)
         result = run_confined(_script("""
-            import resource
-            r = resource
+            import resource as r
             print(r.getrlimit(r.RLIMIT_AS), r.getrlimit(r.RLIMIT_CPU), r.getrlimit(r.RLIMIT_FSIZE),
                   r.getrlimit(r.RLIMIT_NOFILE), r.getrlimit(r.RLIMIT_CORE))
         """), timeout_seconds=30, limits=limits)
@@ -41,26 +124,52 @@ class LimitsAreAppliedTests(SimpleTestCase):
         expected = ((700 * MIB, 700 * MIB), (17, 22), (3 * MIB, 3 * MIB), (99, 99), (0, 0))
         self.assertEqual(result["stdout"].strip(), " ".join(str(item) for item in expected))
 
+    def test_the_child_is_sandboxed_by_no_new_privs_seccomp_and_landlock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "written"
+            result = run_confined(_script("""
+                import sys
+                status = dict(l.split(":", 1) for l in open("/proc/self/status").read().splitlines())
+                print("nnp", status["NoNewPrivs"].strip(), "seccomp", status["Seccomp"].strip())
+                open("/dev/null", "w").write("ok")          # the one writable path
+                try:
+                    open(sys.argv[1], "w").write("x")
+                    print("WROTE")
+                except PermissionError:
+                    print("write-refused")
+            """, target), timeout_seconds=30)
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(result["stdout"].split(), ["nnp", "1", "seccomp", "2", "write-refused"])
+            self.assertFalse(target.exists())
+
     def test_settings_configure_the_limits(self):
-        with override_settings(PRODUCTION_VALIDATION_LIMITS={"memory_bytes": 512 * MIB, "cpu_seconds": 9}):
+        with override_settings(PRODUCTION_VALIDATION_LIMITS={"memory_bytes": 512 * MIB, "cpu_seconds": 9,
+                                                             "group_tasks": 12}):
             limits = confinement.configured_limits()
-        self.assertEqual((limits.memory_bytes, limits.cpu_seconds), (512 * MIB, 9))
+        self.assertEqual((limits.memory_bytes, limits.cpu_seconds, limits.group_tasks), (512 * MIB, 9, 12))
         self.assertEqual(confinement.configured_limits(), Limits())
-        for bad in ({"memory_bytes": 0}, {"cpu_seconds": -1}, {"open_files": True}, {"nonsense": 1}):
+        for bad in ({"memory_bytes": 0}, {"cpu_seconds": -1}, {"open_files": True}, {"group_tasks": 0},
+                    {"group_memory_bytes": "1G"}, {"nonsense": 1}):
             with self.subTest(bad=bad), override_settings(PRODUCTION_VALIDATION_LIMITS=bad):
                 with self.assertRaises((ValueError, TypeError)):
                     confinement.configured_limits()
 
-    def test_the_parent_web_process_limits_are_untouched(self):
-        before = {name: resource.getrlimit(getattr(resource, name))
-                  for name in ("RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE", "RLIMIT_NOFILE")}
-        run_confined(_script("print('x')"), timeout_seconds=30, limits=Limits(memory_bytes=300 * MIB))
-        after = {name: resource.getrlimit(getattr(resource, name)) for name in before}
+    def test_the_parent_web_process_is_untouched(self):
+        names = ("RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE", "RLIMIT_NOFILE", "RLIMIT_CORE", "RLIMIT_NPROC")
+        before = ({name: resource.getrlimit(getattr(resource, name)) for name in names},
+                  confined_exec.own_cgroup(), _proc_status("NoNewPrivs"), _proc_status("Seccomp"))
+        result = run_confined(_script("print('x')"), timeout_seconds=30, limits=Limits(memory_bytes=300 * MIB))
+        self.assertEqual(result["status"], "ok", result)
+        after = ({name: resource.getrlimit(getattr(resource, name)) for name in names},
+                 confined_exec.own_cgroup(), _proc_status("NoNewPrivs"), _proc_status("Seccomp"))
         self.assertEqual(before, after)
+        self.assertEqual((after[2], after[3]), ("0", "0"))
+        with tempfile.NamedTemporaryFile() as handle:   # and it can still write files
+            handle.write(b"x")
 
 
-class ResourceExhaustionTests(SimpleTestCase):
-    def test_memory_pressure_is_stopped_by_the_address_space_limit(self):
+class ResourceExhaustionTests(ConfinementTestCase):
+    def test_a_single_process_memory_bomb_hits_the_address_space_limit(self):
         result = run_confined(_script("""
             blocks = []
             for _ in range(64):
@@ -69,116 +178,367 @@ class ResourceExhaustionTests(SimpleTestCase):
         """), timeout_seconds=60, limits=Limits(memory_bytes=256 * MIB))
         self.assertEqual(result["status"], "resource_limit", result)
         self.assertNotIn("allocated everything", result["stdout"])
+        self.assert_scope_gone(result)
 
-    def test_cpu_runaway_is_killed_by_the_cpu_limit_long_before_the_wall_timeout(self):
+    def test_aggregate_memory_across_several_children_is_bounded_by_the_cgroup(self):
+        """Each child stays far below its own RLIMIT_AS; together they exceed the
+        leaf's memory.max -- only the aggregate limit can stop this."""
         started = time.monotonic()
-        result = run_confined(_script("while True:\n    pass"), timeout_seconds=60,
-                              limits=Limits(cpu_seconds=1))
+        result = run_confined(_script("""
+            import subprocess, sys, time
+            eat = "b = bytearray(b'\\\\x01') * (160 * 1024 * 1024); print('child', flush=True); import time; time.sleep(60)"
+            kids = [subprocess.Popen([sys.executable, "-c", eat]) for _ in range(3)]
+            for kid in kids:
+                print("pid", kid.pid, flush=True)
+            for kid in kids:
+                kid.wait()
+            print("survived")
+        """), timeout_seconds=60, limits=Limits(memory_bytes=1024 * MIB, group_memory_bytes=256 * MIB))
+        self.assertEqual(result["status"], "resource_limit", result)
+        self.assertGreaterEqual(result["cgroup"]["oom_kill"], 1, result)
+        self.assertNotIn("survived", result["stdout"])
+        self.assertLess(time.monotonic() - started, 30)
+        self.assert_scope_gone(result, _pids(result["stdout"], "pid"))
+
+    def test_a_cpu_runaway_is_killed_by_the_cpu_limit_long_before_the_wall_timeout(self):
+        started = time.monotonic()
+        result = run_confined(_script("while True:\n    pass"), timeout_seconds=60, limits=Limits(cpu_seconds=1))
         self.assertEqual(result["status"], "resource_limit", result)
         self.assertLess(time.monotonic() - started, 30)
+        self.assert_scope_gone(result)
+
+    def test_aggregate_cpu_time_across_several_children_is_bounded(self):
+        """Four spinning children: none reaches its own RLIMIT_CPU before the
+        tree's aggregate CPU budget is spent."""
+        started = time.monotonic()
+        result = run_confined(_script("""
+            import subprocess, sys
+            spin = "while True: pass"
+            kids = [subprocess.Popen([sys.executable, "-c", spin]) for _ in range(4)]
+            for kid in kids:
+                print("pid", kid.pid, flush=True)
+            for kid in kids:
+                kid.wait()
+        """), timeout_seconds=60, limits=Limits(cpu_seconds=3))
+        self.assertEqual(result["status"], "resource_limit", result)
+        self.assertGreaterEqual(result["cgroup"]["cpu_usec"], 3_000_000)
+        self.assertLess(time.monotonic() - started, 12)      # 4 x 3 s of per-process CPU would be far later
+        self.assert_scope_gone(result, _pids(result["stdout"], "pid"))
 
     def test_a_hung_tool_is_stopped_by_the_wall_timeout(self):
         started = time.monotonic()
         result = run_confined(_script("import time; time.sleep(600)"), timeout_seconds=1.0)
         self.assertEqual(result["status"], "timeout", result)
         self.assertLess(time.monotonic() - started, 15)
+        self.assert_scope_gone(result)
 
-    def test_oversized_file_output_is_stopped_by_the_file_size_limit(self):
+    def test_fork_pressure_is_bounded_by_the_task_limit(self):
+        result = run_confined(_script("""
+            import os, sys, time
+            made = 0
+            try:
+                while made < 10000:
+                    pid = os.fork()
+                    if pid == 0:
+                        time.sleep(300)
+                        os._exit(0)
+                    made += 1
+            except OSError:
+                pass
+            print("forked", made, flush=True)
+            sys.exit(3)
+        """), timeout_seconds=60, limits=Limits(group_tasks=16))
+        self.assertEqual(result["status"], "resource_limit", result)
+        self.assertLess(int(result["stdout"].split()[1]), 16)
+        self.assertGreaterEqual(result["cgroup"]["pids_max_events"], 1)
+        self.assert_scope_gone(result)
+
+    def test_thread_pressure_is_bounded_by_the_task_limit(self):
+        result = run_confined(_script("""
+            import sys, threading, time
+            made = 0
+            try:
+                while made < 10000:
+                    threading.Thread(target=time.sleep, args=(300,), daemon=True).start()
+                    made += 1
+            except RuntimeError:
+                pass
+            print("threads", made, flush=True)
+            sys.exit(3)
+        """), timeout_seconds=60, limits=Limits(group_tasks=16))
+        self.assertEqual(result["status"], "resource_limit", result)
+        self.assertLess(int(result["stdout"].split()[1]), 16)
+        self.assert_scope_gone(result)
+
+    def test_file_output_is_impossible(self):
+        """RLIMIT_FSIZE remains as a backstop, but Landlock already refuses every
+        file write outside /dev/null."""
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "grows"
-            result = run_confined(_script(f"""
-                with open({str(target)!r}, "wb") as handle:
-                    for _ in range(64):
-                        handle.write(b"\\0" * (1024 * 1024))
-                        handle.flush()
-            """), timeout_seconds=60, limits=Limits(file_size_bytes=1 * MIB))
-            self.assertEqual(result["status"], "resource_limit", result)
-            self.assertLessEqual(target.stat().st_size, 1 * MIB)
+            result = run_confined(_script("""
+                import sys
+                with open(sys.argv[1], "wb") as handle:
+                    handle.write(b"\\0" * (64 * 1024 * 1024))
+            """, target), timeout_seconds=60, limits=Limits(file_size_bytes=1 * MIB))
+            self.assertEqual(result["status"], "failed", result)
+            self.assertIn("PermissionError", result["stderr"])
+            self.assertFalse(target.exists())
 
 
-class ProcessTreeTests(SimpleTestCase):
-    def _alive(self, pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        # A zombie still answers kill(0); check its state.
-        try:
-            return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
-        except FileNotFoundError:
-            return False
+class NoTaskEscapesTests(ConfinementTestCase):
+    """Every way a descendant can leave the parent's process tree, session or
+    process group -- and every way it could try to leave the cgroup -- still
+    ends with the task dead when run_confined returns."""
 
-    def _wait_dead(self, pids, seconds=5.0):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline and any(self._alive(pid) for pid in pids):
-            time.sleep(0.05)
-        return [pid for pid in pids if self._alive(pid)]
-
-    def _tree(self, pidfile, *, leader_exits):
-        return _script(f"""
-            import os, subprocess, sys, time
-            child = subprocess.Popen([sys.executable, "-c",
-                "import subprocess, sys, time; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']);"
-                " open({str(pidfile)!r} + '.g', 'w').write(str(g.pid)); time.sleep(300)"])
-            open({str(pidfile)!r}, "w").write(str(child.pid))
-            deadline = time.time() + 10
-            while not os.path.exists({str(pidfile)!r} + ".g") and time.time() < deadline:
-                time.sleep(0.05)
-            if {leader_exits!r}:
-                sys.exit(0)
+    def test_an_ordinary_child_is_killed_with_the_tool_on_timeout(self):
+        result = run_confined(_script("""
+            import subprocess, sys, time
+            kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+            print("pid", kid.pid, flush=True)
             time.sleep(300)
-        """)
+        """), timeout_seconds=2.0)
+        self.assertEqual(result["status"], "timeout", result)
+        self.assert_scope_gone(result, _pids(result["stdout"], "pid"))
 
-    def test_timeout_kills_the_entire_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pidfile = Path(tmp) / "pids"
-            result = run_confined(self._tree(pidfile, leader_exits=False), timeout_seconds=3.0)
-            self.assertEqual(result["status"], "timeout", result)
-            pids = [int(pidfile.read_text()), int(Path(str(pidfile) + ".g").read_text())]
-            self.assertEqual(self._wait_dead(pids), [])
+    def test_descendants_are_reaped_after_the_tool_exits_successfully(self):
+        result = run_confined(_script("""
+            import subprocess, sys, time
+            kid = subprocess.Popen([sys.executable, "-c",
+                "import subprocess, sys, time; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']);"
+                " print('pid', g.pid, flush=True); time.sleep(300)"])
+            print("pid", kid.pid, flush=True)
+            time.sleep(0.5)
+        """), timeout_seconds=30.0)
+        self.assertEqual(result["status"], "ok", result)
+        pids = _pids(result["stdout"], "pid")
+        self.assertEqual(len(pids), 2, result)
+        self.assert_scope_gone(result, pids)
 
-    def test_descendants_that_outlive_their_parent_are_reaped_after_a_normal_exit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pidfile = Path(tmp) / "pids"
-            result = run_confined(self._tree(pidfile, leader_exits=True), timeout_seconds=30.0)
+    def test_a_child_that_calls_setsid_and_outlives_the_tool_is_killed(self):
+        """Codex's reproduction: setsid() escaped the old process-group kill."""
+        result = run_confined(_script("""
+            import os, sys, time
+            if os.fork() == 0:
+                os.setsid()
+                print("pid", os.getpid(), "sid", os.getsid(0), flush=True)
+                time.sleep(300)
+                os._exit(0)
+            time.sleep(0.5)
+        """), timeout_seconds=30.0)
+        self.assertEqual(result["status"], "ok", result)
+        pids = _pids(result["stdout"], "pid")
+        self.assertEqual(len(pids), 1, result)
+        self.assert_scope_gone(result, pids)
+
+    def test_a_double_forked_daemon_in_its_own_session_and_group_is_killed(self):
+        result = run_confined(_script("""
+            import os, sys, time
+            if os.fork() == 0:
+                os.setsid()
+                if os.fork() == 0:
+                    os.setpgid(0, 0)
+                    print("pid", os.getpid(), flush=True)
+                    devnull = os.open("/dev/null", os.O_RDWR)
+                    for fd in (0, 1, 2):            # a real daemon detaches from the pipes
+                        os.dup2(devnull, fd)
+                    time.sleep(300)
+                os._exit(0)
+            time.sleep(0.5)
+        """), timeout_seconds=30.0)
+        self.assertEqual(result["status"], "ok", result)
+        pids = _pids(result["stdout"], "pid")
+        self.assertEqual(len(pids), 1, result)
+        self.assert_scope_gone(result, pids)
+
+    def test_a_parent_that_exits_before_its_descendant_leaves_nothing_behind(self):
+        result = run_confined(_script("""
+            import os, sys, time
+            if os.fork() == 0:
+                if os.fork() == 0:
+                    time.sleep(0.5)                 # orphaned once its parent exits
+                    print("pid", os.getpid(), "ppid", os.getppid(), flush=True)
+                    time.sleep(300)
+                os._exit(0)
+            time.sleep(1.5)
+        """), timeout_seconds=30.0)
+        self.assertEqual(result["status"], "ok", result)
+        pids = _pids(result["stdout"], "pid")
+        self.assertEqual(len(pids), 1, result)
+        self.assert_scope_gone(result, pids)
+
+    def test_a_descendant_cannot_migrate_itself_out_of_the_leaf(self):
+        """Writing cgroup.procs (Landlock), clone3(CLONE_INTO_CGROUP) (seccomp),
+        creating a cgroup to flee into, or signalling the web process all fail;
+        the would-be escapee dies with the run."""
+        web = "/sys/fs/cgroup" + confined_exec.own_cgroup()
+        result = run_confined(_script("""
+            import ctypes, os, sys, time
+            web, parent_pid = sys.argv[1], int(sys.argv[2])
+            libc = ctypes.CDLL(None, use_errno=True)
+            leaf = "/sys/fs/cgroup" + open("/proc/self/cgroup").read().strip()[3:]
+            root = os.path.dirname(leaf)
+            unit = os.path.dirname(root)
+            if os.fork() == 0:
+                os.setsid()
+                for target in (web, root, unit, leaf):
+                    try:
+                        with open(os.path.join(target, "cgroup.procs"), "w") as handle:
+                            handle.write("0")
+                        print("ESCAPED-procs", target, flush=True)
+                    except OSError as exc:
+                        print("procs-refused", exc.errno, flush=True)
+                try:
+                    os.mkdir(os.path.join(unit, "flee"))
+                    print("ESCAPED-mkdir", flush=True)
+                except OSError as exc:
+                    print("mkdir-refused", exc.errno, flush=True)
+                class CloneArgs(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_uint64) for n in ("flags", "pidfd", "child_tid", "parent_tid",
+                        "exit_signal", "stack", "stack_size", "tls", "set_tid", "set_tid_size", "cgroup")]
+                fd = os.open(web, os.O_RDONLY | os.O_DIRECTORY)
+                args = CloneArgs(flags=0x200000000, exit_signal=17, cgroup=fd)      # CLONE_INTO_CGROUP
+                if libc.syscall(435, ctypes.byref(args), ctypes.c_size_t(ctypes.sizeof(args))) == 0:
+                    os._exit(0)
+                print("clone3-refused", ctypes.get_errno(), flush=True)
+                try:
+                    os.kill(parent_pid, 0)
+                    print("ESCAPED-signal", flush=True)
+                except PermissionError:
+                    print("signal-refused", flush=True)
+                print("pid", os.getpid(), "cgroup", open("/proc/self/cgroup").read().strip()[3:], flush=True)
+                time.sleep(300)
+                os._exit(0)
+            time.sleep(1.5)
+        """, web, os.getpid()), timeout_seconds=30.0)
+        self.assertEqual(result["status"], "ok", result)
+        out = result["stdout"]
+        self.assertNotIn("ESCAPED", out)
+        self.assertEqual(out.count("procs-refused"), 4, out)
+        for line in ("mkdir-refused", "clone3-refused 38", "signal-refused"):
+            self.assertIn(line, out)
+        self.assertIn("cgroup " + result["cgroup"]["path"][len("/sys/fs/cgroup"):], out)
+        self.assertFalse(Path(web).parent.joinpath("flee").exists())
+        self.assert_scope_gone(result, _pids(out, "pid"))
+
+    def test_a_leaf_abandoned_by_a_dead_worker_is_destroyed_by_the_next_run(self):
+        dead = subprocess.Popen(["/bin/true"])
+        dead.wait()
+        leaf = self.root / f"run-{dead.pid}-{secrets.token_hex(6)}"
+        leaf.mkdir()
+        orphan = subprocess.Popen(["/bin/sleep", "300"])
+        try:
+            (leaf / "cgroup.procs").write_text(str(orphan.pid))
+            result = run_confined(_script("print('next')"), timeout_seconds=30)
             self.assertEqual(result["status"], "ok", result)
-            pids = [int(pidfile.read_text()), int(Path(str(pidfile) + ".g").read_text())]
-            self.assertEqual(self._wait_dead(pids), [])
+            orphan.wait(timeout=5)
+            self.assertEqual(orphan.returncode, -9)
+            self.assertFalse(leaf.exists())
+        finally:
+            if orphan.poll() is None:
+                orphan.kill()
+                orphan.wait()
+            confinement._destroy(leaf)
+
+    def test_a_leaf_that_cannot_be_emptied_is_reported_never_ignored(self):
+        with mock.patch.object(confinement, "CLEANUP_TIMEOUT_SECONDS", 0.2), \
+                mock.patch.object(confinement, "_populated", return_value=True):
+            result = run_confined(_script("print('x')"), timeout_seconds=30)
+        self.addCleanup(confinement._destroy, Path(result["cgroup"]["path"]))
+        self.assertEqual(result["status"], "confinement_unavailable", result)
+        self.assertFalse(result["cgroup"]["cleaned"])
 
 
-class FailClosedTests(SimpleTestCase):
+class FailClosedTests(ConfinementTestCase):
+    def _assert_never_ran(self, result):
+        self.assertEqual(result["status"], "confinement_unavailable", result)
+        self.assertNotIn("RAN", result.get("stdout", ""))
+
     def test_a_missing_launcher_never_runs_the_tool_unconfined(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sentinel = Path(tmp) / "ran"
-            with mock.patch.object(confinement, "LAUNCHER", str(Path(tmp) / "missing.py")):
-                result = run_confined(_script(f"open({str(sentinel)!r}, 'w').write('x')"), timeout_seconds=30)
-            self.assertEqual(result["status"], "confinement_unavailable", result)
-            self.assertFalse(sentinel.exists())
+        with mock.patch.object(confinement, "LAUNCHER", "/nonexistent/confined_exec.py"):
+            self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
 
-    def test_limits_that_cannot_be_applied_never_run_the_tool(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sentinel = Path(tmp) / "ran"
-            # The launcher itself refuses a non-positive limit (exit 125 + marker).
-            with mock.patch.object(confinement, "_launcher_argv", lambda executable, args, limits: [
-                PY, "-I", "-S", confinement.LAUNCHER, "--memory", "0", "--cpu", "1", "--fsize", "1",
-                "--nofile", "8", "--", executable, *args,
-            ]):
-                result = run_confined(_script(f"open({str(sentinel)!r}, 'w').write('x')"), timeout_seconds=30)
-            self.assertEqual(result["status"], "confinement_unavailable", result)
-            self.assertFalse(sentinel.exists())
+    def test_no_delegated_subtree_never_runs_the_tool(self):
+        for path in ("/sys/fs/cgroup/user.slice/iportal-validation",           # root-owned: not delegated
+                     "/sys/fs/cgroup/iportal-validation",
+                     "/tmp/iportal-validation", "relative/iportal-validation",
+                     "/sys/fs/cgroup/../tmp/iportal-validation"):
+            with self.subTest(path=path), override_settings(PRODUCTION_VALIDATION_CGROUP=path):
+                self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
+        self.assertFalse(Path("/sys/fs/cgroup/user.slice/iportal-validation").exists())
+
+    def test_a_missing_controller_never_runs_the_tool(self):
+        with mock.patch.object(confinement, "REQUIRED_CONTROLLERS", ("memory", "pids", "no-such-controller")):
+            self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
+
+    def test_limits_the_launcher_refuses_never_run_the_tool(self):
+        real = confinement._launcher_argv
+
+        def zero_memory(leaf, executable, args, limits):
+            argv = real(leaf, executable, args, limits)
+            argv[argv.index("--memory") + 1] = "0"
+            return argv
+
+        with mock.patch.object(confinement, "_launcher_argv", zero_memory):
+            self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
+
+    def test_a_cgroup_the_launcher_cannot_join_never_runs_the_tool(self):
+        real = confinement._launcher_argv
+
+        def elsewhere(leaf, executable, args, limits):
+            argv = real(leaf, executable, args, limits)
+            argv[argv.index("--cgroup") + 1] = str(self.root / "not-a-leaf")
+            return argv
+
+        with mock.patch.object(confinement, "_launcher_argv", elsewhere):
+            self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
+
+    def test_landlock_or_seccomp_unavailable_never_runs_the_tool(self):
+        """The launcher's own fail-closed path (in process, with a refusing libc)."""
+        class Refusing:
+            def syscall(self, *args):
+                return -1
+
+            def prctl(self, *args):
+                return -1
+
+        with self.assertRaises(confined_exec._Refused):
+            confined_exec._landlock(Refusing())
+        with self.assertRaises(confined_exec._Refused):
+            confined_exec._seccomp(Refusing())
+        with self.assertRaises(confined_exec._Refused):
+            confined_exec._no_new_privs(Refusing())
+        for step in ("_landlock", "_seccomp", "_no_new_privs"):
+            with self.subTest(step=step), \
+                    mock.patch.object(confined_exec, "_join_cgroup"), \
+                    mock.patch.object(confined_exec, "_libc", return_value=Refusing()), \
+                    mock.patch.object(confined_exec, "_fail", side_effect=SystemExit) as fail, \
+                    mock.patch.object(confined_exec.os, "execv") as execv:
+                for other in {"_landlock", "_seccomp", "_no_new_privs"} - {step}:
+                    mock.patch.object(confined_exec, other).start()
+                try:
+                    with self.assertRaises(SystemExit):
+                        confined_exec.main(["--cgroup", "/sys/fs/cgroup/x", "--memory", "1", "--cpu", "1",
+                                            "--fsize", "1", "--nofile", "8", "--", "/bin/true"])
+                finally:
+                    mock.patch.stopall()
+                self.assertEqual(fail.call_args.args[0], confined_exec.EXIT_LIMITS)
+                execv.assert_not_called()
 
     def test_a_missing_tool_is_unavailable_not_a_failure_of_the_media(self):
         result = run_confined(["/nonexistent/definitely-not-a-tool", "x"], timeout_seconds=5)
         self.assertEqual(result["status"], "unavailable")
 
     def test_a_clean_retry_works_after_a_confinement_failure(self):
-        bad = run_confined(_script("while True:\n    pass"), timeout_seconds=30, limits=Limits(cpu_seconds=1))
-        self.assertEqual(bad["status"], "resource_limit")
+        with override_settings(PRODUCTION_VALIDATION_CGROUP="/sys/fs/cgroup/user.slice/iportal-validation"):
+            self._assert_never_ran(run_confined(_script("print('RAN')"), timeout_seconds=30))
+        limited = run_confined(_script("while True:\n    pass"), timeout_seconds=30, limits=Limits(cpu_seconds=1))
+        self.assertEqual(limited["status"], "resource_limit")
         good = run_confined(_script("print('fine')"), timeout_seconds=30)
         self.assertEqual((good["status"], good["stdout"].strip()), ("ok", "fine"))
+        self.assert_scope_gone(good)
 
 
-class ValidationUsesConfinementTests(SimpleTestCase):
+class ValidationUsesConfinementTests(ConfinementTestCase):
     """The real Phase-A validator, end to end, through the confined runner."""
 
     @classmethod
@@ -201,6 +561,7 @@ class ValidationUsesConfinementTests(SimpleTestCase):
         super().tearDownClass()
 
     def setUp(self):
+        super().setUp()
         validation.clear_capability_cache()
         self.addCleanup(validation.clear_capability_cache)
 
@@ -210,30 +571,28 @@ class ValidationUsesConfinementTests(SimpleTestCase):
 
         def spy(args, **kwargs):
             result = real(args, **kwargs)
-            seen.append((Path(args[0]).name, result.get("confined")))
+            seen.append((Path(args[0]).name, result.get("confined"), result.get("cgroup", {}).get("cleaned")))
             return result
 
         with mock.patch.object(confinement, "run_confined", side_effect=spy):
             outcome = validation._analyze_path(self.wav, require_engine_decode=True)
         self.assertTrue(seen)
-        self.assertTrue(all(confined for _name, confined in seen), seen)
-        # ffprobe, ffmpeg and the GStreamer child (via the interpreter) all ran.
-        names = {name for name, _ in seen}
+        self.assertTrue(all(confined and cleaned for _name, confined, cleaned in seen), seen)
+        names = {name for name, _, _ in seen}
         self.assertTrue({"ffprobe", "ffmpeg"} <= names, names)
-        self.assertIn(outcome.status, (validation.STATUS_VALID, validation.STATUS_INFRASTRUCTURE))
+        self.assertEqual(outcome.status, validation.STATUS_VALID, outcome)
 
     def test_a_resource_limit_is_retryable_infrastructure_never_invalid(self):
         with override_settings(PRODUCTION_VALIDATION_LIMITS={"memory_bytes": 48 * MIB}):
             starved = validation._analyze_path(self.wav, require_engine_decode=False)
         self.assertEqual(starved.status, validation.STATUS_INFRASTRUCTURE, starved)
         self.assertIn(starved.code, validation.INFRASTRUCTURE_CODES)
-        # ... and a retry with the normal limits validates the same bytes.
         validation.clear_capability_cache()
         retried = validation._analyze_path(self.wav, require_engine_decode=False)
         self.assertEqual(retried.status, validation.STATUS_VALID, retried)
 
     def test_unavailable_confinement_fails_closed_as_retryable_infrastructure(self):
-        with mock.patch.object(confinement, "LAUNCHER", "/nonexistent/confined_exec.py"):
+        with override_settings(PRODUCTION_VALIDATION_CGROUP="/sys/fs/cgroup/user.slice/iportal-validation"):
             outcome = validation._analyze_path(self.wav, require_engine_decode=False)
         self.assertEqual(outcome.status, validation.STATUS_INFRASTRUCTURE)
         self.assertIn(outcome.code, ("confinement_unavailable", "probe_unavailable"))

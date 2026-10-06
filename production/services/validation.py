@@ -137,10 +137,11 @@ def _infrastructure(code):
 
 def _run(args, *, timeout_seconds, stop_event=None):
     """Bounded, shell-free, OS-confined subprocess execution (2.22B): every tool
-    that reads media bytes runs under kernel resource limits (memory, CPU,
-    file size, descriptors) in its own process group, reaped as a whole --
-    see production.services.confinement. If confinement cannot be applied the
-    tool is not run at all (fail closed)."""
+    that reads media bytes runs in its own kernel-limited cgroup (aggregate
+    memory, tasks, CPU), sandboxed by Landlock and seccomp, with per-process
+    rlimits, and the whole tree is killed when the run ends -- see
+    production.services.confinement. If the boundary cannot be established
+    the tool is not run at all (fail closed)."""
     from . import confinement
     return confinement.run_confined(args, timeout_seconds=timeout_seconds, stop_event=stop_event)
 
