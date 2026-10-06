@@ -27,10 +27,22 @@
 # paths may be passed as further arguments (the backup script passes the
 # station content roots from .env, the application root and its own workdir).
 #
+# Capacity (2.22B): the copy, and then the final archive built from it, land
+# on the destination's filesystem (the backup's /tmp work area -- RAM-backed
+# tmpfs on a station). Before copying anything, this helper requires
+#   available >= 2 x (bytes under media/) + reserve
+# (the staged copy plus its share of the archive -- audio barely compresses --
+# plus PRODUCTION_MEDIA_STAGING_RESERVE_BYTES, default 1 GiB, for everything
+# else the backup stages) and refuses otherwise, BEFORE writing a byte, so a
+# growing store can never fill the work area part-way through a backup and
+# starve the station. The refusal names the media size, the requirement, the
+# available space and the filesystem.
+#
 # Exit status: 0 copied, or nothing to copy (no store yet is legitimate);
 #              2 bad usage; 3 media/ exists but is not a real directory, or
 #              the root fails the safety policy (misconfiguration: fail closed
-#              rather than silently skip durable content or read the wrong tree).
+#              rather than silently skip durable content or read the wrong tree);
+#              4 not enough staging space (nothing was copied).
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -75,6 +87,20 @@ if [ -L "$SRC" ] || [ ! -d "$SRC" ]; then
   echo "error: $SRC is not a real directory; refusing to guess what to back up" >&2
   exit 3
 fi
+
+# ---- capacity preflight (before ANY write) -----------------------------------
+RESERVE_BYTES="${PRODUCTION_MEDIA_STAGING_RESERVE_BYTES:-1073741824}"
+case "$RESERVE_BYTES" in ''|*[!0-9]*) echo "error: PRODUCTION_MEDIA_STAGING_RESERVE_BYTES must be a byte count" >&2; exit 2 ;; esac
+MEDIA_BYTES=$(du -s -B1 --apparent-size "$SRC" | cut -f1)
+REQUIRED_BYTES=$(( MEDIA_BYTES * 2 + RESERVE_BYTES ))
+AVAILABLE_BYTES=$(df -P -B1 "$DEST" | awk 'NR == 2 { print $4 }')
+STAGING_FS=$(df -P -B1 "$DEST" | awk 'NR == 2 { print $6 }')
+case "$AVAILABLE_BYTES" in ''|*[!0-9]*) echo "error: could not determine free space at $DEST; refusing to stage" >&2; exit 4 ;; esac
+if [ "$AVAILABLE_BYTES" -lt "$REQUIRED_BYTES" ]; then
+  echo "error: not enough staging space for production media: media/ holds ${MEDIA_BYTES} bytes, staging it needs ${REQUIRED_BYTES} bytes (2 x media + ${RESERVE_BYTES} reserve) but only ${AVAILABLE_BYTES} bytes are available on ${STAGING_FS} (${DEST}). Nothing was copied. Free space there, or move the backup work area to a larger filesystem, before the next backup." >&2
+  exit 4
+fi
+echo "  staging-space check: media ${MEDIA_BYTES} bytes, need ${REQUIRED_BYTES}, available ${AVAILABLE_BYTES} on ${STAGING_FS}"
 
 TARGET="$DEST/production-media"
 if [ -e "$TARGET/media" ]; then

@@ -176,6 +176,84 @@ class StageHelperFunctionalTests(TempDirCase):
         self.assertEqual((root / "media" / SHARD / KEY).read_bytes(), MEDIA_BYTES)
 
 
+DF_SHIM = """#!/bin/bash
+# Test double for df -P -B1 <path>: a fixed filesystem with $FAKE_DF_AVAIL bytes free.
+printf 'Filesystem 1-blocks Used Available Capacity Mounted on\\n'
+printf 'stagingfs 100000000000 1 %s 1%% /fake/staging\\n' "$FAKE_DF_AVAIL"
+"""
+
+
+class StagingCapacityTests(TempDirCase):
+    """2.22B B21: the copy (and the archive built from it) must fit BEFORE the
+    helper writes anything; a growing store can never fill the work area
+    part-way through a backup."""
+
+    def setUp(self):
+        super().setUp()
+        shims = self.tmp / "shims"
+        shims.mkdir()
+        (shims / "df").write_text(DF_SHIM)
+        (shims / "df").chmod(0o755)
+        self.shims = shims
+        self.root, self.dest = self.tmp / "production-media", self.tmp / "dest"
+        self.dest.mkdir()
+        build_store(self.root, transient=False)
+
+    def stage(self, available, reserve=1000):
+        env = {**os.environ, "PATH": f"{self.shims}:{os.environ['PATH']}", "FAKE_DF_AVAIL": str(available),
+               "PRODUCTION_MEDIA_STAGING_RESERVE_BYTES": str(reserve)}
+        return subprocess.run([str(STAGE_HELPER), str(self.root), str(self.dest)],
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    def required(self, reserve=1000):
+        out = subprocess.run(["du", "-s", "-B1", "--apparent-size", str(self.root / "media")],
+                             capture_output=True, text=True, check=True).stdout
+        return int(out.split()[0]) * 2 + reserve
+
+    def test_sufficient_space_stages_and_reports_the_check(self):
+        result = self.stage(self.required() + 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("staging-space check", result.stdout)
+        self.assertTrue((self.dest / "production-media" / "media" / SHARD / KEY).is_file())
+
+    def test_insufficient_predicted_space_refuses_before_writing_anything(self):
+        result = self.stage(self.required() - 1)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(list(self.dest.iterdir()), [])                       # not one byte staged
+
+    def test_the_refusal_is_a_useful_operator_diagnostic(self):
+        need = self.required()
+        result = self.stage(10)
+        for fragment in (f"needs {need} bytes", "only 10 bytes are available on /fake/staging", str(self.dest),
+                         "Nothing was copied", "2 x media"):
+            self.assertIn(fragment, result.stderr)
+
+    def test_store_growth_flips_the_decision_at_the_threshold(self):
+        available = self.required() + 50_000
+        self.assertEqual(self.stage(available).returncode, 0)
+        shutil.rmtree(self.dest / "production-media")
+        # The store grows by 100 kB: the same free space is now too little.
+        (self.root / "media" / SHARD / ("ab" + "1" * 30)).write_bytes(b"\0" * 100_000)
+        result = self.stage(available)
+        self.assertEqual(result.returncode, 4, result.stdout)
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_the_reserve_counts_and_must_be_a_byte_count(self):
+        self.assertEqual(self.stage(self.required(reserve=0) + 10, reserve=10**9).returncode, 4)
+        self.assertEqual(self.stage(10**12, reserve="lots").returncode, 2)
+
+    def test_an_unreadable_free_space_answer_fails_closed(self):
+        result = self.stage("unknown")
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_the_backup_still_aborts_and_records_the_stage_on_refusal(self):
+        text = BACKUP_SCRIPT.read_text()
+        block = text[text.index('CURRENT_STAGE="production_media"'):text.index('CURRENT_STAGE="reports"')]
+        self.assertIn('"$SCRIPT_DIR/stage_production_media.sh"', block)       # called under set -e, no || true
+        self.assertNotIn("|| true", block)
+
+
 class BackupScriptWiringTests(SimpleTestCase):
     """Static wiring of the nightly script (it cannot run without secrets)."""
 
