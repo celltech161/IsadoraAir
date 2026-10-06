@@ -200,7 +200,10 @@ the runtime/backup authority and is still applied at restore, unchanged.
 
 Nothing a client says is trusted — not the extension, not the browser MIME, not
 a reported duration. Four steps, each shell-free, hard-timed, with bounded
-output:
+output, and (since 2.22B) each under kernel resource limits in its own reaped
+process group — see "Resource confinement" in `docs/IPORTAL.md`; a station
+limit or unavailable confinement is a retryable infrastructure outcome, never
+an *invalid* verdict:
 
 1. **Content sniff** picks exactly one allowlisted ffmpeg demuxer, forced for
    every tool call with only the `file` protocol allowed. An uploaded HLS/concat/
@@ -363,6 +366,10 @@ change, delete or bulk action, with a "Bytes on disk" check (stat only).
 
 ## Backup and restore
 
+Staging capacity (2.22B): the staging helper refuses — before writing anything —
+unless `2 x media bytes + reserve` fits on the backup work area; see
+"Backup capacity" in `docs/IPORTAL.md`.
+
 `production-media/media/` is durable station content and is in the nightly
 archive as `srv-content/production-media/media/` (staged by
 `deploy/stage_production_media.sh`, which only ever names `media/`).
@@ -383,20 +390,30 @@ runtime-11 companion mechanism.
 
 ## Carried-forward requirements (from the Phase-A Codex review)
 
-* **Resource confinement before browser exposure (Phase B).** Validation
-  subprocesses are shell-free, time-bounded, output-bounded and process-group
-  terminated, but they have no memory/cgroup limit. Before any arbitrary
-  browser upload is accepted, Phase B must define and prove a confinement
-  (e.g. a systemd-run/cgroup memory limit or a dedicated worker).
+Status after Phase B (2.22B, see `docs/IPORTAL.md`):
+
+* **Resource confinement before browser exposure — DONE (2.22B).** Every
+  validator tool now runs under kernel resource limits (memory, CPU, file
+  size, descriptors, no core) in its own process group that is reaped as a
+  whole, and validation fails closed (`confinement_unavailable`) if the limits
+  cannot be applied — `production.services.confinement`.
 * **No GenericForeignKey or cross-database references** to ProductionMedia
-  (see the binding rule).
+  (see the binding rule). Upheld by Phase B: `VoiceTrack.media` is an
+  ordinary `PROTECT` FK, and system check `library.E900/E901` refuses a
+  router that splits VoiceTrack and ProductionMedia.
+* **Every consumer binding through the canonical lock — DONE for VoiceTrack.**
+  `library.services.voicetrack_media.bind_media` takes `lock_for_binding` in
+  the writing transaction and is the only path the model allows.
 * **Commit promptly.** Intake and binding callers must not hide the final row
   commit inside an unexpectedly long outer transaction: until it commits, the
-  orphan sweeper sees "no row" (after the 24 h minimum grace).
-* **Backup staging growth (before Phase C).** The backup copies `media/` into
-  its temporary staging area, so temporary space grows with the store. Fine
-  for Phase A volumes; correct it (e.g. stream into the archive) before
-  spoken-content volumes grow.
+  orphan sweeper sees "no row" (after the 24 h minimum grace). The VoiceTrack
+  binding transaction does row work only (proven by test).
+* **Backup staging growth — fail-safe in place (2.22B).** The backup still
+  copies `media/` into its temporary staging area (about 2x the store at
+  peak, on RAM-backed `/tmp` at a station), but the staging helper now refuses
+  before writing anything unless `2 x media + reserve` fits, and the backup
+  reports the failed stage. Streaming media into the archive remains the
+  long-term fix before produced-content volumes.
 * **Pre-existing, outside iPortal — fixed in r0106:** restore stage 40 used to
   apply `chown -R` to `REPORTS_ROOT` read from the restored `.env` with no
   comparable safety check. r0106 (P0 1.2) replaced it with the shared
