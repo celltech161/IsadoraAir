@@ -4,6 +4,9 @@
 #
 #   production/tests/run_with_validation_service.sh /path/to/venv/bin/python manage.py test production ...
 #
+# The service runs under the command's own interpreter ($1), or under
+# $VALIDATION_SERVICE_PYTHON when the command is not a Python invocation.
+#
 # 1. a transient isadoraair-validation service with the SAME lifecycle
 #    properties as deploy/isadoraair-validation.service (delegated cpu/memory/
 #    pids subtree, DelegateSubgroup=supervisor, KillMode=control-group,
@@ -13,7 +16,7 @@
 #    exactly as the service does.
 # The service is stopped (and its runs destroyed) when the command ends.
 set -u
-python="$1"
+python="${VALIDATION_SERVICE_PYTHON:-$1}"
 here=$(cd "$(dirname "$0")/../.." && pwd -P)
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/isadoraair-validation-test.XXXXXX")
 chmod 700 "$runtime"
