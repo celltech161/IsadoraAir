@@ -32,7 +32,9 @@ any that cannot be configured and read back fails the run closed):
 * ``pids.max``: processes AND threads together (fork/thread pressure);
 * ``cpu.max``: at most ``cpu_percent`` of one CPU (kernel-enforced rate);
 * the service's monitor: the hard wall deadline (the per-tool Phase-A timeout,
-  capped by the service) and an aggregate CPU-time budget (``cpu.stat``).
+  capped by the service) and an aggregate CPU-time budget (``cpu.stat``,
+  read STRICTLY: accounting that cannot be read or parsed, or that goes
+  backwards, ends the run as ``confinement_unavailable`` -- never as zero).
 
 The trusted launcher (``confined_exec.py``) moves ITSELF into the leaf before
 anything untrusted runs, then sets no_new_privs, a Landlock policy (read and
@@ -45,10 +47,11 @@ survives setsid(), setpgid(), double forking and a parent exiting, so
 
 Fail closed: no validation service, no delegated subtree, a missing cpu /
 memory / pids controller, no ``memory.swap.max`` or ``cgroup.kill``, Landlock
-or seccomp unavailable, a launcher step that cannot be verified, or a leaf that
-cannot be emptied -> ``confinement_unavailable`` (a retryable infrastructure
-error). A tool is never run outside the boundary. A service at capacity
-answers ``busy`` (also retryable) without reading the request.
+or seccomp unavailable, a launcher step that cannot be verified, CPU accounting
+that cannot be read, or a leaf that cannot be emptied ->
+``confinement_unavailable`` (a retryable infrastructure error). A tool is never
+run outside the boundary. A service at capacity answers ``busy`` (also
+retryable) without reading the request.
 """
 from __future__ import annotations
 
@@ -98,6 +101,9 @@ RESOURCE_LIMIT_MARKERS = ("Cannot allocate memory", "Out of memory", "MemoryErro
                           "File too large")
 STATUSES = frozenset({"ok", "failed", "timeout", "stopped", "unavailable", "infrastructure_error",
                       "confinement_unavailable", "resource_limit", "busy"})
+# cpu.stat is a handful of short lines; anything larger is not what we expect.
+CPU_STAT_LIMIT_BYTES = 4096
+_UINT_RE = re.compile(r"^[0-9]{1,20}$")
 
 
 class ConfinementUnavailable(Exception):
@@ -256,7 +262,9 @@ def _populated(leaf: Path) -> bool:
     return True
 
 
-def _counter(path: Path, key: str) -> int:
+def _counter(path: Path, key: str) -> int | None:
+    """Post-mortem accounting for the result's ``cgroup`` record only (None if
+    unknown -- never a made-up zero). Enforcement uses cpu_usage_usec()."""
     try:
         for line in _read(path).splitlines():
             name, _, value = line.partition(" ")
@@ -264,12 +272,63 @@ def _counter(path: Path, key: str) -> int:
                 return int(value)
     except (OSError, ValueError):
         pass
-    return 0
+    return None
+
+
+def _read_cpu_stat(leaf: Path) -> bytes:
+    """The raw ``cpu.stat`` of ``leaf``, read to end of file."""
+    fd = os.open(leaf / "cpu.stat", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        data = b""
+        while True:
+            chunk = os.read(fd, CPU_STAT_LIMIT_BYTES + 1 - len(data))
+            if not chunk:
+                return data
+            data += chunk
+            if len(data) > CPU_STAT_LIMIT_BYTES:
+                raise OSError(errno.EFBIG, "cpu.stat is larger than expected")
+    finally:
+        os.close(fd)
+
+
+def cpu_usage_usec(leaf: Path) -> int:
+    """The tree's cumulative CPU time (``usage_usec`` in the leaf's cpu.stat),
+    read STRICTLY for enforcement. A missing or unreadable file, an I/O error,
+    an incomplete read (no final newline), or a ``usage_usec`` field that is
+    absent, repeated, signed or not a plain decimal raises
+    ConfinementUnavailable: a broken counter is never mistaken for zero use."""
+    try:
+        raw = _read_cpu_stat(leaf)
+    except OSError as exc:
+        raise ConfinementUnavailable(f"cannot read {leaf.name}/cpu.stat: {exc.strerror or exc}") from exc
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise ConfinementUnavailable(f"{leaf.name}/cpu.stat is not ASCII") from None
+    if not text.endswith("\n"):
+        raise ConfinementUnavailable(f"{leaf.name}/cpu.stat read is incomplete")
+    values = [value for name, _, value in (line.partition(" ") for line in text[:-1].split("\n"))
+              if name == "usage_usec"]
+    if len(values) != 1 or not _UINT_RE.match(values[0]):
+        raise ConfinementUnavailable(f"{leaf.name}/cpu.stat has no usable usage_usec: {values!r}"[:200])
+    return int(values[0])
+
+
+def _remove(leaf: Path) -> None:
+    for attempt in range(50):
+        try:
+            leaf.rmdir()
+            return
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or attempt == 49:
+                raise
+            time.sleep(0.01)
 
 
 def _destroy(leaf: Path) -> dict:
     """Kill every task in ``leaf``, wait for it to empty, record what the
-    kernel counted, remove it. ``cleaned`` is False only if a task survived."""
+    kernel counted, remove it. ``cleaned`` is True only once the leaf is gone:
+    a kill that fails, a task that survives or a removal that fails is False."""
     stats = {"path": str(leaf), "cleaned": False}
     try:
         _write(leaf / "cgroup.kill", "1")
@@ -289,20 +348,17 @@ def _destroy(leaf: Path) -> dict:
                 stats[name.replace(".", "_")] = int(_read(leaf / name))
             except (OSError, ValueError):
                 pass
-        for attempt in range(50):
-            try:
-                leaf.rmdir()
-                break
-            except OSError as exc:
-                if exc.errno != errno.EBUSY or attempt == 49:
-                    raise
-                time.sleep(0.01)
+        _remove(leaf)
         stats["cleaned"] = True
     except FileNotFoundError:
-        stats["cleaned"] = True
+        stats["cleaned"] = not os.path.lexists(leaf)       # gone already -- not merely lacking cgroup.kill
     except OSError:
         pass
     return stats
+
+
+def _children(root: Path) -> list[Path]:
+    return sorted(root.iterdir())
 
 
 def reap_all(root: Path | None = None) -> list[dict]:
@@ -310,16 +366,37 @@ def reap_all(root: Path | None = None) -> list[dict]:
     validation service calls this -- at start-up (before it accepts work) and
     when it stops: the subtree is exclusively its own, so any ``run-*`` leaf
     there is a run of a previous instance (or of this one, shutting down).
-    No PID is consulted: nothing else ever lives in that subtree."""
+    No PID is consulted: nothing else ever lives in that subtree.
+
+    All or nothing: raises ConfinementUnavailable unless the subtree could be
+    scanned, every leaf was killed, emptied and removed, and the subtree is
+    then verifiably unpopulated. A failure is never "nothing to clean"."""
     root = root or establish_root()
-    reaped = []
     try:
-        entries = sorted(root.iterdir())
-    except OSError:
-        return reaped
+        entries = _children(root)
+    except OSError as exc:
+        raise ConfinementUnavailable(f"cannot scan {root}: {exc.strerror or exc}") from exc
+    reaped = []
     for entry in entries:
-        if _LEAF_RE.match(entry.name) and entry.is_dir():
+        if not _LEAF_RE.match(entry.name):
+            continue
+        try:
+            is_leaf = stat.S_ISDIR(entry.lstat().st_mode)
+        except FileNotFoundError:
+            continue                                   # removed meanwhile: nothing left to reap
+        except OSError as exc:
+            raise ConfinementUnavailable(f"cannot inspect {entry}: {exc.strerror or exc}") from exc
+        if is_leaf:
             reaped.append(_destroy(entry))
+    failed = [os.path.basename(r["path"]) for r in reaped if not r["cleaned"]]
+    if failed:
+        raise ConfinementUnavailable(f"could not destroy {len(failed)} leftover run(s): {', '.join(failed)}")
+    try:
+        populated = _populated(root)
+    except OSError as exc:
+        raise ConfinementUnavailable(f"cannot verify {root} is empty: {exc.strerror or exc}") from exc
+    if populated:
+        raise ConfinementUnavailable(f"{root} still holds live tasks after reaping")
     return reaped
 
 
@@ -371,9 +448,10 @@ def execute(args, *, timeout_seconds, stop_event=None, limits: Limits | None = N
     stderr = _BoundedCollector(process.stderr, OUTPUT_LIMIT_BYTES)
     stdout.start()
     stderr.start()
-    status = "ok"
+    status, failure = "ok", None
     deadline = started + timeout_seconds
     cpu_budget_usec = limits.cpu_seconds * 1_000_000
+    cpu_used_usec = 0
     try:
         while process.poll() is None:
             if (stop_event is not None and stop_event.is_set()) or (cancelled is not None and cancelled()):
@@ -382,7 +460,17 @@ def execute(args, *, timeout_seconds, stop_event=None, limits: Limits | None = N
             if time.monotonic() >= deadline:
                 status = "timeout"
                 break
-            if _counter(leaf / "cpu.stat", "usage_usec") >= cpu_budget_usec:
+            try:
+                used = cpu_usage_usec(leaf)
+            except ConfinementUnavailable as exc:
+                status, failure = "confinement_unavailable", f"CPU accounting failed: {exc}"
+                break
+            if used < cpu_used_usec:
+                status, failure = "confinement_unavailable", \
+                    f"CPU accounting went backwards ({cpu_used_usec} -> {used} usec)"
+                break
+            cpu_used_usec = used
+            if used >= cpu_budget_usec:
                 status = "resource_limit"
                 break
             try:
@@ -400,8 +488,8 @@ def execute(args, *, timeout_seconds, stop_event=None, limits: Limits | None = N
     out = stdout.finish()
     err = stderr.finish()
     code = process.returncode
-    if not kernel["cleaned"]:
-        result = _unavailable(f"validation cgroup {leaf} could not be emptied")
+    if not kernel["cleaned"] or failure:
+        result = _unavailable(failure or f"validation cgroup {leaf} could not be emptied")
         result.update(returncode=code, cgroup=kernel)
         return result
     if status == "ok" and code != 0:

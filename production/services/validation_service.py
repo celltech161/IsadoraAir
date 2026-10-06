@@ -29,9 +29,12 @@ Unix socket in its 0700 runtime directory and, for each connection:
    when the run ends in every case;
 7. answers with the result as one JSON object and closes the connection.
 
-At start-up -- before accepting work -- and on stop it kills and removes every
-``run-*`` leaf in its subtree (confinement.reap_all). If the service itself is
-killed, systemd kills everything left in its cgroup and restarts it.
+Start-up is gated on cleanup: every ``run-*`` leaf left in its subtree is
+killed and removed (confinement.reap_all) BEFORE the socket is bound, and if
+that cannot be completed and verified the service exits without ever
+listening (systemd restarts it and it tries again). On stop it reaps again. If
+the service itself is killed, systemd kills everything left in its cgroup and
+restarts it.
 
 Deliberately NOT a job system: no persistence, no retries, no callbacks -- one
 synchronous run per connection, a small fixed admission bound.
@@ -88,6 +91,10 @@ def _log(message: str) -> None:
 
 class _Refused(Exception):
     pass
+
+
+class NotReady(Exception):
+    """Start-up cleanup could not be completed and verified: never listen."""
 
 
 def _client_gone(conn) -> bool:
@@ -174,15 +181,26 @@ class ValidationService:
         self.listener = None
 
     # -- lifecycle ------------------------------------------------------------------
-    def reap(self, when: str) -> None:
+    def reap_before_listening(self) -> None:
+        """The readiness gate: every leftover run is destroyed, and the subtree
+        verified empty, or NotReady -- never "nothing found" on a failure."""
         try:
             reaped = confinement.reap_all()
         except confinement.ConfinementUnavailable as exc:
-            _log(f"{when}: no validation subtree ({exc}); every request will fail closed until it exists")
+            raise NotReady(f"start-up cleanup incomplete, not listening: {exc}") from exc
+        if reaped:
+            _log(f"start-up: destroyed {len(reaped)} leftover run(s): "
+                 + ", ".join(os.path.basename(r["path"]) for r in reaped))
+
+    def reap(self, when: str) -> None:
+        """Best effort on the way down (systemd kills whatever is left)."""
+        try:
+            reaped = confinement.reap_all()
+        except confinement.ConfinementUnavailable as exc:
+            _log(f"{when}: cleanup incomplete ({exc}); systemd kills the rest with the unit")
             return
         if reaped:
-            _log(f"{when}: destroyed {len(reaped)} leftover run(s): "
-                 + ", ".join(f"{os.path.basename(r['path'])} cleaned={r['cleaned']}" for r in reaped))
+            _log(f"{when}: destroyed {len(reaped)} run(s)")
 
     def bind(self) -> None:
         directory = os.path.dirname(self.socket_path)
@@ -205,10 +223,11 @@ class ValidationService:
         self.listener = listener
 
     def serve_forever(self) -> None:
-        self.reap("start-up")                  # BEFORE accepting any work
+        self.reap_before_listening()           # raises NotReady: the socket is never bound
         self.bind()
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(signum, lambda *_: self.stop())
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(signum, lambda *_: self.stop())
         _log(f"listening on {self.socket_path} (at most {self.max_active} running, "
              f"{self.max_pending} waiting)")
         try:

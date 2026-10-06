@@ -33,6 +33,8 @@ EXEMPT_CLASSES = {
     "production.tests.test_validation_service.ProtocolTests",
     "production.tests.test_validation_service.LifecycleTests",
     "production.tests.test_validation_service.AdmissionTests",
+    "production.tests.test_validation_service.StartupReadinessTests",
+    "production.tests.test_validation_service.CpuAccountingServiceTests",
 }
 
 

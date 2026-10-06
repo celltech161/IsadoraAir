@@ -38,7 +38,7 @@ def _manager(method: str, unit: str) -> None:
 
 
 class TransientValidationService:
-    def __init__(self, *, env=None, path_prefix=None, limits=None, args=()):
+    def __init__(self, *, env=None, path_prefix=None, limits=None, args=(), pre_start=None):
         self.runtime = Path(tempfile.mkdtemp(prefix="isadoraair-validation-t.",
                                              dir=os.environ.get("XDG_RUNTIME_DIR") or None))
         self.runtime.chmod(0o700)
@@ -52,11 +52,14 @@ class TransientValidationService:
                    f"--property=WorkingDirectory={REPO}"]
         command += [f"--property={item}" for item in UNIT_PROPERTIES]
         command += [f"--setenv={name}={value}" for name, value in variables.items()]
+        if pre_start:       # a shell snippet run by the service process itself, before every start
+            command += ["/bin/bash", "-c", f'{pre_start}\nexec "$@"', "pre-start"]
         command += [sys.executable, str(REPO / "manage.py"), "production_validation_service"]
         command += [f"--limit={name}={value}" for name, value in (limits or {}).items()]
         command += list(args)
         subprocess.run(command, check=True, capture_output=True, timeout=30)
-        self.wait_ready()
+        if not pre_start:
+            self.wait_ready()
 
     # -- lifecycle -------------------------------------------------------------
     def wait_ready(self, seconds=30.0, *, not_pid=None):

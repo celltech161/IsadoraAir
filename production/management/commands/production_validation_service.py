@@ -10,7 +10,7 @@ import dataclasses
 from django.core.management.base import BaseCommand, CommandError
 
 from production.services import confinement
-from production.services.validation_service import ValidationService
+from production.services.validation_service import NotReady, ValidationService
 
 
 class Command(BaseCommand):
@@ -43,7 +43,10 @@ class Command(BaseCommand):
                                         max_active=options["max_active"], max_pending=options["max_pending"])
         except ValueError as exc:
             raise CommandError(str(exc)) from exc
-        service.serve_forever()
+        try:
+            service.serve_forever()
+        except NotReady as exc:
+            raise CommandError(str(exc)) from exc       # exit non-zero; systemd restarts and retries
         return None
 
     requires_system_checks = []           # no database involved; start fast, start always

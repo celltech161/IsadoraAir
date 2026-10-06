@@ -9,6 +9,9 @@ validation run; the web process is only its client.
 * admission: a connection flood far beyond the bound never grows threads,
   connections, media descriptors or runs past it; slow clients cannot hold
   admission; excess is a retryable ``busy``, and the service then serves;
+* start-up cleanup is a readiness gate: if it cannot be completed and
+  verified, the socket is never bound;
+* CPU accounting that cannot be read ends the run, retryably;
 * lifecycle (real systemd user units with the production unit's properties):
   the requesting worker SIGKILLed, a frozen client, the service SIGKILLed,
   stopped and restarted, and leftover leaves reaped at start-up -- in every
@@ -17,6 +20,7 @@ validation run; the web process is only its client.
 import array
 import errno
 import io
+import secrets
 import shutil
 import json
 import os
@@ -31,15 +35,17 @@ import time
 from pathlib import Path
 from unittest import mock
 
+from contextlib import contextmanager
+
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from production.models import ProductionMedia
 from production.services import confinement, intake, validation, validator_commands
 from production.services import validation_service as service_module
-from production.services.validation_service import ValidationService
+from production.services.validation_service import NotReady, ValidationService
 
 from .support import IsolatedMediaRootMixin, fixture
-from .validation_service_support import REPO, validation_service
+from .validation_service_support import REPO, TransientValidationService, validation_service
 
 PY = sys.executable
 MIB = 1024 * 1024
@@ -130,6 +136,53 @@ def _private_socket_path(testcase) -> str:
     os.chmod(directory, 0o700)
     testcase.addCleanup(shutil.rmtree, directory, True)
     return os.path.join(directory, "v.sock")
+
+
+@contextmanager
+def in_process_service(testcase, **options):
+    """The validation service in THIS test process (which holds a delegated
+    subtree like the unit's) -- where a test must reach into the executor to
+    inject a fault, or watch start-up itself."""
+    service = ValidationService(_private_socket_path(testcase), **options)
+    failure = []
+
+    def serve():
+        try:
+            service.serve_forever()
+        except BaseException as exc:                    # noqa: BLE001 -- reported to the test
+            failure.append(exc)
+
+    quiet = mock.patch.object(service_module, "_log")
+    quiet.start()
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        _eventually(lambda: failure or _connects(service.socket_path), 30)
+        if failure:
+            raise failure[0]
+        with override_settings(PRODUCTION_VALIDATION_SOCKET=service.socket_path):
+            yield service
+    finally:
+        service.stop()
+        thread.join(30)
+        quiet.stop()
+
+
+def stale_run(testcase):
+    """A leftover run leaf with a live task in it, as a dead instance leaves one."""
+    leaf = confinement.establish_root() / f"run-{secrets.token_hex(16)}"
+    leaf.mkdir()
+    sleeper = subprocess.Popen(["/bin/sleep", "300"])
+    (leaf / "cgroup.procs").write_text(str(sleeper.pid))
+
+    def cleanup():
+        if sleeper.poll() is None:
+            sleeper.kill()
+        sleeper.wait()
+        confinement._destroy(leaf)
+
+    testcase.addCleanup(cleanup)
+    return leaf, sleeper
 
 
 def raw_request(socket_path, payload: bytes, fds=()):
@@ -628,6 +681,189 @@ class AdmissionTests(SimpleTestCase):
             self.assertTrue(all(limit - 1 <= held <= limit + 3 for _, held in results.values()), results)
             answer = raw_request(service.socket, b'{"v": 1, "argv": ["ffprobe", "-version"], "timeout": 5}\n')
             self.assertEqual(answer["status"], "ok", answer)
+
+
+class StartupReadinessTests(SimpleTestCase):
+    """Codex 2.22B blocker 3: start-up cleanup is a readiness gate. If leftover
+    runs cannot be destroyed -- or the subtree cannot even be inspected -- the
+    socket is never bound; once cleanup can complete, the service starts."""
+
+    def attempt_start(self):
+        path = _private_socket_path(self)
+        service = ValidationService(path)
+        with self.assertRaises(NotReady) as caught, mock.patch.object(service_module, "_log"):
+            service.serve_forever()
+        self.assertIsNone(service.listener)
+        self.assertFalse(os.path.lexists(path), "the socket was bound")
+        self.assertFalse(_connects(path))
+        return str(caught.exception)
+
+    def assert_restored_start_succeeds(self, leaf=None, sleeper=None):
+        with in_process_service(self) as service:
+            if leaf is not None:
+                self.assertFalse(leaf.exists(), "the leftover run survived a successful start")
+                self.assertEqual(sleeper.wait(timeout=5), -signal.SIGKILL)
+            self.assertEqual(confinement.run_confined(["ffprobe", "-version"], timeout_seconds=10)["status"], "ok")
+        self.assertFalse(os.path.lexists(service.socket_path))
+
+    def test_a_scan_failure_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        with mock.patch.object(confinement, "_children", side_effect=OSError(errno.EIO, "Input/output error")):
+            self.assertIn("cannot scan", self.attempt_start())
+        self.assertIsNone(sleeper.poll(), "a failed scan is not 'nothing to clean'")
+        self.assert_restored_start_succeeds(leaf, sleeper)
+
+    def test_no_usable_subtree_never_listens(self):
+        with override_settings(PRODUCTION_VALIDATION_CGROUP="/sys/fs/cgroup/iportal-validation"):
+            self.assertIn("start-up cleanup incomplete", self.attempt_start())
+        self.assert_restored_start_succeeds()
+
+    def test_a_kill_failure_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        real_write = confinement._write
+
+        def write(path, value):
+            if path.name == "cgroup.kill":
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_write(path, value)
+
+        with mock.patch.object(confinement, "_write", side_effect=write):
+            self.assertIn("could not destroy 1 leftover run", self.attempt_start())
+        self.assertIsNone(sleeper.poll())
+        self.assert_restored_start_succeeds(leaf, sleeper)
+
+    def test_a_leaf_that_stays_populated_after_the_kill_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        real_populated = confinement._populated
+        with mock.patch.object(confinement, "CLEANUP_TIMEOUT_SECONDS", 0.2), \
+                mock.patch.object(confinement, "_populated",
+                                  side_effect=lambda path: path == leaf or real_populated(path)):
+            self.assertIn("could not destroy", self.attempt_start())
+        self.assertTrue(leaf.exists())
+        self.assert_restored_start_succeeds(leaf, sleeper)
+
+    def test_a_leaf_removal_failure_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        with mock.patch.object(confinement, "_remove", side_effect=OSError(errno.EBUSY, "Device or resource busy")):
+            self.assertIn("could not destroy", self.attempt_start())
+        self.assertTrue(leaf.exists())
+        self.assert_restored_start_succeeds(leaf, sleeper)
+
+    def test_any_cleaned_false_result_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        with mock.patch.object(confinement, "_destroy", side_effect=lambda path: {"path": str(path), "cleaned": False}):
+            self.assertIn("could not destroy", self.attempt_start())
+        self.assertIsNone(sleeper.poll())
+        self.assert_restored_start_succeeds(leaf, sleeper)
+
+    def test_a_subtree_still_populated_after_reaping_never_listens(self):
+        leaf, sleeper = stale_run(self)
+        root = confinement.establish_root()
+        real_populated = confinement._populated
+        with mock.patch.object(confinement, "_populated", side_effect=lambda path: path == root or real_populated(path)):
+            self.assertIn("still holds live tasks", self.attempt_start())
+        self.assert_restored_start_succeeds()
+
+    def test_a_real_service_whose_cleanup_cannot_complete_never_listens_then_recovers(self):
+        """The real unit, no mocks: while ``flag`` exists, every start of the
+        service finds a leftover run leaf it cannot remove (it holds a child
+        cgroup). Start-up cleanup fails, the process exits, systemd restarts it
+        -- and no instance ever listens. Without the obstacle the next start
+        succeeds and validation works."""
+        flag = Path(tempfile.mkdtemp(prefix="unremovable-")) / "present"
+        self.addCleanup(shutil.rmtree, flag.parent, True)
+        flag.touch()
+        leaf = f"run-{secrets.token_hex(16)}"
+        pre_start = textwrap.dedent(f"""
+            if [ -e '{flag}' ]; then
+                own=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+                mkdir -p "$(dirname "$own")/iportal-validation/{leaf}/obstacle"
+            fi
+        """)
+        service = TransientValidationService(pre_start=pre_start)
+        self.addCleanup(service.stop)
+        attempts, accepted, saw_leaf = set(), False, False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            pid = service.main_pid()
+            if pid:
+                attempts.add(pid)
+            saw_leaf = saw_leaf or any(path.name == leaf for path in service.leaves())
+            accepted = accepted or service.accepts()
+            time.sleep(0.05)
+        self.assertTrue(saw_leaf, "the obstacle was never in place")
+        self.assertFalse(accepted, "the service listened although its start-up cleanup failed")
+        self.assertGreaterEqual(len(attempts), 2, "systemd did not keep retrying the start")
+        self.assertFalse(os.path.lexists(service.socket), "the socket was bound")
+        flag.unlink()
+        service.wait_ready()
+        with service.active():
+            self.assertEqual(confinement.run_confined(["ffprobe", "-version"], timeout_seconds=10)["status"], "ok")
+        self.assertEqual(service.leaves(), [])
+
+
+class CpuAccountingServiceTests(SimpleTestCase):
+    """Codex 2.22B blocker 2: CPU accounting that cannot be read, parsed or
+    trusted while a validation runs ends that run -- tree destroyed, a
+    retryable ``confinement_unavailable`` -- and the service serves the retry."""
+
+    def setUp(self):
+        validation.clear_capability_cache()
+        self.addCleanup(validation.clear_capability_cache)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.wav = Path(tmp.name) / "tone.wav"
+        _tone(self.wav, 0.5)
+        self.hang = fake_tools(self, ffprobe=HANGS_WITH_A_DETACHED_DESCENDANT)
+
+    def test_unusable_cpu_accounting_ends_the_run_retryably(self):
+        real_read = confinement._read_cpu_stat
+        faults = {
+            "missing": FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            "unreadable": PermissionError(errno.EACCES, "Permission denied"),
+            "I/O error": OSError(errno.EIO, "Input/output error"),
+            "empty": b"",
+            "short read": b"usage_usec 12",
+            "no usage_usec": b"user_usec 5\nsystem_usec 5\n",
+            "not a number": b"usage_usec twelve\n",
+            "negative": b"usage_usec -5\n",
+            "repeated": b"usage_usec 1\nusage_usec 2\n",
+            "went backwards": "backwards",
+        }
+        with in_process_service(self) as service:
+            for label, fault in faults.items():
+                with self.subTest(label):
+                    seen = {}
+
+                    def read(leaf, fault=fault, seen=seen):
+                        if "pids" not in seen:
+                            pids = [int(p) for p in (leaf / "cgroup.procs").read_text().split()]
+                            if len(pids) < 2:                    # until the tool and its descendant run
+                                return real_read(leaf)
+                            seen.update(pids=pids, leaf=leaf, at=time.monotonic())
+                        if fault == "backwards":
+                            seen["calls"] = seen.get("calls", 0) + 1
+                            return b"usage_usec 5000\n" if seen["calls"] == 1 else b"usage_usec 10\n"
+                        if isinstance(fault, BaseException):
+                            raise fault
+                        return fault
+
+                    with mock.patch.dict(os.environ, PATH=f"{self.hang}:{os.environ['PATH']}"), \
+                            mock.patch.object(confinement, "_read_cpu_stat", side_effect=read):
+                        started = time.monotonic()
+                        result = confinement.run_confined(
+                            validator_commands.probe("ffprobe", "wav", str(self.wav)), timeout_seconds=20,
+                            media=str(self.wav))
+                    self.assertEqual(result["status"], "confinement_unavailable", result)
+                    self.assertIn("CPU accounting", result["stderr"])
+                    self.assertLess(time.monotonic() - started, 10, "the run was not ended at once")
+                    self.assertTrue(result["cgroup"]["cleaned"], result)
+                    self.assertFalse(seen["leaf"].exists())
+                    self.assertEqual([pid for pid in seen["pids"] if _alive(pid)], [], "a validator task survived")
+                    self.assertEqual(validation._run_failure(result, "probe").code, "confinement_unavailable")
+            # the same service process serves a normal validation afterwards
+            outcome = validation._analyze_path(self.wav, require_engine_decode=True)
+            self.assertEqual(outcome.status, validation.STATUS_VALID, outcome)
 
 
 class LifecycleTests(WorkerMixin, SimpleTestCase):

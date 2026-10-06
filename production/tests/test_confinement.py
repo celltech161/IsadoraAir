@@ -631,3 +631,43 @@ class ValidationFailureMappingTests(SimpleTestCase):
         self.assertIn("validation_busy", validation.INFRASTRUCTURE_CODES)
         self.assertNotIn("validation_busy", validation.MEDIA_VERDICT_CODES)
 
+
+class StrictCpuAccountingTests(ConfinementTestCase):
+    """The CPU-time budget's counter is read strictly: a broken counter is never
+    zero use (Codex 2.22B blocker 2; the live-run cases, through the service,
+    are in test_validation_service.CpuAccountingServiceTests)."""
+
+    def _parse(self, raw):
+        with mock.patch.object(confinement, "_read_cpu_stat", return_value=raw):
+            return confinement.cpu_usage_usec(Path("/sys/fs/cgroup/run-x"))
+
+    def test_a_real_leaf_counter_is_read(self):
+        leaf = confinement._prepare_leaf(Limits())
+        try:
+            self.assertGreaterEqual(confinement.cpu_usage_usec(leaf), 0)
+        finally:
+            confinement._destroy(leaf)
+        with self.assertRaises(confinement.ConfinementUnavailable):
+            confinement.cpu_usage_usec(leaf)                                  # gone: missing, never zero
+
+    def test_a_genuine_zero_is_distinguishable_from_a_failure(self):
+        self.assertEqual(self._parse(b"usage_usec 0\nuser_usec 0\nsystem_usec 0\n"), 0)
+        self.assertEqual(self._parse(b"usage_usec 1234\nuser_usec 1000\n"), 1234)
+
+    def test_every_malformed_counter_fails_closed(self):
+        for raw in (b"", b"usage_usec 12", b"user_usec 5\nsystem_usec 5\n", b"usage_usec twelve\n",
+                    b"usage_usec -5\n", b"usage_usec 1.5\n", b"usage_usec \n", b"usage_usec  12\n",
+                    b"usage_usec 1\nusage_usec 2\n", b"usage_usec 1\xff\n", b"usage_usec 1" + b"0" * 30 + b"\n"):
+            with self.subTest(raw=raw), self.assertRaises(confinement.ConfinementUnavailable):
+                self._parse(raw)
+
+    def test_every_read_failure_fails_closed(self):
+        for error in (FileNotFoundError(2, "No such file"), PermissionError(13, "Permission denied"),
+                      OSError(5, "Input/output error")):
+            with self.subTest(error=error), \
+                    mock.patch.object(confinement, "_read_cpu_stat", side_effect=error), \
+                    self.assertRaises(confinement.ConfinementUnavailable):
+                confinement.cpu_usage_usec(Path("/sys/fs/cgroup/run-x"))
+
+    def test_post_mortem_accounting_never_invents_a_zero(self):
+        self.assertIsNone(confinement._counter(Path("/nonexistent/memory.events"), "oom_kill"))
