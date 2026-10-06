@@ -81,7 +81,7 @@ sudo ln -sf /etc/nginx/sites-available/isadoraair /etc/nginx/sites-enabled/isado
 
 # 4. Reload + enable the units you want running
 sudo systemctl daemon-reload
-sudo systemctl enable --now isadoraair-gunicorn isadoraair-engine \
+sudo systemctl enable --now isadoraair-validation isadoraair-gunicorn isadoraair-engine \
   isadoraair-encoders isadoraair-monitoring isadoraair-rbds
 sudo systemctl enable --now isadoraair-analyze.timer \
   isadoraair-prune-emaillog.timer isadoraair-prune-systemevents.timer \
@@ -102,6 +102,7 @@ Long-running services (one process each, restarted by systemd):
 | Unit | Purpose |
 |---|---|
 | `isadoraair-gunicorn.service` | Web/API — Django app behind nginx |
+| `isadoraair-validation.service` | iPortal media validation — sole owner of every ffprobe/ffmpeg/GStreamer validator run (delegated cgroup subtree; see docs/IPORTAL.md). Without it, uploads stay unvalidated and retryable. |
 | `isadoraair-engine.service` | Playback engine (GStreamer) + Remote-DJ WebRTC signaling |
 | `isadoraair-encoders.service` | Streaming encoders (Liquidsoap → Icecast/Shoutcast) |
 | `isadoraair-rbds.service` | RBDS/RDS client to StereoTool |

@@ -106,36 +106,77 @@ sweeper (24 h grace), triggered at most every 15 minutes by recorder uploads.
 
 ### Resource confinement (Phase-B prerequisite)
 
-Every validator tool (ffprobe, ffmpeg, the GStreamer parity child) runs through
-`production.services.confinement.run_confined`, inside a kernel boundary that
-the tool tree cannot leave and that is destroyed after every run.
+Every validator tool (ffprobe, ffmpeg, the GStreamer parity child) runs inside
+a kernel boundary that the tool tree cannot leave, whose **lifetime is owned by
+a dedicated systemd service** — never by the web process that asked for it.
 
-**Where.** The web service's own *delegated* cgroup v2 subtree:
-`deploy/isadoraair-gunicorn.service` sets `Delegate=cpu memory pids` and
-`DelegateSubgroup=web`, so Gunicorn runs in `<unit>/web` and each validation
-gets a fresh leaf `<unit>/iportal-validation/run-<pid>-<id>` (or under
-`settings.PRODUCTION_VALIDATION_CGROUP`). No privilege, no sudo, no
-per-request root: systemd hands the subtree to the service account once, at
-unit start.
+**Who owns what.**
 
-**Aggregate limits** (the whole tool tree together), defaults calibrated on the
-real validators with 10-minute WAV/FLAC/Opus — measured peaks ≤ 22 MiB charged
-memory, ≤ 18 tasks, ~3 s CPU:
+```
+Gunicorn worker ──(Unix socket, one fixed-shape request, media as an fd)──▶
+isadoraair-validation.service   (deploy/isadoraair-validation.service)
+   <unit>/supervisor                  the service process
+   <unit>/iportal-validation/run-<128-bit id>   one leaf per run
+        └─ ffprobe / ffmpeg / GStreamer tree
+```
 
-| Limit | Default | Mechanism |
+* **The validation service** (`production.services.validation_service`, run as
+  `manage.py production_validation_service`) owns the delegated subtree
+  exclusively. For each request it creates a fresh leaf, runs the tool there
+  (`confinement.execute`), enforces the **hard wall deadline** — min(the
+  requested Phase-A tool timeout, the service's own cap for that command) —
+  and the CPU-time budget, and destroys the tree when the run ends.
+* **The web worker is a client** (`confinement.run_confined`). If it dies —
+  or Gunicorn is restarted — the connection closes and the service kills the
+  run at once. If it merely stalls, the service's deadline still fires. No
+  later request is ever needed for cleanup.
+* **If the service dies**, systemd (`KillMode=control-group`) kills every
+  process left in the unit's cgroup — validation leaves included — and
+  restarts it (`Restart=always`, no start limit); the new instance kills and
+  removes every leftover `run-*` leaf **before** it accepts work. Stopping or
+  restarting the service destroys its runs the same way.
+* **No PID decides ownership.** Leaves are named by a random 128-bit id; the
+  subtree belongs to the service alone, so every `run-*` leaf found at
+  start-up or stop is a run of this service and is reaped.
+
+**The protocol** (fixed and narrow). A request is
+`{"v": 1, "argv": [...], "timeout": seconds}` plus, for a media command,
+exactly one regular-file descriptor (SCM_RIGHTS); the media appears in the
+argv only as a placeholder and the tool sees `/proc/self/fd/<n>`. The service
+runs a request only if its argv is *exactly* one of the five validator
+commands (`production.services.validator_commands`: tool version, decoder
+check, ffprobe, full decode, GStreamer probe) rebuilt from the **service's
+own** tool configuration — so no executable, option, path, environment
+variable or limit can be chosen by a client. The socket lives in the service's
+`0700` runtime directory (`/run/isadoraair-validation/validator.sock`,
+`settings.PRODUCTION_VALIDATION_SOCKET`), is `0600`, and both ends check
+`SO_PEERCRED` (same service account). Browsers never reach it. It is not a job
+system: one synchronous run per connection, at most four at a time.
+
+**Guaranteed limits for one run** (defaults calibrated on the real validators
+with 10-minute WAV/FLAC/Opus — measured peaks ≤ 22 MiB charged memory, ≤ 18
+tasks, ~3 s CPU; overridable only as service configuration,
+`settings.PRODUCTION_VALIDATION_LIMITS` or the command's `--limit`):
+
+| Control | Default | Enforced by |
 | --- | --- | --- |
-| memory | 512 MiB, no swap, OOM kills the whole tree | `memory.max`, `memory.swap.max` 0, `memory.oom.group` 1 |
-| tasks (processes + threads) | 64 | `pids.max` |
-| CPU rate | one CPU | `cpu.max` (when the cpu controller is delegated) |
-| CPU time | 180 s for the tree | parent monitor on `cpu.stat` |
-| wall clock | per tool (Phase A) | parent monitor |
+| memory, whole tree | 512 MiB | kernel: `memory.max` |
+| swap | none | kernel: `memory.swap.max` 0 |
+| OOM | kills the whole tree | kernel: `memory.oom.group` 1 |
+| tasks (processes + threads) | 64 | kernel: `pids.max` |
+| CPU rate | one CPU | kernel: `cpu.max` |
+| CPU time, whole tree | 180 s | service monitor (`cpu.stat`) |
+| wall clock | per tool: 10 s capability checks, 20 s probe, 300 s decode, 125 s GStreamer | service monitor |
+| tree destruction | after every run, on client loss, on service stop/death | `cgroup.kill` (service), then systemd |
+
+So one run can never use more than one CPU, nor more than 180 CPU-seconds, nor
+live longer than its command's cap — and each bound is enforced by the kernel
+or by the service whose own death destroys the tree.
 
 **Per-process backstops**: `RLIMIT_AS` 1 GiB, `RLIMIT_CPU` 180 s (+5 s
-SIGKILL), `RLIMIT_FSIZE` 16 MiB, `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0. All
-are overridable with `settings.PRODUCTION_VALIDATION_LIMITS` (a dict of
-`confinement.Limits` fields).
+SIGKILL), `RLIMIT_FSIZE` 16 MiB, `RLIMIT_NOFILE` 256, `RLIMIT_CORE` 0.
 
-**Why nothing escapes.** The trusted, stdlib-only launcher
+**Why nothing escapes a run.** The trusted, stdlib-only launcher
 (`confined_exec.py`) moves itself into the leaf *before* anything untrusted
 runs, verifies the move, then sets `no_new_privs`, a **Landlock** policy (read
 and execute only — no file is writable anywhere except `/dev/null`, so
@@ -144,29 +185,29 @@ abstract sockets are scoped to the sandbox; no TCP), a **seccomp** filter
 (`clone3` → ENOSYS, so `CLONE_INTO_CGROUP` is unavailable; foreign-ABI
 syscalls kill) and the rlimits, and only then `exec`s the tool. Cgroup
 membership is inherited and is not changed by `setsid()`, `setpgid()`, double
-forking or a parent exiting. After every run — success, failure, timeout,
-interruption — the parent writes `cgroup.kill` (the kernel SIGKILLs every task
-in the leaf, race-free), waits for `populated 0` and removes the leaf; when
-`run_confined` returns, no task of that run is alive. Leaves left by a worker
-that died mid-run are destroyed by the next run.
+forking or a parent exiting.
 
-**Fail closed.** No delegated subtree, a missing controller, no `cgroup.kill`,
-Landlock or seccomp unavailable, a launcher step that cannot be verified, or a
-leaf that cannot be emptied → `confinement_unavailable`, a retryable
-infrastructure error; the tool never runs outside the boundary. A tool stopped
-by a limit is `validation_resource_limit`: a station limit, never an *invalid*
-verdict.
+**Required kernel facilities — fail closed.** cgroup v2 at `/sys/fs/cgroup`;
+the `cpu`, `memory` and `pids` controllers delegated and enabled
+(`confinement.establish_root`); in every leaf `cgroup.kill`, `memory.max`,
+`memory.swap.max`, `memory.oom.group`, `pids.max` and `cpu.max`, each written
+and read back (`confinement._prepare_leaf`); Landlock and seccomp
+(`confined_exec.py`, verified before `exec`). Any one missing, or no
+reachable service → `confinement_unavailable`, a retryable infrastructure
+error; the tool never runs outside the boundary. A tool stopped by a limit is
+`validation_resource_limit`: a station limit, never an *invalid* verdict.
 
-**Deployment note.** The unit change takes effect at the next gunicorn
-restart after `daemon-reload`; until then (or on a host without cgroup v2
-delegation, Landlock or seccomp) uploads are kept as unvalidated takes that
-can be re-validated later. Management commands run from a login shell are
-not in the delegated subtree and also fail closed.
+**Deployment.** Install and enable `isadoraair-validation.service` (rendered
+from `deploy/`), then restart gunicorn (its unit now `Wants=` the validation
+service and no longer needs any cgroup delegation itself). Until the service
+runs, uploads are kept as unvalidated takes that can be re-validated later.
 
-**Tests** that run the real validators need the same delegated subtree:
+**Tests** that run the real validators use the same topology, built from the
+user's own systemd user manager (a transient validation service with the
+production unit's properties; the test process in a delegated scope so the
+executor's own tests can create leaves like the service does):
 
-    systemd-run --user --scope -p Delegate=yes --quiet \
-        production/tests/run_delegated.sh python manage.py test production library ...
+    production/tests/run_with_validation_service.sh /path/to/python manage.py test production library ...
 
 Without it they fail (they do not skip): the absence of the boundary must
 never go unnoticed.

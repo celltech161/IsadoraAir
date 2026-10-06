@@ -201,7 +201,8 @@ the runtime/backup authority and is still applied at restore, unchanged.
 Nothing a client says is trusted — not the extension, not the browser MIME, not
 a reported duration. Four steps, each shell-free, hard-timed, with bounded
 output, and (since 2.22B) each inside its own kernel-limited, killable cgroup
-v2 leaf, sandboxed by Landlock and seccomp — see "Resource confinement" in
+v2 leaf owned by the isadoraair-validation service, sandboxed by Landlock and
+seccomp — see "Resource confinement" in
 `docs/IPORTAL.md`; a station limit or unavailable confinement is a retryable
 infrastructure outcome, never an *invalid* verdict:
 
@@ -393,13 +394,14 @@ runtime-11 companion mechanism.
 Status after Phase B (2.22B, see `docs/IPORTAL.md`):
 
 * **Resource confinement before browser exposure — DONE (2.22B).** Every
-  validator tool runs in its own per-run cgroup v2 leaf in the web service's
-  delegated subtree (aggregate memory, task and CPU limits; the whole tree is
-  killed with `cgroup.kill` after every run, so no descendant can outlive it),
-  sandboxed by Landlock and seccomp so it cannot migrate out, with
-  per-process rlimits as backstops; validation fails closed
-  (`confinement_unavailable`) if any of it cannot be established —
-  `production.services.confinement`.
+  validator tool runs in its own per-run cgroup v2 leaf owned by the dedicated
+  `isadoraair-validation` service (aggregate memory, task and CPU limits; a
+  hard deadline enforced by that service; the whole tree is killed with
+  `cgroup.kill` after every run, when the requesting web worker goes away, and
+  by systemd if the service itself dies), sandboxed by Landlock and seccomp so
+  it cannot migrate out, with per-process rlimits as backstops; validation
+  fails closed (`confinement_unavailable`) if any of it is unavailable —
+  `production.services.confinement`, `production.services.validation_service`.
 * **No GenericForeignKey or cross-database references** to ProductionMedia
   (see the binding rule). Upheld by Phase B: `VoiceTrack.media` is an
   ordinary `PROTECT` FK, and system check `library.E900/E901` refuses a
