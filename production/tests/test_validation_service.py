@@ -689,14 +689,33 @@ class StartupReadinessTests(SimpleTestCase):
     socket is never bound; once cleanup can complete, the service starts."""
 
     def attempt_start(self):
+        """Start a service; it must give up (NotReady) without ever binding. A
+        service that listens instead is stopped and reported, never left
+        serving the test forever."""
         path = _private_socket_path(self)
         service = ValidationService(path)
-        with self.assertRaises(NotReady) as caught, mock.patch.object(service_module, "_log"):
-            service.serve_forever()
-        self.assertIsNone(service.listener)
+        outcome = []
+
+        def start():
+            try:
+                service.serve_forever()
+                outcome.append(None)
+            except BaseException as exc:                    # noqa: BLE001 -- reported below
+                outcome.append(exc)
+
+        with mock.patch.object(service_module, "_log"):
+            thread = threading.Thread(target=start, daemon=True)
+            thread.start()
+            thread.join(15)
+            listened = service.listener is not None or _connects(path)
+            if thread.is_alive():
+                service.stop()
+                thread.join(15)
+        self.assertFalse(listened, "the service listened although its start-up cleanup failed")
         self.assertFalse(os.path.lexists(path), "the socket was bound")
-        self.assertFalse(_connects(path))
-        return str(caught.exception)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], NotReady)
+        return str(outcome[0])
 
     def assert_restored_start_succeeds(self, leaf=None, sleeper=None):
         with in_process_service(self) as service:
