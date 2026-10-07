@@ -220,7 +220,8 @@ from production.services import confinement, validator_commands
 media = sys.argv[1]
 result = confinement.run_confined(validator_commands.probe("ffprobe", "wav", media),
                                   timeout_seconds=float(sys.argv[2]), media=media)
-print(json.dumps({{"status": result["status"], "stderr": result.get("stderr", "")[:200]}}), flush=True)
+print(json.dumps({{"status": result["status"], "returncode": result.get("returncode"),
+                  "stderr": result.get("stderr", "")[:200]}}), flush=True)
 """
 
 
@@ -940,8 +941,15 @@ class LifecycleTests(WorkerMixin, SimpleTestCase):
             self.assert_run_destroyed(service, leaf, pids, seconds=15)
             self.assertIsNone(service.cgroup())
             self.assertFalse(os.path.exists(service.socket))
-            self.assertIn(json.loads(worker.communicate(timeout=30)[0])["status"],
-                          ("confinement_unavailable", "stopped"))
+            answer = json.loads(worker.communicate(timeout=30)[0])
+            # systemd's stop SIGTERMs every process in the unit's cgroup, the
+            # tool included: if it dies of that before the service notices it is
+            # stopping, the run ends "failed" with -SIGTERM -- an infrastructure
+            # outcome (``probe_killed``), never a verdict on the media.
+            outcome = (answer["status"], answer["returncode"])
+            self.assertTrue(outcome[0] in ("confinement_unavailable", "stopped")
+                            or outcome == ("failed", -signal.SIGTERM), answer)
+            self.assertTrue(validation._run_failure(answer, "probe").is_infrastructure_error, answer)
             after = confinement.run_confined(["ffmpeg", "-version"], timeout_seconds=10)
             self.assertEqual(after["status"], "confinement_unavailable")
 
