@@ -53,6 +53,10 @@
       "unit": "isadoraair-sync-road-conditions.timer"
     },
     {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-validation.service"
+    },
+    {
       "policy": "INSTALL_ONLY",
       "unit": "wx-forecast-1day-day.service"
     },
