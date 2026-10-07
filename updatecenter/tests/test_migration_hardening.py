@@ -192,7 +192,10 @@ class CentralAuthorizationGateTests(SimpleTestCase):
 
 class PreflightRegistryContractTests(SimpleTestCase):
     def test_registry_is_explicit_and_keyed_by_pending_migration(self):
-        self.assertEqual(set(preflight.REGISTRY), {preflight.M0087, preflight.M0088})
+        self.assertEqual(set(preflight.REGISTRY), {preflight.M0087, preflight.M0088, preflight.M_PRODUCTION_0001})
+        # r0107: production.0001_initial carries exactly the two read-only host checks
+        self.assertEqual([check_id for check_id, _check in preflight.REGISTRY[preflight.M_PRODUCTION_0001]],
+                         ["production.0001.validation_host_capability", "production.0001.media_root_establishable"])
 
     @mock.patch.object(preflight, "transaction")
     @mock.patch.object(preflight, "connection")

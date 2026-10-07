@@ -9,6 +9,13 @@ a release manifest, and nothing is imported or executed dynamically.
 
 Every check runs inside one PostgreSQL READ ONLY transaction that is always
 rolled back, and returns bounded, structured evidence.
+
+r0107: production.0001_initial -- the migration that first gives a station
+ProductionMedia -- also carries two read-only HOST checks
+(production.services.host_capability): the isadoraair-validation boundary's
+kernel/systemd facilities, and that PRODUCTION_MEDIA_ROOT can be established.
+They write nothing; they move a refusal on an unsupported host ahead of every
+mutation (checkpoint, migration, checkout advance, units, starts).
 """
 from __future__ import annotations
 
@@ -163,9 +170,26 @@ def _check_0088_profile_integrity(cursor, pending):
 
 
 # Explicit registry: pending migration ref -> [(check id, check)].
+M_PRODUCTION_0001 = "production.0001_initial"
+
+
+def _check_validation_host(cursor, pending):
+    from production.services import host_capability
+    return host_capability.check_validation_host()
+
+
+def _check_media_root(cursor, pending):
+    from production.services import host_capability
+    return host_capability.check_media_root()
+
+
 REGISTRY = {
     M0087: [("library.0087.global_slot_ambiguity", _check_0087_global_slot_ambiguity)],
     M0088: [("library.0088.profile_integrity", _check_0088_profile_integrity)],
+    M_PRODUCTION_0001: [
+        ("production.0001.validation_host_capability", _check_validation_host),
+        ("production.0001.media_root_establishable", _check_media_root),
+    ],
 }
 
 
