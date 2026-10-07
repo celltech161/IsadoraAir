@@ -1689,6 +1689,17 @@ exactly what that pending migration will reject:
   and its NOT NULL profile and `ScheduleProfileState` pointers. If 0087 is
   also pending, rows are evaluated as 0087 will leave them.
 * **0088 applied:** neither check runs.
+* **`production.0001_initial` pending (r0107, the first release with
+  ProductionMedia):** two read-only **host** checks
+  (`production/services/host_capability.py`) rather than data checks --
+  `production.0001.validation_host_capability` (unified cgroup v2; `cpu`,
+  `memory`, `pids`; `cgroup.kill`, `memory.swap.max`, `memory.oom.group`,
+  `pids.max`, `cpu.max`; systemd >= 254; a functional Landlock + seccomp
+  self-test) and `production.0001.media_root_establishable`. They move the
+  refusal of a host that cannot run `isadoraair-validation` ahead of every
+  application mutation. Writability is judged from ownership and mode, not
+  `os.access()`, because the updater's own `ProtectSystem=strict` namespace
+  makes `/srv` read-only to it. See `docs/releases/r0107.md`.
 
 Evidence names the migration and check, the global or profile scope, the
 conflicting key, the true count, bounded row IDs and truncation.

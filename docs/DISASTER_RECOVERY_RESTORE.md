@@ -994,7 +994,11 @@ dependency on IsadoraAir's own DB/venv:
 PostgreSQL (running, migrated -- stages 30 + 95 already confirmed this)
   |
   v
-isadoraair-gunicorn                 (After= network, postgresql)
+isadoraair-validation               (r0107+; After= network; iPortal media
+  |                                  validation -- see docs/IPORTAL.md)
+  v
+isadoraair-gunicorn                 (After= network, postgresql, isadoraair-validation;
+                                     Wants= isadoraair-validation)
   |
   +--> isadoraair-monitoring        (After= ...gunicorn)
   |
@@ -1286,9 +1290,15 @@ engine activation whenever `Studio Microphone 1` is configured.
 Once services are up and hardware is attached:
 
 ```bash
-sudo systemctl status isadoraair-gunicorn isadoraair-engine \
+sudo systemctl status isadoraair-validation isadoraair-gunicorn isadoraair-engine \
   isadoraair-encoders isadoraair-monitoring isadoraair-rbds
 ```
+`isadoraair-validation` (r0107+) must be active with
+`/run/isadoraair-validation/validator.sock` present; it refuses to listen
+until its start-up cleanup succeeds and needs the host facilities listed in
+`docs/IPORTAL.md` ("Required kernel facilities"). Without it uploads stay
+unvalidated (fail closed); the restored ProductionMedia under
+`PRODUCTION_MEDIA_ROOT/media/` remains playable regardless.
 plus a real end-to-end check from the dashboard (`https://<host>/`) —
 build an hour's log, confirm the engine actually plays audio, confirm a
 stream connects if encoders are enabled. `manage.py
