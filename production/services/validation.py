@@ -88,11 +88,32 @@ CAPABILITY_TIMEOUT_SECONDS = 10.0
 FFMPEG_TIMEOUT_SECONDS = 300.0
 GSTREAMER_CHILD_TIMEOUT_SECONDS = 120.0
 GSTREAMER_HARD_TIMEOUT_SECONDS = 125.0
+
+
+def _canonical_interpreter() -> str:
+    """This installation's Python, spelled the SAME way in every process.
+
+    The validator commands are matched by exact argv equality between the
+    client (Gunicorn) and the isadoraair-validation service, which rebuilds
+    them from its own constants. The two processes are launched differently:
+    on a station Gunicorn runs from its script's shebang (the virtualenv's
+    real path, e.g. .../isadoraair-django/venv/bin/python3.14) and the service
+    from ExecStart (@@ISA_ROOT@@/venv/bin/python through the /opt/isadoraair
+    symlink), so sys.executable differs between them and every engine probe
+    would be refused. A virtualenv's canonical ``bin/python`` (real prefix)
+    is the same in both and runs the same environment."""
+    if sys.prefix != sys.base_prefix:
+        candidate = os.path.join(os.path.realpath(sys.prefix), "bin", "python")
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.realpath(sys.executable)
+
+
 # Production's OWN isolated probe (production/services/gst_probe.py), with a
 # structured media-vs-capability taxonomy. The interpreter is a tuple so the
 # tests can run it the way a host without GI bindings would (python -S).
-GSTREAMER_PROBE_SCRIPT = str(Path(__file__).with_name("gst_probe.py"))
-GSTREAMER_PROBE_INTERPRETER = (sys.executable,)
+GSTREAMER_PROBE_SCRIPT = os.path.realpath(Path(__file__).with_name("gst_probe.py"))
+GSTREAMER_PROBE_INTERPRETER = (_canonical_interpreter(),)
 VALIDATOR_VERSION = 1
 
 _PROBE_ENTRIES = validator_commands.PROBE_ENTRIES
