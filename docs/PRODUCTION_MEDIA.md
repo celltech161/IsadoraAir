@@ -403,8 +403,9 @@ Status after Phase B (2.22B, see `docs/IPORTAL.md`):
   fails closed (`confinement_unavailable`) if any of it is unavailable —
   including an unreadable CPU-time counter, and a service that has not
   completed its start-up cleanup (it never listens until it has). Admission is
-  bounded (2 running, 4 waiting); excess requests get the retryable
-  `validation_busy` —
+  bounded (default 2 running, 4 waiting; operator range 1–4 / 0–8, hard
+  ceilings enforced by the service itself); excess requests get the
+  retryable `validation_busy` —
   `production.services.confinement`, `production.services.validation_service`.
 * **No GenericForeignKey or cross-database references** to ProductionMedia
   (see the binding rule). Upheld by Phase B: `VoiceTrack.media` is an

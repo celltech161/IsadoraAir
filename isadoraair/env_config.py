@@ -333,6 +333,11 @@ class ManagedSetting:
     validate: Callable[[str, str], None] = field(default=lambda key, value: None)
     services_note: str = ""
     is_path: bool = False
+    # The value the CONSUMING service is actually running with, as a string,
+    # or None if unknown. Default (None here): this Django process's settings.
+    # For a key consumed only by another service (the validation service's
+    # admission limits) the Django process's own value would be meaningless.
+    running: Optional[Callable[[], Optional[str]]] = None
 
 
 MANAGED_SETTINGS: dict = {}
@@ -438,6 +443,67 @@ register_setting(ManagedSetting(
         "each new job, so its next invocation picks up the saved path without "
         "a separate config edit. Move existing shared files before jobs resume."
     ),
+))
+# ---------------------------------------------------------------------
+# 2.22B: isadoraair-validation's admission limits. ONE canonical domain
+# (production.services.admission) is used for this form's validation, the
+# service's settings/command line, and the service itself, which refuses to
+# start outside it. Only that service reads these, at start-up.
+# ---------------------------------------------------------------------
+def validate_validation_active(key, value):
+    from production.services import admission
+    _reject_control_chars(key, value)
+    try:
+        admission.parse_active(value)
+    except admission.AdmissionConfigError as exc:
+        raise InvalidValueError(key, str(exc)) from None
+
+
+def validate_validation_pending(key, value):
+    from production.services import admission
+    _reject_control_chars(key, value)
+    try:
+        admission.parse_pending(value)
+    except admission.AdmissionConfigError as exc:
+        raise InvalidValueError(key, str(exc)) from None
+
+
+def _cast_validation_active(value):
+    from production.services import admission
+    return admission.parse_active(value)
+
+
+def _cast_validation_pending(value):
+    from production.services import admission
+    return admission.parse_pending(value)
+
+
+def _running_validation_limit(field_name):
+    def running():
+        from production.services import admission
+        reported = admission.running_limits(str(django_settings.PRODUCTION_VALIDATION_SOCKET))
+        return None if reported is None else str(reported[field_name])
+    return running
+
+
+_VALIDATION_SERVICE_NOTE = (
+    "Protects the on-air host from validation resource exhaustion: every run may use a full "
+    "CPU and 512 MiB. Read only by isadoraair-validation when it starts -- restart "
+    "isadoraair-validation to apply a saved change (a restart cancels validations in "
+    "progress; those uploads stay unvalidated and can be validated again)."
+)
+
+register_setting(ManagedSetting(
+    key="PRODUCTION_VALIDATION_MAX_ACTIVE", label="Concurrent validations (allowed 1-4, default 2)",
+    category="production", default="2", cast=_cast_validation_active,
+    validate=validate_validation_active, services_note=_VALIDATION_SERVICE_NOTE,
+    running=_running_validation_limit("max_active"),
+))
+register_setting(ManagedSetting(
+    key="PRODUCTION_VALIDATION_MAX_PENDING", label="Pending validation requests (allowed 0-8, default 4)",
+    category="production", default="4", cast=_cast_validation_pending,
+    validate=validate_validation_pending, services_note=_VALIDATION_SERVICE_NOTE,
+    running=_running_validation_limit("max_pending"),
 ))
 register_setting(ManagedSetting(
     key="REPORTS_ROOT", label="Reports storage directory", category="reports",
@@ -554,11 +620,17 @@ def compare_to_running(keys=None, env_path=None):
     for key in keys:
         setting = MANAGED_SETTINGS[key]
         disk_raw = repo_data.get(key, setting.default)
-        running_raw = str(getattr(django_settings, key, setting.default))
-        try:
-            matches = setting.cast(disk_raw) == setting.cast(running_raw)
-        except (ValueError, TypeError):
-            matches = disk_raw == running_raw
+        if setting.running is not None:
+            running_raw = setting.running()
+        else:
+            running_raw = str(getattr(django_settings, key, setting.default))
+        if running_raw is None:
+            matches = False                 # the consuming service is not running/reporting
+        else:
+            try:
+                matches = setting.cast(disk_raw) == setting.cast(running_raw)
+            except (ValueError, TypeError):
+                matches = disk_raw == running_raw
         if setting.secret:
             results[key] = ComparisonResult(key=key, matches=matches, disk_display=None, running_display=None)
         else:

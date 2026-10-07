@@ -245,6 +245,12 @@ PRODUCTION_MEDIA_ROOT = config('PRODUCTION_MEDIA_ROOT', default='/srv/isadoraair
 # 0700 runtime directory. Without the service, validation fails closed.
 PRODUCTION_VALIDATION_SOCKET = config('PRODUCTION_VALIDATION_SOCKET',
                                       default='/run/isadoraair-validation/validator.sock')
+# Its admission limits (admin: Production media -> Validation limits). Kept as
+# the raw .env strings: only isadoraair-validation reads them, at start-up,
+# through production.services.admission's strict parser (1..4 and 0..8) -- an
+# out-of-domain value stops that service from starting, never this process.
+PRODUCTION_VALIDATION_MAX_ACTIVE = config('PRODUCTION_VALIDATION_MAX_ACTIVE', default='2')
+PRODUCTION_VALIDATION_MAX_PENDING = config('PRODUCTION_VALIDATION_MAX_PENDING', default='4')
 
 # Where the GW3000/Ecowitt weather receiver writes latest_weather.json,
 # wind_history.json, and smoothed_wind.json -- read by the /wx/ views and

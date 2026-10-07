@@ -159,13 +159,27 @@ variable or limit can be chosen by a client. The socket lives in the service's
 `SO_PEERCRED` (same service account). Browsers never reach it. It is not a job
 system: one synchronous run per connection.
 
-**Admission is bounded before anything is allocated.** At most
-`MAX_ACTIVE_RUNS` = **2** runs execute at once and at most
-`MAX_PENDING_REQUESTS` = **4** more admitted requests wait for a run slot
-(within their own deadline); settings `PRODUCTION_VALIDATION_MAX_ACTIVE` /
-`PRODUCTION_VALIDATION_MAX_PENDING` or the command's `--max-active` /
-`--max-pending` change them. The accept loop admits a connection only while
-fewer than 6 are admitted, and only an admitted connection gets a handler
+**Admission is bounded before anything is allocated.** By default at most
+**2** runs execute at once and at most **4** more admitted requests wait for a
+run slot (within their own deadline). An operator may choose **1–4**
+concurrent validations and **0–8** pending requests — never more: these are
+hard ceilings of the service (`production.services.admission`, the one
+canonical parser for every route). They are set at **Admin → Production
+media → Validation limits** (superusers; stored in `.env` as
+`PRODUCTION_VALIDATION_MAX_ACTIVE` / `PRODUCTION_VALIDATION_MAX_PENDING`
+through the shared managed-settings mechanism, `isadoraair/env_config.py`), or
+with the service's `--max-active` / `--max-pending`. Only plain digits inside
+the range are accepted: booleans, fractions, signs, hex, exponents, padding,
+over-long numbers and out-of-range values are refused — by the admin form
+with a message, and by the service itself, which then **does not start**
+(never clamps). A saved change takes effect when `isadoraair-validation` is
+restarted (which cancels validations in progress; those uploads stay
+unvalidated and can be validated again); the admin page compares the saved
+values with the limits the running service reports (`admission.json` beside
+its socket) and says "Restart required" until they match. The per-run
+memory, task, CPU and time limits and the sandbox are not adjustable there.
+With the defaults, the accept loop admits a connection only while fewer than
+6 are admitted, and only an admitted connection gets a handler
 thread; any other connection is answered `{"status": "busy"}` at once and
 closed **without reading it** — whatever it sent, passed descriptors
 included, is discarded by the kernel with the connection. Beyond the listen

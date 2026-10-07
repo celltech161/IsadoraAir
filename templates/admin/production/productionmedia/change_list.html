@@ -1,0 +1,7 @@
+{% extends "admin/change_list.html" %}
+{# ProductionMedia rows are read-only; the one operational setting here is the
+   validation service's admission limits (production/admin.py). #}
+{% block object-tools-items %}
+  <li><a href="{% url 'admin:production_productionmedia_validation_limits' %}">Validation limits</a></li>
+  {{ block.super }}
+{% endblock %}

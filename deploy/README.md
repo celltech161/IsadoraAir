@@ -102,7 +102,7 @@ Long-running services (one process each, restarted by systemd):
 | Unit | Purpose |
 |---|---|
 | `isadoraair-gunicorn.service` | Web/API — Django app behind nginx |
-| `isadoraair-validation.service` | iPortal media validation — sole owner of every ffprobe/ffmpeg/GStreamer validator run (delegated cgroup subtree; see docs/IPORTAL.md). Without it, uploads stay unvalidated and retryable. |
+| `isadoraair-validation.service` | iPortal media validation — sole owner of every ffprobe/ffmpeg/GStreamer validator run (delegated cgroup subtree; see docs/IPORTAL.md). Without it, uploads stay unvalidated and retryable. Admission limits (admin: Production media → Validation limits; 1–4 running, 0–8 waiting) are read only at its start — restart it to apply a change; an out-of-range value keeps it from starting. |
 | `isadoraair-engine.service` | Playback engine (GStreamer) + Remote-DJ WebRTC signaling |
 | `isadoraair-encoders.service` | Streaming encoders (Liquidsoap → Icecast/Shoutcast) |
 | `isadoraair-rbds.service` | RBDS/RDS client to StereoTool |

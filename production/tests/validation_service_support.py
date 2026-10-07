@@ -38,7 +38,7 @@ def _manager(method: str, unit: str) -> None:
 
 
 class TransientValidationService:
-    def __init__(self, *, env=None, path_prefix=None, limits=None, args=(), pre_start=None):
+    def __init__(self, *, env=None, path_prefix=None, limits=None, args=(), pre_start=None, wait=True):
         self.runtime = Path(tempfile.mkdtemp(prefix="isadoraair-validation-t.",
                                              dir=os.environ.get("XDG_RUNTIME_DIR") or None))
         self.runtime.chmod(0o700)
@@ -58,7 +58,7 @@ class TransientValidationService:
         command += [f"--limit={name}={value}" for name, value in (limits or {}).items()]
         command += list(args)
         subprocess.run(command, check=True, capture_output=True, timeout=30)
-        if not pre_start:
+        if wait and not pre_start:
             self.wait_ready()
 
     # -- lifecycle -------------------------------------------------------------

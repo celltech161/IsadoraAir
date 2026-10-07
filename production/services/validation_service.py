@@ -52,14 +52,15 @@ import sys
 import threading
 import time
 
-from . import confinement, validator_commands
+from . import admission, confinement, validator_commands
 
-# Admission (settings PRODUCTION_VALIDATION_MAX_ACTIVE / _MAX_PENDING override).
-# Conservative for an on-air host: each run may use one CPU and 512 MiB, so at
-# most two run at once; four more may wait for a run slot; any further
-# connection is answered ``busy`` immediately.
-MAX_ACTIVE_RUNS = 2
-MAX_PENDING_REQUESTS = 4
+# Admission defaults. Conservative for an on-air host: each run may use one CPU
+# and 512 MiB, so at most two run at once; four more may wait for a run slot;
+# any further connection is answered ``busy`` immediately. An operator may
+# choose 1..4 / 0..8 (production.services.admission -- the one canonical
+# domain; nothing outside it ever starts).
+MAX_ACTIVE_RUNS = admission.ACTIVE_DEFAULT
+MAX_PENDING_REQUESTS = admission.PENDING_DEFAULT
 # Total time an admitted client has to deliver its whole request.
 REQUEST_READ_TIMEOUT_SECONDS = 5.0
 LISTEN_BACKLOG = 16
@@ -158,25 +159,27 @@ def _read_request(conn):
     return request, fds
 
 
-def configured_admission() -> tuple[int, int]:
+def _configured(name, default):
     from django.conf import settings
-    return (int(getattr(settings, "PRODUCTION_VALIDATION_MAX_ACTIVE", MAX_ACTIVE_RUNS)),
-            int(getattr(settings, "PRODUCTION_VALIDATION_MAX_PENDING", MAX_PENDING_REQUESTS)))
+    return getattr(settings, name, default)
 
 
 class ValidationService:
     def __init__(self, socket_path: str, *, tools=None, limits=None, max_active=None, max_pending=None):
-        default_active, default_pending = configured_admission()
-        max_active = default_active if max_active is None else max_active
-        max_pending = default_pending if max_pending is None else max_pending
-        if max_active < 1 or max_pending < 0:
-            raise ValueError("max_active must be >= 1 and max_pending >= 0")
+        # Authoritative: whatever the route (settings, command line, a direct
+        # caller), a limit outside the domain stops construction --
+        # AdmissionConfigError, never a clamped or reinterpreted value.
+        if max_active is None:
+            max_active = _configured("PRODUCTION_VALIDATION_MAX_ACTIVE", MAX_ACTIVE_RUNS)
+        if max_pending is None:
+            max_pending = _configured("PRODUCTION_VALIDATION_MAX_PENDING", MAX_PENDING_REQUESTS)
+        max_active, max_pending = admission.parse_active(max_active), admission.parse_pending(max_pending)
         self.socket_path = socket_path
         self.tools = tools or configured_tools()
         self.limits = limits or confinement.configured_limits()
         self.max_active, self.max_pending = max_active, max_pending
         self.slots = threading.BoundedSemaphore(max_active)                     # running
-        self.admission = threading.BoundedSemaphore(max_active + max_pending)    # running + waiting
+        self.admitted = threading.BoundedSemaphore(max_active + max_pending)     # running + waiting
         self.stopping = threading.Event()
         self.listener = None
 
@@ -221,8 +224,10 @@ class ValidationService:
         os.chmod(self.socket_path, 0o600)
         listener.listen(LISTEN_BACKLOG)
         self.listener = listener
+        admission.write_status(self.socket_path, self.max_active, self.max_pending)
 
     def serve_forever(self) -> None:
+        admission.remove_status(self.socket_path)      # a dead predecessor's limits are not "running"
         self.reap_before_listening()           # raises NotReady: the socket is never bound
         self.bind()
         if threading.current_thread() is threading.main_thread():
@@ -252,20 +257,20 @@ class ValidationService:
         except OSError:
             conn.close()
             return
-        if not self.admission.acquire(blocking=False):
+        if not self.admitted.acquire(blocking=False):
             _reject_busy(conn)
             return
         try:
             threading.Thread(target=self._admitted, args=(conn,), daemon=True).start()
         except RuntimeError:
-            self.admission.release()
+            self.admitted.release()
             _reject_busy(conn)
 
     def _admitted(self, conn) -> None:
         try:
             self.handle(conn)
         finally:
-            self.admission.release()
+            self.admitted.release()
 
     def stop(self) -> None:
         self.stopping.set()
@@ -278,6 +283,7 @@ class ValidationService:
 
     def shutdown(self) -> None:
         self.reap("stop")                     # no run outlives the service
+        admission.remove_status(self.socket_path)
         try:
             os.unlink(self.socket_path)
         except OSError:

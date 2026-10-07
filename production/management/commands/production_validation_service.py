@@ -22,11 +22,13 @@ class Command(BaseCommand):
         parser.add_argument("--limit", action="append", default=[], metavar="FIELD=INTEGER",
                             help="Override one confinement.Limits field (service configuration; "
                                  "default: settings.PRODUCTION_VALIDATION_LIMITS).")
-        parser.add_argument("--max-active", type=int, default=None,
-                            help="Runs at once (default: settings.PRODUCTION_VALIDATION_MAX_ACTIVE or 2).")
-        parser.add_argument("--max-pending", type=int, default=None,
+        # Plain strings: parsed ONLY by production.services.admission (argparse's
+        # int() would accept "+2", " 2", "1_0" and any size).
+        parser.add_argument("--max-active", default=None, metavar="1..4",
+                            help="Runs at once (default: settings.PRODUCTION_VALIDATION_MAX_ACTIVE, else 2).")
+        parser.add_argument("--max-pending", default=None, metavar="0..8",
                             help="Admitted requests waiting for a run slot (default: "
-                                 "settings.PRODUCTION_VALIDATION_MAX_PENDING or 4).")
+                                 "settings.PRODUCTION_VALIDATION_MAX_PENDING, else 4).")
 
     def handle(self, *args, **options):
         limits = confinement.configured_limits()
