@@ -263,6 +263,43 @@ class RecorderBrowserTests(IsolatedMediaRootMixin, StaticLiveServerTestCase):
         self.assertFalse(ProductionMedia.objects.exists())          # nothing is saved by editing or export
         self.assert_clean(page)
 
+    @in_browser
+    def test_punch_in_controls_say_what_each_mode_does(self):
+        """r0108: both modes record OVER the take from the playhead; they differ
+        only in what follows. The old "Replace the rest (instead of insert)"
+        checkbox suggested an insert that never existed."""
+        page = self.open()
+        modes = page.eval_on_selector_all("input[name=ipPunchTail]", "els => els.map(e => [e.id, e.value, e.checked])")
+        self.assertEqual(modes, [["ipPunchKeepTail", "insert", True], ["ipPunchReplace", "replace", False]])
+        label = lambda ident: page.eval_on_selector(f"#{ident}", "el => el.closest('label').textContent.trim()")
+        self.assertIn("keep the rest", label("ipPunchKeepTail"))
+        self.assertIn("discard the rest", label("ipPunchReplace"))
+        self.assertNotIn("insert", page.text_content("#ipRecorderPanel").lower())       # no misleading verb
+        # The mode choice only applies (and is only enabled) while punch-in is on.
+        self.assertTrue(page.is_disabled("#ipPunchKeepTail") and page.is_disabled("#ipPunchReplace"))
+        page.check("#ipPunch")
+        self.assertFalse(page.is_disabled("#ipPunchKeepTail") or page.is_disabled("#ipPunchReplace"))
+
+        self.arm(page)
+        page.uncheck("#ipPunch")
+        self.record(page, 3.0)
+        total = self.duration(page)
+        # "keep the rest": a 1 s punch at 1.0 s leaves the length unchanged.
+        page.evaluate("() => { window.IPortalWorkstation.playhead = 1.0; }")
+        page.check("#ipPunch")
+        self.record(page, 1.0)
+        self.assertAlmostEqual(self.duration(page), total, delta=0.05)
+        self.assertEqual(page.evaluate("window.IPortalWorkstation.ops")[-1], "punch-insert")   # provenance id unchanged
+        # "discard the rest": the take ends where the new recording ends (~2.0 s).
+        page.click("#ipUndo")
+        page.evaluate("() => { window.IPortalWorkstation.playhead = 1.0; }")
+        page.check("#ipPunchReplace")
+        self.record(page, 1.0)
+        self.assertAlmostEqual(self.duration(page), 2.0, delta=0.35)
+        self.assertEqual(page.evaluate("window.IPortalWorkstation.ops")[-1], "punch-replace")
+        self.assertFalse(ProductionMedia.objects.exists())
+        self.assert_clean(page)
+
     # -- 4. import and limits --------------------------------------------------------------
     @in_browser
     def test_import_invalid_oversized_and_excessive_duration(self):

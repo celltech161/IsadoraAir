@@ -99,6 +99,7 @@
     }
     $("ipLoadCurrent").hidden = !(c.current && allowed("edit"));
     $("ipRemove").hidden = !allowed("remove");
+    draw();                                          // the empty editor's text depends on what is on air
     refreshControls();
   }
 
@@ -179,9 +180,16 @@
   }
   function stopTimer() { if (timerHandle) { root.clearInterval(timerHandle); timerHandle = null; } }
 
+  // Punch-in always records over the take from the playhead; the two modes
+  // differ only in what follows the new audio (audio_core.punchIn): "insert"
+  // keeps the original tail, "replace" ends the take with the new recording.
+  // (The identifiers are the editor's and its saved provenance; the labels
+  // on the page say what they do.)
+  function punchMode() { return $("ipPunchReplace").checked ? "replace" : "insert"; }
+
   function record() {
     var rec = ensureRecorder();
-    S.punch = $("ipPunch").checked && S.pcm ? { at: S.playhead, mode: $("ipPunchReplace").checked ? "replace" : "insert" } : null;
+    S.punch = $("ipPunch").checked && S.pcm ? { at: S.playhead, mode: punchMode() } : null;
     rec.start();
     $("ipTimer").classList.add("recording");
     startTimer();
@@ -243,7 +251,16 @@
     var canvas = $("ipWave"), ctx2d = canvas.getContext("2d");
     var w = canvas.width = canvas.clientWidth || canvas.width, h = canvas.height;
     ctx2d.fillStyle = "#0b0d10"; ctx2d.fillRect(0, 0, w, h);
-    if (!S.pcm || !A.length(S.pcm)) { $("ipSelection").textContent = "No audio yet."; return; }
+    if (!S.pcm || !A.length(S.pcm)) {
+      // An existing on-air take is never implied away: say it is not loaded.
+      var onAir = !!S.ctx.current;
+      $("ipSelection").textContent = onAir ? "Editor empty — the on-air take is not loaded." : "No audio yet.";
+      if (onAir) {
+        ctx2d.fillStyle = "#9ca3af"; ctx2d.font = "14px sans-serif"; ctx2d.textAlign = "center";
+        ctx2d.fillText("The on-air take is not loaded — use “Edit the on-air take” to edit it.", w / 2, h / 2);
+      }
+      return;
+    }
     var v = S.view || { start: 0, end: A.duration(S.pcm) }, span = Math.max(1e-6, v.end - v.start);
     if (S.selection) {
       var x0 = (S.selection.start - v.start) / span * w, x1 = (S.selection.end - v.start) / span * w;
@@ -586,6 +603,15 @@
     $("ipRetry").hidden = !(S.pendingTake && S.pendingTake.validation_state === "unvalidated");
     $("ipCancelUpload").hidden = !busy;
     $("ipImportBtn").disabled = !allowed("import") || capturing || busy;
+    $("ipPunchKeepTail").disabled = $("ipPunchReplace").disabled = !$("ipPunch").checked || capturing;
+    // Reopened with a take already on air and nothing in the editor: show
+    // that state and offer the take -- never load or create anything by itself.
+    var emptyWithTake = !has && !!S.ctx.current && allowed("edit");
+    $("ipEditorEmpty").hidden = !emptyWithTake;
+    if (emptyWithTake) {
+      $("ipEditorEmptyLength").textContent = S.ctx.current.duration_seconds ? fmt(S.ctx.current.duration_seconds) : S.ctx.current.label;
+      $("ipLoadCurrentEmpty").disabled = capturing || busy;
+    }
     if (S.dirty) $("ipSaveState").textContent = $("ipSaveState").textContent.indexOf("Upload") === 0
       ? $("ipSaveState").textContent : "Unsaved changes — not on air.";
   }
@@ -624,6 +650,8 @@
     $("ipImportBtn").addEventListener("click", function () { $("ipImport").click(); });
     $("ipImport").addEventListener("change", function () { importFile(this.files[0]); this.value = ""; });
     $("ipLoadCurrent").addEventListener("click", loadCurrent);
+    $("ipLoadCurrentEmpty").addEventListener("click", loadCurrent);
+    $("ipPunch").addEventListener("change", refreshControls);
     $("ipPlay").addEventListener("click", play);
     $("ipPlayStop").addEventListener("click", stopPlayback);
     $("ipZoomIn").addEventListener("click", function () { zoom(0.5); });

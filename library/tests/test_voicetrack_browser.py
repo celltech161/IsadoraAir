@@ -155,6 +155,57 @@ class VoiceTrackStudioBrowserTests(IsolatedMediaRootMixin, StaticLiveServerTestC
         self.assertEqual(errors, [])
         self.assertFalse([url for url in requests if "/api/engine" in url], "preview/record must never touch air")
 
+    # -- r0108: reopening with a take already on air ----------------------------------
+
+    @in_browser
+    def test_reopening_shows_the_on_air_take_and_creates_nothing(self):
+        media = ingest_take()
+        bound = vtm.bind_media(track_id=self.track.pk, position="intro", media_id=media.pk,
+                               user=self.other_talent, expected_revision=vtm.ABSENT)
+        revision = vtm.revision_of(bound)
+        takes = set(ProductionMedia.objects.values_list("pk", flat=True))
+        context = self.browser.new_context()
+        self.as_user(context, self.session_cookie)
+        page = context.new_page()
+        errors, writes = [], []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        page.on("request", lambda req: writes.append(req.url) if req.method != "GET" else None)
+        self.studio(page)
+
+        # The editor says a take is on air and offers it; nothing is loaded by itself.
+        self.assertFalse(page.evaluate("document.getElementById('ipEditorEmpty').hidden"))
+        self.assertIn("already on air", page.text_content("#ipEditorEmpty"))
+        self.assertEqual(page.text_content("#ipSelection"), "Editor empty — the on-air take is not loaded.")
+        self.assertIsNone(page.evaluate("IPortalWorkstation.pcm"))
+        self.assertEqual(page.evaluate("IPortalWorkstation.sourceKind"), "none")
+        self.assertTrue(page.is_disabled("#ipSave"))
+
+        page.click("#ipLoadCurrentEmpty")
+        page.wait_for_function("window.IPortalWorkstation.pcm")
+        self.assertEqual(page.evaluate("[IPortalWorkstation.sourceKind, IPortalWorkstation.parentMediaId, "
+                                       "IPortalWorkstation.dirty, IPortalWorkstation.baseRevision]"),
+                         ["edit-media", str(media.pk), False, revision])
+        self.assertTrue(page.evaluate("document.getElementById('ipEditorEmpty').hidden"))
+        self.assertTrue(page.is_disabled("#ipSave"))                       # an unedited load is not a change
+        page.wait_for_timeout(1500)                                          # past the draft debounce
+
+        # Opening and loading created, promoted and drafted nothing.
+        self.assertEqual(writes, [])
+        self.assertEqual(self.draft_keys(page), [])
+        self.assertEqual(set(ProductionMedia.objects.values_list("pk", flat=True)), takes)
+        row = VoiceTrack.objects.get(track=self.track, position="intro")
+        self.assertEqual((row.media_id, vtm.revision_of(row)), (media.pk, revision))
+        self.assertEqual(errors, [])
+
+    @in_browser
+    def test_with_nothing_on_air_the_editor_is_simply_empty(self):
+        context = self.browser.new_context()
+        self.as_user(context, self.session_cookie)
+        page = context.new_page()
+        self.studio(page)
+        self.assertTrue(page.evaluate("document.getElementById('ipEditorEmpty').hidden"))
+        self.assertEqual(page.text_content("#ipSelection"), "No audio yet.")
+
     # -- 2.22B corrective: drafts keep their revision, and belong to one user --------
 
     @in_browser

@@ -89,9 +89,16 @@
         <span class="ip-timer" id="ipTimer">0:00.0</span>
         <span class="ip-small">max <span id="ipMax"></span></span>
       </div>
-      <div class="ip-row">
-        <label class="ip-inline"><input type="checkbox" id="ipPunch"> Punch in at the playhead</label>
-        <label class="ip-inline"><input type="checkbox" id="ipPunchReplace"> Replace the rest (instead of insert)</label>
+      <div class="ip-row" role="group" aria-labelledby="ipPunchLabel">
+        <label class="ip-inline" id="ipPunchLabel"><input type="checkbox" id="ipPunch"> Punch in at the playhead</label>
+        <span class="ip-small">the next recording records over the take from the playhead, then:</span>
+      </div>
+      <div class="ip-row ip-punch-modes">
+        {# Both modes overwrite from the playhead; they differ only in what happens AFTER the new recording. The values are the editor's mode identifiers (audio_core.punchIn). #}
+        <label class="ip-inline" title="Only as much of the take as the new recording lasts is replaced; the original audio after it is kept.">
+          <input type="radio" name="ipPunchTail" id="ipPunchKeepTail" value="insert" checked> keep the rest of the take after it</label>
+        <label class="ip-inline" title="Everything after the playhead is dropped; the take ends where the new recording ends.">
+          <input type="radio" name="ipPunchTail" id="ipPunchReplace" value="replace"> discard the rest (the take ends where the new recording ends)</label>
       </div>
       <div class="ip-row">
         <button type="button" class="ip-btn" id="ipImportBtn">Import file…</button>
@@ -103,6 +110,11 @@
 
   <div class="ip-panel" style="margin-top:0.75rem;" id="ipEditorPanel">
     <h2><span class="ip-badge preview">PREVIEW</span> Editor <span class="ip-small">— browser only; nothing here is on air until you save</span></h2>
+    <div id="ipEditorEmpty" class="ip-banner info" hidden>
+      <strong>This voice track is already on air</strong> (<span id="ipEditorEmptyLength"></span>).
+      The editor is empty until you load that take — or record or import a new take to replace it.
+      <button type="button" class="ip-btn primary" id="ipLoadCurrentEmpty">Edit the on-air take</button>
+    </div>
     <canvas id="ipWave" width="1060" height="160" aria-label="Waveform"></canvas>
     <div class="ip-row ip-small"><span id="ipSelection">No audio yet.</span></div>
     <div class="ip-row">
