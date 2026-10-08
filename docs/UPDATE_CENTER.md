@@ -776,28 +776,42 @@ all fail closed without stash/reset/clean/force.
 project's `STATIC_ROOT` belongs to the live release layout. A failure is manual
 intervention after the point of no fake rollback, and no service restarts occur.
 
-**Static-permission invariant (r0108).** nginx serves `STATIC_ROOT` directly as
-another account, so after every collectstatic every directory there must be at
-least `0755` and every file at least `0644` — whatever umask the run inherits.
-The updater runs it under `UMask=0077`, which before r0108 left every *newly
-created* static directory `0700` (nginx 403: r0107's `production/iportal/`,
-and `weather/css`/`weather/js` before it). The application owns the fix, not
-the protected runtime: the `staticfiles` storage
-(`isadoraair/static_storage.py`, `settings.STORAGES`) creates under umask 022
-(new entries are 0755/0644 from the moment they exist) and, as collectstatic's
-post-process step, repairs the whole tree, adding bits only. **Nothing in this
-path may change permissions, owner or group by pathname** — a pathname checked
-and then changed can be swapped for a symlink in between (r0108 corrective:
-Codex widened an external 0600 file through exactly that). The repair pins
-`STATIC_ROOT` with `O_DIRECTORY|O_NOFOLLOW` relative to its parent, opens every
-child relative to its parent's descriptor with `O_NOFOLLOW`, judges it by
-`fstat()` and changes it with `fchmod()`; symlinks are skipped, a symlinked
-root is refused, and without these mechanisms it fails closed (no path
-fallback). Django's own post-create `chmod`/`chown` is disabled for the same
-reason. A release therefore repairs earlier damage only when it declares
-`collectstatic_required`. Do not "fix" this with the global
-`FILE_UPLOAD_PERMISSIONS`/`FILE_UPLOAD_DIRECTORY_PERMISSIONS`: those govern
-uploads and every other storage, which must stay restrictive. Regression:
+**Static-destination invariant (r0108).** nginx serves `STATIC_ROOT` directly
+as another account, so after every collectstatic every directory there must be
+at least `0755` and every file at least `0644` — whatever umask the run
+inherits (the updater's `UMask=0077` used to leave every *new* static
+directory `0700`: nginx 403 for r0107's `production/iportal/`, and
+`weather/css`/`weather/js` before it). And **no collectstatic destination
+operation may trust a mutable pathname**: the application account can rename
+the checkout and everything in it, so a pathname checked and then used can be
+swapped for a symlink in between (Codex widened, wrote into and deleted
+external files that way). The application owns both, not the protected
+runtime — the `staticfiles` storage (`isadoraair/static_storage.py`,
+`settings.STORAGES`):
+
+* reaches `STATIC_ROOT` from `/`, one component at a time, each opened
+  relative to the previous descriptor with `O_DIRECTORY|O_NOFOLLOW` and
+  `fstat`-verified; a symlink or non-directory anywhere fails closed. It may
+  create only the final component (`mkdirat` on the pinned parent, re-opened
+  no-follow, `fchmod 0755`). `STATIC_ROOT` must therefore be a symlink-free
+  physical path — settings derive it from the resolved `BASE_DIR`;
+* walks every destination name (relative components only) the same way,
+  creating missing directories relative to their pinned parent;
+* answers existence/size/time with `fstatat(AT_SYMLINK_NOFOLLOW)`, writes a
+  fresh no-follow temporary, `fchmod`s it `0644` and `renameat`s it over the
+  leaf within the pinned directory, deletes with `unlinkat` (a symlink leaf is
+  replaced or removed as an entry, never followed);
+* offers no `path()`, so collectstatic runs none of its own pathname code
+  against the destination and refuses `--link`;
+* repairs the whole tree after each run through descriptors (`fchmod` on what
+  was actually opened; symlinks skipped), adding bits only.
+
+Without these primitives it fails closed — there is no pathname fallback. A
+release repairs earlier damage only when it declares `collectstatic_required`.
+Do not "fix" permissions with the global
+`FILE_UPLOAD_PERMISSIONS`/`FILE_UPLOAD_DIRECTORY_PERMISSIONS` (they govern
+uploads and every other storage, which must stay restrictive), and do not
+return the static backend to a pathname storage. Regression and attack tests:
 `isadoraair/tests/test_static_permissions.py`.
 
 Systemd input bytes come only from the root-owned immutable staged target.
