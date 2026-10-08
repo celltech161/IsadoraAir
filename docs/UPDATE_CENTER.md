@@ -776,6 +776,22 @@ all fail closed without stash/reset/clean/force.
 project's `STATIC_ROOT` belongs to the live release layout. A failure is manual
 intervention after the point of no fake rollback, and no service restarts occur.
 
+**Static-permission invariant (r0108).** nginx serves `STATIC_ROOT` directly as
+another account, so after every collectstatic every directory there must be at
+least `0755` and every file at least `0644` — whatever umask the run inherits.
+The updater runs it under `UMask=0077`, which before r0108 left every *newly
+created* static directory `0700` (nginx 403: r0107's `production/iportal/`,
+and `weather/css`/`weather/js` before it). The application owns the fix, not
+the protected runtime: the `staticfiles` storage
+(`isadoraair/static_storage.py`, `settings.STORAGES`) creates with explicit
+modes and, as collectstatic's post-process step, repairs the whole tree
+(adding bits only; never following symlinks or leaving `STATIC_ROOT`). A
+release therefore repairs earlier damage only when it declares
+`collectstatic_required`. Do not "fix" this with the global
+`FILE_UPLOAD_PERMISSIONS`/`FILE_UPLOAD_DIRECTORY_PERMISSIONS`: those govern
+uploads and every other storage, which must stay restrictive. Regression:
+`isadoraair/tests/test_static_permissions.py`.
+
 Systemd input bytes come only from the root-owned immutable staged target.
 Phase B automatically handles only a compiled closed allowlist of core
 IsadoraAir units that are also declared changed/new-required by the complete

@@ -216,6 +216,16 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
+# nginx (another account) serves STATIC_ROOT directly, and Update Center runs
+# collectstatic under UMask=0077: the staticfiles backend gives what it creates
+# explicit 0755/0644 modes and repairs the whole tree after every run
+# (isadoraair/static_storage.py). Scoped to STATIC_ROOT on purpose -- the
+# global FILE_UPLOAD_*PERMISSIONS stay unset so uploads, reports and
+# ProductionMedia keep their own restrictive modes.
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'isadoraair.static_storage.StaticRootStorage'},
+}
 
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
