@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0108",
+  "previous_release_id": "r0107",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Post-r0107 hardening. collectstatic under the updater's UMask=0077 no longer leaves nginx-unreadable static entries and repairs existing 0700/0600 ones; every destination operation is descriptor-confined (STATIC_ROOT must be symlink-free; --link unsupported). VoiceTrack previews play the current take. Monitoring watches isadoraair-validation (add the Monitor Check row after install). iPortal punch-in labels and reopen state. collectstatic; Gunicorn+Monitoring restart; no migrations; runtime 12.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
