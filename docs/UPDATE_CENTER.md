@@ -783,10 +783,18 @@ The updater runs it under `UMask=0077`, which before r0108 left every *newly
 created* static directory `0700` (nginx 403: r0107's `production/iportal/`,
 and `weather/css`/`weather/js` before it). The application owns the fix, not
 the protected runtime: the `staticfiles` storage
-(`isadoraair/static_storage.py`, `settings.STORAGES`) creates with explicit
-modes and, as collectstatic's post-process step, repairs the whole tree
-(adding bits only; never following symlinks or leaving `STATIC_ROOT`). A
-release therefore repairs earlier damage only when it declares
+(`isadoraair/static_storage.py`, `settings.STORAGES`) creates under umask 022
+(new entries are 0755/0644 from the moment they exist) and, as collectstatic's
+post-process step, repairs the whole tree, adding bits only. **Nothing in this
+path may change permissions, owner or group by pathname** — a pathname checked
+and then changed can be swapped for a symlink in between (r0108 corrective:
+Codex widened an external 0600 file through exactly that). The repair pins
+`STATIC_ROOT` with `O_DIRECTORY|O_NOFOLLOW` relative to its parent, opens every
+child relative to its parent's descriptor with `O_NOFOLLOW`, judges it by
+`fstat()` and changes it with `fchmod()`; symlinks are skipped, a symlinked
+root is refused, and without these mechanisms it fails closed (no path
+fallback). Django's own post-create `chmod`/`chown` is disabled for the same
+reason. A release therefore repairs earlier damage only when it declares
 `collectstatic_required`. Do not "fix" this with the global
 `FILE_UPLOAD_PERMISSIONS`/`FILE_UPLOAD_DIRECTORY_PERMISSIONS`: those govern
 uploads and every other storage, which must stay restrictive. Regression:
