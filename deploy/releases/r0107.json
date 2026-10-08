@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "release_id": "r0107",
+  "previous_release_id": "r0106",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal foundation and evergreen voice tracking (2.22A/B): immutable ProductionMedia store, shared browser recorder/editor, evergreen VoiceTrack takes with history (legacy filepath kept). New isadoraair-validation.service confines every upload validation (admin limits, default 2/4). Protected runtime 12 authorizes only that unit; a read-only host preflight blocks unsupported hosts before any change. Additive migrations, collectstatic, Gunicorn+engine restart. Then refresh Runtime Recovery.",
+  "migrations_required": [
+    "production.0001_initial",
+    "library.0089_voicetrack_media"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-gunicorn.service"
+  ],
+  "systemd_units_new_required": [
+    "isadoraair-validation.service"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 12,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "7dbe7e31cb10593d3b52fe094feb5a8ee7dcbd9a37597b465f014cac002a3ee8",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 11,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0107-primary.json"
+    ]
+  }
+}
