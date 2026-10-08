@@ -170,13 +170,21 @@ class VoiceTrackPreviewCacheTests(IsolatedMediaRootMixin, TestCase):
         foreign = self.record(name="flac.flac", ctype="audio/flac")
         self.track = saved
 
+        # A user whose PATH grants reach the endpoint but who lacks the
+        # voicetrack.record capability: the view's own check must refuse
+        # BEFORE any redirect (which would name the current take).
+        from library.models import GroupAccess
+        reaching = Group.objects.create(name="reaches-voicetrack-paths")
+        GroupAccess.objects.create(group=reaching, allowed_prefixes="/api/voicetrack/\n/voicetracks/",
+                                   landing_url="/voicetracks/")
+        self.listener.groups.add(reaching)
         outsider = Client()
         outsider.force_login(self.listener)
         for url in (vt.preview_url, f"/api/voicetrack/{vt.pk}/audio/?take={foreign}",
                     f"/api/voicetrack/{vt.pk}/audio/?take=legacy"):
             with self.subTest(url=url):
                 response = outsider.get(url)
-                self.assertNotIn(response.status_code, (200, 206, 302))
+                self.assertEqual(response.status_code, 403)
                 self.assertNotIn("Location", response)
         stale = f"/api/voicetrack/{vt.pk}/audio/?take={foreign}"
         anonymous = Client().get(stale)
