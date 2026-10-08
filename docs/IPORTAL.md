@@ -65,8 +65,19 @@ scratch non-VoiceTrack adapter).
   maximum duration (10 min for VoiceTrack); the take is kept at the limit.
 * **Editing** (browser-local) — waveform, zoom, drag selection, playhead,
   keep/delete trim, peak normalize (to 0.95, an explicit operation), gain,
-  bounded undo (5 steps / 400 MB), punch-in at the playhead (insert keeps the
-  original tail, replace ends the clip with the overdub), import, WAV export.
+  bounded undo (5 steps / 400 MB), punch-in at the playhead, import, WAV export.
+  **Punch-in always records over the take from the playhead** — nothing is
+  ever shifted or inserted. The two modes differ only in what follows the new
+  audio: *keep the rest of the take after it* (the original tail stays; mode
+  and provenance identifier `insert` / `punch-insert`, kept from OGRemote) or
+  *discard the rest* (the take ends where the new recording ends; `replace` /
+  `punch-replace`). The mode choice is enabled only while punch-in is ticked.
+  (r0108 relabelled the controls; the audio semantics are unchanged.)
+* **Reopening a workspace with audio already on air** — the editor starts
+  empty (opening never loads, drafts, uploads or binds anything) and says so:
+  "This voice track is already on air", with **Edit the on-air take**, which
+  loads it (unchanged, not dirty — Save stays disabled until an edit). A
+  browser draft, if any, is still offered separately.
 * **Three visibly distinct states** — **PREVIEW** (the browser-local edit, never
   on air), a saved take (immutable ProductionMedia, not yet on air), and **ON
   AIR** (the domain's committed binding). Preview plays in the browser only:
@@ -249,6 +260,33 @@ from `deploy/`), then restart gunicorn (its unit now `Wants=` the validation
 service and no longer needs any cgroup delegation itself). Until the service
 runs, uploads are kept as unvalidated takes that can be re-validated later.
 
+**Monitoring (r0108).** Add a Monitor Check in Admin (Monitoring → Monitor
+Checks → Add): kind **Systemd Service**, unit `isadoraair-validation.service`
+(consecutive failures 2, the default). No migration seeds it — the same
+pattern as the Backup Recovery Assurance check. For this unit the
+ordinary systemd probe also asks the service's read-only readiness observer
+(`production/services/validation_health.py`): the socket exists, the status
+file (`admission.json`) holds in-domain limits, and an *empty-request
+handshake* is answered — connect, send nothing, close the writing half; the
+service answers `unavailable` ("incomplete request") without running or
+logging anything, or `busy` at capacity, so no validation load is created.
+
+| State | Status | Card |
+| --- | --- | --- |
+| running, answering, valid limits | ok | Running (· busy at capacity), "2 at once · 4 waiting" |
+| running, answering, status file missing/malformed | warning | Running · no status / bad status |
+| stopped or failed | critical | Stopped |
+| between automatic restarts, or restarted since the last poll (`NRestarts`) | critical | Restarting / Restarted |
+| active but socket missing, not listening, unreachable, unresponsive (2 s), or a bad reply | critical | Not listening / Unreachable / Unresponsive / Bad reply |
+| the observer itself failed | unknown | Unknown |
+
+Debounce, transition events, notifications and cooldowns are Monitoring's
+existing ones (a single automatic restart is absorbed by the debounce; a
+restart loop alerts). Monitoring never restarts the service, changes its
+limits or enters its cgroup, and the card has no Restart button (the unit is
+not in the protected operator-restart allowlist). Monitoring and uploads are
+independent: either can fail without affecting the other or the engine.
+
 **Tests** that run the real validators use the same topology, built from the
 user's own systemd user manager (a transient validation service with the
 production unit's properties; the test process in a delegated scope so the
@@ -307,6 +345,19 @@ never go unnoticed.
 * **Retired** — the pre-Phase-B `upload`, `save-edited` (both overwrote files
   in place) and `delete` endpoints (all `csrf_exempt`) and the in-page
   recorder/editor. The read-only preview `/api/voicetrack/<id>/audio/` stays.
+* **Preview URLs name the take (r0108)** — pages link the preview as
+  `/api/voicetrack/<id>/audio/?take=<VoiceTrack.preview_take>` (the bound
+  ProductionMedia id, or `legacy`). A rebinding changes the URL, so a browser
+  can never replay an earlier take it already loaded under a fixed URL (seen on
+  KOGR after a re-record); an unchanged binding keeps a stable URL. A request
+  naming a superseded take — a page rendered before the re-record — is
+  redirected to the current one *after* the access check: `take` only ever
+  selects this row's own current audio, never an arbitrary take. The endpoint
+  stays `Cache-Control: private, no-store` (now for legacy files too: the
+  logical URL is mutable), Range requests are unchanged, and the Track and
+  Voice Tracks pages drop their players' loaded audio when restored from the
+  back/forward cache. Inside the studio the on-air player already uses the
+  immutable per-take endpoint. Engine resolution is unchanged.
 * **One database** — system check `library.E900/E901` refuses a router that
   splits VoiceTrack and ProductionMedia.
 
