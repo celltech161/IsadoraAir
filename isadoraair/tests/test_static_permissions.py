@@ -192,6 +192,22 @@ class StaticPermissionTests(SimpleTestCase):
             static_storage.reconcile_static_permissions(self.static_root)
         self.assertEqual(mode(real), 0o700)
 
+    def test_an_entry_swapped_for_a_symlink_after_its_lstat_is_not_followed(self):
+        """The window between the walk's lstat and the chmod: a directory
+        replaced by a symlink to private material must not widen the target."""
+        private = self.base / "private"
+        private.mkdir(mode=0o700)
+        self.static_root.mkdir(parents=True)
+        entry = self.static_root / "swapped"
+        entry.mkdir(mode=0o700)
+        stale = os.lstat(entry)                       # what the walk saw: a 0700 directory
+        entry.rmdir()
+        entry.symlink_to(private)                     # ... then swapped
+        changed = []
+        static_storage._ensure(str(entry), stale, static_storage.STATIC_DIRECTORY_MODE, changed)
+        self.assertEqual(mode(private), 0o700)
+        self.assertEqual(changed, [])
+
     def test_reconcile_of_a_missing_root_is_a_no_op(self):
         self.assertEqual(static_storage.reconcile_static_permissions(self.static_root), [])
         self.assertFalse(self.static_root.exists())

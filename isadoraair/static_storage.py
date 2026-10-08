@@ -76,7 +76,14 @@ def _ensure(path, info, required, changed):
     if mode & required == required:
         return
     try:
-        os.chmod(path, mode | required)
+        try:
+            # Never through a symlink, even one swapped in after the lstat:
+            # Linux refuses a no-follow chmod of a symlink (NotImplementedError).
+            os.chmod(path, mode | required, follow_symlinks=False)
+        except NotImplementedError:
+            if stat.S_ISLNK(os.lstat(path).st_mode):
+                return                                  # replaced by a symlink meanwhile: not ours to change
+            os.chmod(path, mode | required)             # a platform without no-follow chmod at all
     except OSError as exc:
         raise StaticPermissionError(
             f"{path} is mode {mode:04o}; nginx needs at least {required:04o} and it could not be changed: {exc}"
