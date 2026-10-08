@@ -579,28 +579,49 @@ const SELF_HEALTH_CAPTIONS = {
   heartbeat_stale_process_alive: "Unresponsive",
   heartbeat_stale_systemd_unavailable: "Heartbeat stale",
   no_heartbeat_recorded: "No heartbeat",
+  // r0108 -- the validation service's readiness (probes._validation_readiness).
+  restarting: "Restarting",
+  restarted: "Restarted",
+  socket_missing: "Not listening",
+  socket_invalid: "Not listening",
+  not_listening: "Not listening",
+  socket_unreachable: "Unreachable",
+  unresponsive: "Unresponsive",
+  unexpected_reply: "Bad reply",
+  status_missing: "Running · no status",
+  status_malformed: "Running · bad status",
+  observer_error: "Unknown",
 };
 
 function renderSystemdBody(check) {
   const uptimeSeconds = check.detail && check.detail.uptime_seconds;
   const uptimeHours = uptimeSeconds != null ? (uptimeSeconds / 3600).toFixed(2) : null;
   const reason = check.detail && check.detail.reason;
-  const caption = check.status === "ok" ? "Running"
+  const caption = check.status === "ok" ? (check.detail && check.detail.at_capacity ? "Running · busy" : "Running")
     : check.status === "unknown" ? "Unknown"
     : (reason && SELF_HEALTH_CAPTIONS[reason]) || "Stopped";
   const heartbeatAge = check.detail && check.detail.heartbeat_age_seconds;
   const heartbeatLine = (reason && heartbeatAge != null)
     ? `<div class="mon-card-detail">Last heartbeat ${Math.round(heartbeatAge)}s ago</div>`
     : "";
+  // r0108 -- a unit that reports its effective limits (the validation
+  // service) shows them; one outside the protected restart allowlist gets
+  // no Restart button (the broker would refuse it).
+  const d = check.detail || {};
+  const limitsLine = (Number.isInteger(d.max_active) && Number.isInteger(d.max_pending))
+    ? `<div class="mon-card-detail">${d.max_active} at once · ${d.max_pending} waiting</div>`
+    : "";
+  const restartable = d.restart_via_dashboard !== false;
   return `
     <div class="mon-led-row">
       <span class="mon-led ${check.status}"></span>
       <span class="mon-led-caption">${caption}</span>
     </div>
     ${heartbeatLine}
+    ${limitsLine}
     <div class="mon-uptime-row">
       <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
-      <button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>
+      ${restartable ? `<button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>` : ""}
     </div>
     ${renderVersionBadge(check)}
   `;

@@ -42,7 +42,7 @@ def probe_systemd(check):
     try:
         result = subprocess.run(
             ["systemctl", "show", check.systemd_unit,
-             "--property=ActiveState,SubState,ActiveEnterTimestamp"],
+             "--property=ActiveState,SubState,ActiveEnterTimestamp,NRestarts"],
             capture_output=True, text=True, timeout=5, check=False,
             env=_UTC_ENV,
         )
@@ -68,9 +68,70 @@ def probe_systemd(check):
         except ValueError:
             pass
 
+    readiness = APPLICATION_READINESS.get(check.systemd_unit)
+    if readiness is not None:
+        return readiness(check, props, detail)
     if active_state != "active":
         return "critical", detail
     return "ok", detail
+
+
+# r0108 -- first-party units whose systemd state alone does not prove they can
+# do their job. A plain "Systemd Service" check of one of these units also
+# asks the unit's own READ-ONLY readiness observer (never a control action:
+# Monitoring does not restart, reconfigure or load the service). Keyed by the
+# exact unit name, like release_status' COVERED_UNITS.
+VALIDATION_UNIT = "isadoraair-validation.service"
+_last_restarts = {}            # check.id -> NRestarts seen on the previous poll
+
+
+def _validation_readiness(check, props, detail):
+    """isadoraair-validation: systemd state, automatic-restart evidence and the
+    service's own readiness (production.services.validation_health -- socket,
+    status file, an empty-request handshake; never a validation run).
+
+    critical -- not active (stopped, failed, or between automatic restarts),
+                restarted automatically since the previous poll (a crash; a
+                restart loop keeps this critical through the debounce), or
+                active but not answering on its socket;
+    warning  -- answering, but its status file (the effective limits the
+                Admin page reports) is missing or malformed;
+    ok       -- running, answering, valid limits (at capacity is still ok).
+    The card's Restart button is withheld: this unit is not in the
+    protected operator-restart allowlist."""
+    detail["restart_via_dashboard"] = False
+    try:
+        restarts = int(props.get("NRestarts", ""))
+    except ValueError:
+        restarts = None
+    detail["n_restarts"] = restarts
+    previous = _last_restarts.get(check.id)
+    _last_restarts[check.id] = restarts
+    active_state, sub_state = detail["active_state"], detail["sub_state"]
+    if active_state != "active":
+        detail["reason"] = "restarting" if sub_state == "auto-restart" or active_state == "activating" \
+            else "service_inactive"
+        return "critical", detail
+    if restarts is not None and previous is not None and restarts > previous:
+        detail["reason"] = "restarted"
+        return "critical", detail
+    try:
+        from production.services import validation_health
+        readiness = validation_health.observe()
+    except Exception as exc:  # noqa: BLE001 -- an observer bug is "unknown", never a crash
+        detail["reason"] = "observer_error"
+        detail["error"] = str(exc)[:200]
+        return "unknown", detail
+    detail["max_active"] = readiness["max_active"]
+    detail["max_pending"] = readiness["max_pending"]
+    detail["at_capacity"] = readiness["at_capacity"]
+    if readiness["ready"]:
+        return "ok", detail
+    detail["reason"] = readiness["reason"]
+    return ("warning" if readiness["reason"] in validation_health.DEGRADED_REASONS else "critical"), detail
+
+
+APPLICATION_READINESS = {VALIDATION_UNIT: _validation_readiness}
 
 
 def probe_disk(check):
