@@ -2901,8 +2901,18 @@ def api_voicetrack_audio(request, pk):
     Phase-A safe open; a legacy VoiceTrack streams its legacy file as before.
     Recording, editing, saving and removal live in the shared iPortal
     recorder (/voicetracks/studio/) -- the destructive pre-Phase-B upload /
-    save-edited / delete endpoints are retired."""
-    from django.http import FileResponse
+    save-edited / delete endpoints are retired.
+
+    r0108: pages link here as ``?take=<VoiceTrack.preview_take>`` (the bound
+    take's identity), so a rebinding changes the URL and a browser can never
+    replay an earlier take under it. A request naming a take that is no longer
+    this row's -- a page rendered before a re-record, restored from the
+    back/forward cache -- is redirected to the current one, AFTER the access
+    check: the parameter only ever selects among this row's own current
+    audio, never an arbitrary take. Without ``take`` the current audio is
+    served as before. Never cached by the browser (the logical URL is
+    mutable)."""
+    from django.http import FileResponse, HttpResponseRedirect
     from library.models import VoiceTrack
     from production.recorder.views import _stream_media
     from production.services import media_io
@@ -2911,6 +2921,11 @@ def api_voicetrack_audio(request, pk):
         return HttpResponseForbidden("Not authorized.")
 
     vt = get_object_or_404(VoiceTrack.objects.select_related("media"), pk=pk)
+    requested = request.GET.get("take")
+    if requested is not None and requested != vt.preview_take:
+        response = HttpResponseRedirect(vt.preview_url)
+        response["Cache-Control"] = "private, no-store"
+        return response
     audio = vt.playable_audio()
     if audio is None:
         return HttpResponseNotFound("Voice-track audio missing.")
@@ -2919,7 +2934,9 @@ def api_voicetrack_audio(request, pk):
             return _stream_media(request, media_io.open_media(vt.media, require_valid=True))
         except Exception:  # noqa: BLE001 -- purged/inconsistent: nothing to preview
             return HttpResponseNotFound("Voice-track audio missing.")
-    return FileResponse(open(audio.path, "rb"), content_type="audio/wav")
+    response = FileResponse(open(audio.path, "rb"), content_type="audio/wav")
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @csrf_exempt

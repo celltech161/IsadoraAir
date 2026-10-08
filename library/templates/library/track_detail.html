@@ -587,7 +587,7 @@
         </div>
         {% if voicetracks.intro %}
         <div class="vt-existing" data-vt-id="{{ voicetracks.intro.id }}">
-          <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}" style="width:100%;"></audio>
+          <audio controls preload="none" data-vt-preview src="{{ voicetracks.intro.preview_url }}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.intro.duration_seconds|floatformat:2 }}s ·
             {% if voicetracks.intro.media_id %}iPortal take{% else %}legacy recording{% endif %} ·
@@ -615,7 +615,7 @@
         </div>
         {% if voicetracks.outro %}
         <div class="vt-existing" data-vt-id="{{ voicetracks.outro.id }}">
-          <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}" style="width:100%;"></audio>
+          <audio controls preload="none" data-vt-preview src="{{ voicetracks.outro.preview_url }}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.outro.duration_seconds|floatformat:2 }}s ·
             {% if voicetracks.outro.media_id %}iPortal take{% else %}legacy recording{% endif %} ·
@@ -752,6 +752,16 @@ const TRACK_ID = {{ track.id }};
 // take and opens the studio for a slot.
 // ============================================================
 {% if can_edit_voicetracks %}
+// r0108: a page restored from the back/forward cache keeps the audio its
+// players already loaded. Drop it, so the next play fetches again: a
+// superseded ?take= is redirected by the server to the current take.
+window.addEventListener("pageshow", function (event) {
+  if (!event.persisted) return;
+  document.querySelectorAll("audio[data-vt-preview]").forEach(function (audio) {
+    audio.pause();
+    audio.load();
+  });
+});
 // Initial (server-rendered) marker values. Used at record-click time
 // to decide whether to auto-save the form -- if the field value
 // differs from initial, the server's copy of the marker is stale and

@@ -2240,6 +2240,20 @@ class VoiceTrack(models.Model):
     def is_production_media_backed(self):
         return self.media_id is not None
 
+    @property
+    def preview_take(self):
+        """Which audio this row's browser preview stands for (r0108): the bound
+        ProductionMedia's id, or ``legacy``. It is part of every preview URL,
+        so repointing the row to a new take changes the URL the browser
+        fetches -- no page or browser media cache can replay an earlier take
+        under it -- while an unchanged binding keeps a stable URL."""
+        return str(self.media_id) if self.media_id is not None else "legacy"
+
+    @property
+    def preview_url(self):
+        from django.urls import reverse
+        return f"{reverse('library:api-voicetrack-audio', args=[self.pk])}?take={self.preview_take}"
+
     def playable_audio(self):
         """THE media resolver for the on-air engine (2.22B B11/B12):
 

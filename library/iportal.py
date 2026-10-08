@@ -87,7 +87,7 @@ class EvergreenVoiceTrackAdapter(RecordingAdapter):
             elif audio is not None:
                 current = CurrentAudio(origin="legacy", label="On-air take (legacy recording)",
                                        duration_seconds=audio.duration_seconds,
-                                       preview_url=reverse("library:api-voicetrack-audio", args=[vt.pk]))
+                                       preview_url=vt.preview_url)
         blocked = vtm.eligibility_error(track, position) or ""
         operations = ["open", "record", "import", "save", "export"]
         if current is not None:

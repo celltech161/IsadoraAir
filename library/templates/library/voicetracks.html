@@ -130,7 +130,7 @@
         <td>{{ vt.recorded_by.username|default:"—" }}</td>
         <td>{{ vt.edited_at|date:"Y-m-d H:i"|default:vt.recorded_at|date:"Y-m-d H:i" }}</td>
         <td>{% if vt.media_id %}iPortal take{% else %}legacy recording{% endif %}</td>
-        <td><audio controls preload="none" src="{% url 'library:api-voicetrack-audio' vt.id %}" style="height:24px; max-width:180px;"></audio></td>
+        <td><audio controls preload="none" data-vt-preview src="{{ vt.preview_url }}" style="height:24px; max-width:180px;"></audio></td>
         <td class="vt-actions">
           <a class="btn" href="{% url 'library:iportal-evergreen-voicetrack-page' %}?track={{ vt.track.id }}&position={{ vt.position }}">Open in iPortal</a>
         </td>
@@ -165,4 +165,16 @@
 
 {% block extra_js %}
 {# 2.22B: re-record, edit and delete happen in the shared iPortal recorder/editor. #}
+<script>
+// r0108: a page restored from the back/forward cache keeps the audio its
+// players already loaded. Drop it, so the next play fetches again: a
+// superseded ?take= is redirected by the server to the current take.
+window.addEventListener("pageshow", function (event) {
+  if (!event.persisted) return;
+  document.querySelectorAll("audio[data-vt-preview]").forEach(function (audio) {
+    audio.pause();
+    audio.load();
+  });
+});
+</script>
 {% endblock %}
