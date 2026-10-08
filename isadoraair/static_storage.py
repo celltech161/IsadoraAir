@@ -338,15 +338,26 @@ class StaticRootStorage(Storage):
             return os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
 
     def _regular_stat(self, name):
+        """The leaf's metadata -- ONLY for a regular file. Anything else (a
+        symlink, never followed; a directory, FIFO, socket, device) is not a
+        static file and has no usable time or size: collectstatic, seeing an
+        error from get_modified_time(), deletes the ENTRY and saves a real file
+        in its place (a non-empty directory makes that deletion fail loudly).
+        Reporting such an entry's own mtime would let a newer one be skipped
+        as "unmodified", leaving the asset missing."""
         info = self._leaf_stat(name)
-        if stat.S_ISLNK(info.st_mode):
-            # Never reported as the link's target: collectstatic, seeing an
-            # error here, deletes the ENTRY and writes a real file in its place.
-            raise StaticConfinementError(errno.ELOOP, f"{name} is a symlink in STATIC_ROOT; it will be replaced")
+        if not stat.S_ISREG(info.st_mode):
+            kind, code = ((("a symlink", errno.ELOOP) if stat.S_ISLNK(info.st_mode) else
+                           ("a directory", errno.EISDIR) if stat.S_ISDIR(info.st_mode) else
+                           ("not a regular file", errno.EINVAL)))
+            raise StaticConfinementError(code, f"{name} is {kind} in STATIC_ROOT; it will be replaced")
         return info
 
     # -- Storage API used by collectstatic -------------------------------------------------
     def exists(self, name):
+        """True for ANY entry, regular or not, so that collectstatic goes on to
+        get_modified_time() -- which refuses a non-regular leaf -- and then
+        replaces it; never a claim that a valid static file is present."""
         try:
             self._leaf_stat(name)
         except FileNotFoundError:
@@ -406,6 +417,8 @@ class StaticRootStorage(Storage):
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
                     raise StaticConfinementError(errno.ELOOP, f"{name} is a symlink in STATIC_ROOT") from exc
+                if exc.errno == errno.ENXIO:
+                    raise StaticConfinementError(errno.ENXIO, f"{name} is not a regular file") from exc
                 raise
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):

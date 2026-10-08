@@ -397,6 +397,76 @@ class StaticPermissionTests(SimpleTestCase):
         self.assertIn("production", directories)
         self.assertIn("linked.js", files)
 
+    # -- non-regular destination leaves (Codex on 737d11d) ------------------------------------
+    NEWER = 4_000_000_000                                         # 2096: newer than any source
+
+    def make_leaf(self, kind):
+        """Replace the collected asset with a non-regular entry whose own mtime
+        is NEWER than the source -- what used to be skipped as "unmodified"."""
+        leaf = self.static_root / ASSET
+        if leaf.is_dir() and not leaf.is_symlink():
+            leaf.rmdir()                                          # (left over when not replaced)
+        else:
+            leaf.unlink()
+        if kind == "directory":
+            leaf.mkdir()
+        elif kind == "symlink":
+            outside = self.base / "outside.js"
+            if not outside.exists():
+                private_file(outside)
+            leaf.symlink_to(outside)
+        elif kind == "fifo":
+            os.mkfifo(leaf)
+        elif kind == "socket":
+            import socket
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(leaf))
+            listener.close()                                      # the socket inode stays
+        os.utime(leaf, (self.NEWER, self.NEWER), follow_symlinks=False)
+        self.assertGreater(os.lstat(leaf).st_mtime, SOURCE_ASSET.stat().st_mtime)
+        return leaf
+
+    def test_a_newer_directory_where_an_asset_belongs_is_replaced_not_skipped(self):
+        """Codex's reproduction through the real release command: an empty
+        directory at production/iportal/workstation.js with a newer mtime was
+        accepted as current file metadata -- "0 static files copied, 152
+        unmodified" -- and the asset stayed missing with a successful exit."""
+        collect()
+        leaf = self.make_leaf("directory")
+        out = StringIO()
+        call_command("collectstatic", "--noinput", "--skip-checks", stdout=out, stderr=StringIO())
+        self.assertTrue(stat.S_ISREG(os.lstat(leaf).st_mode), "the asset is still not a regular file")
+        self.assertEqual(leaf.read_bytes(), SOURCE_ASSET.read_bytes())
+        self.assertEqual(mode(leaf), 0o644)
+        self.assertIn("1 static file copied", out.getvalue())             # not "unmodified"
+        self.assert_servable()
+
+    def test_no_non_regular_leaf_is_reported_as_a_current_static_file(self):
+        storage = storages["staticfiles"]
+        for kind in ("directory", "symlink", "fifo", "socket"):
+            with self.subTest(kind=kind):
+                collect()
+                leaf = self.make_leaf(kind)
+                self.assertTrue(storage.exists(ASSET))                     # the entry exists ...
+                for method in (storage.get_modified_time, storage.size, storage.open):
+                    with self.assertRaises(static_storage.StaticConfinementError):   # ... but is no static file
+                        method(ASSET)
+                collect()                                                   # and is replaced, not skipped
+                self.assertTrue(stat.S_ISREG(os.lstat(leaf).st_mode), kind)
+                self.assertEqual(leaf.read_bytes(), SOURCE_ASSET.read_bytes())
+                self.assertEqual(mode(leaf), 0o644)
+        outside = self.base / "outside.js"
+        self.assertEqual((outside.read_bytes(), mode(outside)), (b"SENTINEL private bytes\n", 0o600))
+
+    def test_a_non_empty_directory_where_an_asset_belongs_fails_loudly(self):
+        collect()
+        leaf = self.make_leaf("directory")
+        (leaf / "keep").write_text("k")
+        os.utime(leaf, (self.NEWER, self.NEWER))
+        with self.assertRaises(OSError):                                    # never a silent "unmodified"
+            collect()
+        self.assertEqual((leaf / "keep").read_text(), "k")                 # never deleted recursively
+
     def test_a_directory_where_a_file_is_expected_fails_safely(self):
         collect()
         storage = storages["staticfiles"]
