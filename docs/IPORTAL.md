@@ -75,7 +75,7 @@ scratch non-VoiceTrack adapter).
   (r0108 relabelled the controls; the audio semantics are unchanged.)
 * **Reopening a workspace with audio already on air** — the editor starts
   empty (opening never loads, drafts, uploads or binds anything) and says so:
-  "This voice track is already on air", with **Edit the on-air take**, which
+  "A take is already on air here", with **Edit the on-air take**, which
   loads it (unchanged, not dirty — Save stays disabled until an edit). A
   browser draft, if any, is still offered separately.
 * **Three visibly distinct states** — **PREVIEW** (the browser-local edit, never
