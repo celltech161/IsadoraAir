@@ -294,6 +294,17 @@ stores a **new** media (own UUID, key, hash); the parent must be present and
 valid (judged from the database, not the instance passed in). Recipes are not
 executed in Phase A — only their provenance is recorded.
 
+## Renditions and reference audio (Phase C)
+
+The shared render engine (`production/services/render/`) turns one valid
+ProductionMedia into a NEW `rendition` through a code-registered recipe of
+fixed steps; the result goes through the ordinary rendition intake (validated,
+GStreamer included) and records `derived_from`, the recipe key/version, the
+canonical parameter digest and the toolchain. Station beds are
+`ReferenceAudio` rows (`production.0002`): a key pinning one retained `bed`
+media and its SHA-256, append-only, resolved only by key. Details:
+[SPOKEN_CONTENT.md](SPOKEN_CONTENT.md).
+
 ## Purge and retention
 
 **Phase A ships no retention policy**: no scheduler, no timer, no default
