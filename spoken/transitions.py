@@ -46,6 +46,7 @@ from django.utils import timezone
 from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
 from production.services import reference_audio, render, retention
+from production.services.render import protocol as render_protocol
 
 from . import guard
 from .lifecycle import TRANSITIONS, Rule, writable_columns  # noqa: F401 -- Rule re-exported
@@ -415,6 +416,10 @@ def _verify_render(row, bound, evidence) -> None:
     if (bound.recipe_key, bound.recipe_version, bound.recipe_params_digest) != (
             evidence.recipe_key, evidence.recipe_version, evidence.provenance_digest):
         raise EvidenceRefused("the render evidence disagrees with the stored rendition", code="rendition_mismatch")
+    # Every rendition row is inserted by the render executor's intake (the
+    # model refuses any other insert); it records the executor's identity.
+    if not bound.toolchain.endswith(render_protocol.EXECUTOR_MARKER):
+        raise EvidenceRefused("the rendition was not produced by the render executor", code="rendition_mismatch")
     ctype = row.content_type                                       # locked by _apply(lock_type=True)
     try:
         expected = render.expected(ctype.recipe_key, ctype.recipe_params)
