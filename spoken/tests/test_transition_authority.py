@@ -78,11 +78,12 @@ class CodexBypassRegressionTests(GrantFixtures):
 
     def test_writes_inside_a_legitimate_transition_cannot_piggyback(self):
         victim = self.item()                                      # draft, 1 event
-        attempts = {}
+        attempts, fired = {}, []
 
         def receiver(sender, instance, **kwargs):
-            if sender is not SpokenItem or attempts:
+            if sender is not SpokenItem or fired:
                 return
+            fired.append(True)                                    # once, even if a forgery saves
             for label, attempt in {
                 "save delivered+forged": lambda: self._forge_save(victim),
                 "update delivered+forged": lambda: SpokenItem.objects.filter(pk=victim.pk).update(
@@ -301,6 +302,8 @@ class LeakageTests(GrantFixtures):
 
         def attempt(label):
             try:
+                with connections["default"].cursor() as cursor:    # never wait on the test's row lock
+                    cursor.execute("SET lock_timeout = '2s'")
                 row.save()
                 results[label] = "succeeded"
             except Refused:
@@ -312,11 +315,11 @@ class LeakageTests(GrantFixtures):
         with guard._authorized(self.grant_for(self.a)):
             plain = threading.Thread(target=attempt, args=("fresh thread",))
             plain.start()
-            plain.join()
+            plain.join(30)
             context = contextvars.copy_context()                 # even a thread handed the context
             copied = threading.Thread(target=context.run, args=(attempt, "copied context"))
             copied.start()
-            copied.join()
+            copied.join(30)
         self.assertEqual(results, {"fresh thread": "refused", "copied context": "refused"})
 
     def test_grants_do_not_reach_other_async_tasks(self):
