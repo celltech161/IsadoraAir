@@ -141,6 +141,19 @@ class SpokenItemAuthorityTests(AuthorityFixtures):
         self.assert_refused(SpokenItem.objects.get(pk=self.item.pk).delete)
         self.assertFalse(hasattr(SpokenItem.objects, "delete"))         # queryset-only, as in Django
 
+    def test_an_eventless_item_cannot_be_deleted_either(self):
+        # Codex's reproduction: an item with no events (so no PROTECT row
+        # stands in the way) must still be undeletable through the ORM.
+        with guard.transition_scope():
+            bare = SpokenItem.objects.create(content_type=self.ctype, state=S.DRAFT)
+        self.snapshot = self.state()
+        for name, manager in self.managers().items():
+            if name == "user.spoken_items":
+                continue                                                # bare has no submitter
+            with self.subTest(manager=name):
+                self.assert_refused(lambda: manager.filter(pk=bare.pk).delete())
+        self.assert_refused(bare.delete)
+
     def test_inside_the_scope_the_state_must_still_be_an_item_state(self):
         with guard.transition_scope():
             self.assert_refused(lambda: SpokenItem.objects.create(content_type=self.ctype, state="not_a_state"))
