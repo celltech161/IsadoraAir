@@ -7,6 +7,8 @@ default manager, the BASE manager and the reverse related managers. Outside
 the services each one must be refused before the database changes; reads
 keep working. (Raw SQL is outside the threat model.)
 """
+from unittest import mock
+
 from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -58,6 +60,38 @@ class ManagerWiringTests(AuthorityFixtures):
                 self.assertIsInstance(model._base_manager.all(), queryset)
                 for manager in reverse:
                     self.assertIsInstance(manager.all(), queryset)
+
+    def test_refusals_are_semantic_not_django_internals(self):
+        """Each generic write API is refused by OUR override, before Django's
+        own implementation runs -- not because, say, bulk_update() happens to
+        call update() internally today."""
+        from django.db.models import QuerySet
+        loaded = SpokenItem.objects.get(pk=self.item.pk)
+        event = SpokenItemEvent.objects.first()
+        ctype = SpokenContentType.objects.get(pk=self.ctype.pk)
+        cases = {
+            "SpokenItem.bulk_create": ("bulk_create", lambda: SpokenItem.objects.bulk_create([SpokenItem()])),
+            "SpokenItem.bulk_update user fk": ("bulk_update", lambda: SpokenItem.objects.bulk_update(
+                [loaded], ["submitted_by"])),
+            "SpokenItem.bulk_update state": ("bulk_update", lambda: SpokenItem.objects.bulk_update(
+                [loaded], ["state"])),
+            "SpokenItem.delete": ("delete", lambda: SpokenItem.objects.all().delete()),
+            "SpokenItem.update": ("update", lambda: SpokenItem.objects.all().update(state=S.DELIVERED)),
+            "SpokenItemEvent.bulk_create": ("bulk_create", lambda: SpokenItemEvent.objects.bulk_create([event])),
+            "SpokenItemEvent.bulk_update": ("bulk_update", lambda: SpokenItemEvent.objects.bulk_update(
+                [event], ["actor"])),
+            "SpokenItemEvent.delete": ("delete", lambda: SpokenItemEvent.objects.all().delete()),
+            "SpokenItemEvent.update": ("update", lambda: SpokenItemEvent.objects.all().update(event="x")),
+            "SpokenContentType.bulk_create": ("bulk_create", lambda: SpokenContentType.objects.bulk_create([ctype])),
+            "SpokenContentType.bulk_update": ("bulk_update", lambda: SpokenContentType.objects.bulk_update(
+                [ctype], ["name"])),
+            "SpokenContentType.update": ("update", lambda: SpokenContentType.objects.all().update(name="x")),
+        }
+        for label, (method, attempt) in cases.items():
+            with self.subTest(api=label), mock.patch.object(QuerySet, method, autospec=True) as django_impl:
+                with self.assertRaises(guard.SpokenIntegrityError):
+                    attempt()
+                django_impl.assert_not_called()
 
     def test_reads_work_everywhere(self):
         self.assertEqual(SpokenItem._base_manager.get(pk=self.item.pk).state, S.SUBMITTED)

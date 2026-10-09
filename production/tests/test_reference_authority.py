@@ -62,6 +62,20 @@ class ReferenceAudioOrmAuthorityTests(IsolatedMediaRootMixin, TestCase):
                 self.assertIsInstance(manager.all(), ReferenceAudioQuerySet)
         self.assertEqual(ReferenceAudio._base_manager.get(pk=self.reference.pk).key, "bed.x")      # reads work
 
+    def test_refusals_are_semantic_not_django_internals(self):
+        from django.db.models import QuerySet
+        cases = {
+            "bulk_create": lambda: ReferenceAudio.objects.bulk_create([ReferenceAudio(key="bed.y")]),
+            "bulk_update": lambda: ReferenceAudio.objects.bulk_update([self.reference], ["registered_by"]),
+            "delete": lambda: ReferenceAudio.objects.all().delete(),
+            "update": lambda: ReferenceAudio.objects.all().update(sha256="0" * 64),
+        }
+        for method, attempt in cases.items():
+            with self.subTest(api=method), mock.patch.object(QuerySet, method, autospec=True) as django_impl:
+                with self.assertRaises(ReferenceAudioIntegrityError):
+                    attempt()
+                django_impl.assert_not_called()
+
     def test_no_generic_creation(self):
         forged = dict(key="bed.forged", sha256=self.other_bed.sha256)
         for name, manager in self.managers().items():
