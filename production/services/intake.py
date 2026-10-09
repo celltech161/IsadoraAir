@@ -56,7 +56,7 @@ from django.utils import timezone
 
 from .. import policy as policy_mod
 from ..errors import IntakeError, MediaNotValidated, MediaPurged, MediaRejected
-from ..models import ProductionMedia
+from ..models import ProductionMedia, rendition_authorized
 from . import layout, retention, validation
 
 CHUNK_SIZE = 1024 * 1024
@@ -167,6 +167,10 @@ def _promote(part: Path, destination: Path) -> None:
 def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params):
     if kind not in dict(ProductionMedia.KIND_CHOICES):
         raise IntakeError("unknown media kind", code="invalid_kind")
+    if kind == ProductionMedia.KIND_RENDITION and not rendition_authorized():
+        # Before a byte is staged: only the render executor's intake
+        # (production.services.render.rendition) creates renditions.
+        raise IntakeError("renditions are created only by the render executor's intake", code="rendition_authority")
     if owner is not None and getattr(owner, "pk", None) is None:
         raise IntakeError("owner must be a saved user or None", code="invalid_owner")
     derived = kind in ProductionMedia.DERIVED_KINDS

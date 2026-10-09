@@ -56,6 +56,63 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 STORAGE_KEY_PATTERN = r"^[0-9a-f]{2}/[0-9a-f]{32}$"
 
 
+# -- the sole rendition-creation authority (2.22C2A) ----------------------------------
+#
+# A ``rendition`` row is created ONLY by production.services.render.rendition,
+# from a sealed output the isadoraair-render executor returned over its
+# authenticated socket. That module opens a scope naming the EXACT row it is
+# about to insert -- parent, recipe key/version, provenance digest, executor
+# toolchain and the output's SHA-256 -- and ProductionMedia.save() refuses any
+# rendition insert outside it or not matching it (once; then it re-reads the
+# written row, so a pre_save receiver cannot alter it). bulk_create refuses
+# renditions outright, and generic intake refuses kind=rendition early. So
+# ordinary code -- generic derivative intake, objects.create(), a hand-built
+# RenderEvidence -- cannot fabricate rendition provenance. Raw SQL is outside
+# the boundary, as everywhere in this module.
+
+@dataclass(frozen=True)
+class _RenditionAuthority:
+    derived_from_id: object
+    recipe_key: str
+    recipe_version: int
+    recipe_params_digest: str
+    toolchain: str
+    sha256: str
+
+
+class _RenditionGrant:
+    __slots__ = ("authority", "used")
+
+    def __init__(self, authority):
+        self.authority, self.used = authority, False
+
+
+_rendition = contextvars.ContextVar("production_rendition_authority", default=None)
+
+
+@contextmanager
+def rendition_authority(**columns):
+    """Authorize inserting exactly ONE rendition with these columns. Entered
+    only by production.services.render.rendition."""
+    if _rendition.get() is not None:
+        raise ImmutableMediaError("rendition authorities do not nest", code="rendition_authority")
+    token = _rendition.set(_RenditionGrant(_RenditionAuthority(**columns)))
+    try:
+        yield
+    finally:
+        _rendition.reset(token)
+
+
+def rendition_authorized() -> bool:
+    grant = _rendition.get()
+    return grant is not None and not grant.used
+
+
+def _rendition_columns(row) -> tuple:
+    return (str(row.derived_from_id), row.recipe_key, row.recipe_version, row.recipe_params_digest, row.toolchain,
+            row.sha256)
+
+
 class ProductionMediaQuerySet(models.QuerySet):
     """Fails closed on every generic bulk mutation (see the module docstring).
 
@@ -79,6 +136,10 @@ class ProductionMediaQuerySet(models.QuerySet):
     def bulk_create(self, objs, *args, update_conflicts=False, **kwargs):
         if update_conflicts:
             raise ImmutableMediaError("ProductionMedia is immutable; bulk_create(update_conflicts=True) is refused.")
+        objs = list(objs)
+        if any(getattr(obj, "kind", None) == ProductionMedia.KIND_RENDITION for obj in objs):
+            raise ImmutableMediaError("renditions are created only by the render executor's intake",
+                                      code="rendition_authority")
         return super().bulk_create(objs, *args, update_conflicts=update_conflicts, **kwargs)
 
     def delete(self):
@@ -287,6 +348,9 @@ class ProductionMedia(models.Model):
         if self._state.adding:
             if self.owner_id and not self.owner_username:
                 self.owner_username = self.owner.get_username()[:150]
+            if self.kind == self.KIND_RENDITION:
+                self._save_rendition(*args, **kwargs)
+                return
             super().save(*args, **kwargs)
             return
         changed = self._changed_fields()
@@ -296,6 +360,28 @@ class ProductionMedia(models.Model):
                 "Create a derived ProductionMedia instead, or use production.transitions.",
             )
         # Nothing differs: there is nothing to write (never issue an UPDATE).
+
+    def _save_rendition(self, *args, **kwargs):
+        """A rendition insert: only the exact row the render intake authorized,
+        once, inside its transaction -- verified again after the write."""
+        grant = _rendition.get()
+        expected = grant.authority if grant is not None else None
+        if grant is None or grant.used or _rendition_columns(self) != (
+                str(expected.derived_from_id), expected.recipe_key, expected.recipe_version,
+                expected.recipe_params_digest, expected.toolchain, expected.sha256):
+            raise ImmutableMediaError("renditions are created only by the render executor's intake",
+                                      code="rendition_authority")
+        if not transaction.get_connection(kwargs.get("using")).in_atomic_block:
+            raise ImmutableMediaError("a rendition is inserted inside its intake transaction",
+                                      code="rendition_authority")
+        grant.used = True
+        super().save(*args, **kwargs)
+        stored = type(self)._base_manager.filter(pk=self.pk).first()
+        if stored is None or stored.kind != self.KIND_RENDITION or _rendition_columns(stored) != (
+                str(expected.derived_from_id), expected.recipe_key, expected.recipe_version,
+                expected.recipe_params_digest, expected.toolchain, expected.sha256):
+            raise ImmutableMediaError("the inserted rendition differs from the authorized one",
+                                      code="rendition_authority")
 
     def delete(self, *args, **kwargs):
         raise ImmutableMediaError(

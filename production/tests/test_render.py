@@ -1,15 +1,16 @@
 """The shared render engine: parameter safety, the step library, reference
-audio, the subprocess boundary, and every failure path -- none of which may
-leave a bindable rendition. Rendering tests run under
-production/tests/run_with_validation_service.sh (renditions are validated by
-the real validation service, GStreamer included).
+audio, and every failure path a caller sees -- none of which may leave a
+bindable rendition. Rendering tests run under
+production/tests/run_with_validation_service.sh: renders go through the real
+isadoraair-render service and renditions are validated by the real validation
+service, GStreamer included. The service, its sandbox and its protocol are
+covered in production.tests.test_render_service.
 """
 import io
 import json
 import math
 import os
 import re
-import subprocess
 import unittest
 from unittest import mock
 
@@ -19,7 +20,7 @@ from django.test import SimpleTestCase, TestCase
 from production.errors import MediaNotValidated
 from production.models import ProductionMedia, ReferenceAudio, reference_registration
 from production.services import intake, layout, reference_audio, render, retention, validation
-from production.services.render import engine, params as params_mod, runner, steps
+from production.services.render import engine, params as params_mod, steps
 from spoken.tests import support as audio
 
 from .support import IsolatedMediaRootMixin, ffmpeg_available, fixture, mark_purged_leaving_bytes
@@ -158,16 +159,16 @@ class RenderFailureTests(IsolatedMediaRootMixin, TestCase):
     def renditions(self):
         return ProductionMedia.objects.filter(kind=ProductionMedia.KIND_RENDITION)
 
-    def work_entries(self):
-        root = layout.work_root()
+    def staging(self):
+        root = layout.incoming_dir()
         return sorted(os.listdir(root)) if root.exists() else []
 
     def assert_fails(self, code, source, recipe="3min_ctr", raw=None, **options):
-        before = self.work_entries()
+        before = self.staging()
         with self.assertRaises(render.RenderError) as raised:
             render.render(source, recipe, raw, **options)
         self.assertEqual(raised.exception.code, code, str(raised.exception))
-        self.assertEqual(self.work_entries(), before)                   # scratch always removed
+        self.assertEqual(self.staging(), before)                        # nothing left staged
         return raised.exception
 
     def test_missing_retired_purged_and_tampered_beds(self):
@@ -213,52 +214,11 @@ class RenderFailureTests(IsolatedMediaRootMixin, TestCase):
         with transaction.atomic(), self.assertRaises(MediaNotValidated):
             retention.lock_for_binding(error.media)                       # not bindable
 
-    def test_timeout_nonzero_exit_and_missing_limits_tool(self):
+    def test_a_render_past_its_deadline_times_out_in_the_service(self):
         source = self.ingest(audio.voice(2.0))
-        self.assert_fails("render_timeout", source, recipe="lcl_psa", timeout_seconds=0.01)
-        with mock.patch.object(validation, "FFMPEG", "false"):
-            self.assert_fails("render_failed", source, recipe="lcl_psa")
-        real = runner.resolve_tool
-        with mock.patch.object(runner, "resolve_tool", lambda name: None if name == "prlimit" else real(name)):
-            self.assert_fails("render_unavailable", source, recipe="lcl_psa")
+        error = self.assert_fails("render_timeout", source, recipe="lcl_psa", timeout_seconds=0.01)
+        self.assertTrue(error.retryable)
         self.assertFalse(self.renditions().exists())
-
-    def test_the_subprocess_boundary(self):
-        """Every tool a real render runs: argv list, no shell, prlimit-wrapped,
-        fixed environment, own session, only the media descriptors passed,
-        only safe filter text, and no path but /proc/self/fd/N or the scratch
-        directory."""
-        self.bed()
-        source = self.ingest(audio.voice(1.0))
-        calls = []
-        real_popen = subprocess.Popen
-
-        def spy(argv, **kwargs):
-            calls.append((list(argv), kwargs))
-            return real_popen(argv, **kwargs)
-        with mock.patch.object(runner.subprocess, "Popen", side_effect=spy):
-            engine._toolchain.cache_clear()
-            result = render.render(source, "3min_ctr")
-        self.assertTrue(result.media.is_valid)
-        self.assertEqual(len(calls), 5)                       # version, prepare, mix, analysis, encode
-        work = str(layout.work_root())
-        for argv, kwargs in calls:
-            self.assertFalse(kwargs.get("shell"))
-            self.assertTrue(argv[0].endswith("/prlimit"))
-            self.assertIn("--core=0", argv)
-            self.assertEqual(set(kwargs["env"]), {"PATH", "LC_ALL"})
-            self.assertTrue(kwargs["start_new_session"])
-            tool_args = argv[argv.index("--") + 1:]
-            self.assertTrue(tool_args[0].endswith("/ffmpeg"))
-            for flag in ("-af", "-filter_complex"):
-                if flag in tool_args:
-                    self.assertRegex(tool_args[tool_args.index(flag) + 1], SAFE_FILTER)
-            for arg in tool_args[1:]:
-                if "/" in arg:
-                    self.assertTrue(re.fullmatch(r"/proc/self/fd/\d+", arg) or arg.startswith(work + "/"), arg)
-            for fd in kwargs.get("pass_fds", ()):
-                self.assertIn(f"/proc/self/fd/{fd}", tool_args)
-        self.assertEqual(self.work_entries(), [])
 
 
 @unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")

@@ -131,7 +131,49 @@ def _validation_readiness(check, props, detail):
     return ("warning" if readiness["reason"] in validation_health.DEGRADED_REASONS else "critical"), detail
 
 
-APPLICATION_READINESS = {VALIDATION_UNIT: _validation_readiness}
+RENDER_UNIT = "isadoraair-render.service"
+
+
+def _render_readiness(check, props, detail):
+    """isadoraair-render (2.22C2A): the same policy as the validator -- systemd
+    state, automatic-restart evidence and the service's own read-only readiness
+    (production.services.render_health: socket, status file, an empty-request
+    handshake; never a render). Also reports running/waiting renders and the
+    last failure code the service saw. Independent of isadoraair-validation:
+    one being down never changes the other's card. The Restart button is
+    withheld (not in the protected operator-restart allowlist)."""
+    detail["restart_via_dashboard"] = False
+    try:
+        restarts = int(props.get("NRestarts", ""))
+    except ValueError:
+        restarts = None
+    detail["n_restarts"] = restarts
+    previous = _last_restarts.get(check.id)
+    _last_restarts[check.id] = restarts
+    active_state, sub_state = detail["active_state"], detail["sub_state"]
+    if active_state != "active":
+        detail["reason"] = "restarting" if sub_state == "auto-restart" or active_state == "activating" \
+            else "service_inactive"
+        return "critical", detail
+    if restarts is not None and previous is not None and restarts > previous:
+        detail["reason"] = "restarted"
+        return "critical", detail
+    try:
+        from production.services import render_health
+        readiness = render_health.observe()
+    except Exception as exc:  # noqa: BLE001 -- an observer bug is "unknown", never a crash
+        detail["reason"] = "observer_error"
+        detail["error"] = str(exc)[:200]
+        return "unknown", detail
+    for name in ("max_active", "max_pending", "active", "pending", "at_capacity", "last_failure"):
+        detail[name] = readiness[name]
+    if readiness["ready"]:
+        return "ok", detail
+    detail["reason"] = readiness["reason"]
+    return ("warning" if readiness["reason"] in render_health.DEGRADED_REASONS else "critical"), detail
+
+
+APPLICATION_READINESS = {VALIDATION_UNIT: _validation_readiness, RENDER_UNIT: _render_readiness}
 
 
 def probe_disk(check):

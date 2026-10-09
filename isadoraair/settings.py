@@ -262,6 +262,14 @@ PRODUCTION_VALIDATION_SOCKET = config('PRODUCTION_VALIDATION_SOCKET',
 # out-of-domain value stops that service from starting, never this process.
 PRODUCTION_VALIDATION_MAX_ACTIVE = config('PRODUCTION_VALIDATION_MAX_ACTIVE', default='2')
 PRODUCTION_VALIDATION_MAX_PENDING = config('PRODUCTION_VALIDATION_MAX_PENDING', default='4')
+# iPortal recipe renders run in the SEPARATE isadoraair-render service
+# (deploy/isadoraair-render.service; production.services.render_service): its
+# own socket, cgroup subtree, admission pool (1..2 at once, default 1; 0..4
+# waiting, default 2) and limits. Without the service, rendering fails closed
+# (retryable). Nothing in the web request path renders.
+PRODUCTION_RENDER_SOCKET = config('PRODUCTION_RENDER_SOCKET', default='/run/isadoraair-render/render.sock')
+PRODUCTION_RENDER_MAX_ACTIVE = config('PRODUCTION_RENDER_MAX_ACTIVE', default='1')
+PRODUCTION_RENDER_MAX_PENDING = config('PRODUCTION_RENDER_MAX_PENDING', default='2')
 
 # Where the GW3000/Ecowitt weather receiver writes latest_weather.json,
 # wind_history.json, and smoothed_wind.json -- read by the /wx/ views and

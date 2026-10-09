@@ -53,19 +53,33 @@ class DerivationTests(IsolatedMediaRootMixin, TestCase):
 
     def test_recipe_provenance_is_recorded_with_a_canonical_parameter_digest(self):
         parent = original()
-        a = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="rendition", validate=False,
+        a = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="edit", validate=False,
                                      recipe_key="loudnorm", recipe_version=1,
                                      recipe_params={"i": -16, "tp": -1.0, "lra": 5}).media
-        b = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="rendition", validate=False,
+        b = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="edit", validate=False,
                                      recipe_key="loudnorm", recipe_version=1,
                                      recipe_params={"lra": 5, "tp": -1.0, "i": -16}).media      # same, reordered
         self.assertEqual(a.recipe_params_digest, b.recipe_params_digest)
         self.assertEqual(a.recipe_params_digest,
                          hashlib.sha256(b'{"i":-16,"lra":5,"tp":-1.0}').hexdigest())
         self.assertEqual((a.recipe_key, a.recipe_version), ("loudnorm", 1))
-        other = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="rendition", validate=False,
+        other = intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="edit", validate=False,
                                          recipe_key="loudnorm", recipe_version=1, recipe_params={"i": -23}).media
         self.assertNotEqual(other.recipe_params_digest, a.recipe_params_digest)
+
+    def test_generic_intake_never_creates_a_rendition(self):
+        """2.22C2A: renditions come only from the render executor's intake
+        (production.services.render.rendition); generic derivative intake with
+        any claimed provenance is refused before a byte is staged."""
+        parent = original()
+        before = ProductionMedia.objects.count()
+        with self.assertRaises(IntakeError) as caught:
+            intake.ingest_derivative(parent, FileLike(fixture("flac.flac")), kind="rendition", validate=False,
+                                     recipe_key="lcl_psa", recipe_version=1, recipe_params={"forged": True},
+                                     toolchain="ffmpeg; executor isadoraair-render/1")
+        self.assertEqual(caught.exception.code, "rendition_authority")
+        self.assertEqual(ProductionMedia.objects.count(), before)
+        self.assertEqual(self.list_files("incoming"), [])
 
     def test_identical_bytes_still_get_an_independent_identity(self):
         parent = original()
@@ -76,7 +90,7 @@ class DerivationTests(IsolatedMediaRootMixin, TestCase):
     def test_lineage_can_be_chained(self):
         first = original()
         second = intake.ingest_derivative(first, FileLike(fixture("flac.flac")), kind="edit", validate=True).media
-        third = intake.ingest_derivative(second, FileLike(fixture("mp3.mp3")), kind="rendition", validate=True).media
+        third = intake.ingest_derivative(second, FileLike(fixture("mp3.mp3")), kind="edit", validate=True).media
         self.assertEqual([third.derived_from_id, second.derived_from_id], [second.pk, first.pk])
 
     def test_a_derivative_is_validated_independently_of_its_parent(self):

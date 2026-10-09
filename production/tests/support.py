@@ -229,6 +229,17 @@ def make_row(**overrides):
         id=media_id, kind="upload", storage_key=layout.storage_key_for(media_id), sha256=SHA_A, byte_size=10,
     )
     columns.update(overrides)
+    if columns["kind"] == ProductionMedia.KIND_RENDITION:
+        # Only the render executor's intake creates renditions; a model-level
+        # fixture of one is a RAW insert (Django's base QuerySet.bulk_create --
+        # the raw-SQL-equivalent path outside the ORM boundary), standing in for
+        # an executor output unless the test says otherwise.
+        from django.db.models import QuerySet
+
+        from production.services.render.protocol import EXECUTOR_MARKER
+        columns.setdefault("toolchain", f"ffmpeg version test; render-engine 1; {EXECUTOR_MARKER}")
+        (row,) = QuerySet.bulk_create(ProductionMedia._base_manager.all(), [ProductionMedia(**columns)])
+        return ProductionMedia.objects.get(pk=row.pk)
     return ProductionMedia.objects.create(**columns)
 
 
