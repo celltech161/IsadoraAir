@@ -417,7 +417,7 @@ class LeakageTests(GrantFixtures):
 
         def attempt(label):
             try:
-                guard._execute()
+                guard._take(guard.ItemWrite)        # the binding itself, independent of the transaction check
                 results[label] = "succeeded"
             except Refused:
                 results[label] = "refused"
@@ -439,7 +439,7 @@ class LeakageTests(GrantFixtures):
     def test_grants_do_not_reach_other_async_tasks(self):
         async def in_task():
             try:
-                guard._execute()
+                guard._take(guard.ItemWrite)        # the binding itself, independent of the transaction check
                 return "succeeded"
             except Refused:
                 return "refused"
@@ -449,7 +449,8 @@ class LeakageTests(GrantFixtures):
         with guard._authorized(self.grant_for(self.a)):
             self.assertEqual(asyncio.run(in_task()), "refused")             # a task copies the context
             self.assertEqual(asyncio.run(spawns_a_task()), "refused")
-        self.assertEqual(SpokenItem.objects.get(pk=self.a.pk).state, S.SUBMITTED)
+            guard._execute()                                                # still usable where it was opened
+        self.assertEqual(SpokenItem.objects.get(pk=self.a.pk).state, S.VALIDATED)
 
 
 class LegitimateLifecycleTests(GrantFixtures):
