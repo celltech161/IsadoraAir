@@ -432,4 +432,3 @@ def status_snapshot(path: str | None = None) -> dict | None:
                 "last_failure": data.get("last_failure")}
     except (OSError, ValueError, KeyError, TypeError):
         return None
-
