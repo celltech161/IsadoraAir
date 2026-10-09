@@ -76,6 +76,7 @@ INSTALLED_APPS = [
     'aircheck',
     'updatecenter',
     'production',
+    'spoken',
     'axes',
 ]
 
