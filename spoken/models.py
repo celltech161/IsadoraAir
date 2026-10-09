@@ -24,7 +24,7 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models import Q
 
 from production.models import ProductionMedia
@@ -67,16 +67,31 @@ class RecallPolicy(models.TextChoices):
 
 
 class SpokenContentTypeQuerySet(models.QuerySet):
+    """Configuration is written ONLY through ``SpokenContentType.save()``
+    (row-locked, validated). Generic bulk writes would skip both."""
+
     def update(self, **kwargs):
-        guard.refuse_queryset_update("SpokenContentType", kwargs, allowed=())
-        return super().update(**kwargs)
+        raise guard.SpokenIntegrityError(
+            "content-type configuration changes only through SpokenContentType.save() (validated, row-locked)")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise guard.SpokenIntegrityError("content-type bulk_update is refused; save each type")
+
+    def bulk_create(self, objs, *args, **kwargs):
+        raise guard.SpokenIntegrityError("content-type bulk_create is refused; save each type")
 
 
 class SpokenContentType(models.Model):
     """A station-configured kind of spoken content. Created disabled; the
     configuration (recipe, limits, projection policy) is validated by
     ``spoken.configuration`` on every save. Once an item uses it, its ``code``
-    is permanent."""
+    is permanent.
+
+    ``save()`` is the configuration authority: in ONE transaction it locks the
+    persisted row (``SELECT ... FOR UPDATE``), checks code permanence against
+    the items that exist while the lock is held, validates, writes and commits.
+    ``create_item`` and render completion lock the same row, so a rename and a
+    first item -- or a reconfiguration and a completion -- are serialized."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     code = models.CharField(max_length=48, unique=True)
@@ -142,13 +157,20 @@ class SpokenContentType(models.Model):
 
     def save(self, *args, **kwargs):
         from . import configuration
-        configuration.check_before_save(self)
-        super().save(*args, **kwargs)
+        using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=using):
+            configuration.check_before_save(self, using=using)       # locks the persisted row first
+            super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        if self._state.adding is False and SpokenItem.objects.filter(content_type_id=self.pk).exists():
-            raise guard.SpokenIntegrityError("a content type with items is never deleted; disable it instead")
-        return super().delete(*args, **kwargs)
+        using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=using):
+            # The same row lock create_item takes (the PROTECT foreign key also
+            # refuses at the database).
+            type(self)._base_manager.db_manager(using).select_for_update().filter(pk=self.pk).values_list("pk").first()
+            if SpokenItem._base_manager.db_manager(using).filter(content_type_id=self.pk).exists():
+                raise guard.SpokenIntegrityError("a content type with items is never deleted; disable it instead")
+            return super().delete(*args, **kwargs)
 
 
 # -- SpokenItem --------------------------------------------------------------------------
@@ -179,13 +201,23 @@ TERMINAL_STATES = (ItemState.RECALLED, ItemState.EXPIRED, ItemState.INVALID, Ite
 
 
 class SpokenItemQuerySet(models.QuerySet):
+    """Default AND base manager; reverse managers derive from it (see guard)."""
+
     def update(self, **kwargs):
         guard.refuse_queryset_update("SpokenItem", kwargs, allowed=guard.ITEM_FREE_COLUMNS)
         return super().update(**kwargs)
 
     def bulk_update(self, objs, fields, batch_size=None):
-        guard.refuse_queryset_update("SpokenItem", {name: None for name in fields}, allowed=guard.ITEM_FREE_COLUMNS)
+        guard.refuse_item_bulk_update(fields)
         return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    def bulk_create(self, objs, *args, **kwargs):
+        guard.refuse("spoken items are created only by spoken.transitions.create_item; bulk_create is refused")
+
+    def delete(self):
+        guard.refuse("spoken items are never deleted; recall or retire them")
+
+    delete.queryset_only = True
 
 
 class SpokenItem(models.Model):
@@ -305,8 +337,13 @@ class SpokenItemEventQuerySet(models.QuerySet):
     def bulk_update(self, objs, fields, batch_size=None):
         raise guard.SpokenIntegrityError("spoken item events are append-only")
 
+    def bulk_create(self, objs, *args, **kwargs):
+        raise guard.SpokenIntegrityError("spoken item events are written only by spoken.transitions")
+
     def delete(self):
         raise guard.SpokenIntegrityError("spoken item events are append-only")
+
+    delete.queryset_only = True
 
 
 class SpokenItemEvent(models.Model):
