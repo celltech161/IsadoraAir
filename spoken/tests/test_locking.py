@@ -8,6 +8,7 @@ on a stale state.
 """
 import threading
 import time
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.db import connection, connections
@@ -78,3 +79,40 @@ class RowLockTests(TransactionTestCase):
         self.assertEqual((self.item.state, self.item.submission_media_id), (ItemState.RECALLED, None))
         self.assertEqual(list(SpokenItemEvent.objects.filter(item=self.item).values_list("event", flat=True)),
                          ["created", "recalled"])
+
+
+class LockedSnapshotConcurrencyTests(TransactionTestCase):
+    """The complete-row expectation is the row as LOCKED by the transition. A
+    concurrent ordinary edit (title/notes) cannot change the row until the
+    transition commits -- it waits on the row lock -- and is then applied on
+    top, touching only the editorial columns. No legitimate edit is refused
+    and nothing is compared against a stale snapshot."""
+
+    def test_an_ordinary_edit_waits_for_the_transition_then_lands(self):
+        owner = User.objects.create_user("owner")
+        item = transitions.submit(transitions.create_item(make_type(), actor=owner), media(), actor=owner)
+        paused, release = threading.Event(), threading.Event()
+        real_commit = transitions._commit
+
+        def pausing_commit(row, plan):
+            if threading.current_thread().name == "transition":
+                paused.set()
+                assert release.wait(WAIT)
+            return real_commit(row, plan)
+
+        def edit():
+            row = transitions.SpokenItem.objects.get(pk=item.pk)
+            row.title = "edited concurrently"
+            row.save()
+        with mock.patch.object(transitions, "_commit", pausing_commit):
+            transition, transition_box = RowLockTests.run_thread(self, "transition",
+                                                                 lambda: transitions.record_validation(item))
+            self.assertTrue(paused.wait(WAIT))                     # the row is locked and snapshotted
+            editor, editor_box = RowLockTests.run_thread(self, "editor", edit)
+            RowLockTests.wait_until_blocked(self)                  # the edit waits on the row lock
+            release.set()
+            transition.join(WAIT)
+            editor.join(WAIT)
+        self.assertEqual((transition_box["error"], editor_box["error"]), (None, None))
+        row = transitions.SpokenItem.objects.get(pk=item.pk)
+        self.assertEqual((row.state, row.title), (ItemState.VALIDATED, "edited concurrently"))

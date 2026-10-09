@@ -189,8 +189,10 @@ class SpokenItemAuthorityTests(AuthorityFixtures):
         self.assert_refused(bare.delete)
 
     def test_while_a_grant_is_open_the_state_must_still_be_an_item_state(self):
+        locked = dict(guard.snapshot(SpokenItem._base_manager.get(pk=self.item.pk)))
         grant = guard.ItemWrite(item_id=self.item.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED,
-                                values=(("state", S.VALIDATED),))
+                                values=(("state", S.VALIDATED),),
+                                expected=tuple(sorted({**locked, "state": S.VALIDATED}.items())))
         with guard._authorized(grant):
             self.assert_refused(lambda: SpokenItem.objects.create(content_type=self.ctype, state="not_a_state"))
             self.assert_refused(lambda: SpokenItem.objects.filter(pk=self.item.pk).update(state="bogus"))

@@ -84,6 +84,10 @@ class ProjectionRequired(InvalidTransition):
     code = "projection_required"
 
 
+class InvalidEventDetail(SpokenServiceError, ValueError):
+    code = "invalid_event_detail"
+
+
 # -- actors -------------------------------------------------------------------------
 
 def is_manager(user) -> bool:
@@ -103,11 +107,18 @@ def _actor_columns(actor, actor_kind):
 
 
 def _bounded(detail) -> str:
-    """Event detail as bounded, CANONICAL JSON text: an immutable value the
-    plan can hold (no caller-owned or nested mutable object survives)."""
-    encoded = json.dumps(dict(detail or {}), sort_keys=True, separators=(",", ":"), default=str, allow_nan=False)
+    """Event detail as bounded, strict CANONICAL JSON text (guard.canonical_json):
+    an immutable value the plan can hold. A value without a strict JSON meaning
+    is refused at planning -- never stringified."""
+    detail = {} if detail is None else detail
+    if not isinstance(detail, dict):
+        raise InvalidEventDetail("event detail is a JSON object")
+    try:
+        encoded = guard.canonical_json(detail)
+    except guard.NotCanonicalJSON as exc:
+        raise InvalidEventDetail(f"event detail is not strict JSON: {exc}") from None
     if len(encoded.encode()) > DETAIL_LIMIT_BYTES:
-        raise ValueError("event detail exceeds its bound")
+        raise InvalidEventDetail("event detail exceeds its bound")
     return encoded
 
 
@@ -129,11 +140,12 @@ class TransitionPlan:
     item_id: object
     from_state: str | None
     to_state: str
-    item_values: tuple            # ((attname, value), ...) -- protected item columns
+    item_values: tuple            # ((attname, value), ...) -- protected item columns written
+    item_expected: tuple          # EVERY authoritative item column afterwards (locked row + values)
     event_values: tuple           # ((attname, value), ...) -- every event column
 
     def __post_init__(self):
-        for name in ("item_values", "event_values"):
+        for name in ("item_values", "item_expected", "event_values"):
             pairs = getattr(self, name)
             if not isinstance(pairs, tuple) or not all(
                     isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[0], str)
@@ -145,29 +157,35 @@ _PLANNED = weakref.WeakSet()
 
 
 def _attname_values(model, values: dict) -> tuple:
-    """Field names (with related objects) -> sorted ((attname, raw value), ...)."""
+    """Field names (with related objects) -> sorted ((attname, frozen value), ...)."""
     out = {}
     for name, value in values.items():
         field = model._meta.get_field(name)
-        if field.is_relation:
-            value = getattr(value, "pk", value)
-        out[field.attname] = value
+        out[field.attname] = guard.freeze(field, value)
     return tuple(sorted(out.items()))
 
 
-def _plan(row, *, from_state, to_state, rule, changes, actor_kind, user, username, media, detail) -> TransitionPlan:
+def _plan(row, *, from_state, to_state, rule, changes, actor_kind, user, username, media, detail,
+          locked=None) -> TransitionPlan:
+    """``locked``: guard.snapshot of the row taken right after it was locked
+    (None for a creation) -- the authority for every column the transition
+    leaves alone; never a later re-read."""
     item_values = _attname_values(SpokenItem, changes)
     if from_state is not None:
         extra = {name for name, _ in item_values} - writable_columns(from_state, to_state)
         if extra:                                            # a service bug, never a caller's choice
             raise InvalidTransition(f"{from_state} -> {to_state} does not write {sorted(extra)}")
-    event_values = _attname_values(SpokenItemEvent, {
+        item_expected = tuple(sorted({**dict(locked), **dict(item_values)}.items()))
+    else:
+        item_expected = guard.creation_expected(item_values)
+    detail_text = _bounded(detail)                           # strict canonical JSON, refused before any grant
+    event_values = tuple(sorted(dict(_attname_values(SpokenItemEvent, {
         "item": row.pk, "event": rule.event, "from_state": from_state or "", "to_state": to_state,
         "actor_kind": actor_kind, "actor": user, "actor_username": username, "media": media,
-        "asset": None, "edition": None, "detail": _bounded(detail),
-    })
+        "asset": None, "edition": None,
+    }), detail=detail_text).items()))
     plan = TransitionPlan(item_id=row.pk, from_state=from_state, to_state=to_state, item_values=item_values,
-                          event_values=event_values)
+                          item_expected=item_expected, event_values=event_values)
     _PLANNED.add(plan)
     return plan
 
@@ -195,7 +213,8 @@ def _commit(row, plan) -> None:
     if plan.from_state is None:
         raise guard.SpokenIntegrityError("creation plans are committed by create_item")
     with guard._authorized(guard.ItemWrite(item_id=plan.item_id, from_state=plan.from_state,
-                                           to_state=plan.to_state, values=plan.item_values)):
+                                           to_state=plan.to_state, values=plan.item_values,
+                                           expected=plan.item_expected)):
         guard._execute()
     _write_event(plan)
     row.refresh_from_db()
@@ -218,6 +237,7 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
                 raise SpokenItem.DoesNotExist("no such spoken item")
             SpokenContentType.objects.select_for_update().filter(pk=type_id).values_list("pk").first()
         row = SpokenItem.objects.select_for_update(of=("self",)).select_related("content_type").get(pk=pk)
+        locked = guard.snapshot(row)            # the authoritative pre-write row, before any callback runs
         key = (row.state, to_state)
         rule = TRANSITIONS.get(key)
         if rule is None or (expected_from is not None and row.state not in expected_from):
@@ -240,8 +260,9 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
         planned.update(state=to_state, state_changed_at=now)
         if to_state in TERMINAL_STATES:
             planned["terminal_at"] = now
-        plan = _plan(row, from_state=row.state, to_state=to_state, rule=rule, changes=planned,
-                     actor_kind=actor_kind, user=user, username=username, media=bound, detail=detail)
+        plan = _plan(row, from_state=dict(locked)["state"], to_state=to_state, rule=rule, changes=planned,
+                     actor_kind=actor_kind, user=user, username=username, media=bound, detail=detail,
+                     locked=locked)
         _commit(row, plan)
         return row
 
@@ -271,7 +292,8 @@ def create_item(content_type, *, actor, title="", notes="", origin=ItemOrigin.SU
                               "state": S.DRAFT, "state_changed_at": now},
                      actor_kind=ActorKind.USER, user=user, username=username, media=None, detail=detail)
         _require_planned(plan, row)
-        with guard._authorized(guard.ItemCreate(item_id=plan.item_id, values=plan.item_values)):
+        with guard._authorized(guard.ItemCreate(item_id=plan.item_id, values=plan.item_values,
+                                                expected=plan.item_expected)):
             guard._execute()
         _write_event(plan)
         return SpokenItem.objects.select_related("content_type").get(pk=plan.item_id)

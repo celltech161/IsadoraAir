@@ -39,6 +39,20 @@ def item_snapshot(item):
             list(SpokenItemEvent._base_manager.filter(item_id=item.pk).values_list("id", flat=True)))
 
 
+def write_grant(item, from_state, to_state, values):
+    """A well-formed ItemWrite: its expectation is the row's current
+    authoritative columns plus ``values`` (as the service derives it)."""
+    values = tuple(sorted(values, key=lambda pair: pair[0]))
+    locked = dict(guard.snapshot(SpokenItem._base_manager.get(pk=getattr(item, "pk", item))))
+    return guard.ItemWrite(item_id=getattr(item, "pk", item), from_state=from_state, to_state=to_state,
+                           values=values, expected=tuple(sorted({**locked, **dict(values)}.items())))
+
+
+def create_grant(item_id, values):
+    values = tuple(sorted(values, key=lambda pair: pair[0]))
+    return guard.ItemCreate(item_id=item_id, values=values, expected=guard.creation_expected(values))
+
+
 class connected:
     """Connect a signal receiver for the duration of a with-block."""
 
@@ -62,8 +76,7 @@ class GrantFixtures(Fixtures):
         self.plan_values = (("state", S.VALIDATED), ("state_changed_at", self.now), ("validated_at", self.now))
 
     def grant_for(self, item, values=None):
-        return guard.ItemWrite(item_id=item.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED,
-                               values=values or self.plan_values)
+        return write_grant(item, S.SUBMITTED, S.VALIDATED, values or self.plan_values)
 
     def loaded(self, item, **changes):
         row = SpokenItem.objects.get(pk=item.pk)
@@ -234,7 +247,8 @@ class PlanImmutabilityTests(GrantFixtures):
                               "not pairs": ({"state": "validated"},), "list payload": [("state", "x")]}.items():
             with self.subTest(case=label), self.assertRaises(TypeError):
                 transitions.TransitionPlan(item_id=self.a.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED,
-                                           item_values=self.plan_values, event_values=values)
+                                           item_values=self.plan_values, item_expected=self.grant_for(self.a).expected,
+                                           event_values=values)
 
     def test_the_canonical_detail_is_stable(self):
         self.assertEqual(transitions._bounded({"b": 1, "a": {"y": [2, 1], "x": None}}),
@@ -245,23 +259,31 @@ class CodexBypassRegressionTests(GrantFixtures):
     def test_hand_built_grants_cannot_describe_what_the_table_forbids(self):
         draft = self.item()
         for label, record in {
-            "draft -> delivered": guard.ItemWrite(item_id=draft.pk, from_state=S.DRAFT, to_state=S.DELIVERED,
-                                                  values=(("state", S.DELIVERED),)),
-            "processed -> delivered": guard.ItemWrite(item_id=draft.pk, from_state=S.PROCESSED,
-                                                      to_state=S.DELIVERED, values=(("state", S.DELIVERED),)),
-            "submit + forged failure": guard.ItemWrite(item_id=draft.pk, from_state=S.DRAFT, to_state=S.SUBMITTED,
-                                                       values=(("state", S.SUBMITTED), ("failure_code", "forged"))),
-            "state other than target": guard.ItemWrite(item_id=draft.pk, from_state=S.DRAFT, to_state=S.SUBMITTED,
-                                                       values=(("state", S.RECALLED),)),
+            "draft -> delivered": write_grant(draft, S.DRAFT, S.DELIVERED, (("state", S.DELIVERED),)),
+            "processed -> delivered": write_grant(draft, S.PROCESSED, S.DELIVERED, (("state", S.DELIVERED),)),
+            "submit + forged failure": write_grant(draft, S.DRAFT, S.SUBMITTED,
+                                                   (("state", S.SUBMITTED), ("failure_code", "forged"))),
+            "state other than target": write_grant(draft, S.DRAFT, S.SUBMITTED, (("state", S.RECALLED),)),
+            "expectation hides a change": guard.ItemWrite(
+                item_id=draft.pk, from_state=S.DRAFT, to_state=S.SUBMITTED, values=(("state", S.SUBMITTED),),
+                expected=tuple(sorted({**dict(write_grant(draft, S.DRAFT, S.SUBMITTED, (("state", S.SUBMITTED),))
+                                              .expected), "state": S.DRAFT}.items()))),
+            "expectation incomplete": guard.ItemWrite(
+                item_id=draft.pk, from_state=S.DRAFT, to_state=S.SUBMITTED, values=(("state", S.SUBMITTED),),
+                expected=(("state", S.SUBMITTED),)),
             "delivered event": guard.EventCreate(values=tuple(self.event_values(
                 draft, event="delivered", from_state=S.PROCESSED, to_state=S.DELIVERED).items())),
             "event slug mismatch": guard.EventCreate(values=tuple(self.event_values(draft, event="recalled").items())),
-            "create non-draft": guard.ItemCreate(item_id=uuid.uuid4(), values=(("state", S.SUBMITTED),
-                                                                               ("origin", "submitted"))),
-            "create imported": guard.ItemCreate(item_id=uuid.uuid4(), values=(("state", S.DRAFT),
-                                                                              ("origin", "imported"))),
-            "create with failure": guard.ItemCreate(item_id=uuid.uuid4(), values=(
+            "create non-draft": create_grant(uuid.uuid4(), (("state", S.SUBMITTED), ("origin", "submitted"))),
+            "create imported": create_grant(uuid.uuid4(), (("state", S.DRAFT), ("origin", "imported"))),
+            "create with failure": create_grant(uuid.uuid4(), (
                 ("state", S.DRAFT), ("origin", "submitted"), ("failure_code", "forged"))),
+            "creation expects a non-default": guard.ItemCreate(
+                item_id=uuid.uuid4(), values=(("origin", "submitted"), ("state", S.DRAFT)),
+                expected=tuple(sorted({**dict(guard.creation_expected((("origin", "submitted"), ("state", S.DRAFT)))),
+                                       "failure_code": "forged"}.items()))),
+            "event missing a column": guard.EventCreate(values=tuple(
+                (k, v) for k, v in self.event_values(draft).items() if k != "asset_id")),
         }.items():
             with self.subTest(grant=label), self.assertRaises(Refused):
                 with guard._authorized(record):
@@ -271,7 +293,7 @@ class CodexBypassRegressionTests(GrantFixtures):
         row = SpokenItem.objects.get(pk=self.a.pk)
         forged = transitions.TransitionPlan(
             item_id=row.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED, item_values=self.plan_values,
-            event_values=tuple(self.event_values().items()))
+            item_expected=self.grant_for(self.a).expected, event_values=tuple(self.event_values().items()))
         before = item_snapshot(self.a)
         opened = []
         real = guard._authorized
@@ -337,7 +359,7 @@ class ExactItemWriteTests(GrantFixtures):
 
 class ExactCreationTests(GrantFixtures):
     def creation_grant(self, item_id):
-        return guard.ItemCreate(item_id=item_id, values=(
+        return create_grant(item_id, (
             ("content_type_id", self.ctype.pk), ("origin", "submitted"), ("submitted_by_id", self.owner.pk),
             ("submitted_by_username", "owner"), ("state", S.DRAFT), ("state_changed_at", self.now)))
 
@@ -518,8 +540,7 @@ class LegitimateLifecycleTests(GrantFixtures):
         for source, target in ((S.PROCESSED, S.DELIVERED), (S.DELIVERED, S.SUPERSEDED),
                                (S.SUPERSEDED, S.DELIVERED), (S.DELIVERED, S.RECALLED), (S.DELIVERED, S.EXPIRED)):
             with self.subTest(grant=f"{source}->{target}"), self.assertRaises(Refused):
-                with guard._authorized(guard.ItemWrite(item_id=item.pk, from_state=source, to_state=target,
-                                                       values=(("state", target),))):
+                with guard._authorized(write_grant(item, source, target, (("state", target),))):
                     pass
         self.assertEqual(SpokenItem.objects.get(pk=item.pk).state, S.PROCESSED)
 
@@ -549,3 +570,162 @@ class NoGrantTestIsolation(TestCase):
         owner = User.objects.create_user("o")
         transitions.create_item(make_type(), actor=owner)
         self.assertIsNone(guard._grant.get())
+
+
+class CompleteRowVerificationTests(GrantFixtures):
+    """Codex: read-back covered only the grant's own columns, so an UNPLANNED
+    protected column could be forged while every planned value stayed right.
+    Every authoritative column is now verified against the locked pre-write
+    row plus the plan (or, for a creation, the plan plus model defaults)."""
+
+    def tamper_item_update(self, **extra):
+        real = QuerySet.update
+
+        def wrapped(queryset, **kwargs):
+            if queryset.model is SpokenItem and "state" in kwargs:
+                kwargs = {**kwargs, **extra}                         # planned values left untouched
+            return real(queryset, **kwargs)
+        return mock.patch.object(QuerySet, "update", wrapped)
+
+    def test_an_unplanned_column_forged_alongside_a_correct_transition_is_refused(self):
+        before = item_snapshot(self.a)
+        with self.tamper_item_update(failure_code="forged-unplanned"), self.assertRaises(Refused) as raised:
+            transitions.record_validation(self.a)
+        self.assertIn("failure", str(raised.exception))              # caught on the unplanned column itself
+        self.assertEqual(item_snapshot(self.a), before)             # still submitted, no validated event
+        row = SpokenItem.objects.get(pk=self.a.pk)
+        self.assertEqual((row.state, row.failure_code), (S.SUBMITTED, ""))
+        self.assertFalse(SpokenItemEvent.objects.filter(item=row, event="validated").exists())
+        self.assertEqual(transitions.record_validation(self.a).state, S.VALIDATED)   # a normal retry works
+
+    def test_every_class_of_unplanned_protected_column_is_verified(self):
+        other_media = media()
+        for label, extra in {
+            "failure detail": {"failure_detail": "forged"},
+            "review evidence": {"reviewed_by_id": self.manager.pk, "reviewed_by_username": "m",
+                                "reviewed_at": self.now, "review_note": "forged"},
+            "recall evidence": {"recalled_by_id": self.manager.pk, "recalled_at": self.now, "recall_reason": "x"},
+            "lease": {"lease_token": uuid.uuid4(), "lease_expires_at": self.now},
+            "rendition": {"rendition_media_id": other_media.pk},
+            "submission": {"submission_media_id": other_media.pk},
+            "attempts": {"processing_attempts": 9},
+            "timestamps": {"processed_at": self.now, "delivered_at": self.now, "expires_at": self.now},
+            "identity": {"origin": "assigned", "submitted_by_username": "someone"},
+            "type": {"content_type_id": make_type(code="elsewhere").pk},
+            "created_at": {"created_at": self.now - timedelta(days=3)},
+        }.items():
+            with self.subTest(columns=label):
+                before = item_snapshot(self.a)
+                with self.tamper_item_update(**extra), self.assertRaises(Refused):
+                    transitions.record_validation(self.a)
+                self.assertEqual(item_snapshot(self.a), before)
+
+    def test_creation_verifies_every_column_against_the_defaults(self):
+        real = QuerySet.bulk_create
+
+        def wrapped(queryset, objs, *args, **kwargs):
+            if queryset.model is SpokenItem:
+                for obj in objs:
+                    obj.failure_code = "forged-unplanned"           # planned draft values untouched
+            return real(queryset, objs, *args, **kwargs)
+        before = (SpokenItem.objects.count(), SpokenItemEvent.objects.count())
+        with mock.patch.object(QuerySet, "bulk_create", wrapped), self.assertRaises(Refused) as raised:
+            transitions.create_item(self.ctype, actor=self.owner)
+        self.assertIn("failure", str(raised.exception))
+        self.assertEqual((SpokenItem.objects.count(), SpokenItemEvent.objects.count()), before)   # no draft, no event
+        self.assertEqual(transitions.create_item(self.ctype, actor=self.owner).state, S.DRAFT)
+
+    def test_every_event_column_is_verified(self):
+        real = QuerySet.bulk_create
+        for column, value in {"asset_id": uuid.uuid4(), "edition_id": uuid.uuid4(), "actor_username": "x",
+                              "actor_kind": "worker", "detail": {"duration_seconds": "9"}}.items():
+            def wrapped(queryset, objs, *args, column=column, value=value, **kwargs):
+                if queryset.model is SpokenItemEvent:
+                    for obj in objs:
+                        setattr(obj, column, value)
+                return real(queryset, objs, *args, **kwargs)
+            with self.subTest(column=column):
+                before = item_snapshot(self.a)
+                with mock.patch.object(QuerySet, "bulk_create", wrapped), self.assertRaises(Refused):
+                    with transaction.atomic():
+                        transitions.record_validation(self.a)
+                self.assertEqual(item_snapshot(self.a), before)
+
+    def test_expectations_come_from_the_locked_row_not_a_later_reread(self):
+        """Something inside the transition (here: raw-SQL-equivalent code in a
+        verify step) changes an unplanned column after the lock. The locked
+        snapshot -- not a re-read -- is the expectation, so it is caught."""
+        def sneak(row, bound):
+            QuerySet.update(SpokenItem._base_manager.filter(pk=row.pk), failure_code="sneaked-in")
+        before = item_snapshot(self.a)
+        with self.assertRaises(Refused):
+            transitions._apply(self.a, S.RECALLED, actor=self.manager, verify=sneak)
+        self.assertEqual(item_snapshot(self.a), before)
+
+    def test_plan_expectations_are_complete_and_sealed(self):
+        captured = {}
+        real = transitions._commit
+
+        def capture(row, plan):
+            captured["plan"] = plan
+            return real(row, plan)
+        with mock.patch.object(transitions, "_commit", capture):
+            transitions.record_validation(self.a)
+        expected = dict(captured["plan"].item_expected)
+        self.assertEqual(set(expected), {f.attname for f in guard.authoritative_item_fields()})
+        self.assertEqual((expected["state"], expected["failure_code"]), (S.VALIDATED, ""))
+        with self.assertRaises((TypeError, dataclasses.FrozenInstanceError)):
+            captured["plan"].item_expected = ()
+        with self.assertRaises(TypeError):
+            captured["plan"].item_expected[0] = ("state", S.DELIVERED)
+
+
+class StrictCanonicalJSONTests(GrantFixtures):
+    def test_unsupported_values_are_refused_never_stringified(self):
+        import datetime
+        import decimal
+
+        class Shouty(str):
+            def __str__(self):
+                return "SHOUTY"
+        for label, value in {
+            "object": {"bad": object()}, "object key": {object(): "x"}, "int key": {1: "x"},
+            "tuple key": {("a",): 1}, "decimal": {"d": decimal.Decimal("1.5")}, "uuid": {"u": uuid.uuid4()},
+            "datetime": {"t": datetime.datetime.now()}, "date": {"t": datetime.date.today()}, "set": {"s": {1}},
+            "bytes": {"b": b"x"}, "nan": {"n": float("nan")}, "inf": {"n": float("inf")},
+            "-inf": {"n": float("-inf")}, "nested object": {"a": [1, {"b": object()}]},
+            "too deep": {"deep": json.loads("[" * 40 + "]" * 40)},
+        }.items():
+            with self.subTest(case=label), self.assertRaises(transitions.InvalidEventDetail) as raised:
+                transitions._bounded(value)
+            self.assertNotIn("0x", str(raised.exception))              # no runtime identity leaks into errors
+        self.assertEqual(guard.canonical_json({"k": Shouty("value")}), '{"k":"value"}')   # characters, not __str__
+
+    def test_canonical_text_is_deterministic(self):
+        self.assertEqual(transitions._bounded({"a": 1, "b": 2}), transitions._bounded({"b": 2, "a": 1}))
+        self.assertEqual(transitions._bounded({"x": {"b": [1, {"d": 1, "c": 2}], "a": None}}),
+                         '{"x":{"a":null,"b":[1,{"c":2,"d":1}]}}')
+        self.assertEqual(transitions._bounded({"t": (1, 2)}), transitions._bounded({"t": [1, 2]}))
+        self.assertEqual(transitions._bounded({"u": "é", "f": 1.5, "b": True, "n": None}),
+                         '{"b":true,"f":1.5,"n":null,"u":"\\u00e9"}')
+
+    def test_an_unsupported_detail_is_refused_before_any_plan_grant_or_write(self):
+        opened, planned_before = [], len(transitions._PLANNED)
+        real = guard._authorized
+
+        def spy(record):
+            opened.append(type(record).__name__)
+            return real(record)
+        before = item_snapshot(self.a)
+        with mock.patch.object(guard, "_authorized", spy):
+            with self.assertRaises(transitions.InvalidEventDetail):
+                transitions._apply(self.a, S.RECALLED, actor=self.manager, detail={"bad": object()})
+            with self.assertRaises(transitions.InvalidEventDetail):
+                transitions.create_item(self.ctype, actor=self.owner, detail={"bad": object()})
+        self.assertEqual((opened, len(transitions._PLANNED)), ([], planned_before))
+        self.assertEqual(item_snapshot(self.a), before)
+
+    def test_supported_nested_detail_round_trips(self):
+        detail = {"validation": {"checks": ["a", "b"], "ok": True, "score": 0.5, "none": None}}
+        item = transitions._apply(self.a, S.RECALLED, actor=self.manager, detail=detail)
+        self.assertEqual(SpokenItemEvent.objects.filter(item=item).latest("id").detail, detail)

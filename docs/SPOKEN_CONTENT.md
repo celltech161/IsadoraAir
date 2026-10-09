@@ -106,13 +106,38 @@ that plan, each opened only around one call to `guard._execute()`:
 one ORM statement that exposes no model instance to application code and
 emits **no model signals** (base `QuerySet.update` filtered by id AND source
 state; base `QuerySet.bulk_create` of an instance built from the payload —
-Django still applies `auto_now_add`, primary keys and JSON encoding), then
-reads the row back in the same transaction and refuses, rolling the whole
-transition back, unless it equals the payload. So `pre_save` receivers,
-descriptors or anything else between authorization and SQL cannot change
-what is written, and a tampered write never commits (item and event roll
-back together; a normal retry builds a fresh plan). `Model.save()` never
-honors a grant.
+Django still applies `auto_now_add`, primary keys and JSON encoding). It then
+reads back the **complete authoritative row** — the canonical column set from
+`guard.authoritative_item_fields()` (every SpokenItem column except the
+primary key and title/notes; the same definition the ordinary-save guard
+uses), never just the grant's own columns — and compares every column with
+the grant's sealed expectation:
+
+* an existing item: the snapshot taken right after the row was locked (before
+  any callback runs; never a later re-read) with the plan's values applied;
+* a new item: the plan's values and the model default for every other column;
+* an event: every column of its payload.
+
+Generated columns are checked for their approved semantics instead of a value
+nobody knew in advance: the primary key exists and `created_at` was stamped
+during the write. Any difference — a planned value, an unplanned column such
+as `failure_code`, or an event column — raises and rolls back the whole
+transition (item and event together; a normal retry builds a fresh plan).
+`pre_save` receivers, descriptors or anything else between authorization and
+SQL therefore cannot change what is written. `Model.save()` never honors a
+grant. Title/notes are outside the lifecycle expectation: the transition's
+SQL never writes them, and because the transition holds the item's row lock,
+a concurrent ordinary edit waits and then lands on top of the committed
+transition (two-session test in `spoken/tests/test_locking.py`).
+
+**Event detail is strict canonical JSON** (`guard.canonical_json`): objects
+with string keys, arrays (tuples become arrays), strings, finite numbers,
+booleans and null; sorted keys, compact separators, ASCII. Decimal, UUID,
+datetime/date, sets, bytes, arbitrary objects, non-string keys, NaN and
+±Infinity, and nesting deeper than 32 are refused at planning
+(`InvalidEventDetail`) — before any plan, grant or write; nothing is ever
+stringified, so no runtime representation can enter the evidence. Callers
+pass such values as explicit strings when they need them.
 
 A grant is itself checked against the fixed transition table: it can never
 describe a C2 (library) transition, a column its rule does not write, a state
