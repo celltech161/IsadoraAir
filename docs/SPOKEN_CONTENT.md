@@ -75,19 +75,50 @@ same through all of them (proven per manager in `spoken/tests/test_authority.py`
 
 | API | `SpokenItem` | `SpokenItemEvent` | `SpokenContentType` |
 | --- | --- | --- | --- |
-| `save()` adding / `create()` / creating branch of `get_or_create()` / `update_or_create()` | refused outside `transition_scope` | refused outside `transition_scope` | allowed — through the validated, row-locked `save()` |
+| `save()` adding / `create()` / creating branch of `get_or_create()` / `update_or_create()` | refused unless it is exactly the row an open `ItemCreate` grant describes | refused unless it is exactly the event an open `EventCreate` grant describes | allowed — through the validated, row-locked `save()` |
 | `bulk_create()` (plain, `ignore_conflicts`, `update_conflicts`) | **always refused** | **always refused** | **always refused** |
-| `save()` of an existing row / updating branch of `update_or_create()` | only title/notes change (compared with the authoritative row) | refused (append-only) | validated, row-locked `save()` |
-| `QuerySet.update()` | title/notes; a user FK to NULL alone (Django's SET_NULL) | only `actor=None` (Django's SET_NULL) — every other column refused | **always refused** |
-| `bulk_update()` | title/notes only, even in the scope | **always refused** | **always refused** |
+| `save()` of an existing row / updating branch of `update_or_create()` | only title/notes change — unless it is exactly the write an open `ItemWrite` grant for this row describes | refused (append-only) | validated, row-locked `save()` |
+| `QuerySet.update()` | title/notes; a user FK to NULL alone (Django's SET_NULL) — never a protected column, grant or not | only `actor=None` (Django's SET_NULL) — every other column refused | **always refused** |
+| `bulk_update()` | title/notes only, grant or not | **always refused** | **always refused** |
 | `delete()` (instance, QuerySet, any manager) | **always refused** | **always refused** | refused while items exist (row-locked; PROTECT also refuses) |
 
-A `state` that is not an `ItemState` is refused on every write path, even
-inside the scope. The state set is enforced by this boundary, deliberately not
+A `state` that is not an `ItemState` is refused on every write path, grant
+or not. The state set is enforced by this boundary, deliberately not
 by a database check constraint (a new state must never need a manual
 migration). No foreign key into an item or an event cascades, so Django's
 deletion collector never reaches them. Admin is read-only for items, events,
 assets and editions. Raw SQL is outside the boundary, as for ProductionMedia.
+
+**Operation-specific write authority** (`spoken/guard.py`,
+`spoken/lifecycle.py`). There is no trusted "inside the service" context.
+The transition service validates a transition, computes ONE immutable
+`TransitionPlan` (the exact protected item columns and the exact event), and
+derives two grants from it, each opened only around its own statement:
+
+* `ItemWrite(item id, from state, to state, {attname: exact value})` — the
+  one `save()` of that row: the persisted row must be in `from state`; every
+  planned column must hold its exact planned value; every other protected
+  column must equal the authoritative row. (`ItemCreate(item id, values)`
+  does the same for the one new row in `create_item`; every unplanned column
+  must hold the model default.)
+* `EventCreate({every event column: exact value})` — the one event insert.
+
+A grant is itself checked against the fixed transition table: it can never
+describe a C2 (library) transition, a column its rule does not write, a state
+other than its target, or an event its rule does not record — so even a
+hand-built grant cannot deliver, forge failure fields onto a submission, or
+claim a delivery. A grant is consumed by its first matching write (before
+Django's own save, so `pre_save`/`post_save` receivers cannot reuse it),
+cannot be nested, is bound to the thread and asyncio task that opened it, and
+is always removed on exit. Only plans built by the validation path are
+committed, once. Completion opens no grant until locks, lease, persisted
+rendition evidence and expected provenance have all been verified.
+
+The transition functions are the supported mutation API. Grants, plans and
+`_authorized` are private implementation details of `spoken`; deliberately
+importing them (or calling Django's base `QuerySet` methods directly) is
+equivalent to raw SQL and outside the ORM threat model.
+(`spoken/tests/test_transition_authority.py`.)
 
 **Content-type configuration** is written only through
 `SpokenContentType.save()`, which in ONE transaction locks the persisted row
