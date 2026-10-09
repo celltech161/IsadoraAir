@@ -26,7 +26,8 @@ EXPECTED_CONSTRAINTS = {
 class MigrationStructureTests(SimpleTestCase):
     def test_it_is_the_only_migration_and_contains_exactly_one_createmodel(self):
         names = sorted(path.name for path in MIGRATION.parent.glob("*.py"))
-        self.assertEqual(names, ["0001_initial.py", "__init__.py"])
+        # 2.22C adds 0002 (ReferenceAudio) -- see spoken/tests/test_migration.py.
+        self.assertEqual(names, ["0001_initial.py", "0002_referenceaudio.py", "__init__.py"])
         tree = ast.parse(MIGRATION.read_text())
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
@@ -90,7 +91,8 @@ class LivePlanClassificationTests(TransactionTestCase):
             # so unapplying production also unapplies it; production.0001 is
             # still planned first and judged on its own.
             self.assertEqual(refs[0], REF)
-            self.assertEqual(set(refs) - {REF}, {"library.0089_voicetrack_media"})
+            self.assertEqual(set(refs) - {REF}, {"library.0089_voicetrack_media", "production.0002_referenceaudio",
+                                                 "spoken.0001_initial"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
