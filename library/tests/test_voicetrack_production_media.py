@@ -636,7 +636,11 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
         call_command("migrate", "library", "0088", verbosity=0)
         try:
             payload = probe.build_probe_payload()
-            self.assertEqual([item["ref"] for item in payload["plan"]], ["library.0089_voicetrack_media"])
+            # 2.22C: spoken.0001 depends on library.0089 (Category/Track FKs), so
+            # unapplying library also unapplies it; library.0089 still plans
+            # first and is judged on its own (spoken has its own classifier test).
+            self.assertEqual([item["ref"] for item in payload["plan"]],
+                             ["library.0089_voicetrack_media", "spoken.0001_initial"])
             item = payload["plan"][0]
             self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
                              [("AddField", "additive")])

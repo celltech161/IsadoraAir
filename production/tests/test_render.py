@@ -31,7 +31,7 @@ RECIPES = ("cal_events", "usd239min", "news_item", "3min_ctr", "lcl_psa")
 SAFE_FILTER = re.compile(r"^[A-Za-z0-9_=:.,;|\[\]-]+$")
 
 
-class ParameterSafetyTests(SimpleTestCase):
+class ParameterSafetyTests(IsolatedMediaRootMixin, SimpleTestCase):
     def assert_code(self, code, recipe, raw):
         with self.assertRaises(render.RenderError) as raised:
             render.render(None, recipe, raw)                 # parameters are checked before any media access
@@ -82,7 +82,7 @@ class ParameterSafetyTests(SimpleTestCase):
         self.assertEqual(recipe.resolve({"bed_gain_db": 3})["bed_gain_db"], 3.0)
 
 
-class StepLibraryTests(SimpleTestCase):
+class StepLibraryTests(IsolatedMediaRootMixin, SimpleTestCase):
     def test_every_recipe_emits_only_safe_filter_text_at_its_extremes(self):
         for key in RECIPES:
             recipe = render.get(key)
@@ -125,7 +125,7 @@ class StepLibraryTests(SimpleTestCase):
             render.register(render.Recipe(key="lcl_psa", version=2, title="dup", plan=lambda p: steps.RenderPlan()))
 
 
-class LoudnormParsingTests(SimpleTestCase):
+class LoudnormParsingTests(IsolatedMediaRootMixin, SimpleTestCase):
     GOOD = {"input_i": "-23.10", "input_tp": "-4.20", "input_lra": "2.30", "input_thresh": "-33.50",
             "target_offset": "0.40"}
 

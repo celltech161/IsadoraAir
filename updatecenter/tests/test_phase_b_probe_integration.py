@@ -21,6 +21,7 @@ from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.executor import Executor, _strict_probe
 from isadoraair_updater.process import CommandRunner
 from updatecenter.management.commands.updatecenter_probe import build_probe_payload
+from .historical_graph import hold_dependents
 
 
 class TargetSourceRealGraphTests(SimpleTestCase):
@@ -213,10 +214,8 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
 
         def leaf_nodes(graph, app=None):
             leaves = current_leaf_nodes(graph, app)
-            return sorted(
-                self.r0077_library_leaf if app_label == "library" else (app_label, name)
-                for app_label, name in leaves
-            )
+            return sorted(hold_dependents(graph, leaves, {"library": self.r0077_library_leaf[1]},
+                                          drop_unapplied=True))
 
         with patch.object(MigrationGraph, "leaf_nodes", leaf_nodes):
             yield
@@ -224,12 +223,8 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
     def test_corrected_target_probe_and_real_postgres_migration(self):
         executor = MigrationExecutor(connection)
         latest_targets = executor.loader.graph.leaf_nodes()
-        r0075_targets = [
-            ("library", "0081_remotedjconfig_reconnect_grace_seconds")
-            if app_label == "library"
-            else (app_label, migration_name)
-            for app_label, migration_name in latest_targets
-        ]
+        r0075_targets = hold_dependents(executor.loader.graph, latest_targets,
+                                        {"library": "0081_remotedjconfig_reconnect_grace_seconds"})
 
         try:
             executor.migrate(r0075_targets)

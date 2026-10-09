@@ -30,12 +30,14 @@ from isadoraair_updater.executor import ExecutionError, Executor
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner
 
+from .historical_graph import hold_dependents
+
 
 
 def _library_targets(leaf):
     executor = MigrationExecutor(connection)
     leaves = executor.loader.graph.leaf_nodes()
-    return leaves, [("library", leaf) if app == "library" else (app, name) for app, name in leaves]
+    return leaves, hold_dependents(executor.loader.graph, leaves, {"library": leaf})
 
 
 class RecorderObservationTests(TransactionTestCase):
@@ -275,7 +277,9 @@ class RealGraphReconstructionTests(TransactionTestCase):
             # The REAL graph keeps growing: rolling library back to 0086 also
             # unapplies every later library migration (2.22B: 0089), which the
             # probe then correctly plans after the historical pair.
-            self.assertTrue(all(ref.startswith("library.") and ref > "library.0088" for ref in refs[2:]), refs)
+            # 2.22C: and spoken.0001, which depends on library.0089.
+            self.assertTrue(all((ref.startswith("library.") and ref > "library.0088") or ref == "spoken.0001_initial"
+                                for ref in refs[2:]), refs)
             MigrationExecutor(connection).migrate(after_m1)
             resumed = build_probe_payload(**context, recovery_plan_refs=refs)
             self.assertNotEqual(resumed["migration_plan_digest"], original["migration_plan_digest"])

@@ -32,6 +32,7 @@ from isadoraair_updater.staging import StagedSource
 from protected_bootstrap.manifest_field import parse_protected_runtime_field
 from updatecenter import release_chain
 from updatecenter.management.commands.updatecenter_probe import build_probe_payload
+from .historical_graph import hold_dependents
 
 # This is a historical r0088 -> r0092 simulation, but the probe always reports
 # every pending migration in the checkout it inspects and this suite runs it
@@ -42,20 +43,22 @@ from updatecenter.management.commands.updatecenter_probe import build_probe_payl
 R0092_LIBRARY_LEAF = ("library", "0085_remote_dj_queue_set_next_access")
 
 
-def _r0092_leaf_nodes(nodes):
-    return [
-        R0092_LIBRARY_LEAF if node[0] == "library"
-        else ("updatecenter", "0003_updatejob_migration_plan_review_and_more")
-        if node[0] == "updatecenter" else node
-        for node in nodes
-    ]
+def _r0092_leaf_nodes(nodes, graph=None):
+    """The r0092 tree: library and updatecenter at their r0092 leaves; apps
+    that did not exist then and depend on later library migrations (2.22C:
+    spoken) are left out."""
+    if graph is None:
+        graph = MigrationExecutor(connection).loader.graph
+    return hold_dependents(graph, nodes, {"library": R0092_LIBRARY_LEAF[1],
+                                          "updatecenter": "0003_updatejob_migration_plan_review_and_more"},
+                           drop_unapplied=True)
 
 
 def r0092_tree_probe(**kwargs):
     original = MigrationGraph.leaf_nodes
 
     def leaf_nodes(graph, app=None):
-        return _r0092_leaf_nodes(original(graph, app))
+        return _r0092_leaf_nodes(original(graph, app), graph)
 
     with mock.patch.object(MigrationGraph, "leaf_nodes", leaf_nodes):
         return build_probe_payload(**kwargs)
