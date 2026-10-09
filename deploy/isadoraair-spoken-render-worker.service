@@ -1,0 +1,28 @@
+[Unit]
+Description=IsadoraAir spoken-content render worker (leased; renders via isadoraair-render)
+Documentation=file://@@ISA_ROOT@@/docs/SPOKEN_CONTENT.md
+After=network.target postgresql.service isadoraair-render.service isadoraair-validation.service
+# Renders run in isadoraair-render and renditions are validated by
+# isadoraair-validation; without either, the worker's attempts fail closed
+# (bounded retries; items fail with a retryable code an operator can retry).
+Wants=isadoraair-render.service isadoraair-validation.service
+
+[Service]
+# Claims validated spoken items through their lease (spoken.worker), asks the
+# render service, ingests the sealed output as a rendition and completes or
+# fails the item. No job table: the item lease is the only authority. Dormant
+# until a spoken content type is enabled.
+Type=simple
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+EnvironmentFile=@@ISA_ROOT@@/.env
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py spoken_render_worker
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -185,29 +185,34 @@ range-checked numbers and emit filter text with fixed formats; configuration
 can never supply a filter, command or path. A reference parameter is a slug
 resolved through `ReferenceAudio`.
 
-`render(source, recipe_key, params)`:
-1. recipe from the code registry; parameters validated (unknown, wrong type,
-   out of bounds, non-finite, path-like or expression-like values refused);
-2. source must be present and valid; beds resolved by key, hash-verified;
-3. in a private `work/` directory: prepare (48 kHz stereo), mix, loudness
-   analysis (JSON parsed structurally; `-inf` ⇒ `silent_render`), apply +
-   FLAC — each a **bounded tool run** (`runner.py`): argv only, fixed tool
-   path and environment, `prlimit` (address space, CPU, output size, files,
-   no core; missing `prlimit` ⇒ not run), own session killed at the deadline,
-   capped output, only the media descriptors passed (`/proc/self/fd/N`);
-4. the FLAC goes through the ordinary rendition intake
-   (`intake.ingest_derivative`, `kind=rendition`): validated by the validation
-   service — ffprobe, full decode **and the engine's GStreamer decode** — and
-   recorded with `derived_from`, recipe key/version, the canonical provenance
-   digest (`render/provenance.py`: recipe, version, engine version, fully
-   resolved params and the exact reference registrations/bytes) and the
-   toolchain identity.
+`render(source, recipe_key, params)` never renders in the calling process.
+Since Phase C2A it is the client of a **separate, sandboxed render executor**
+(`isadoraair-render`, below):
 
-Failures raise `RenderError` with a stable code and leave **no bindable
-rendition**: nothing is ingested before every step succeeded, an invalid
-rendition is refused by intake (no row), a validation-infrastructure failure
-leaves an `unvalidated` row nothing can bind; the scratch directory is always
-removed; the source is never touched; retries make new renditions.
+1. `render/client.py`: recipe from the code registry, parameters validated
+   (unknown, wrong type, out of bounds, non-finite, path-like or
+   expression-like values refused); the source must be present and valid;
+   beds resolved by key and hash-verified; source and beds are opened
+   **read-only** and sent as descriptors with the canonical provenance digest
+   the client expects;
+2. the executor proves every descriptor's bytes, the recipe version, the
+   parameters, the pinned references and the digest, runs the fixed steps —
+   prepare (48 kHz stereo), mix, loudness analysis (JSON parsed structurally;
+   `-inf` ⇒ `silent_render`), apply + FLAC — and returns the FLAC as a
+   **sealed memfd**;
+3. `render/rendition.py` — the **sole rendition-creation authority** —
+   streams that same descriptor through the ordinary derivative intake:
+   validated by the validation service (ffprobe, full decode **and the
+   engine's GStreamer decode**) and recorded with `derived_from`, recipe
+   key/version, the canonical provenance digest (`render/provenance.py`) and
+   the executor's toolchain identity (`…; executor isadoraair-render/1`).
+
+Failures raise `RenderError` with a stable code (and `retryable`) and leave
+**no bindable rendition**: an invalid rendition is refused by intake (no row);
+a validation-infrastructure failure leaves an `unvalidated` row nothing can
+bind; the source is never touched; retries make new renditions. A render that
+completion later finds outdated stays an immutable, unbindable orphan for
+ordinary retention.
 
 ### Render completion (`transitions.complete_processing`)
 
@@ -236,17 +241,95 @@ completion holds, the only orders are "completion under the old
 configuration, then the change" or "change, then the old render refused".
 No in-flight configuration snapshot (and so no migration) is needed in C1.
 
-### C2 gate — sandboxed render executor (mandatory before any type is enabled)
+### The render executor — `isadoraair-render` (Phase C2A)
 
-Validators run inside the `isadoraair-validation` service's
-cgroup/Landlock/seccomp boundary; renders currently run in the calling
-process under `prlimit`, on sources that already passed that boundary. That is
-acceptable only while C1 is dormant (no production type enabled, projection
-closed). Before C2 enables anything, rendering moves to a **separate**
-sandboxed render executor: its own service and socket, its own worker pool and
-cgroup, Landlock/seccomp, its own admission limits, Monitoring, and an
-output-descriptor protocol returning `RenderEvidence`. Its release restarts
-services by operator action.
+A **separate** service from `isadoraair-validation`
+(`deploy/isadoraair-render.service`; `manage.py production_render_service`;
+`production/services/render_service.py`): its own unit, Unix socket
+(`/run/isadoraair-render/render.sock`, 0600 in a 0700 runtime directory,
+same-account peers only via `SO_PEERCRED`), delegated cgroup subtree
+(`<unit>/iportal-render/run-<id>`), admission pool, limits, status file and
+Monitoring card. A render — two ffmpeg passes over a whole programme — can
+therefore never consume validation capacity, delay uploads, or change the
+validator's authority; each degrades independently (tested both ways).
+
+**Protocol** (`render/protocol.py`, version 1): one connection, one request,
+one answer, each a JSON line. The only operation is `render`: a
+code-registered recipe key and version, the type's raw parameters, the source
+and each pinned reference as `{media, sha256, bytes, duration}` with their
+**read-only descriptors** (SCM_RIGHTS), the expected provenance digest, a
+timeout and a correlation (`item`, `lease`). Nothing in it can name a
+command, executable, ffmpeg option, filter, path or URL. The answer is
+`status: ok` with exactly one **sealed memfd** (`F_SEAL_WRITE|GROW|SHRINK|SEAL`)
+and its size and SHA-256, the recipe, digest, provenance document, measured
+loudness and the executor's toolchain — or a stable error code (never tool
+output or paths; those go to the service journal, bounded).
+
+**Executor** (`render/executor.py`): every received descriptor must be a
+regular file opened **read-only** whose size and SHA-256 are the claimed ones
+(a substituted descriptor is refused before anything runs); the recipe
+version must be the registered one; the pinned references must be exactly the
+ones the plan uses; its own canonical digest must equal the client's
+expectation. Each step is a fixed ffmpeg argv built from the step library with
+the pinned absolute ffmpeg, `-protocol_whitelist fd`, inputs as fresh
+read-only reopens (`-fd N -i fd:`) and outputs as service-created memfds
+(`-fd N fd:`) — no path appears anywhere.
+
+**Sandbox** (every step, `confinement.execute` with the launcher's `render`
+profile): cgroup leaf limits (1.5 GiB for the step's tree, 64 tasks, one CPU,
+30 CPU-minutes), no_new_privs, **Landlock with no filesystem writes at all and
+reads only beneath /usr, /lib, /lib64, the loader cache/timezone in /etc and
+the CPU topology** (not the station's homes, source tree, media library,
+configuration or keys), **seccomp denying `socket(2)`** (no network, netlink
+or unix sockets) and `clone3`, rlimits (AS 2 GiB, FSIZE 1 GiB, NOFILE 256, no
+core), a fixed environment (`PATH=/usr/bin:/bin`, `LC_ALL=C.UTF-8`,
+`HOME`/`TMPDIR` nonexistent — nothing inherited), its own session, the
+service's hard deadline (`120 s + 6 × duration`, ≤ 1 h), and `cgroup.kill` of
+the whole tree when the step ends. Start-up destroys leftover leaves and runs
+a confined toolchain probe before the socket is bound. The unit adds
+`PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `ProtectSystem=strict`,
+`ProtectHome=read-only`, no capabilities, `MemoryMax=3G`, `TasksMax=256` and
+`CPUWeight=50` (a render yields to playout).
+
+**Admission**: at most 1 render at once (operator domain 1–2) and 2 admitted
+requests waiting (0–4); anything beyond is answered `busy` from the accept
+loop without reading the request. A slot is released on success, failure,
+timeout and client disconnect (closing the connection cancels the render);
+a failed step or a malformed request never affects the next one.
+
+**Sole rendition authority**: a `rendition` row can be inserted only inside
+`production.models.rendition_authority`, which `render/rendition.py` opens
+naming the exact row (parent, recipe key/version, digest, executor
+toolchain, output SHA-256) for an `ExecutorOutput` the client issued (identity
+sealed, single use). `ProductionMedia.save()` refuses any other rendition
+insert — and re-reads the row afterwards, so a `pre_save` receiver cannot
+alter it; `bulk_create` refuses renditions; generic intake refuses
+`kind=rendition` before staging a byte. Completion additionally requires the
+executor's identity in the rendition's toolchain. Raw SQL is outside the
+boundary.
+
+**Worker** (`spoken/worker.py`; `manage.py spoken_render_worker [--once]`;
+`deploy/isadoraair-spoken-render-worker.service`): claims a validated item (or
+one whose lease expired) with `start_processing` — the item lease is the only
+authority, no job table — renders, completes with the exact evidence, or
+fails. Transient failures (busy, service/sandbox unavailable, timeout, an
+unvalidated rendition) retry twice within the lease (2 s, 10 s); one
+`render_outdated` re-renders against the current configuration; deterministic
+failures fail at once; more than 3 claims fail `attempts_exhausted`; a lease
+lost to expiry is left to its new holder. Operator-attention conditions emit a
+`spoken_render` SystemEvent; SpokenItemEvent stays the history. Nothing renders
+in the web request path.
+
+**Monitoring** (`production/services/render_health.py`, the Systemd Service
+check's readiness hook for `isadoraair-render.service`): socket, status file
+(limits, renders running/waiting, last failure code and time) and an
+empty-request handshake — read-only; the card has no Restart button.
+
+**Deployment** (not done in C2A): the two units are not in the protected
+runtime's managed-unit policy, so Update Center cannot install or restart
+them yet; a release must declare them and a new protected-runtime generation
+must authorize them (or an operator installs them). No content type is
+enabled.
 
 ## The five recipes (`spoken/recipes.py`, all version 1)
 
@@ -302,9 +385,10 @@ registration keeps its bed media retained (PROTECT; purge refuses), so every
 rendition's provenance stays resolvable. Beds are few and small; that cost is
 the price of provenance, not a leak.
 
-## Not in C1
+## Not in C1 / C2A
 
 Library Track projection, promotion/rollback, stale recall, expiry, Track
-reconcile (C2); worker command; any HTTP/recorder surface for spoken content;
+reconcile (C2B); any HTTP/recorder surface for spoken content; enabling any
+content type;
 per-type grants and work queue (Phase E); active messages (Phase D);
 occurrence voice tracking (2.6); legacy import or OGRemote changes (Phase F/G).

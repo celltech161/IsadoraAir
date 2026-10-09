@@ -1,0 +1,60 @@
+[Unit]
+Description=IsadoraAir iPortal render executor (sole owner of recipe-render processes)
+Documentation=file://@@ISA_ROOT@@/docs/SPOKEN_CONTENT.md
+After=network.target
+# Restart forever: a crash loop must never leave render runs unowned.
+StartLimitIntervalSec=0
+
+[Service]
+# SEPARATE from isadoraair-validation: its own socket, delegated cgroup
+# subtree (<unit>/iportal-render/run-<id>), admission pool and limits, so a
+# saturated or failed renderer never touches validation capacity. Every
+# ffmpeg render step lives in a leaf of THIS unit, confined by the launcher's
+# "render" profile (Landlock: no filesystem writes, reads only beneath /usr,
+# /lib, /lib64 and the loader cache/timezone; seccomp: no clone3, no
+# socket(2)); inputs and outputs are descriptors only.
+Type=simple
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+EnvironmentFile=@@ISA_ROOT@@/.env
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py production_render_service
+Delegate=cpu memory pids
+DelegateSubgroup=supervisor
+KillMode=control-group
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+# The socket and status file live here, closed to everyone else (the worker
+# runs as the same account; browsers never reach it).
+RuntimeDirectory=isadoraair-render
+RuntimeDirectoryMode=0700
+UMask=0077
+# Whole-unit backstops above the per-step leaf limits, and a lower CPU weight
+# than the on-air engine: a render yields to playout.
+MemoryMax=3G
+TasksMax=256
+CPUWeight=50
+# The service needs no network (clients and the socket are local AF_UNIX), no
+# privilege and no writable filesystem beyond its runtime directory and its
+# own delegated cgroup subtree.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
