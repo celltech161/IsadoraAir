@@ -147,10 +147,18 @@ class CodexBypassRegressionTests(GrantFixtures):
             item_id=row.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED, item_values=self.plan_values,
             event_values=tuple(self.event_values().items()))
         before = item_snapshot(self.a)
+        opened = []
+        real = guard._authorized
+
+        def spy(record):
+            opened.append(type(record).__name__)
+            return real(record)
         for label, attempt in {"_commit": lambda: transitions._commit(row, forged),
                                "_write_event": lambda: transitions._write_event(forged)}.items():
-            with self.subTest(helper=label), self.assertRaises(Refused), transaction.atomic():
-                attempt()
+            with self.subTest(helper=label), mock.patch.object(guard, "_authorized", spy):
+                with self.assertRaises(Refused), transaction.atomic():
+                    attempt()
+        self.assertEqual(opened, [])                    # refused before any grant is opened
         self.assertEqual(item_snapshot(self.a), before)
 
 
