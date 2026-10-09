@@ -19,6 +19,7 @@ from spoken import guard, transitions
 from spoken.configuration import ConfigurationError
 from spoken.models import ItemState, SpokenContentType, SpokenItem, SpokenItemEvent
 
+from .support import raw_insert
 from .test_domain import make_category, make_type, media
 
 User = get_user_model()
@@ -178,8 +179,7 @@ class SpokenItemAuthorityTests(AuthorityFixtures):
     def test_an_eventless_item_cannot_be_deleted_either(self):
         # Codex's reproduction: an item with no events (so no PROTECT row
         # stands in the way) must still be undeletable through the ORM.
-        with guard.transition_scope():
-            bare = SpokenItem.objects.create(content_type=self.ctype, state=S.DRAFT)
+        bare = raw_insert(SpokenItem, content_type=self.ctype, state=S.DRAFT)
         self.snapshot = self.state()
         for name, manager in self.managers().items():
             if name == "user.spoken_items":
@@ -188,8 +188,10 @@ class SpokenItemAuthorityTests(AuthorityFixtures):
                 self.assert_refused(lambda: manager.filter(pk=bare.pk).delete())
         self.assert_refused(bare.delete)
 
-    def test_inside_the_scope_the_state_must_still_be_an_item_state(self):
-        with guard.transition_scope():
+    def test_while_a_grant_is_open_the_state_must_still_be_an_item_state(self):
+        grant = guard.ItemWrite(item_id=self.item.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED,
+                                values=(("state", S.VALIDATED),))
+        with guard._authorized(grant):
             self.assert_refused(lambda: SpokenItem.objects.create(content_type=self.ctype, state="not_a_state"))
             self.assert_refused(lambda: SpokenItem.objects.filter(pk=self.item.pk).update(state="bogus"))
             self.assert_refused(lambda: SpokenItem.objects.bulk_create([SpokenItem(content_type=self.ctype)]))
@@ -263,7 +265,11 @@ class SpokenItemEventAuthorityTests(AuthorityFixtures):
                 with self.subTest(manager=name, api=label):
                     self.assert_refused(attempt)
         self.assert_refused(SpokenItemEvent.objects.first().delete)
-        with guard.transition_scope():                                  # append-only even for the service
+        event = SpokenItemEvent.objects.filter(item=self.item).last()
+        grant = guard.EventCreate(values=tuple(
+            (f.attname, getattr(event, f.attname)) for f in SpokenItemEvent._meta.concrete_fields
+            if f.attname not in ("id", "created_at")))
+        with guard._authorized(grant):                                  # append-only even under a grant
             self.assert_refused(lambda: SpokenItemEvent.objects.all().delete())
             self.assert_refused(lambda: SpokenItemEvent.objects.bulk_create([]))
 

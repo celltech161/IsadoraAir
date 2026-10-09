@@ -381,9 +381,7 @@ class SpokenItemEvent(models.Model):
         return f"{self.event} {self.from_state}->{self.to_state}"
 
     def save(self, *args, **kwargs):
-        if not self._state.adding:
-            raise guard.SpokenIntegrityError("spoken item events are append-only")
-        guard.check_event_write()
+        guard.check_event_write(self)                  # exact, single-use authorization (or refused)
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):

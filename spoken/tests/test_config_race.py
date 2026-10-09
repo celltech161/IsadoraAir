@@ -83,7 +83,7 @@ class RenameRaceTests(TransactionTestCase):
         seam = sessions.Seam(transitions._bounded, "creator")
         with mock.patch.object(transitions, "_bounded", seam):
             a, a_box = sessions.run_thread("creator", self.create_item())
-            self.assertTrue(seam.reached.wait(sessions.WAIT))           # A: type locked, item inserted
+            self.assertTrue(seam.reached.wait(sessions.WAIT))           # A: type locked, item planned
             b, b_box = sessions.run_thread("renamer", self.rename_to("renamed"))
             observed = sessions.blocked_or_done(b)
             seam.release.set()

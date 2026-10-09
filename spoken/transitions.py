@@ -8,8 +8,18 @@ Every state change goes through ``_apply``:
    state is the one it found);
 3. check actor, policy and evidence against the locked, authoritative row;
 4. bind any media under ``lock_for_binding`` (the ProductionMedia binding
-   rule), update state and timestamps;
-5. append the SpokenItemEvent -- state and event commit together or not at all.
+   rule) and verify any further evidence (render completion);
+5. compute ONE immutable ``TransitionPlan`` -- the exact protected item
+   columns and the exact event -- from the validated data;
+6. write the item under an exact, single-use ``ItemWrite`` grant derived from
+   the plan, then the event under an exact ``EventCreate`` grant derived from
+   the same plan (spoken.guard) -- state and event commit together or not at
+   all.
+
+There is no trusted "inside the service" context: each grant authorizes one
+statement with one payload, is checked against the transition table, and is
+closed before anything else runs. Creation (``create_item``) works the same
+way with an ``ItemCreate`` grant for the exact new row.
 
 Render completion additionally locks the item's content type FIRST (the
 same row lock configuration saves and ``create_item`` take; order: type ->
@@ -25,6 +35,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -36,8 +47,10 @@ from production.models import ProductionMedia
 from production.services import reference_audio, render, retention
 
 from . import guard
+from .lifecycle import TRANSITIONS, Rule, writable_columns  # noqa: F401 -- Rule re-exported
 from .models import (
-    ActorKind, ItemOrigin, ItemState, RecallPolicy, SpokenContentType, SpokenItem, SpokenItemEvent,
+    TERMINAL_STATES, ActorKind, ItemOrigin, ItemState, RecallPolicy, SpokenContentType, SpokenItem,
+    SpokenItemEvent,
 )
 
 S = ItemState
@@ -70,41 +83,6 @@ class ProjectionRequired(InvalidTransition):
     code = "projection_required"
 
 
-@dataclass(frozen=True)
-class Rule:
-    event: str
-    c2: bool = False          # needs the library-projection service (C2)
-
-
-TRANSITIONS: dict[tuple, Rule] = {
-    (None, S.DRAFT): Rule("created"),
-    (S.DRAFT, S.SUBMITTED): Rule("submitted"),
-    (S.SUBMITTED, S.VALIDATED): Rule("validated"),
-    (S.SUBMITTED, S.INVALID): Rule("invalid"),
-    (S.VALIDATED, S.PROCESSING): Rule("processing_started"),
-    (S.PROCESSING, S.PROCESSING): Rule("processing_reclaimed"),
-    (S.PROCESSING, S.PROCESSED): Rule("processed"),
-    (S.PROCESSING, S.FAILED): Rule("failed"),
-    (S.FAILED, S.VALIDATED): Rule("retried"),
-    (S.PROCESSED, S.AWAITING_REVIEW): Rule("review_requested"),
-    (S.AWAITING_REVIEW, S.REJECTED): Rule("rejected"),
-    # recall before delivery (no library effect)
-    (S.DRAFT, S.RECALLED): Rule("recalled"),
-    (S.SUBMITTED, S.RECALLED): Rule("recalled"),
-    (S.VALIDATED, S.RECALLED): Rule("recalled"),
-    (S.PROCESSED, S.RECALLED): Rule("recalled"),
-    (S.AWAITING_REVIEW, S.RECALLED): Rule("recalled"),
-    (S.FAILED, S.RECALLED): Rule("recalled"),
-    # library projection -- C2
-    (S.PROCESSED, S.DELIVERED): Rule("delivered", c2=True),
-    (S.AWAITING_REVIEW, S.DELIVERED): Rule("approved_delivered", c2=True),
-    (S.DELIVERED, S.SUPERSEDED): Rule("superseded", c2=True),
-    (S.SUPERSEDED, S.DELIVERED): Rule("repromoted", c2=True),
-    (S.DELIVERED, S.RECALLED): Rule("recalled", c2=True),
-    (S.DELIVERED, S.EXPIRED): Rule("expired", c2=True),
-}
-
-
 # -- actors -------------------------------------------------------------------------
 
 def is_manager(user) -> bool:
@@ -131,11 +109,88 @@ def _bounded(detail) -> dict:
     return json.loads(encoded)
 
 
+# -- plans: the exact writes a validated transition makes ------------------------------------
+
+@dataclass(frozen=True, eq=False)
+class TransitionPlan:
+    """The already-validated intended writes of one transition. Both grants
+    derive from this one object, so the item write and its event cannot
+    diverge. Only plans built by ``_plan`` (after validation) are committed."""
+
+    item_id: object
+    from_state: str | None
+    to_state: str
+    item_values: tuple            # ((attname, value), ...) -- protected item columns
+    event_values: tuple           # ((attname, value), ...) -- every event column
+
+
+_PLANNED = weakref.WeakSet()
+
+
+def _attname_values(model, values: dict) -> tuple:
+    """Field names (with related objects) -> sorted ((attname, raw value), ...)."""
+    out = {}
+    for name, value in values.items():
+        field = model._meta.get_field(name)
+        if field.is_relation:
+            value = getattr(value, "pk", value)
+        out[field.attname] = value
+    return tuple(sorted(out.items()))
+
+
+def _plan(row, *, from_state, to_state, rule, changes, actor_kind, user, username, media, detail) -> TransitionPlan:
+    item_values = _attname_values(SpokenItem, changes)
+    if from_state is not None:
+        extra = {name for name, _ in item_values} - writable_columns(from_state, to_state)
+        if extra:                                            # a service bug, never a caller's choice
+            raise InvalidTransition(f"{from_state} -> {to_state} does not write {sorted(extra)}")
+    event_values = _attname_values(SpokenItemEvent, {
+        "item": row.pk, "event": rule.event, "from_state": from_state or "", "to_state": to_state,
+        "actor_kind": actor_kind, "actor": user, "actor_username": username, "media": media,
+        "asset": None, "edition": None, "detail": _bounded(detail),
+    })
+    plan = TransitionPlan(item_id=row.pk, from_state=from_state, to_state=to_state, item_values=item_values,
+                          event_values=event_values)
+    _PLANNED.add(plan)
+    return plan
+
+
+def _require_planned(plan, row) -> None:
+    if plan not in _PLANNED or str(plan.item_id) != str(row.pk):
+        raise guard.SpokenIntegrityError("only a validated transition plan is committed, once")
+
+
+def _write_event(plan) -> SpokenItemEvent:
+    if plan not in _PLANNED:
+        raise guard.SpokenIntegrityError("only a validated transition plan is committed, once")
+    _PLANNED.discard(plan)                                   # a plan records exactly one event
+    with guard._authorized(guard.EventCreate(values=plan.event_values)):
+        return SpokenItemEvent.objects.create(**dict(plan.event_values))
+
+
+def _commit(row, plan) -> None:
+    """Perform exactly the plan: one item save under its ItemWrite grant, then
+    one event insert under its EventCreate grant. Each grant covers only its
+    own statement; the plan is spent afterwards."""
+    _require_planned(plan, row)
+    if plan.from_state is None:
+        raise guard.SpokenIntegrityError("creation plans are committed by create_item")
+    for attname, value in plan.item_values:
+        setattr(row, attname, value)
+    with guard._authorized(guard.ItemWrite(item_id=plan.item_id, from_state=plan.from_state,
+                                           to_state=plan.to_state, values=plan.item_values)):
+        row.save()
+    _write_event(plan)
+
+
 # -- the core ---------------------------------------------------------------------------
 
 def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_from=None, detail=None,
-           check=None, mutate=None, media=None, require_valid_media=True, lock_type=False, verify=None):
-    with transaction.atomic(), guard.transition_scope():
+           check=None, changes=None, media=None, require_valid_media=True, lock_type=False, verify=None):
+    """``changes(row, bound, now)`` returns the transition's own protected
+    columns ({field name: value}); state, its timestamp and terminal_at are
+    added here."""
+    with transaction.atomic():
         pk = getattr(item, "pk", item)
         if lock_type:
             # content_type is immutable on an item (guard), so reading it
@@ -163,18 +218,13 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
         if verify is not None:
             verify(row, bound)
         now = timezone.now()
-        from_state = row.state
-        if mutate is not None:
-            mutate(row, bound, now)
-        row.state = to_state
-        row.state_changed_at = now
-        if to_state in (S.RECALLED, S.EXPIRED, S.INVALID, S.REJECTED):
-            row.terminal_at = now
-        row.save()
-        SpokenItemEvent.objects.create(
-            item=row, event=rule.event, from_state=from_state, to_state=to_state, actor_kind=actor_kind,
-            actor=user, actor_username=username, media=bound, detail=_bounded(detail),
-        )
+        planned = dict(changes(row, bound, now)) if changes is not None else {}
+        planned.update(state=to_state, state_changed_at=now)
+        if to_state in TERMINAL_STATES:
+            planned["terminal_at"] = now
+        plan = _plan(row, from_state=row.state, to_state=to_state, rule=rule, changes=planned,
+                     actor_kind=actor_kind, user=user, username=username, media=bound, detail=detail)
+        _commit(row, plan)
         return row
 
 
@@ -182,25 +232,30 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
 
 def create_item(content_type, *, actor, title="", notes="", origin=ItemOrigin.SUBMITTED, detail=None) -> SpokenItem:
     """(none) -> draft. The type must be enabled. ``imported`` items are
-    created only by the Phase F import tooling."""
+    created only by the Phase F import tooling. The item and its ``created``
+    event are inserted in one transaction, each under its exact grant."""
     if origin == ItemOrigin.IMPORTED:
         raise NotPermitted("imported items are created by the import tooling (Phase F)")
     if origin not in (ItemOrigin.SUBMITTED, ItemOrigin.ASSIGNED):
         raise NotPermitted("unknown origin")
     user, username = _actor_columns(actor, ActorKind.USER)
-    with transaction.atomic(), guard.transition_scope():
+    with transaction.atomic():
         ctype = SpokenContentType.objects.select_for_update().get(pk=getattr(content_type, "pk", content_type))
         if not ctype.enabled:
             raise NotPermitted("this content type is disabled", code="type_disabled")
         now = timezone.now()
-        row = SpokenItem.objects.create(
-            content_type=ctype, origin=origin, submitted_by=user, submitted_by_username=username,
-            title=str(title)[:200], notes=str(notes), state=S.DRAFT, state_changed_at=now,
-        )
-        SpokenItemEvent.objects.create(
-            item=row, event=TRANSITIONS[(None, S.DRAFT)].event, from_state="", to_state=S.DRAFT,
-            actor_kind=ActorKind.USER, actor=user, actor_username=username, detail=_bounded(detail),
-        )
+        row = SpokenItem(id=uuid.uuid4(), content_type=ctype, origin=origin, submitted_by=user,
+                         submitted_by_username=username, title=str(title)[:200], notes=str(notes),
+                         state=S.DRAFT, state_changed_at=now)
+        plan = _plan(row, from_state=None, to_state=S.DRAFT, rule=TRANSITIONS[(None, S.DRAFT)],
+                     changes={"content_type": ctype, "origin": origin, "submitted_by": user,
+                              "submitted_by_username": username, "title": row.title, "notes": row.notes,
+                              "state": S.DRAFT, "state_changed_at": now},
+                     actor_kind=ActorKind.USER, user=user, username=username, media=None, detail=detail)
+        _require_planned(plan, row)
+        with guard._authorized(guard.ItemCreate(item_id=plan.item_id, values=plan.item_values)):
+            row.save(force_insert=True)
+        _write_event(plan)
         return row
 
 
@@ -229,11 +284,10 @@ def submit(item, media, *, actor) -> SpokenItem:
         if limit is not None and candidate.byte_size > limit:
             raise EvidenceRefused("the media is larger than this type allows", code="too_large")
 
-    def mutate(row, bound, now):
-        row.submission_media = bound
-        row.submitted_at = now
+    def changes(row, bound, now):
+        return {"submission_media": bound, "submitted_at": now}
 
-    return _apply(item, S.SUBMITTED, actor=actor, check=check, mutate=mutate, media=media,
+    return _apply(item, S.SUBMITTED, actor=actor, check=check, changes=changes, media=media,
                   require_valid_media=False, detail={"media": str(getattr(media, "pk", media))})
 
 
@@ -255,13 +309,13 @@ def record_validation(item, *, actor_kind=ActorKind.SYSTEM) -> SpokenItem:
         code = policy_duration_code(media.decoded_duration_seconds, media_policy_for(row.content_type))
     if code:
         def fail(row, bound, now):
-            row.failure_code, row.failure_detail = code[:64], ""
-        return _apply(row, S.INVALID, actor_kind=actor_kind, expected_from=(S.SUBMITTED,), mutate=fail,
+            return {"failure_code": code[:64], "failure_detail": ""}
+        return _apply(row, S.INVALID, actor_kind=actor_kind, expected_from=(S.SUBMITTED,), changes=fail,
                       detail={"code": code})
 
     def ok(row, bound, now):
-        row.validated_at = now
-    return _apply(row, S.VALIDATED, actor_kind=actor_kind, expected_from=(S.SUBMITTED,), mutate=ok,
+        return {"validated_at": now}
+    return _apply(row, S.VALIDATED, actor_kind=actor_kind, expected_from=(S.SUBMITTED,), changes=ok,
                   media=media, detail={"duration_seconds": str(media.decoded_duration_seconds)})
 
 
@@ -278,14 +332,13 @@ def start_processing(item, *, lease_seconds=600, actor_kind=ActorKind.WORKER) ->
         if row.state == S.PROCESSING and (row.lease_expires_at is None or row.lease_expires_at > timezone.now()):
             raise InvalidTransition("the item is leased to another worker", code="lease_held")
 
-    def mutate(row, bound, now):
-        row.lease_token, row.lease_expires_at = token, now + timedelta(seconds=int(lease_seconds))
-        row.processing_attempts = min(row.processing_attempts + 1, 1000)
-        row.processing_started_at = now
-        row.failure_code, row.failure_detail = "", ""
+    def changes(row, bound, now):
+        return {"lease_token": token, "lease_expires_at": now + timedelta(seconds=int(lease_seconds)),
+                "processing_attempts": min(row.processing_attempts + 1, 1000), "processing_started_at": now,
+                "failure_code": "", "failure_detail": ""}
 
     row = _apply(item, S.PROCESSING, actor_kind=actor_kind, expected_from=(S.VALIDATED, S.PROCESSING),
-                 check=check, mutate=mutate, detail={"lease_seconds": int(lease_seconds)})
+                 check=check, changes=changes, detail={"lease_seconds": int(lease_seconds)})
     return row, token
 
 
@@ -356,15 +409,13 @@ def complete_processing(item, *, lease_token, evidence, render_detail=None,
     def check(row, user):
         _require_lease(row, lease_token)
 
-    def mutate(row, bound, now):
-        row.rendition_media = bound
-        row.processed_at = now
-        row.lease_token = row.lease_expires_at = None
+    def changes(row, bound, now):
+        return {"rendition_media": bound, "processed_at": now, "lease_token": None, "lease_expires_at": None}
 
     detail = {"rendition": evidence.rendition_id, "evidence": evidence.as_dict()}
     detail.update(render_detail or {})
     return _apply(item, S.PROCESSED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), check=check,
-                  mutate=mutate, media=evidence.rendition_id, detail=detail, lock_type=True,
+                  changes=changes, media=evidence.rendition_id, detail=detail, lock_type=True,
                   verify=lambda row, bound: _verify_render(row, bound, evidence))
 
 
@@ -372,12 +423,12 @@ def fail_processing(item, *, lease_token, code, detail="", actor_kind=ActorKind.
     def check(row, user):
         _require_lease(row, lease_token)
 
-    def mutate(row, bound, now):
-        row.failure_code, row.failure_detail = str(code)[:64], str(detail)[:500]
-        row.lease_token = row.lease_expires_at = None
+    def changes(row, bound, now):
+        return {"failure_code": str(code)[:64], "failure_detail": str(detail)[:500], "lease_token": None,
+                "lease_expires_at": None}
 
     return _apply(item, S.FAILED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), check=check,
-                  mutate=mutate, detail={"code": str(code)[:64]})
+                  changes=changes, detail={"code": str(code)[:64]})
 
 
 def retry(item, *, actor) -> SpokenItem:
@@ -385,10 +436,10 @@ def retry(item, *, actor) -> SpokenItem:
         if not is_manager(user):
             raise NotPermitted("only a manager may retry a failed item")
 
-    def mutate(row, bound, now):
-        row.failure_code, row.failure_detail = "", ""
+    def changes(row, bound, now):
+        return {"failure_code": "", "failure_detail": ""}
 
-    return _apply(item, S.VALIDATED, actor=actor, expected_from=(S.FAILED,), check=check, mutate=mutate)
+    return _apply(item, S.VALIDATED, actor=actor, expected_from=(S.FAILED,), check=check, changes=changes)
 
 
 # -- review and recall ---------------------------------------------------------------------------
@@ -405,12 +456,11 @@ def reject(item, *, actor, note="") -> SpokenItem:
         if not is_manager(user):
             raise NotPermitted("only a manager may review")
 
-    def mutate(row, bound, now):
-        row.reviewed_by, row.reviewed_at = actor, now
-        row.reviewed_by_username = actor.get_username()[:150]
-        row.review_note = str(note)[:1000]
+    def changes(row, bound, now):
+        return {"reviewed_by": actor, "reviewed_at": now, "reviewed_by_username": actor.get_username()[:150],
+                "review_note": str(note)[:1000]}
 
-    return _apply(item, S.REJECTED, actor=actor, expected_from=(S.AWAITING_REVIEW,), check=check, mutate=mutate,
+    return _apply(item, S.REJECTED, actor=actor, expected_from=(S.AWAITING_REVIEW,), check=check, changes=changes,
                   detail={"note": str(note)[:1000]})
 
 
@@ -425,9 +475,8 @@ def recall(item, *, actor, reason="") -> SpokenItem:
             raise NotPermitted("only managers may recall this type")
         _owner_or_manager(row, user)
 
-    def mutate(row, bound, now):
-        row.recalled_by, row.recalled_at = actor, now
-        row.recalled_by_username = actor.get_username()[:150]
-        row.recall_reason = str(reason)[:500]
+    def changes(row, bound, now):
+        return {"recalled_by": actor, "recalled_at": now, "recalled_by_username": actor.get_username()[:150],
+                "recall_reason": str(reason)[:500]}
 
-    return _apply(item, S.RECALLED, actor=actor, check=check, mutate=mutate, detail={"reason": str(reason)[:500]})
+    return _apply(item, S.RECALLED, actor=actor, check=check, changes=changes, detail={"reason": str(reason)[:500]})

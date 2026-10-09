@@ -103,3 +103,12 @@ def integrated_loudness(path) -> float:
                              "-"], capture_output=True, text=True, check=True)
     values = re.findall(r"I:\s+(-?\d+(?:\.\d+)?) LUFS", result.stderr)
     return float(values[-1])
+
+
+def raw_insert(model, **values):
+    """Insert one row WITHOUT the spoken guards -- Django's base
+    QuerySet.bulk_create called directly, i.e. the raw-SQL-equivalent path
+    that is outside the ORM authority boundary. Only for proving database
+    constraints and for fabricating adversarial fixtures."""
+    from django.db.models import QuerySet
+    return QuerySet.bulk_create(model._base_manager.all(), [model(**values)])[0]

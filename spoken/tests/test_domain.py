@@ -21,6 +21,7 @@ from spoken.models import (
     AssetMode, AssetState, EditionState, ItemState, RecallPolicy, SpokenAsset, SpokenAssetEdition,
     SpokenContentType, SpokenItem, SpokenItemEvent,
 )
+from spoken.tests.support import raw_insert
 
 User = get_user_model()
 S = ItemState
@@ -243,9 +244,9 @@ class LifecycleTests(Fixtures):
         with self.assertRaises(transitions.InvalidTransition) as raised:
             transitions.start_processing(item)                         # still held
         self.assertEqual(raised.exception.code, "lease_held")
-        with guard.transition_scope():                                  # the lease expires
-            SpokenItem.objects.filter(pk=item.pk).update(lease_expires_at=timezone.now() - timedelta(seconds=1))
-        item, new_token = transitions.start_processing(item)
+        later = timezone.now() + timedelta(hours=2)                     # the lease has expired by then
+        with mock.patch("django.utils.timezone.now", return_value=later):
+            item, new_token = transitions.start_processing(item)
         self.assertEqual(item.processing_attempts, 2)
         self.assertNotEqual(new_token, token)
         rendition = self.rendition_for(item)
@@ -385,14 +386,13 @@ class DatabaseInvariantTests(Fixtures):
     bypass the services."""
 
     def assert_rejected(self, make):
-        with self.assertRaises(IntegrityError), transaction.atomic(), guard.transition_scope():
+        with self.assertRaises(IntegrityError), transaction.atomic():
             make()
 
     def raw_item(self, **overrides):
         values = dict(content_type=self.ctype, state=S.DRAFT)
         values.update(overrides)
-        with guard.transition_scope():
-            return SpokenItem.objects.create(**values)
+        return raw_insert(SpokenItem, **values)
 
     def test_item_invariants(self):
         self.assert_rejected(lambda: self.raw_item(lease_token="00000000-0000-0000-0000-000000000001"))
