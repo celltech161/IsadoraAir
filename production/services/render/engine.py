@@ -17,7 +17,9 @@
    the validation service -- including the engine's own GStreamer decode --
    and only a ``valid`` result becomes a usable rendition, with
    ``derived_from`` = the source, the recipe key/version, the canonical
-   parameter digest and the toolchain identity.
+   provenance digest (production.services.render.provenance -- the SAME
+   helper a consumer uses to verify a rendition at completion) and the
+   toolchain identity.
 
 Any failure raises RenderError and leaves no bindable rendition: nothing is
 ingested until every step succeeded, an invalid rendition is refused by
@@ -40,9 +42,9 @@ from ...models import ProductionMedia
 from ...policy import MediaPolicy
 from .. import intake, layout, media_io, reference_audio, validation
 from . import params as params_mod
+from . import provenance as provenance_mod
 from . import registry, runner
-
-ENGINE_VERSION = 1
+from .provenance import ENGINE_VERSION, RenderEvidence
 _DETAIL_LIMIT = 500
 _LOUDNORM_KEYS = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
 
@@ -66,6 +68,13 @@ class RenderResult:
     params_digest: str
     toolchain: str
     measured_input: dict              # first-pass loudness of the pre-normalization mix
+
+    @property
+    def evidence(self) -> RenderEvidence:
+        """The primitive claim a consumer checks (never trusts) at completion."""
+        return RenderEvidence(rendition_id=str(self.media.pk), source_id=str(self.media.derived_from_id),
+                              recipe_key=self.recipe_key, recipe_version=self.recipe_version,
+                              provenance_digest=self.params_digest)
 
 
 @lru_cache(maxsize=4)
@@ -141,14 +150,11 @@ def _timeout_for(source: ProductionMedia, override) -> float:
 def render(source, recipe_key, recipe_params=None, *, owner=None, timeout_seconds=None,
            policy: MediaPolicy | None = None) -> RenderResult:
     try:
-        recipe = registry.get(recipe_key)
+        recipe, resolved, plan = provenance_mod.prepare(recipe_key, recipe_params)
     except registry.UnknownRecipe as exc:
         raise RenderError("unknown_recipe", str(exc)) from exc
-    try:
-        resolved = recipe.resolve(recipe_params)
     except params_mod.RecipeParameterError as exc:
         raise RenderError(exc.code, str(exc)) from exc
-    plan = recipe.build(resolved)
 
     ffmpeg = runner.resolve_tool(validation.FFMPEG)
     if ffmpeg is None or runner.resolve_tool("prlimit") is None:
@@ -164,7 +170,8 @@ def render(source, recipe_key, recipe_params=None, *, owner=None, timeout_second
     try:
         if plan.bed is not None:
             try:
-                bed = reference_audio.resolve(resolved[plan.bed.reference_param])
+                key = provenance_mod.reference_keys(plan, resolved)[plan.bed.reference_param]
+                bed = reference_audio.resolve(key)
             except reference_audio.ReferenceAudioError as exc:
                 raise RenderError(exc.code, str(exc)) from exc
         timeout = _timeout_for(source_row, timeout_seconds)
@@ -211,11 +218,9 @@ def render(source, recipe_key, recipe_params=None, *, owner=None, timeout_second
               *plan.encode.output_args(), str(rendition)], timeout=timeout, stage="encode", cwd=work)
 
         # 4. provenance + the ordinary validated rendition intake
-        provenance = {
-            "recipe": recipe.key, "version": recipe.version, "engine": ENGINE_VERSION, "params": resolved,
-            "references": {plan.bed.reference_param: bed.provenance()} if bed is not None else {},
-        }
-        digest = intake.digest_recipe_params(provenance)
+        provenance = provenance_mod.document(
+            recipe, resolved, {plan.bed.reference_param: bed.provenance()} if bed is not None else {})
+        digest = provenance_mod.digest(provenance)
         try:
             with open(rendition, "rb") as handle:
                 ingested = intake.ingest_derivative(

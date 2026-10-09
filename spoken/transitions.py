@@ -11,6 +11,11 @@ Every state change goes through ``_apply``:
    rule), update state and timestamps;
 5. append the SpokenItemEvent -- state and event commit together or not at all.
 
+Render completion additionally locks the item's content type FIRST (the
+same row lock configuration saves and ``create_item`` take; order: type ->
+item -> media -> reference key), so the configuration it verifies against
+cannot change before the processed state commits.
+
 Transitions that deliver to, or retire from, the library (``-> delivered``,
 ``-> superseded``, delivered ``-> recalled``/``expired``) are part of the table
 -- their identities are fixed now -- but are refused until the C2 projection
@@ -28,7 +33,7 @@ from django.utils import timezone
 
 from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
-from production.services import retention
+from production.services import reference_audio, render, retention
 
 from . import guard
 from .models import (
@@ -129,10 +134,17 @@ def _bounded(detail) -> dict:
 # -- the core ---------------------------------------------------------------------------
 
 def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_from=None, detail=None,
-           check=None, mutate=None, media=None, require_valid_media=True):
+           check=None, mutate=None, media=None, require_valid_media=True, lock_type=False, verify=None):
     with transaction.atomic(), guard.transition_scope():
-        row = SpokenItem.objects.select_for_update(of=("self",)).select_related("content_type").get(
-            pk=getattr(item, "pk", item))
+        pk = getattr(item, "pk", item)
+        if lock_type:
+            # content_type is immutable on an item (guard), so reading it
+            # unlocked is safe; the TYPE lock is taken before the item lock.
+            type_id = SpokenItem.objects.filter(pk=pk).values_list("content_type_id", flat=True).first()
+            if type_id is None:
+                raise SpokenItem.DoesNotExist("no such spoken item")
+            SpokenContentType.objects.select_for_update().filter(pk=type_id).values_list("pk").first()
+        row = SpokenItem.objects.select_for_update(of=("self",)).select_related("content_type").get(pk=pk)
         key = (row.state, to_state)
         rule = TRANSITIONS.get(key)
         if rule is None or (expected_from is not None and row.state not in expected_from):
@@ -148,6 +160,8 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
                 bound = retention.lock_for_binding(media, require_valid=require_valid_media)
             except (MediaPurged, MediaNotValidated, MediaInconsistent) as exc:
                 raise EvidenceRefused("the media is missing, purged or not valid", code="media_unusable") from exc
+        if verify is not None:
+            verify(row, bound)
         now = timezone.now()
         from_state = row.state
         if mutate is not None:
@@ -280,30 +294,78 @@ def _require_lease(row, token):
         raise EvidenceRefused("the lease is stale or belongs to another worker", code="stale_lease")
 
 
-def complete_processing(item, *, lease_token, rendition, render_detail=None,
+def _parse_evidence(evidence) -> render.RenderEvidence:
+    if isinstance(evidence, render.RenderResult):
+        evidence = evidence.evidence
+    if not isinstance(evidence, render.RenderEvidence):
+        raise EvidenceRefused("completion needs the render's RenderEvidence", code="rendition_mismatch")
+    try:
+        uuid.UUID(evidence.rendition_id)
+    except ValueError:
+        raise EvidenceRefused("the evidence names no rendition", code="rendition_mismatch") from None
+    return evidence
+
+
+def _verify_render(row, bound, evidence) -> None:
+    """The rendition is EXACTLY the render this item's type authorizes now.
+
+    The evidence is only a claim: every field is checked against the
+    persisted, row-locked ProductionMedia, and the persisted provenance
+    against what the type's CURRENT configuration and CURRENT references
+    produce (render.expected -- the helper render() itself uses)."""
+    if (bound.kind != ProductionMedia.KIND_RENDITION or row.submission_media_id is None
+            or bound.derived_from_id != row.submission_media_id
+            or evidence.source_id != str(row.submission_media_id)
+            or bound.recipe_key != row.content_type.recipe_key):
+        raise EvidenceRefused("the rendition does not derive from this item's submission by its recipe",
+                              code="rendition_mismatch")
+    if (bound.recipe_key, bound.recipe_version, bound.recipe_params_digest) != (
+            evidence.recipe_key, evidence.recipe_version, evidence.provenance_digest):
+        raise EvidenceRefused("the render evidence disagrees with the stored rendition", code="rendition_mismatch")
+    ctype = row.content_type                                       # locked by _apply(lock_type=True)
+    try:
+        expected = render.expected(ctype.recipe_key, ctype.recipe_params)
+    except (render.UnknownRecipe, render.RecipeParameterError, reference_audio.ReferenceAudioError) as exc:
+        raise EvidenceRefused("the type's current recipe configuration cannot be rendered; retry after fixing it",
+                              code="render_outdated") from exc
+    if (bound.recipe_version, bound.recipe_params_digest) != (expected.recipe_version, expected.digest):
+        raise EvidenceRefused("the rendition was made with another recipe version, other parameters or other "
+                              "reference audio than the type now specifies; render again", code="render_outdated")
+    if SpokenItem.objects.filter(rendition_media_id=bound.pk).exclude(pk=row.pk).exists():
+        raise EvidenceRefused("the rendition is already bound to another item", code="rendition_already_bound")
+
+
+def complete_processing(item, *, lease_token, evidence, render_detail=None,
                         actor_kind=ActorKind.WORKER) -> SpokenItem:
-    """processing -> processed, binding the rendition. The rendition must be
-    a valid ``rendition`` derived from THIS item's submission by THIS type's
-    recipe; the caller's lease must still be the current one."""
+    """processing -> processed, binding the rendition named by ``evidence``
+    (a ``render.RenderEvidence``; a ``RenderResult`` is reduced to its
+    evidence). Under the content-type lock, the item lock, the rendition's
+    binding lock and the references' shared key locks it proves: the caller
+    holds the current lease; the rendition is a valid ``rendition`` derived
+    from THIS item's submission; its stored recipe key, version and provenance
+    digest equal the evidence's AND what the type's current recipe,
+    parameters and current reference audio produce; and no other item has
+    bound it.
+
+    If the configuration or a reference changed while the render ran, the
+    completion is refused (``render_outdated``) and nothing is written: the
+    worker must render again (or fail the attempt). An outdated render is
+    never bound."""
+    evidence = _parse_evidence(evidence)
 
     def check(row, user):
         _require_lease(row, lease_token)
-        candidate = ProductionMedia.objects.filter(pk=getattr(rendition, "pk", rendition)).first()
-        if (candidate is None or candidate.kind != ProductionMedia.KIND_RENDITION
-                or candidate.derived_from_id != row.submission_media_id
-                or candidate.recipe_key != row.content_type.recipe_key):
-            raise EvidenceRefused("the rendition does not derive from this item's submission by its recipe",
-                                  code="rendition_mismatch")
 
     def mutate(row, bound, now):
         row.rendition_media = bound
         row.processed_at = now
         row.lease_token = row.lease_expires_at = None
 
-    detail = {"rendition": str(getattr(rendition, "pk", rendition))}
+    detail = {"rendition": evidence.rendition_id, "evidence": evidence.as_dict()}
     detail.update(render_detail or {})
     return _apply(item, S.PROCESSED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), check=check,
-                  mutate=mutate, media=rendition, detail=detail)
+                  mutate=mutate, media=evidence.rendition_id, detail=detail, lock_type=True,
+                  verify=lambda row, bound: _verify_render(row, bound, evidence))
 
 
 def fail_processing(item, *, lease_token, code, detail="", actor_kind=ActorKind.WORKER) -> SpokenItem:

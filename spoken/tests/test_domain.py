@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from production.errors import PurgeRefused
 from production.models import ProductionMedia
-from production.services import retention
+from production.services import render, retention
 from production.tests.support import VALID_FACTS, make_row
 from spoken import guard, projection, transitions
 from spoken.models import (
@@ -67,13 +67,34 @@ class Fixtures(TestCase):
     def processing(self):
         return transitions.start_processing(self.validated(), lease_seconds=60)
 
-    def rendition_for(self, item):
-        return media(kind=ProductionMedia.KIND_RENDITION, derived_from=item.submission_media,
-                     recipe_key=item.content_type.recipe_key, recipe_version=1)
+    def expected(self, item):
+        ctype = SpokenContentType.objects.get(pk=item.content_type_id)
+        with transaction.atomic():
+            return render.expected(ctype.recipe_key, ctype.recipe_params)
+
+    def rendition_for(self, item, **overrides):
+        """A valid rendition row whose stored provenance is exactly what the
+        item's type currently specifies (what render() would record)."""
+        expected = self.expected(item)
+        values = dict(derived_from=item.submission_media, recipe_key=expected.recipe_key,
+                      recipe_version=expected.recipe_version, recipe_params_digest=expected.digest)
+        values.update(overrides)
+        return media(kind=ProductionMedia.KIND_RENDITION, **values)
+
+    @staticmethod
+    def evidence(rendition, **overrides):
+        values = dict(rendition_id=str(rendition.pk), source_id=str(rendition.derived_from_id),
+                      recipe_key=rendition.recipe_key, recipe_version=rendition.recipe_version,
+                      provenance_digest=rendition.recipe_params_digest)
+        values.update(overrides)
+        return render.RenderEvidence(**values)
+
+    def complete(self, item, token, rendition, **overrides):
+        return transitions.complete_processing(item, lease_token=token, evidence=self.evidence(rendition, **overrides))
 
     def processed(self):
         item, token = self.processing()
-        return transitions.complete_processing(item, lease_token=token, rendition=self.rendition_for(item))
+        return self.complete(item, token, self.rendition_for(item))
 
     def events(self, item):
         return list(SpokenItemEvent.objects.filter(item=item).values_list("event", "from_state", "to_state"))
@@ -229,18 +250,16 @@ class LifecycleTests(Fixtures):
         self.assertNotEqual(new_token, token)
         rendition = self.rendition_for(item)
         with self.assertRaises(transitions.EvidenceRefused) as raised:
-            transitions.complete_processing(item, lease_token=token, rendition=rendition)       # stale worker
+            self.complete(item, token, rendition)       # stale worker
         self.assertEqual(raised.exception.code, "stale_lease")
-        unrelated = media(kind=ProductionMedia.KIND_RENDITION, derived_from=media(), recipe_key="lcl_psa",
-                          recipe_version=1)
+        unrelated = self.rendition_for(item, derived_from=media())
         with self.assertRaises(transitions.EvidenceRefused) as raised:
-            transitions.complete_processing(item, lease_token=new_token, rendition=unrelated)
+            self.complete(item, new_token, unrelated)
         self.assertEqual(raised.exception.code, "rendition_mismatch")
-        other_recipe = media(kind=ProductionMedia.KIND_RENDITION, derived_from=item.submission_media,
-                             recipe_key="cal_events", recipe_version=1)
+        other_recipe = self.rendition_for(item, recipe_key="cal_events")
         with self.assertRaises(transitions.EvidenceRefused):
-            transitions.complete_processing(item, lease_token=new_token, rendition=other_recipe)
-        item = transitions.complete_processing(item, lease_token=new_token, rendition=rendition)
+            self.complete(item, new_token, other_recipe)
+        item = self.complete(item, new_token, rendition)
         self.assertEqual((item.state, item.rendition_media_id, item.lease_token, item.lease_expires_at),
                          (S.PROCESSED, rendition.pk, None, None))
 
@@ -258,7 +277,7 @@ class LifecycleTests(Fixtures):
         item = transitions.submit(self.item(no_review), media(), actor=self.owner)
         item = transitions.record_validation(item)
         item, token = transitions.start_processing(item)
-        item = transitions.complete_processing(item, lease_token=token, rendition=self.rendition_for(item))
+        item = self.complete(item, token, self.rendition_for(item))
         with self.assertRaises(transitions.InvalidTransition):
             transitions.request_review(item)
         reviewed = transitions.request_review(self.processed())
