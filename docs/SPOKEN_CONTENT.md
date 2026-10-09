@@ -289,7 +289,11 @@ the whole tree when the step ends. Start-up destroys leftover leaves and runs
 a confined toolchain probe before the socket is bound. The unit adds
 `PrivateNetwork`, `RestrictAddressFamilies=AF_UNIX`, `ProtectSystem=strict`,
 `ProtectHome=read-only`, no capabilities, `MemoryMax=3G`, `TasksMax=256` and
-`CPUWeight=50` (a render yields to playout).
+`CPUWeight=50` (a render yields to playout); it does not set
+`ProtectKernelTunables`/`ProtectControlGroups`, which would make `/sys`
+read-only and break the delegated subtree. These unit-level options are
+verified by `systemd-analyze verify` only: a user manager cannot apply them,
+so the first start under the system manager is an installation check.
 
 **Admission**: at most 1 render at once (operator domain 1–2) and 2 admitted
 requests waiting (0–4); anything beyond is answered `busy` from the accept

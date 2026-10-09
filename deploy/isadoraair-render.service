@@ -43,9 +43,11 @@ CapabilityBoundingSet=
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 PrivateTmp=yes
+# ProtectSystem=strict leaves /sys writable for the delegated cgroup subtree;
+# ProtectKernelTunables/ProtectControlGroups are deliberately NOT set (they
+# would remount /sys read-only and break the per-run leaves).
 ProtectSystem=strict
 ProtectHome=read-only
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectClock=yes
