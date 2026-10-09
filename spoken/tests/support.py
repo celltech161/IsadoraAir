@@ -9,6 +9,7 @@ each frequency per window.
 from __future__ import annotations
 
 import array
+import contextlib
 import io
 import math
 import re
@@ -112,3 +113,21 @@ def raw_insert(model, **values):
     constraints and for fabricating adversarial fixtures."""
     from django.db.models import QuerySet
     return QuerySet.bulk_create(model._base_manager.all(), [model(**values)])[0]
+
+
+@contextlib.contextmanager
+def failing_event_write():
+    """Fail a transition's EVENT write -- after its item write already ran in
+    the same transaction -- to prove the two commit together or not at all."""
+    from unittest import mock
+
+    from spoken import guard
+    real = guard._execute
+
+    def execute():
+        grant = guard._grant.get()
+        if grant is not None and isinstance(grant.record, guard.EventCreate):
+            raise RuntimeError("disk full")
+        return real()
+    with mock.patch.object(guard, "_execute", execute):
+        yield

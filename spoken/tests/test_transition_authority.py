@@ -1,14 +1,16 @@
-"""Operation-specific write authority (the replacement for the Boolean
-``transition_scope``).
+"""Operation-specific write authority, sealed through the Django write boundary.
 
-A protected SpokenItem / SpokenItemEvent write succeeds only when it is
-EXACTLY the write an open, single-use grant describes -- same model, same
-row (or the exact new row), same source state, same columns, same values.
-Every test uses valid ItemState values, so the state-enum guard is never
-what refuses.
+A protected SpokenItem / SpokenItemEvent write happens only as the exact
+execution (``guard._execute``) of an open, single-use grant derived from a
+deeply immutable TransitionPlan: no model instance is handed to application
+code, no model signal fires, and the written row is read back and compared
+with the grant before the transaction can commit. Every test uses valid
+ItemState values, so the state-enum guard is never what refuses.
 """
 import asyncio
 import contextvars
+import dataclasses
+import json
 import threading
 import uuid
 from datetime import timedelta
@@ -16,13 +18,15 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.db import connections, transaction
-from django.db.models.signals import pre_save
+from django.db.models import QuerySet
+from django.db.models.signals import post_save, pre_save
 from django.test import TestCase
 from django.utils import timezone
 
 from spoken import guard, transitions
 from spoken.models import ItemState, SpokenItem, SpokenItemEvent
 
+from .support import failing_event_write
 from .test_domain import Fixtures, make_type, media
 
 User = get_user_model()
@@ -33,6 +37,19 @@ Refused = guard.SpokenIntegrityError
 def item_snapshot(item):
     return (SpokenItem._base_manager.filter(pk=item.pk).values().get(),
             list(SpokenItemEvent._base_manager.filter(item_id=item.pk).values_list("id", flat=True)))
+
+
+class connected:
+    """Connect a signal receiver for the duration of a with-block."""
+
+    def __init__(self, signal, receiver):
+        self.signal, self.receiver = signal, receiver
+
+    def __enter__(self):
+        self.signal.connect(self.receiver, weak=False)
+
+    def __exit__(self, *exc):
+        self.signal.disconnect(self.receiver)
 
 
 class GrantFixtures(Fixtures):
@@ -64,58 +81,167 @@ class GrantFixtures(Fixtures):
         values = {"item_id": (item or self.a).pk, "event": "validated", "from_state": S.SUBMITTED,
                   "to_state": S.VALIDATED, "actor_kind": "system", "actor_id": None, "actor_username": "",
                   "media_id": (item or self.a).submission_media_id, "asset_id": None, "edition_id": None,
-                  "detail": {"duration_seconds": "2.000000"}}
+                  "detail": transitions._bounded({"duration_seconds": "2.000000"})}
         values.update(changes)
         return values
 
 
-class CodexBypassRegressionTests(GrantFixtures):
-    """Codex's reproduction: while the transition machinery is authorizing a
-    legitimate write, unrelated code tries a valid-but-unauthorized transition
-    (draft -> delivered, failure_code="forged") and a schema-valid forged
-    event. Here that code runs in a pre_save receiver, i.e. INSIDE a real
-    transition's save, exactly where the old Boolean scope was active."""
+class SignalBoundaryTests(GrantFixtures):
+    """Codex blocker 1: a pre_save receiver mutated an already-authorized
+    instance before SQL. Lifecycle writes now expose no instance and emit no
+    model signal; anything that alters the payload on its way to SQL is caught
+    by the read-back and the whole transition rolls back."""
 
-    def test_writes_inside_a_legitimate_transition_cannot_piggyback(self):
-        victim = self.item()                                      # draft, 1 event
-        attempts, fired = {}, []
+    def test_pre_save_cannot_tamper_with_an_authorized_item_or_event_write(self):
+        seen = []
+
+        def receiver(sender, instance, **kwargs):
+            if sender in (SpokenItem, SpokenItemEvent):
+                seen.append(sender.__name__)
+                if sender is SpokenItem:
+                    instance.state, instance.failure_code = S.DELIVERED, "forged"
+                else:
+                    instance.event, instance.from_state, instance.to_state = "delivered", "", S.DRAFT
+                    instance.detail = {"forged": True}
+        with connected(pre_save, receiver), connected(post_save, receiver):
+            transitions.record_validation(self.a)
+        self.assertEqual(seen, [])                                 # no model signal on a lifecycle write
+        row = SpokenItem.objects.get(pk=self.a.pk)
+        self.assertEqual((row.state, row.failure_code), (S.VALIDATED, ""))
+        event = SpokenItemEvent.objects.filter(item=row).latest("id")
+        self.assertEqual((event.event, event.from_state, event.to_state, event.detail),
+                         ("validated", S.SUBMITTED, S.VALIDATED, {"duration_seconds": "2.000000"}))
+        self.assertFalse(SpokenItemEvent.objects.filter(event="delivered").exists())
+
+    def tamper(self, model, method, mutate):
+        """Alter the payload inside Django's own write call, i.e. between the
+        grant and the SQL -- the last point anything could still interfere."""
+        real = getattr(QuerySet, method)
+
+        def wrapped(queryset, *args, **kwargs):
+            if queryset.model is model:
+                args, kwargs = mutate(args, kwargs)
+            return real(queryset, *args, **kwargs)
+        return mock.patch.object(QuerySet, method, wrapped)
+
+    def test_an_item_payload_altered_before_sql_is_detected_and_rolled_back(self):
+        def forge(args, kwargs):
+            return args, {**kwargs, "state": S.DELIVERED, "failure_code": "forged"}
+        before = item_snapshot(self.a)
+        with self.tamper(SpokenItem, "update", forge), self.assertRaises(Refused):
+            transitions.record_validation(self.a)
+        self.assertEqual(item_snapshot(self.a), before)             # no state, no event
+        self.assertIsNone(guard._grant.get())
+        self.assertEqual(transitions.record_validation(self.a).state, S.VALIDATED)    # a normal retry works
+
+    def test_an_event_payload_altered_before_sql_is_detected_and_rolled_back(self):
+        def forge(args, kwargs):
+            (event,) = args[0]
+            event.event, event.from_state, event.to_state, event.detail = "delivered", "", S.DRAFT, {"forged": True}
+            return args, kwargs
+        before = item_snapshot(self.a)
+        with self.tamper(SpokenItemEvent, "bulk_create", forge), self.assertRaises(Refused):
+            transitions.record_validation(self.a)
+        self.assertEqual(item_snapshot(self.a), before)             # the item write rolled back too
+        self.assertFalse(SpokenItemEvent.objects.filter(event="delivered").exists())
+        self.assertIsNone(guard._grant.get())
+        self.assertEqual(transitions.record_validation(self.a).state, S.VALIDATED)
+
+    def test_post_save_receivers_cannot_issue_lifecycle_writes(self):
+        outcomes, fired = {}, []
 
         def receiver(sender, instance, **kwargs):
             if sender is not SpokenItem or fired:
                 return
-            fired.append(True)                                    # once, even if a forgery saves
+            fired.append(True)
             for label, attempt in {
-                "save delivered+forged": lambda: self._forge_save(victim),
-                "update delivered+forged": lambda: SpokenItem.objects.filter(pk=victim.pk).update(
-                    state=S.DELIVERED, failure_code="forged"),
-                "forged event": lambda: SpokenItemEvent.objects.create(
-                    item=victim, event="delivered", from_state=S.DRAFT, to_state=S.DELIVERED,
-                    actor_kind="system"),
-                "nested grant": lambda: guard._authorized(self.grant_for(victim)).__enter__(),
+                "save submitted -> delivered": lambda: self._forge_save(self.b, state=S.DELIVERED),
+                "update -> delivered": lambda: SpokenItem.objects.filter(pk=self.b.pk).update(state=S.DELIVERED),
+                "forged event": lambda: SpokenItemEvent.objects.create(**{
+                    **self.event_values(self.b), "event": "delivered", "detail": {}}),
+                "execute without a grant": guard._execute,
             }.items():
                 try:
                     with transaction.atomic():
                         attempt()
-                    attempts[label] = "succeeded"
+                    outcomes[label] = "succeeded"
                 except Refused:
-                    attempts[label] = "refused"
+                    outcomes[label] = "refused"
+        row = SpokenItem.objects.get(pk=self.a.pk)
+        row.title = "retitled"
+        with connected(post_save, receiver):
+            row.save()                                             # an ordinary save does emit post_save
+        self.assertEqual(len(outcomes), 4)
+        self.assertEqual(outcomes, dict.fromkeys(outcomes, "refused"))
+        self.assertEqual(SpokenItem.objects.get(pk=self.b.pk).state, S.SUBMITTED)
 
-        pre_save.connect(receiver, weak=False)
-        try:
-            transitions.record_validation(self.a)                 # a legitimate transition
-        finally:
-            pre_save.disconnect(receiver)
-        self.assertEqual(attempts, dict.fromkeys(attempts, "refused"))
-        self.assertEqual(len(attempts), 4)
-        victim.refresh_from_db()
-        self.assertEqual((victim.state, victim.failure_code, victim.events.count()), (S.DRAFT, "", 1))
-        self.assertEqual(SpokenItem.objects.get(pk=self.a.pk).state, S.VALIDATED)    # the real one landed
+    def test_pre_save_cannot_smuggle_protected_values_into_an_ordinary_save(self):
+        def receiver(sender, instance, **kwargs):
+            if sender is SpokenItem:
+                instance.state, instance.failure_code = S.DELIVERED, "forged"
+        row = SpokenItem.objects.get(pk=self.a.pk)
+        row.title = "retitled"
+        with connected(pre_save, receiver):
+            row.save()
+        stored = SpokenItem.objects.get(pk=self.a.pk)
+        self.assertEqual((stored.title, stored.state, stored.failure_code), ("retitled", S.SUBMITTED, ""))
 
-    def _forge_save(self, victim):
-        row = SpokenItem.objects.get(pk=victim.pk)
-        row.state, row.failure_code = S.DELIVERED, "forged"
+    def _forge_save(self, item, **changes):
+        row = SpokenItem.objects.get(pk=item.pk)
+        for name, value in changes.items():
+            setattr(row, name, value)
         row.save()
 
+
+class PlanImmutabilityTests(GrantFixtures):
+    """Codex blocker 2: a genuine plan's nested detail was mutable after
+    validation. Plans now hold only immutable pairs; detail is canonical JSON."""
+
+    nested = {"validation": {"checks": ["a", "b"], "score": 1}}
+
+    def test_a_genuine_plan_cannot_be_altered_and_commits_its_validated_detail(self):
+        caller_detail = json.loads(json.dumps(self.nested))
+        attempts = {}
+        real_commit = transitions._commit
+
+        def tampering_commit(row, plan):
+            detail = dict(plan.event_values)["detail"]
+            for label, attempt in {
+                "replace field": lambda: setattr(plan, "event_values", ()),
+                "assign into payload": lambda: plan.event_values.__setitem__(0, ("event", "delivered")),
+                "mutate detail": lambda: detail.__setitem__("forged_after_validation", True),
+                "mutate nested dict": lambda: detail["validation"].update(x=1),
+                "mutate nested list": lambda: detail["validation"]["checks"].append("z"),
+            }.items():
+                try:
+                    attempt()
+                    attempts[label] = "mutated"
+                except (TypeError, AttributeError, dataclasses.FrozenInstanceError):
+                    attempts[label] = "impossible"
+            caller_detail["validation"]["checks"].append("added after planning")      # the caller's input
+            caller_detail["validation"]["score"] = 99
+            caller_detail["forged_after_validation"] = True
+            return real_commit(row, plan)
+        with mock.patch.object(transitions, "_commit", tampering_commit):
+            item = transitions._apply(self.a, S.RECALLED, actor=self.manager, detail=caller_detail)
+        self.assertEqual(attempts, dict.fromkeys(attempts, "impossible"))
+        self.assertEqual(len(attempts), 5)
+        event = SpokenItemEvent.objects.filter(item=item).latest("id")
+        self.assertEqual(event.detail, self.nested)                      # exactly the validated detail
+
+    def test_plans_refuse_mutable_values(self):
+        for label, values in {"dict": (("detail", {"a": 1}),), "list": (("detail", ["a"]),),
+                              "not pairs": ({"state": "validated"},), "list payload": [("state", "x")]}.items():
+            with self.subTest(case=label), self.assertRaises(TypeError):
+                transitions.TransitionPlan(item_id=self.a.pk, from_state=S.SUBMITTED, to_state=S.VALIDATED,
+                                           item_values=self.plan_values, event_values=values)
+
+    def test_the_canonical_detail_is_stable(self):
+        self.assertEqual(transitions._bounded({"b": 1, "a": {"y": [2, 1], "x": None}}),
+                         '{"a":{"x":null,"y":[2,1]},"b":1}')
+
+
+class CodexBypassRegressionTests(GrantFixtures):
     def test_hand_built_grants_cannot_describe_what_the_table_forbids(self):
         draft = self.item()
         for label, record in {
@@ -163,62 +289,50 @@ class CodexBypassRegressionTests(GrantFixtures):
 
 
 class ExactItemWriteTests(GrantFixtures):
-    def test_the_exact_planned_write_succeeds_once(self):
+    def test_the_grant_executes_exactly_once(self):
         with guard._authorized(self.grant_for(self.a)):
-            row = self.loaded(self.a)
-            row.save()
-            row.validated_at = self.now + timedelta(seconds=5)
+            guard._execute()
             with self.assertRaises(Refused):                    # consumed
-                row.save()
-        self.assertEqual(SpokenItem.objects.get(pk=self.a.pk).state, S.VALIDATED)
+                guard._execute()
+        row = SpokenItem.objects.get(pk=self.a.pk)
+        self.assertEqual((row.state, row.validated_at, row.state_changed_at), (S.VALIDATED, self.now, self.now))
+        self.assertEqual(SpokenItem.objects.get(pk=self.b.pk).state, S.SUBMITTED)    # only its own row
 
-    def test_every_unplanned_protected_column_is_refused(self):
+    def test_save_never_honors_a_grant(self):
+        """Even under an open grant for this very row, save() writes nothing protected."""
         other_media = media()
-        extras = {
-            "failure_code": "forged", "failure_detail": "forged", "reviewed_by_id": self.manager.pk,
-            "reviewed_by_username": "x", "reviewed_at": self.now, "review_note": "x",
-            "recalled_by_id": self.manager.pk, "recalled_at": self.now, "recall_reason": "x",
-            "lease_token": uuid.uuid4(), "lease_expires_at": self.now, "rendition_media_id": other_media.pk,
-            "submission_media_id": other_media.pk, "terminal_at": self.now, "processed_at": self.now,
-            "delivered_at": self.now, "expires_at": self.now, "processing_attempts": 7,
-            "origin": "assigned", "submitted_by_id": self.other.pk, "submitted_by_username": "x",
-            "content_type_id": make_type(code="elsewhere").pk,
+        changes = {
+            "exact plan": {}, "state": {"state": S.DELIVERED}, "failure_code": {"failure_code": "forged"},
+            "failure_detail": {"failure_detail": "forged"}, "reviewed_by_id": {"reviewed_by_id": self.manager.pk},
+            "reviewed_at": {"reviewed_at": self.now}, "recalled_by_id": {"recalled_by_id": self.manager.pk},
+            "recalled_at": {"recalled_at": self.now},
+            "lease": {"lease_token": uuid.uuid4(), "lease_expires_at": self.now},
+            "rendition_media_id": {"rendition_media_id": other_media.pk},
+            "state_changed_at": {"state_changed_at": self.now + timedelta(seconds=1)},
+            "terminal_at": {"terminal_at": self.now}, "processing_attempts": {"processing_attempts": 7},
         }
-        for attname, value in extras.items():
-            with self.subTest(column=attname):
-                with guard._authorized(self.grant_for(self.a)):
-                    self.assert_refused(self.loaded(self.a, **{attname: value}).save)
-
-    def test_planned_columns_with_other_values_are_refused(self):
-        for attname, value in {"state": S.RECALLED, "state_changed_at": self.now + timedelta(seconds=1),
-                               "validated_at": self.now + timedelta(seconds=1)}.items():
-            with self.subTest(column=attname):
-                with guard._authorized(self.grant_for(self.a)):
-                    self.assert_refused(self.loaded(self.a, **{attname: value}).save)
-
-    def test_a_planned_column_cannot_be_left_out(self):
-        with guard._authorized(self.grant_for(self.a)):
-            row = self.loaded(self.a)
-            self.assert_refused(lambda: row.save(update_fields=["state", "state_changed_at"]))
+        for label, extra in changes.items():
+            with self.subTest(change=label), guard._authorized(self.grant_for(self.a)):
+                self.assert_refused(self.loaded(self.a, **extra).save)
 
     def test_the_grant_needs_the_authorized_source_state(self):
         validated = transitions.record_validation(self.b)          # b is no longer submitted
         with guard._authorized(self.grant_for(validated)):
-            self.assert_refused(self.loaded(validated).save, item=validated)
+            self.assert_refused(guard._execute, item=validated)
 
-    def test_another_row_is_refused_through_save_and_queryset_update(self):
+    def test_another_row_or_a_broader_write_is_refused(self):
         with guard._authorized(self.grant_for(self.a)):
-            self.assert_refused(self.loaded(self.b).save, item=self.b)
             for target in (self.a, self.b):
                 with self.subTest(target=str(target.pk)):
                     self.assert_refused(lambda: SpokenItem.objects.filter(pk=target.pk).update(
                         state=S.VALIDATED, state_changed_at=self.now, validated_at=self.now), item=target)
             self.assert_refused(lambda: SpokenItem.objects.all().update(state=S.VALIDATED))
+            self.assert_refused(self.loaded(self.b).save, item=self.b)
 
     def test_an_item_grant_does_not_create_items_or_events(self):
         with guard._authorized(self.grant_for(self.a)):
             self.assert_refused(lambda: SpokenItem.objects.create(content_type=self.ctype, state=S.DRAFT))
-            self.assert_refused(lambda: SpokenItemEvent.objects.create(**self.event_values()))
+            self.assert_refused(lambda: SpokenItemEvent.objects.create(**{**self.event_values(), "detail": {}}))
 
 
 class ExactCreationTests(GrantFixtures):
@@ -227,55 +341,49 @@ class ExactCreationTests(GrantFixtures):
             ("content_type_id", self.ctype.pk), ("origin", "submitted"), ("submitted_by_id", self.owner.pk),
             ("submitted_by_username", "owner"), ("state", S.DRAFT), ("state_changed_at", self.now)))
 
-    def candidate(self, item_id, **overrides):
-        values = dict(id=item_id, content_type=self.ctype, origin="submitted", submitted_by=self.owner,
-                      submitted_by_username="owner", state=S.DRAFT, state_changed_at=self.now)
-        values.update(overrides)
-        return SpokenItem(**values)
-
     def test_a_creation_grant_creates_exactly_one_described_row(self):
         item_id = uuid.uuid4()
         before = SpokenItem.objects.count()
-        for label, overrides in {
-            "another id": {"id": uuid.uuid4()}, "other type": {"content_type": make_type(code="alt")},
-            "other origin": {"origin": "assigned"}, "other submitter": {"submitted_by": self.other},
-            "lifecycle timestamp": {"validated_at": self.now}, "failure": {"failure_code": "forged"},
-            "lease": {"lease_token": uuid.uuid4(), "lease_expires_at": self.now},
-            "other time": {"state_changed_at": self.now + timedelta(seconds=1)},
-        }.items():
-            with self.subTest(case=label), guard._authorized(self.creation_grant(item_id)):
-                with self.assertRaises(Refused), transaction.atomic():
-                    self.candidate(item_id, **overrides).save(force_insert=True)
         with guard._authorized(self.creation_grant(item_id)):
-            self.candidate(item_id).save(force_insert=True)
-            with self.assertRaises(Refused), transaction.atomic():        # single use
-                self.candidate(uuid.uuid4()).save(force_insert=True)
+            with self.assertRaises(Refused), transaction.atomic():          # save() never creates
+                SpokenItem(id=item_id, content_type=self.ctype, state=S.DRAFT).save(force_insert=True)
+            guard._execute()
+            with self.assertRaises(Refused), transaction.atomic():          # single use
+                guard._execute()
+        row = SpokenItem.objects.get(pk=item_id)
+        self.assertEqual((row.state, row.origin, row.submitted_by_id, row.failure_code, row.validated_at,
+                          row.lease_token, row.state_changed_at),
+                         (S.DRAFT, "submitted", self.owner.pk, "", None, None, self.now))
+        self.assertIsNotNone(row.created_at)                                 # auto_now_add still applied
         self.assertEqual(SpokenItem.objects.count(), before + 1)
 
     def test_creation_and_its_event_are_atomic(self):
         before = (SpokenItem.objects.count(), SpokenItemEvent.objects.count())
-        with mock.patch.object(type(SpokenItemEvent.objects), "create", side_effect=RuntimeError("disk full")):
-            with self.assertRaises(RuntimeError):
-                transitions.create_item(self.ctype, actor=self.owner)
+        with failing_event_write(), self.assertRaises(RuntimeError):
+            transitions.create_item(self.ctype, actor=self.owner)
         self.assertEqual((SpokenItem.objects.count(), SpokenItemEvent.objects.count()), before)
+        self.assertIsNone(guard._grant.get())
 
 
 class ExactEventTests(GrantFixtures):
-    def test_every_altered_event_column_is_refused_and_the_exact_one_inserts_once(self):
-        other_media = media()
+    def test_the_event_grant_inserts_exactly_its_payload_once(self):
         legit = self.event_values()
-        alterations = {"item_id": self.b.pk, "event": "invalid", "from_state": S.DRAFT, "to_state": S.INVALID,
-                       "actor_kind": "worker", "actor_id": self.manager.pk, "actor_username": "someone",
-                       "media_id": other_media.pk, "asset_id": uuid.uuid4(), "edition_id": uuid.uuid4(),
-                       "detail": {"forged": True}}
-        for attname, value in alterations.items():
-            with self.subTest(column=attname), guard._authorized(guard.EventCreate(values=tuple(legit.items()))):
-                self.assert_refused(lambda: SpokenItemEvent.objects.create(**{**legit, attname: value}))
         with guard._authorized(guard.EventCreate(values=tuple(legit.items()))):
-            SpokenItemEvent.objects.create(**legit)
-            self.assert_refused(lambda: SpokenItemEvent.objects.create(**legit))      # consumed
-        self.assert_refused(lambda: SpokenItemEvent.objects.create(**legit))          # and closed
-        self.assertEqual(SpokenItemEvent.objects.filter(item=self.a, event="validated").count(), 1)
+            for attname, value in {"item_id": self.b.pk, "event": "invalid", "from_state": S.DRAFT,
+                                   "to_state": S.INVALID, "actor_kind": "worker", "actor_id": self.manager.pk,
+                                   "actor_username": "someone", "media_id": media().pk, "asset_id": uuid.uuid4(),
+                                   "edition_id": uuid.uuid4(), "detail": {"forged": True}}.items():
+                with self.subTest(column=attname):                          # ordinary inserts never pass
+                    self.assert_refused(lambda: SpokenItemEvent.objects.create(**{
+                        **legit, "detail": json.loads(legit["detail"]), attname: value}))
+            event_id = guard._execute()
+            self.assert_refused(guard._execute)                              # consumed
+        event = SpokenItemEvent.objects.get(pk=event_id)
+        self.assertEqual((event.item_id, event.event, event.from_state, event.to_state, event.media_id,
+                          event.detail), (self.a.pk, "validated", S.SUBMITTED, S.VALIDATED,
+                                          self.a.submission_media_id, {"duration_seconds": "2.000000"}))
+        self.assertIsNotNone(event.created_at)
+        self.assert_refused(guard._execute)                                  # and closed
 
     def test_an_event_grant_does_not_authorize_item_writes(self):
         with guard._authorized(guard.EventCreate(values=tuple(self.event_values().items()))):
@@ -287,12 +395,12 @@ class LeakageTests(GrantFixtures):
         with guard._authorized(self.grant_for(self.a)):
             pass
         self.assertIsNone(guard._grant.get())
-        self.assert_refused(self.loaded(self.a).save)
+        self.assert_refused(guard._execute)
         with self.assertRaises(ZeroDivisionError):
             with guard._authorized(self.grant_for(self.a)):
                 raise ZeroDivisionError
         self.assertIsNone(guard._grant.get())
-        self.assert_refused(self.loaded(self.a).save)
+        self.assert_refused(guard._execute)
 
     def test_grants_do_not_nest(self):
         with guard._authorized(self.grant_for(self.a)):
@@ -306,13 +414,10 @@ class LeakageTests(GrantFixtures):
 
     def test_grants_do_not_cross_threads(self):
         results = {}
-        row = self.loaded(self.a)
 
         def attempt(label):
             try:
-                with connections["default"].cursor() as cursor:    # never wait on the test's row lock
-                    cursor.execute("SET lock_timeout = '2s'")
-                row.save()
+                guard._execute()
                 results[label] = "succeeded"
             except Refused:
                 results[label] = "refused"
@@ -329,15 +434,16 @@ class LeakageTests(GrantFixtures):
             copied.start()
             copied.join(30)
         self.assertEqual(results, {"fresh thread": "refused", "copied context": "refused"})
+        self.assertEqual(SpokenItem.objects.get(pk=self.a.pk).state, S.SUBMITTED)
 
     def test_grants_do_not_reach_other_async_tasks(self):
         async def in_task():
             try:
-                self.loaded_row.save()
+                guard._execute()
                 return "succeeded"
             except Refused:
                 return "refused"
-        self.loaded_row = self.loaded(self.a)
+
         async def spawns_a_task():
             return await asyncio.get_running_loop().create_task(in_task())
         with guard._authorized(self.grant_for(self.a)):
@@ -348,14 +454,14 @@ class LeakageTests(GrantFixtures):
 
 class LegitimateLifecycleTests(GrantFixtures):
     """Every C1 transition still works, records exactly its event, and rolls
-    back with its event on an injected failure."""
+    back with its event when the event write fails."""
 
     def assert_step(self, item, call, state, event, stamps=()):
         before = item_snapshot(item)
-        with mock.patch.object(type(SpokenItemEvent.objects), "create", side_effect=RuntimeError("disk full")):
-            with self.assertRaises(RuntimeError):
-                call()
+        with failing_event_write(), self.assertRaises(RuntimeError):
+            call()
         self.assertEqual(item_snapshot(item), before)                          # atomic
+        self.assertIsNone(guard._grant.get())
         result = call()
         row = result[0] if isinstance(result, tuple) else result
         row = SpokenItem.objects.get(pk=row.pk)
@@ -363,6 +469,7 @@ class LegitimateLifecycleTests(GrantFixtures):
         self.assertEqual(len(events), len(before[1]) + 1)                      # exactly one event
         self.assertEqual((row.state, events[-1].event, events[-1].to_state), (state, event, state))
         self.assertNotEqual(row.state_changed_at, before[0]["state_changed_at"])   # restamped
+        self.assertIsNotNone(events[-1].created_at)
         for stamp in stamps:
             self.assertIsNotNone(getattr(row, stamp), stamp)
         return result

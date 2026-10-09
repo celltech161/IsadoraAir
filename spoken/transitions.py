@@ -37,7 +37,8 @@ import json
 import uuid
 import weakref
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from django.db import transaction
 from django.utils import timezone
@@ -101,27 +102,43 @@ def _actor_columns(actor, actor_kind):
     return None, ""
 
 
-def _bounded(detail) -> dict:
-    detail = dict(detail or {})
-    encoded = json.dumps(detail, sort_keys=True, default=str)
+def _bounded(detail) -> str:
+    """Event detail as bounded, CANONICAL JSON text: an immutable value the
+    plan can hold (no caller-owned or nested mutable object survives)."""
+    encoded = json.dumps(dict(detail or {}), sort_keys=True, separators=(",", ":"), default=str, allow_nan=False)
     if len(encoded.encode()) > DETAIL_LIMIT_BYTES:
         raise ValueError("event detail exceeds its bound")
-    return json.loads(encoded)
+    return encoded
 
 
 # -- plans: the exact writes a validated transition makes ------------------------------------
+
+_IMMUTABLE_VALUES = (str, int, float, bool, type(None), datetime, date, Decimal, uuid.UUID)
+
 
 @dataclass(frozen=True, eq=False)
 class TransitionPlan:
     """The already-validated intended writes of one transition. Both grants
     derive from this one object, so the item write and its event cannot
-    diverge. Only plans built by ``_plan`` (after validation) are committed."""
+    diverge. Only plans built by ``_plan`` (after validation) are committed.
+
+    DEEPLY immutable: each payload is a tuple of (attname, value) pairs whose
+    values are immutable scalars; event ``detail`` is canonical JSON text,
+    decoded into a fresh object only by the exact executor (spoken.guard)."""
 
     item_id: object
     from_state: str | None
     to_state: str
     item_values: tuple            # ((attname, value), ...) -- protected item columns
     event_values: tuple           # ((attname, value), ...) -- every event column
+
+    def __post_init__(self):
+        for name in ("item_values", "event_values"):
+            pairs = getattr(self, name)
+            if not isinstance(pairs, tuple) or not all(
+                    isinstance(pair, tuple) and len(pair) == 2 and isinstance(pair[0], str)
+                    and isinstance(pair[1], _IMMUTABLE_VALUES) for pair in pairs):
+                raise TypeError(f"TransitionPlan.{name} must hold only immutable (attname, value) pairs")
 
 
 _PLANNED = weakref.WeakSet()
@@ -165,22 +182,23 @@ def _write_event(plan) -> SpokenItemEvent:
         raise guard.SpokenIntegrityError("only a validated transition plan is committed, once")
     _PLANNED.discard(plan)                                   # a plan records exactly one event
     with guard._authorized(guard.EventCreate(values=plan.event_values)):
-        return SpokenItemEvent.objects.create(**dict(plan.event_values))
+        event_id = guard._execute()
+    return SpokenItemEvent.objects.get(pk=event_id)
 
 
 def _commit(row, plan) -> None:
-    """Perform exactly the plan: one item save under its ItemWrite grant, then
-    one event insert under its EventCreate grant. Each grant covers only its
-    own statement; the plan is spent afterwards."""
+    """Perform exactly the plan: the item UPDATE under its ItemWrite grant,
+    then the event INSERT under its EventCreate grant -- each executed by the
+    guard straight from the grant's payload (no model instance, no signals)
+    and verified by reading the row back. The plan is spent afterwards."""
     _require_planned(plan, row)
     if plan.from_state is None:
         raise guard.SpokenIntegrityError("creation plans are committed by create_item")
-    for attname, value in plan.item_values:
-        setattr(row, attname, value)
     with guard._authorized(guard.ItemWrite(item_id=plan.item_id, from_state=plan.from_state,
                                            to_state=plan.to_state, values=plan.item_values)):
-        row.save()
+        guard._execute()
     _write_event(plan)
+    row.refresh_from_db()
 
 
 # -- the core ---------------------------------------------------------------------------
@@ -254,9 +272,9 @@ def create_item(content_type, *, actor, title="", notes="", origin=ItemOrigin.SU
                      actor_kind=ActorKind.USER, user=user, username=username, media=None, detail=detail)
         _require_planned(plan, row)
         with guard._authorized(guard.ItemCreate(item_id=plan.item_id, values=plan.item_values)):
-            row.save(force_insert=True)
+            guard._execute()
         _write_event(plan)
-        return row
+        return SpokenItem.objects.select_related("content_type").get(pk=plan.item_id)
 
 
 def _owner_or_manager(row, user):

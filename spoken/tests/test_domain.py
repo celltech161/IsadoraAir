@@ -21,7 +21,7 @@ from spoken.models import (
     AssetMode, AssetState, EditionState, ItemState, RecallPolicy, SpokenAsset, SpokenAssetEdition,
     SpokenContentType, SpokenItem, SpokenItemEvent,
 )
-from spoken.tests.support import raw_insert
+from spoken.tests.support import failing_event_write, raw_insert
 
 User = get_user_model()
 S = ItemState
@@ -309,14 +309,11 @@ class LifecycleTests(Fixtures):
 class AtomicityTests(Fixtures):
     def test_state_and_event_commit_together_or_not_at_all(self):
         item = self.item()
-        real_create = SpokenItemEvent.objects.create
-        with mock.patch.object(type(SpokenItemEvent.objects), "create", side_effect=RuntimeError("disk full")):
-            with self.assertRaises(RuntimeError):
-                transitions.submit(item, media(), actor=self.owner)
+        with failing_event_write(), self.assertRaises(RuntimeError):     # the item UPDATE already ran
+            transitions.submit(item, media(), actor=self.owner)
         item.refresh_from_db()
         self.assertEqual((item.state, item.submission_media_id, item.submitted_at), (S.DRAFT, None, None))
         self.assertEqual(len(self.events(item)), 1)
-        self.assertTrue(real_create)
 
     def test_a_refused_check_writes_nothing(self):
         item = self.item()

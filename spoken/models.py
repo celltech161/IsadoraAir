@@ -159,8 +159,9 @@ class SpokenContentType(models.Model):
         from . import configuration
         using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
         with transaction.atomic(using=using):
-            configuration.check_before_save(self, using=using)       # locks the persisted row first
+            stored_code = configuration.check_before_save(self, using=using)   # locks the persisted row first
             super().save(*args, **kwargs)
+            configuration.check_persisted(self, stored_code, using=using)    # what reached the row, pre-commit
 
     def delete(self, *args, **kwargs):
         using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
@@ -310,7 +311,15 @@ class SpokenItem(models.Model):
         return f"{self.content_type_id} item {self.id} [{self.state}]"
 
     def save(self, *args, **kwargs):
+        """Ordinary saves edit title/notes only. Lifecycle writes never come
+        through here: spoken.transitions executes exact grants (spoken.guard)."""
         guard.check_item_save(self, kwargs.get("update_fields"))
+        # Write ONLY the editorial columns, so nothing a pre_save receiver does
+        # to a protected attribute can reach the UPDATE.
+        writable = guard.editorial_update_fields(kwargs.get("update_fields"))
+        if not writable:
+            return
+        kwargs["update_fields"] = writable
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -381,7 +390,7 @@ class SpokenItemEvent(models.Model):
         return f"{self.event} {self.from_state}->{self.to_state}"
 
     def save(self, *args, **kwargs):
-        guard.check_event_write(self)                  # exact, single-use authorization (or refused)
+        guard.check_event_write(self)                  # always refused: events come from exact grants
         super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
