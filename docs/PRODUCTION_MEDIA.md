@@ -300,10 +300,13 @@ The shared render engine (`production/services/render/`) turns one valid
 ProductionMedia into a NEW `rendition` through a code-registered recipe of
 fixed steps; the result goes through the ordinary rendition intake (validated,
 GStreamer included) and records `derived_from`, the recipe key/version, the
-canonical parameter digest and the toolchain. Station beds are
+canonical provenance digest (`render/provenance.py`, shared with consumers
+that verify a rendition before binding it) and the toolchain. Station beds are
 `ReferenceAudio` rows (`production.0002`): a key pinning one retained `bed`
-media and its SHA-256, append-only, resolved only by key. Details:
-[SPOKEN_CONTENT.md](SPOKEN_CONTENT.md).
+media and its SHA-256, append-only, resolved only by key, written only by
+`services/reference_audio.py` (per-key advisory lock; ORM creation, mutation
+and deletion refused through every manager; retired rows keep their bed
+retained on purpose). Details: [SPOKEN_CONTENT.md](SPOKEN_CONTENT.md).
 
 ## Purge and retention
 

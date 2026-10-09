@@ -55,7 +55,7 @@ state and timestamps, append the `SpokenItemEvent` — all in one transaction.
 | submitted → validated / invalid | system | the submission's own validation verdict and the type's duration bounds |
 | validated → processing | worker | a fresh lease (30 s – 1 h); attempts counted |
 | processing → processing | worker | reclaim only after the lease **expired** (new token) |
-| processing → processed | worker | the current lease token; a valid `rendition` derived from this item's submission by this type's recipe; bound |
+| processing → processed | worker | the current lease token; `RenderEvidence` whose rendition is EXACTLY the render the type authorizes now (see *Render completion*); bound |
 | processing → failed | worker | the current lease token; failure code/detail |
 | failed → validated | manager | retry |
 | processed → awaiting_review | system | only if the type requires review |
@@ -65,12 +65,39 @@ state and timestamps, append the `SpokenItemEvent` — all in one transaction.
 
 "Manager" in C1 is staff/superuser; per-type grants are Phase E.
 
-**Guards** (`spoken/guard.py`): outside the transition service, ordinary ORM
-paths refuse to create items or events, to change any lifecycle column
-(`save()` compares with the authoritative row; `update()`/`bulk_update()`
-refuse), and to delete items; events are append-only everywhere. Only
-title/notes and Django's own `SET_NULL` of a deleted user are free. Admin is
-read-only for items, events, assets and editions.
+**Authority boundary** (`spoken/guard.py`, the guarded querysets in
+`spoken/models.py`). Ordinary Django ORM code can read spoken state but not
+fabricate, mutate or destroy it outside the services. The guarded querysets
+are the **default and the base** managers (`Meta.base_manager_name`), and
+every reverse related manager (`content_type.items`, `item.events`,
+`user.spoken_items`, …) is built from them, so each API below behaves the
+same through all of them (proven per manager in `spoken/tests/test_authority.py`):
+
+| API | `SpokenItem` | `SpokenItemEvent` | `SpokenContentType` |
+| --- | --- | --- | --- |
+| `save()` adding / `create()` / creating branch of `get_or_create()` / `update_or_create()` | refused outside `transition_scope` | refused outside `transition_scope` | allowed — through the validated, row-locked `save()` |
+| `bulk_create()` (plain, `ignore_conflicts`, `update_conflicts`) | **always refused** | **always refused** | **always refused** |
+| `save()` of an existing row / updating branch of `update_or_create()` | only title/notes change (compared with the authoritative row) | refused (append-only) | validated, row-locked `save()` |
+| `QuerySet.update()` | title/notes; a user FK to NULL alone (Django's SET_NULL) | only `actor=None` (Django's SET_NULL) — every other column refused | **always refused** |
+| `bulk_update()` | title/notes only, even in the scope | **always refused** | **always refused** |
+| `delete()` (instance, QuerySet, any manager) | **always refused** | **always refused** | refused while items exist (row-locked; PROTECT also refuses) |
+
+A `state` that is not an `ItemState` is refused on every write path, even
+inside the scope. The state set is enforced by this boundary, deliberately not
+by a database check constraint (a new state must never need a manual
+migration). No foreign key into an item or an event cascades, so Django's
+deletion collector never reaches them. Admin is read-only for items, events,
+assets and editions. Raw SQL is outside the boundary, as for ProductionMedia.
+
+**Content-type configuration** is written only through
+`SpokenContentType.save()`, which in ONE transaction locks the persisted row
+(`SELECT … FOR UPDATE`), checks code permanence against the items that exist
+while the lock is held, validates (code shape, recipe and parameter schema,
+media limits, enabled-projection category) and writes. `create_item()` locks
+the same row before creating an item, so a rename and a first item are
+serialized: a rename that locks first commits and the item is created against
+the renamed type; an item that locks first commits and the rename then sees it
+and is refused. (`spoken/tests/test_config_race.py`, two real sessions.)
 
 ## Render engine (`production/services/render/`)
 
@@ -96,9 +123,10 @@ resolved through `ReferenceAudio`.
 4. the FLAC goes through the ordinary rendition intake
    (`intake.ingest_derivative`, `kind=rendition`): validated by the validation
    service — ffprobe, full decode **and the engine's GStreamer decode** — and
-   recorded with `derived_from`, recipe key/version, the canonical parameter
-   digest (recipe, version, resolved params and the exact reference bytes) and
-   the toolchain identity.
+   recorded with `derived_from`, recipe key/version, the canonical provenance
+   digest (`render/provenance.py`: recipe, version, engine version, fully
+   resolved params and the exact reference registrations/bytes) and the
+   toolchain identity.
 
 Failures raise `RenderError` with a stable code and leave **no bindable
 rendition**: nothing is ingested before every step succeeded, an invalid
@@ -106,14 +134,44 @@ rendition is refused by intake (no row), a validation-infrastructure failure
 leaves an `unvalidated` row nothing can bind; the scratch directory is always
 removed; the source is never touched; retries make new renditions.
 
-**Open C2 decision — confined rendering.** Validators run inside the
-`isadoraair-validation` service's cgroup/Landlock/seccomp boundary; renders
-currently run in the calling process under `prlimit`, on sources that already
-passed that boundary. Moving renders into the validation service (a fixed
-render-command set plus an output descriptor) is the recommended C2 step
-before any production type is enabled; it changes the validation service, so
-that release must restart it by operator action (it is outside the protected
-restart allowlist).
+### Render completion (`transitions.complete_processing`)
+
+`render()` returns a `RenderResult`; its `.evidence` is a frozen
+`RenderEvidence` of primitives (rendition id, source id, recipe key, recipe
+version, provenance digest) — the shape C2 will carry over a socket. It is a
+**claim, not authority**: anyone can construct one. Completion locks, in
+order, the content type (the row configuration saves lock), the item, the
+rendition (`lock_for_binding`) and each reference key (shared advisory lock),
+then requires:
+
+* the caller holds the current lease;
+* the rendition is a valid `rendition` derived from this item's submission;
+* its **stored** recipe key, version and provenance digest equal the
+  evidence's (a forged or swapped claim → `rendition_mismatch`);
+* and equal what `render.expected()` — the same helper `render()` uses —
+  computes from the type's **current** recipe, parameters and **current**
+  reference registrations (another version, other parameters or a replaced
+  bed → `render_outdated`);
+* no other item has bound it (`rendition_already_bound`).
+
+If the configuration or a bed changed while the render ran, completion is
+refused and nothing is written; the worker renders again (or fails the
+attempt). Because configuration saves and bed registrations take the locks
+completion holds, the only orders are "completion under the old
+configuration, then the change" or "change, then the old render refused".
+No in-flight configuration snapshot (and so no migration) is needed in C1.
+
+### C2 gate — sandboxed render executor (mandatory before any type is enabled)
+
+Validators run inside the `isadoraair-validation` service's
+cgroup/Landlock/seccomp boundary; renders currently run in the calling
+process under `prlimit`, on sources that already passed that boundary. That is
+acceptable only while C1 is dormant (no production type enabled, projection
+closed). Before C2 enables anything, rendering moves to a **separate**
+sandboxed render executor: its own service and socket, its own worker pool and
+cgroup, Landlock/seccomp, its own admission limits, Monitoring, and an
+output-descriptor protocol returning `RenderEvidence`. Its release restarts
+services by operator action.
 
 ## The five recipes (`spoken/recipes.py`, all version 1)
 
@@ -138,12 +196,36 @@ sits 3 dB lower against a stereo bed than its file level suggests.
 Nothing existing fit (`FXCart` is a mutable absolute path with no hash pin),
 so `production` gains the smallest domain-neutral mapping: `ReferenceAudio`
 (key → one current row → a `bed` ProductionMedia + the SHA-256 pinned at
-registration). `register()` binds under the binding rule and retires the
-previous row for the key (who/why recorded); `resolve()` refuses a missing,
-retired, purged, not-valid or hash-mismatched reference and hands the renderer
-an open descriptor of the verified bytes. Referenced media — even by retired
-rows — cannot be purged, so every rendition's provenance stays resolvable. No
-production bed is ingested in C1.
+registration). `resolve()` refuses a missing, retired, purged, not-valid or
+hash-mismatched reference and hands the renderer an open descriptor of the
+verified bytes. No production bed is ingested in C1.
+
+**Authority.** `production.services.reference_audio` is the only writer:
+
+* `register(key, media)` — under a transaction-scoped PostgreSQL advisory lock
+  for the key (`pg_advisory_xact_lock(0x52454641, first 32 bits of
+  SHA-256("isadoraair.production.reference_audio\0" + key))`; stable across
+  processes; a collision only serializes two keys), it locks the current row,
+  binds the media under `lock_for_binding`, requires a valid `bed` whose stored
+  bytes re-hash to its SHA-256, retires the current row and inserts the new
+  one — one transaction, so a failed insert leaves the former registration
+  current. Re-registering the media already current is idempotent. Same-key
+  races serialize on the advisory lock (including the very first registration,
+  when there is no row to lock); the partial unique constraint stays as
+  defense in depth and is never the normal race outcome.
+* `retire(key)` — the one mutation: a state-qualified UPDATE of exactly the
+  retirement columns of the current row; idempotent (`None` when nothing is
+  current).
+* Everything else is refused through the default, base and reverse managers:
+  creation outside the registration scope (which authorizes only the exact
+  key/media/SHA being inserted), any `save()` of an existing row, any
+  `update()` except Django's SET_NULL of a deleted user, `bulk_create`,
+  `bulk_update`, and every deletion.
+
+**Retention is intentional.** Registrations are never deleted, and a retired
+registration keeps its bed media retained (PROTECT; purge refuses), so every
+rendition's provenance stays resolvable. Beds are few and small; that cost is
+the price of provenance, not a leak.
 
 ## Not in C1
 
