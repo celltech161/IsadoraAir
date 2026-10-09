@@ -230,7 +230,7 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
             executor.migrate(r0075_targets)
             r0075_executor = MigrationExecutor(connection)
             historical_apps = r0075_executor.loader.project_state(
-                r0075_targets
+                [target for target in r0075_targets if target[1] is not None]      # apps not yet installed
             ).apps
             HistoricalPlayEvent = historical_apps.get_model("library", "PlayEvent")
             historical = HistoricalPlayEvent.objects.create(started_at=timezone.now())
