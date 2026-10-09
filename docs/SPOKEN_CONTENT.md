@@ -91,33 +91,52 @@ assets and editions. Raw SQL is outside the boundary, as for ProductionMedia.
 
 **Operation-specific write authority** (`spoken/guard.py`,
 `spoken/lifecycle.py`). There is no trusted "inside the service" context.
-The transition service validates a transition, computes ONE immutable
-`TransitionPlan` (the exact protected item columns and the exact event), and
-derives two grants from it, each opened only around its own statement:
+The transition service validates a transition and computes ONE **deeply
+immutable** `TransitionPlan`: tuples of `(attname, value)` pairs holding only
+immutable scalars, with event `detail` stored as canonical JSON text (the
+constructor refuses anything mutable, so neither the caller's input nor a
+holder of the plan can change it after validation). Two grants derive from
+that plan, each opened only around one call to `guard._execute()`:
 
-* `ItemWrite(item id, from state, to state, {attname: exact value})` — the
-  one `save()` of that row: the persisted row must be in `from state`; every
-  planned column must hold its exact planned value; every other protected
-  column must equal the authoritative row. (`ItemCreate(item id, values)`
-  does the same for the one new row in `create_item`; every unplanned column
-  must hold the model default.)
-* `EventCreate({every event column: exact value})` — the one event insert.
+* `ItemWrite(item id, from state, to state, {attname: exact value})` /
+  `ItemCreate(item id, values)` — one item write or creation;
+* `EventCreate({every event column: exact value})` — one event insert.
+
+`_execute()` takes **no data**: it writes exactly the open grant's payload with
+one ORM statement that exposes no model instance to application code and
+emits **no model signals** (base `QuerySet.update` filtered by id AND source
+state; base `QuerySet.bulk_create` of an instance built from the payload —
+Django still applies `auto_now_add`, primary keys and JSON encoding), then
+reads the row back in the same transaction and refuses, rolling the whole
+transition back, unless it equals the payload. So `pre_save` receivers,
+descriptors or anything else between authorization and SQL cannot change
+what is written, and a tampered write never commits (item and event roll
+back together; a normal retry builds a fresh plan). `Model.save()` never
+honors a grant.
 
 A grant is itself checked against the fixed transition table: it can never
 describe a C2 (library) transition, a column its rule does not write, a state
-other than its target, or an event its rule does not record — so even a
-hand-built grant cannot deliver, forge failure fields onto a submission, or
-claim a delivery. A grant is consumed by its first matching write (before
-Django's own save, so `pre_save`/`post_save` receivers cannot reuse it),
-cannot be nested, is bound to the thread and asyncio task that opened it, and
-is always removed on exit. Only plans built by the validation path are
-committed, once. Completion opens no grant until locks, lease, persisted
-rendition evidence and expected provenance have all been verified.
+other than its target, or an event its rule does not record. A grant is
+consumed by its execution, cannot be nested, is bound to the thread and
+asyncio task that opened it, and is always removed on exit. Only plans built
+by the validation path are committed, once. Completion opens no grant until
+locks, lease, persisted rendition evidence and expected provenance have all
+been verified.
 
-The transition functions are the supported mutation API. Grants, plans and
-`_authorized` are private implementation details of `spoken`; deliberately
-importing them (or calling Django's base `QuerySet` methods directly) is
-equivalent to raw SQL and outside the ORM threat model.
+Ordinary saves of an item (title/notes) still run normally and emit signals,
+but **write only the editorial columns** (`update_fields` is narrowed), so a
+`pre_save` receiver cannot smuggle a protected value into that SQL; a
+`post_save` receiver attempting a lifecycle write is refused like any other
+ORM caller. The same post-signal rule covers the other entry-checked writes:
+`SpokenContentType.save()` re-reads and re-validates the row it wrote (and
+re-checks code permanence) before its transaction can commit, and a
+`ReferenceAudio` insert is compared with its exact registration before the
+registering transaction can commit.
+
+The transition functions are the supported mutation API. Grants, plans,
+`_authorized` and `_execute` are private implementation details of `spoken`;
+deliberately importing them (or calling Django's base `QuerySet` methods
+directly) is equivalent to raw SQL and outside the ORM threat model.
 (`spoken/tests/test_transition_authority.py`.)
 
 **Content-type configuration** is written only through

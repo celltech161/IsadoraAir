@@ -62,16 +62,22 @@ def check_projection(content_type) -> None:
               "an enabled type that delivers to the library needs a target category")
 
 
-def check_code_permanence(content_type, *, using=None) -> None:
+def check_code_permanence(content_type, *, using=None) -> str | None:
     """Lock the PERSISTED row (whatever ``_state.adding`` claims) and, if the
     code changes, test for items while the lock is held. Must run inside the
     transaction that writes the row (SpokenContentType.save), so the lock is
     held until commit: ``create_item`` locks the same row before creating a
-    first item, so one of the two waits for the other."""
-    from .models import SpokenItem
+    first item, so one of the two waits for the other. Returns the stored code
+    (None for a new row)."""
     model = type(content_type)
     stored = (model._base_manager.db_manager(using).select_for_update().filter(pk=content_type.pk)
               .values_list("code", flat=True).first())
+    _check_rename(content_type, stored, using=using)
+    return stored
+
+
+def _check_rename(content_type, stored, *, using=None) -> None:
+    from .models import SpokenItem
     if stored is None or stored == content_type.code:
         return
     if SpokenItem._base_manager.db_manager(using).filter(content_type_id=content_type.pk).exists():
@@ -84,14 +90,31 @@ def check_code(content_type) -> None:
         _fail("code", "invalid_code", "a type code is a lowercase slug (letters, digits, '-', '_')")
 
 
-def check_before_save(content_type, *, using=None) -> None:
-    check_code_permanence(content_type, using=using)
+def _validate(content_type) -> None:
     check_code(content_type)
     if not isinstance(content_type.recipe_params, dict):
         _fail("recipe_params", "invalid_parameters", "recipe parameters must be a JSON object")
     check_recipe(content_type.recipe_key, content_type.recipe_params)
     check_limits(content_type)
     check_projection(content_type)
+
+
+def check_before_save(content_type, *, using=None):
+    """Lock, check permanence, validate -- before the write. Returns the
+    stored code for check_persisted."""
+    stored = check_code_permanence(content_type, using=using)
+    _validate(content_type)
+    return stored
+
+
+def check_persisted(content_type, stored_code, *, using=None) -> None:
+    """After the write, inside the same transaction: re-read the row and run
+    the same checks on what was ACTUALLY written, so a pre_save receiver that
+    altered the instance after check_before_save cannot persist an invalid or
+    renamed-in-use configuration (the save raises and rolls back)."""
+    persisted = type(content_type)._base_manager.db_manager(using).get(pk=content_type.pk)
+    _check_rename(persisted, stored_code, using=using)
+    _validate(persisted)
 
 
 def media_policy_for(content_type) -> media_policy.MediaPolicy:

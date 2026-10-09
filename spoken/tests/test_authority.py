@@ -338,6 +338,30 @@ class ContentTypeWriteAuthorityTests(AuthorityFixtures):
             self.assert_refused(lambda: SpokenContentType.objects.update_or_create(
                 pk=self.ctype.pk, defaults={"code": "renamed"}))
 
+    def test_a_pre_save_receiver_cannot_persist_an_invalid_or_illegal_configuration(self):
+        from django.db.models.signals import pre_save
+        unused = SpokenContentType.objects.create(code="unused-cfg", name="U", delivery_mode="retain_only",
+                                                  recipe_key="lcl_psa")
+        self.snapshot = self.state()
+        for label, (target, tamper, error) in {
+            "unknown recipe": (unused, {"recipe_key": "no_such_recipe"}, ConfigurationError),
+            "bad parameters": (unused, {"recipe_params": {"bogus": 1}}, ConfigurationError),
+            "limits": (unused, {"max_bytes": 10 ** 15}, ConfigurationError),
+            "rename a used type": (self.ctype, {"code": "renamed-by-signal"}, guard.SpokenIntegrityError),
+        }.items():
+            def receiver(sender, instance, tamper=tamper, **kwargs):
+                if sender is SpokenContentType:
+                    for name, value in tamper.items():
+                        setattr(instance, name, value)
+            pre_save.connect(receiver, weak=False)
+            try:
+                with self.subTest(case=label):
+                    row = SpokenContentType.objects.get(pk=target.pk)
+                    row.name = "edited"                                 # an innocent, valid edit
+                    self.assert_refused(row.save, error)
+            finally:
+                pre_save.disconnect(receiver)
+
     def test_individual_saves_and_admin_style_edits_still_work(self):
         fresh = SpokenContentType.objects.create(code="fresh", name="Fresh", delivery_mode="retain_only",
                                                  recipe_key="lcl_psa")

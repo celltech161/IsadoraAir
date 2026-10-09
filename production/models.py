@@ -44,7 +44,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 
 from .errors import ImmutableMediaError, ReferenceAudioIntegrityError
@@ -456,8 +456,17 @@ class ReferenceAudio(_GuardedReferenceAudio):
                 "reference audio is registered only by production.services.reference_audio.register")
         if kwargs.get("update_fields") is not None or kwargs.get("force_update"):
             raise ReferenceAudioIntegrityError("a registration is inserted once, never updated")
+        if not transaction.get_connection(kwargs.get("using")).in_atomic_block:
+            raise ReferenceAudioIntegrityError("a registration is inserted inside its registering transaction")
         kwargs["force_insert"] = True
         super().save(*args, **kwargs)
+        # The authorization was checked on entry; a pre_save receiver runs after
+        # that. Verify what actually reached the row (same transaction, before
+        # commit) so a tampered insert is refused and rolled back.
+        stored = type(self)._base_manager.filter(pk=self.pk).values("key", "media_id", "sha256", "retired_at").first()
+        if stored is None or (stored["key"], str(stored["media_id"]), stored["sha256"], stored["retired_at"]) != (
+                authorized.key, str(authorized.media_id), authorized.sha256, None):
+            raise ReferenceAudioIntegrityError("the inserted registration differs from the authorized one")
 
     def delete(self, *args, **kwargs):
         raise ReferenceAudioIntegrityError("reference audio registrations are retained provenance; never deleted")

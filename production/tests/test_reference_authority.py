@@ -178,6 +178,25 @@ class ReferenceAudioServiceTests(IsolatedMediaRootMixin, TestCase):
         self.assertEqual(ReferenceAudio.objects.get(pk=row.pk).retired_at, retired_at)
         self.assertEqual(ReferenceAudio.objects.filter(key="bed.x").count(), 1)       # history readable
 
+    def test_a_pre_save_receiver_cannot_alter_the_registered_pin(self):
+        from django.db.models.signals import pre_save
+        former = reference_audio.register("bed.x", self.first)
+        tampers = {"pin": {"sha256": "0" * 64}, "key": {"key": "bed.other"}, "media": {"media_id": self.first.pk},
+                   "born retired": {"retired_at": timezone.now()}}
+        for label, tamper in tampers.items():
+            def receiver(sender, instance, tamper=tamper, **kwargs):
+                if sender is ReferenceAudio:
+                    for name, value in tamper.items():
+                        setattr(instance, name, value)
+            pre_save.connect(receiver, weak=False)
+            try:
+                with self.subTest(case=label), self.assertRaises(ReferenceAudioIntegrityError):
+                    reference_audio.register("bed.x", self.second)
+            finally:
+                pre_save.disconnect(receiver)
+            rows = list(ReferenceAudio.objects.values_list("pk", "key", "sha256", "retired_at"))
+            self.assertEqual(rows, [(former.pk, "bed.x", self.first.sha256, None)])   # rolled back, still current
+
     def test_identical_reregistration_is_idempotent(self):
         row = reference_audio.register("bed.x", self.first)
         again = reference_audio.register("bed.x", self.first)
