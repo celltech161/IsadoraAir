@@ -38,13 +38,16 @@ There is deliberately no database trigger (that would need a manual migration).
 """
 from __future__ import annotations
 
+import contextvars
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
-from .errors import ImmutableMediaError
+from .errors import ImmutableMediaError, ReferenceAudioIntegrityError
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 # <2 hex shard>/<32 hex media id> -- relative to <root>/media/. Extensionless on
@@ -304,7 +307,86 @@ class ProductionMedia(models.Model):
 REFERENCE_KEY_PATTERN = r"^[a-z0-9][a-z0-9_.-]{0,63}$"
 
 
-class ReferenceAudio(models.Model):
+# -- ReferenceAudio authority ------------------------------------------------------------
+#
+# A ReferenceAudio row is retained provenance. Ordinary ORM code can READ it and
+# nothing else:
+#
+# * creation happens only inside ``production.services.reference_audio.register``,
+#   which (under the per-key advisory lock and ``lock_for_binding``) opens a
+#   registration scope naming the EXACT row it is about to insert -- key, media,
+#   pinned SHA-256. ``save()`` refuses any insert outside that scope or not
+#   matching it, so ``objects.create()``, ``get_or_create()``,
+#   ``update_or_create()`` and instance saves cannot fabricate a registration;
+# * an existing row is never re-saved: identity, media, pin and registration
+#   evidence are immutable. Retirement -- the one mutation -- is a single
+#   state-qualified UPDATE of exactly the retirement columns, issued by the
+#   service (as production.transitions does for ProductionMedia);
+# * ``QuerySet.update()`` refuses everything except the SET_NULL Django performs
+#   when a User is deleted; ``bulk_create``/``bulk_update`` and every deletion
+#   (instance, queryset, default/base/reverse manager) refuse.
+#
+# The guarded queryset is the default AND the base manager. ``base_manager_name``
+# sits on an abstract parent so the accepted production.0002 migration state is
+# unchanged (abstract-parent Meta is not part of the child's migration options;
+# Options.base_manager falls back to the first parent's base manager name).
+# Raw SQL is outside the boundary, as for ProductionMedia.
+
+@dataclass(frozen=True)
+class _Registration:
+    key: str
+    media_id: object
+    sha256: str
+
+
+_registration = contextvars.ContextVar("production_reference_registration", default=None)
+
+_REFERENCE_USER_FKS = ("registered_by", "registered_by_id", "retired_by", "retired_by_id")
+
+
+@contextmanager
+def reference_registration(*, key, media_id, sha256):
+    """Authorize inserting exactly ONE row with these identity columns.
+    Entered only by production.services.reference_audio.register."""
+    token = _registration.set(_Registration(key=key, media_id=media_id, sha256=sha256))
+    try:
+        yield
+    finally:
+        _registration.reset(token)
+
+
+class ReferenceAudioQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        # Exactly Django's SET_NULL of a deleted user (actor unlinked; the
+        # username snapshots keep the history readable). Nothing else.
+        if kwargs and set(kwargs) <= set(_REFERENCE_USER_FKS) and all(v is None for v in kwargs.values()):
+            return super().update(**kwargs)
+        raise ReferenceAudioIntegrityError(
+            f"reference audio registrations are immutable; refusing a generic update of {sorted(kwargs)} "
+            "(retire through production.services.reference_audio)")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ReferenceAudioIntegrityError("reference audio registrations are immutable; bulk_update is refused")
+
+    def bulk_create(self, objs, *args, **kwargs):
+        raise ReferenceAudioIntegrityError(
+            "reference audio is registered only by production.services.reference_audio.register")
+
+    def delete(self):
+        raise ReferenceAudioIntegrityError("reference audio registrations are retained provenance; never deleted")
+
+    delete.queryset_only = True
+
+
+class _GuardedReferenceAudio(models.Model):
+    objects = ReferenceAudioQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+        base_manager_name = "objects"
+
+
+class ReferenceAudio(_GuardedReferenceAudio):
     """A station-managed, human-keyed pin of one retained ProductionMedia --
     the beds, intros and similar reference audio that render recipes use.
 
@@ -314,6 +396,10 @@ class ReferenceAudio(models.Model):
     registered. Rows are append-only: replacing the audio behind a key retires
     the current row and registers a new one (both recorded, with who and why),
     so a rendition's provenance can always name the exact bytes it used.
+
+    Retained provenance: rows are never deleted, so every bed media a
+    registration -- current OR retired -- names stays retained (PROTECT; purge
+    refuses). That low-volume cost is intentional.
 
     Resolution (production.services.reference_audio) refuses a missing,
     retired, purged, not-valid or hash-mismatched reference; a recipe can never
@@ -350,6 +436,7 @@ class ReferenceAudio(models.Model):
             models.CheckConstraint(condition=Q(sha256__regex=SHA256_PATTERN),
                                    name="production_reference_sha256_hex"),
             # One current (un-retired) row per key: resolution is unambiguous.
+            # Defense in depth beneath the service's per-key advisory lock.
             models.UniqueConstraint(fields=["key"], condition=Q(retired_at__isnull=True),
                                     name="production_reference_one_current_per_key"),
         ]
@@ -357,3 +444,20 @@ class ReferenceAudio(models.Model):
 
     def __str__(self):
         return f"{self.key} -> {self.media_id}"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ReferenceAudioIntegrityError(
+                "reference audio registrations are immutable (retire through production.services.reference_audio)")
+        authorized = _registration.get()
+        if (authorized is None or self.retired_at is not None or self.key != authorized.key
+                or str(self.media_id) != str(authorized.media_id) or self.sha256 != authorized.sha256):
+            raise ReferenceAudioIntegrityError(
+                "reference audio is registered only by production.services.reference_audio.register")
+        if kwargs.get("update_fields") is not None or kwargs.get("force_update"):
+            raise ReferenceAudioIntegrityError("a registration is inserted once, never updated")
+        kwargs["force_insert"] = True
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ReferenceAudioIntegrityError("reference audio registrations are retained provenance; never deleted")

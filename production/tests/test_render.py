@@ -17,7 +17,7 @@ from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase
 
 from production.errors import MediaNotValidated
-from production.models import ProductionMedia, ReferenceAudio
+from production.models import ProductionMedia, ReferenceAudio, reference_registration
 from production.services import intake, layout, reference_audio, render, retention, validation
 from production.services.render import engine, params as params_mod, runner, steps
 from spoken.tests import support as audio
@@ -302,7 +302,10 @@ class ReferenceAudioTests(IsolatedMediaRootMixin, TestCase):
     def test_one_current_row_per_key_is_a_database_invariant(self):
         bed = self.ingest(audio.bed(1.0), ProductionMedia.KIND_BED)
         reference_audio.register("bed.x", bed)
-        with self.assertRaises(IntegrityError), transaction.atomic():
+        # Defense in depth beneath the per-key advisory lock: even an insert
+        # through the registration authority cannot add a second current row.
+        with self.assertRaises(IntegrityError), transaction.atomic(), \
+                reference_registration(key="bed.x", media_id=bed.pk, sha256=bed.sha256):
             ReferenceAudio.objects.create(key="bed.x", media=bed, sha256=bed.sha256)
 
     def test_referenced_bed_media_cannot_be_purged(self):

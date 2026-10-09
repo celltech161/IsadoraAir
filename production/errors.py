@@ -23,6 +23,13 @@ class ImmutableMediaError(ProductionMediaError):
     code = "immutable_media"
 
 
+class ReferenceAudioIntegrityError(ProductionMediaError):
+    """An ordinary ORM path tried to create, change or delete a ReferenceAudio
+    registration outside production.services.reference_audio."""
+
+    code = "reference_audio_integrity"
+
+
 class IntakeError(ProductionMediaError):
     """Intake could not store the bytes (I/O failure, bad request, collision)."""
 
