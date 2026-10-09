@@ -56,6 +56,12 @@ def _parse(value, *, label, minimum, maximum) -> int:
     return number
 
 
+def parse_bounded(value, *, label, minimum, maximum) -> int:
+    """The same strict parser for another service's admission domain (e.g.
+    isadoraair-render's own limits, production.services.render_service)."""
+    return _parse(value, label=label, minimum=minimum, maximum=maximum)
+
+
 def parse_active(value) -> int:
     return _parse(value, label=ACTIVE_LABEL, minimum=ACTIVE_MIN, maximum=ACTIVE_MAX)
 

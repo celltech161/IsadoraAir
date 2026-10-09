@@ -3,7 +3,7 @@
 Usage (only ever invoked by production.services.confinement):
 
     python -I -S confined_exec.py --cgroup /sys/fs/cgroup/.../run-X
-        --memory BYTES --cpu SECONDS --fsize BYTES --nofile N -- /abs/tool arg ...
+        --memory BYTES --cpu SECONDS --fsize BYTES --nofile N [--profile render] -- /abs/tool arg ...
 
 Before the untrusted tool runs, this launcher (trusted, standard library only)
 establishes, in this order, and then exec()s the tool:
@@ -26,6 +26,14 @@ establishes, in this order, and then exec()s the tool:
    ``CLONE_INTO_CGROUP`` -- the one way to start a process in another cgroup
    without writing ``cgroup.procs`` -- is unavailable; syscalls of a foreign
    ABI (x32 / 32-bit compat) kill the process.
+
+The ``render`` profile (isadoraair-render) narrows this further: Landlock lets
+the tool READ only what a renderer needs (/usr, /lib, /lib64, the loader
+cache and timezone in /etc, the CPU topology in /sys, /dev/null and
+/dev/urandom) -- not the station's
+home directories, source tree, media library, configuration secrets or keys --
+and seccomp makes ``socket(2)`` fail with EACCES (no network, netlink or unix
+sockets). A renderer reads and writes only the descriptors it was handed.
 5. **rlimits** -- per-process backstops inside the aggregate limits:
    RLIMIT_AS, RLIMIT_CPU (SIGXCPU, SIGKILL 5 s later), RLIMIT_FSIZE,
    RLIMIT_NOFILE, RLIMIT_CORE 0.
@@ -78,9 +86,11 @@ _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
 _SECCOMP_RET_ALLOW = 0x7FFF0000
 _ENOSYS = 38
+_EACCES = 13
 _NR_CLONE3 = 435                    # same number on every 64-bit Linux ABI
 _X32_SYSCALL_BIT = 0x40000000
 _AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
+_NR_SOCKET = {"x86_64": 41, "aarch64": 198}
 
 
 class _Refused(Exception):
@@ -100,7 +110,7 @@ def _parse(argv):
     options, command = argv[:split], argv[split + 1:]
     if not command or not os.path.isabs(command[0]):
         _fail(EXIT_LIMITS, "usage: the command must be an absolute path")
-    values = {}
+    values = {"--profile": "validation"}
     numeric = {"--memory", "--cpu", "--fsize", "--nofile"}
     it = iter(options)
     for name in it:
@@ -109,6 +119,11 @@ def _parse(argv):
         except StopIteration:
             _fail(EXIT_LIMITS, f"usage: {name} needs a value")
         if name == "--cgroup":
+            values[name] = raw
+            continue
+        if name == "--profile":
+            if raw not in PROFILES:
+                _fail(EXIT_LIMITS, f"usage: unknown profile {raw!r}")
             values[name] = raw
             continue
         if name not in numeric:
@@ -120,7 +135,7 @@ def _parse(argv):
         if value <= 0:
             _fail(EXIT_LIMITS, f"usage: {name} must be positive")
         values[name] = value
-    if set(values) != numeric | {"--cgroup"}:
+    if set(values) != numeric | {"--cgroup", "--profile"}:
         _fail(EXIT_LIMITS, "usage: --cgroup, --memory, --cpu, --fsize and --nofile are all required")
     return values, command
 
@@ -176,7 +191,19 @@ def landlock_abi(libc=None):
                         ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
 
 
-def _landlock(libc):
+# (path, rights) Landlock read rules per profile. Paths that do not exist on a
+# host are skipped (e.g. /lib64 on aarch64); every rule that exists must apply.
+_READ_EXEC = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR
+PROFILES = {
+    "validation": (("/", _READ_EXEC),),
+    "render": (("/usr", _READ_EXEC), ("/lib", _READ_EXEC), ("/lib64", _READ_EXEC),
+               ("/etc/ld.so.cache", FS_READ_FILE), ("/etc/ld.so.preload", FS_READ_FILE),
+               ("/etc/localtime", FS_READ_FILE), ("/sys/devices/system/cpu", FS_READ_FILE | FS_READ_DIR),
+               ("/dev/urandom", FS_READ_FILE)),
+}
+
+
+def _landlock(libc, profile="validation"):
     abi = landlock_abi(libc)
     if abi < 1:
         raise _Refused("Landlock is not available")
@@ -195,8 +222,9 @@ def _landlock(libc):
     ruleset = _check(libc.syscall(_SYS_LANDLOCK_CREATE_RULESET, buf, ctypes.c_size_t(size), ctypes.c_uint32(0)),
                      "landlock_create_ruleset")
     try:
-        for path, allowed in (("/", FS_EXECUTE | FS_READ_FILE | FS_READ_DIR),
-                              ("/dev/null", FS_READ_FILE | FS_WRITE_FILE)):
+        for path, allowed in (*PROFILES[profile], ("/dev/null", FS_READ_FILE | FS_WRITE_FILE)):
+            if path != "/dev/null" and profile != "validation" and not os.path.lexists(path):
+                continue
             fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
             try:
                 rule = ctypes.create_string_buffer(struct.pack("=Qi", allowed, fd), 12)
@@ -222,22 +250,30 @@ class _SockFprog(ctypes.Structure):
     _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(_SockFilter))]
 
 
-def _seccomp(libc):
-    arch = _AUDIT_ARCH.get(platform.machine())
+def _seccomp(libc, deny_sockets=False):
+    machine = platform.machine()
+    arch = _AUDIT_ARCH.get(machine)
     if arch is None:
-        raise _Refused(f"no seccomp policy for architecture {platform.machine()!r}")
+        raise _Refused(f"no seccomp policy for architecture {machine!r}")
     ld_w_abs, jeq_k, jge_k, ret_k = 0x20, 0x15, 0x35, 0x06
+    # Rules after the syscall number is loaded: (number, return value).
+    rules = [(_NR_CLONE3, _SECCOMP_RET_ERRNO | _ENOSYS)]
+    if deny_sockets:
+        rules.append((_NR_SOCKET[machine], _SECCOMP_RET_ERRNO | _EACCES))
     program = [
-        (ld_w_abs, 0, 0, 4),                            # 0: A = seccomp_data.arch
-        (jeq_k, 1, 0, arch),                            # 1: native ABI? -> 3
-        (ret_k, 0, 0, _SECCOMP_RET_KILL_PROCESS),       # 2: foreign ABI: kill
-        (ld_w_abs, 0, 0, 0),                            # 3: A = seccomp_data.nr
-        (jge_k, 3, 0, _X32_SYSCALL_BIT),                # 4: x32 syscall? -> 8 (kill)
-        (jeq_k, 0, 1, _NR_CLONE3),                      # 5: clone3? -> 6 else 7
-        (ret_k, 0, 0, _SECCOMP_RET_ERRNO | _ENOSYS),    # 6: clone3 -> ENOSYS
-        (ret_k, 0, 0, _SECCOMP_RET_ALLOW),              # 7: everything else
-        (ret_k, 0, 0, _SECCOMP_RET_KILL_PROCESS),       # 8
+        (ld_w_abs, 0, 0, 4),                            # A = seccomp_data.arch
+        (jeq_k, 1, 0, arch),                            # native ABI? skip the kill
+        (ret_k, 0, 0, _SECCOMP_RET_KILL_PROCESS),       # foreign ABI: kill
+        (ld_w_abs, 0, 0, 0),                            # A = seccomp_data.nr
     ]
+    kill_at = len(program) + 1 + 2 * len(rules) + 1     # index of the final KILL
+    program.append((jge_k, kill_at - (len(program) + 1), 0, _X32_SYSCALL_BIT))   # x32 syscall: kill
+    for number, verdict in rules:
+        program.append((jeq_k, 0, 1, number))           # this syscall? -> next insn, else skip it
+        program.append((ret_k, 0, 0, verdict))
+    program.append((ret_k, 0, 0, _SECCOMP_RET_ALLOW))   # everything else
+    program.append((ret_k, 0, 0, _SECCOMP_RET_KILL_PROCESS))
+    assert len(program) - 1 == kill_at
     filters = (_SockFilter * len(program))(*[_SockFilter(*insn) for insn in program])
     fprog = _SockFprog(len(program), filters)
     _check(libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER, ctypes.addressof(fprog), 0, 0), "seccomp")
@@ -261,8 +297,8 @@ def main(argv):
         _join_cgroup(values["--cgroup"])
         libc = _libc()
         _no_new_privs(libc)
-        _landlock(libc)
-        _seccomp(libc)
+        _landlock(libc, values["--profile"])
+        _seccomp(libc, deny_sockets=values["--profile"] == "render")
         _apply(resource.RLIMIT_CORE, 0, 0)
         _apply(resource.RLIMIT_AS, values["--memory"], values["--memory"])
         _apply(resource.RLIMIT_CPU, values["--cpu"], values["--cpu"] + CPU_HARD_GRACE_SECONDS)

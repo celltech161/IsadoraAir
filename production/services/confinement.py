@@ -83,6 +83,7 @@ LAUNCHER_EXIT_LIMITS = confined_exec.EXIT_LIMITS
 LAUNCHER_EXIT_EXEC = confined_exec.EXIT_EXEC
 CGROUP_MOUNT = confined_exec.CGROUP_MOUNT
 VALIDATION_CGROUP_NAME = "iportal-validation"
+RENDER_CGROUP_NAME = "iportal-render"
 REQUIRED_CONTROLLERS = ("cpu", "memory", "pids")
 CLEANUP_TIMEOUT_SECONDS = 10.0
 LEAF_PREFIX = "run-"
@@ -144,12 +145,27 @@ def configured_limits() -> Limits:
 # in for it), in that service's delegated cgroup subtree.
 # =============================================================================
 
-def validation_root() -> Path:
-    """Where per-run leaves are created: ``settings.PRODUCTION_VALIDATION_CGROUP``
-    (an absolute cgroup-filesystem path) or, by default, ``iportal-validation``
-    beside this process's own cgroup -- i.e. inside the unit cgroup systemd
-    delegated to the validation service (``DelegateSubgroup=supervisor``)."""
-    configured = getattr(settings, "PRODUCTION_VALIDATION_CGROUP", None)
+@dataclass(frozen=True)
+class Subtree:
+    """One service's exclusive run subtree: its leaf directory name beside the
+    service's own cgroup, and the setting that may pin it elsewhere."""
+
+    name: str
+    setting: str
+
+
+VALIDATION = Subtree(VALIDATION_CGROUP_NAME, "PRODUCTION_VALIDATION_CGROUP")
+# isadoraair-render (production.services.render_service): a SEPARATE unit with
+# its own delegated subtree; renders never share the validators' leaves.
+RENDER = Subtree(RENDER_CGROUP_NAME, "PRODUCTION_RENDER_CGROUP")
+
+
+def validation_root(subtree: Subtree = VALIDATION) -> Path:
+    """Where per-run leaves are created: the subtree's setting (an absolute
+    cgroup-filesystem path) or, by default, ``<subtree.name>`` beside this
+    process's own cgroup -- i.e. inside the unit cgroup systemd delegated to
+    the service (``DelegateSubgroup=supervisor``)."""
+    configured = getattr(settings, subtree.setting, None)
     if configured:
         root = Path(configured)
     else:
@@ -159,10 +175,10 @@ def validation_root() -> Path:
             raise ConfinementUnavailable(f"cannot read own cgroup: {exc}") from exc
         if own in ("", "/"):
             raise ConfinementUnavailable("this process is in the root cgroup; no delegated subtree")
-        root = Path(CGROUP_MOUNT + own).parent / VALIDATION_CGROUP_NAME
+        root = Path(CGROUP_MOUNT + own).parent / subtree.name
     if not root.is_absolute() or os.path.realpath(root) != str(root) \
             or not str(root).startswith(CGROUP_MOUNT + "/"):
-        raise ConfinementUnavailable(f"validation cgroup {str(root)!r} is not a canonical path under {CGROUP_MOUNT}")
+        raise ConfinementUnavailable(f"{subtree.name} cgroup {str(root)!r} is not a canonical path under {CGROUP_MOUNT}")
     return root
 
 
@@ -199,10 +215,10 @@ def _enable_controllers(cgroup: Path) -> None:
         raise ConfinementUnavailable(f"{cgroup}: cannot enable {', '.join(REQUIRED_CONTROLLERS)}")
 
 
-def establish_root() -> Path:
-    """Verify (and, first time, create) the validation subtree with every
+def establish_root(subtree: Subtree = VALIDATION) -> Path:
+    """Verify (and, first time, create) the service's subtree with every
     REQUIRED controller enabled for its leaves. Raises ConfinementUnavailable."""
-    root = validation_root()
+    root = validation_root(subtree)
     delegated = root.parent
     try:
         if not (Path(CGROUP_MOUNT) / "cgroup.controllers").is_file():
@@ -223,8 +239,8 @@ def establish_root() -> Path:
     return root
 
 
-def _prepare_leaf(limits: Limits) -> Path:
-    root = establish_root()
+def _prepare_leaf(limits: Limits, subtree: Subtree = VALIDATION) -> Path:
+    root = establish_root(subtree)
     leaf = root / f"{LEAF_PREFIX}{secrets.token_hex(16)}"
     try:
         leaf.mkdir(mode=0o755)
@@ -361,7 +377,7 @@ def _children(root: Path) -> list[Path]:
     return sorted(root.iterdir())
 
 
-def reap_all(root: Path | None = None) -> list[dict]:
+def reap_all(root: Path | None = None, subtree: Subtree = VALIDATION) -> list[dict]:
     """Kill and remove EVERY run leaf under the validation root. Only the
     validation service calls this -- at start-up (before it accepts work) and
     when it stops: the subtree is exclusively its own, so any ``run-*`` leaf
@@ -371,7 +387,7 @@ def reap_all(root: Path | None = None) -> list[dict]:
     All or nothing: raises ConfinementUnavailable unless the subtree could be
     scanned, every leaf was killed, emptied and removed, and the subtree is
     then verifiably unpopulated. A failure is never "nothing to clean"."""
-    root = root or establish_root()
+    root = root or establish_root(subtree)
     try:
         entries = _children(root)
     except OSError as exc:
@@ -400,11 +416,12 @@ def reap_all(root: Path | None = None) -> list[dict]:
     return reaped
 
 
-def _launcher_argv(leaf: Path, executable: str, args, limits: Limits) -> list[str]:
+def _launcher_argv(leaf: Path, executable: str, args, limits: Limits, profile=None) -> list[str]:
     return [
         sys.executable, "-I", "-S", LAUNCHER, "--cgroup", str(leaf),
         "--memory", str(limits.memory_bytes), "--cpu", str(limits.cpu_seconds),
         "--fsize", str(limits.file_size_bytes), "--nofile", str(limits.open_files),
+        *(("--profile", profile) if profile else ()),
         "--", executable, *args,
     ]
 
@@ -415,7 +432,7 @@ def _unavailable(reason: str) -> dict:
 
 
 def execute(args, *, timeout_seconds, stop_event=None, limits: Limits | None = None, pass_fds=(),
-            cancelled=None) -> dict:
+            cancelled=None, subtree: Subtree = VALIDATION, profile=None, env=None) -> dict:
     """Run argv (no shell) inside a fresh leaf, in THIS process's delegated
     subtree. The hard deadline, the CPU-time budget and the final destruction
     of the tree are enforced here -- the validation service is the only
@@ -431,15 +448,16 @@ def execute(args, *, timeout_seconds, stop_event=None, limits: Limits | None = N
     if not os.path.isfile(LAUNCHER):
         return _unavailable("confinement launcher missing")
     try:
-        leaf = _prepare_leaf(limits)
+        leaf = _prepare_leaf(limits, subtree)
     except ConfinementUnavailable as exc:
         return _unavailable(str(exc))
-    argv = _launcher_argv(leaf, executable, list(args[1:]), limits)
+    extra = {"profile": profile} if profile else {}               # the validation call is unchanged
+    argv = _launcher_argv(leaf, executable, list(args[1:]), limits, **extra)
     started = time.monotonic()
     try:
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            shell=False, start_new_session=True, close_fds=True, pass_fds=tuple(pass_fds),
+            shell=False, start_new_session=True, close_fds=True, pass_fds=tuple(pass_fds), env=env,
         )
     except OSError as exc:
         _destroy(leaf)
