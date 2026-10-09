@@ -299,3 +299,61 @@ class ProductionMedia(models.Model):
             "ProductionMedia rows are never deleted; purge the bytes instead "
             "(production.services.retention.purge_media).",
         )
+
+
+REFERENCE_KEY_PATTERN = r"^[a-z0-9][a-z0-9_.-]{0,63}$"
+
+
+class ReferenceAudio(models.Model):
+    """A station-managed, human-keyed pin of one retained ProductionMedia --
+    the beds, intros and similar reference audio that render recipes use.
+
+    Domain-neutral and deliberately tiny: it is NOT a workflow and NOT an
+    asset hierarchy. A key (``bed.news_intro``) resolves to exactly one
+    CURRENT row, which names the media AND pins the SHA-256 it had when it was
+    registered. Rows are append-only: replacing the audio behind a key retires
+    the current row and registers a new one (both recorded, with who and why),
+    so a rendition's provenance can always name the exact bytes it used.
+
+    Resolution (production.services.reference_audio) refuses a missing,
+    retired, purged, not-valid or hash-mismatched reference; a recipe can never
+    reach audio by path -- only by key.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.CharField(max_length=64)
+    media = models.ForeignKey(ProductionMedia, on_delete=models.PROTECT, related_name="reference_audio")
+    sha256 = models.CharField(max_length=64)
+    label = models.CharField(max_length=200, blank=True)
+    note = models.CharField(max_length=500, blank=True)
+    registered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="registered_reference_audio",
+    )
+    registered_by_username = models.CharField(max_length=150, blank=True)
+    registered_at = models.DateTimeField(auto_now_add=True)
+    retired_at = models.DateTimeField(null=True, blank=True)
+    retired_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="retired_reference_audio",
+    )
+    retired_by_username = models.CharField(max_length=150, blank=True)
+    retire_reason = models.CharField(max_length=500, blank=True)
+
+    class Meta:
+        ordering = ["key", "-registered_at"]
+        verbose_name = "reference audio"
+        verbose_name_plural = "reference audio"
+        constraints = [
+            models.CheckConstraint(condition=Q(key__regex=REFERENCE_KEY_PATTERN),
+                                   name="production_reference_key_shape"),
+            models.CheckConstraint(condition=Q(sha256__regex=SHA256_PATTERN),
+                                   name="production_reference_sha256_hex"),
+            # One current (un-retired) row per key: resolution is unambiguous.
+            models.UniqueConstraint(fields=["key"], condition=Q(retired_at__isnull=True),
+                                    name="production_reference_one_current_per_key"),
+        ]
+        indexes = [models.Index(fields=["key", "registered_at"], name="production_reference_history")]
+
+    def __str__(self):
+        return f"{self.key} -> {self.media_id}"

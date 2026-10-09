@@ -20,7 +20,7 @@ from django.urls import path, reverse
 
 from isadoraair import env_admin
 
-from .models import ProductionMedia
+from .models import ProductionMedia, ReferenceAudio
 from .services import admission, layout
 
 VALIDATION_LIMIT_KEYS = ["PRODUCTION_VALIDATION_MAX_ACTIVE", "PRODUCTION_VALIDATION_MAX_PENDING"]
@@ -141,3 +141,22 @@ class ProductionMediaAdmin(admin.ModelAdmin):
 
     def get_actions(self, request):
         return {}
+
+
+@admin.register(ReferenceAudio)
+class ReferenceAudioAdmin(admin.ModelAdmin):
+    """Read-only: registration and retirement go through
+    production.services.reference_audio (append-only, binding-locked)."""
+
+    list_display = ("key", "label", "media", "sha256", "registered_by_username", "registered_at", "retired_at")
+    list_filter = ("key",)
+    search_fields = ("key", "label", "sha256")
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
