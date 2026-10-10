@@ -57,9 +57,17 @@ def check_limits(content_type) -> None:
 
 
 def check_projection(content_type) -> None:
+    from .models import CurrentRecallPolicy, DeliveryMode
+    if content_type.delivery_mode not in DeliveryMode.values:
+        _fail("delivery_mode", "invalid_delivery_mode", "unknown delivery mode")
     if content_type.enabled and content_type.projects_to_library and content_type.target_category_id is None:
         _fail("target_category", "target_category_required",
               "an enabled type that delivers to the library needs a target category")
+    if content_type.on_current_recall == CurrentRecallPolicy.RESTORE_PREVIOUS:
+        # C2B never resurrects a superseded edition automatically; a reviewed
+        # re-promotion feature may enable this later.
+        _fail("on_current_recall", "restore_previous_unsupported",
+              "restoring the previous edition is not supported; a recall retires the current content")
 
 
 def check_code_permanence(content_type, *, using=None) -> str | None:

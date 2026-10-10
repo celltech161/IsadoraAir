@@ -106,9 +106,28 @@ class EditionInline(admin.TabularInline):
 
 @admin.register(SpokenAsset)
 class SpokenAssetAdmin(ReadOnlyAdmin):
-    list_display = ("id", "content_type", "mode", "slot_key", "state", "generation", "track", "library_relpath")
+    """Read-only diagnostics: mode/state, generation, current item and
+    rendition, Track, stable path, the active edition's SHA, the file's
+    observed status and the edition history. Repairs: spoken_projection
+    reconcile."""
+    list_display = ("id", "content_type", "mode", "slot_key", "state", "generation", "current_item", "track",
+                    "library_relpath")
     list_filter = ("mode", "state", "content_type")
+    readonly_fields = ("active_edition_sha256", "library_file_status")
     inlines = [EditionInline]
+
+    @admin.display(description="Active edition SHA-256")
+    def active_edition_sha256(self, obj):
+        active = obj.editions.filter(state="active").first()
+        return active.library_sha256 if active else "-"
+
+    @admin.display(description="Library file")
+    def library_file_status(self, obj):
+        from .projection_health import asset_file_status
+        try:
+            return asset_file_status(obj)
+        except Exception as exc:                            # noqa: BLE001 -- diagnostics only
+            return f"unreadable ({exc})"
 
 
 @admin.register(SpokenAssetEdition)

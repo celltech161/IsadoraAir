@@ -168,7 +168,7 @@ def _attname_values(model, values: dict) -> tuple:
 
 
 def _plan(row, *, from_state, to_state, rule, changes, actor_kind, user, username, media, detail,
-          locked=None) -> TransitionPlan:
+          locked=None, asset=None, edition=None) -> TransitionPlan:
     """``locked``: guard.snapshot of the row taken right after it was locked
     (None for a creation) -- the authority for every column the transition
     leaves alone; never a later re-read."""
@@ -184,7 +184,7 @@ def _plan(row, *, from_state, to_state, rule, changes, actor_kind, user, usernam
     event_values = tuple(sorted(dict(_attname_values(SpokenItemEvent, {
         "item": row.pk, "event": rule.event, "from_state": from_state or "", "to_state": to_state,
         "actor_kind": actor_kind, "actor": user, "actor_username": username, "media": media,
-        "asset": None, "edition": None,
+        "asset": asset, "edition": edition,
     }), detail=detail_text).items()))
     plan = TransitionPlan(item_id=row.pk, from_state=from_state, to_state=to_state, item_values=item_values,
                           item_expected=item_expected, event_values=event_values)
@@ -219,6 +219,21 @@ def _commit(row, plan) -> None:
                                            expected=plan.item_expected)):
         guard._execute()
     _write_event(plan)
+    row.refresh_from_db()
+
+
+def _commit_projected(row, plan, *, asset_id, edition_id) -> None:
+    """A C2 plan, committed by the projection service (spoken.delivery): the
+    item write under a ProjectedItemWrite grant -- whose projection witness
+    the guard re-checks against the locked database -- then its event."""
+    _require_planned(plan, row)
+    write = guard.ItemWrite(item_id=plan.item_id, from_state=plan.from_state, to_state=plan.to_state,
+                            values=plan.item_values, expected=plan.item_expected)
+    with guard._authorized(guard.ProjectedItemWrite(write=write, asset_id=asset_id, edition_id=edition_id)):
+        guard._execute()
+    _PLANNED.discard(plan)
+    with guard._authorized(guard.ProjectedEventCreate(values=plan.event_values)):
+        guard._execute()
     row.refresh_from_db()
 
 
@@ -519,8 +534,14 @@ def reject(item, *, actor, note="") -> SpokenItem:
 
 
 def recall(item, *, actor, reason="") -> SpokenItem:
-    """Recall before delivery (C1). Managers always; the submitter while the
-    type's recall policy allows it. A delivered item's recall is C2."""
+    """Recall. Before delivery: managers always; the submitter while the
+    type's recall policy allows it. A delivered (or superseded) item's recall
+    removes projected content, so it is the projection service's
+    (spoken.delivery.recall_delivered)."""
+    state = SpokenItem.objects.filter(pk=getattr(item, "pk", item)).values_list("state", flat=True).first()
+    if state in (S.DELIVERED, S.SUPERSEDED):
+        from . import delivery
+        return delivery.recall_delivered(item, actor=actor, reason=reason)
 
     def check(row, user, now):
         if is_manager(user):

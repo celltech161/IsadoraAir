@@ -31,7 +31,14 @@ class Command(BaseCommand):
             signal.signal(signum, lambda *_: stopping.append(True))
         limit = 1 if options["once"] else max(0, options["max_items"])
         done = 0
+        # C2B: converge projections left by a crash before taking new work.
+        from spoken import delivery
+        findings = [f for f in delivery.reconcile() if f.get("action") not in ("none", "skipped")]
+        if findings:
+            self.stdout.write(f"projection reconcile: {len(findings)} change(s)")
         while not stopping:
+            for advanced in worker.advance_ready():
+                self.stdout.write(f"{advanced.item_id}: {advanced.result} {advanced.code}".rstrip())
             outcome = worker.process_one()
             if outcome is None:
                 if options["once"]:

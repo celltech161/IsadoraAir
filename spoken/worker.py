@@ -151,3 +151,24 @@ def process_one(*, render_fn=render.render, sleep=time.sleep):
             return _fail(item, token, exc.code, exc)
         except transitions.InvalidTransition as exc:
             return Outcome(str(item.pk), "lost_lease", exc.code)
+
+
+def advance_ready(*, limit=20) -> list:
+    """The projection pass (C2B): every ``processed`` item goes on through
+    the authoritative path -- review when its type requires it, else
+    delivery by the projection service (spoken.delivery) -- and the bounded
+    expiry sweep runs. A delivery that fails leaves its item ``processed``
+    for the next pass (its operator-attention is deduplicated)."""
+    from . import delivery
+    outcomes = []
+    for pk in (SpokenItem.objects.filter(state=ItemState.PROCESSED).order_by("processed_at", "pk")
+               .values_list("pk", flat=True)[:limit]):
+        try:
+            result = delivery.advance_processed(pk)
+            outcomes.append(Outcome(str(pk), "delivered" if result is not None else "awaiting_review"))
+        except transitions.SpokenServiceError as exc:
+            outcomes.append(Outcome(str(pk), "delivery_failed", exc.code))
+            delivery._attention(f"delivery_{exc.code}", None, f"item {pk}: {exc}")
+    for item in delivery.expire_due():
+        outcomes.append(Outcome(str(item.pk), "expired"))
+    return outcomes
