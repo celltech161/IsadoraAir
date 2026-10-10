@@ -519,9 +519,18 @@ Unknown modes fail closed. Track metadata: the fixed `title_policy`, the
 `artist_label` (empty: the type's name), the target category, `ready2air`
 = `deliver_ready_to_air`, duration/sample rate/channels from the validated
 rendition, cue-in 0 and next-start = the duration (the whole file airs; the
-music analyzer's cue/segue detection never runs on it). `expires_at` =
-delivery + `default_lifetime`. A replay of a delivered item returns the
-existing result.
+music analyzer's cue/segue detection never runs on it, and no waveform is
+generated — a projected spoken Track has no waveform display). The Track is
+an ordinary playout identity: no engine or scheduling change, and actual air
+remains proven only by the existing PlayEvent/LogItem as-run paths.
+`expires_at` = delivery + `default_lifetime`.
+
+**Idempotency.** Delivering a delivered item returns the existing result (no
+generation, Track, edition or file write); recall/expiry of an item already
+ended is refused, never repeated; `expire_due` skips what is no longer due;
+`reconcile` on a healthy projection writes nothing (no row, no file); a
+concurrent duplicate delivery is either the same result or a retryable
+`delivery_in_progress`.
 
 **Files.** `LIBRARY_ROOT/<category>/spoken-<asset uuid>.flac` (never from
 user input). `spoken/library_files.py` reaches the category directory with

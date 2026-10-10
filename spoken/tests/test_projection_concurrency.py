@@ -130,6 +130,27 @@ class ProjectionRaceTests(ProjectionMixin, TransactionTestCase):
                     self.assertEqual((asset.state, asset.current_item_id), (AssetState.LIVE, newer.pk))
                     self.assertIn(SpokenItem.objects.get(pk=old.pk).state, (S.RECALLED, S.EXPIRED))
 
+    def test_operator_detach_against_recall_and_expiry(self):
+        for contender in ("recall", "expire"):
+            with self.subTest(contender=contender):
+                ctype = self.make_type(default_lifetime=timedelta(seconds=1))
+                item, result = self.delivered(ctype)
+                time.sleep(1.1)
+                if contender == "recall":
+                    other = lambda: delivery.recall_delivered(item, actor=self.manager)      # noqa: E731
+                else:
+                    other = lambda: delivery.expire_item(item)                               # noqa: E731
+                outcomes = race(lambda: Track.objects.get(pk=result.track_id).delete(), other)
+                self.assert_no_unexpected_failure(outcomes)
+                delivery.reconcile()
+                asset = SpokenAsset.objects.get(content_type=ctype)
+                self.assertFalse(Track.objects.filter(pk=result.track_id).exists())     # never recreated
+                self.assertIn(asset.state, (AssetState.DETACHED, AssetState.PENDING))
+                if asset.state == AssetState.DETACHED:
+                    self.assertIsNone(asset.track_id)
+                self.assertIn(SpokenItem.objects.get(pk=item.pk).state, (S.RECALLED, S.EXPIRED))
+                self.assertIsNone(self.sha_on_disk(asset.library_relpath))
+
     def test_reconcile_and_relocation_against_delivery(self):
         ctype = self.make_type()
         self.delivered(ctype)
