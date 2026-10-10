@@ -11,10 +11,11 @@ generic workflow table, no generic foreign key and no workflow state on
 `ProductionMedia`. Foreign keys point domain → `ProductionMedia` (PROTECT),
 never the reverse.
 
-**Phase C1 (this slice)** delivers the permanent schema, the lifecycle
-authority, the render engine, the five recipes and reference audio. It does
-**not** create, change or delete library Tracks or files, run expiry, or
-enable any production type — Track projection is C2.
+**Phase C1** delivered the permanent schema, the lifecycle authority, the
+render engine, the five recipes and reference audio; **C2A** the sandboxed
+render executor; **C2B** the library projection (delivery, atomic promotion,
+recall, expiry, detach, relocation, reconcile — *Library projection* below).
+No production type is enabled.
 
 ## Schema (`spoken.0001_initial`, `production.0002_referenceaudio`)
 
@@ -61,7 +62,16 @@ state and timestamps, append the `SpokenItemEvent` — all in one transaction.
 | processed → awaiting_review | system | only if the type requires review |
 | awaiting_review → rejected | manager | review note |
 | pre-delivery → recalled | manager, or the submitter while `recall_policy` allows | not while `processing` |
-| → delivered, delivered → superseded / recalled / expired, superseded → delivered | — | **in the table, refused until C2** (`ProjectionRequired`) |
+| processed → delivered | system (type without review) or manager | **only the projection service** (`spoken.delivery`, C2B): exact current provenance; projected first (see *Library projection*) |
+| awaiting_review → delivered (`approved_delivered`) | manager | the approval IS the delivery, through the same projection |
+| delivered → superseded | system | a newer edition replaced it (current-edition) |
+| delivered / superseded → recalled | manager; the submitter only under `owner_anytime` | removes projected content only if it is the asset's current, live content |
+| delivered / superseded → expired | system | `expires_at` (delivery + `default_lifetime`) has passed; same rule |
+| superseded → delivered (`repromoted`) | — | **never performed in C2B** (no automatic re-promotion) |
+
+`transitions._apply` still refuses every C2 rule (`ProjectionRequired`); the
+projection service executes them with a `ProjectedItemWrite` grant whose
+projection witness the guard re-checks against the database.
 
 "Manager" in C1 is staff/superuser; per-type grants are Phase E.
 
@@ -460,10 +470,156 @@ registration keeps its bed media retained (PROTECT; purge refuses), so every
 rendition's provenance stays resolvable. Beds are few and small; that cost is
 the price of provenance, not a leak.
 
-## Not in C1 / C2A
+## Library projection (Phase C2B — `spoken/delivery.py`)
 
-Library Track projection, promotion/rollback, stale recall, expiry, Track
-reconcile (C2B); any HTTP/recorder surface for spoken content; enabling any
-content type;
+**Authority.** The projection service is the only ordinary writer of
+`SpokenAsset`, `SpokenAssetEdition`, the projected library file and the
+projection-owned columns of a projected Track. The authoritative chain is
+type + item + its validated C2A rendition + asset/active edition → Track;
+spoken lifecycle is never inferred from a Track.
+
+* `SpokenAsset` / `SpokenAssetEdition`: guarded querysets (default and base
+  manager), `save()`/`delete()` refused, reverse managers derived from them.
+  Writes are exact single-use grants executed by `spoken.guard`
+  (`AssetCreate` only pending and empty; `AssetWrite` compare-and-write on
+  state + generation, permitted state moves only, generation never
+  decreases; `EditionCreate` only pending; `EditionWrite` pending → active /
+  aborted, active → superseded), each read back complete. Django's own
+  SET_NULL of a deleted Track is the one ordinary asset update allowed, and
+  only for an asset the deletion already detached.
+* A projected Track (one linked to an asset) is still a library Track, but
+  its `filepath`, `filename`, `format`, `title`, `artist`, `category`,
+  `ready2air`, `duration_seconds`, `sample_rate`, `channels`, `bit_depth`,
+  cue/next-start marks and `remote_url` belong to the projection: `save()`,
+  `update()`, `bulk_update()` (and so `update_or_create`, imports, the track
+  edit view — which refuses *before* moving any file) are refused for them
+  (`TrackWriteRefused`, via `library.models.register_track_write_guard`).
+  Play counts, art, rotation weight and every other column stay the
+  library's; ordinary Tracks are untouched. `import_songs` skips
+  `spoken-<uuid>.flac`.
+* A C2 item transition executes only through a `ProjectedItemWrite` whose
+  witness the guard re-reads: delivered ⇔ the item's ACTIVE edition on its
+  LIVE asset (current item, rendition and generation agreeing) — or a
+  retain-only type; superseded ⇔ its edition was superseded by a newer one;
+  recalled/expired ⇔ nothing of the item is projected live (no active or
+  pending edition). Its event (`ProjectedEventCreate`) follows the write.
+
+**Delivery** (`deliver_item`, `approve_and_deliver`; the worker's
+`advance_ready` pass sends `processed` items to review or delivery): lock
+type → item → asset; the item must be `processed` (type without review) or
+`awaiting_review` (manager approval); the rendition is bound
+(`lock_for_binding`), valid, the executor's, and EXACTLY what the type's
+current recipe and current references produce (`render_outdated` otherwise —
+the item stays `processed`); the target category must exist and form a
+safe path. Modes: `current_edition` (`cal_events`, `usd239min`,
+`news_item`) — ONE non-retired asset per (type, slot `""`), one stable Track,
+generation +1 per delivery; `accumulating` (`3min_ctr`, `lcl_psa`) — one
+asset and Track per item; `retain_only` — delivered, nothing projected.
+Unknown modes fail closed. Track metadata: the fixed `title_policy`, the
+`artist_label` (empty: the type's name), the target category, `ready2air`
+= `deliver_ready_to_air`, duration/sample rate/channels from the validated
+rendition, cue-in 0 and next-start = the duration (the whole file airs; the
+music analyzer's cue/segue detection never runs on it). `expires_at` =
+delivery + `default_lifetime`. A replay of a delivered item returns the
+existing result.
+
+**Files.** `LIBRARY_ROOT/<category>/spoken-<asset uuid>.flac` (never from
+user input). `spoken/library_files.py` reaches the category directory with
+no-follow descriptors (a symlinked or non-directory category is refused),
+copies the rendition's immutable bytes from production storage into a hidden
+staging file in THAT directory (`.spoken-<uuid>.<random>.partial`,
+`O_EXCL|O_NOFOLLOW`) while hashing, fsyncs, re-reads and verifies the staged
+copy (rendition SHA == staged SHA), then `renameat`s it over the stable name
+— one atomic step on the destination filesystem, whatever filesystem the
+production store is on — and fsyncs the directory. Readers see the previous
+complete file or the new complete file, never a partial one. A symlink
+planted at the stable name is replaced, never followed. Mode 0644.
+
+**The DB/filesystem commit model.** PostgreSQL and a rename are not one
+atomic transaction; correctness comes from explicit states, exact hashes and
+deterministic reconciliation:
+
+| Step | Authority if the process dies here (after `reconcile`) |
+| --- | --- |
+| TX-A: asset (first delivery: created `pending`), next generation, `pending` edition | previous active edition (or none); the pending edition is aborted once stale |
+| TX-B, under the type/item/asset/edition locks: re-validate (item, edition still pending, generation newer than the asset's — a stale promotion stops here), stage + verify + rename | previous edition: its exact bytes are re-published from its rendition (or the file removed if there was none) |
+| same TX-B: Track create/update, previous active → superseded, new → active, asset → live at the new generation (compare-and-write), previous item → superseded, item → delivered + events | same (the transaction never committed) |
+| **COMMIT — the commit point** | the new edition |
+| relocation leftover removed, staging pruned | the new edition (leftovers removed by reconcile) |
+
+The publication happens while TX-B holds the locks, so no other operation can
+publish to the same path between it and the commit, and an older in-flight
+promotion can never overwrite a newer edition. A failure (not a crash)
+aborts the pending edition and converges the files at once. A pending edition
+never makes anything airable; there is never more than one active edition
+(database constraint + the executor).
+
+**Recall and expiry** (`recall_delivered` — also reached through
+`transitions.recall`; `expire_item`, `expire_due` — the worker's bounded,
+idempotent sweep). An item leaves delivery with a projection effect ONLY if
+asset, item, active edition and current identity agree that it is the live
+content; a superseded item's recall/expiry changes its own lifecycle only, so
+a stale recall or expiry can never touch a newer edition. Removing live
+content: the active edition → superseded, the Track → not Ready-to-Air
+(committed first), the file removed after commit; a current-edition asset
+becomes `pending` — the same asset and Track wait for a new, deliberate
+delivery — and an accumulating asset `retired`. **Nothing is re-promoted
+automatically**: `repromoted` is never performed, and
+`on_current_recall=restore_previous` is refused by configuration validation.
+
+**Operator Track deletion = detach.** Deleting a projected Track by any path
+(instance or queryset; the `pre_delete` receiver runs inside the deletion's
+transaction) records the asset as `detached` (active edition superseded, link
+cleared; the file is removed after commit). The item keeps its history.
+Reconcile never recreates a detached asset's Track; a new delivery to a
+detached current-edition slot is refused (`asset_detached`) until a manager
+calls `reattach_asset` (→ `pending`; the next delivery creates a new Track).
+A detached accumulating asset stays detached.
+
+**Category change = controlled relocation.** A type's new target category
+does not move anything silently: the next delivery publishes to the new path,
+or `reconcile` relocates — copy + verify + atomic rename into the NEW
+directory, then the asset and Track move, then the old file is removed only
+after commit. A failed relocation keeps the last known-good file.
+
+**Reconcile** (`manage.py spoken_projection reconcile [--dry-run]`; the
+worker runs it at start-up). The database decides what must exist. Per asset
+(skipped while an operation holds its locks): abort stale pending editions;
+relocate on a category change; the stable path must hold the active edition's
+exact bytes (missing or wrong bytes: re-published from the immutable
+rendition — never adopted; if that is impossible the Track becomes
+unavailable and the operator is told); a pending/retired/detached asset has no
+file; a live asset's Track must exist (a lost link is re-linked to the Track
+at the stable path, keeping its identity; a vanished Track is recreated)
+and its projection-owned columns are restored from authority; a non-live
+asset's Track is never Ready-to-Air. Orphans: stale staging files removed
+(fresh ones belong to attempts in flight), an asset's copy at a path it no
+longer has removed, an unknown `spoken-*.flac` reported and never deleted.
+A healthy projection causes no write. `manage.py spoken_projection status`
+(`spoken/projection_health.py`) observes the same conditions read-only;
+`spoken_projection` SystemEvents mark faults needing the operator. The admin
+shows asset mode/state, generation, current item, Track, path, the active
+edition's SHA, the observed file status and the edition history (read-only).
+
+**Global lock order** (every operation; a subset, never another order):
+SpokenContentType → SpokenItem(s) → SpokenAsset → SpokenAssetEdition(s) →
+ProductionMedia (`lock_for_binding`) → ReferenceAudio keys → library Track.
+Detach locks the asset alone (still in order). Several ReferenceAudio keys are
+always locked through `reference_audio.lock_keys`: ascending lock id (then
+key), each id once — a total order even when two keys' ids collide — so a
+future multi-reference recipe cannot deadlock (render completion's
+`provenance.expected` takes all its keys this way).
+
+**Deliberately not in C2B:** slots other than `""` (one current-edition asset
+per type; per-item slots would need a schema field), automatic re-promotion,
+a Monitoring check type for projections (a new check-type choice is a
+migration; the observer is `spoken_projection status` and the admin),
+re-rendering an item whose rendition became outdated before delivery (it
+stays `processed`; recall and resubmit), any HTTP/recorder surface, enabling
+any production type.
+
+## Not in C1 / C2A / C2B
+
+Any HTTP/recorder surface for spoken content; enabling any content type;
 per-type grants and work queue (Phase E); active messages (Phase D);
 occurrence voice tracking (2.6); legacy import or OGRemote changes (Phase F/G).
