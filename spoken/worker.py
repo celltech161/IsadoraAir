@@ -22,7 +22,12 @@ Retry policy (bounded everywhere):
 * deterministic failures (unusable source, invalid configuration, a missing
   reference, an invalid rendition, silence, an evidence mismatch) fail at once;
 * an item claimed more than MAX_ATTEMPTS times is failed ``attempts_exhausted``;
-* a lease lost to expiry is left alone -- its new holder owns the item.
+* a lease lost to expiry is left alone -- its new holder owns the item. An
+  EXPIRED lease authorizes nothing even before it is reclaimed
+  (transitions._require_lease), so every render gets a deadline that ends
+  LEASE_MARGIN_SECONDS before the lease does, a retry that would no longer
+  fit is abandoned, and a completion or failure refused for an expired lease
+  leaves the item to the next claim. There is no lease renewal.
 
 SystemEvents are only operator attention (the service is unavailable, the
 sandbox is broken, an item keeps failing); SpokenItemEvent stays the history.
@@ -47,6 +52,11 @@ TRANSIENT_RETRIES = 2
 OUTDATED_RERENDERS = 1
 BACKOFF_SECONDS = (2.0, 10.0)
 LEASE_SECONDS = transitions.LEASE_MAX_SECONDS
+# A render must end this long before the lease does (rendition intake and its
+# validation, then completion, still run under the lease).
+LEASE_MARGIN_SECONDS = 600.0
+MIN_RENDER_SECONDS = 60.0
+LOST_LEASE_CODES = frozenset({"stale_lease", "lease_expired"})
 # Infrastructure conditions an operator should hear about.
 ATTENTION_CODES = frozenset({"service_unavailable", "sandbox_unavailable", "render_unavailable",
                              "rendition_unvalidated", "attempts_exhausted", "busy"})
@@ -59,16 +69,20 @@ class Outcome:
     code: str = ""
 
 
-def render_timeout_seconds(duration) -> float:
-    """The render's own deadline, inside the lease (leaving time to validate)."""
+def render_timeout_seconds(duration, lease_expires_at=None, now=None) -> float:
+    """The render's own deadline, inside what remains of the lease (leaving
+    LEASE_MARGIN_SECONDS to ingest, validate and complete)."""
     seconds = float(Decimal(str(duration or 0)))
-    return min(float(LEASE_SECONDS) - 600.0, 120.0 + 6.0 * seconds)
+    budget = float(LEASE_SECONDS)
+    if lease_expires_at is not None:
+        budget = (lease_expires_at - (now or timezone.now())).total_seconds()
+    return min(budget - LEASE_MARGIN_SECONDS, 120.0 + 6.0 * seconds)
 
 
 def candidates(limit=10) -> list:
     now = timezone.now()
     return list(SpokenItem.objects.filter(Q(state=ItemState.VALIDATED)
-                                          | Q(state=ItemState.PROCESSING, lease_expires_at__lt=now))
+                                          | Q(state=ItemState.PROCESSING, lease_expires_at__lte=now))
                 .order_by("validated_at", "created_at").values_list("pk", flat=True)[:limit])
 
 
@@ -93,8 +107,10 @@ def _attention(code, item_id, detail=""):
 def _fail(item, token, code, detail) -> Outcome:
     try:
         transitions.fail_processing(item.pk, lease_token=token, code=code, detail=str(detail)[:500])
-    except transitions.EvidenceRefused:
-        return Outcome(str(item.pk), "lost_lease", code)
+    except transitions.EvidenceRefused as exc:
+        if exc.code not in LOST_LEASE_CODES:
+            raise
+        return Outcome(str(item.pk), "lost_lease", exc.code)
     _attention(code, item.pk, detail)
     return Outcome(str(item.pk), "failed", code)
 
@@ -111,10 +127,12 @@ def process_one(*, render_fn=render.render, sleep=time.sleep):
     transient = outdated = 0
     while True:
         ctype = SpokenContentType.objects.get(pk=item.content_type_id)       # the CURRENT configuration
+        timeout = render_timeout_seconds(item.submission_media.decoded_duration_seconds, item.lease_expires_at)
+        if timeout < MIN_RENDER_SECONDS:
+            return Outcome(str(item.pk), "lost_lease", "lease_expiring")      # the next claim renders it
         try:
             result = render_fn(item.submission_media_id, ctype.recipe_key, ctype.recipe_params, item=item.pk,
-                               lease=token, timeout_seconds=render_timeout_seconds(
-                                   item.submission_media.decoded_duration_seconds))
+                               lease=token, timeout_seconds=timeout)
         except render.RenderError as exc:
             if exc.retryable and transient < TRANSIENT_RETRIES:
                 sleep(BACKOFF_SECONDS[min(transient, len(BACKOFF_SECONDS) - 1)])
@@ -125,7 +143,7 @@ def process_one(*, render_fn=render.render, sleep=time.sleep):
             transitions.complete_processing(item.pk, lease_token=token, evidence=result.evidence)
             return Outcome(str(item.pk), "processed")
         except transitions.EvidenceRefused as exc:
-            if exc.code == "stale_lease":
+            if exc.code in LOST_LEASE_CODES:
                 return Outcome(str(item.pk), "lost_lease", exc.code)
             if exc.code == "render_outdated" and outdated < OUTDATED_RERENDERS:
                 outdated += 1

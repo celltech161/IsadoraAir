@@ -59,7 +59,7 @@ class RowLockTests(TransactionTestCase):
     def test_a_concurrent_transition_waits_for_the_lock_and_sees_the_committed_state(self):
         locked, release = threading.Event(), threading.Event()
 
-        def pausing_check(row, user):
+        def pausing_check(row, user, now):
             locked.set()
             assert release.wait(WAIT)
 

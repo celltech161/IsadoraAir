@@ -58,6 +58,7 @@ from .models import (
 S = ItemState
 DETAIL_LIMIT_BYTES = 8 * 1024
 LEASE_MIN_SECONDS, LEASE_MAX_SECONDS = 30, 3600
+_NO_LEASE = object()                 # _apply: the transition is not lease-authorized
 
 
 class SpokenServiceError(Exception):
@@ -224,10 +225,13 @@ def _commit(row, plan) -> None:
 # -- the core ---------------------------------------------------------------------------
 
 def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_from=None, detail=None,
-           check=None, changes=None, media=None, require_valid_media=True, lock_type=False, verify=None):
+           check=None, changes=None, media=None, require_valid_media=True, lock_type=False, verify=None,
+           lease_token=_NO_LEASE):
     """``changes(row, bound, now)`` returns the transition's own protected
     columns ({field name: value}); state, its timestamp and terminal_at are
-    added here."""
+    added here. ``lease_token``: the transition is authorized by the
+    processing lease, which must be the item's current AND unexpired lease
+    (_require_lease) at the ``now`` taken under the row lock."""
     with transaction.atomic():
         pk = getattr(item, "pk", item)
         if lock_type:
@@ -246,8 +250,13 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
         if rule.c2:
             raise ProjectionRequired(f"{row.state} -> {to_state} delivers to the library (Phase C2)")
         user, username = _actor_columns(actor, actor_kind)
+        # ONE timezone-aware server time for the whole transition, taken under
+        # the row lock: lease freshness, the transition's own timestamps.
+        now = timezone.now()
+        if lease_token is not _NO_LEASE:
+            _require_lease(row, lease_token, now)
         if check is not None:
-            check(row, user)
+            check(row, user, now)
         bound = None
         if media is not None:
             try:
@@ -256,7 +265,6 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
                 raise EvidenceRefused("the media is missing, purged or not valid", code="media_unusable") from exc
         if verify is not None:
             verify(row, bound)
-        now = timezone.now()
         planned = dict(changes(row, bound, now)) if changes is not None else {}
         planned.update(state=to_state, state_changed_at=now)
         if to_state in TERMINAL_STATES:
@@ -314,7 +322,7 @@ def submit(item, media, *, actor) -> SpokenItem:
     """draft -> submitted, binding ``media`` as the submission. Validation of
     the media is the next transition; its byte size is checked here."""
 
-    def check(row, user):
+    def check(row, user, now):
         _owner_or_manager(row, user)
         if not SpokenContentType.objects.filter(pk=row.content_type_id, enabled=True).exists():
             raise NotPermitted("this content type is disabled", code="type_disabled")
@@ -369,8 +377,8 @@ def start_processing(item, *, lease_seconds=600, actor_kind=ActorKind.WORKER) ->
         raise ValueError("lease length out of range")
     token = uuid.uuid4()
 
-    def check(row, user):
-        if row.state == S.PROCESSING and (row.lease_expires_at is None or row.lease_expires_at > timezone.now()):
+    def check(row, user, now):
+        if row.state == S.PROCESSING and (row.lease_expires_at is None or row.lease_expires_at > now):
             raise InvalidTransition("the item is leased to another worker", code="lease_held")
 
     def changes(row, bound, now):
@@ -383,9 +391,16 @@ def start_processing(item, *, lease_seconds=600, actor_kind=ActorKind.WORKER) ->
     return row, token
 
 
-def _require_lease(row, token):
-    if row.lease_token is None or str(row.lease_token) != str(token):
+def _require_lease(row, token, now):
+    """THE lease rule, for every lease-authorized transition (via _apply's
+    ``lease_token``), on the row-locked item at the transition's one ``now``:
+    the item holds a lease, it is the caller's token, and it has not expired
+    -- ``lease_expires_at > now``; at ``== now`` it is already expired. An
+    expired lease authorizes nothing, even before another worker reclaims it."""
+    if row.lease_token is None or token is None or str(row.lease_token) != str(token):
         raise EvidenceRefused("the lease is stale or belongs to another worker", code="stale_lease")
+    if row.lease_expires_at is None or now.tzinfo is None or not row.lease_expires_at > now:
+        raise EvidenceRefused("the lease has expired", code="lease_expired")
 
 
 def _parse_evidence(evidence) -> render.RenderEvidence:
@@ -451,33 +466,27 @@ def complete_processing(item, *, lease_token, evidence, render_detail=None,
     never bound."""
     evidence = _parse_evidence(evidence)
 
-    def check(row, user):
-        _require_lease(row, lease_token)
-
     def changes(row, bound, now):
         return {"rendition_media": bound, "processed_at": now, "lease_token": None, "lease_expires_at": None}
 
     detail = {"rendition": evidence.rendition_id, "evidence": evidence.as_dict()}
     detail.update(render_detail or {})
-    return _apply(item, S.PROCESSED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), check=check,
+    return _apply(item, S.PROCESSED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), lease_token=lease_token,
                   changes=changes, media=evidence.rendition_id, detail=detail, lock_type=True,
                   verify=lambda row, bound: _verify_render(row, bound, evidence))
 
 
 def fail_processing(item, *, lease_token, code, detail="", actor_kind=ActorKind.WORKER) -> SpokenItem:
-    def check(row, user):
-        _require_lease(row, lease_token)
-
     def changes(row, bound, now):
         return {"failure_code": str(code)[:64], "failure_detail": str(detail)[:500], "lease_token": None,
                 "lease_expires_at": None}
 
-    return _apply(item, S.FAILED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), check=check,
+    return _apply(item, S.FAILED, actor_kind=actor_kind, expected_from=(S.PROCESSING,), lease_token=lease_token,
                   changes=changes, detail={"code": str(code)[:64]})
 
 
 def retry(item, *, actor) -> SpokenItem:
-    def check(row, user):
+    def check(row, user, now):
         if not is_manager(user):
             raise NotPermitted("only a manager may retry a failed item")
 
@@ -490,14 +499,14 @@ def retry(item, *, actor) -> SpokenItem:
 # -- review and recall ---------------------------------------------------------------------------
 
 def request_review(item, *, actor_kind=ActorKind.SYSTEM) -> SpokenItem:
-    def check(row, user):
+    def check(row, user, now):
         if not row.content_type.requires_review:
             raise InvalidTransition("this type does not require review", code="review_not_required")
     return _apply(item, S.AWAITING_REVIEW, actor_kind=actor_kind, expected_from=(S.PROCESSED,), check=check)
 
 
 def reject(item, *, actor, note="") -> SpokenItem:
-    def check(row, user):
+    def check(row, user, now):
         if not is_manager(user):
             raise NotPermitted("only a manager may review")
 
@@ -513,7 +522,7 @@ def recall(item, *, actor, reason="") -> SpokenItem:
     """Recall before delivery (C1). Managers always; the submitter while the
     type's recall policy allows it. A delivered item's recall is C2."""
 
-    def check(row, user):
+    def check(row, user, now):
         if is_manager(user):
             return
         if row.content_type.recall_policy == RecallPolicy.MANAGERS_ONLY:
