@@ -410,7 +410,7 @@ class DatabaseInvariantTests(Fixtures):
         values = dict(id=asset_id, content_type=self.ctype, mode=AssetMode.CURRENT_EDITION, slot_key="",
                       library_relpath=projection.library_relpath("LocalNews", asset_id))
         values.update(overrides)
-        return SpokenAsset.objects.create(**values)
+        return raw_insert(SpokenAsset, **values)          # constraints, below the projection's guard
 
     def test_asset_invariants(self):
         self.asset(slot_key="morning")
@@ -438,16 +438,18 @@ class DatabaseInvariantTests(Fixtures):
         item = self.processed()
         rendition = item.rendition_media
         now = timezone.now()
-        SpokenAssetEdition.objects.create(asset=asset, item=item, rendition=rendition, generation=1,
+        raw_insert(SpokenAssetEdition, asset=asset, item=item, rendition=rendition, generation=1,
                                           state=EditionState.ACTIVE, promoted_at=now)
-        self.assert_rejected(lambda: SpokenAssetEdition.objects.create(
-            asset=asset, item=item, rendition=rendition, generation=2, state=EditionState.ACTIVE, promoted_at=now))
-        self.assert_rejected(lambda: SpokenAssetEdition.objects.create(asset=asset, item=item, rendition=rendition,
-                                                                       generation=1))
-        self.assert_rejected(lambda: SpokenAssetEdition.objects.create(
-            asset=asset, item=item, rendition=rendition, generation=3, library_sha256="xyz"))
-        self.assert_rejected(lambda: SpokenAssetEdition.objects.create(
-            asset=asset, item=item, rendition=rendition, generation=4, state=EditionState.SUPERSEDED))
+        self.assert_rejected(lambda: raw_insert(
+            SpokenAssetEdition, asset=asset, item=item, rendition=rendition, generation=2, state=EditionState.ACTIVE,
+            promoted_at=now))
+        self.assert_rejected(lambda: raw_insert(SpokenAssetEdition, asset=asset, item=item, rendition=rendition,
+                                                generation=1))
+        self.assert_rejected(lambda: raw_insert(
+            SpokenAssetEdition, asset=asset, item=item, rendition=rendition, generation=3, library_sha256="xyz"))
+        self.assert_rejected(lambda: raw_insert(
+            SpokenAssetEdition, asset=asset, item=item, rendition=rendition, generation=4,
+            state=EditionState.SUPERSEDED))
         with self.assertRaises(PurgeRefused):
             retention.purge_media(rendition)                     # an edition references it too
 

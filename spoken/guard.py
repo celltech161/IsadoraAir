@@ -102,6 +102,68 @@ class EventCreate:
     values: tuple                 # ((attname, value), ...) -- every event column but the generated ones
 
 
+# -- C2B projection grants (private to spoken.delivery) ---------------------------------------
+
+@dataclass(frozen=True)
+class ProjectedItemWrite:
+    """A C2 item transition (delivered / superseded / delivered-or-superseded
+    -> recalled / expired). ``write`` is the exact item write; ``asset_id`` /
+    ``edition_id`` name the projection state that WITNESSES it, re-read and
+    checked by the executor against the locked database before the write
+    (_witness): an item is never marked delivered without its active edition,
+    nor recalled/expired while its content is still projected live."""
+    write: ItemWrite
+    asset_id: object
+    edition_id: object
+
+
+@dataclass(frozen=True)
+class ProjectedEventCreate:
+    """The event of a C2 transition: written only after its witnessed item
+    write (the executor requires the item to already be in ``to_state``)."""
+    values: tuple
+
+
+@dataclass(frozen=True)
+class AssetCreate:
+    asset_id: object
+    values: tuple                 # EVERY authoritative asset column but the generated ones
+
+
+@dataclass(frozen=True)
+class AssetWrite:
+    asset_id: object
+    match: tuple                  # ((attname, value), ...) the row must still hold (compare-and-write)
+    values: tuple                 # ((attname, value), ...) -- exact changes (updated_at included)
+    expected: tuple               # EVERY authoritative asset column afterwards
+
+
+@dataclass(frozen=True)
+class EditionCreate:
+    edition_id: object
+    values: tuple                 # EVERY authoritative edition column but the generated ones
+
+
+@dataclass(frozen=True)
+class EditionWrite:
+    edition_id: object
+    from_state: str
+    values: tuple
+    expected: tuple
+
+
+@dataclass(frozen=True)
+class TrackCreate:
+    values: tuple                 # EVERY projection-owned Track column
+
+
+@dataclass(frozen=True)
+class TrackWrite:
+    track_id: object
+    values: tuple                 # projection-owned columns changed (+ updated_at)
+    expected: tuple               # EVERY projection-owned Track column afterwards
+
+
 # -- the canonical column sets ------------------------------------------------------------
 
 def authoritative_item_fields() -> list:
@@ -121,6 +183,42 @@ def authoritative_event_fields() -> list:
 
 def _attnames(fields, exclude=()) -> set:
     return {field.attname for field in fields if field.attname not in exclude}
+
+
+# The library Track columns a projection OWNS on a Track linked to a
+# SpokenAsset: its file identity, scheduling identity, displayed metadata,
+# readiness and the media facts/marks the projection derives from the
+# validated rendition. Ordinary Track workflows may not change them on a
+# projected Track (check_track_*); every other Track column (play counts,
+# art cache, rotation weight, waveform...) stays the library's.
+PROJECTED_TRACK_FIELDS = ("filepath", "filename", "format", "title", "artist_id", "category_id", "ready2air",
+                          "duration_seconds", "sample_rate", "channels", "bit_depth", "cue_in_seconds",
+                          "cue_out_seconds", "next_start_seconds", "remote_url")
+ASSET_GENERATED = ("created_at", "updated_at")
+EDITION_GENERATED = ("created_at",)
+
+# Permitted asset state moves (from, to) -- one table for the executor.
+ASSET_MOVES = frozenset({
+    ("pending", "pending"), ("pending", "live"), ("live", "live"), ("live", "pending"), ("live", "retired"),
+    ("pending", "retired"), ("pending", "detached"), ("live", "detached"), ("detached", "pending"),
+    ("detached", "detached"), ("retired", "retired"),
+})
+EDITION_MOVES = frozenset({("pending", "active"), ("pending", "aborted"), ("active", "superseded")})
+
+
+def authoritative_asset_fields() -> list:
+    from .models import SpokenAsset
+    return [field for field in SpokenAsset._meta.concrete_fields if not field.primary_key]
+
+
+def authoritative_edition_fields() -> list:
+    from .models import SpokenAssetEdition
+    return [field for field in SpokenAssetEdition._meta.concrete_fields if not field.primary_key]
+
+
+def projected_track_fields() -> list:
+    from library.models import Track
+    return [Track._meta.get_field(name.removesuffix("_id")) for name in PROJECTED_TRACK_FIELDS]
 
 
 # -- strict canonical JSON --------------------------------------------------------------------
@@ -252,6 +350,94 @@ def _check_record(record) -> None:
         if rule is None or rule.c2 or values.get("event") != rule.event:
             raise SpokenIntegrityError("an event grant must record a permitted, non-projection transition")
         return
+    _check_projection_record(record)
+
+
+def _check_projection_record(record) -> None:
+    """The C2B grants: each must itself be a move the projection allows."""
+    from . import lifecycle
+    if isinstance(record, ProjectedItemWrite):
+        write = record.write
+        key = (write.from_state, write.to_state)
+        rule = lifecycle.TRANSITIONS.get(key)
+        if not isinstance(write, ItemWrite) or rule is None or not rule.c2 or key not in lifecycle.C2B_PERFORMABLE:
+            raise SpokenIntegrityError(f"{write.from_state} -> {write.to_state} is not a performable projection move")
+        values = dict(write.values)
+        if values.get("state") != write.to_state:
+            raise SpokenIntegrityError("an item write grant must set exactly its target state")
+        extra = set(values) - lifecycle.writable_columns(write.from_state, write.to_state)
+        if extra:
+            raise SpokenIntegrityError(f"{write.from_state} -> {write.to_state} never writes {sorted(extra)}")
+        expected = dict(write.expected)
+        if set(expected) != _attnames(authoritative_item_fields()) or any(
+                expected[name] != value for name, value in values.items()):
+            raise SpokenIntegrityError("an item write grant must expect every authoritative column")
+        if write.to_state == "delivered" and (record.asset_id is None) != (record.edition_id is None):
+            raise SpokenIntegrityError("a delivery is witnessed by an asset AND its active edition, or by neither")
+        return
+    if isinstance(record, ProjectedEventCreate):
+        values = dict(record.values)
+        if set(values) != _attnames(authoritative_event_fields(), EVENT_GENERATED):
+            raise SpokenIntegrityError("an event grant must give every event column")
+        key = (values.get("from_state") or None, values.get("to_state"))
+        rule = lifecycle.TRANSITIONS.get(key)
+        if rule is None or not rule.c2 or key not in lifecycle.C2B_PERFORMABLE or values.get("event") != rule.event:
+            raise SpokenIntegrityError("a projection event must record a performable projection transition")
+        return
+    if isinstance(record, AssetCreate):
+        values = dict(record.values)
+        if set(values) != _attnames(authoritative_asset_fields(), ASSET_GENERATED):
+            raise SpokenIntegrityError("an asset creation grant must give every asset column")
+        if (values["state"] != "pending" or values["generation"] != 0 or values["track_id"] is not None
+                or values["current_item_id"] is not None or values["current_rendition_id"] is not None
+                or values["retired_at"] is not None):
+            raise SpokenIntegrityError("an asset is only ever created pending and empty")
+        return
+    if isinstance(record, AssetWrite):
+        match, values = dict(record.match), dict(record.values)
+        if "state" not in match or "generation" not in match or "id" in values or "created_at" in values:
+            raise SpokenIntegrityError("an asset write compares its state and generation and never its identity")
+        if (match["state"], values.get("state", match["state"])) not in ASSET_MOVES:
+            raise SpokenIntegrityError(f"an asset never moves {match['state']} -> {values.get('state')}")
+        if "generation" in values and values["generation"] < match["generation"]:
+            raise SpokenIntegrityError("an asset generation never decreases")
+        expected = dict(record.expected)
+        if set(expected) != _attnames(authoritative_asset_fields()) or any(
+                expected[name] != value for name, value in values.items()):
+            raise SpokenIntegrityError("an asset write grant must expect every authoritative column")
+        return
+    if isinstance(record, EditionCreate):
+        values = dict(record.values)
+        if set(values) != _attnames(authoritative_edition_fields(), EDITION_GENERATED):
+            raise SpokenIntegrityError("an edition creation grant must give every edition column")
+        if (values["state"] != "pending" or values["promoted_at"] is not None or values["superseded_at"] is not None
+                or values["superseded_by_id"] is not None):
+            raise SpokenIntegrityError("an edition is only ever created pending")
+        return
+    if isinstance(record, EditionWrite):
+        values = dict(record.values)
+        if (record.from_state, values.get("state")) not in EDITION_MOVES:
+            raise SpokenIntegrityError(f"an edition never moves {record.from_state} -> {values.get('state')}")
+        if set(values) - {"state", "promoted_at", "superseded_at", "superseded_by_id"}:
+            raise SpokenIntegrityError("an edition write changes only its state and its dates")
+        expected = dict(record.expected)
+        if set(expected) != _attnames(authoritative_edition_fields()) or any(
+                expected[name] != value for name, value in values.items()):
+            raise SpokenIntegrityError("an edition write grant must expect every authoritative column")
+        return
+    if isinstance(record, TrackCreate):
+        if set(dict(record.values)) != set(PROJECTED_TRACK_FIELDS):
+            raise SpokenIntegrityError("a projected Track is created with every projection-owned column")
+        return
+    if isinstance(record, TrackWrite):
+        values = dict(record.values)
+        if not set(values) - {"updated_at"} or set(values) - set(PROJECTED_TRACK_FIELDS) - {"updated_at"}:
+            raise SpokenIntegrityError("a projected Track write changes projection-owned columns only")
+        expected = dict(record.expected)
+        if set(expected) != set(PROJECTED_TRACK_FIELDS) or any(
+                expected[name] != value for name, value in values.items() if name != "updated_at"):
+            raise SpokenIntegrityError("a projected Track write must expect every projection-owned column")
+        return
     raise SpokenIntegrityError("unknown write grant")
 
 
@@ -345,10 +531,11 @@ def _verify_complete(model, pk, fields, expected: dict, *, generated=(), window=
             continue
         if not _same(field, row[field.attname], expected[field.attname]):
             raise SpokenIntegrityError(f"{model.__name__}.{field.name} differs from the authorized write")
-    if "created_at" in generated:
-        started, finished = window
-        if row["created_at"] is None or not (started <= row["created_at"] <= finished):
-            raise SpokenIntegrityError(f"{model.__name__}.created_at was not stamped by the write")
+    for stamp in ("created_at", "updated_at"):
+        if stamp in generated:
+            started, finished = window
+            if row[stamp] is None or not (started <= row[stamp] <= finished):
+                raise SpokenIntegrityError(f"{model.__name__}.{stamp} was not stamped by the write")
 
 
 def _take(kind):
@@ -364,33 +551,49 @@ def _execute():
     -- and verify the COMPLETE authoritative row it produced. Takes no data:
     there is nothing a caller can substitute."""
     from django.db import transaction
-    from django.db.models import QuerySet
-    from django.utils import timezone
 
-    from .models import SpokenItem, SpokenItemEvent
     grant = _grant.get()
     kind = type(grant.record) if grant is not None else None
-    if kind not in (ItemWrite, ItemCreate, EventCreate):
+    executor = _EXECUTORS.get(kind)
+    if executor is None:
         raise SpokenIntegrityError("no open grant authorizes this write")
     record = _take(kind)                    # owner-checked and consumed before anything else
     if not transaction.get_connection().in_atomic_block:
         raise SpokenIntegrityError("authorized spoken writes run inside the transition's transaction")
-    if kind is ItemWrite:
-        count = QuerySet.update(SpokenItem._base_manager.filter(pk=record.item_id, state=record.from_state),
-                                **_decode(SpokenItem, record.values))
-        if count != 1:
-            raise SpokenIntegrityError("the item is not in the state this write was authorized from")
-        _verify_complete(SpokenItem, record.item_id, authoritative_item_fields(),
-                         _decode(SpokenItem, record.expected))
-        return None
+    return executor(record)
+
+
+def _exec_item_write(record):
+    from django.db.models import QuerySet
+
+    from .models import SpokenItem
+    count = QuerySet.update(SpokenItem._base_manager.filter(pk=record.item_id, state=record.from_state),
+                            **_decode(SpokenItem, record.values))
+    if count != 1:
+        raise SpokenIntegrityError("the item is not in the state this write was authorized from")
+    _verify_complete(SpokenItem, record.item_id, authoritative_item_fields(), _decode(SpokenItem, record.expected))
+    return None
+
+
+def _exec_item_create(record):
+    from django.db.models import QuerySet
+    from django.utils import timezone
+
+    from .models import SpokenItem
     started = timezone.now()
-    if kind is ItemCreate:
-        row = SpokenItem(id=record.item_id, **_decode(SpokenItem, record.values))
-        QuerySet.bulk_create(SpokenItem._base_manager.all(), [row])
-        _verify_complete(SpokenItem, record.item_id, authoritative_item_fields(),
-                         _decode(SpokenItem, record.expected), generated=ITEM_GENERATED,
-                         window=(started, timezone.now()))
-        return row.pk
+    row = SpokenItem(id=record.item_id, **_decode(SpokenItem, record.values))
+    QuerySet.bulk_create(SpokenItem._base_manager.all(), [row])
+    _verify_complete(SpokenItem, record.item_id, authoritative_item_fields(), _decode(SpokenItem, record.expected),
+                     generated=ITEM_GENERATED, window=(started, timezone.now()))
+    return row.pk
+
+
+def _exec_event(record):
+    from django.db.models import QuerySet
+    from django.utils import timezone
+
+    from .models import SpokenItemEvent
+    started = timezone.now()
     (event,) = QuerySet.bulk_create(SpokenItemEvent._base_manager.all(),
                                     [SpokenItemEvent(**_decode(SpokenItemEvent, record.values))])
     if event.pk is None:
@@ -399,6 +602,150 @@ def _execute():
                      _decode(SpokenItemEvent, record.values), generated=EVENT_GENERATED,
                      window=(started, timezone.now()))
     return event.pk
+
+
+def _witness(record) -> None:
+    """The projection state a C2 item transition claims, re-read from the
+    database inside the transaction (the projection service holds the type,
+    item and asset locks): refuse unless it is exactly so."""
+    from .models import SpokenAsset, SpokenAssetEdition, SpokenItem
+    write = record.write
+    item_id = write.item_id
+    item = SpokenItem._base_manager.filter(pk=item_id).values(
+        "rendition_media_id", "content_type__delivery_mode").first()
+    if item is None:
+        raise SpokenIntegrityError("the witnessed item does not exist")
+    live_elsewhere = SpokenAsset._base_manager.filter(current_item_id=item_id, state="live")
+    open_editions = SpokenAssetEdition._base_manager.filter(item_id=item_id, state__in=("pending", "active"))
+    if write.to_state == "delivered":
+        if record.edition_id is None:
+            if item["content_type__delivery_mode"] != "retain_only" or open_editions.exists():
+                raise SpokenIntegrityError("only retain-only content is delivered without a projected edition")
+            return
+        edition = SpokenAssetEdition._base_manager.filter(pk=record.edition_id).values(
+            "asset_id", "item_id", "rendition_id", "generation", "state").first()
+        asset = SpokenAsset._base_manager.filter(pk=record.asset_id).values(
+            "state", "current_item_id", "current_rendition_id", "generation").first()
+        if (edition is None or asset is None or edition["state"] != "active"
+                or str(edition["item_id"]) != str(item_id) or str(edition["asset_id"]) != str(record.asset_id)
+                or edition["rendition_id"] != item["rendition_media_id"] or asset["state"] != "live"
+                or str(asset["current_item_id"]) != str(item_id)
+                or asset["current_rendition_id"] != edition["rendition_id"]
+                or asset["generation"] != edition["generation"]):
+            raise SpokenIntegrityError("a delivery is witnessed only by the item's ACTIVE edition on its live asset")
+        return
+    if write.to_state == "superseded":
+        edition = SpokenAssetEdition._base_manager.filter(pk=record.edition_id).values(
+            "item_id", "state", "superseded_by_id").first()
+        if (edition is None or str(edition["item_id"]) != str(item_id) or edition["state"] != "superseded"
+                or edition["superseded_by_id"] is None or live_elsewhere.exists() or open_editions.exists()):
+            raise SpokenIntegrityError("an item is superseded only once a newer edition replaced its own")
+        return
+    # -> recalled / expired: nothing of the item may still be projected
+    if live_elsewhere.exists() or open_editions.exists():
+        raise SpokenIntegrityError("an item whose content is still projected cannot leave delivery")
+
+
+def _exec_projected_item(record):
+    _witness(record)
+    return _exec_item_write(record.write)
+
+
+def _exec_projected_event(record):
+    from .models import SpokenAssetEdition, SpokenItem
+    values = dict(record.values)
+    state = SpokenItem._base_manager.filter(pk=values["item_id"]).values_list("state", flat=True).first()
+    if state != values["to_state"]:
+        raise SpokenIntegrityError("a projection event follows its witnessed item write")
+    if values["to_state"] == "delivered" and values["edition_id"] is not None and not (
+            SpokenAssetEdition._base_manager.filter(pk=values["edition_id"], item_id=values["item_id"],
+                                                    state="active").exists()):
+        raise SpokenIntegrityError("a delivery event names the item's active edition")
+    return _exec_event(record)
+
+
+def _exec_asset_create(record):
+    from django.db.models import QuerySet
+    from django.utils import timezone
+
+    from .models import SpokenAsset
+    started = timezone.now()
+    QuerySet.bulk_create(SpokenAsset._base_manager.all(),
+                         [SpokenAsset(id=record.asset_id, **_decode(SpokenAsset, record.values))])
+    _verify_complete(SpokenAsset, record.asset_id, authoritative_asset_fields(),
+                     _decode(SpokenAsset, record.values), generated=ASSET_GENERATED, window=(started, timezone.now()))
+    return record.asset_id
+
+
+def _exec_asset_write(record):
+    from django.db.models import QuerySet
+
+    from .models import SpokenAsset
+    match = _decode(SpokenAsset, record.match)
+    count = QuerySet.update(SpokenAsset._base_manager.filter(pk=record.asset_id, **match),
+                            **_decode(SpokenAsset, record.values))
+    if count != 1:
+        raise SpokenIntegrityError("the asset changed since this write was authorized (compare-and-write)")
+    _verify_complete(SpokenAsset, record.asset_id, authoritative_asset_fields(), _decode(SpokenAsset, record.expected))
+    return None
+
+
+def _exec_edition_create(record):
+    from django.db.models import QuerySet
+    from django.utils import timezone
+
+    from .models import SpokenAssetEdition
+    started = timezone.now()
+    QuerySet.bulk_create(SpokenAssetEdition._base_manager.all(),
+                         [SpokenAssetEdition(id=record.edition_id, **_decode(SpokenAssetEdition, record.values))])
+    _verify_complete(SpokenAssetEdition, record.edition_id, authoritative_edition_fields(),
+                     _decode(SpokenAssetEdition, record.values), generated=EDITION_GENERATED,
+                     window=(started, timezone.now()))
+    return record.edition_id
+
+
+def _exec_edition_write(record):
+    from django.db.models import QuerySet
+
+    from .models import SpokenAssetEdition
+    count = QuerySet.update(SpokenAssetEdition._base_manager.filter(pk=record.edition_id, state=record.from_state),
+                            **_decode(SpokenAssetEdition, record.values))
+    if count != 1:
+        raise SpokenIntegrityError("the edition is not in the state this write was authorized from")
+    _verify_complete(SpokenAssetEdition, record.edition_id, authoritative_edition_fields(),
+                     _decode(SpokenAssetEdition, record.expected))
+    return None
+
+
+def _exec_track_create(record):
+    from django.db.models import QuerySet
+
+    from library.models import Track
+    (track,) = QuerySet.bulk_create(Track._base_manager.all(), [Track(**_decode(Track, record.values))])
+    if track.pk is None:
+        raise SpokenIntegrityError("the projected Track was not assigned an id")
+    _verify_complete(Track, track.pk, projected_track_fields(), _decode(Track, record.values))
+    return track.pk
+
+
+def _exec_track_write(record):
+    from django.db.models import QuerySet
+
+    from library.models import Track
+    count = QuerySet.update(Track._base_manager.filter(pk=record.track_id), **_decode(Track, record.values))
+    if count != 1:
+        raise SpokenIntegrityError("the projected Track does not exist")
+    _verify_complete(Track, record.track_id, projected_track_fields(), _decode(Track, record.expected))
+    return None
+
+
+_EXECUTORS = {
+    ItemWrite: _exec_item_write, ItemCreate: _exec_item_create, EventCreate: _exec_event,
+    ProjectedItemWrite: _exec_projected_item, ProjectedEventCreate: _exec_projected_event,
+    AssetCreate: _exec_asset_create, AssetWrite: _exec_asset_write,
+    EditionCreate: _exec_edition_create, EditionWrite: _exec_edition_write,
+    TrackCreate: _exec_track_create, TrackWrite: _exec_track_write,
+}
 
 
 # -- ordinary ORM paths ----------------------------------------------------------------------
@@ -433,3 +780,79 @@ def editorial_update_fields(update_fields) -> list:
 
 def check_event_write(event) -> None:
     raise SpokenIntegrityError("spoken item events are written only by spoken.transitions (append-only)")
+
+
+# -- ordinary ORM paths: projection identity (C2B) ---------------------------------------------
+
+def refuse_projection(model_name) -> None:
+    raise SpokenIntegrityError(
+        f"{model_name} changes only through the spoken projection service (spoken.delivery)")
+
+
+def check_asset_queryset_update(queryset, columns: dict) -> None:
+    """The one Django-owned asset write: the SET_NULL of a deleted Track --
+    and only for rows the Track deletion already DETACHED (or that no longer
+    link a Track). Unlinking a live projected Track any other way is refused:
+    a projected Track is detached by deleting it (spoken.delivery)."""
+    if set(columns) <= {"track", "track_id"} and all(value is None for value in columns.values()):
+        if queryset.filter(track__isnull=False).exclude(state__in=("detached", "retired")).exists():
+            raise SpokenIntegrityError("a live projected Track is detached by deleting it, never by unlinking it")
+        return
+    refuse_projection("SpokenAsset")
+
+
+_OWNED_NAMES = None
+
+
+def _owned_names() -> frozenset:
+    global _OWNED_NAMES
+    if _OWNED_NAMES is None:
+        _OWNED_NAMES = frozenset(name for field in projected_track_fields() for name in (field.name, field.attname))
+    return _OWNED_NAMES
+
+
+def _projected(track_ids) -> bool:
+    from .models import SpokenAsset
+    return SpokenAsset._base_manager.filter(track_id__in=[pk for pk in track_ids if pk is not None]).exists()
+
+
+def _track_refusal(message):
+    from library.models import TrackWriteRefused
+
+    class ProjectedTrackWriteRefused(SpokenIntegrityError, TrackWriteRefused):
+        pass
+    return ProjectedTrackWriteRefused(message)
+
+
+def check_track_save(track, update_fields) -> None:
+    """An ordinary Track save may not change a projection-owned column of a
+    Track linked to a SpokenAsset (its file, category, title, artist,
+    readiness or media facts come from the projection, never from an edit).
+    Ordinary Tracks, and the library's own columns, are untouched."""
+    if track._state.adding or track.pk is None:
+        return
+    owned = [field for field in projected_track_fields()
+             if update_fields is None or field.name in update_fields or field.attname in update_fields]
+    loaded = [field for field in owned if field.attname in track.__dict__]
+    if not loaded or not _projected([track.pk]):
+        return
+    current = type(track)._base_manager.filter(pk=track.pk).values(*[f.attname for f in loaded]).first()
+    if current is None:
+        return
+    changed = sorted(field.name for field in loaded
+                     if not _same(field, track.__dict__[field.attname], current[field.attname]))
+    if changed:
+        raise _track_refusal(
+            f"Track {changed} of a projected spoken Track change only through the spoken projection")
+
+
+def check_track_update(queryset, columns: dict) -> None:
+    if set(columns) & _owned_names() and queryset.filter(spoken_asset__isnull=False).exists():
+        raise _track_refusal(
+            f"Track {sorted(set(columns) & _owned_names())} of a projected spoken Track change only through "
+            "the spoken projection")
+
+
+def check_track_bulk_update(objs, fields) -> None:
+    if set(fields) & _owned_names() and _projected([obj.pk for obj in objs]):
+        raise _track_refusal("a projected spoken Track's owned columns change only through the projection")

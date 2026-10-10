@@ -4,9 +4,16 @@ authorization the table does not allow).
 
 Each rule names its event and the protected item columns (attnames) that
 transition may write, besides ``state``/``state_changed_at`` (always) and
-``terminal_at`` (when entering a terminal state). C2 rules deliver to the
-library and are refused until the projection service exists -- by the
-service AND by the guard, so no hand-built authorization can perform them.
+``terminal_at`` (when entering a terminal state). C2 rules deliver to, or
+remove from, the library: only the projection service (spoken.delivery)
+performs them, and the guard executes one only with a PROJECTION WITNESS it
+re-checks against the locked database (spoken.guard.ProjectedItemWrite) --
+so no hand-built authorization can deliver an item that has no active
+edition, or recall one whose content is still live.
+
+``repromoted`` (superseded -> delivered) stays in the table as an identity
+but is NOT performable in C2B: nothing ever resurrects a superseded edition
+automatically (C2B_PERFORMABLE excludes it).
 """
 from __future__ import annotations
 
@@ -29,6 +36,8 @@ TERMINAL = frozenset({"terminal_at"})
 _LEASE = frozenset({"lease_token", "lease_expires_at"})
 _FAILURE = frozenset({"failure_code", "failure_detail"})
 _RECALL = frozenset({"recalled_by_id", "recalled_by_username", "recalled_at", "recall_reason"})
+_DELIVERY = frozenset({"delivered_at", "expires_at"})
+_REVIEW = frozenset({"reviewed_by_id", "reviewed_by_username", "reviewed_at", "review_note"})
 
 # What item creation may set (everything else must hold the model default).
 CREATE_COLUMNS = frozenset({"content_type_id", "origin", "submitted_by_id", "submitted_by_username", "title",
@@ -58,17 +67,29 @@ TRANSITIONS: dict[tuple, Rule] = {
     (S.PROCESSED, S.RECALLED): Rule("recalled", columns=_RECALL),
     (S.AWAITING_REVIEW, S.RECALLED): Rule("recalled", columns=_RECALL),
     (S.FAILED, S.RECALLED): Rule("recalled", columns=_RECALL),
-    # library projection -- C2
-    (S.PROCESSED, S.DELIVERED): Rule("delivered", c2=True),
-    (S.AWAITING_REVIEW, S.DELIVERED): Rule("approved_delivered", c2=True),
+    # library projection -- C2 (performed only by spoken.delivery, witnessed)
+    (S.PROCESSED, S.DELIVERED): Rule("delivered", c2=True, columns=_DELIVERY),
+    (S.AWAITING_REVIEW, S.DELIVERED): Rule("approved_delivered", c2=True, columns=_DELIVERY | _REVIEW),
     (S.DELIVERED, S.SUPERSEDED): Rule("superseded", c2=True),
     (S.SUPERSEDED, S.DELIVERED): Rule("repromoted", c2=True),
-    (S.DELIVERED, S.RECALLED): Rule("recalled", c2=True),
+    (S.DELIVERED, S.RECALLED): Rule("recalled", c2=True, columns=_RECALL),
     (S.DELIVERED, S.EXPIRED): Rule("expired", c2=True),
+    # C2B: a superseded item can still be recalled or expire -- with NO
+    # projection effect (it carries nothing; it can never touch the newer
+    # edition that superseded it).
+    (S.SUPERSEDED, S.RECALLED): Rule("recalled", c2=True, columns=_RECALL),
+    (S.SUPERSEDED, S.EXPIRED): Rule("expired", c2=True),
 }
+
+# The C2 transitions the C2B projection service performs (and the guard
+# executes). ``repromoted`` is deliberately absent: no automatic re-promotion.
+C2B_PERFORMABLE = frozenset({
+    (S.PROCESSED, S.DELIVERED), (S.AWAITING_REVIEW, S.DELIVERED), (S.DELIVERED, S.SUPERSEDED),
+    (S.DELIVERED, S.RECALLED), (S.DELIVERED, S.EXPIRED), (S.SUPERSEDED, S.RECALLED), (S.SUPERSEDED, S.EXPIRED),
+})
 
 
 def writable_columns(from_state, to_state) -> frozenset:
-    """Every protected attname the (non-C2) transition may write."""
+    """Every protected attname the transition may write."""
     rule = TRANSITIONS[(from_state, to_state)]
     return ALWAYS | rule.columns | (TERMINAL if to_state in TERMINAL_STATES else frozenset())

@@ -412,6 +412,43 @@ class AssetState(models.TextChoices):
     DETACHED = "detached", "Detached (Track deleted by an operator)"
 
 
+class SpokenAssetQuerySet(models.QuerySet):
+    """Default AND base manager (see _guard_base_manager); reverse managers
+    derive from it. Projection identity changes only through the exact
+    grants of the projection service (spoken.delivery / spoken.guard)."""
+
+    def update(self, **kwargs):
+        guard.check_asset_queryset_update(self, kwargs)
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        guard.refuse_projection("SpokenAsset")
+
+    def bulk_create(self, objs, *args, **kwargs):
+        guard.refuse_projection("SpokenAsset")
+
+    def delete(self):
+        guard.refuse_projection("SpokenAsset")
+
+    delete.queryset_only = True
+
+
+class SpokenAssetEditionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        guard.refuse_projection("SpokenAssetEdition")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        guard.refuse_projection("SpokenAssetEdition")
+
+    def bulk_create(self, objs, *args, **kwargs):
+        guard.refuse_projection("SpokenAssetEdition")
+
+    def delete(self):
+        guard.refuse_projection("SpokenAssetEdition")
+
+    delete.queryset_only = True
+
+
 class SpokenAsset(models.Model):
     """The stable airable identity a spoken item projects into a library Track.
 
@@ -440,6 +477,8 @@ class SpokenAsset(models.Model):
     retired_at = models.DateTimeField(null=True, blank=True)
     retired_reason = models.CharField(max_length=200, blank=True)
 
+    objects = SpokenAssetQuerySet.as_manager()
+
     class Meta:
         ordering = ["-created_at"]
         constraints = [
@@ -466,6 +505,12 @@ class SpokenAsset(models.Model):
     def __str__(self):
         return f"{self.mode} asset {self.id} [{self.state}]"
 
+    def save(self, *args, **kwargs):
+        guard.refuse_projection("SpokenAsset")
+
+    def delete(self, *args, **kwargs):
+        guard.refuse_projection("SpokenAsset")
+
 
 class EditionState(models.TextChoices):
     PENDING = "pending", "Pending"
@@ -491,6 +536,8 @@ class SpokenAssetEdition(models.Model):
     superseded_by = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT,
                                       related_name="supersedes")
 
+    objects = SpokenAssetEditionQuerySet.as_manager()
+
     class Meta:
         ordering = ["asset", "generation"]
         constraints = [
@@ -507,3 +554,24 @@ class SpokenAssetEdition(models.Model):
 
     def __str__(self):
         return f"edition g{self.generation} of {self.asset_id} [{self.state}]"
+
+    def save(self, *args, **kwargs):
+        guard.refuse_projection("SpokenAssetEdition")
+
+    def delete(self, *args, **kwargs):
+        guard.refuse_projection("SpokenAssetEdition")
+
+
+def _guard_base_manager(model) -> None:
+    """Make the guarded queryset the model's BASE manager too (what Django
+    uses for related-object deletion handling and ``_base_manager``), as
+    ``Meta.base_manager_name`` does for the C1 models. Set on ``_meta`` here
+    rather than in ``Meta`` because these two models' accepted initial
+    migration (spoken.0001) predates their guard, and a ``Meta`` option would
+    be a new (options-only) migration; migration state reads only declared
+    ``Meta`` options, so this changes no schema and no migration."""
+    model._meta.base_manager_name = "objects"
+
+
+_guard_base_manager(SpokenAsset)
+_guard_base_manager(SpokenAssetEdition)

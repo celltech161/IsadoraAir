@@ -272,6 +272,38 @@ class Holiday(models.Model):
 # Track - the core model
 # ---------------------------------------------------------------
 
+# Write guards another app registers for Track columns it OWNS on some Tracks
+# (spoken.apps registers the spoken projection's: a Track linked to a
+# SpokenAsset is a projection, its file/category/title/artist/readiness come
+# from the projection service, never from an ordinary edit). Each guard is a
+# (save, update, bulk_update) triple of callables that raise to refuse; the
+# library itself never calls into those apps directly.
+TRACK_WRITE_GUARDS = []
+
+
+class TrackWriteRefused(Exception):
+    """A registered guard refused a Track write (e.g. a projection-owned
+    column of a projected spoken Track)."""
+
+
+def register_track_write_guard(save, update, bulk_update) -> None:
+    if (save, update, bulk_update) not in TRACK_WRITE_GUARDS:
+        TRACK_WRITE_GUARDS.append((save, update, bulk_update))
+
+
+class TrackQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        for _save, update, _bulk in TRACK_WRITE_GUARDS:
+            update(self, kwargs)
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        objs = list(objs)
+        for _save, _update, bulk in TRACK_WRITE_GUARDS:
+            bulk(objs, fields)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+
 class Track(models.Model):
     ENERGY_CHOICES = [
         ("slow", "Slow"),
@@ -423,6 +455,8 @@ class Track(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = TrackQuerySet.as_manager()
+
     class Meta:
         ordering = ["artist", "title"]
         indexes = [
@@ -432,6 +466,16 @@ class Track(models.Model):
 
     def __str__(self):
         return f"{self.artist} - {self.title}"
+
+    def check_write_guards(self, update_fields=None) -> None:
+        """Raise TrackWriteRefused if a registered guard refuses saving this
+        instance as it is now (views call it BEFORE side effects)."""
+        for save, _update, _bulk in TRACK_WRITE_GUARDS:
+            save(self, update_fields)
+
+    def save(self, *args, **kwargs):
+        self.check_write_guards(kwargs.get("update_fields"))
+        super().save(*args, **kwargs)
 
 
 # ---------------------------------------------------------------

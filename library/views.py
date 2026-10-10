@@ -1920,6 +1920,14 @@ def api_track_detail(request, pk):
     # only succeeds when disk is in the new place.
     from django.conf import settings as django_settings
     from library.middleware import user_is_contributor as _uic
+    from library.models import TrackWriteRefused
+    try:
+        # A projected spoken Track's file, category, title, artist and
+        # readiness belong to the spoken projection: refuse BEFORE moving
+        # anything on disk.
+        track.check_write_guards()
+    except TrackWriteRefused as exc:
+        return JsonResponse({"error": str(exc)}, status=409)
     if track.pk and track.category_id:
         old_track = Track.objects.filter(pk=track.pk).only("filepath", "category_id").first()
         if old_track and old_track.category_id != track.category_id:

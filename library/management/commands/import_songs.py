@@ -1,5 +1,6 @@
 import os
 import struct
+import re
 from pathlib import Path
 
 from django.conf import settings
@@ -9,6 +10,7 @@ from mutagen import File as MutagenFile
 from library.models import Album, Artist, Category, Genre, Track
 from library.services.related_artists import resolve_fallback_metadata
 
+_PROJECTED_SPOKEN = re.compile(r"spoken-[0-9a-f]{32}\.flac")
 SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2", ".alac"}
 
 # WAV files can carry metadata in either an ID3 chunk (which mutagen
@@ -236,7 +238,9 @@ class Command(BaseCommand):
                 ext = filepath.suffix.lower()
                 total += 1
 
-                if ext not in SUPPORTED_EXT:
+                if ext not in SUPPORTED_EXT or _PROJECTED_SPOKEN.fullmatch(name):
+                    # spoken-<uuid>.flac is a spoken projection's file: its
+                    # Track is the projection's (spoken.delivery), never an import.
                     skipped += 1
                     continue
 
