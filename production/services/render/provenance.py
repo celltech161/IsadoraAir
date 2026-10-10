@@ -89,7 +89,13 @@ def expected(recipe_key, recipe_params, *, pin=reference_audio.current_pin) -> E
     transaction.atomic()). Raises UnknownRecipe, RecipeParameterError or
     reference_audio.ReferenceAudioError."""
     recipe, resolved, plan = prepare(recipe_key, recipe_params)
-    references = {param: pin(key) for param, key in reference_keys(plan, resolved).items()}
+    keys = reference_keys(plan, resolved)
+    if pin is reference_audio.current_pin:
+        # All the keys' shared locks first, in the one global order
+        # (reference_audio.lock_keys), before any is read: a future
+        # multi-reference recipe can never deadlock a concurrent completion.
+        reference_audio.lock_keys(keys.values(), shared=True)
+    references = {param: pin(key) for param, key in keys.items()}
     doc = document(recipe, resolved, references)
     return ExpectedRender(recipe_key=recipe.key, recipe_version=recipe.version, params=resolved,
                           references=references, document=doc, digest=digest(doc))

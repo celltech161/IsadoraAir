@@ -112,6 +112,24 @@ def lock_key(key: str, *, shared: bool = False) -> None:
         cursor.execute(f"SELECT {function}(%s, %s)", [LOCK_NAMESPACE, key_lock_id(key)])
 
 
+def lock_keys(keys, *, shared: bool = False) -> list:
+    """Take the advisory locks of SEVERAL keys in ONE deterministic global
+    order -- ascending lock id (then key), each id once -- so two
+    transactions locking overlapping key sets can never wait on each other in
+    a cycle. Ordering by the lock id, not the key text, is what makes it
+    total: two keys whose ids collide share one lock, taken once. Every
+    multi-key acquisition (render completion, delivery) goes through here.
+    Returns the keys in acquisition order."""
+    ordered = sorted({check_key(key) for key in keys}, key=lambda key: (key_lock_id(key), key))
+    taken = set()
+    for key in ordered:
+        lock_id = key_lock_id(key)
+        if lock_id not in taken:
+            lock_key(key, shared=shared)
+            taken.add(lock_id)
+    return ordered
+
+
 def _current_locked(key):
     return ReferenceAudio.objects.select_for_update(of=("self",)).filter(key=key, retired_at__isnull=True).first()
 
