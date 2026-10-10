@@ -17,8 +17,8 @@ class Command(BaseCommand):
         parser.add_argument("--socket", default=None,
                             help="Unix socket path (default: settings.PRODUCTION_RENDER_SOCKET).")
         # Plain strings: parsed ONLY by the service's strict admission parser.
-        parser.add_argument("--max-active", default=None, metavar="1..2",
-                            help="Renders at once (default: settings.PRODUCTION_RENDER_MAX_ACTIVE, else 1).")
+        parser.add_argument("--max-active", default=None, metavar="1",
+                            help="Renders at once: must be 1 (default: settings.PRODUCTION_RENDER_MAX_ACTIVE, else 1).")
         parser.add_argument("--max-pending", default=None, metavar="0..4",
                             help="Admitted requests waiting for a render slot (default: "
                                  "settings.PRODUCTION_RENDER_MAX_PENDING, else 2).")

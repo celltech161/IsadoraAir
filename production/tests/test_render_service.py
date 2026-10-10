@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,6 +41,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
+from django.core.management import CommandError, call_command
 from django.db import IntegrityError, transaction
 from django.db.models.signals import pre_save
 from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
@@ -48,7 +50,7 @@ from production import models as models_mod
 from production.errors import ImmutableMediaError, IntakeError, MediaNotValidated
 from production.models import ProductionMedia, rendition_authority
 from production.services import (
-    confinement, intake, reference_audio, render, render_health, render_service, retention, validation,
+    admission, confinement, intake, reference_audio, render, render_health, render_service, retention, validation,
 )
 from production.services.render import client, executor, protocol, provenance, rendition
 from spoken.tests import support as audio
@@ -812,6 +814,195 @@ def fake_service(testcase, answer_for):
         stop.set()
         listener.close()
         thread.join(5)
+
+
+# -- render concurrency: exactly one, by construction ------------------------------------
+
+class _Sampler:
+    """Samples, every 10 ms, the REAL cgroup leaves of the render subtree, the
+    service's counters and this process's distinct render memfds (input
+    snapshots and voice WAV intermediates -- a step's reopened descriptor of
+    the same memfd counts once); keeps the maxima."""
+
+    def __init__(self, service):
+        self.service, self.stop, self.timeline = service, threading.Event(), []
+        self.max_leaves = self.max_active = self.max_inputs = self.max_voices = 0
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while not self.stop.is_set():
+            leaves = len(_run_leaves())
+            inputs = len(_memfds("/memfd:isadoraair-render-input-"))
+            voices = len(_memfds("/memfd:isadoraair-render-voice"))
+            with self.service._state:
+                active, pending = self.service.active, self.service.pending
+            self.max_leaves, self.max_active = max(self.max_leaves, leaves), max(self.max_active, active)
+            self.max_inputs, self.max_voices = max(self.max_inputs, inputs), max(self.max_voices, voices)
+            if not self.timeline or self.timeline[-1] != (active, pending):
+                self.timeline.append((active, pending))
+            time.sleep(0.01)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(10)
+
+
+def _memfds(prefix):
+    """The distinct memfds (by inode) this process holds whose name starts so."""
+    return {os.stat(f"/proc/self/fd/{fd}").st_ino for fd in _links(prefix) if os.path.exists(f"/proc/self/fd/{fd}")}
+
+
+def _wav(seconds, channels=2):
+    """A sine WAV of ``seconds`` (made by ffmpeg: long fixtures, quickly; via
+    a file, so the RIFF sizes are real)."""
+    with tempfile.TemporaryDirectory(prefix="render-wav-") as directory:
+        path = os.path.join(directory, "sine.wav")
+        subprocess.run([FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        f"sine=frequency=220:duration={seconds}:sample_rate=48000", "-af", "volume=0.25",
+                        "-ac", str(channels), "-c:a", "pcm_s16le", path], check=True, capture_output=True)
+        with open(path, "rb") as handle:
+            return handle.read()
+
+
+def _concurrently(service, requests):
+    """Send every (body, fds) at once; [(answer dict, received fds)] in order."""
+    results = [None] * len(requests)
+
+    def one(index, body, fds):
+        answer, received = send(service.socket_path, body, fds)
+        results[index] = (json.loads(answer), received)
+    threads = [threading.Thread(target=one, args=(i, body, fds)) for i, (body, fds) in enumerate(requests)]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.2)                                      # a deterministic arrival order
+    for thread in threads:
+        thread.join(600)
+    return results
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class RenderConcurrencyTests(MediaFixtures, TestCase):
+    """C2A final corrective: one maximal render peaks at ~1.6 GiB of the
+    unit's 3 GiB, so the service renders exactly ONE request at a time. Every
+    surface that can configure it (settings/environment, the command, any
+    constructor, the status file) accepts 1 and refuses anything else --
+    never clamping -- before the service listens or allocates anything; a
+    queued request holds only its descriptors, never snapshots."""
+
+    def test_one_is_accepted_and_two_is_refused_everywhere(self):
+        self.assertEqual((render_service.ACTIVE_DEFAULT, render_service.ACTIVE_MIN, render_service.ACTIVE_MAX),
+                         (1, 1, 1))
+        for value in ("1", 1):
+            self.assertEqual(render_service.parse_active(value), 1)
+        for value in ("2", 2, "0", 0, "3", "10", True, "1.0", " 1", "", None):
+            with self.subTest(value=repr(value)), self.assertRaises(admission.AdmissionConfigError) as raised:
+                render_service.parse_active(value)
+            self.assertIn("Concurrent renders must be 1.", str(raised.exception))
+            self.assertIn("More than one render at once is not supported", str(raised.exception))
+        path = _private_socket_path(self)
+        self.assertEqual(render_service.RenderService(path, ffmpeg=FFMPEG, max_active="1").max_active, 1)
+        self.assertEqual(render_service.RenderService(path, ffmpeg=FFMPEG).max_active, 1)        # the default
+        with self.assertRaises(admission.AdmissionConfigError):
+            render_service.RenderService(path, ffmpeg=FFMPEG, max_active=2)                    # a constructor
+        with override_settings(PRODUCTION_RENDER_MAX_ACTIVE="2"), self.assertRaises(admission.AdmissionConfigError):
+            render_service.RenderService(path, ffmpeg=FFMPEG)                                  # settings / env
+        started = []
+        with mock.patch.object(render_service.RenderService, "serve_forever",
+                               lambda service: started.append(service.max_active)):
+            call_command("production_render_service", "--socket", path, "--max-active=1")
+            with self.assertRaises(CommandError) as raised:                                     # the command
+                call_command("production_render_service", "--socket", path, "--max-active=2")
+            self.assertIn("More than one render at once is not supported", str(raised.exception))
+            with override_settings(PRODUCTION_RENDER_MAX_ACTIVE="2"), self.assertRaises(CommandError):
+                call_command("production_render_service", "--socket", path)
+        self.assertEqual(started, [1])                                                          # 2 never served
+        self.assertFalse(os.path.exists(path))
+        status = os.path.join(os.path.dirname(path), render_service.STATUS_FILENAME)
+        with open(status, "w") as handle:
+            json.dump({"max_active": 2, "max_pending": 2, "active": 0, "pending": 0}, handle)
+        self.assertIsNone(render_service.status_snapshot(path))       # a status claiming 2 is not believed
+
+    def test_a_real_service_process_configured_for_two_never_starts(self):
+        path = _private_socket_path(self)
+        for args, env in ((["--max-active=2"], {}), ([], {"PRODUCTION_RENDER_MAX_ACTIVE": "2"})):
+            with self.subTest(args=args, env=env):
+                try:
+                    result = subprocess.run([sys.executable, str(REPO / "manage.py"), "production_render_service",
+                                             "--socket", path, *args], cwd=REPO, capture_output=True, text=True,
+                                            env={**os.environ, **env}, timeout=60)
+                except subprocess.TimeoutExpired:
+                    self.fail("a service configured for two renders at once started")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("More than one render at once is not supported", result.stderr)
+                self.assertFalse(os.path.exists(path))                 # never bound, never listened
+
+    def test_requests_render_one_at_a_time_at_the_largest_supported_configuration(self):
+        """active 1, pending 1: the first renders, the second waits (holding
+        no snapshot), the third is busy; the first completes, the second is
+        promoted and completes. Never two real cgroup leaves, two active
+        renders or two requests' snapshots/intermediates at once."""
+        voice = ingest(audio.voice(3.0))
+        slow = render_service.render_limits().__class__(**{**render_service.render_limits().__dict__,
+                                                            "cpu_percent": 5})
+        with in_process_render_service(self, ffmpeg=FFMPEG, max_active=str(render_service.ACTIVE_MAX),
+                                       max_pending="1", limits=slow) as service:
+            body, fds, close = build_request(voice, "lcl_psa")
+            self.addCleanup(close)
+            busy = []
+
+            def third_when_full():
+                self.assertTrue(_eventually(lambda: (service.active, service.pending) == (1, 1), 60))
+                busy.append(json.loads(send(service.socket_path, body, fds)[0])["status"])
+            third = threading.Thread(target=third_when_full)
+            with _Sampler(service) as sampler:
+                third.start()
+                results = _concurrently(service, [(body, fds), (body, fds)])
+                third.join(120)
+            for answer, received in results:
+                self.assertEqual(answer["status"], "ok", answer)
+                for fd in received:
+                    os.close(fd)
+            self.assertEqual(busy, ["busy"])
+            self.assertEqual((sampler.max_leaves, sampler.max_active, sampler.max_inputs, sampler.max_voices),
+                             (1, 1, 1, 1), sampler.timeline)
+            self.assertIn((1, 1), sampler.timeline)                    # one rendering, one waiting
+            self.assertTrue(_eventually(lambda: (service.active, service.pending) == (0, 0), 10))   # all released
+            waiting = sampler.timeline.index((1, 1))
+            self.assertIn((1, 0), sampler.timeline[waiting:])          # the waiting one was promoted
+
+    def test_two_heavy_requests_queue_instead_of_rendering_together(self):
+        """Two representative heavy requests (2-minute stereo sources, a bed)
+        sent together: one renders while the other waits with NO input
+        snapshot or intermediate; both complete; the service survives and
+        renders again."""
+        heavy = [ingest(_wav(120)), ingest(_wav(121))]
+        with in_process_render_service(self, ffmpeg=FFMPEG) as service:
+            requests = []
+            for source in heavy:
+                body, fds, close = build_request(source, "3min_ctr")
+                requests.append((body, fds))
+                self.addCleanup(close)
+            with _Sampler(service) as sampler:
+                results = _concurrently(service, requests)
+            for answer, received in results:
+                self.assertEqual(answer["status"], "ok", answer)
+                for fd in received:
+                    os.close(fd)
+            self.assertIn((1, 1), sampler.timeline)
+            # one request's source + bed snapshots and one voice WAV at most -- never two requests' worth
+            self.assertEqual((sampler.max_leaves, sampler.max_active, sampler.max_voices), (1, 1, 1))
+            self.assertLessEqual(sampler.max_inputs, 2)
+            self.assertEqual(_links("/memfd:isadoraair-render"), [])
+            body, fds, close = build_request(self.source, "lcl_psa")
+            self.addCleanup(close)
+            answer, received = send(service.socket_path, body, fds)
+            self.assertEqual(json.loads(answer)["status"], "ok")
+            for fd in received:
+                os.close(fd)
 
 
 @unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")

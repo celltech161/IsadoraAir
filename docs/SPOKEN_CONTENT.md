@@ -296,10 +296,9 @@ render unit (not reclaimable page cache), alongside the WAV intermediates
 (≤ ~660 MiB each for a one-hour stereo source). Measured peaks of the whole
 render unit, one render at a time: a one-hour mono source with a 3-minute bed
 1.4 GiB; the largest inputs one request may carry (a 512 MiB source and a
-512 MiB bed) 1.6 GiB; back to ~130 MiB afterwards — inside `MemoryMax=3G` at
-the default of one active render. Two such maximal renders at once (the
-operator's `max_active=2`) could reach the unit's limit, so 2 is only for
-stations whose spoken items are short.
+512 MiB bed) 1.6 GiB; back to ~130 MiB afterwards — inside `MemoryMax=3G`
+with one render at a time, which is why the service renders exactly one (see
+*Admission*).
 
 **Sandbox** (every step, `confinement.execute` with the launcher's `render`
 profile): cgroup leaf limits (1.5 GiB for the step's tree, 64 tasks, one CPU,
@@ -321,11 +320,26 @@ read-only and break the delegated subtree. These unit-level options are
 verified by `systemd-analyze verify` only: a user manager cannot apply them,
 so the first start under the system manager is an installation check.
 
-**Admission**: at most 1 render at once (operator domain 1–2) and 2 admitted
-requests waiting (0–4); anything beyond is answered `busy` from the accept
-loop without reading the request. A slot is released on success, failure,
-timeout and client disconnect (closing the connection cancels the render);
-a failed step or a malformed request never affects the next one.
+**Admission**: exactly **one render at a time**, by construction, and 2
+admitted requests waiting (0–4); anything beyond is answered `busy` from the
+accept loop without reading the request. Render concurrency is not an
+operator choice: one maximal request peaks at ~1.6 GiB of the unit's 3 GiB
+(idle ~130 MiB), so two would not fit. `PRODUCTION_RENDER_MAX_ACTIVE`, the
+command's `--max-active` and every `RenderService` constructor go through one
+parser that accepts only `1`; any other value (including `2`) is refused with
+an explanation — never clamped — before the service binds its socket or
+allocates anything, so systemd sees a failed start, and a status file
+claiming more is not believed. A waiting request holds only its received
+descriptors: its input snapshots and intermediates are created only once it
+holds the single run slot. A slot is released on success, failure, timeout and
+client disconnect (closing the connection cancels the render); the next
+waiting request is then promoted; a failed step or a malformed request never
+affects the next one. *Deferred (not C2A):* more than one render at once may
+return only with admission that reserves each request's expected memory —
+sealed source/reference snapshots, decoded/intermediate WAVs, the output, the
+service baseline and a safety margin — service-wide (an estimate from the
+request's sizes and durations; queue or refuse when the aggregate reservation
+would exceed a safe ceiling).
 
 **Sole rendition authority**: a `rendition` row is inserted only by
 `render/rendition.py`, for an `ExecutorOutput` the client issued (identity

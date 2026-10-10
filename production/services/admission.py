@@ -40,7 +40,10 @@ class AdmissionConfigError(ValueError):
 
 
 def _parse(value, *, label, minimum, maximum) -> int:
-    domain = f"{label} must be between {minimum} and {maximum}."
+    if minimum == maximum:
+        domain = f"{label} must be {minimum}."
+    else:
+        domain = f"{label} must be between {minimum} and {maximum}."
     if isinstance(value, bool):
         raise AdmissionConfigError(f"{domain} A true/false value is not a number.")
     if isinstance(value, int):

@@ -18,7 +18,7 @@ For each connection it:
    REQUEST_READ_TIMEOUT_SECONDS: exactly one ``render`` of a code-registered
    recipe, the source and pinned references as read-only descriptors. There
    is no command, executable, option, filter, path or URL in the protocol;
-4. waits for a run slot (at most ``max_active`` renders at once) within the
+4. waits for a run slot (ONE render at a time -- ACTIVE_MAX is 1) within the
    request's own deadline, cancelling if the client goes away;
 5. snapshots every input into a sealed, service-owned memfd in the same read
    pass that verifies its size and SHA-256, closes the client's descriptors
@@ -60,7 +60,13 @@ from . import admission, confinement
 from .render import executor, protocol
 from .render.engine import ENGINE_VERSION, RenderError
 
-ACTIVE_DEFAULT, ACTIVE_MIN, ACTIVE_MAX = 1, 1, 2
+# ONE render at a time, by construction: one maximal request peaks at ~1.6 GiB
+# of the unit's MemoryMax=3G (input snapshots + WAV intermediates + output),
+# so two would not fit. Concurrency > 1 returns only with admission that
+# reserves each request's expected memory service-wide.
+ACTIVE_DEFAULT, ACTIVE_MIN, ACTIVE_MAX = 1, 1, 1
+ACTIVE_UNSUPPORTED = ("More than one render at once is not supported: a maximal render needs about 1.6 GiB of "
+                      "the render unit's 3 GiB, and admission does not yet reserve memory per request.")
 PENDING_DEFAULT, PENDING_MIN, PENDING_MAX = 2, 0, 4
 STATUS_FILENAME = "status.json"
 DEFAULT_SOCKET = "/run/isadoraair-render/render.sock"
@@ -75,7 +81,14 @@ MAX_SOURCE_SECONDS = Decimal(3600)
 
 
 def parse_active(value) -> int:
-    return admission.parse_bounded(value, label="Concurrent renders", minimum=ACTIVE_MIN, maximum=ACTIVE_MAX)
+    """THE render-concurrency validation (settings, environment, CLI, every
+    constructor, the status file): exactly 1. Anything else is refused --
+    never clamped -- before the service binds its socket or allocates
+    anything."""
+    try:
+        return admission.parse_bounded(value, label="Concurrent renders", minimum=ACTIVE_MIN, maximum=ACTIVE_MAX)
+    except admission.AdmissionConfigError as exc:
+        raise admission.AdmissionConfigError(f"{exc} {ACTIVE_UNSUPPORTED}") from None
 
 
 def parse_pending(value) -> int:
