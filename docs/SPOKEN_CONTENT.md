@@ -291,7 +291,15 @@ and intermediates are closed as soon as their last step is done; nothing
 persists past the request. One render holds at most `MAX_INPUT_BYTES` (1 GiB)
 of input snapshots (`input_too_large` beyond); running out of room while
 snapshotting or for an intermediate fails `render_resource_limit` with every
-memfd closed and the slot released.
+memfd closed and the slot released. Snapshots are memfd pages charged to the
+render unit (not reclaimable page cache), alongside the WAV intermediates
+(≤ ~660 MiB each for a one-hour stereo source). Measured peaks of the whole
+render unit, one render at a time: a one-hour mono source with a 3-minute bed
+1.4 GiB; the largest inputs one request may carry (a 512 MiB source and a
+512 MiB bed) 1.6 GiB; back to ~130 MiB afterwards — inside `MemoryMax=3G` at
+the default of one active render. Two such maximal renders at once (the
+operator's `max_active=2`) could reach the unit's limit, so 2 is only for
+stations whose spoken items are short.
 
 **Sandbox** (every step, `confinement.execute` with the launcher's `render`
 profile): cgroup leaf limits (1.5 GiB for the step's tree, 64 tasks, one CPU,
@@ -365,9 +373,11 @@ distinct from a replaced token's `stale_lease`). Each render's deadline ends
 10 minutes before the lease does (`min(lease remaining − 600 s, 120 s + 6 ×
 duration)`), a retry that no longer fits is not started, and a worker whose
 lease expired abandons the item to the next claim. There is no lease renewal:
-with the 1-hour lease a render gets at most 50 minutes, which covers every
-source up to ~8 minutes at the service's `120 s + 6 × duration` budget and far
-longer real renders (they run at many times real time). Operator-attention conditions emit a
+with the 1-hour lease a render gets at most 50 minutes. That is less than the
+service's `120 s + 6 × duration` allowance for sources longer than ~8
+minutes, but real renders run far faster than that allowance: a one-hour
+source with a bed rendered (snapshot, mix, two-pass loudness, FLAC) in about
+4 minutes and validated in under 10 seconds on the station host. Operator-attention conditions emit a
 `spoken_render` SystemEvent; SpokenItemEvent stays the history. Nothing renders
 in the web request path.
 
