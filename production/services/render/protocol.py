@@ -62,7 +62,7 @@ _REFERENCE_KEYS = _MEDIA_KEYS | {"key", "reference"}
 CODES = {
     "invalid_request": False, "unknown_recipe": False, "recipe_version_mismatch": False,
     "invalid_parameters": False, "reference_mismatch": False, "descriptor_invalid": False,
-    "descriptor_mismatch": False, "provenance_mismatch": False, "source_too_long": False,
+    "descriptor_mismatch": False, "provenance_mismatch": False, "source_too_long": False, "input_too_large": False,
     "empty_voice": False, "silent_render": False, "loudness_analysis_failed": False, "render_failed": False,
     "render_resource_limit": False,
     "busy": True, "render_timeout": True, "render_unavailable": True, "sandbox_unavailable": True,

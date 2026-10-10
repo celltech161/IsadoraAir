@@ -195,7 +195,8 @@ Since Phase C2A it is the client of a **separate, sandboxed render executor**
    beds resolved by key and hash-verified; source and beds are opened
    **read-only** and sent as descriptors with the canonical provenance digest
    the client expects;
-2. the executor proves every descriptor's bytes, the recipe version, the
+2. the executor snapshots every descriptor into a sealed memfd in the same
+   pass that proves its bytes, checks the recipe version, the
    parameters, the pinned references and the digest, runs the fixed steps —
    prepare (48 kHz stereo), mix, loudness analysis (JSON parsed structurally;
    `-inf` ⇒ `silent_render`), apply + FLAC — and returns the FLAC as a
@@ -265,15 +266,32 @@ and its size and SHA-256, the recipe, digest, provenance document, measured
 loudness and the executor's toolchain — or a stable error code (never tool
 output or paths; those go to the service journal, bounded).
 
-**Executor** (`render/executor.py`): every received descriptor must be a
-regular file opened **read-only** whose size and SHA-256 are the claimed ones
-(a substituted descriptor is refused before anything runs); the recipe
-version must be the registered one; the pinned references must be exactly the
-ones the plan uses; its own canonical digest must equal the client's
-expectation. Each step is a fixed ffmpeg argv built from the step library with
-the pinned absolute ffmpeg, `-protocol_whitelist fd`, inputs as fresh
-read-only reopens (`-fd N -i fd:`) and outputs as service-created memfds
-(`-fd N fd:`) — no path appears anywhere.
+**Executor** (`render/executor.py`): the recipe version must be the
+registered one; the pinned references must be exactly the ones the plan
+uses; its own canonical digest must equal the client's expectation. Every
+received descriptor must be a regular file opened **read-only** — but a
+read-only descriptor does not make its inode immutable (another, writable
+handle can rewrite it, same size, after any check). So each input becomes an
+**immutable service-owned snapshot**: its bytes are copied into a memfd *in
+the same read pass* that counts and hashes them (at most one byte past the
+claimed size is read), the copy is refused unless exactly the claimed size and
+SHA-256 were read (a substituted descriptor is refused before anything runs),
+and the memfd is sealed `F_SEAL_WRITE|GROW|SHRINK|SEAL`. The service then
+closes the client's descriptors — before the first step — and nothing reads
+them again; a later rewrite of the source's or a bed's inode cannot reach the
+render. If a reference is re-registered after the snapshot, the render
+finishes against its old, pinned bytes and completion refuses it
+(`render_outdated`); no database lock is held through a render. Each step is
+a fixed ffmpeg argv built from the step library with the pinned absolute
+ffmpeg, `-protocol_whitelist fd`, inputs as fresh read-only reopens of
+**sealed** memfds only (input snapshots, and each intermediate sealed once its
+step finished; anything unsealed is refused) (`-fd N -i fd:`) and outputs as
+service-created memfds (`-fd N fd:`) — no path appears anywhere. Snapshots
+and intermediates are closed as soon as their last step is done; nothing
+persists past the request. One render holds at most `MAX_INPUT_BYTES` (1 GiB)
+of input snapshots (`input_too_large` beyond); running out of room while
+snapshotting or for an intermediate fails `render_resource_limit` with every
+memfd closed and the slot released.
 
 **Sandbox** (every step, `confinement.execute` with the launcher's `render`
 profile): cgroup leaf limits (1.5 GiB for the step's tree, 64 tasks, one CPU,

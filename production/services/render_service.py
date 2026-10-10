@@ -20,7 +20,10 @@ For each connection it:
    is no command, executable, option, filter, path or URL in the protocol;
 4. waits for a run slot (at most ``max_active`` renders at once) within the
    request's own deadline, cancelling if the client goes away;
-5. renders with render.executor -- every ffmpeg step in a fresh leaf of its
+5. snapshots every input into a sealed, service-owned memfd in the same read
+   pass that verifies its size and SHA-256, closes the client's descriptors
+   (their inodes can still change; the snapshots cannot), and
+   renders with render.executor -- every ffmpeg step in a fresh leaf of its
    exclusive subtree via confinement.execute with the launcher's ``render``
    profile: cgroup limits, no_new_privs, Landlock (NO filesystem writes; reads
    only beneath /usr, /lib, /lib64, the loader cache/timezone and the CPU
@@ -406,10 +409,16 @@ class RenderService:
         finally:
             self._count("pending", -1)
         self._count("active", 1)
+
+        def release():
+            """The inputs are sealed snapshots now: the caller's descriptors
+            (whose inodes can still change) are closed before any step runs."""
+            while fds:
+                os.close(fds.pop())
         try:
             return executor.execute(
                 parsed, source_fd, reference_fds, deadline=deadline, max_seconds=MAX_SOURCE_SECONDS,
-                ffmpeg=self.ffmpeg,
+                ffmpeg=self.ffmpeg, release=release,
                 run_step=lambda argv, pass_fds, timeout: self.run_step(argv, pass_fds, timeout, cancelled))
         finally:
             self.slots.release()

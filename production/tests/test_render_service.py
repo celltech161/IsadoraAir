@@ -19,7 +19,9 @@ Run under production/tests/run_with_validation_service.sh (a delegated scope,
 the real validation service and a real render service).
 """
 import array
+import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -274,6 +276,243 @@ class ExecutorBoundaryTests(MediaFixtures, TestCase):
         finally:
             close()
         self.assertLessEqual(set(os.listdir("/proc/self/fd")) - before, set())
+
+
+def _close_quietly(fd):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _links(prefix):
+    """This process's descriptors whose target starts with ``prefix``."""
+    found = []
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{name}").startswith(prefix):
+                found.append(int(name))
+        except OSError:
+            pass
+    return found
+
+
+def confined_step(calls, before=None):
+    def run_step(argv, pass_fds, timeout):
+        if before is not None:
+            before(argv, pass_fds)
+        calls.append((list(argv), tuple(pass_fds)))
+        return confinement.execute(argv, timeout_seconds=timeout, pass_fds=pass_fds,
+                                   limits=render_service.render_limits(), subtree=confinement.RENDER,
+                                   profile="render", env=dict(render_service.TOOL_ENVIRONMENT))
+    return run_step
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class InputSnapshotTests(MediaFixtures, TestCase):
+    """C2A corrective A: every input becomes an immutable, service-owned
+    snapshot of EXACTLY the bytes that passed verification. A read-only
+    descriptor does not make its inode immutable: a second, writable handle
+    can rewrite the same inode, same size, after the check. The renderer
+    never reads the caller's inode again once the sealed snapshot exists."""
+
+    def mutable_copy(self, row):
+        """A caller-side file holding ``row``'s bytes (payload A), a read-only
+        descriptor of it, and ``mutate()``: rewrite THAT inode in place, same
+        size, with payload B (A's header, silent samples) through a separate
+        writable descriptor."""
+        payload = layout_path(row).read_bytes()
+        directory = Path(tempfile.mkdtemp(prefix="render-input-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "input"
+        path.write_bytes(payload)
+        read_only = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(_close_quietly, read_only)
+        substitute = payload[:44] + bytes(len(payload) - 44)
+
+        def mutate():
+            writable = os.open(path, os.O_WRONLY)
+            try:
+                os.pwrite(writable, substitute, 0)
+            finally:
+                os.close(writable)
+            assert os.fstat(read_only).st_size == len(payload)
+            assert executor.fd_sha256(read_only) == hashlib.sha256(substitute).hexdigest() != row.sha256
+        return read_only, mutate, path
+
+    def parsed(self, body):
+        return protocol.parse_request(body, max_bytes=2 ** 30, max_seconds=render_service.MAX_SOURCE_SECONDS)
+
+    def execute(self, body, source_fd, reference_fds, *, before=None, release=None):
+        return executor.execute(self.parsed(body), source_fd, reference_fds, run_step=confined_step([], before),
+                                ffmpeg=FFMPEG, deadline=time.monotonic() + 120,
+                                max_seconds=render_service.MAX_SOURCE_SECONDS, release=release)
+
+    def test_a_snapshot_is_sealed_and_holds_exactly_the_verified_bytes(self):
+        read_only, mutate, _ = self.mutable_copy(self.source)
+        entry = client._media_entry(self.source)
+        snapshot = executor.snapshot_input(read_only, entry, "source")
+        try:
+            self.assertTrue(os.readlink(f"/proc/self/fd/{snapshot}").startswith("/memfd:isadoraair-render-input"))
+            self.assertEqual(fcntl.fcntl(snapshot, fcntl.F_GET_SEALS) & executor.SEALS, executor.SEALS)
+            attempts = {
+                "write": lambda: os.pwrite(snapshot, b"x", 0),
+                "shrink": lambda: os.ftruncate(snapshot, 0),
+                "grow": lambda: os.ftruncate(snapshot, entry["bytes"] + 1),
+                "append": lambda: os.pwrite(snapshot, b"x", entry["bytes"]),
+                "reseal": lambda: fcntl.fcntl(snapshot, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE),
+                "writable map": lambda: __import__("mmap").mmap(snapshot, entry["bytes"]),
+            }
+            for label, attempt in attempts.items():
+                with self.subTest(attempt=label), self.assertRaises(PermissionError):
+                    attempt()
+            mutate()                                                    # the caller's inode now holds B
+            self.assertEqual((os.fstat(snapshot).st_size, executor.fd_sha256(snapshot)),
+                             (entry["bytes"], entry["sha256"]))
+            reopened = executor.reopen_read_only(snapshot)
+            try:
+                self.assertEqual(executor.fd_sha256(reopened), entry["sha256"])
+            finally:
+                os.close(reopened)
+        finally:
+            os.close(snapshot)
+
+    def test_steps_only_ever_reopen_sealed_snapshots(self):
+        read_only, _, _ = self.mutable_copy(self.source)
+        unsealed = executor.new_memfd("probe")
+        try:
+            for label, fd in (("the caller's descriptor", read_only), ("an unsealed memfd", unsealed)):
+                with self.subTest(fd=label), self.assertRaises(render.RenderError):
+                    executor.reopen_read_only(fd)
+        finally:
+            os.close(unsealed)
+
+    def test_a_mutation_between_sealed_snapshot_and_first_step_has_no_effect(self):
+        """The exact boundary: the snapshots are sealed, the first step has
+        not started (``release`` runs there) -- both the source's and the
+        bed's inode are rewritten. The render is the render of A."""
+        body, fds, close = build_request(self.source, "3min_ctr")
+        self.addCleanup(close)
+        baseline = self.execute(body, fds[0], {"bed": fds[1]})
+        os.close(baseline.fd)
+        source, mutate_source, _ = self.mutable_copy(self.source)
+        bed, mutate_bed, _ = self.mutable_copy(self.bed_row.media)
+        order = []
+
+        def release():
+            order.append("snapshots sealed")
+            mutate_source()
+            mutate_bed()
+
+        def before(argv, pass_fds):
+            order.append("step")
+            if order.count("step") == 1:
+                for fd in pass_fds[:1]:                                  # the prepare step's input
+                    self.assertEqual(executor.fd_sha256(fd), self.source.sha256)
+        rendered = self.execute(body, source, {"bed": bed}, before=before, release=release)
+        try:
+            self.assertEqual(order[:2], ["snapshots sealed", "step"])
+            self.assertEqual((rendered.sha256, rendered.size, rendered.measured_input),
+                             (baseline.sha256, baseline.size, baseline.measured_input))
+        finally:
+            os.close(rendered.fd)
+
+    def test_codex_input_substitution_reproduction_through_the_service(self):
+        """Codex: verified payload A; the same inode overwritten with
+        same-size payload B; the render must still consume A."""
+        with in_process_render_service(self, ffmpeg=FFMPEG) as service:
+            body, fds, close = build_request(self.source, "3min_ctr")
+            self.addCleanup(close)
+            answer, received = send(service.socket_path, body, fds)
+            baseline = json.loads(answer)
+            for fd in received:
+                os.close(fd)
+            self.assertEqual(baseline["status"], "ok", baseline)
+            source, mutate_source, path = self.mutable_copy(self.source)
+            bed, mutate_bed, bed_path = self.mutable_copy(self.bed_row.media)
+            real_step, seen = service.run_step, []
+
+            def first_step_mutates(argv, pass_fds, timeout, cancelled=None):
+                if not seen:
+                    # the service already let go of the caller's descriptors:
+                    # only this test's own still name the files
+                    seen.append((_links(str(path)), _links(str(bed_path))))
+                    mutate_source()
+                    mutate_bed()
+                return real_step(argv, pass_fds, timeout, cancelled)
+            with mock.patch.object(service, "run_step", first_step_mutates):
+                answer, received = send(service.socket_path, body, [source, bed])
+            answer = json.loads(answer)
+            try:
+                self.assertEqual(answer["status"], "ok", answer)
+                self.assertEqual(seen, [([source], [bed])])
+                client._verify_output(received[0], answer)
+                self.assertEqual((answer["output"], answer["measured_input"]),
+                                 (baseline["output"], baseline["measured_input"]))
+            finally:
+                for fd in received:
+                    os.close(fd)
+            self.assertNotEqual(executor.fd_sha256(source), self.source.sha256)    # the inode did change
+
+    def test_snapshot_exhaustion_fails_cleanly_and_releases_everything(self):
+        with in_process_render_service(self, ffmpeg=FFMPEG) as service:
+            body, fds, close = build_request(self.source, "3min_ctr")
+            self.addCleanup(close)
+            never = mock.Mock(side_effect=AssertionError("a step ran"))
+            calls = {"n": 0}
+            real_write = executor._write_all
+
+            def exhausted(fd, data):
+                calls["n"] += 1
+                if calls["n"] > 1:                                       # the bed's snapshot: no room
+                    raise OSError(errno.ENOMEM, "no room")
+                real_write(fd, data)
+            with mock.patch.object(service, "run_step", never), mock.patch.object(executor, "_write_all", exhausted):
+                answer, received = send(service.socket_path, body, fds)
+            self.assertEqual((json.loads(answer)["code"], received), ("render_resource_limit", []))
+            with mock.patch.object(service, "run_step", never), mock.patch.object(executor, "MAX_INPUT_BYTES", 1024):
+                answer, received = send(service.socket_path, body, fds)
+            self.assertEqual((json.loads(answer)["code"], received), ("input_too_large", []))
+            # the service closed every descriptor it received and every partial snapshot
+            inputs = [str(layout_path(self.source)), str(layout_path(self.bed_row.media))]
+            self.assertTrue(_eventually(lambda: [_links(name) for name in inputs] == [[fds[0]], [fds[1]]], 10))
+            self.assertEqual(_links("/memfd:isadoraair-render"), [])
+            status = render_service.status_snapshot(service.socket_path)
+            self.assertEqual((status["active"], status["pending"]), (0, 0))
+            answer, received = send(service.socket_path, body, fds)          # the slot came back
+            self.assertEqual(json.loads(answer)["status"], "ok")
+            for fd in received:
+                os.close(fd)
+
+    def test_the_largest_single_input_snapshots_within_bounds(self):
+        """A PLATFORM_MAX_BYTES (512 MiB) input -- the largest one media may
+        be -- snapshots in one pass, sealed, and is gone once closed."""
+        from production import policy
+        size = policy.PLATFORM_MAX_BYTES
+        directory = Path(tempfile.mkdtemp(prefix="render-large-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "large"
+        with open(path, "wb") as handle:
+            handle.truncate(size)
+        digest, zeros = hashlib.sha256(), bytes(1024 * 1024)
+        for _ in range(size // len(zeros)):
+            digest.update(zeros)
+        read_only = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(_close_quietly, read_only)
+        entry = {"bytes": size, "sha256": digest.hexdigest()}
+        snapshot = executor.snapshot_input(read_only, entry, "source")
+        try:
+            self.assertTrue(executor.is_sealed(snapshot))
+            self.assertEqual(os.fstat(snapshot).st_size, size)
+        finally:
+            os.close(snapshot)
+        self.assertEqual(_links("/memfd:isadoraair-render"), [])
+        with self.assertRaises(render.RenderError) as raised:            # grown past its claim: refused
+            with open(path, "ab") as handle:
+                handle.write(b"x")
+            executor.snapshot_input(read_only, entry, "source")
+        self.assertEqual(raised.exception.code, "descriptor_mismatch")
+        self.assertEqual(_links("/memfd:isadoraair-render"), [])
 
 
 def layout_path(row):

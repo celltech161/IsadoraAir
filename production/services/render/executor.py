@@ -4,9 +4,15 @@ Runs inside isadoraair-render (production.services.render_service), never in
 the web process or a worker. It receives already-open, READ-ONLY descriptors
 for the source and each pinned reference (beds) and:
 
-1. proves every descriptor is a regular file, opened read-only, of the claimed
-   size, whose bytes hash to the claimed SHA-256 (a substituted descriptor is
-   refused before anything runs);
+1. SNAPSHOTS every input: proves the descriptor is a regular file opened
+   read-only of the claimed size, then copies its bytes into a service-owned
+   memfd IN THE SAME read pass that counts and hashes them, refuses unless
+   exactly the claimed size and SHA-256 were copied (a substituted descriptor
+   is refused before anything runs), and SEALS the memfd (no write, grow,
+   shrink or further seal change, ever). From then on the caller's descriptor
+   is no longer authoritative -- it is released (``release``) before the first
+   step and nothing reads it again: a read-only descriptor does not make its
+   inode immutable, the sealed snapshot does;
 2. resolves the recipe from the code registry (the version must be the
    registered one), validates the parameters against its schema, checks the
    pinned references are exactly the ones the plan uses, and refuses unless
@@ -15,17 +21,22 @@ for the source and each pinned reference (beds) and:
    ffmpeg invocation built here from the step library, through ``run_step``
    (in the service: confinement.execute in the render subtree with the
    socket-denying seccomp profile). Every input is a fresh read-only reopen of
-   a descriptor (``-fd N -i fd:``), every output a memfd created here
-   (``-fd N fd:``), and ``-protocol_whitelist fd`` refuses every other ffmpeg
+   a SEALED memfd -- an input snapshot or a finished, sealed intermediate --
+   (``-fd N -i fd:``; reopen_read_only refuses anything unsealed), every
+   output a memfd created here (``-fd N fd:``), and ``-protocol_whitelist fd`` refuses every other ffmpeg
    protocol (file:, http:, ...). The tool tree therefore needs, and has, no
    filesystem write authority at all;
 4. seals the FLAC memfd (no further write, grow or shrink, ever) and hashes it.
+
+Every snapshot and intermediate is closed as soon as its last step is done;
+nothing persists beyond the request.
 
 The caller owns the returned descriptor. Nothing here touches the database,
 the media store or any path a client chose.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import io
@@ -42,6 +53,9 @@ from .engine import RenderError, parse_loudnorm
 
 SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 _HASH_CHUNK = 1024 * 1024
+# The most input bytes (source + references) one render snapshots into memory.
+MAX_INPUT_BYTES = 1024 * 1024 * 1024
+_RESOURCE_ERRNOS = frozenset({errno.ENOMEM, errno.ENOSPC, errno.EFBIG, errno.EDQUOT})
 _DETAIL_LIMIT = 500
 
 
@@ -68,8 +82,25 @@ def fd_sha256(fd: int) -> str:
         offset += len(chunk)
 
 
-def verify_input(fd: int, entry: dict) -> None:
-    """A received descriptor must be exactly the claimed bytes, read-only."""
+def is_sealed(fd: int) -> bool:
+    try:
+        return fcntl.fcntl(fd, fcntl.F_GET_SEALS) & SEALS == SEALS
+    except OSError:
+        return False
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def snapshot_input(fd: int, entry: dict, name: str) -> int:
+    """An immutable, service-owned copy of EXACTLY the claimed bytes: a sealed
+    memfd, or RenderError. The copy, the byte count and the SHA-256 come from
+    ONE read pass over ``fd`` (never "hash, then copy later"), reading at most
+    one byte past the claimed size; a mutation of the caller's inode after
+    this returns cannot reach the snapshot."""
     try:
         info = os.fstat(fd)
         mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
@@ -77,12 +108,65 @@ def verify_input(fd: int, entry: dict) -> None:
         raise RenderError("descriptor_invalid", "a descriptor cannot be inspected") from None
     if not stat.S_ISREG(info.st_mode) or mode != os.O_RDONLY:
         raise RenderError("descriptor_invalid", "inputs are regular files opened read-only")
-    if info.st_size != entry["bytes"] or fd_sha256(fd) != entry["sha256"]:
+    expected = entry["bytes"]
+    if info.st_size != expected:
         raise RenderError("descriptor_mismatch", "a descriptor does not hold the claimed bytes")
+    snapshot = new_memfd(f"input-{name}")
+    try:
+        digest, copied = hashlib.sha256(), 0
+        while True:
+            chunk = os.pread(fd, min(_HASH_CHUNK, expected + 1 - copied), copied)
+            if not chunk:
+                break
+            digest.update(chunk)
+            _write_all(snapshot, chunk)
+            copied += len(chunk)
+            if copied > expected:
+                break
+        if copied != expected or digest.hexdigest() != entry["sha256"]:
+            raise RenderError("descriptor_mismatch", "a descriptor does not hold the claimed bytes")
+        fcntl.fcntl(snapshot, fcntl.F_ADD_SEALS, SEALS)
+        if os.fstat(snapshot).st_size != expected or not is_sealed(snapshot):
+            raise RenderError("render_failed", "an input snapshot could not be sealed", stage="snapshot")
+        sealed, snapshot = snapshot, None
+        return sealed
+    except OSError as exc:
+        if exc.errno in _RESOURCE_ERRNOS:
+            raise RenderError("render_resource_limit", "no room to snapshot an input", stage="snapshot") from None
+        raise RenderError("descriptor_invalid", "a descriptor cannot be read") from None
+    finally:
+        if snapshot is not None:
+            os.close(snapshot)
+
+
+def snapshot_inputs(request: dict, source_fd: int, reference_fds: dict) -> tuple[int, dict]:
+    """(source snapshot, {param: reference snapshot}) -- all sealed -- or
+    RenderError with nothing left open."""
+    total = request["source"]["bytes"] + sum(entry["bytes"] for entry in request["references"].values())
+    if total > MAX_INPUT_BYTES:
+        raise RenderError("input_too_large", "the inputs are larger than one render may hold", stage="snapshot")
+    taken = []
+    try:
+        source = snapshot_input(source_fd, request["source"], "source")
+        taken.append(source)
+        references = {}
+        for name in sorted(reference_fds):
+            references[name] = snapshot_input(reference_fds[name], request["references"][name], name)
+            taken.append(references[name])
+        taken = []
+        return source, references
+    finally:
+        for fd in taken:
+            os.close(fd)
 
 
 def reopen_read_only(fd: int) -> int:
-    """A fresh, read-only description of ``fd``'s file at offset 0."""
+    """A fresh, read-only description (its own offset 0) of a SEALED memfd --
+    an input snapshot or a finished intermediate. Anything else (a caller's
+    descriptor, an unsealed file) is refused: no step ever reads bytes that
+    can still change."""
+    if not is_sealed(fd):
+        raise RenderError("render_failed", "a step input is not a sealed snapshot", stage="snapshot")
     return os.open(f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_CLOEXEC)
 
 
@@ -139,23 +223,36 @@ def _status(result, stage):
 
 
 def execute(request: dict, source_fd: int, reference_fds: dict, *, run_step, ffmpeg: str, deadline: float,
-            max_seconds: Decimal) -> Rendered:
-    """Render one shape-checked request. ``reference_fds``: {param: fd}.
+            max_seconds: Decimal, release=None) -> Rendered:
+    """Render one shape-checked request. ``reference_fds``: {param: fd} (the
+    caller's descriptors; read ONCE, into sealed snapshots).
     ``run_step(argv, pass_fds, timeout_seconds) -> confinement result``.
-    ``deadline``: monotonic time by which everything must be done."""
+    ``deadline``: monotonic time by which everything must be done.
+    ``release()``: called once the snapshots are sealed, before the first
+    step -- the service closes the caller's descriptors there."""
     recipe, resolved, plan, pins, digest, document = plan_request(request)
     if request["source"]["duration_seconds"] > max_seconds:
         raise RenderError("source_too_long", "the source is longer than this service renders")
-    verify_input(source_fd, request["source"])
-    for name, fd in reference_fds.items():
-        verify_input(fd, request["references"][name])
-
+    source_snapshot, reference_snapshots = snapshot_inputs(request, source_fd, reference_fds)
+    held = {"source": source_snapshot, **{f"reference:{name}": fd for name, fd in reference_snapshots.items()}}
     opened = []
 
     def fresh_ro(fd):
         handle = reopen_read_only(fd)
         opened.append(handle)
         return handle
+
+    def drop(*names):
+        """Close what no later step reads (snapshots, finished intermediates)."""
+        for name in names:
+            fd = held.pop(name, None)
+            if fd is not None:
+                os.close(fd)
+        while opened:
+            os.close(opened.pop())
+
+    def seal(fd):
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, SEALS)
 
     def step(stage, argv, pass_fds):
         remaining = deadline - time.monotonic()
@@ -166,17 +263,23 @@ def execute(request: dict, source_fd: int, reference_fds: dict, *, run_step, ffm
         return result
 
     common = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-y", "-protocol_whitelist", "fd"]
-    voice = new_memfd("voice")
-    mixed = new_memfd("mix") if plan.bed is not None else None
-    output = new_memfd("rendition")
+    output = None
     try:
+        if release is not None:
+            release()                               # the caller's descriptors are no longer authoritative
+        held["voice"] = voice = new_memfd("voice")
+        if plan.bed is not None:
+            held["mix"] = mixed = new_memfd("mix")
+        output = new_memfd("rendition")
         # 1. the voice, 48 kHz stereo 16-bit
-        source = fresh_ro(source_fd)
+        source = fresh_ro(source_snapshot)
         argv = [*common, "-loglevel", "error", "-fd", str(source), "-i", "fd:", "-map", "0:a:0", "-vn", "-sn",
                 "-dn", "-ac", "2", "-ar", "48000"]
         if plan.voice:
             argv += ["-af", plan.voice_filter()]
         step("prepare", [*argv, "-c:a", "pcm_s16le", "-f", "wav", "-fd", str(voice), "fd:"], (source, voice))
+        drop("source")
+        seal(voice)
         voice_seconds = _wav_seconds(voice)
         if voice_seconds <= 0:
             raise RenderError("empty_voice", "no voice audio remained after preparation", stage="prepare")
@@ -188,13 +291,15 @@ def execute(request: dict, source_fd: int, reference_fds: dict, *, run_step, ffm
             bed_seconds = float(request["references"][plan.bed.reference_param]["duration_seconds"])
             graph = plan.bed.filter_complex(voice_end=voice_seconds + delay, bed_duration=bed_seconds,
                                             delay=plan.delay)
-            bed, voice_in = fresh_ro(reference_fds[plan.bed.reference_param]), fresh_ro(voice)
+            bed, voice_in = fresh_ro(held[f"reference:{plan.bed.reference_param}"]), fresh_ro(voice)
             argv = [*common, "-loglevel", "error"]
             if plan.bed.loops:
                 argv += ["-stream_loop", "-1"]
             argv += ["-fd", str(bed), "-i", "fd:", "-fd", str(voice_in), "-i", "fd:", "-filter_complex", graph,
                      "-map", "[mix]", "-c:a", "pcm_s16le", "-f", "wav", "-fd", str(mixed), "fd:"]
             step("mix", argv, (bed, voice_in, mixed))
+            drop(f"reference:{plan.bed.reference_param}", "voice")
+            seal(mixed)
             master = mixed
 
         # 3. two-pass loudness normalization + FLAC
@@ -215,8 +320,12 @@ def execute(request: dict, source_fd: int, reference_fds: dict, *, run_step, ffm
                             recipe_version=recipe.version)
         output = None                                    # ownership passes to the caller
         return rendered
+    except OSError as exc:
+        if exc.errno in _RESOURCE_ERRNOS:
+            raise RenderError("render_resource_limit", "no room for a render intermediate") from None
+        raise
     finally:
-        for fd in (*opened, voice, mixed, output):
+        for fd in (*opened, *held.values(), output):
             if fd is not None:
                 try:
                     os.close(fd)
