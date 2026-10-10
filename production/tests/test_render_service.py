@@ -32,19 +32,23 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+import uuid
+from contextlib import ExitStack, contextmanager
+from datetime import datetime
+from datetime import timezone as dt_timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
-from django.db import transaction
-from django.db.models import QuerySet
+from django.db import IntegrityError, transaction
 from django.db.models.signals import pre_save
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
-from production.errors import ImmutableMediaError
+from production import models as models_mod
+from production.errors import ImmutableMediaError, IntakeError, MediaNotValidated
 from production.models import ProductionMedia, rendition_authority
 from production.services import (
-    confinement, intake, reference_audio, render, render_health, render_service, validation,
+    confinement, intake, reference_audio, render, render_health, render_service, retention, validation,
 )
 from production.services.render import client, executor, protocol, provenance, rendition
 from spoken.tests import support as audio
@@ -895,65 +899,237 @@ class ClientTests(MediaFixtures, TestCase):
 
 # -- rendition authority -----------------------------------------------------------------
 
-@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
-class RenditionAuthorityTests(MediaFixtures, TestCase):
-    def columns(self, **overrides):
-        values = dict(kind=ProductionMedia.KIND_RENDITION, storage_key="ab/" + "c" * 32, sha256="d" * 64,
-                      byte_size=10, derived_from=self.source, recipe_key="lcl_psa", recipe_version=1,
-                      recipe_params_digest="e" * 64, toolchain=f"x; {protocol.EXECUTOR_MARKER}",
-                      validation_state="unvalidated")
+FORGED_AT = datetime(2001, 1, 1, tzinfo=dt_timezone.utc)
+# One forged value per concrete column (each, alone, as a tampering layer below
+# the model would write it). None: the forged value is computed per test.
+FORGERIES = {
+    "id": None, "kind": "edit", "owner_id": None, "owner_username": "forged", "storage_key": None,
+    "sha256": "f" * 64, "byte_size": 11, "original_filename": "forged.flac", "declared_content_type": "audio/flac",
+    "derived_from_id": None, "recipe_key": "forged", "recipe_version": 2, "recipe_params_digest": "1" * 64,
+    "toolchain": "forged", "container": "flac", "codec": "flac", "sample_rate": 44100, "channels": 1,
+    "decoded_duration_seconds": Decimal("9.5"), "header_duration_seconds": Decimal("9.5"), "probe": {"forged": 1},
+    "validation_state": "valid", "validation_code": "ok", "validated_at": FORGED_AT, "retention_state": "purged",
+    "purged_at": FORGED_AT, "created_at": FORGED_AT,
+}
+# The Codex attack: a valid verdict with its facts, forged together (the
+# database constraints accept the combination; only the authority refuses it).
+CODEX_FORGERY = {"validation_state": "valid", "validated_at": FORGED_AT, "container": "flac", "codec": "flac",
+                 "sample_rate": 44100, "channels": 1, "decoded_duration_seconds": Decimal("9.5"), "byte_size": 11}
+
+
+def _field(attname):
+    return next(field for field in ProductionMedia._meta.concrete_fields if field.attname == attname)
+
+
+@contextmanager
+def _tampering(values):
+    """Change columns BELOW the model -- in the insert compiler, after the
+    authority's checks and with no signal involved (Field.pre_save)."""
+    with ExitStack() as stack:
+        for attname, value in values.items():
+            stack.enter_context(mock.patch.object(_field(attname), "pre_save", return_value=value))
+        yield
+
+
+class RenditionRows(MediaFixtures):
+    def row(self, **overrides):
+        media_id = uuid.uuid4()
+        values = {"id": media_id, "kind": ProductionMedia.KIND_RENDITION, "owner_id": None, "owner_username": "",
+                  "storage_key": f"{media_id.hex[:2]}/{media_id.hex}", "sha256": "d" * 64, "byte_size": 10,
+                  "original_filename": "", "declared_content_type": "", "derived_from_id": self.source.pk,
+                  "recipe_key": "lcl_psa", "recipe_version": 1, "recipe_params_digest": "e" * 64,
+                  "toolchain": f"x; {protocol.EXECUTOR_MARKER}"}
         values.update(overrides)
         return values
 
-    def authority(self, **overrides):
-        values = dict(derived_from_id=self.source.pk, recipe_key="lcl_psa", recipe_version=1,
-                      recipe_params_digest="e" * 64, toolchain=f"x; {protocol.EXECUTOR_MARKER}", sha256="d" * 64)
-        values.update(overrides)
-        return rendition_authority(**values)
+    def renditions(self):
+        return ProductionMedia.objects.filter(kind=ProductionMedia.KIND_RENDITION)
+
+    def forged(self, attname, row):
+        if attname == "id":
+            return uuid.uuid4()
+        if attname == "storage_key":
+            other = uuid.uuid4().hex
+            return f"{other[:2]}/{other}"
+        if attname == "derived_from_id":
+            return ingest(audio.voice(1.2)).pk
+        if attname == "owner_id":
+            from django.contrib.auth import get_user_model
+            return get_user_model().objects.create_user(f"forger-{uuid.uuid4().hex[:8]}").pk
+        return FORGERIES[attname]
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class RenditionAuthorityTests(RenditionRows, TestCase):
+    def test_every_column_is_classified_and_the_authority_binds_them_all(self):
+        concrete = {field.attname for field in ProductionMedia._meta.concrete_fields}
+        bound, initial = models_mod.RENDITION_BOUND_FIELDS, set(models_mod.RENDITION_INITIAL_VALUES)
+        generated = models_mod.RENDITION_GENERATED_FIELDS
+        self.assertEqual(bound | initial | generated, concrete)
+        self.assertFalse(bound & initial or bound & generated or initial & generated)
+        self.assertEqual(set(FORGERIES), concrete)                  # every column is attacked below
+        self.assertEqual(generated, {"created_at"})
+        self.assertEqual(models_mod.RENDITION_INITIAL_VALUES, {
+            "container": "", "codec": "", "sample_rate": None, "channels": None, "decoded_duration_seconds": None,
+            "header_duration_seconds": None, "probe": {}, "validation_state": "unvalidated", "validation_code": "",
+            "validated_at": None, "retention_state": "present", "purged_at": None})
+        with transaction.atomic(), rendition_authority(self.row()) as grant:
+            self.assertEqual(set(grant.expected) | generated, concrete)       # the complete expected row
 
     def test_ordinary_orm_code_cannot_create_a_rendition(self):
+        columns = {name.removesuffix("_id") if name in ("owner_id", "derived_from_id") else name: value
+                   for name, value in self.row().items()}
+        columns["derived_from"] = self.source
+        columns.pop("owner")
         before = ProductionMedia.objects.count()
         attempts = {
-            "objects.create": lambda: ProductionMedia.objects.create(**self.columns()),
-            "save": lambda: ProductionMedia(**self.columns()).save(),
-            "bulk_create": lambda: ProductionMedia.objects.bulk_create([ProductionMedia(**self.columns())]),
+            "objects.create": lambda: ProductionMedia.objects.create(**columns),
+            "save": lambda: ProductionMedia(**columns).save(),
+            "bulk_create": lambda: ProductionMedia.objects.bulk_create([ProductionMedia(**columns)]),
             "base manager bulk_create": lambda: ProductionMedia._base_manager.bulk_create(
-                [ProductionMedia(**self.columns())]),
+                [ProductionMedia(**columns)]),
             "reverse manager": lambda: self.source.derivatives.create(**{
-                k: v for k, v in self.columns().items() if k != "derived_from"}),
+                k: v for k, v in columns.items() if k != "derived_from"}),
         }
         for label, attempt in attempts.items():
             with self.subTest(path=label), self.assertRaises(ImmutableMediaError) as raised, transaction.atomic():
                 attempt()
             self.assertEqual(raised.exception.code, "rendition_authority")
+            # ...not even inside an open, matching authority: only insert_rendition inserts
+            with self.subTest(path=f"{label} under an authority"), self.assertRaises(ImmutableMediaError), \
+                    transaction.atomic(), rendition_authority(self.row(**{"id": columns["id"]})):
+                attempt()
+        for label, ingest_call in {
+            "ingest_stream": lambda: intake.ingest_stream(io.BytesIO(audio.voice(1.0)), kind="rendition",
+                                                          derived_from=self.source, validate=False),
+            "ingest_derivative": lambda: intake.ingest_derivative(self.source, io.BytesIO(audio.voice(1.0)),
+                                                                  kind="rendition", validate=False),
+        }.items():
+            with self.subTest(path=label), self.assertRaises(IntakeError) as raised:
+                ingest_call()
+            self.assertEqual(raised.exception.code, "rendition_authority")
         self.assertEqual(ProductionMedia.objects.count(), before)
 
-    def test_the_authority_admits_exactly_one_matching_row(self):
-        for label, overrides in {"other sha": {"sha256": "f" * 64}, "other digest": {"recipe_params_digest": "1" * 64},
-                                 "other parent": {"derived_from": ingest(audio.voice(1.2))},
-                                 "other toolchain": {"toolchain": "forged"}, "other version": {"recipe_version": 2}}.items():
-            with self.subTest(case=label), self.authority(), self.assertRaises(ImmutableMediaError), \
-                    transaction.atomic():
-                ProductionMedia.objects.create(**self.columns(**overrides))
-        with self.authority(), transaction.atomic():
-            ProductionMedia.objects.create(**self.columns())
-            with self.assertRaises(ImmutableMediaError), transaction.atomic():         # single use
-                ProductionMedia.objects.create(**self.columns(storage_key="ab/" + "9" * 32))
-        with self.authority(), self.assertRaises(ImmutableMediaError):
-            with self.authority():                                                # no nesting
+    def test_the_authority_names_exactly_the_complete_row_once(self):
+        row = self.row()
+        for label, variant in {"a bound column missing": {k: v for k, v in row.items() if k != "byte_size"},
+                               "a validation fact pre-set": {**row, "validation_state": "valid"},
+                               "codec pre-set": {**row, "codec": "flac"},
+                               "not a rendition": {**row, "kind": "edit"},
+                               "no parent": {**row, "derived_from_id": None}}.items():
+            with self.subTest(case=label), self.assertRaises(ImmutableMediaError), transaction.atomic(), \
+                    rendition_authority(variant):
                 pass
+        with transaction.atomic(), rendition_authority(row):
+            stored = models_mod.insert_rendition()
+            with self.assertRaises(ImmutableMediaError):
+                models_mod.insert_rendition()                             # single use
+            with self.assertRaises(ImmutableMediaError), rendition_authority(self.row()):
+                pass                                                      # no nesting
+        with self.assertRaises(ImmutableMediaError), transaction.atomic():
+            models_mod.insert_rendition()                                 # closed
+        values = ProductionMedia.objects.filter(pk=stored.pk).values().get()
+        self.assertEqual({k: values[k] for k in row}, row)
+        self.assertEqual({k: values[k] for k in models_mod.RENDITION_INITIAL_VALUES},
+                         models_mod.RENDITION_INITIAL_VALUES)
 
-    def test_a_pre_save_receiver_cannot_alter_the_authorized_rendition(self):
+    def test_each_column_changed_alone_below_the_model_is_refused_and_rolled_back(self):
+        """One forged column at a time, so no obvious mismatch can mask a
+        column the verification would miss. A few forgeries the database
+        constraints already refuse on their own (a verdict state or timestamp
+        without the rest, a purge without its time); every other one reaches
+        -- and is refused by -- the complete read-back."""
+        caught_by_database = set()
+        for attname in sorted(FORGERIES):
+            row = self.row()
+            forged = self.forged(attname, row)
+            with self.subTest(column=attname):
+                with self.assertRaises((ImmutableMediaError, IntegrityError)) as raised, transaction.atomic(), \
+                        rendition_authority(row), _tampering({attname: forged}):
+                    models_mod.insert_rendition()
+                if isinstance(raised.exception, IntegrityError):
+                    caught_by_database.add(attname)
+                else:
+                    self.assertEqual(raised.exception.code, "rendition_authority")
+                    if attname != "id":                               # a forged id: "not inserted"
+                        self.assertIn(attname, str(raised.exception))
+                self.assertFalse(self.renditions().exists())
+        self.assertEqual(caught_by_database, {"validation_state", "validated_at", "retention_state", "purged_at"})
+
+    def test_the_codex_verdict_forgery_below_the_model_is_refused(self):
+        row = self.row()
+        with self.assertRaises(ImmutableMediaError) as raised, transaction.atomic(), rendition_authority(row), \
+                _tampering(CODEX_FORGERY):
+            models_mod.insert_rendition()
+        for attname in CODEX_FORGERY:
+            self.assertIn(attname, str(raised.exception))
+        self.assertFalse(self.renditions().exists())
+
+    def test_a_pre_save_receiver_never_sees_or_changes_a_rendition(self):
+        """The Codex attack at the signal layer, during a legitimate
+        ExecutorOutput ingestion: a receiver keeps every executor-bound column
+        and forges the verdict and facts. The exact insert emits no signal,
+        so the receiver never runs for the rendition; what is stored is the
+        validator's verdict and nothing forged."""
+        seen = []
+
         def receiver(sender, instance, **kwargs):
-            if sender is ProductionMedia:
-                instance.recipe_params_digest = "0" * 64
+            if sender is ProductionMedia and instance.kind == ProductionMedia.KIND_RENDITION:
+                seen.append(instance.pk)
+                for attname, value in CODEX_FORGERY.items():
+                    setattr(instance, attname, value)
         pre_save.connect(receiver, weak=False)
-        try:
-            with self.authority(), self.assertRaises(ImmutableMediaError), transaction.atomic():
-                ProductionMedia.objects.create(**self.columns())
-        finally:
-            pre_save.disconnect(receiver)
-        self.assertFalse(ProductionMedia.objects.filter(kind=ProductionMedia.KIND_RENDITION).exists())
+        self.addCleanup(pre_save.disconnect, receiver)
+        result = rendition.ingest(client.request_render(self.source, "lcl_psa"), self.source)
+        media = ProductionMedia.objects.get(pk=result.media.pk)
+        self.assertEqual(seen, [])
+        self.assertEqual((media.validation_state, media.container, media.codec, media.sample_rate, media.channels),
+                         ("valid", "flac", "flac", 48000, 2))
+        self.assertNotEqual(media.validated_at, FORGED_AT)
+        self.assertEqual(media.byte_size, layout_path(media).stat().st_size)
+        self.assertNotEqual(media.decoded_duration_seconds, Decimal("9.5"))
+        with mock.patch.object(validation, "_analyze_path", return_value=validation.ValidationOutcome(
+                validation.STATUS_INFRASTRUCTURE, "validation_unavailable", {})):
+            with self.assertRaises(render.RenderError) as raised:
+                rendition.ingest(client.request_render(self.source, "lcl_psa"), self.source)
+        orphan = ProductionMedia.objects.get(pk=raised.exception.media.pk)
+        self.assertEqual(seen, [])
+        self.assertEqual((orphan.validation_state, orphan.validated_at, orphan.codec, orphan.sample_rate),
+                         ("unvalidated", None, "", None))
+
+    def test_tampering_during_real_ingestion_rolls_everything_back(self):
+        output = client.request_render(self.source, "lcl_psa")
+        media_files = self.list_files("media")
+        with _tampering({"codec": "forged"}), self.assertRaises(render.RenderError) as raised:
+            rendition.ingest(output, self.source)
+        self.assertEqual(raised.exception.code, "rendition_authority")
+        self.assertFalse(self.renditions().exists())                    # no partial row
+        self.assertEqual(self.list_files("media"), media_files)         # its stored bytes removed
+        self.assertEqual(self.list_files("incoming"), [])
+        with self.assertRaises(OSError):
+            os.fstat(output.fd)                                          # the output descriptor is closed
+        with self.assertRaises(render.RenderError) as raised:
+            rendition.ingest(output, self.source)                        # and can never be used again
+        self.assertEqual(raised.exception.code, "rendition_authority")
+        fresh = rendition.ingest(client.request_render(self.source, "lcl_psa"), self.source)
+        self.assertEqual(fresh.media.validation_state, "valid")         # a fresh render succeeds
+
+    def test_a_validator_down_orphan_stays_unvalidated_and_unbindable(self):
+        unavailable = validation.ValidationOutcome(validation.STATUS_INFRASTRUCTURE, "validation_unavailable", {})
+        with mock.patch.object(validation, "_analyze_path", return_value=unavailable):
+            with self.assertRaises(render.RenderError) as raised:
+                rendition.ingest(client.request_render(self.source, "lcl_psa"), self.source)
+        self.assertEqual((raised.exception.code, raised.exception.retryable), ("rendition_unvalidated", True))
+        orphan = ProductionMedia.objects.filter(pk=raised.exception.media.pk).values().get()
+        self.assertEqual({k: orphan[k] for k in models_mod.RENDITION_INITIAL_VALUES},
+                         {**models_mod.RENDITION_INITIAL_VALUES, "validation_code": "validation_unavailable"})
+        with transaction.atomic(), self.assertRaises(MediaNotValidated):
+            retention.lock_for_binding(orphan["id"])                     # nothing can bind it
+        outcome = validation.validate_media(orphan["id"])                  # the ordinary pipeline, later
+        judged = ProductionMedia.objects.get(pk=orphan["id"])
+        self.assertEqual((outcome.status, judged.validation_state, judged.codec, judged.sample_rate),
+                         ("valid", "valid", "flac", 48000))
+        self.assertEqual((judged.sha256, judged.recipe_params_digest), (orphan["sha256"], orphan["recipe_params_digest"]))
 
     def test_only_issued_single_use_outputs_for_their_own_source_become_renditions(self):
         forged = client.ExecutorOutput(fd=executor.new_memfd("forged"), request_id="ab" * 16,
@@ -972,7 +1148,7 @@ class RenditionAuthorityTests(MediaFixtures, TestCase):
         with self.assertRaises(render.RenderError) as raised:
             rendition.ingest(output, self.source)                      # already used
         self.assertEqual(raised.exception.code, "rendition_authority")
-        self.assertFalse(ProductionMedia.objects.filter(kind=ProductionMedia.KIND_RENDITION).exists())
+        self.assertFalse(self.renditions().exists())
 
     def test_the_real_chain_keeps_descriptor_continuity_and_records_the_executor(self):
         output = client.request_render(self.source, "3min_ctr")
@@ -985,6 +1161,41 @@ class RenditionAuthorityTests(MediaFixtures, TestCase):
         self.assertTrue(media.toolchain.endswith(protocol.EXECUTOR_MARKER))
         self.assertEqual(media.recipe_params_digest, result.evidence.provenance_digest)
         self.assertFalse(client.issued(output))                        # consumed: single use
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class RenditionTransactionTests(RenditionRows, TransactionTestCase):
+    """The authority exists only inside the transaction block that consumes
+    it (real transactions: no test-case wrapper)."""
+
+    def test_the_authority_is_bound_to_its_insertion_transaction(self):
+        with self.assertRaises(ImmutableMediaError):
+            with rendition_authority(self.row()):                        # outside any transaction
+                pass
+        row = self.row()
+        with transaction.atomic():                                       # opened in one transaction...
+            opened = rendition_authority(row)
+            opened.__enter__()
+        try:
+            with self.assertRaises(ImmutableMediaError), transaction.atomic():
+                models_mod.insert_rendition()                            # ...consumed in another
+        finally:
+            opened.__exit__(None, None, None)
+        with transaction.atomic(), rendition_authority(self.row()):
+            with self.assertRaises(ImmutableMediaError), transaction.atomic():
+                models_mod.insert_rendition()                            # a nested block is not its block
+        with transaction.atomic():
+            leaked = rendition_authority(self.row())
+            leaked.__enter__()
+        try:
+            with self.assertRaises(ImmutableMediaError):
+                models_mod.insert_rendition()                            # left open past its transaction
+        finally:
+            leaked.__exit__(None, None, None)
+        self.assertFalse(self.renditions().exists())
+        with transaction.atomic(), rendition_authority(self.row()):
+            models_mod.insert_rendition()                                # the one legitimate shape
+        self.assertEqual(self.renditions().count(), 1)
 
 
 # -- independence from the validation service; Monitoring ------------------------------------

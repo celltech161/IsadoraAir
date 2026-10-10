@@ -7,6 +7,7 @@ lease left alone, two workers never on one item, and an end-to-end render
 through the real service.
 """
 import io
+import os
 import threading
 import unittest
 from datetime import timedelta
@@ -196,3 +197,94 @@ class EndToEndWorkerTests(IsolatedMediaRootMixin, Fixtures):
         self.assertEqual(SpokenItemEvent.objects.filter(item=item, event="processed").get().detail["evidence"]
                          ["provenance_digest"], rendition.recipe_params_digest)
         self.assertIsNone(worker.process_one(sleep=lambda seconds: None))     # nothing left
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class CombinedBoundaryTests(IsolatedMediaRootMixin, Fixtures):
+    """C2A corrective: claim -> sealed input snapshots -> render -> the exact
+    UNVALIDATED rendition row -> its verdict -> completion under a FRESH
+    lease; then each boundary broken on its own -- the source rewritten after
+    its snapshot, a rendition column tampered with below the model, the lease
+    expiring before completion, the validator down -- without weakening the
+    others."""
+
+    def setUp(self):
+        super().setUp()
+        voice = intake.ingest_stream(io.BytesIO(audio.voice(1.0)), kind=ProductionMedia.KIND_RECORDING,
+                                     validate=True).media
+        self.voice = voice
+        self.item_ = transitions.record_validation(transitions.submit(self.item(), voice, actor=self.owner))
+        self.addCleanup(mock.patch.stopall)
+
+    def renditions(self):
+        return ProductionMedia.objects.filter(kind=ProductionMedia.KIND_RENDITION)
+
+    def test_the_whole_chain_with_every_boundary_intact(self):
+        outcome = worker.process_one(sleep=lambda seconds: None)
+        self.assertEqual(outcome.result, "processed", outcome)
+        item = SpokenItem.objects.get(pk=self.item_.pk)
+        rendition = item.rendition_media
+        self.assertEqual((rendition.validation_state, rendition.codec, rendition.sample_rate, rendition.channels),
+                         ("valid", "flac", 48000, 2))
+        self.assertEqual((item.state, item.lease_token), (S.PROCESSED, None))
+
+    def test_a_source_rewritten_after_its_snapshot_changes_nothing(self):
+        from production.services.render import client
+        from production.tests.test_render_service import FFMPEG, in_process_render_service, layout_path
+        with in_process_render_service(self, ffmpeg=FFMPEG) as service:
+            baseline = client.request_render(self.voice, "lcl_psa")
+            expected_sha = baseline.sha256
+            baseline.close()
+            path = layout_path(self.voice)
+            real_step, rewritten = service.run_step, []
+
+            def first_step_rewrites_the_source(argv, pass_fds, timeout, cancelled=None):
+                if not rewritten:
+                    os.chmod(path, 0o600)
+                    data = path.read_bytes()
+                    with open(path, "r+b") as handle:                     # same inode, same size, silence
+                        handle.write(data[:44] + bytes(len(data) - 44))
+                    rewritten.append(True)
+                return real_step(argv, pass_fds, timeout, cancelled)
+            with mock.patch.object(service, "run_step", first_step_rewrites_the_source):
+                outcome = worker.process_one(sleep=lambda seconds: None)
+        self.assertEqual((outcome.result, rewritten), ("processed", [True]), outcome)
+        self.assertEqual(SpokenItem.objects.get(pk=self.item_.pk).rendition_media.sha256, expected_sha)
+
+    def test_a_rendition_column_tampered_below_the_model_stores_nothing(self):
+        from production.tests.test_render_service import _tampering
+        with _tampering({"codec": "forged"}):
+            outcome = worker.process_one(sleep=lambda seconds: None)
+        self.assertEqual((outcome.result, outcome.code), ("failed", "rendition_authority"))
+        self.assertFalse(self.renditions().exists())
+        self.assertEqual(SpokenItem.objects.get(pk=self.item_.pk).state, S.FAILED)
+
+    def test_a_lease_expiring_before_completion_binds_nothing(self):
+        def render_then_expire(*args, **kwargs):
+            result = render.render(*args, **kwargs)
+            moment = SpokenItem.objects.get(pk=self.item_.pk).lease_expires_at + timedelta(seconds=1)
+            mock.patch("django.utils.timezone.now", return_value=moment).start()
+            return result
+        outcome = worker.process_one(render_fn=render_then_expire, sleep=lambda seconds: None)
+        self.assertEqual((outcome.result, outcome.code), ("lost_lease", "lease_expired"))
+        item = SpokenItem.objects.get(pk=self.item_.pk)
+        self.assertEqual((item.state, item.rendition_media_id), (S.PROCESSING, None))
+        self.assertEqual(self.renditions().get().validation_state, "valid")     # an unbound, valid orphan
+
+    def test_a_validator_down_orphan_cannot_complete_until_validated(self):
+        from production.services import validation
+        item, token = transitions.start_processing(self.item_, lease_seconds=600)
+        unavailable = validation.ValidationOutcome(validation.STATUS_INFRASTRUCTURE, "validation_unavailable", {})
+        with mock.patch.object(validation, "_analyze_path", return_value=unavailable), \
+                self.assertRaises(render.RenderError) as raised:
+            render.render(self.voice, self.ctype.recipe_key, self.ctype.recipe_params, item=item.pk, lease=token)
+        orphan = ProductionMedia.objects.get(pk=raised.exception.media.pk)
+        self.assertEqual((orphan.validation_state, orphan.validated_at, orphan.codec, orphan.sample_rate,
+                          orphan.channels, orphan.decoded_duration_seconds), ("unvalidated", None, "", None, None, None))
+        with self.assertRaises(transitions.EvidenceRefused) as refused:
+            self.complete(item, token, orphan)
+        self.assertEqual(refused.exception.code, "media_unusable")
+        self.assertEqual(SpokenItem.objects.get(pk=item.pk).state, S.PROCESSING)
+        validation.validate_media(orphan)                                # the ordinary pipeline, later
+        done = self.complete(item, token, ProductionMedia.objects.get(pk=orphan.pk))
+        self.assertEqual((done.state, done.rendition_media_id), (S.PROCESSED, orphan.pk))

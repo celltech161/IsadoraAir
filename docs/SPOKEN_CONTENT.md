@@ -55,8 +55,8 @@ state and timestamps, append the `SpokenItemEvent` — all in one transaction.
 | submitted → validated / invalid | system | the submission's own validation verdict and the type's duration bounds |
 | validated → processing | worker | a fresh lease (30 s – 1 h); attempts counted |
 | processing → processing | worker | reclaim only after the lease **expired** (new token) |
-| processing → processed | worker | the current lease token; `RenderEvidence` whose rendition is EXACTLY the render the type authorizes now (see *Render completion*); bound |
-| processing → failed | worker | the current lease token; failure code/detail |
+| processing → processed | worker | the current, unexpired lease token; `RenderEvidence` whose rendition is EXACTLY the render the type authorizes now (see *Render completion*); bound |
+| processing → failed | worker | the current, unexpired lease token; failure code/detail |
 | failed → validated | manager | retry |
 | processed → awaiting_review | system | only if the type requires review |
 | awaiting_review → rejected | manager | review note |
@@ -225,7 +225,7 @@ order, the content type (the row configuration saves lock), the item, the
 rendition (`lock_for_binding`) and each reference key (shared advisory lock),
 then requires:
 
-* the caller holds the current lease;
+* the caller holds the current, **unexpired** lease;
 * the rendition is a valid `rendition` derived from this item's submission;
 * its **stored** recipe key, version and provenance digest equal the
   evidence's (a forged or swapped claim → `rendition_mismatch`);
@@ -319,16 +319,35 @@ loop without reading the request. A slot is released on success, failure,
 timeout and client disconnect (closing the connection cancels the render);
 a failed step or a malformed request never affects the next one.
 
-**Sole rendition authority**: a `rendition` row can be inserted only inside
-`production.models.rendition_authority`, which `render/rendition.py` opens
-naming the exact row (parent, recipe key/version, digest, executor
-toolchain, output SHA-256) for an `ExecutorOutput` the client issued (identity
-sealed, single use). `ProductionMedia.save()` refuses any other rendition
-insert — and re-reads the row afterwards, so a `pre_save` receiver cannot
-alter it; `bulk_create` refuses renditions; generic intake refuses
-`kind=rendition` before staging a byte. Completion additionally requires the
-executor's identity in the rendition's toolchain. Raw SQL is outside the
-boundary.
+**Sole rendition authority**: a `rendition` row is inserted only by
+`render/rendition.py`, for an `ExecutorOutput` the client issued (identity
+sealed, single use, rendered from this source, carrying the executor's
+identity and SHA-256), and only as **one complete, exact row**. Every concrete
+`ProductionMedia` column is classified (`production.models.RENDITION_*`;
+a test fails if a new column is not): *bound* — id, kind, custody, storage
+key, SHA-256, size, display metadata, parent, recipe key/version, provenance
+digest, toolchain — each derived from intake and checked against the executor
+output; *initial* — every validation fact (`validation_state=unvalidated`,
+`validation_code=""`, `validated_at`, container, codec, sample rate, channels,
+decoded/header duration, probe) and retention (`present`, no `purged_at`) at
+its canonical unset value; *generated* — `created_at`, which must be an aware
+time taken while the authority was open. Inside intake's insertion
+transaction (after the parent's binding lock) `rendition_authority(row)` is
+opened — refused outside a transaction, and consumable only in the very
+transaction block that opened it — and `insert_rendition()` writes exactly
+that row with a plain insert that emits **no model signals** (no `pre_save`
+receiver can see or widen it), then re-reads and compares **every column**;
+any difference refuses, the transaction rolls back and the stored bytes are
+removed (the output stays consumed). The authority is not a validation
+authority: the validation service's verdict is recorded afterwards by the
+ordinary one-time `production.transitions.record_verdict` (an invalid
+rendition is refused before anything is stored), or — validator down — only
+its infrastructure code, leaving an immutable, unvalidated, unbindable orphan
+until `validate_media()` judges it. `ProductionMedia.save()`, `create()`,
+reverse managers and every `bulk_create` refuse renditions outright, even
+inside an open authority; generic intake refuses `kind=rendition` before
+staging a byte. Completion additionally requires the executor's identity in
+the rendition's toolchain. Raw SQL is outside the boundary.
 
 **Worker** (`spoken/worker.py`; `manage.py spoken_render_worker [--once]`;
 `deploy/isadoraair-spoken-render-worker.service`): claims a validated item (or
@@ -338,7 +357,17 @@ fails. Transient failures (busy, service/sandbox unavailable, timeout, an
 unvalidated rendition) retry twice within the lease (2 s, 10 s); one
 `render_outdated` re-renders against the current configuration; deterministic
 failures fail at once; more than 3 claims fail `attempts_exhausted`; a lease
-lost to expiry is left to its new holder. Operator-attention conditions emit a
+lost to expiry is left to its new holder. An **expired lease authorizes
+nothing**, even before another worker reclaims it: completion and failure
+require, under the item lock at one server `now`, a lease, the caller's
+token and `lease_expires_at > now` (`== now` is expired; `lease_expired`,
+distinct from a replaced token's `stale_lease`). Each render's deadline ends
+10 minutes before the lease does (`min(lease remaining − 600 s, 120 s + 6 ×
+duration)`), a retry that no longer fits is not started, and a worker whose
+lease expired abandons the item to the next claim. There is no lease renewal:
+with the 1-hour lease a render gets at most 50 minutes, which covers every
+source up to ~8 minutes at the service's `120 s + 6 × duration` budget and far
+longer real renders (they run at many times real time). Operator-attention conditions emit a
 `spoken_render` SystemEvent; SpokenItemEvent stays the history. Nothing renders
 in the web request path.
 

@@ -56,7 +56,7 @@ from django.utils import timezone
 
 from .. import policy as policy_mod
 from ..errors import IntakeError, MediaNotValidated, MediaPurged, MediaRejected
-from ..models import ProductionMedia, rendition_authorized
+from ..models import ProductionMedia
 from . import layout, retention, validation
 
 CHUNK_SIZE = 1024 * 1024
@@ -164,12 +164,13 @@ def _promote(part: Path, destination: Path) -> None:
         raise IntakeError("could not finalize the upload", code="promotion_failed") from exc
 
 
-def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params):
+def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params, *, rendition_insert=None):
     if kind not in dict(ProductionMedia.KIND_CHOICES):
         raise IntakeError("unknown media kind", code="invalid_kind")
-    if kind == ProductionMedia.KIND_RENDITION and not rendition_authorized():
+    if (kind == ProductionMedia.KIND_RENDITION) != (rendition_insert is not None):
         # Before a byte is staged: only the render executor's intake
-        # (production.services.render.rendition) creates renditions.
+        # (production.services.render.rendition, with its exact-row insert)
+        # creates renditions; generic intake never does.
         raise IntakeError("renditions are created only by the render executor's intake", code="rendition_authority")
     if owner is not None and getattr(owner, "pk", None) is None:
         raise IntakeError("owner must be a saved user or None", code="invalid_owner")
@@ -209,12 +210,37 @@ def ingest_stream(
       and validate_media() can be called later.
     * An infrastructure failure during validation never rejects the media: it
       is stored ``unvalidated`` and the returned outcome says why.
+    * ``kind="rendition"`` is refused: renditions come only from the render
+      executor's intake (production.services.render.rendition).
     """
+    return _ingest(source, kind=kind, owner=owner, original_filename=original_filename,
+                   declared_content_type=declared_content_type, policy=policy, validate=validate,
+                   retain_invalid=retain_invalid, derived_from=derived_from, recipe_key=recipe_key,
+                   recipe_version=recipe_version, recipe_params=recipe_params, toolchain=toolchain)
+
+
+def _insert_generic(columns, outcome) -> ProductionMedia:
+    if outcome is not None:
+        if outcome.status in (validation.STATUS_VALID, validation.STATUS_INVALID):
+            columns.update(validation.verdict_columns(outcome, timezone.now()))
+        else:
+            columns["validation_code"] = outcome.code
+    return ProductionMedia.objects.create(**columns)
+
+
+def _ingest(source, *, kind, owner=None, original_filename="", declared_content_type="", policy=None,
+            validate=True, retain_invalid=False, derived_from=None, recipe_key="", recipe_version=None,
+            recipe_params=None, toolchain="", rendition_insert=None) -> IngestResult:
+    """ingest_stream's body. ``rendition_insert(columns, outcome) -> media`` is
+    given only by the rendition intake: it inserts the row (from ``columns``,
+    with every validation fact unset) inside THIS function's insertion
+    transaction, after the parent is locked."""
     media_policy = policy if policy is not None else policy_mod.DEFAULT_POLICY
     recipe_digest = ""
     if recipe_params is not None:
         recipe_digest = digest_recipe_params(recipe_params)
-    parent = _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params)
+    parent = _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params,
+                            rendition_insert=rendition_insert)
 
     layout.ensure_layout()
     part = layout.new_part_path()
@@ -245,11 +271,6 @@ def ingest_stream(
             derived_from=parent, recipe_key=recipe_key[:64], recipe_version=recipe_version,
             recipe_params_digest=recipe_digest, toolchain=toolchain[:200],
         )
-        if outcome is not None:
-            if outcome.status in (validation.STATUS_VALID, validation.STATUS_INVALID):
-                columns.update(validation.verdict_columns(outcome, timezone.now()))
-            else:
-                columns["validation_code"] = outcome.code
         with transaction.atomic():
             if parent is not None:
                 # THE binding rule (see retention.lock_for_binding): the parent
@@ -263,7 +284,7 @@ def ingest_stream(
                     raise IntakeError("the parent media was purged", code="parent_purged") from exc
                 except MediaNotValidated as exc:
                     raise IntakeError("the parent media is not valid", code="parent_not_valid") from exc
-            media = ProductionMedia.objects.create(**columns)
+            media = (rendition_insert or _insert_generic)(columns, outcome)
     except Exception:
         # Not a hard kill: tidy up. (A hard kill is covered by the reconciler.)
         _unlink_quiet(part)

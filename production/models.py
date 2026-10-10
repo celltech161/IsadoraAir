@@ -60,57 +60,135 @@ STORAGE_KEY_PATTERN = r"^[0-9a-f]{2}/[0-9a-f]{32}$"
 #
 # A ``rendition`` row is created ONLY by production.services.render.rendition,
 # from a sealed output the isadoraair-render executor returned over its
-# authenticated socket. That module opens a scope naming the EXACT row it is
-# about to insert -- parent, recipe key/version, provenance digest, executor
-# toolchain and the output's SHA-256 -- and ProductionMedia.save() refuses any
-# rendition insert outside it or not matching it (once; then it re-reads the
-# written row, so a pre_save receiver cannot alter it). bulk_create refuses
-# renditions outright, and generic intake refuses kind=rendition early. So
-# ordinary code -- generic derivative intake, objects.create(), a hand-built
-# RenderEvidence -- cannot fabricate rendition provenance. Raw SQL is outside
-# the boundary, as everywhere in this module.
+# authenticated socket, and only as ONE COMPLETE, EXACT row:
+#
+#   begin the insertion transaction
+#   -> derive the complete expected row (every concrete column)
+#   -> open rendition_authority(row)       (refused outside a transaction)
+#   -> insert_rendition()                  (in that same transaction block)
+#   -> verify the complete persisted row   (any difference: refused, rolled back)
+#   -> close the authority -> commit
+#
+# The insert is an exact write that emits no model signals (no pre_save
+# receiver can widen the row), and the persisted row is still re-read and
+# compared column by column. A rendition always starts UNVALIDATED with every
+# validation fact unset: the authority is not a validation authority -- the
+# verdict is recorded afterwards, once, only by production.transitions
+# (record_verdict / record_infrastructure_attempt). ProductionMedia.save() and
+# every bulk_create refuse renditions outright, and generic intake refuses
+# kind=rendition before a byte is staged. Raw SQL is outside the boundary, as
+# everywhere in this module.
 
-@dataclass(frozen=True)
-class _RenditionAuthority:
-    derived_from_id: object
-    recipe_key: str
-    recipe_version: int
-    recipe_params_digest: str
-    toolchain: str
-    sha256: str
+# Every concrete ProductionMedia column, classified for rendition creation.
+# (test_render_service proves this covers the model exactly: a new column
+# must be classified before any rendition can be inserted.)
+#
+# BOUND -- exact values the rendition intake derives from the executor output
+# and ordinary intake semantics (identity, custody, bytes, display metadata,
+# derivation provenance, executor identity):
+RENDITION_BOUND_FIELDS = frozenset({
+    "id", "kind", "owner_id", "owner_username", "storage_key", "sha256", "byte_size", "original_filename",
+    "declared_content_type", "derived_from_id", "recipe_key", "recipe_version", "recipe_params_digest",
+    "toolchain",
+})
+# INITIAL -- unknown until validation / retention: must hold exactly these
+# canonical values at insert (validation alone establishes the facts):
+RENDITION_INITIAL_VALUES = {
+    "container": "", "codec": "", "sample_rate": None, "channels": None, "decoded_duration_seconds": None,
+    "header_duration_seconds": None, "probe": {}, "validation_state": "unvalidated", "validation_code": "",
+    "validated_at": None, "retention_state": "present", "purged_at": None,
+}
+# GENERATED -- set at insert; verified semantically (an aware timestamp taken
+# while the authority was open).
+RENDITION_GENERATED_FIELDS = frozenset({"created_at"})
+
+
+def _rendition_refused(message):
+    return ImmutableMediaError(message, code="rendition_authority")
 
 
 class _RenditionGrant:
-    __slots__ = ("authority", "used")
+    __slots__ = ("expected", "connection", "block", "opened_at", "used", "closed")
 
-    def __init__(self, authority):
-        self.authority, self.used = authority, False
+    def __init__(self, expected, connection, block, opened_at):
+        self.expected, self.connection, self.block, self.opened_at = expected, connection, block, opened_at
+        self.used = self.closed = False
 
 
 _rendition = contextvars.ContextVar("production_rendition_authority", default=None)
 
 
+def _rendition_classification_complete() -> bool:
+    concrete = {field.attname for field in ProductionMedia._meta.concrete_fields}
+    classified = RENDITION_BOUND_FIELDS | set(RENDITION_INITIAL_VALUES) | RENDITION_GENERATED_FIELDS
+    return concrete == classified and not (RENDITION_BOUND_FIELDS & set(RENDITION_INITIAL_VALUES))
+
+
 @contextmanager
-def rendition_authority(**columns):
-    """Authorize inserting exactly ONE rendition with these columns. Entered
-    only by production.services.render.rendition."""
+def rendition_authority(row: dict):
+    """Authorize inserting exactly ONE rendition: the complete row ``row``
+    ({attname: value} for every BOUND column) plus the canonical INITIAL
+    values. Must be opened inside the transaction that consumes it, and is
+    consumed (insert_rendition) in that same transaction block. Entered only
+    by production.services.render.rendition."""
+    from django.utils import timezone
+    connection = transaction.get_connection()
+    if not connection.in_atomic_block or not connection.atomic_blocks:
+        raise _rendition_refused("a rendition authority is opened inside its insertion transaction")
     if _rendition.get() is not None:
-        raise ImmutableMediaError("rendition authorities do not nest", code="rendition_authority")
-    token = _rendition.set(_RenditionGrant(_RenditionAuthority(**columns)))
+        raise _rendition_refused("rendition authorities do not nest")
+    if not _rendition_classification_complete():
+        raise _rendition_refused("ProductionMedia has a column the rendition authority does not classify")
+    if not isinstance(row, dict) or set(row) != RENDITION_BOUND_FIELDS:
+        raise _rendition_refused("a rendition authority names every bound column, and only those")
+    if row["kind"] != ProductionMedia.KIND_RENDITION or row["derived_from_id"] is None:
+        raise _rendition_refused("a rendition authority names a rendition derived from its source")
+    expected = {**row, **RENDITION_INITIAL_VALUES}
+    grant = _RenditionGrant(expected, connection, connection.atomic_blocks[-1], timezone.now())
+    token = _rendition.set(grant)
     try:
-        yield
+        yield grant
     finally:
+        grant.closed = True
         _rendition.reset(token)
 
 
-def rendition_authorized() -> bool:
+def _same(field, mine, theirs) -> bool:
+    try:
+        return field.to_python(mine) == field.to_python(theirs)
+    except Exception:                   # noqa: BLE001 -- an unparseable value is a difference
+        return False
+
+
+def insert_rendition() -> "ProductionMedia":
+    """THE rendition insert: the open authority's exact row, once, in the
+    transaction block that opened it; then the complete persisted row is
+    verified. Any difference raises (the caller's transaction rolls back)."""
+    from django.utils import timezone
     grant = _rendition.get()
-    return grant is not None and not grant.used
-
-
-def _rendition_columns(row) -> tuple:
-    return (str(row.derived_from_id), row.recipe_key, row.recipe_version, row.recipe_params_digest, row.toolchain,
-            row.sha256)
+    connection = transaction.get_connection()
+    if grant is None or grant.used or grant.closed:
+        raise _rendition_refused("renditions are created only by the render executor's intake")
+    if (grant.connection is not connection or not connection.in_atomic_block or not connection.atomic_blocks
+            or connection.atomic_blocks[-1] is not grant.block):
+        raise _rendition_refused("a rendition authority is consumed in the transaction that opened it")
+    grant.used = True
+    fields = {field.attname: field for field in ProductionMedia._meta.concrete_fields}
+    instance = ProductionMedia(**{name: grant.expected[name] for name in grant.expected})
+    # The exact write: the plain QuerySet insert -- no pre_save/post_save, so no
+    # receiver can see or change the row; created_at comes from auto_now_add.
+    models.QuerySet.bulk_create(ProductionMedia._base_manager.all(), [instance])
+    stored = ProductionMedia._base_manager.filter(pk=grant.expected["id"]).values(*fields).first()
+    checked_at = timezone.now()
+    if stored is None:
+        raise _rendition_refused("the authorized rendition was not inserted")
+    differing = sorted(name for name, value in grant.expected.items() if not _same(fields[name], value, stored[name]))
+    created = stored["created_at"]
+    if created is None or created.tzinfo is None or not grant.opened_at <= created <= checked_at:
+        differing.append("created_at")
+    if differing:
+        raise _rendition_refused(f"the inserted rendition differs from the authorized one: {differing}")
+    return ProductionMedia._base_manager.get(pk=grant.expected["id"])
 
 
 class ProductionMediaQuerySet(models.QuerySet):
@@ -138,8 +216,7 @@ class ProductionMediaQuerySet(models.QuerySet):
             raise ImmutableMediaError("ProductionMedia is immutable; bulk_create(update_conflicts=True) is refused.")
         objs = list(objs)
         if any(getattr(obj, "kind", None) == ProductionMedia.KIND_RENDITION for obj in objs):
-            raise ImmutableMediaError("renditions are created only by the render executor's intake",
-                                      code="rendition_authority")
+            raise _rendition_refused("renditions are created only by the render executor's intake")
         return super().bulk_create(objs, *args, update_conflicts=update_conflicts, **kwargs)
 
     def delete(self):
@@ -346,11 +423,11 @@ class ProductionMedia(models.Model):
 
     def save(self, *args, **kwargs):
         if self._state.adding:
+            if self.kind == self.KIND_RENDITION:
+                # Never through save(): only insert_rendition's exact write.
+                raise _rendition_refused("renditions are created only by the render executor's intake")
             if self.owner_id and not self.owner_username:
                 self.owner_username = self.owner.get_username()[:150]
-            if self.kind == self.KIND_RENDITION:
-                self._save_rendition(*args, **kwargs)
-                return
             super().save(*args, **kwargs)
             return
         changed = self._changed_fields()
@@ -360,28 +437,6 @@ class ProductionMedia(models.Model):
                 "Create a derived ProductionMedia instead, or use production.transitions.",
             )
         # Nothing differs: there is nothing to write (never issue an UPDATE).
-
-    def _save_rendition(self, *args, **kwargs):
-        """A rendition insert: only the exact row the render intake authorized,
-        once, inside its transaction -- verified again after the write."""
-        grant = _rendition.get()
-        expected = grant.authority if grant is not None else None
-        if grant is None or grant.used or _rendition_columns(self) != (
-                str(expected.derived_from_id), expected.recipe_key, expected.recipe_version,
-                expected.recipe_params_digest, expected.toolchain, expected.sha256):
-            raise ImmutableMediaError("renditions are created only by the render executor's intake",
-                                      code="rendition_authority")
-        if not transaction.get_connection(kwargs.get("using")).in_atomic_block:
-            raise ImmutableMediaError("a rendition is inserted inside its intake transaction",
-                                      code="rendition_authority")
-        grant.used = True
-        super().save(*args, **kwargs)
-        stored = type(self)._base_manager.filter(pk=self.pk).first()
-        if stored is None or stored.kind != self.KIND_RENDITION or _rendition_columns(stored) != (
-                str(expected.derived_from_id), expected.recipe_key, expected.recipe_version,
-                expected.recipe_params_digest, expected.toolchain, expected.sha256):
-            raise ImmutableMediaError("the inserted rendition differs from the authorized one",
-                                      code="rendition_authority")
 
     def delete(self, *args, **kwargs):
         raise ImmutableMediaError(

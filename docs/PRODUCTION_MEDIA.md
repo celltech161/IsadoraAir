@@ -298,8 +298,10 @@ executed in Phase A — only their provenance is recorded.
 
 The shared render engine (`production/services/render/`; renders run only in the
 sandboxed `isadoraair-render` executor since C2A, and only its intake —
-`render/rendition.py` under `models.rendition_authority` — may create a
-`rendition` row) turns one valid
+`render/rendition.py`, through `models.rendition_authority` and
+`models.insert_rendition` — may create a `rendition` row: one complete, exact,
+unvalidated row, verified column by column, whose verdict only the ordinary
+validation transition records) turns one valid
 ProductionMedia into a NEW `rendition` through a code-registered recipe of
 fixed steps; the result goes through the ordinary rendition intake (validated,
 GStreamer included) and records `derived_from`, the recipe key/version, the
