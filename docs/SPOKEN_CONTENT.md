@@ -522,15 +522,43 @@ Unknown modes fail closed. Track metadata: the fixed `title_policy`, the
 = `deliver_ready_to_air`, duration/sample rate/channels from the validated
 rendition, cue-in 0 and next-start = the duration (the whole file airs; the
 music analyzer's cue/segue detection never runs on it, and no waveform is
-generated — a projected spoken Track has no waveform display). Immediately
-before actual deck construction the engine re-reads the Track: it must exist,
-be Ready-to-Air and have a file. For a reserved spoken path it also requires
-the asset to own that Track and be `live`, and the current delivered item,
-rendition, generation and active edition to agree. The shared per-asset deck
-open lock is held through pipeline synchronization; promotion/reconcile hold
-its exclusive form. A cached Track or earlier log-build decision is never
-playout authority. Actual air remains proven by the existing
-PlayEvent/LogItem as-run paths.
+generated — a projected spoken Track has no waveform display).
+
+**Playout (`spoken/playout.py`, used by `library/services/engine.py`).** Only
+spoken-projection-sensitive Tracks get spoken rules; every ordinary Track keeps
+the engine's pre-C2B eligibility exactly (Track present, filepath set, file on
+disk — **no Ready-to-Air rule**, so operator insertion, warning-only
+not-Ready logs and not-yet-approved contributor uploads behave as before).
+
+* *Queue filtering and the 250 ms state/preview path* (`_log_item_playable`)
+  classify with a database-free test of the reserved filename
+  (`spoken-<32 hex>.flac`, which survives loss of `SpokenAsset.track_id`).
+  An ordinary item costs no query there; a spoken candidate gets a bounded
+  current-state inspection (≤ 3 queries). This is never open authority.
+* *Actual deck construction* (`_create_deck`) re-reads authority every time:
+  one asset lookup by `track_id` OR reserved path decides whether the Track is
+  projection-sensitive (so a linked Track whose path no longer looks projected
+  is still caught; a reserved filename with no asset is refused). For a
+  sensitive Track it takes the per-asset shared lock **non-blocking** (an
+  exclusive promotion/reconcile makes the attempt fail fast — the engine never
+  waits on a projection), then re-reads the Track and requires it to be
+  Ready-to-Air, the asset to own it and be `live`, and the current delivered
+  item, rendition, generation and active edition to agree. A cached Track or
+  earlier log-build decision is never playout authority.
+* *Lock continuity.* The session advisory lock lives exactly as long as its
+  PostgreSQL session, so the engine recycles its connection
+  (`close_old_connections`) once, at the start of the deck-open scope, and
+  never inside it (`_close_old_connections` is a no-op there — this is what
+  the playback-occurrence claim calls). One backend therefore holds the lock
+  from the re-read, through the real claim, to `sync_state_with_parent()`
+  (where filesrc opens the file), and unlocks it on that same session.
+  Immediately before the new bin joins the live pipeline a query-free check
+  confirms the lease's connection is still the one that took it; if the
+  session was lost the deck is abandoned before touching the live pipeline
+  (SystemEvent), and a release problem is reported, never raised after a
+  deck is live.
+
+Actual air remains proven by the existing PlayEvent/LogItem as-run paths.
 `expires_at` = delivery + `default_lifetime`.
 
 **Idempotency.** Delivering a delivered item returns the existing result (no
@@ -571,7 +599,7 @@ reconcile distinguish a live operation (non-blocking lock attempt fails) from
 an abandoned `retiring` barrier (lock succeeds), without a timing heuristic.
 Recall and expiry wait across the barrier and then apply to the now-superseded
 item without touching the replacement; detach refuses during the gap. The engine takes the
-shared form only for a projected deck open: a deck opened before the barrier
+shared form, non-blocking, only for a projected deck open: a deck opened before the barrier
 may retain A's already-open inode; every new deck after the barrier refuses.
 An older in-flight promotion can never overwrite a newer edition. A failure
 (not a crash)
