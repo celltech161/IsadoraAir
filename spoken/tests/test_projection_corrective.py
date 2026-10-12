@@ -1,128 +1,26 @@
-"""C2B corrective reverse proofs R16-R20.
+"""C2B corrective reverse proofs R18-R20: reserved-path ownership after FK
+loss, identity-safe reconciliation, and a literally read-only dry run.
 
-These tests pin the rejection boundaries: durable barrier before rename,
-current deck-open authority, reserved-path ownership after FK loss,
-identity-safe reconciliation, and a literally read-only dry run.
+R16/R17 (durable barrier before rename, current deck-open authority) run
+through the real engine deck path in test_projection_deck_open.
 """
 import hashlib
 import os
 import unittest
-from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 from django.db import connection
 from django.db.models import QuerySet
-from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from library.models import Track, TrackWriteRefused
 from library.services import engine as engine_module
 from monitoring.models import SystemEvent
-from spoken import delivery, library_files, playout
-from spoken.models import AssetState, SpokenAsset
+from spoken import delivery
+from spoken.models import SpokenAsset
 
 from .projection_support import FFMPEG, ProjectionFixtures, flac
-
-
-@unittest.skipUnless(FFMPEG, "ffmpeg not available")
-class DeckBarrierTests(ProjectionFixtures):
-    def occurrence(self, track):
-        return SimpleNamespace(id=991, track=track)
-
-    def attempt_deck(self, occurrence):
-        engine = engine_module.PlaybackEngine.__new__(engine_module.PlaybackEngine)
-        with mock.patch.object(
-            engine,
-            "_claim_playback_occurrence",
-            side_effect=AssertionError("deck construction reached"),
-        ) as constructor:
-            result = engine._create_deck("A", occurrence)
-        return result, constructor.called
-
-    def test_r16_rename_before_final_commit_is_never_deck_open_authority(self):
-        ctype = self.make_type()
-        old, first = self.delivered(ctype)
-        asset = SpokenAsset.objects.get(pk=first.asset_id)
-        cached = Track.objects.get(pk=first.track_id)
-        occurrence = self.occurrence(cached)
-        new = self.processed(ctype, data=flac(2345))
-        observed = []
-
-        def inspect(point):
-            if point != "after_publish":
-                return
-            current_asset = SpokenAsset.objects.get(pk=asset.pk)
-            current_track = Track.objects.get(pk=cached.pk)
-            observed.append((current_asset.state, current_track.ready2air,
-                             self.sha_on_disk(asset.library_relpath),
-                             engine_module._log_item_playable(occurrence), self.attempt_deck(occurrence)))
-            raise delivery.SimulatedCrash(point)
-
-        with mock.patch.object(delivery, "_fault", inspect), self.assertRaises(delivery.SimulatedCrash):
-            delivery.deliver_item(new)
-        self.assertEqual(observed[0][:3], (AssetState.RETIRING, False, new.rendition_media.sha256))
-        self.assertFalse(observed[0][3][0])
-        self.assertEqual(observed[0][4], (None, False))
-        delivery.reconcile()
-        asset.refresh_from_db()
-        self.assertEqual((asset.state, self.sha_on_disk(asset.library_relpath)),
-                         (AssetState.LIVE, old.rendition_media.sha256))
-        self.assertTrue(Track.objects.get(pk=cached.pk).ready2air)
-
-    def test_r17_cached_occurrence_refuses_recall_when_remove_fails(self):
-        ctype = self.make_type()
-        item, result = self.delivered(ctype)
-        occurrence = self.occurrence(Track.objects.get(pk=result.track_id))  # caches ready=True
-        with mock.patch.object(library_files, "remove", side_effect=OSError("held open")):
-            delivery.recall_delivered(item, actor=self.manager)
-        asset = SpokenAsset.objects.get(pk=result.asset_id)
-        self.assertTrue(self.library_file(asset.library_relpath).exists())
-        self.assertEqual(self.attempt_deck(occurrence), (None, False))
-
-    def test_r17_cached_occurrence_refuses_expiry_when_remove_fails(self):
-        ctype = self.make_type(default_lifetime=timedelta(seconds=1))
-        item, result = self.delivered(ctype)
-        occurrence = self.occurrence(Track.objects.get(pk=result.track_id))
-        with mock.patch("spoken.delivery.timezone.now", return_value=timezone.now() + timedelta(minutes=1)), \
-                mock.patch.object(library_files, "remove", side_effect=OSError("held open")):
-            delivery.expire_item(item)
-        asset = SpokenAsset.objects.get(pk=result.asset_id)
-        self.assertTrue(self.library_file(asset.library_relpath).exists())
-        self.assertEqual(self.attempt_deck(occurrence), (None, False))
-
-    def test_r17_current_ready_state_and_detach_override_cached_occurrences(self):
-        ctype = self.make_type()
-        _item, result = self.delivered(ctype)
-        cached = Track.objects.get(pk=result.track_id)
-        occurrence = self.occurrence(cached)
-
-        # Ordinary not-ready policy is re-read by identity, not taken from the
-        # cached instance retained by a previously built log occurrence.
-        QuerySet.update(Track._base_manager.filter(pk=cached.pk), ready2air=False)
-        self.assertEqual(self.attempt_deck(occurrence), (None, False))
-        QuerySet.update(Track._base_manager.filter(pk=cached.pk), ready2air=True)
-
-        # Detach/delete likewise invalidates that same cached occurrence.
-        Track.objects.get(pk=cached.pk).delete()
-        self.assertEqual(self.attempt_deck(occurrence), (None, False))
-
-    def test_projection_link_with_corrupt_path_is_not_treated_as_ordinary(self):
-        ctype = self.make_type()
-        _item, result = self.delivered(ctype)
-        cached = Track.objects.get(pk=result.track_id)
-        QuerySet.update(Track._base_manager.filter(pk=cached.pk), filepath="/tmp/not-the-projection.flac")
-        cached.filepath = "/tmp/not-the-projection.flac"
-        self.assertEqual(self.attempt_deck(self.occurrence(cached)), (None, False))
-
-    def test_projected_playability_lookup_is_bounded(self):
-        ctype = self.make_type()
-        _item, result = self.delivered(ctype)
-        with CaptureQueriesContext(connection) as queries:
-            authority = playout.inspect(result.track_id)
-        self.assertTrue(authority.allowed)
-        self.assertLessEqual(len(queries), 3)
 
 
 @unittest.skipUnless(FFMPEG, "ffmpeg not available")
