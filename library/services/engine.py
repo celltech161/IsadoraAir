@@ -996,12 +996,77 @@ def _log_item_playable(log_item):
     track = log_item.track
     if track is None:
         return False, "track deleted from library (FK set NULL)"
+    if not isinstance(track, Track):
+        fp = track.filepath
+        if not fp:
+            return False, f"track id={track.id} has no filepath"
+        if not Path(fp).is_file():
+            return False, f"file missing on disk: {fp}"
+        return True, None
+    # A queued/log-built instance is only a hint.  Ready-to-Air and spoken
+    # projection authority are re-read from committed DB state every time.
+    from spoken import playout
+    authority = playout.inspect(track.pk)
+    if not authority.allowed:
+        return False, authority.reason
+    track = authority.track
+    log_item.track = track
     fp = track.filepath
     if not fp:
         return False, f"track id={track.id} has no filepath"
     if not Path(fp).is_file():
         return False, f"file missing on disk: {fp}"
     return True, None
+
+
+@contextmanager
+def _deck_open_authority(log_item):
+    """Hold spoken projection authority through actual deck construction."""
+    playable, reason = _log_item_playable(log_item)
+    if not playable:
+        yield None, reason
+        return
+    track = log_item.track
+    # Engine unit tests use lightweight Track doubles; real LogItem relations
+    # are always library.Track instances and take the authoritative path.
+    if not isinstance(track, Track):
+        yield track, None
+        return
+    from spoken import playout
+    with playout.authorized_open(track.pk) as authority:
+        if not authority.allowed:
+            yield None, authority.reason
+            return
+        log_item.track = authority.track
+        yield authority.track, None
+
+
+def _require_deck_open_authority(method):
+    """Keep projection authority held until ``method`` finishes opening."""
+    @functools.wraps(method)
+    def wrapper(
+        self, slot, log_item, resume_position_ns=None,
+        *, continuation_reason_override=None,
+        continuation_start_on_first_real=False,
+        before_sync=None,
+    ):
+        # This shared authority scope lasts until the filesrc-backed bin is
+        # synchronized with its parent.  An exclusive promotion cannot commit
+        # its barrier/rename concurrently; a deck authorized first retains A's
+        # already-open inode, while a promotion authorized first makes this
+        # attempt fail fast or observe the new committed edition.
+        with _deck_open_authority(log_item) as (track, reason):
+            if track is None:
+                item_id = log_item.id if log_item is not None else "None"
+                print(f"  Cannot create deck for log item id={item_id}: {reason}")
+                return None
+            return method(
+                self, slot, log_item, resume_position_ns,
+                continuation_reason_override=continuation_reason_override,
+                continuation_start_on_first_real=continuation_start_on_first_real,
+                before_sync=before_sync,
+            )
+    return wrapper
 
 
 def _glib_safe(default_return=True):
@@ -6858,22 +6923,13 @@ class PlaybackEngine:
             print(f"  Continuation segment start failed (non-fatal): {exc}")
             return False
 
+    @_require_deck_open_authority
     def _create_deck(
         self, slot, log_item, resume_position_ns=None,
         *, continuation_reason_override=None,
         continuation_start_on_first_real=False,
         before_sync=None,
     ):
-        # Belt-and-braces: _next_queue_item already filters unplayable
-        # items, but _create_deck is also reached from other paths
-        # (_insert_urgent_next, crossfade swap, log reload flow). One
-        # centralized check here catches all of them uniformly instead
-        # of relying on every caller to remember.
-        playable, reason = _log_item_playable(log_item)
-        if not playable:
-            item_id = log_item.id if log_item is not None else "None"
-            print(f"  Cannot create deck for log item id={item_id}: {reason}")
-            return None
         track = log_item.track
         filepath = track.filepath
 

@@ -32,27 +32,25 @@ one atomic transaction, and this module never claims they are. Instead:
   TX-A  lock type -> item -> asset (created pending on first delivery) ->
         verify lifecycle, rendition, exact provenance -> next generation ->
         create a PENDING edition (durable intent).
-  TX-B  relock type -> item -> asset -> editions; re-validate (item state,
-        edition still pending, generation newer than the asset's -- a stale
-        operation is aborted here); publish the rendition's bytes to the
-        asset's stable path (stage in the destination directory, verify SHA,
-        atomic rename) WHILE HOLDING THE LOCKS, so no other operation can
-        publish to that path in between; then, in the same transaction:
+  TX-B  relock and re-validate; set the Track not Ready-to-Air and asset
+        RETIRING, then COMMIT this durable unavailable barrier.
+  TX-C  publish the rendition's bytes to the stable path (stage, verify SHA,
+        atomic rename) while holding the locks; then, in the same transaction:
         Track create/update, previous active edition -> superseded, new
         edition -> active, asset -> live at the new generation (compare-and-
         write on state+generation), previous current item -> superseded,
         item -> delivered (+ events).
-        COMMIT = THE COMMIT POINT: the new edition is authoritative.
+        COMMIT = THE COMMIT POINT: the new edition is authoritative and the
+        barrier is removed.
   then  remove a file left behind by a relocation; prune staging.
 
-The database is authoritative at every instant: before TX-B commits the
-previous active edition (or none) is; after, the new one is. A crash
-between the rename and the commit leaves the new bytes on disk while the
-database still names the previous edition -- ``reconcile`` (run by the
-worker at start-up, and on demand) restores the previous edition's exact
-bytes from its immutable rendition (or removes the file when there was
-none) and aborts the pending edition. A failure (not a crash) runs the same
-convergence at once. A pending edition never makes anything airable.
+An exclusive session advisory lock spans TX-B's commit through TX-C and is
+shared by deck-open authority. Thus no new deck opens the stable path while
+bytes and committed authority differ. A crash releases the lock but leaves
+RETIRING durable; ``reconcile`` takes the lock, restores the previous active
+edition's exact bytes (or removes the first delivery's uncommitted file), and
+only then commits LIVE/readiness again. A failure runs that convergence at
+once. A pending edition never makes anything airable.
 
 RECALL / EXPIRY never resurrect anything. An item that is not the current,
 live content of its asset (superseded, or projected nowhere) leaves delivery
@@ -75,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -87,7 +86,7 @@ from production.models import ProductionMedia
 from production.services import reference_audio, render, retention
 from production.services.render import protocol as render_protocol
 
-from . import guard, library_files, projection, transitions
+from . import guard, library_files, projection, projection_lock, transitions
 from .models import (
     ActorKind, AssetMode, AssetState, DeliveryMode, EditionState, ItemState, RecallPolicy, SpokenAsset,
     SpokenAssetEdition, SpokenContentType, SpokenItem,
@@ -390,6 +389,9 @@ def _deliver(item_pk, *, approve, actor, actor_kind, note) -> DeliveryResult:
         if asset.state == AssetState.DETACHED:
             raise ProjectionError("the asset was detached by an operator; a manager must reattach it first",
                                   code="asset_detached")
+        if asset.state == AssetState.RETIRING:
+            raise ProjectionError("the projection has an unresolved unavailable barrier; reconcile it first",
+                                  code="projection_in_transition", retryable=True)
         rendition = _bind_rendition(row)
         _abort_stale_pending(asset, row, timezone.now())
         generation = (SpokenAssetEdition.objects.filter(asset=asset).aggregate(top=Max("generation"))["top"] or 0) + 1
@@ -397,18 +399,25 @@ def _deliver(item_pk, *, approve, actor, actor_kind, note) -> DeliveryResult:
         edition = _create_edition(asset, row, rendition, generation)
         planned = (str(asset.pk), str(edition.pk), row.state, rendition.pk)
     _fault("pending_created")
-    # TX-B: publish under the locks, then make it authoritative -----------------------------------
+    # TX-B: commit the durable unavailable barrier.  The session lock spans
+    # this commit, publication and TX-C, so reconcile/deck-open can distinguish
+    # a live operation from a crash-abandoned barrier.
     published = []
-    try:
-        with transaction.atomic():
-            result = _promote(item_pk, planned, approve=approve, actor=actor, actor_kind=actor_kind, note=note,
-                              published=published)
-        _fault("committed")
-    except SimulatedCrash:
-        raise
-    except Exception as exc:
-        _compensate(planned, published, exc)
-        raise
+    with projection_lock.session(asset.pk, wait=True):
+        try:
+            _enter_unavailable(item_pk, planned, approve=approve, actor=actor, actor_kind=actor_kind)
+            _fault("barrier_committed")
+            # TX-C: publish while the asset/type/edition rows are locked, then
+            # commit new projection authority and readiness together.
+            with transaction.atomic():
+                result = _promote(item_pk, planned, approve=approve, actor=actor, actor_kind=actor_kind, note=note,
+                                  published=published)
+            _fault("committed")
+        except SimulatedCrash:
+            raise
+        except Exception as exc:
+            _compensate(planned, published, exc)
+            raise
     _cleanup_after_promotion(result)
     return result.delivery
 
@@ -436,7 +445,8 @@ class _Promotion:
     remove_relpath: str | None
 
 
-def _promote(item_pk, planned, *, approve, actor, actor_kind, note, published) -> _Promotion:
+def _validate_promotion(item_pk, planned, *, approve, actor, actor_kind, required_asset_states):
+    """Lock and re-prove TX-A's intent for either side of the barrier."""
     asset_id, edition_id, from_state, rendition_id = planned
     ctype = _lock_type(item_pk)
     row = _lock_item(item_pk)
@@ -444,17 +454,38 @@ def _promote(item_pk, planned, *, approve, actor, actor_kind, note, published) -
     editions = {e.pk: e for e in SpokenAssetEdition.objects.select_for_update().filter(asset=asset)
                 .order_by("generation")}
     edition = editions.get(uuid.UUID(edition_id))
-    # re-validate everything TX-A decided: a stale operation stops HERE
     if row.state != from_state or row.rendition_media_id != rendition_id:
         raise ProjectionError("the item changed during delivery", code="stale_promotion")
     if edition is None or edition.state != EditionState.PENDING:
         raise ProjectionError("the pending edition was aborted", code="stale_promotion")
-    if asset.state in (AssetState.DETACHED, AssetState.RETIRED):
-        raise ProjectionError(f"the asset is {asset.state}", code="asset_detached")
+    if asset.state not in required_asset_states:
+        code = "asset_detached" if asset.state in (AssetState.DETACHED, AssetState.RETIRED) else "stale_promotion"
+        raise ProjectionError(f"the asset is {asset.state}", code=code)
     if edition.generation <= asset.generation:
         raise ProjectionError("a newer edition was promoted first", code="stale_promotion")
     _deliverable(row, approve=approve, actor=actor, actor_kind=actor_kind)
     rendition = _bind_rendition(row)
+    return ctype, row, asset, editions, edition, rendition
+
+
+def _enter_unavailable(item_pk, planned, *, approve, actor, actor_kind) -> None:
+    """TX-B: make new deck creation impossible before pathname mutation."""
+    with transaction.atomic():
+        ctype, row, asset, _editions, _edition, _rendition = _validate_promotion(
+            item_pk, planned, approve=approve, actor=actor, actor_kind=actor_kind,
+            required_asset_states=(AssetState.PENDING, AssetState.LIVE),
+        )
+        now = timezone.now()
+        if asset.track_id is not None:
+            _set_ready(asset.track_id, False, now)
+        _write_asset(asset, {"state": AssetState.RETIRING}, now)
+
+
+def _promote(item_pk, planned, *, approve, actor, actor_kind, note, published) -> _Promotion:
+    ctype, row, asset, editions, edition, rendition = _validate_promotion(
+        item_pk, planned, approve=approve, actor=actor, actor_kind=actor_kind,
+        required_asset_states=(AssetState.RETIRING,),
+    )
     code = _category_code(ctype)
     target = projection.library_relpath(code, asset.pk)
     before = asset.library_relpath                           # differs only when the category changed
@@ -463,7 +494,8 @@ def _promote(item_pk, planned, *, approve, actor, actor_kind, note, published) -
     library_files.publish(target, rendition)
     published.append(target)
     _fault("after_publish")                                  # = before the Track write
-    # authoritative finalization -- ONE transaction
+    # Authoritative finalization -- ONE transaction.  The Track remains
+    # unavailable to other sessions until this transaction commits LIVE.
     values = _track_values(ctype, row, asset.pk, rendition, target, ready=ctype.deliver_ready_to_air)
     track_id = asset.track_id
     if track_id is None or not _write_track(track_id, values, now):
@@ -511,15 +543,87 @@ def _compensate(planned, published, exc) -> None:
     try:
         with transaction.atomic():
             asset = SpokenAsset.objects.get(pk=asset_id)
-            SpokenContentType.objects.select_for_update().filter(pk=asset.content_type_id).values_list("pk").first()
+            ctype = (SpokenContentType.objects.select_for_update(of=("self",)).select_related("target_category")
+                     .get(pk=asset.content_type_id))
             asset = SpokenAsset.objects.select_for_update().get(pk=asset_id)
             edition = SpokenAssetEdition.objects.select_for_update().filter(pk=edition_id).first()
             if edition is not None and edition.state == EditionState.PENDING:
                 _write_edition(edition, {"state": EditionState.ABORTED})
-            _converge_files(asset, extra_relpaths=published, report=[])
+            if asset.state == AssetState.RETIRING:
+                _recover_barrier(asset, ctype, timezone.now(), report=[], apply=True)
+                for relpath in published:
+                    if relpath != asset.library_relpath and library_files.exists(relpath):
+                        library_files.remove(relpath)
+            else:
+                _converge_files(asset, extra_relpaths=published, report=[])
     except Exception:                                      # noqa: BLE001
         log.exception("spoken projection: compensation after a failed delivery did not complete")
         _attention("compensation_failed", asset_id, f"{type(exc).__name__}: {exc}")
+
+
+def _recover_barrier(asset, ctype, now, *, report, apply) -> bool:
+    """Conservatively roll an abandoned RETIRING asset back to DB authority.
+
+    The caller owns the exclusive projection advisory lock and row locks.
+    A prior ACTIVE edition is the only authority that may be restored.  A
+    first-delivery barrier has no prior edition, so its uncommitted file is
+    removed and the asset returns to PENDING.  The barrier is removed only in
+    the same commit that restores final Track readiness.
+    """
+    if asset.state != AssetState.RETIRING:
+        return True
+    pending = list(SpokenAssetEdition.objects.select_for_update().filter(
+        asset=asset, state=EditionState.PENDING))
+    active = SpokenAssetEdition.objects.select_for_update().select_related("rendition").filter(
+        asset=asset, state=EditionState.ACTIVE).first()
+    if active is None:
+        if apply:
+            if library_files.exists(asset.library_relpath):
+                library_files.remove(asset.library_relpath)
+            for edition in pending:
+                _write_edition(edition, {"state": EditionState.ABORTED})
+            if asset.track_id is not None:
+                _set_ready(asset.track_id, False, now)
+            _write_asset(asset, {"state": AssetState.PENDING, "current_item": None,
+                                 "current_rendition": None}, now)
+        report.append({"asset": str(asset.pk), "finding": "abandoned_projection_barrier",
+                       "action": "rolled_back_to_pending" if apply else "would_roll_back_to_pending"})
+        return True
+    coherent = (asset.current_item_id == active.item_id
+                and asset.current_rendition_id == active.rendition_id
+                and asset.generation == active.generation)
+    if not coherent:
+        report.append({"asset": str(asset.pk), "finding": "barrier_authority_inconsistent",
+                       "action": "none", "attention": True,
+                       "detail": "active edition does not match the last committed asset authority"})
+        return False
+    sha, _size = library_files.current(asset.library_relpath)
+    if sha != active.rendition.sha256:
+        finding = "file_missing" if sha is None else "file_wrong_bytes"
+        if not apply:
+            report.append({"asset": str(asset.pk), "finding": finding, "action": "would_restore"})
+        else:
+            try:
+                library_files.publish(asset.library_relpath, active.rendition)
+                report.append({"asset": str(asset.pk), "finding": finding, "action": "restored"})
+            except library_files.LibraryFileError as restore_error:
+                if asset.track_id is not None:
+                    _set_ready(asset.track_id, False, now)
+                report.append({"asset": str(asset.pk), "finding": finding, "action": "restore_failed",
+                               "detail": str(restore_error), "attention": True})
+                return False
+    if asset.track_id is None or _owned_now(asset.track_id) is None:
+        report.append({"asset": str(asset.pk), "finding": "barrier_track_identity_missing", "action": "none",
+                       "attention": True, "detail": "cannot remove barrier without the authoritative Track"})
+        return False
+    if apply:
+        for edition in pending:
+            _write_edition(edition, {"state": EditionState.ABORTED})
+        _set_ready(asset.track_id, bool(ctype.deliver_ready_to_air), now)
+        _write_asset(asset, {"state": AssetState.LIVE}, now)
+    report.append({"asset": str(asset.pk), "finding": "abandoned_projection_barrier",
+                   "action": "restored_previous" if apply else "would_restore_previous"})
+    return True
 
 
 # -- leaving delivery: recall and expiry -----------------------------------------------------------
@@ -553,6 +657,19 @@ def expire_due(*, limit=200) -> list:
 
 
 def _end(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
+    # Take the cross-transaction lock before the row-lock order.  If a
+    # replacement already owns it, recall/expiry waits; after promotion the
+    # old item is superseded and the lifecycle transition proceeds with no
+    # projection effect.  This preserves operator intent without interleaving
+    # stable-path work or deadlocking type-lock -> advisory-lock.
+    asset_id = (SpokenAsset.objects.filter(current_item_id=item_pk).exclude(state=AssetState.RETIRED)
+                .values_list("pk", flat=True).first())
+    scope = projection_lock.session(asset_id, wait=True) if asset_id is not None else nullcontext(True)
+    with scope:
+        return _end_locked(item_pk, to_state, actor=actor, actor_kind=actor_kind, reason=reason)
+
+
+def _end_locked(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
     removed = None
     with transaction.atomic():
         ctype = _lock_type(item_pk)
@@ -575,6 +692,9 @@ def _end(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
         # for the projection: it can never touch a newer edition).
         asset = SpokenAsset.objects.select_for_update().filter(current_item=row).exclude(
             state=AssetState.RETIRED).first()
+        if asset is not None and asset.state == AssetState.RETIRING:
+            raise ProjectionError("the projection has an abandoned barrier; reconcile it first",
+                                  code="projection_in_transition", retryable=True)
         edition_id, effect = None, "none"
         if asset is not None and asset.state == AssetState.LIVE and row.state == S.DELIVERED:
             active = _active_edition(asset)
@@ -618,9 +738,16 @@ def track_deleted(sender, instance, **kwargs) -> None:
     if peek is None:
         return
     with transaction.atomic():
+        # Lock before the asset row.  Promotion/reconcile use the same order,
+        # so an operator delete waits across a live barrier without forming
+        # advisory-lock <-> row-lock inversion.  Once acquired, intent wins
+        # against the now-current generation and the Track cannot be recreated.
+        projection_lock.transaction_lock(peek, wait=True)
         asset = SpokenAsset.objects.select_for_update().get(pk=peek)
         if asset.track_id != instance.pk:
             return
+        if asset.state == AssetState.RETIRING:
+            raise guard.SpokenIntegrityError("reconcile the projection barrier before deleting its Track")
         now = timezone.now()
         if asset.state == AssetState.RETIRED:
             _write_asset(asset, {"track": None}, now)
@@ -717,13 +844,21 @@ def reconcile(*, apply=True) -> list:
     for pk in SpokenAsset.objects.order_by("created_at", "pk").values_list("pk", flat=True):
         report.extend(_reconcile_asset(pk, apply=apply))
     report.extend(_reconcile_orphans(apply=apply))
-    for finding in report:
-        if finding.get("attention"):
-            _attention(finding["finding"], finding.get("asset"), finding.get("detail", ""))
+    if apply:
+        for finding in report:
+            if finding.get("attention"):
+                _attention(finding["finding"], finding.get("asset"), finding.get("detail", ""))
     return report
 
 
 def _reconcile_asset(pk, *, apply) -> list:
+    with projection_lock.session(pk, wait=False) as acquired:
+        if not acquired:
+            return [{"asset": str(pk), "finding": "busy", "action": "skipped"}]
+        return _reconcile_asset_locked(pk, apply=apply)
+
+
+def _reconcile_asset_locked(pk, *, apply) -> list:
     report = []
     with transaction.atomic():
         type_id = SpokenAsset.objects.filter(pk=pk).values_list("content_type_id", flat=True).first()
@@ -733,6 +868,11 @@ def _reconcile_asset(pk, *, apply) -> list:
         if asset is None:
             return [{"asset": str(pk), "finding": "busy", "action": "skipped"}]
         now = timezone.now()
+        if asset.state == AssetState.RETIRING:
+            recovered = _recover_barrier(asset, ctype, now, report=report, apply=apply)
+            if not apply or not recovered:
+                return report
+            asset = SpokenAsset.objects.select_for_update().get(pk=pk)
         for pending in SpokenAssetEdition.objects.select_for_update().filter(asset=asset, state=EditionState.PENDING):
             if now - pending.created_at >= timedelta(seconds=STALE_PENDING_SECONDS):
                 if apply:
@@ -785,20 +925,36 @@ def _reconcile_track(asset, ctype, now, *, file_ok, apply, report) -> None:
         values = _track_values(ctype, item, asset.pk, active.rendition, asset.library_relpath,
                                ready=ctype.deliver_ready_to_air and file_ok)
         if asset.track_id is None or _owned_now(asset.track_id) is None:
-            # A live asset without its Track is corruption (a deliberate
-            # deletion DETACHES the asset instead). If the link alone was
-            # lost, the Track at the stable path is still this projection's
-            # (only the projection creates Tracks there): re-link it, keeping
-            # its identity; otherwise create it anew.
+            # Path equality is never identity.  The append-only delivery
+            # event binds this exact active edition/generation/SHA/path to the
+            # original Track PK.  Without that witness we fail closed.
             from library.models import Track
-            orphan = (Track._base_manager.filter(filepath=values["filepath"], spoken_asset__isnull=True)
-                      .values_list("pk", flat=True).first())
+            track_id, identity_detail = _delivered_track_identity(asset, active)
+            if track_id is None:
+                report.append({"asset": pk, "finding": "track_identity_unproven", "action": "none",
+                               "attention": True, "detail": identity_detail})
+                return
+            original = Track._base_manager.filter(pk=track_id).first()
+            if original is None:
+                report.append({"asset": pk, "finding": "track_identity_missing", "action": "none",
+                               "attention": True,
+                               "detail": f"delivery witness names vanished Track {track_id}; no recreation guessed"})
+                return
+            occupant = Track._base_manager.filter(filepath=values["filepath"]).exclude(pk=track_id).first()
+            if occupant is not None:
+                report.append({"asset": pk, "finding": "reserved_path_occupied", "action": "none",
+                               "attention": True,
+                               "detail": f"unrelated Track {occupant.pk} occupies the projected path"})
+                return
+            if not file_ok:
+                report.append({"asset": pk, "finding": "track_link_unavailable", "action": "none",
+                               "attention": True, "detail": "projection bytes are not proven"})
+                return
             report.append({"asset": pk, "finding": "track_missing",
-                           "action": ("relinked" if orphan else "recreated") if apply else "would_repair"})
+                           "action": "relinked" if apply else "would_relink",
+                           "track": track_id, "identity": "delivered_event"})
             if apply:
-                track_id = orphan if orphan is not None else _create_track(values)
-                if orphan is not None:
-                    _write_track(track_id, values, now)
+                _write_track(track_id, values, now)
                 _write_asset(asset, {"track": track_id}, now)
             return
         current = _owned_now(asset.track_id)
@@ -825,6 +981,27 @@ def _reconcile_track(asset, ctype, now, *, file_ok, apply, report) -> None:
 def _track_model():
     from library.models import Track
     return Track
+
+
+def _delivered_track_identity(asset, active) -> tuple[int | None, str]:
+    """Track PK durably recorded by the exact active-edition delivery."""
+    from .models import SpokenItemEvent
+    details = list(SpokenItemEvent._base_manager.filter(
+        asset=asset, edition=active, item_id=active.item_id, to_state=ItemState.DELIVERED,
+    ).values_list("detail", flat=True))
+    proven = set()
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        track_id = detail.get("track")
+        if (isinstance(track_id, int) and not isinstance(track_id, bool) and track_id > 0
+                and detail.get("generation") == active.generation
+                and detail.get("library_relpath") == asset.library_relpath
+                and detail.get("library_sha256") == active.library_sha256):
+            proven.add(track_id)
+    if len(proven) != 1:
+        return None, "active-edition delivery has no unique exact Track identity witness"
+    return proven.pop(), ""
 
 
 def _reconcile_orphans(*, apply) -> list:

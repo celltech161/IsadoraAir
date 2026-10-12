@@ -22,7 +22,7 @@ from .test_domain import make_category
 
 S = ItemState
 
-DB_POINTS = ("before_pending", "pending_created", "before_stage", "after_publish", "track_written",
+DB_POINTS = ("before_pending", "pending_created", "barrier_committed", "before_stage", "after_publish", "track_written",
              "edition_activated", "before_delivered", "before_commit")
 FS_POINTS = ("staged", "verified", "published")
 
@@ -242,14 +242,14 @@ class ReconcileTests(ProjectionFixtures):
         self.assertEqual([(f["finding"], f["action"]) for f in report], [("track_missing", "relinked")])
         asset.refresh_from_db()
         self.assertEqual(asset.track_id, track.pk)                    # the same Track identity
-        with connection.cursor() as cursor:                          # corruption: the Track row vanished
+        with connection.cursor() as cursor:                          # corruption: link and Track row vanished
+            cursor.execute("UPDATE spoken_spokenasset SET track_id = NULL WHERE id = %s", [asset.pk])
             cursor.execute("DELETE FROM library_track WHERE id = %s", [track.pk])
         report = self.changes(delivery.reconcile())
-        self.assertEqual([(f["finding"], f["action"]) for f in report], [("track_missing", "recreated")])
+        self.assertEqual([(f["finding"], f["action"]) for f in report], [])
+        self.assertIn("track_identity_missing", [f["finding"] for f in delivery.reconcile()])
         asset.refresh_from_db()
-        recreated = Track.objects.get(pk=asset.track_id)
-        self.assertEqual((recreated.filepath, recreated.ready2air),
-                         (str(self.library_file(asset.library_relpath)), True))
+        self.assertIsNone(asset.track_id)                              # identity is not guessed/recreated
 
     def test_a_category_change_is_a_controlled_relocation(self):
         ctype, item, asset, track = self.live()

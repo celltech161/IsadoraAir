@@ -303,6 +303,17 @@ class TrackQuerySet(models.QuerySet):
             bulk(objs, fields)
         return super().bulk_update(objs, fields, batch_size=batch_size)
 
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        # Creation at a projection-reserved path must pass the same guards as
+        # Model.save()/objects.create().  Projection's exact grant deliberately
+        # uses Django's base QuerySet primitive and therefore remains the only
+        # bypass.
+        for obj in objs:
+            for save, _update, _bulk in TRACK_WRITE_GUARDS:
+                save(obj, None)
+        return super().bulk_create(objs, *args, **kwargs)
+
 
 class Track(models.Model):
     ENERGY_CHOICES = [

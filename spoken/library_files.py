@@ -84,6 +84,22 @@ def absolute(relpath: str) -> Path:
     return library_root() / category / name
 
 
+def relative(filepath: str) -> str | None:
+    """Return the canonical projected relpath represented by ``filepath``.
+
+    This is a lexical authority check: it never resolves/follows the final
+    path.  ``None`` means the path is outside the projected namespace.
+    """
+    if not isinstance(filepath, str) or not filepath:
+        return None
+    try:
+        relpath = Path(os.path.abspath(filepath)).relative_to(library_root()).as_posix()
+        split(relpath)
+    except (ValueError, LibraryFileError):
+        return None
+    return relpath
+
+
 @contextmanager
 def _category_dir(category: str, *, create: bool):
     """A no-follow descriptor of LIBRARY_ROOT/<category> (or None if it does

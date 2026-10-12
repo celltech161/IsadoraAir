@@ -487,7 +487,8 @@ spoken lifecycle is never inferred from a Track.
   aborted, active → superseded), each read back complete. Django's own
   SET_NULL of a deleted Track is the one ordinary asset update allowed, and
   only for an asset the deletion already detached.
-* A projected Track (one linked to an asset) is still a library Track, but
+* A projected Track (one linked to an asset **or occupying an asset's
+  committed reserved pathname**) is still a library Track, but
   its `filepath`, `filename`, `format`, `title`, `artist`, `category`,
   `ready2air`, `duration_seconds`, `sample_rate`, `channels`, `bit_depth`,
   cue/next-start marks and `remote_url` belong to the projection: `save()`,
@@ -496,7 +497,8 @@ spoken lifecycle is never inferred from a Track.
   (`TrackWriteRefused`, via `library.models.register_track_write_guard`).
   Play counts, art, rotation weight and every other column stay the
   library's; ordinary Tracks are untouched. `import_songs` skips
-  `spoken-<uuid>.flac`.
+  `spoken-<uuid>.flac`. Losing `SpokenAsset.track_id` therefore does not open
+  the Track to ordinary edits or let another Track claim the reserved path.
 * A C2 item transition executes only through a `ProjectedItemWrite` whose
   witness the guard re-reads: delivered ⇔ the item's ACTIVE edition on its
   LIVE asset (current item, rendition and generation agreeing) — or a
@@ -520,9 +522,15 @@ Unknown modes fail closed. Track metadata: the fixed `title_policy`, the
 = `deliver_ready_to_air`, duration/sample rate/channels from the validated
 rendition, cue-in 0 and next-start = the duration (the whole file airs; the
 music analyzer's cue/segue detection never runs on it, and no waveform is
-generated — a projected spoken Track has no waveform display). The Track is
-an ordinary playout identity: no engine or scheduling change, and actual air
-remains proven only by the existing PlayEvent/LogItem as-run paths.
+generated — a projected spoken Track has no waveform display). Immediately
+before actual deck construction the engine re-reads the Track: it must exist,
+be Ready-to-Air and have a file. For a reserved spoken path it also requires
+the asset to own that Track and be `live`, and the current delivered item,
+rendition, generation and active edition to agree. The shared per-asset deck
+open lock is held through pipeline synchronization; promotion/reconcile hold
+its exclusive form. A cached Track or earlier log-build decision is never
+playout authority. Actual air remains proven by the existing
+PlayEvent/LogItem as-run paths.
 `expires_at` = delivery + `default_lifetime`.
 
 **Idempotency.** Delivering a delivered item returns the existing result (no
@@ -551,14 +559,22 @@ deterministic reconciliation:
 | Step | Authority if the process dies here (after `reconcile`) |
 | --- | --- |
 | TX-A: asset (first delivery: created `pending`), next generation, `pending` edition | previous active edition (or none); the pending edition is aborted once stale |
-| TX-B, under the type/item/asset/edition locks: re-validate (item, edition still pending, generation newer than the asset's — a stale promotion stops here), stage + verify + rename | previous edition: its exact bytes are re-published from its rendition (or the file removed if there was none) |
-| same TX-B: Track create/update, previous active → superseded, new → active, asset → live at the new generation (compare-and-write), previous item → superseded, item → delivered + events | same (the transaction never committed) |
+| TX-B: re-validate, set Track not Ready-to-Air and asset `retiring`, **commit the unavailable barrier** | previous edition remains DB authority but no new deck may open the stable path |
+| TX-C, under type/item/asset/edition locks and the cross-transaction exclusive asset lock: stage + verify + rename | `retiring`; reconcile re-publishes the previous edition's exact bytes (or removes the file when there was none) |
+| same TX-C: Track create/update, previous active → superseded, new → active, asset → live at the new generation (compare-and-write), previous item → superseded, item → delivered + events | same rollback to previous authority (TX-C never committed) |
 | **COMMIT — the commit point** | the new edition |
 | relocation leftover removed, staging pruned | the new edition (leftovers removed by reconcile) |
 
-The publication happens while TX-B holds the locks, so no other operation can
-publish to the same path between it and the commit, and an older in-flight
-promotion can never overwrite a newer edition. A failure (not a crash)
+The exclusive PostgreSQL session advisory lock spans TX-B's commit, file
+publication and TX-C's commit. It serializes another delivery and lets
+reconcile distinguish a live operation (non-blocking lock attempt fails) from
+an abandoned `retiring` barrier (lock succeeds), without a timing heuristic.
+Recall and expiry wait across the barrier and then apply to the now-superseded
+item without touching the replacement; detach refuses during the gap. The engine takes the
+shared form only for a projected deck open: a deck opened before the barrier
+may retain A's already-open inode; every new deck after the barrier refuses.
+An older in-flight promotion can never overwrite a newer edition. A failure
+(not a crash)
 aborts the pending edition and converges the files at once. A pending edition
 never makes anything airable; there is never more than one active edition
 (database constraint + the executor).
@@ -598,13 +614,20 @@ relocate on a category change; the stable path must hold the active edition's
 exact bytes (missing or wrong bytes: re-published from the immutable
 rendition — never adopted; if that is impossible the Track becomes
 unavailable and the operator is told); a pending/retired/detached asset has no
-file; a live asset's Track must exist (a lost link is re-linked to the Track
-at the stable path, keeping its identity; a vanished Track is recreated)
-and its projection-owned columns are restored from authority; a non-live
-asset's Track is never Ready-to-Air. Orphans: stale staging files removed
+file; an abandoned `retiring` barrier restores the last committed active
+edition before atomically returning the Track/asset to airable/live. A live
+asset's lost Track link is repaired only when the append-only delivery event
+for the exact active edition, generation, path and SHA names one surviving
+Track PK. Path equality alone is never identity; a vanished witnessed Track,
+missing/ambiguous evidence, or an unrelated Track occupying the reserved path
+fails closed and raises operator attention (no guessed adoption/recreation).
+When identity is proven, its projection-owned columns are restored from
+authority; a non-live asset's Track is never Ready-to-Air. Orphans: stale staging files removed
 (fresh ones belong to attempts in flight), an asset's copy at a path it no
 longer has removed, an unknown `spoken-*.flac` reported and never deleted.
-A healthy projection causes no write. `manage.py spoken_projection status`
+A healthy projection causes no write. `--dry-run` also emits no SystemEvent
+and changes no row, file or mtime; attention is returned in its report only.
+`manage.py spoken_projection status`
 (`spoken/projection_health.py`) observes the same conditions read-only;
 `spoken_projection` SystemEvents mark faults needing the operator. The admin
 shows asset mode/state, generation, current item, Track, path, the active

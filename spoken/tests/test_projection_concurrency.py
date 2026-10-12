@@ -14,15 +14,15 @@ from django.test import TransactionTestCase
 
 from library.models import Track
 from production.services import reference_audio
-from spoken import delivery, transitions
+from spoken import delivery, guard, transitions
 from spoken.models import AssetState, DeliveryMode, EditionState, ItemState, SpokenAsset, SpokenAssetEdition, SpokenItem
 
 from .projection_support import FFMPEG, ProjectionFixtures, ProjectionMixin
 from .test_domain import make_category
 
 S = ItemState
-ALLOWED = ("stale_promotion", "delivery_in_progress", "asset_detached", "not_delivered", "not_deliverable",
-           "not_due")
+ALLOWED = ("stale_promotion", "delivery_in_progress", "projection_in_transition", "asset_detached",
+           "not_delivered", "not_deliverable", "not_due")
 
 
 def race(*operations, timeout=120):
@@ -56,6 +56,16 @@ class ProjectionRaceTests(ProjectionMixin, TransactionTestCase):
             if exc is None:
                 continue
             self.assertNotIsInstance(exc, OperationalError, f"database error (deadlock?): {exc}")
+            if isinstance(exc, guard.SpokenIntegrityError):
+                self.assertIn(
+                    str(exc),
+                    {
+                        "the projected Track cannot be deleted while replacement is in progress",
+                        "reconcile the projection barrier before deleting its Track",
+                    },
+                    repr(exc),
+                )
+                continue
             self.assertIn(getattr(exc, "code", None), ALLOWED, repr(exc))
 
     def assert_coherent(self, ctype):
@@ -168,6 +178,83 @@ class ProjectionRaceTests(ProjectionMixin, TransactionTestCase):
         self.assertTrue(asset.library_relpath.startswith("NewsDesk/"))
         self.assertEqual(sorted(p.parent.name for p in self.library.rglob("spoken-*.flac")), ["NewsDesk"])
         self.assert_coherent(ctype)
+
+    def test_barrier_gap_waits_recall_expiry_and_refuses_detach_reconcile(self):
+        """The session lock covers the gap after barrier commit and before
+        TX-C takes row locks; contenders fail/skip instead of interleaving."""
+        from unittest import mock
+        from spoken import guard
+
+        for contender in ("recall", "expire", "detach", "reconcile"):
+            with self.subTest(contender=contender):
+                ctype = self.make_type(code=f"barrier-{contender}", default_lifetime=timedelta(seconds=1))
+                old, first = self.delivered(ctype)
+                newer = self.processed(ctype)
+                if contender == "expire":
+                    time.sleep(1.1)
+                barrier, release = threading.Event(), threading.Event()
+                outcome = []
+
+                def pause(point):
+                    if point == "barrier_committed":
+                        barrier.set()
+                        if not release.wait(20):
+                            raise AssertionError("test did not release the barrier")
+
+                def promote():
+                    try:
+                        outcome.append((delivery.deliver_item(newer), None))
+                    except BaseException as exc:  # noqa: BLE001 -- asserted below
+                        outcome.append((None, exc))
+                    finally:
+                        connections.close_all()
+
+                with mock.patch.object(delivery, "_fault", pause):
+                    thread = threading.Thread(target=promote)
+                    thread.start()
+                    self.assertTrue(barrier.wait(20), "delivery did not commit its barrier")
+                    end_outcome, end_thread = [], None
+                    if contender in ("recall", "expire", "detach"):
+                        def end_item():
+                            try:
+                                if contender == "recall":
+                                    result = delivery.recall_delivered(old, actor=self.manager)
+                                elif contender == "expire":
+                                    result = delivery.expire_item(old)
+                                else:
+                                    result = Track.objects.get(pk=first.track_id).delete()
+                                end_outcome.append((result, None))
+                            except BaseException as exc:  # noqa: BLE001 -- asserted below
+                                end_outcome.append((None, exc))
+                            finally:
+                                connections.close_all()
+                        end_thread = threading.Thread(target=end_item)
+                        end_thread.start()
+                        time.sleep(0.2)
+                        self.assertTrue(end_thread.is_alive(), f"{contender} did not wait for the barrier")
+                    else:
+                        report = delivery.reconcile()
+                        self.assertIn("busy", [finding["finding"] for finding in report])
+                    release.set()
+                    thread.join(30)
+                    self.assertFalse(thread.is_alive(), "delivery deadlocked")
+                    if end_thread is not None:
+                        end_thread.join(30)
+                        self.assertFalse(end_thread.is_alive(), "recall/expiry deadlocked")
+                        self.assertEqual(len(end_outcome), 1)
+                        self.assertIsNone(end_outcome[0][1], repr(end_outcome[0][1]))
+                self.assertEqual(len(outcome), 1)
+                self.assertIsNone(outcome[0][1], repr(outcome[0][1]))
+                asset = SpokenAsset.objects.get(content_type=ctype)
+                if contender == "detach":
+                    self.assertEqual(asset.state, AssetState.DETACHED)
+                    self.assertIsNone(asset.track_id)
+                    self.assertFalse(Track.objects.filter(pk=first.track_id).exists())
+                else:
+                    self.assertEqual((asset.state, asset.current_item_id), (AssetState.LIVE, newer.pk))
+                if contender in ("recall", "expire"):
+                    self.assertEqual(SpokenItem.objects.get(pk=old.pk).state,
+                                     S.RECALLED if contender == "recall" else S.EXPIRED)
 
 
 class ReferenceKeyLockOrderTests(TransactionTestCase):

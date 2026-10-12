@@ -199,7 +199,10 @@ EDITION_GENERATED = ("created_at",)
 
 # Permitted asset state moves (from, to) -- one table for the executor.
 ASSET_MOVES = frozenset({
-    ("pending", "pending"), ("pending", "live"), ("live", "live"), ("live", "pending"), ("live", "retired"),
+    ("pending", "pending"), ("pending", "retiring"), ("pending", "live"),
+    ("live", "live"), ("live", "retiring"), ("live", "pending"), ("live", "retired"),
+    ("retiring", "retiring"), ("retiring", "live"), ("retiring", "pending"),
+    ("retiring", "detached"), ("retiring", "retired"),
     ("pending", "retired"), ("pending", "detached"), ("live", "detached"), ("detached", "pending"),
     ("detached", "detached"), ("retired", "retired"),
 })
@@ -816,6 +819,36 @@ def _projected(track_ids) -> bool:
     return SpokenAsset._base_manager.filter(track_id__in=[pk for pk in track_ids if pk is not None]).exists()
 
 
+def _reserved(filepath) -> bool:
+    if not isinstance(filepath, str):
+        return False
+    from . import library_files
+    from .models import SpokenAsset
+    relpath = library_files.relative(filepath)
+    return relpath is not None and SpokenAsset._base_manager.filter(library_relpath=relpath).exists()
+
+
+def _queryset_uses_reserved_path(queryset) -> bool:
+    """One bounded EXISTS; never materialize the growing asset namespace."""
+    from django.db.models import CharField, Subquery, Value
+    from django.db.models.functions import Concat
+
+    from . import library_files
+    from .models import SpokenAsset
+    prefix = f"{library_files.library_root()}/"
+    paths = (SpokenAsset._base_manager.annotate(
+        absolute_path=Concat(Value(prefix), "library_relpath", output_field=CharField()),
+    ).values("absolute_path"))
+    return queryset.filter(filepath__in=Subquery(paths)).exists()
+
+
+def _any_reserved(filepaths) -> bool:
+    from . import library_files
+    from .models import SpokenAsset
+    relpaths = {relpath for filepath in filepaths if (relpath := library_files.relative(filepath)) is not None}
+    return bool(relpaths) and SpokenAsset._base_manager.filter(library_relpath__in=relpaths).exists()
+
+
 def _track_refusal(message):
     from library.models import TrackWriteRefused
 
@@ -830,11 +863,16 @@ def check_track_save(track, update_fields) -> None:
     readiness or media facts come from the projection, never from an edit).
     Ordinary Tracks, and the library's own columns, are untouched."""
     if track._state.adding or track.pk is None:
+        if _reserved(getattr(track, "filepath", None)):
+            raise _track_refusal("the projected spoken pathname is reserved for its SpokenAsset")
         return
     owned = [field for field in projected_track_fields()
              if update_fields is None or field.name in update_fields or field.attname in update_fields]
     loaded = [field for field in owned if field.attname in track.__dict__]
-    if not loaded or not _projected([track.pk]):
+    current_path = type(track)._base_manager.filter(pk=track.pk).values_list("filepath", flat=True).first()
+    sensitive = (_projected([track.pk]) or _reserved(current_path)
+                 or _reserved(getattr(track, "filepath", None)))
+    if not loaded or not sensitive:
         return
     current = type(track)._base_manager.filter(pk=track.pk).values(*[f.attname for f in loaded]).first()
     if current is None:
@@ -847,12 +885,25 @@ def check_track_save(track, update_fields) -> None:
 
 
 def check_track_update(queryset, columns: dict) -> None:
-    if set(columns) & _owned_names() and queryset.filter(spoken_asset__isnull=False).exists():
+    owned = set(columns) & _owned_names()
+    proposed_reserved = "filepath" in columns and _reserved(columns["filepath"])
+    sensitive = (queryset.filter(spoken_asset__isnull=False).exists()
+                 or _queryset_uses_reserved_path(queryset) or proposed_reserved)
+    if owned and sensitive:
         raise _track_refusal(
-            f"Track {sorted(set(columns) & _owned_names())} of a projected spoken Track change only through "
+            f"Track {sorted(owned)} of a projected spoken Track change only through "
             "the spoken projection")
 
 
 def check_track_bulk_update(objs, fields) -> None:
-    if set(fields) & _owned_names() and _projected([obj.pk for obj in objs]):
+    owned = set(fields) & _owned_names()
+    current_reserved = _any_reserved(_track_filepaths([obj.pk for obj in objs]).values())
+    proposed_reserved = "filepath" in fields and any(_reserved(getattr(obj, "filepath", None)) for obj in objs)
+    if owned and (_projected([obj.pk for obj in objs]) or current_reserved or proposed_reserved):
         raise _track_refusal("a projected spoken Track's owned columns change only through the projection")
+
+
+def _track_filepaths(track_ids) -> dict:
+    from library.models import Track
+    ids = [pk for pk in track_ids if pk is not None]
+    return dict(Track._base_manager.filter(pk__in=ids).values_list("pk", "filepath"))
