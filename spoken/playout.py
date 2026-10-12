@@ -1,6 +1,23 @@
-"""Current database authority for opening a Track on an on-air deck."""
+"""Current database authority for opening a Track on an on-air deck.
+
+Only spoken-projection-sensitive Tracks are subject to it.  Two questions
+are kept apart:
+
+* ``is_candidate`` -- a database-free test of the reserved filename
+  ``spoken-<asset hex>.flac``.  The engine's 250 ms queue/preview filtering
+  uses it so ordinary Tracks never cost a query there; only candidates are
+  inspected (``inspect``).  The name survives loss of ``SpokenAsset.track_id``,
+  which is why the reserved namespace exists.
+* ``authorized_open`` -- the actual deck-open authority, re-read from
+  committed state for every deck.  It also catches a Track linked by
+  ``SpokenAsset.track_id`` whose path no longer looks projected.  An ordinary
+  Track keeps the engine's pre-C2B behaviour (no Ready-to-Air rule, no lock).
+"""
 from __future__ import annotations
 
+import logging
+import re
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -11,6 +28,11 @@ from library.models import Track
 from . import library_files, projection_lock
 from .models import AssetState, EditionState, ItemState, SpokenAsset, SpokenAssetEdition
 
+log = logging.getLogger(__name__)
+
+_RESERVED_NAME = re.compile(r"spoken-[0-9a-f]{32}\.flac")
+_LEASES = threading.local()
+
 
 @dataclass(frozen=True)
 class DeckAuthority:
@@ -20,6 +42,14 @@ class DeckAuthority:
     @property
     def allowed(self) -> bool:
         return self.track is not None and self.reason is None
+
+
+def is_candidate(track) -> bool:
+    """Database- and filesystem-free: does this Track carry a reserved
+    projected filename?  Every projected Track does (its path is derived from
+    the asset), so this is conservative for queue filtering."""
+    filepath = getattr(track, "filepath", None)
+    return isinstance(filepath, str) and bool(_RESERVED_NAME.fullmatch(filepath.rsplit("/", 1)[-1]))
 
 
 def _fresh_track(track_id):
@@ -65,12 +95,9 @@ def _projection_reason(track, asset) -> str | None:
 
 
 def inspect(track_id) -> DeckAuthority:
-    """A bounded current-state check used by queue filtering.
-
-    Actual deck construction repeats it while holding the projection's shared
-    lock (``authorized_open``); this advisory check alone is not the open
-    authorization.
-    """
+    """A bounded current-state check of a spoken candidate, used by queue
+    filtering.  It is advisory only: actual deck construction repeats it
+    while holding the projection's shared lock (``authorized_open``)."""
     track = _fresh_track(track_id)
     if track is None:
         return DeckAuthority(None, "track deleted from library (FK set NULL)")
@@ -79,54 +106,92 @@ def inspect(track_id) -> DeckAuthority:
     asset, identity_reason = _projection_asset(track)
     if identity_reason:
         return DeckAuthority(None, identity_reason)
-    if asset is not None:
-        reason = _projection_reason(track, asset)
-        if reason:
-            return DeckAuthority(None, reason)
-    return DeckAuthority(track, None)
+    if asset is None:
+        return DeckAuthority(None, "reserved spoken filename has no projection authority")
+    reason = _projection_reason(track, asset)
+    return DeckAuthority(None, reason) if reason else DeckAuthority(track, None)
+
+
+def lease_active() -> bool:
+    return bool(getattr(_LEASES, "stack", None))
+
+
+def lease_intact() -> bool:
+    """Query-free: is the innermost deck-open lease on this thread still held
+    by its own backend?  True when no lease is active (an ordinary Track)."""
+    stack = getattr(_LEASES, "stack", None)
+    return not stack or stack[-1].intact()
+
+
+def current_lease():
+    stack = getattr(_LEASES, "stack", None)
+    return stack[-1] if stack else None
+
+
+def _report_release(lease) -> None:
+    if lease.release_problem is None:
+        return
+    log.error("spoken projection deck-open lock for asset %s: %s", lease.asset_id, lease.release_problem)
+    from monitoring.models import emit_event
+    emit_event("spoken_projection", "Spoken projection: deck-open lock release problem", level="error",
+               detail={"asset": str(lease.asset_id), "backend_pid": lease.backend_pid,
+                       "problem": lease.release_problem},
+               dedupe_key=f"spoken_projection|deck_lease_release|{lease.asset_id}")
 
 
 @contextmanager
-def authorized_open(track_id):
+def authorized_open(track):
     """Authorize one actual deck construction from current committed state.
 
-    A shared advisory lock is held until the caller has synchronized the new
-    deck with the live pipeline.  Delivery/reconcile take the exclusive form,
-    so either the old inode was already opened under old authority or the new
-    deck observes the post-promotion authority; it cannot race the barrier and
-    stable-path rename.
+    ``track`` is the occurrence's (possibly cached) Track.  An ordinary Track
+    is yielded unchanged: no lock, no Ready-to-Air rule.  A projection-
+    sensitive one is authorized only under a non-blocking shared lock taken on
+    this thread's connection and held until the caller has synchronized the
+    deck (opened the file).  Delivery/reconcile take the exclusive form, so
+    either the old inode was already opened under old authority or the new
+    deck observes the post-promotion authority.  The caller must not recycle
+    the connection while the lease is active (``lease_intact`` checks).
     """
-    initial = _fresh_track(track_id)
-    if initial is None:
-        yield DeckAuthority(None, "track deleted from library (FK set NULL)")
-        return
-    asset, identity_reason = _projection_asset(initial)
+    asset, identity_reason = _projection_asset(track)
     if identity_reason:
         yield DeckAuthority(None, identity_reason)
         return
     if asset is None:
-        fresh = _fresh_track(track_id)
-        if fresh is None:
-            yield DeckAuthority(None, "track deleted from library (FK set NULL)")
-        elif not fresh.ready2air:
-            yield DeckAuthority(None, f"track id={track_id} is not Ready-to-Air")
+        if is_candidate(track):
+            yield DeckAuthority(None, "reserved spoken filename has no projection authority")
         else:
-            yield DeckAuthority(fresh, None)
+            yield DeckAuthority(track, None)
         return
-    with projection_lock.session(asset.pk, shared=True, wait=False) as acquired:
-        if not acquired:
-            yield DeckAuthority(None, "spoken projection is changing")
-            return
-        fresh = _fresh_track(track_id)
-        asset, identity_reason = _projection_asset(fresh) if fresh is not None else (None, None)
-        if fresh is None or asset is None:
-            yield DeckAuthority(None, "spoken projection identity disappeared")
-            return
-        if identity_reason:
-            yield DeckAuthority(None, identity_reason)
-            return
-        if not fresh.ready2air:
-            yield DeckAuthority(None, f"track id={track_id} is not Ready-to-Air")
-            return
-        reason = _projection_reason(fresh, asset)
-        yield DeckAuthority(None, reason) if reason else DeckAuthority(fresh, None)
+    held = None
+    try:
+        with projection_lock.deck_lease(asset.pk) as lease:
+            if lease is None:
+                yield DeckAuthority(None, "spoken projection is changing")
+                return
+            held = lease
+            stack = getattr(_LEASES, "stack", None)
+            if stack is None:
+                stack = _LEASES.stack = []
+            stack.append(lease)
+            try:
+                yield _locked_authority(track.pk)
+            finally:
+                stack.remove(lease)
+    finally:
+        if held is not None:
+            _report_release(held)
+
+
+def _locked_authority(track_id) -> DeckAuthority:
+    fresh = _fresh_track(track_id)
+    if fresh is None:
+        return DeckAuthority(None, "spoken projection identity disappeared")
+    asset, identity_reason = _projection_asset(fresh)
+    if identity_reason:
+        return DeckAuthority(None, identity_reason)
+    if asset is None:
+        return DeckAuthority(None, "spoken projection identity disappeared")
+    if not fresh.ready2air:
+        return DeckAuthority(None, f"track id={track_id} is not Ready-to-Air")
+    reason = _projection_reason(fresh, asset)
+    return DeckAuthority(None, reason) if reason else DeckAuthority(fresh, None)

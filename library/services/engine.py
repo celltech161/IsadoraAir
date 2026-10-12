@@ -24,7 +24,7 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
 django.setup()
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 from django.db import close_old_connections, connection, transaction
 from django.db.models import F, Min, Sum
@@ -996,21 +996,22 @@ def _log_item_playable(log_item):
     track = log_item.track
     if track is None:
         return False, "track deleted from library (FK set NULL)"
-    if not isinstance(track, Track):
-        fp = track.filepath
-        if not fp:
-            return False, f"track id={track.id} has no filepath"
-        if not Path(fp).is_file():
-            return False, f"file missing on disk: {fp}"
-        return True, None
-    # A queued/log-built instance is only a hint.  Ready-to-Air and spoken
-    # projection authority are re-read from committed DB state every time.
-    from spoken import playout
-    authority = playout.inspect(track.pk)
-    if not authority.allowed:
-        return False, authority.reason
-    track = authority.track
-    log_item.track = track
+    # Spoken projection (C2B): only a Track carrying a reserved projected
+    # filename -- a database-free test -- is inspected here; every ordinary
+    # Track keeps exactly the legacy checks below, with no query.  This runs
+    # for every queued item on the 250 ms state/preview path, so it is never
+    # the deck-open authority: _deck_open_authority re-reads that.
+    if isinstance(track, Track):
+        from spoken import playout
+        if playout.is_candidate(track):
+            try:
+                authority = playout.inspect(track.pk)
+            except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
+                return False, f"spoken projection authority unavailable: {exc}"
+            if not authority.allowed:
+                return False, authority.reason
+            track = authority.track
+            log_item.track = track
     fp = track.filepath
     if not fp:
         return False, f"track id={track.id} has no filepath"
@@ -1019,26 +1020,74 @@ def _log_item_playable(log_item):
     return True, None
 
 
+# Deck-open scope (C2B): while this thread is authorizing and building a deck,
+# its database connection may hold the spoken projection's shared session
+# advisory lock, which lives exactly as long as that PostgreSQL session.
+# Connection recycling therefore happens once, before the scope, and never
+# inside it (see _close_old_connections).
+_DECK_OPEN = threading.local()
+
+
+def _close_old_connections():
+    """close_old_connections(), except inside a deck-open scope on this
+    thread, where it would end the session holding the deck-open lock before
+    the file is opened.  The scope's entry already recycled the connection."""
+    if getattr(_DECK_OPEN, "depth", 0):
+        return
+    close_old_connections()
+
+
 @contextmanager
 def _deck_open_authority(log_item):
-    """Hold spoken projection authority through actual deck construction."""
-    playable, reason = _log_item_playable(log_item)
-    if not playable:
-        yield None, reason
-        return
-    track = log_item.track
-    # Engine unit tests use lightweight Track doubles; real LogItem relations
-    # are always library.Track instances and take the authoritative path.
-    if not isinstance(track, Track):
-        yield track, None
-        return
-    from spoken import playout
-    with playout.authorized_open(track.pk) as authority:
-        if not authority.allowed:
-            yield None, authority.reason
+    """Hold spoken projection authority through actual deck construction.
+
+    Order: recycle the connection (outermost scope only) -> legacy
+    playability -> asset lookup -> non-blocking shared lock + fresh re-read
+    (spoken Tracks only) -> yield to construction, which opens the file
+    before the scope ends -> unlock on the same session.
+    """
+    # A persisted LogItem is a real occurrence even before its track FK is
+    # loaded (loading it is a query, which must follow the recycling).
+    real = isinstance(log_item, LogItem) or isinstance(getattr(log_item, "track", None), Track)
+    outermost = not getattr(_DECK_OPEN, "depth", 0)
+    if real and outermost:
+        close_old_connections()
+    _DECK_OPEN.depth = getattr(_DECK_OPEN, "depth", 0) + (1 if real else 0)
+    try:
+        playable, reason = _log_item_playable(log_item)
+        if not playable:
+            yield None, reason
             return
-        log_item.track = authority.track
-        yield authority.track, None
+        track = log_item.track
+        # Engine unit tests use lightweight Track doubles; real LogItem
+        # relations are always library.Track instances.
+        if not isinstance(track, Track):
+            yield track, None
+            return
+        from spoken import playout
+        scope = ExitStack()
+        try:
+            authority = scope.enter_context(playout.authorized_open(track))
+        except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
+            scope.close()
+            yield None, f"spoken projection authority unavailable: {exc}"
+            return
+        with scope:
+            if not authority.allowed:
+                yield None, authority.reason
+                return
+            log_item.track = authority.track
+            yield authority.track, None
+    finally:
+        _DECK_OPEN.depth -= (1 if real else 0)
+
+
+def _deck_open_still_authorized():
+    """Query-free check, immediately before a new deck bin joins the live
+    pipeline and opens its file: is a spoken deck-open lease still held by
+    the session that took it?  True for ordinary Tracks (no lease)."""
+    from spoken import playout
+    return playout.lease_intact()
 
 
 def _require_deck_open_authority(method):
@@ -4955,7 +5004,7 @@ class PlaybackEngine:
         Current and pending Studio Monitor generations receive the setting;
         a generation built after this call reads the same cached values.
         """
-        close_old_connections()
+        _close_old_connections()
         cfg = AudioOutput.objects.filter(name=STUDIO_MONITOR_NAME).first()
         enabled = bool(cfg and cfg.agc_enabled)
         self._studio_monitor_agc_settings = {
@@ -5099,7 +5148,7 @@ class PlaybackEngine:
 
     def _approved_log_queue(self, target_date, hour):
         """Return an approved log and its playable materialized queue."""
-        close_old_connections()
+        _close_old_connections()
         log = (
             PlaylistLog.objects
             .filter(date=target_date, hour=hour, status="approved")
@@ -5463,7 +5512,7 @@ class PlaybackEngine:
         if not self.running:
             return False
 
-        close_old_connections()
+        _close_old_connections()
         now = timezone.localtime()
 
         with self._lock:
@@ -5723,7 +5772,7 @@ class PlaybackEngine:
         thread via GLib.idle_add -- see _install_built_hour -- rather
         than touching engine state directly from this thread."""
         try:
-            close_old_connections()
+            _close_old_connections()
             log, error = build_and_approve_hour_log_locked(target_date, target_hour, target_duration_seconds=target_duration_seconds)
             if error == LOCK_CONTENDED:
                 print(f"  Async build deferred for {target_date} {target_hour:02d}:00 -- already being built elsewhere")
@@ -6106,7 +6155,7 @@ class PlaybackEngine:
         target the real remaining window rather than assuming a full
         hour is empty."""
         try:
-            close_old_connections()
+            _close_old_connections()
             # fill_remaining_hour appends onto `existing_picks` in place
             # and returns that same list, so the new items must be
             # sliced off using the count captured *before* the call.
@@ -6192,7 +6241,7 @@ class PlaybackEngine:
             print(f"  Discarding stale live-fill proposal for log id={log_id} -- real hour boundary reached since dispatch")
             return False
 
-        close_old_connections()
+        _close_old_connections()
         try:
             with transaction.atomic():
                 log = PlaylistLog.objects.get(id=log_id)
@@ -6569,7 +6618,10 @@ class PlaybackEngine:
         original timestamp survives every recreation of the same occurrence.
         """
         try:
-            close_old_connections()
+            # Within _create_deck this is a no-op: the deck-open scope already
+            # recycled the connection, and the session may now hold the spoken
+            # projection's deck-open lock until the file is opened.
+            _close_old_connections()
             with transaction.atomic():
                 # Keep the engine's single GLib thread bounded if a Web
                 # Request transaction currently owns this row.
@@ -6679,7 +6731,7 @@ class PlaybackEngine:
         transition_recorded = False
         persisted_played_at = None
         try:
-            close_old_connections()
+            _close_old_connections()
             with transaction.atomic():
                 locked_item = (
                     LogItem.objects.select_for_update(of=("self",))
@@ -6876,7 +6928,7 @@ class PlaybackEngine:
             ):
                 return False
         try:
-            close_old_connections()
+            _close_old_connections()
             with transaction.atomic():
                 play_event = (
                     PlayEvent.objects.select_for_update()
@@ -7282,6 +7334,24 @@ class PlaybackEngine:
             )
         )
 
+        # Spoken projection (C2B): the file opens when this bin is synchronized
+        # below.  Nothing between here and that synchronization touches the
+        # database, so a deck-open lease still held by its own session now is
+        # still held at the open.  If the session ended (connection lost),
+        # stop before the bin touches the live pipeline.
+        if not _deck_open_still_authorized():
+            print(f"  Cannot create deck for log item id={log_item.id}: "
+                  "spoken projection deck-open lock was lost before the file open")
+            emit_event(
+                category="spoken_projection",
+                level="error",
+                title="Spoken projection deck open abandoned: lock lost before file open",
+                detail={"slot": slot, "track_id": track.id, "log_item_id": log_item.id},
+                dedupe_key=f"spoken_projection|deck_lease_lost|{track.id}",
+            )
+            deck_bin.set_state(Gst.State.NULL)
+            return None
+
         self.main_pipeline.add(deck_bin)
 
         mixer_pad = self.mixer.request_pad_simple("sink_%u")
@@ -7659,7 +7729,7 @@ class PlaybackEngine:
             if close_segment and not interrupted else None
         )
         try:
-            close_old_connections()
+            _close_old_connections()
             with transaction.atomic():
                 play_event = None
                 if deck.play_event_id:
@@ -7781,7 +7851,7 @@ class PlaybackEngine:
             if not resume_is_loadable:
                 resume_log_item_id = None
         try:
-            close_old_connections()
+            _close_old_connections()
             with transaction.atomic():
                 stale = list(
                     PlayEventSegment.objects.select_for_update()
@@ -8582,7 +8652,7 @@ class PlaybackEngine:
         True if a new fire was started, False otherwise (dropped by cap
         or ignored by retrigger)."""
         try:
-            close_old_connections()
+            _close_old_connections()
             cart = FXCart.objects.filter(id=cart_id, enabled=True).first()
         except Exception as exc:
             print(f"  fx_fire: DB read failed for cart {cart_id}: {exc}")
@@ -8944,7 +9014,7 @@ class PlaybackEngine:
         attack. If NO VTs exist, this is a no-op and the caller
         continues into the normal crossfade path."""
         try:
-            close_old_connections()
+            _close_old_connections()
             outgoing_vt = VoiceTrack.objects.filter(
                 track=outgoing_deck.track, position="outro",
             ).select_related("media").first()
@@ -9379,7 +9449,7 @@ class PlaybackEngine:
     def _insert_urgent_next_inner(self, category_code):
         if not self.current_log or not self.log_items:
             raise RuntimeError("No live log loaded")
-        close_old_connections()
+        _close_old_connections()
         category = Category.objects.get(code=category_code)
         track = (
             Track.objects.filter(category=category, ready2air=True)
@@ -9468,7 +9538,7 @@ class PlaybackEngine:
         if log_item is None or log_item.category_id is None or log_item.category.kind.code != "music":
             return log_item
 
-        close_old_connections()
+        _close_old_connections()
         already_spliced = SongRequest.objects.filter(
             status="scheduled", log_item_id=log_item.id,
             log_item__playback_claimed_at__isnull=True,
@@ -9570,7 +9640,7 @@ class PlaybackEngine:
         checking) is worse than skipping straight to whatever's
         genuinely next."""
         try:
-            close_old_connections()
+            _close_old_connections()
             req = (
                 SongRequest.objects.filter(
                     intro_log_item_id=intro_item.id, status="scheduled",
@@ -10410,7 +10480,7 @@ class PlaybackEngine:
         if user_id is None:
             return True
 
-        close_old_connections()
+        _close_old_connections()
         from django.contrib.auth import get_user_model
         from authz.evaluator import authorize as _authorize
 
@@ -13135,7 +13205,7 @@ class PlaybackEngine:
         seek call genuinely in flight, the rest of this method is
         deferred via the shared countdown until every slot has actually
         cleared, exactly as it always was when nothing was in flight."""
-        close_old_connections()
+        _close_old_connections()
         with self._lock:
             decks_to_remove = [d for d in self.decks.values() if d]
 
@@ -13234,7 +13304,7 @@ class PlaybackEngine:
             return
         self._last_queue_reload = now
 
-        close_old_connections()
+        _close_old_connections()
         # [P0] 1.8 defense-in-depth -- the ~3s reload MUST NOT reintroduce
         # a poison-guarded item that the previous cycle already filtered.
         # See _apply_poison_skip's docstring and PoisonMarkerCrossRestartTests.

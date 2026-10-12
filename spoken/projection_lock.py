@@ -65,6 +65,64 @@ def session(asset_id, *, shared=False, wait=True):
                     raise RuntimeError("spoken projection advisory lock was not held at release")
 
 
+class DeckLease:
+    """The engine's shared deck-open lock, bound to the backend that took it.
+
+    A session advisory lock lives exactly as long as its PostgreSQL session,
+    so the lease is only as good as the connection object it was taken on:
+    ``intact()`` is a query-free identity check that the same open
+    connection is still the thread's Django connection.
+    """
+
+    def __init__(self, asset_id, raw, backend_pid):
+        self.asset_id = asset_id
+        self.backend_pid = backend_pid
+        self.release_problem = None
+        self._raw = raw
+
+    def intact(self) -> bool:
+        raw = connection.connection
+        return raw is not None and raw is self._raw and not raw.closed
+
+    def release(self) -> str | None:
+        """Unlock on the owning session.  Never raises: a deck may already be
+        live.  Returns None, or a description of what went wrong."""
+        if not self.intact():
+            return "the session holding the deck-open lock ended before release"
+        first, second = key(self.asset_id)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock_shared(%s, %s)", [first, second])
+                released = cursor.fetchone()[0]
+        except Exception as exc:                                  # noqa: BLE001 -- reported by the caller
+            return f"deck-open lock release failed: {type(exc).__name__}: {exc}"
+        return None if released else "the owning session no longer held the deck-open lock"
+
+
+@contextmanager
+def deck_lease(asset_id):
+    """The engine's non-blocking shared lock for one deck open.
+
+    Yields None when promotion/reconcile holds the exclusive form (the engine
+    must not wait on a projection).  Otherwise yields a :class:`DeckLease`;
+    release problems are recorded on ``lease.release_problem`` instead of
+    raised, because the caller's deck may already be on air.
+    """
+    _postgres()
+    first, second = key(asset_id)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock_shared(%s, %s), pg_backend_pid()", [first, second])
+        acquired, backend_pid = cursor.fetchone()
+    if not acquired:
+        yield None
+        return
+    lease = DeckLease(asset_id, connection.connection, backend_pid)
+    try:
+        yield lease
+    finally:
+        lease.release_problem = lease.release()
+
+
 def transaction_lock(asset_id, *, shared=False, wait=True) -> bool:
     """Take the asset lock for the current transaction."""
     _postgres()
