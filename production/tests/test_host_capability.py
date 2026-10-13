@@ -1,5 +1,6 @@
 """r0107 release: the read-only host preflight the protected updater runs, via
-production.0001_initial's migration preflight, before any mutation.
+production.0001_initial's migration preflight, before any mutation (and, from
+r0109, the render-host preflight via production.0002_referenceaudio).
 
 Each facility is checked against synthetic /proc and cgroup trees (both the
 pass and every fail shape), the sandbox self-test against deliberately broken
@@ -152,6 +153,84 @@ class FacilityTests(IsolatedMediaRootMixin, SimpleTestCase):
                 self.assertFalse(host.check_validation_host()["ok"])
 
 
+class RenderFacilityTests(SimpleTestCase):
+    """r0109: the render profile self-test against this host and against
+    launchers broken in each way the preflight must notice."""
+
+    def _launcher(self, *, landlock="render", seccomp="render", refuse=False):
+        real = (Path(host.__file__).with_name("confined_exec.py")).read_text()
+        body = real + textwrap.dedent(f"""
+            _real_landlock, _real_seccomp = _landlock, _seccomp
+            def _landlock(libc, profile="validation"):
+                if {refuse!r}:
+                    raise _Refused("Landlock is not available")
+                mode = {landlock!r}
+                if mode == "noop":
+                    return 6
+                return _real_landlock(libc, profile if mode == "render" else "validation")
+            def _seccomp(libc, deny_sockets=False):
+                mode = {seccomp!r}
+                if mode == "noop":
+                    return None
+                return _real_seccomp(libc, deny_sockets=deny_sockets if mode == "render" else False)
+        """)
+        path = _tree(self) / "confined_exec.py"
+        path.write_text(body)
+        return path
+
+    def test_the_render_profile_bites_and_the_render_ffmpeg_still_runs(self):
+        result = host.render_sandbox_selftest()
+        self.assertTrue(result["ok"], result)
+        self.assertIn("ffmpeg version", result["detail"])
+        self.assertTrue(host.render_sandbox_selftest(launcher=self._launcher())["ok"])
+
+    def test_each_missing_refusal_fails(self):
+        cases = {
+            "no Landlock in force": (self._launcher(landlock="noop"), "file write"),
+            "validation read roots instead of render roots": (self._launcher(landlock="validation"),
+                                                             "read outside the render roots"),
+            "socket(2) not denied": (self._launcher(seccomp="validation"), "socket(2)"),
+            "no seccomp in force": (self._launcher(seccomp="noop"), "socket(2)"),
+            "Landlock unavailable": (self._launcher(refuse=True), "Landlock is not available"),
+            "no launcher at all": (Path("/nonexistent/confined_exec.py"), "failed"),
+        }
+        for label, (launcher, expected) in cases.items():
+            with self.subTest(label):
+                result = host.render_sandbox_selftest(launcher=launcher)
+                self.assertFalse(result["ok"], result)
+                self.assertIn(expected, result["detail"])
+
+    def test_a_toolchain_that_cannot_run_confined_fails(self):
+        # Outside the render read roots: Landlock refuses to execute it.
+        directory = _tree(self)
+        copied = directory / "ffmpeg"
+        shutil.copy2(shutil.which("ffmpeg"), copied)
+        result = host.render_sandbox_selftest(ffmpeg=str(copied))
+        self.assertFalse(result["ok"], result)
+        self.assertIn("does not run under the render profile", result["detail"])
+        result = host.render_sandbox_selftest(ffmpeg="/usr/bin/true")
+        self.assertFalse(result["ok"], result)
+
+    def test_no_render_toolchain_fails(self):
+        from production.services import render_service
+        with mock.patch.object(render_service, "configured_ffmpeg",
+                               side_effect=render_service.NotReady("no usable ffmpeg ('')")):
+            result = host.render_sandbox_selftest()
+        self.assertFalse(result["ok"])
+        self.assertIn("no render toolchain", result["detail"])
+
+    def test_any_failing_facility_fails_the_render_check(self):
+        self.assertTrue(host.check_render_host()["ok"])
+        broken = {"ok": False, "detail": "x"}
+        for name in ("cgroup_v2_unified", "controllers_available", "leaf_interfaces", "systemd_version",
+                     "render_sandbox_selftest"):
+            with self.subTest(name), mock.patch.object(host, name, return_value=broken):
+                self.assertFalse(host.check_render_host()["ok"])
+        self.assertEqual(set(host.check_render_host()["facilities"]),
+                         {"cgroup_v2_unified", "controllers", "leaf_interface_files", "systemd_delegate_subgroup",
+                          "render_sandbox"})
+
+
 class MediaRootTests(IsolatedMediaRootMixin, SimpleTestCase):
     def test_an_absent_root_under_a_writable_parent_is_establishable_and_nothing_is_created(self):
         result = host.check_media_root()
@@ -234,6 +313,24 @@ class PreflightRegistryTests(IsolatedMediaRootMixin, TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertEqual([item["id"] for item in payload["checks"] if item["status"] == "failed"],
                          ["production.0001.media_root_establishable"])
+
+    def test_production_0002_carries_the_render_host_check_and_this_host_passes(self):
+        pending = ["production.0002_referenceaudio", "spoken.0001_initial"]
+        payload = self.run_command(*pending)
+        self.assert_executor_accepts(payload, pending)
+        self.assertEqual([item["id"] for item in payload["checks"]], ["production.0002.render_host_capability"])
+        self.assertEqual(payload["status"], "ok", payload)
+        self.assertTrue(payload["checks"][0]["evidence"]["facilities"]["render_sandbox"]["ok"])
+
+    def test_a_host_that_cannot_render_confined_blocks_before_any_mutation(self):
+        pending = ["production.0002_referenceaudio", "spoken.0001_initial"]
+        with mock.patch.object(host, "render_sandbox_selftest",
+                               return_value={"ok": False, "detail": "the render profile did not refuse socket(2)"}):
+            payload = self.run_command(*pending)
+        self.assert_executor_accepts(payload, pending)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual([item["id"] for item in payload["checks"] if item["status"] == "failed"],
+                         ["production.0002.render_host_capability"])
 
     def test_no_host_check_once_production_media_exists(self):
         payload = self.run_command("library.0089_voicetrack_media")

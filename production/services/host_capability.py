@@ -30,6 +30,17 @@ Nothing here writes, creates, starts or reconfigures anything. Two checks:
 
 The validation service keeps failing closed on its own whatever this says;
 this preflight only moves the refusal ahead of every mutation.
+
+r0109 adds ``render_host_capability`` for ``production.0002_referenceaudio``
+(pending exactly when a station first takes on Phase C spoken content):
+deploy/isadoraair-render.service needs the same delegated cgroup facilities,
+and every render step runs under the launcher's narrower ``render`` profile.
+Its FUNCTIONAL self-test applies exactly that profile in a throwaway child and
+proves it bites -- a write is refused, a file outside the render read roots
+cannot be read, socket(2) fails, clone3 returns ENOSYS -- and that the very
+ffmpeg the render service will use (render_service.configured_ffmpeg) still
+runs and reports its version under it. The real system manager's delegation
+of the unit's own subtree remains a post-install acceptance check.
 """
 from __future__ import annotations
 
@@ -82,6 +93,45 @@ else:
     write = "ALLOWED"
 result = libc.syscall(435, None, ctypes.c_size_t(0))
 print("sandbox", abi, write, result, ctypes.get_errno())
+"""
+
+
+# The render-profile child: everything it needs is imported BEFORE the sandbox
+# (afterwards it may read only the render roots), then it proves each refusal
+# and runs the toolchain the way a render step does (a plain fork/exec, no
+# shell), printing one parseable line.
+_RENDER_SELFTEST = r"""
+import ctypes, errno, importlib.util, os, socket, subprocess, sys
+spec = importlib.util.spec_from_file_location("confined_exec_render_selftest", sys.argv[1])
+launcher = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(launcher)
+probe, outside, ffmpeg = sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    libc = launcher._libc()
+    launcher._no_new_privs(libc)
+    abi = launcher._landlock(libc, "render")
+    launcher._seccomp(libc, deny_sockets=True)
+except launcher._Refused as exc:
+    print("refused", exc)
+    sys.exit(3)
+def attempt(action):
+    try:
+        action()
+    except OSError as exc:
+        return "refused" if exc.errno in (errno.EACCES, errno.EPERM) else f"errno-{exc.errno}"
+    return "ALLOWED"
+write = attempt(lambda: os.close(os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)))
+read = attempt(lambda: os.close(os.open(outside, os.O_RDONLY)))
+sock = attempt(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close())
+clone3 = libc.syscall(435, None, ctypes.c_size_t(0))
+clone3_errno = ctypes.get_errno()
+try:
+    tool = subprocess.run([ffmpeg, "-hide_banner", "-version"], stdin=subprocess.DEVNULL, capture_output=True,
+                          timeout=20, check=False)
+    returncode, first = tool.returncode, (tool.stdout.decode("ascii", "replace").splitlines() or [""])[0]
+except (OSError, subprocess.TimeoutExpired) as exc:
+    returncode, first = -1, type(exc).__name__
+print("render", abi, write, read, sock, clone3, clone3_errno, returncode, first.strip()[:100])
 """
 
 
@@ -217,6 +267,76 @@ def sandbox_selftest(*, launcher: Path | None = None, python: str = sys.executab
     if clone3 != -1 or errno_value != _ENOSYS:
         return _facility(False, f"seccomp did not refuse clone3 (result {clone3}, errno {errno_value})")
     return _facility(True, f"no_new_privs, Landlock ABI {abi}, seccomp (clone3 -> ENOSYS)")
+
+
+def render_sandbox_selftest(*, launcher: Path | None = None, python: str = sys.executable,
+                            ffmpeg: str | None = None) -> dict:
+    """The launcher's render profile (Landlock render read roots + seccomp
+    with socket(2) denied), applied in a throwaway child: no write, no read
+    outside the render roots, no socket, no clone3 -- and the render ffmpeg
+    still runs under it."""
+    if launcher is None:
+        launcher = Path(__file__).with_name("confined_exec.py")
+    if ffmpeg is None:
+        from production.services import render_service
+        try:
+            ffmpeg = render_service.configured_ffmpeg()
+        except render_service.NotReady as exc:
+            return _facility(False, f"no render toolchain: {exc}")
+    with tempfile.TemporaryDirectory(prefix="isadoraair-render-selftest-") as scratch:
+        probe, outside = Path(scratch) / "must-not-exist", Path(scratch) / "outside-the-render-roots"
+        outside.write_bytes(b"not for a renderer\n")
+        try:
+            result = subprocess.run(
+                [python, "-I", "-S", "-c", _RENDER_SELFTEST, str(launcher), str(probe), str(outside), str(ffmpeg)],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=SELFTEST_TIMEOUT_SECONDS,
+                check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return _facility(False, f"render sandbox self-test could not run: {exc}")
+        escaped = probe.exists()
+    output = result.stdout.decode("ascii", "replace").strip()
+    match = re.fullmatch(r"render (-?\d+) (\S+) (\S+) (\S+) (-?\d+) (\d+) (-?\d+) ?(.*)", output)
+    if result.returncode != 0 or match is None:
+        detail = output or result.stderr.decode("utf-8", "replace").strip()
+        return _facility(False, f"render sandbox self-test failed: {detail}")
+    abi, write, read, sock = int(match.group(1)), match.group(2), match.group(3), match.group(4)
+    clone3, errno_value, tool_rc, version = int(match.group(5)), int(match.group(6)), int(match.group(7)), match.group(8)
+    if abi < 1:
+        return _facility(False, "Landlock is not available")
+    if write != "refused" or escaped:
+        return _facility(False, "the render profile did not refuse a file write")
+    if read != "refused":
+        return _facility(False, "the render profile did not refuse a read outside the render roots")
+    if sock != "refused":
+        return _facility(False, "the render profile did not refuse socket(2)")
+    if clone3 != -1 or errno_value != _ENOSYS:
+        return _facility(False, f"seccomp did not refuse clone3 (result {clone3}, errno {errno_value})")
+    if tool_rc != 0 or not version.startswith("ffmpeg version"):
+        return _facility(False, f"{ffmpeg} does not run under the render profile (exit {tool_rc}: {version!r})")
+    return _facility(True, f"render profile: Landlock ABI {abi}, no write/outside read/socket, clone3 -> ENOSYS; "
+                           f"{version}")
+
+
+def _host_facilities(overrides) -> dict:
+    return {
+        "cgroup_v2_unified": cgroup_v2_unified(**{k: v for k, v in overrides.items()
+                                                 if k in ("proc", "cgroup_mount")}),
+        "controllers": controllers_available(**{k: v for k, v in overrides.items() if k == "cgroup_mount"}),
+        "leaf_interface_files": leaf_interfaces(**{k: v for k, v in overrides.items()
+                                                    if k in ("proc", "cgroup_mount")}),
+        "systemd_delegate_subgroup": systemd_version(**{k: v for k, v in overrides.items()
+                                                         if k == "systemctl_candidates"}),
+    }
+
+
+def check_render_host(**overrides) -> dict:
+    """r0109 evidence for the updater: what deploy/isadoraair-render.service
+    and the render profile need (``ok`` is popped by the preflight runner)."""
+    facilities = _host_facilities(overrides)
+    facilities["render_sandbox"] = render_sandbox_selftest(
+        **{k: v for k, v in overrides.items() if k in ("launcher", "python", "ffmpeg")})
+    return {"ok": all(item["ok"] for item in facilities.values()), "facilities": facilities}
 
 
 def check_validation_host(**overrides) -> dict:

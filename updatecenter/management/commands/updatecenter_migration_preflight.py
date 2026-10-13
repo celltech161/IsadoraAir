@@ -171,11 +171,18 @@ def _check_0088_profile_integrity(cursor, pending):
 
 # Explicit registry: pending migration ref -> [(check id, check)].
 M_PRODUCTION_0001 = "production.0001_initial"
+# r0109: pending exactly when a station first takes on Phase C spoken content.
+M_PRODUCTION_0002 = "production.0002_referenceaudio"
 
 
 def _check_validation_host(cursor, pending):
     from production.services import host_capability
     return host_capability.check_validation_host()
+
+
+def _check_render_host(cursor, pending):
+    from production.services import host_capability
+    return host_capability.check_render_host()
 
 
 def _check_media_root(cursor, pending):
@@ -190,6 +197,7 @@ REGISTRY = {
         ("production.0001.validation_host_capability", _check_validation_host),
         ("production.0001.media_root_establishable", _check_media_root),
     ],
+    M_PRODUCTION_0002: [("production.0002.render_host_capability", _check_render_host)],
 }
 
 
