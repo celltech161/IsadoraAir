@@ -153,7 +153,7 @@ class FacilityTests(IsolatedMediaRootMixin, SimpleTestCase):
                 self.assertFalse(host.check_validation_host()["ok"])
 
 
-class RenderFacilityTests(SimpleTestCase):
+class RenderFacilityTests(IsolatedMediaRootMixin, SimpleTestCase):
     """r0109: the render profile self-test against this host and against
     launchers broken in each way the preflight must notice."""
 

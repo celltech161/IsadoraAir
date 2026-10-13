@@ -19,6 +19,7 @@ from django.test import SimpleTestCase, TestCase
 
 from production.services import render_service
 
+from .support import IsolatedMediaRootMixin
 from .test_render_service import MediaFixtures, _private_socket_path, in_process_render_service
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy"
@@ -31,7 +32,7 @@ def _service_section(unit):
     return parser["Service"]
 
 
-class UnitGateTests(SimpleTestCase):
+class UnitGateTests(IsolatedMediaRootMixin, SimpleTestCase):
     def test_the_render_unit_gates_its_start_on_the_readiness_handshake(self):
         service = _service_section("isadoraair-render.service")
         self.assertEqual(service["ExecStartPost"],
