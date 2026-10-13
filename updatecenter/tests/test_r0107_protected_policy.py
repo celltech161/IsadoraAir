@@ -27,6 +27,9 @@ from updatecenter import manifest as manifest_mod
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY = PROJECT_ROOT / "deploy" / "updater_runtime" / "protected-policy.json"
 R0106 = "f65652a2830d2eb721defc05adfeb533acc6ef8c"
+# Pinned to what r0107 shipped: later generations (r0109's 13) extend the
+# working-tree policy and are covered by their own release tests.
+R0107 = "e3f51c0f5616f28d140fea2014ed4e8c9de0dc6e"
 NEW_UNIT = "isadoraair-validation.service"
 
 
@@ -40,7 +43,10 @@ def _policy_at(commit: str) -> dict:
 
 class R0107ProtectedPolicyTests(SimpleTestCase):
     def setUp(self):
-        self.raw = POLICY.read_bytes()
+        self.raw = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "show", f"{R0107}:deploy/updater_runtime/protected-policy.json"],
+            check=True, capture_output=True,
+        ).stdout
         self.value = json.loads(self.raw)
         self.document = parse_policy_dict(self.value, label="protected-policy.json")
 

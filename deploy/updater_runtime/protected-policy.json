@@ -45,6 +45,14 @@
       "unit": "isadoraair-rbds.service"
     },
     {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-render.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-spoken-render-worker.service"
+    },
+    {
       "policy": "INSTALL_ONLY",
       "unit": "isadoraair-sync-road-conditions.service"
     },
