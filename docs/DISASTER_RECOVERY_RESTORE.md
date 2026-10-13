@@ -996,6 +996,16 @@ PostgreSQL (running, migrated -- stages 30 + 95 already confirmed this)
   v
 isadoraair-validation               (r0107+; After= network; iPortal media
   |                                  validation -- see docs/IPORTAL.md)
+  |
+  +--> isadoraair-render            (r0109+; After= network; spoken-content
+  |      |                           renders, independent of validation --
+  |      |                           see docs/SPOKEN_CONTENT.md)
+  |      v
+  |    isadoraair-spoken-render-worker
+  |                                 (r0109+; After= network, postgresql,
+  |                                  render, validation; Wants= render,
+  |                                  validation; idle until a spoken type
+  |                                  is enabled)
   v
 isadoraair-gunicorn                 (After= network, postgresql, isadoraair-validation;
                                      Wants= isadoraair-validation)
@@ -1291,8 +1301,17 @@ Once services are up and hardware is attached:
 
 ```bash
 sudo systemctl status isadoraair-validation isadoraair-gunicorn isadoraair-engine \
-  isadoraair-encoders isadoraair-monitoring isadoraair-rbds
+  isadoraair-encoders isadoraair-monitoring isadoraair-rbds \
+  isadoraair-render isadoraair-spoken-render-worker
 ```
+`isadoraair-render` (r0109+) must be active with
+`/run/isadoraair-render/render.sock` and `status.json` present (it never
+listens until its start-up cleanup and a confined toolchain probe pass;
+`render_health.observe()` reports `ready`). `isadoraair-spoken-render-worker`
+must stay active; with no spoken type enabled it does nothing. Restored
+projected spoken Tracks keep their files under `LIBRARY_ROOT`; run
+`manage.py spoken_projection reconcile --dry-run` to confirm the projection
+matches the restored database.
 `isadoraair-validation` (r0107+) must be active with
 `/run/isadoraair-validation/validator.sock` present; it refuses to listen
 until its start-up cleanup succeeds and needs the host facilities listed in

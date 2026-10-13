@@ -1738,6 +1738,15 @@ exactly what that pending migration will reject:
   application mutation. Writability is judged from ownership and mode, not
   `os.access()`, because the updater's own `ProtectSystem=strict` namespace
   makes `/srv` read-only to it. See `docs/releases/r0107.md`.
+* **`production.0002_referenceaudio` pending (r0109, the first release with
+  Phase C spoken content):** one read-only host check,
+  `production.0002.render_host_capability` -- the same cgroup v2 / controller /
+  leaf-file / systemd >= 254 facilities, plus a functional self-test of the
+  launcher's **render** profile (a write, a read outside the render roots and
+  `socket(2)` refused, `clone3` -> `ENOSYS`) that must still run the exact
+  `ffmpeg` `isadoraair-render` resolves. It moves the refusal of a host that
+  cannot render confined ahead of every application mutation. See
+  `docs/releases/r0109.md`.
 
 Evidence names the migration and check, the global or profile scope, the
 conflicting key, the true count, bounded row IDs and truncation.
