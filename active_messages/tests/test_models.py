@@ -150,7 +150,7 @@ class DatabaseInvariantTests(Domain, TestCase):
             "unknown state": dict(state="replayed"),
             "bad digest": dict(composition_digest="ABC"),
             "zero components": dict(component_count=0),
-            "too many components": dict(component_count=17),
+            "too many components": dict(component_count=25),            # the absolute ceiling is 24
             "zero generation": dict(policy_generation=0),
             "ready without its aggregate": dict(state="ready"),
             "terminal still holding the slot": dict(state="suppressed", failure_code="x", terminal_at=self.now),

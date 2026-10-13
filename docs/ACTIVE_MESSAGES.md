@@ -58,7 +58,9 @@ domain, and no path is ever authority.
 * **ActiveBroadcastPolicy** — the singleton (id 1, created on first use, no
   data migration). THE serialization root. `generation`,
   `native_airing_enabled` (default False), `default_replay_interval_seconds`
-  (default 1200; 60..86400), `stinger_key` (a ReferenceAudio key or "").
+  (default 1200; 60..86400), `stinger_key` (a ReferenceAudio key or ""), and
+  the three composition limits (see "Bounds"): `max_active_messages`,
+  `max_message_seconds`, `max_aggregate_seconds`.
 * **ActiveBroadcastMessage** — one producer's lifecycle. `producer_key` is the
   durable identity (`user:<pk>` for a native account; other namespaces are
   reserved for the Phase G import), with `producer` as an optional SET_NULL
@@ -84,7 +86,10 @@ through a private compare-and-write store with read-back.
 * an execution has its `mix_media` from READY on; ACCEPTED/CLAIMED/STARTED
   are dated in order; COMPLETED has end time and confirmed duration; air
   evidence needs a start; FAILED/SUPPRESSED carry a code;
-* the digest is lowercase SHA-256; 1..16 components; generation ≥ 1;
+* the digest is lowercase SHA-256; 1..24 components (the absolute ceiling);
+  generation ≥ 1;
+* the policy limits lie within 1..their absolute ceilings, and the
+  per-message limit never exceeds the aggregate limit;
 * one event per Replay Now request token, and it names its execution.
 
 ## Message lifecycle
@@ -104,8 +109,10 @@ POST returns the row unchanged). Clear acts on the exact UUID: clearing an old,
 already-superseded row can never touch its replacement. An ACTIVE message's
 media never changes — editing means preparing a new message and activating it.
 
-Media binding: valid, present, not a bed, measured duration ≤ 300 s, and the
-binder's own media unless they hold control. The replaced media is recorded by
+Media binding: valid, present, not a bed, measured duration within the
+policy's per-message limit (never truncated to fit), and the binder's own
+media unless they hold control. Binding reads the limit for early feedback;
+activation re-checks every limit under the policy lock. The replaced media is recorded by
 identity in the event detail, not by foreign key, so it stays purgeable.
 
 There is **no default expiry**. `expires_at` is optional; `set_message_expiry`
@@ -120,7 +127,8 @@ every change of which messages are active, holds the policy lock.
 `generation` increases by exactly one per composition change — activation
 (including its supersession), clear of an active message, an expiry sweep
 that expires anything — and per output-affecting policy change (stinger,
-native-airing gate). Replay never changes it. In the same transaction, every
+native-airing gate, composition limits — one step per `set_limits` call however
+many limits it changes). Replay never changes it. In the same transaction, every
 PENDING_RENDER/READY execution built for an older generation is SUPPRESSED
 (`stale_generation`). Executions the engine already holds (ACCEPTED and
 later) are left to the engine's own re-read (D2B).
@@ -181,10 +189,43 @@ reviewable now; nothing in D1 can move an execution to STARTED.
 
 ## Bounds
 
-Safety constants, never operator input: at most **16** active messages; each
-message at most **300 s**; the active set at most **900 s** in total; snapshot
-at most 32 KiB; event detail at most 4 KiB. Activation refuses a message that
-would break a bound.
+The composition limits are **operator policy** on `ActiveBroadcastPolicy`,
+changed only through `services.set_limits` (control) — editable in Django
+admin, whose form hands valid values to that service — within **absolute
+ceilings** fixed in code (`ABSOLUTE_MAX_*` in `active_messages/models.py`) and
+enforced three times: the service, the admin form's validators/constraints,
+and the database.
+
+| Limit | Default | Allowed | Absolute ceiling — why |
+| --- | --- | --- | --- |
+| `max_active_messages` | 16 | 1..24 | **24**: each component is one sealed input descriptor in a single aggregate render (D2A), plus the stinger; and at the aggregate ceiling 24 components already average only 50 s — typical PSA length — so more could not carry meaningful messages anyway |
+| `max_message_seconds` | 300 | 1..600, ≤ aggregate | **600 s**: a 10-minute "message" is programming, not an announcement; half the aggregate ceiling, so at least two producers always fit |
+| `max_aggregate_seconds` | 600 | 1..1200 | **1200 s**: the legacy (and default) 20-minute replay cadence — an aggregate any longer would put more PA audio than ordinary programming between plays |
+
+Aggregate accounting is every component's validated decoded duration **plus
+the stinger's** when an urgent component brings it in (the stinger is
+ReferenceAudio, so its validated duration is known in D1). The snapshot
+records `duration_seconds` per component, `stinger_seconds` and
+`accounted_seconds` (outside the digest). The exact *rendered* duration exists
+only once D2A has rendered the aggregate; D2A must re-check it against the
+aggregate limit before the mix may air (see the D2 contract).
+
+* Media is **never truncated** to satisfy a limit.
+* **Activation** refuses (`CompositionIneligible`: `too_many_active`,
+  `message_too_long`, `aggregate_too_long`, with a detail naming the limit and
+  the offending message/amount) any activation whose resulting active set
+  breaks a limit. Supersession does not add to the count.
+* Changing a limit is output-affecting: one generation step, and still-pending
+  airings of the old generation are suppressed.
+* Lowering a limit below the current active set clears nothing. That set
+  **fails closed**: due materialization and Replay Now raise
+  `CompositionIneligible` (any expiry done in the same pass still commits), an
+  operator-visible SystemEvent (`error`) explains which limit, and
+  `snapshot_active_composition()["ineligible"]` reports it — until an operator
+  clears messages or raises the limit.
+
+Fixed safety constants, never operator input: snapshot at most 32 KiB; event
+detail at most 4 KiB.
 
 ## Authorization
 
@@ -192,14 +233,17 @@ would break a bound.
 (activate, Replay Now, clear, expiry on active messages, policy), seeded to
 Station Administrator only by `authz.0008`; staff/superuser keep
 `authorize()`'s compatibility bypass. Every service checks `authorize()`
-itself. The admin is read-only diagnostics.
+itself. The admin is read-only diagnostics, except the policy's three
+composition limits, which it changes only through `services.set_limits`
+(control).
 
 ## Intended D2 contract (not implemented in D1)
 
 * **D2A:** `bind_execution_mix` — under policy → media → execution, verify the
   rendition's provenance names exactly the snapshot's ordered inputs and
-  stinger pin, require the current generation, then PENDING_RENDER → READY.
-  Render failure → FAILED with a code.
+  stinger pin, require the current generation, **refuse a mix whose measured
+  duration exceeds the policy's aggregate limit** (fail closed — never
+  truncate), then PENDING_RENDER → READY. Render failure → FAILED with a code.
 * **D2B:** command `active_message_play` {execution_id, attempt_token,
   policy_generation, composition_digest, mix_media_id} over
   `enqueue_engine_command` — never a path or a Track. The engine re-reads the

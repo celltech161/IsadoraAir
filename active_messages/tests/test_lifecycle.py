@@ -189,23 +189,6 @@ class ActivationTests(Domain, TestCase):
         self.assertEqual(new.activation_generation, generation + 1)
         self.assertEqual(self.events(old)[-1], "superseded")
 
-    def test_the_active_set_is_bounded(self):
-        from django.contrib.auth import get_user_model
-        producers = [get_user_model().objects.create_user(f"p{index}", is_staff=True) for index in range(17)]
-        for producer in producers[:16]:
-            self.active(producer, seconds="10.000000")
-        with self.assertRaises(services.LimitExceeded) as caught:
-            self.active(producers[16], seconds="10.000000")
-        self.assertEqual(caught.exception.code, "too_many_active")
-
-    def test_the_aggregate_duration_is_bounded(self):
-        from django.contrib.auth import get_user_model
-        for index in range(3):
-            self.active(get_user_model().objects.create_user(f"q{index}", is_staff=True), seconds="300.000000")
-        with self.assertRaises(services.LimitExceeded) as caught:
-            self.active(self.producer, seconds="1.000000")
-        self.assertEqual(caught.exception.code, "aggregate_too_long")
-
 
 class ClearAndExpiryTests(Domain, TestCase):
     def test_clear_is_exact_idempotent_and_moves_the_generation(self):

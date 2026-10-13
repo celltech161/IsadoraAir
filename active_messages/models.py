@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Q
 
@@ -41,8 +42,17 @@ POLICY_ID = 1
 REPLAY_INTERVAL_MIN_SECONDS = 60
 REPLAY_INTERVAL_MAX_SECONDS = 86400
 DEFAULT_REPLAY_INTERVAL_SECONDS = 1200          # legacy OGRemote default: 20 minutes
-# Safety constants, never operator-supplied (docs/ACTIVE_MESSAGES.md, "Bounds").
-MAX_COMPONENTS = 16
+
+# Operator policy limits (ActiveBroadcastPolicy, editable in admin) and the
+# ABSOLUTE ceilings no configuration may exceed (docs/ACTIVE_MESSAGES.md,
+# "Bounds"). The ceilings are resource and playout safety, enforced by the
+# services, the admin form and the database.
+DEFAULT_MAX_ACTIVE_MESSAGES = 16
+DEFAULT_MAX_MESSAGE_SECONDS = 300
+DEFAULT_MAX_AGGREGATE_SECONDS = 600
+ABSOLUTE_MAX_ACTIVE_MESSAGES = 24       # one sealed render input each (+ stinger); avg 50 s within 1200 s
+ABSOLUTE_MAX_MESSAGE_SECONDS = 600      # a 10-minute "message" is programming, not an announcement
+ABSOLUTE_MAX_AGGREGATE_SECONDS = 1200   # = the legacy 20-minute cadence: never more PA than programming between plays
 
 
 class ActorKind(models.TextChoices):
@@ -66,8 +76,12 @@ class ActiveBroadcastPolicy(models.Model):
 
     ``generation`` increases by exactly one for every change of what the
     aggregate would contain (activation, replacement, clear, expiry) and for
-    output-affecting policy changes (stinger, the native-airing gate). Replay
-    alone never changes it. An execution carries the generation it was built
+    output-affecting policy changes (stinger, the native-airing gate, the
+    three composition limits). Replay alone never changes it.
+
+    The limits are operator policy within code-level absolute ceilings
+    (ABSOLUTE_MAX_*), enforced by the services, the admin form validators and
+    the database. Media is never truncated to fit a limit. An execution carries the generation it was built
     for; one whose generation is no longer current is stale and never airs.
 
     ``native_airing_enabled`` is the dormant gate: False by default and on
@@ -79,6 +93,24 @@ class ActiveBroadcastPolicy(models.Model):
     generation = models.PositiveBigIntegerField(default=0)
     default_replay_interval_seconds = models.PositiveIntegerField(default=DEFAULT_REPLAY_INTERVAL_SECONDS)
     stinger_key = models.CharField(max_length=64, blank=True, default="")
+    max_active_messages = models.PositiveSmallIntegerField(
+        default=DEFAULT_MAX_ACTIVE_MESSAGES,
+        validators=[MinValueValidator(1), MaxValueValidator(ABSOLUTE_MAX_ACTIVE_MESSAGES)],
+        help_text=(f"How many messages may be active together (all producers, both kinds). "
+                   f"1..{ABSOLUTE_MAX_ACTIVE_MESSAGES}; default {DEFAULT_MAX_ACTIVE_MESSAGES}. Activation beyond it is "
+                   f"refused; an active set above a lowered limit is not aired until messages are cleared."))
+    max_message_seconds = models.PositiveIntegerField(
+        default=DEFAULT_MAX_MESSAGE_SECONDS,
+        validators=[MinValueValidator(1), MaxValueValidator(ABSOLUTE_MAX_MESSAGE_SECONDS)],
+        help_text=(f"Longest single message, in seconds of validated decoded audio. "
+                   f"1..{ABSOLUTE_MAX_MESSAGE_SECONDS}; default {DEFAULT_MAX_MESSAGE_SECONDS}; at most the aggregate "
+                   f"limit. Longer media is refused at binding and activation -- never truncated."))
+    max_aggregate_seconds = models.PositiveIntegerField(
+        default=DEFAULT_MAX_AGGREGATE_SECONDS,
+        validators=[MinValueValidator(1), MaxValueValidator(ABSOLUTE_MAX_AGGREGATE_SECONDS)],
+        help_text=(f"Longest aggregate airing, in seconds: every active message plus the stinger when an urgent "
+                   f"message uses one. 1..{ABSOLUTE_MAX_AGGREGATE_SECONDS}; default {DEFAULT_MAX_AGGREGATE_SECONDS}. "
+                   f"An active set over the limit is not aired (fail closed, operator alert)."))
     updated_at = models.DateTimeField(null=True, blank=True)
     updated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
@@ -99,6 +131,18 @@ class ActiveBroadcastPolicy(models.Model):
                 name="active_policy_interval_bounded"),
             models.CheckConstraint(condition=Q(stinger_key="") | Q(stinger_key__regex=REFERENCE_KEY_PATTERN),
                                    name="active_policy_stinger_key_shape"),
+            models.CheckConstraint(
+                condition=Q(max_active_messages__gte=1) & Q(max_active_messages__lte=ABSOLUTE_MAX_ACTIVE_MESSAGES),
+                name="active_policy_active_limit_bounded"),
+            models.CheckConstraint(
+                condition=Q(max_message_seconds__gte=1) & Q(max_message_seconds__lte=ABSOLUTE_MAX_MESSAGE_SECONDS),
+                name="active_policy_message_limit_bounded"),
+            models.CheckConstraint(
+                condition=Q(max_aggregate_seconds__gte=1) & Q(max_aggregate_seconds__lte=ABSOLUTE_MAX_AGGREGATE_SECONDS),
+                name="active_policy_aggregate_limit_bounded"),
+            models.CheckConstraint(condition=Q(max_message_seconds__lte=models.F("max_aggregate_seconds")),
+                                   name="active_policy_message_within_aggregate",
+                                   violation_error_message="The per-message limit cannot exceed the aggregate limit."),
         ]
 
     def __str__(self):
@@ -349,7 +393,8 @@ class ActiveBroadcastExecution(models.Model):
                 name="active_execution_open_slot_matches_state"),
             models.CheckConstraint(condition=Q(composition_digest__regex=SHA256_PATTERN),
                                    name="active_execution_digest_sha256"),
-            models.CheckConstraint(condition=Q(component_count__gte=1) & Q(component_count__lte=MAX_COMPONENTS),
+            models.CheckConstraint(condition=Q(component_count__gte=1)
+                                   & Q(component_count__lte=ABSOLUTE_MAX_ACTIVE_MESSAGES),
                                    name="active_execution_components_bounded"),
             models.CheckConstraint(condition=Q(policy_generation__gte=1), name="active_execution_generation_positive"),
             models.CheckConstraint(condition=~Q(state__in=_HAS_MIX) | Q(mix_media__isnull=False, ready_at__isnull=False),

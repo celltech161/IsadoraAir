@@ -15,8 +15,12 @@ Rules the code below keeps:
   move. PREPARED messages are changed under their own row lock.
 * ``policy.generation`` increases by exactly one per composition change
   (activation incl. replacement, clear of an active message, an expiry sweep
-  that expires anything, stinger and native-airing changes). Replay never
-  changes it.
+  that expires anything, stinger, native-airing and composition-limit
+  changes). Replay never changes it.
+* An active set that breaks a policy limit (count, per-message, aggregate)
+  is never aired: activation refuses to create it, and materialization /
+  Replay Now fail closed with CompositionIneligible and an operator alert.
+  Media is never truncated to fit.
 * After every generation change, unfinished executions the domain still owns
   (PENDING_RENDER/READY) whose generation is no longer current are SUPPRESSED
   in the same transaction. Executions the engine already holds (D2B) are left
@@ -48,18 +52,17 @@ from production.services import reference_audio, retention
 
 from . import _store, composition
 from .models import (
-    POLICY_ID, PRESTART_DOMAIN_STATES, REPLAY_INTERVAL_MAX_SECONDS, REPLAY_INTERVAL_MIN_SECONDS,
-    TERMINAL_MESSAGE_STATES, UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessage,
-    ActiveBroadcastMessageEvent, ActiveBroadcastPolicy, ActorKind, ExecutionReason, ExecutionState, MessageKind,
-    MessageState,
+    ABSOLUTE_MAX_ACTIVE_MESSAGES, ABSOLUTE_MAX_AGGREGATE_SECONDS, ABSOLUTE_MAX_MESSAGE_SECONDS, POLICY_ID,
+    PRESTART_DOMAIN_STATES, REPLAY_INTERVAL_MAX_SECONDS, REPLAY_INTERVAL_MIN_SECONDS, TERMINAL_MESSAGE_STATES,
+    UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessage, ActiveBroadcastMessageEvent,
+    ActiveBroadcastPolicy, ActorKind, ExecutionReason, ExecutionState, MessageKind, MessageState,
 )
 
 PRODUCE = "active_message.produce"
 CONTROL = "active_message.control"
 
-# Safety bounds (docs/ACTIVE_MESSAGES.md, "Bounds"). Constants, never operator input.
-MAX_MESSAGE_SECONDS = Decimal("300")
-MAX_AGGREGATE_SECONDS = Decimal("900")
+# The composition limits are operator policy on ActiveBroadcastPolicy, within
+# the models' ABSOLUTE_MAX_* ceilings (docs/ACTIVE_MESSAGES.md, "Bounds").
 DETAIL_LIMIT_BYTES = 4096
 TITLE_LIMIT = 200
 REASON_LIMIT = 500
@@ -99,6 +102,15 @@ class MediaRefused(ActiveMessageError):
 
 class LimitExceeded(ActiveMessageError):
     code = "limit_exceeded"
+
+
+class CompositionIneligible(LimitExceeded):
+    """The active set breaks a policy limit, so it is not aired (fail closed).
+    ``detail`` explains which limit and by how much, for the operator."""
+
+    def __init__(self, message: str, *, code: str, detail: dict):
+        super().__init__(message, code=code)
+        self.detail = detail
 
 
 class NothingActive(ActiveMessageError):
@@ -292,7 +304,7 @@ def _expire_locked(policy, now, *, actor_kind):
 
 # -- message media -------------------------------------------------------------------------------
 
-def _check_message_media(media, *, actor, control: bool) -> Decimal:
+def _check_message_media(media, *, actor, control: bool, max_seconds: int) -> Decimal:
     if media.kind == ProductionMedia.KIND_BED:
         raise MediaRefused("station beds are not producer messages", code="bed_not_message")
     if media.owner_id != actor.pk and not control:
@@ -300,9 +312,43 @@ def _check_message_media(media, *, actor, control: bool) -> Decimal:
     duration = media.decoded_duration_seconds
     if duration is None or duration <= 0:
         raise MediaRefused("the media has no measured duration", code="duration_unknown")
-    if duration > MAX_MESSAGE_SECONDS:
-        raise LimitExceeded(f"a message is at most {MAX_MESSAGE_SECONDS} seconds", code="message_too_long")
+    if duration > max_seconds:
+        raise LimitExceeded(f"the media is {duration} s; a message is at most {max_seconds} s "
+                            f"(policy limit; media is never truncated)", code="message_too_long")
     return duration
+
+
+def _check_eligible(policy, messages, stinger_seconds) -> Decimal:
+    """Fail closed unless ``messages`` (an active set, or a candidate one)
+    fits every policy limit. Returns the accounted airtime."""
+    if len(messages) > policy.max_active_messages:
+        raise CompositionIneligible(
+            f"{len(messages)} messages would be active; the limit is {policy.max_active_messages}",
+            code="too_many_active", detail={"active": len(messages), "limit": policy.max_active_messages})
+    for message in sorted(messages, key=lambda candidate: str(candidate.pk)):     # deterministic report
+        duration = message.message_media.decoded_duration_seconds
+        if duration is None or duration <= 0 or duration > policy.max_message_seconds:
+            raise CompositionIneligible(
+                f"message {message.pk} is {duration} s; the per-message limit is {policy.max_message_seconds} s",
+                code="message_too_long",
+                detail={"message": str(message.pk), "seconds": str(duration), "limit": policy.max_message_seconds})
+    total = composition.accounted_seconds(messages, stinger_seconds)
+    if total > policy.max_aggregate_seconds:
+        raise CompositionIneligible(
+            f"the active set is {total} s (stinger included when urgent); the aggregate limit is "
+            f"{policy.max_aggregate_seconds} s",
+            code="aggregate_too_long",
+            detail={"seconds": str(total), "limit": policy.max_aggregate_seconds,
+                    "stinger_seconds": None if stinger_seconds is None else str(stinger_seconds)})
+    return total
+
+
+def _alert_ineligible(exc: CompositionIneligible) -> None:
+    """Operator attention (never history): the active set is not being aired."""
+    from monitoring.models import emit_event
+    emit_event("active_messages", "Active messages: active set exceeds the policy limits and is not aired",
+               level="error", detail={"code": exc.code, "explanation": str(exc), **exc.detail},
+               dedupe_key=f"active_messages|ineligible|{exc.code}")
 
 
 # -- message lifecycle --------------------------------------------------------------------------
@@ -346,7 +392,9 @@ def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
         if row.message_media_id is not None and str(row.message_media_id) == str(media_id):
             return row
         bound = _lock_media(media_id)
-        duration = _check_message_media(bound, actor=actor, control=control)
+        # Early feedback at binding; activation re-checks under the policy lock.
+        duration = _check_message_media(bound, actor=actor, control=control,
+                                        max_seconds=current_policy().max_message_seconds)
         previous = row.message_media_id
         row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.PREPARED, "message_media": previous},
                            values={"message_media": bound})
@@ -414,16 +462,11 @@ def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
         if row.expires_at is not None and row.expires_at <= now:
             raise InvalidTransition("the message has already expired", code="already_expired")
         media = _lock_media(row.message_media_id)
-        duration = media.decoded_duration_seconds
-        if duration is None or duration <= 0 or duration > MAX_MESSAGE_SECONDS:
-            raise LimitExceeded("the message's media is outside the message bounds", code="message_too_long")
-        others = [other for other in _active_messages() if other.pk != previous_id]
-        if len(others) + 1 > composition.MAX_COMPONENTS:
-            raise LimitExceeded(f"at most {composition.MAX_COMPONENTS} messages can be active together",
-                                code="too_many_active")
-        total = duration + sum((other.message_media.decoded_duration_seconds for other in others), Decimal(0))
-        if total > MAX_AGGREGATE_SECONDS:
-            raise LimitExceeded(f"the active set would exceed {MAX_AGGREGATE_SECONDS} seconds", code="aggregate_too_long")
+        row.message_media = media
+        # The active set this activation would produce must fit every policy limit.
+        candidate = [other for other in _active_messages() if other.pk != previous_id] + [row]
+        _pin, _unavailable, stinger_seconds = _stinger(policy, candidate)
+        _check_eligible(policy, candidate, stinger_seconds)
 
         policy = _bump(policy)
         if previous_id:
@@ -497,12 +540,18 @@ def expire_due_messages(*, now=None, actor_kind=ActorKind.SYSTEM) -> list:
 # -- executions ----------------------------------------------------------------------------------
 
 def _stinger(policy, messages):
+    """(pin, unavailable code, validated decoded duration) of the stinger this
+    set would use -- (None, "", None) when no component is urgent or none is
+    configured."""
     if not policy.stinger_key or not any(message.kind == MessageKind.URGENT for message in messages):
-        return None, ""
+        return None, "", None
     try:
-        return reference_audio.current_pin(policy.stinger_key), ""
+        pin = reference_audio.current_pin(policy.stinger_key)
     except reference_audio.ReferenceAudioError as exc:
-        return None, exc.code
+        return None, exc.code, None
+    seconds = (ProductionMedia.objects.filter(pk=pin["media"])
+               .values_list("decoded_duration_seconds", flat=True).first())
+    return pin, "", seconds
 
 
 def _warn_stinger(code, key):
@@ -513,10 +562,12 @@ def _warn_stinger(code, key):
     transaction.on_commit(emit)
 
 
-def _create_execution(policy, messages, *, reason, due_at, now, event, actor_kind, user=None, request_token=None):
-    stinger_pin, unavailable = _stinger(policy, messages)
+def _create_execution(policy, messages, stinger, *, reason, due_at, now, event, actor_kind, user=None,
+                      request_token=None):
+    stinger_pin, unavailable, stinger_seconds = stinger
     try:
-        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable)
+        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable,
+                                     stinger_seconds=stinger_seconds)
     except composition.CompositionError as exc:
         raise LimitExceeded(str(exc), code=exc.code) from None
     digest = composition.digest(snapshot)
@@ -540,8 +591,13 @@ def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
     transaction: an expired message is never in a new airing.
 
     Concurrent callers serialize on the policy lock, and the database allows
-    only one unfinished execution: two workers get the same occurrence."""
+    only one unfinished execution: two workers get the same occurrence.
+
+    An active set that breaks a policy limit is NOT aired: CompositionIneligible
+    is raised (after the expiry/suppression work commits) and an operator
+    alert is raised."""
     now = _now(now)
+    refusal = None
     with transaction.atomic():
         policy = _lock_policy()
         policy, _expired = _expire_locked(policy, now, actor_kind=actor_kind)
@@ -553,8 +609,16 @@ def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
         due = [message.next_due_at for message in messages if message.next_due_at <= now]
         if not due:
             return None
-        return _create_execution(policy, messages, reason=ExecutionReason.SCHEDULED, due_at=min(due), now=now,
-                                 event="execution_materialized", actor_kind=actor_kind)
+        stinger = _stinger(policy, messages)
+        try:
+            _check_eligible(policy, messages, stinger[2])
+        except CompositionIneligible as exc:
+            refusal = exc
+        else:
+            return _create_execution(policy, messages, stinger, reason=ExecutionReason.SCHEDULED, due_at=min(due),
+                                     now=now, event="execution_materialized", actor_kind=actor_kind)
+    _alert_ineligible(refusal)
+    raise refusal
 
 
 def request_manual_replay(*, actor, request_token, now=None):
@@ -567,6 +631,7 @@ def request_manual_replay(*, actor, request_token, now=None):
     except (TypeError, ValueError):
         raise InvalidRequest("request_token is a UUID", code="invalid_request_token") from None
     now = _now(now)
+    refusal = None
     with transaction.atomic():
         policy = _lock_policy()
         prior = _prior_request(token)
@@ -586,22 +651,39 @@ def request_manual_replay(*, actor, request_token, now=None):
         messages = _active_messages()
         if not messages:
             raise NothingActive("no message is active")
-        return _create_execution(policy, messages, reason=ExecutionReason.MANUAL, due_at=now, now=now,
-                                 event="replay_requested", actor_kind=ActorKind.USER, user=actor,
-                                 request_token=token)
+        stinger = _stinger(policy, messages)
+        try:
+            _check_eligible(policy, messages, stinger[2])
+        except CompositionIneligible as exc:
+            refusal = exc
+        else:
+            return _create_execution(policy, messages, stinger, reason=ExecutionReason.MANUAL, due_at=now, now=now,
+                                     event="replay_requested", actor_kind=ActorKind.USER, user=actor,
+                                     request_token=token)
+    _alert_ineligible(refusal)
+    raise refusal
 
 
 def snapshot_active_composition() -> dict:
     """The composition (snapshot + digest + generation) an airing created now
-    would carry. Read-only; takes the policy lock for a consistent view."""
+    would carry, and ``ineligible`` (None, or why the set would not air under
+    the current policy limits). Read-only; takes the policy lock for a
+    consistent view."""
     with transaction.atomic():
         policy = _lock_policy()
         messages = _active_messages()
         if not messages:
-            return {"generation": policy.generation, "snapshot": None, "digest": None}
-        stinger_pin, unavailable = _stinger(policy, messages)
-        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable)
-        return {"generation": policy.generation, "snapshot": snapshot, "digest": composition.digest(snapshot)}
+            return {"generation": policy.generation, "snapshot": None, "digest": None, "ineligible": None}
+        stinger_pin, unavailable, stinger_seconds = _stinger(policy, messages)
+        try:
+            _check_eligible(policy, messages, stinger_seconds)
+            ineligible = None
+        except CompositionIneligible as exc:
+            ineligible = {"code": exc.code, "explanation": str(exc), **exc.detail}
+        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable,
+                                     stinger_seconds=stinger_seconds)
+        return {"generation": policy.generation, "snapshot": snapshot, "digest": composition.digest(snapshot),
+                "ineligible": ineligible}
 
 
 # -- air evidence (applied by the D2B engine path; unreachable in D1) ---------------------------------
@@ -743,6 +825,52 @@ def set_stinger_key(key, *, actor, now=None) -> ActiveBroadcastPolicy:
         policy = _policy_write(policy, actor, now, {"stinger_key": key})
         _event("policy_stinger", generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
                detail={"stinger_key": key, "previous": previous})
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+    return policy
+
+
+LIMIT_CEILINGS = {
+    "max_active_messages": ABSOLUTE_MAX_ACTIVE_MESSAGES,
+    "max_message_seconds": ABSOLUTE_MAX_MESSAGE_SECONDS,
+    "max_aggregate_seconds": ABSOLUTE_MAX_AGGREGATE_SECONDS,
+}
+
+
+def set_limits(*, actor, max_active_messages=None, max_message_seconds=None, max_aggregate_seconds=None,
+               now=None) -> ActiveBroadcastPolicy:
+    """Change the composition limits (control). ``None`` leaves a limit as is.
+
+    Each limit is a whole number 1..its absolute ceiling, and the per-message
+    limit never exceeds the aggregate one. A change can change which active
+    set may air, so it is output-affecting: ONE generation step for the whole
+    call (however many limits change), and still-pending airings built for the
+    old generation are suppressed. Nothing already active is cleared or
+    truncated: a set that no longer fits is simply not aired (fail closed)
+    until an operator clears messages or raises the limit."""
+    _require(actor, CONTROL)
+    requested = {"max_active_messages": max_active_messages, "max_message_seconds": max_message_seconds,
+                 "max_aggregate_seconds": max_aggregate_seconds}
+    for name, value in requested.items():
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= LIMIT_CEILINGS[name]:
+            raise InvalidRequest(f"{name} is a whole number from 1 to {LIMIT_CEILINGS[name]}",
+                                 code="limit_out_of_range")
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        current = {name: getattr(policy, name) for name in requested}
+        merged = {name: current[name] if value is None else value for name, value in requested.items()}
+        if merged["max_message_seconds"] > merged["max_aggregate_seconds"]:
+            raise InvalidRequest("the per-message limit cannot exceed the aggregate limit",
+                                 code="message_exceeds_aggregate")
+        changed = {name: value for name, value in merged.items() if value != current[name]}
+        if not changed:
+            return policy
+        policy = _bump(policy)
+        policy = _policy_write(policy, actor, now, changed)
+        _event("policy_limits", generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
+               detail={"previous": {name: current[name] for name in changed}, "limits": changed})
         _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
     return policy
 

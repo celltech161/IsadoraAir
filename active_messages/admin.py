@@ -1,13 +1,18 @@
-"""Staff-only, READ-ONLY engineering diagnostics for the active-message domain.
+"""Staff-only engineering diagnostics for the active-message domain.
 
-Nothing here changes state: lifecycle, policy and executions change only
-through active_messages.services (the D3 operator surface calls them with
-capability checks). The models refuse every ordinary write regardless.
+Messages, executions and events are READ-ONLY here: they change only through
+active_messages.services. The one configuration surface is the policy's
+composition limits, and even that never writes the model: a valid form is
+handed to ``services.set_limits`` (capability check, absolute ceilings,
+one generation step, stale-airing suppression). The models refuse every
+ordinary write regardless.
 """
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
 from django.urls import reverse
 from django.utils.html import format_html
 
+from . import _store, services
 from .models import ActiveBroadcastExecution, ActiveBroadcastMessage, ActiveBroadcastMessageEvent, ActiveBroadcastPolicy
 
 
@@ -53,10 +58,49 @@ class ExecutionEventInline(EventInline):
     fk_name = "execution"
 
 
+LIMIT_FIELDS = ("max_active_messages", "max_message_seconds", "max_aggregate_seconds")
+
+
 @admin.register(ActiveBroadcastPolicy)
-class ActiveBroadcastPolicyAdmin(ReadOnlyAdmin):
-    list_display = ("id", "generation", "native_airing_enabled", "default_replay_interval_seconds", "stinger_key",
-                    "updated_at", "updated_by_username")
+class ActiveBroadcastPolicyAdmin(admin.ModelAdmin):
+    """The composition limits are editable (through services.set_limits);
+    everything else on the policy is read-only diagnostics."""
+
+    actions = None
+    list_display = ("id", "generation", "native_airing_enabled", "max_active_messages", "max_message_seconds",
+                    "max_aggregate_seconds", "default_replay_interval_seconds", "stinger_key", "updated_at",
+                    "updated_by_username")
+    fields = LIMIT_FIELDS + ("generation", "native_airing_enabled", "default_replay_interval_seconds", "stinger_key",
+                             "updated_at", "updated_by_username")
+    readonly_fields = ("generation", "native_airing_enabled", "default_replay_interval_seconds", "stinger_key",
+                       "updated_at", "updated_by_username")
+
+    def changelist_view(self, request, extra_context=None):
+        _store.ensure_policy()                    # the singleton exists from first sight, with its defaults
+        return super().changelist_view(request, extra_context)
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return super().has_change_permission(request, obj) and services.can(request.user, services.CONTROL)
+
+    def save_model(self, request, obj, form, change):
+        changes = {name: form.cleaned_data[name] for name in LIMIT_FIELDS if name in form.changed_data}
+        if not changes:
+            return
+        try:
+            services.set_limits(actor=request.user, **changes)
+        except services.NotPermitted as exc:
+            raise PermissionDenied(str(exc)) from None
+        except services.InvalidRequest as exc:
+            # The form already validated ceilings and the cross-field rule (the
+            # model's validators and constraints); only a concurrent change gets
+            # here. Nothing was written.
+            self.message_user(request, f"Limits not changed: {exc}", level=messages.ERROR)
 
 
 @admin.register(ActiveBroadcastMessage)

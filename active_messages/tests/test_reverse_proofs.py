@@ -152,3 +152,16 @@ class BindingLockReverseProofTests(Sessions):
         self.assertEqual(ActiveBroadcastMessage.objects.get(pk=message.pk).message_media_id, candidate.pk)
         self.assertIn((str(candidate.pk), "active_messages.ActiveBroadcastMessage", "message_media", 1),
                       reconcile.find_purged_media_still_referenced())
+
+
+class LimitReverseProofTests(Domain, TestCase):
+    def test_without_the_eligibility_check_a_set_over_the_policy_limits_goes_active_and_airs(self):
+        services.set_limits(actor=self.admin, max_active_messages=1)
+        self.active(self.producer)
+        with mock.patch("active_messages.services._check_eligible", return_value=None):
+            self.active(self.producer2)                                    # over the configured count
+            execution = services.materialize_due_execution()
+        self.assertEqual(ActiveBroadcastMessage.objects.filter(state="active").count(), 2)
+        self.assertEqual(execution.component_count, 2)                     # it would air
+        # The real check reports the same set as ineligible:
+        self.assertEqual(services.snapshot_active_composition()["ineligible"]["code"], "too_many_active")
