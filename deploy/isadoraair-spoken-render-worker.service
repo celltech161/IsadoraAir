@@ -18,6 +18,13 @@ Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@
 EnvironmentFile=@@ISA_ROOT@@/.env
 ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py spoken_render_worker
+# Start-up gate (r0109): a start job -- Update Center's `enable --now` included
+# -- completes only if the worker survives its start-up (Django, the database,
+# the start-up projection reconcile) for 10 s; a worker that dies at once
+# fails the start instead of looking active while it restarts. It has no
+# socket: staying active with zero work is its healthy state.
+ExecStartPost=/usr/bin/sleep 10
+TimeoutStartSec=60
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30

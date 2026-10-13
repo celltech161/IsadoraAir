@@ -19,6 +19,13 @@ Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@
 EnvironmentFile=@@ISA_ROOT@@/.env
 ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py production_render_service
+# Readiness gate (r0109): a start job -- Update Center's `enable --now`
+# included -- completes only once the service answers its readiness handshake
+# (production.services.render_health; it binds only after its start-up cleanup
+# and confined toolchain probe). A renderer that cannot become ready fails the
+# start instead of looking active while it restarts.
+ExecStartPost=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py production_render_ready --timeout 60
+TimeoutStartSec=90
 Delegate=cpu memory pids
 DelegateSubgroup=supervisor
 KillMode=control-group
