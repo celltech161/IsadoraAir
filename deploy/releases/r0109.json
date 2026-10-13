@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "release_id": "r0109",
+  "previous_release_id": "r0108",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Phase C spoken-content infrastructure, dormant: spoken item domain and lifecycle, five code-backed recipes with exact provenance, new sandboxed isadoraair-render (one render at a time) and isadoraair-spoken-render-worker, library projection with recall/expiry/detach/reconcile. No spoken type is enabled. Runtime 13 authorizes only those two units; a render-host preflight blocks unsupported hosts first. Additive migrations; Gunicorn+engine+Monitoring restart. Then refresh Runtime Recovery.",
+  "migrations_required": [
+    "production.0002_referenceaudio",
+    "spoken.0001_initial"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [
+    "isadoraair-render.service",
+    "isadoraair-spoken-render-worker.service"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 13,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "54666de3be2f40f453400fca1bd5a14bd6168668b7a360296a82dca134043002",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 11,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0109-primary.json"
+    ]
+  }
+}

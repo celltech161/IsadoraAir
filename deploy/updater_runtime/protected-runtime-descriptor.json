@@ -1,5 +1,5 @@
 {
-  "bundle_sha256": "8ad5ae718598bbe76d23f44bf26bd89f61568b4e378eb62590898a32b52bfb4a",
+  "bundle_sha256": "48e8240507a5322a46024b71df4625cc79cc05e5d4c18ef3326f3ddb3bba1386",
   "entrypoint": "updaterd.py",
   "files": [
     {
@@ -107,8 +107,8 @@
     {
       "mode": "0644",
       "path": "protected-policy.json",
-      "sha256": "8d6d5ea6e4d0487ba5fb2ee244c859ac13c889c7978a150e6040a1411cf374a3",
-      "size_bytes": 1729
+      "sha256": "085c8d57ca7110efd12f1d1ccdea96531c0b8ffce3faaac3738802e069b0dcce",
+      "size_bytes": 1913
     },
     {
       "mode": "0644",
@@ -171,7 +171,7 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 12,
+  "generation": 13,
   "manifest_protocol_version": 5,
   "runtime_version": 11,
   "schema_version": 1,
