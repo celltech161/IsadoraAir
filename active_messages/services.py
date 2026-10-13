@@ -1,0 +1,768 @@
+"""THE active-message authority (iPortal Phase D1).
+
+Every change to the domain happens here, in one transaction per call, with
+one lock order everywhere:
+
+    1. ActiveBroadcastPolicy (the serialization root)
+    2. ActiveBroadcastMessage rows, in UUID order
+    3. ProductionMedia, through retention.lock_for_binding (the binding rule)
+    4. ActiveBroadcastExecution
+
+Rules the code below keeps:
+
+* Every write to an ACTIVE message -- and every change of which messages are
+  active -- holds the policy lock, so under that lock the active set cannot
+  move. PREPARED messages are changed under their own row lock.
+* ``policy.generation`` increases by exactly one per composition change
+  (activation incl. replacement, clear of an active message, an expiry sweep
+  that expires anything, stinger and native-airing changes). Replay never
+  changes it.
+* After every generation change, unfinished executions the domain still owns
+  (PENDING_RENDER/READY) whose generation is no longer current are SUPPRESSED
+  in the same transaction. Executions the engine already holds (D2B) are left
+  to the engine's own authoritative re-read.
+* An execution's composition is frozen at creation. Clear and expiry act on
+  FUTURE airings; nothing here stops audio that is already on air.
+* Every state change appends its event in the same transaction.
+
+D1 contains no renderer and no engine path: executions are created
+PENDING_RENDER and stay there until D2A binds their aggregate. The functions
+that apply engine air evidence (``record_air_completed`` /
+``record_air_interrupted``) exist so the cadence rules are reviewable now;
+nothing in D1 can move an execution to STARTED.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import timedelta
+from decimal import Decimal
+
+from django.db import transaction
+from django.utils import timezone
+
+from authz.evaluator import authorize
+from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from production.models import ProductionMedia
+from production.services import reference_audio, retention
+
+from . import _store, composition
+from .models import (
+    POLICY_ID, PRESTART_DOMAIN_STATES, REPLAY_INTERVAL_MAX_SECONDS, REPLAY_INTERVAL_MIN_SECONDS,
+    TERMINAL_MESSAGE_STATES, UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessage,
+    ActiveBroadcastMessageEvent, ActiveBroadcastPolicy, ActorKind, ExecutionReason, ExecutionState, MessageKind,
+    MessageState,
+)
+
+PRODUCE = "active_message.produce"
+CONTROL = "active_message.control"
+
+# Safety bounds (docs/ACTIVE_MESSAGES.md, "Bounds"). Constants, never operator input.
+MAX_MESSAGE_SECONDS = Decimal("300")
+MAX_AGGREGATE_SECONDS = Decimal("900")
+DETAIL_LIMIT_BYTES = 4096
+TITLE_LIMIT = 200
+REASON_LIMIT = 500
+
+# D2B turns this on together with the engine path. Until then the dormant gate
+# cannot be opened: nothing could air.
+NATIVE_AIRING_AVAILABLE = False
+
+M = MessageState
+X = ExecutionState
+
+
+class ActiveMessageError(Exception):
+    code = "active_message_error"
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        if code:
+            self.code = code
+
+
+class NotPermitted(ActiveMessageError):
+    code = "not_permitted"
+
+
+class InvalidRequest(ActiveMessageError):
+    code = "invalid_request"
+
+
+class InvalidTransition(ActiveMessageError):
+    code = "invalid_transition"
+
+
+class MediaRefused(ActiveMessageError):
+    code = "media_refused"
+
+
+class LimitExceeded(ActiveMessageError):
+    code = "limit_exceeded"
+
+
+class NothingActive(ActiveMessageError):
+    code = "nothing_active"
+
+
+class ExecutionBusy(ActiveMessageError):
+    code = "execution_busy"
+
+
+class EvidenceRefused(ActiveMessageError):
+    code = "evidence_refused"
+
+
+class NativeAiringUnavailable(ActiveMessageError):
+    code = "native_airing_unavailable"
+
+
+# -- small helpers -------------------------------------------------------------------------
+
+def _now(now=None):
+    value = now or timezone.now()
+    if timezone.is_naive(value):
+        raise InvalidRequest("times are timezone-aware")
+    return value
+
+
+def can(user, capability: str) -> bool:
+    return bool(user is not None and authorize(user, capability))
+
+
+def _require(user, capability: str) -> None:
+    if user is None or getattr(user, "pk", None) is None:
+        raise NotPermitted("this action needs an authenticated user", code="unauthenticated")
+    result = authorize(user, capability)
+    if not result:
+        raise NotPermitted(result.reason, code=result.code)
+
+
+def _username(user) -> str:
+    return user.get_username()[:150] if user is not None and getattr(user, "pk", None) is not None else ""
+
+
+def _detail(detail) -> dict:
+    detail = {} if detail is None else detail
+    try:
+        encoded = composition.canonical_json(detail)
+    except (TypeError, ValueError) as exc:
+        raise InvalidRequest(f"event detail is not strict JSON: {exc}") from None
+    if len(encoded.encode()) > DETAIL_LIMIT_BYTES:
+        raise InvalidRequest("event detail exceeds its bound")
+    return json.loads(encoded)
+
+
+def _event(event, *, generation, actor_kind, user=None, message=None, execution=None, from_state="", to_state="",
+           detail=None, request_token=None) -> ActiveBroadcastMessageEvent:
+    return _store.insert(
+        ActiveBroadcastMessageEvent, message=message, execution=execution, event=event, from_state=from_state,
+        to_state=to_state, actor_kind=actor_kind, actor=user if _username(user) else None,
+        actor_username=_username(user), generation=generation, request_token=request_token,
+        detail=_detail(detail))
+
+
+def _iso(value):
+    return None if value is None else value.isoformat()
+
+
+def _aware_future(value, now, label):
+    if value is None:
+        return None
+    if timezone.is_naive(value):
+        raise InvalidRequest(f"{label} must be timezone-aware")
+    if value <= now:
+        raise InvalidRequest(f"{label} must be in the future", code="not_in_future")
+    return value
+
+
+def _message_id(message) -> uuid.UUID:
+    """The message's UUID (from a row or an id); a malformed id is an unknown message."""
+    try:
+        return uuid.UUID(str(getattr(message, "pk", message)))
+    except (TypeError, ValueError, AttributeError):
+        raise InvalidRequest("no such active message", code="unknown_message") from None
+
+
+# -- locks -----------------------------------------------------------------------------------
+
+def _lock_policy() -> ActiveBroadcastPolicy:
+    _store.ensure_policy()
+    return ActiveBroadcastPolicy.objects.select_for_update().get(pk=POLICY_ID)
+
+
+def _lock_message(message) -> ActiveBroadcastMessage:
+    try:
+        return ActiveBroadcastMessage.objects.select_for_update(of=("self",)).get(pk=_message_id(message))
+    except ActiveBroadcastMessage.DoesNotExist:
+        raise InvalidRequest("no such active message", code="unknown_message") from None
+
+
+def _lock_messages(ids) -> dict:
+    """Lock several messages in UUID order (rows are locked as the sorted scan returns them)."""
+    ids = sorted({uuid.UUID(str(value)) for value in ids})
+    rows = ActiveBroadcastMessage.objects.select_for_update(of=("self",)).filter(pk__in=ids).order_by("id")
+    return {row.pk: row for row in rows}
+
+
+def _lock_media(media) -> ProductionMedia:
+    try:
+        return retention.lock_for_binding(media)
+    except MediaPurged:
+        raise MediaRefused("the media's bytes have been purged", code="media_purged") from None
+    except MediaNotValidated:
+        raise MediaRefused("the media has not been validated as valid", code="media_not_valid") from None
+    except MediaInconsistent:
+        raise MediaRefused("no such production media", code="unknown_media") from None
+
+
+def _open_execution():
+    return (ActiveBroadcastExecution.objects.select_for_update(of=("self",))
+            .filter(state__in=UNFINISHED_EXECUTION_STATES).first())
+
+
+def _current_active_id(producer_key, kind, *, exclude):
+    """The producer's ACTIVE message of this kind (the one an activation supersedes)."""
+    return (ActiveBroadcastMessage.objects.filter(state=M.ACTIVE, producer_key=producer_key, kind=kind)
+            .exclude(pk=exclude).values_list("id", flat=True).first())
+
+
+def _prior_request(token):
+    """The event that already resolved this Replay Now request token, if any."""
+    return ActiveBroadcastMessageEvent.objects.select_related("execution").filter(request_token=token).first()
+
+
+def _active_messages():
+    return list(ActiveBroadcastMessage.objects.select_related("message_media").filter(state=M.ACTIVE))
+
+
+# -- generation and staleness ----------------------------------------------------------------
+
+def _bump(policy) -> ActiveBroadcastPolicy:
+    return _store.write(ActiveBroadcastPolicy, POLICY_ID, match={"generation": policy.generation},
+                        values={"generation": policy.generation + 1})
+
+
+def _suppress_stale(policy, *, now, actor_kind, user=None) -> list:
+    """Suppress every domain-owned unfinished execution built for an older generation."""
+    stale = list(ActiveBroadcastExecution.objects.select_for_update(of=("self",))
+                 .filter(state__in=PRESTART_DOMAIN_STATES).exclude(policy_generation=policy.generation)
+                 .order_by("id"))
+    suppressed = []
+    for execution in stale:
+        row = _store.write(
+            ActiveBroadcastExecution, execution.pk,
+            match={"state": execution.state, "policy_generation": execution.policy_generation},
+            values={"state": X.SUPPRESSED, "open_slot": None, "terminal_at": now, "failure_code": "stale_generation",
+                    "failure_detail": f"built for generation {execution.policy_generation}; "
+                                      f"generation {policy.generation} is current"})
+        _event("execution_suppressed", execution=row, from_state=execution.state, to_state=X.SUPPRESSED,
+               generation=policy.generation, actor_kind=actor_kind, user=user,
+               detail={"code": "stale_generation", "built_for": execution.policy_generation})
+        suppressed.append(row)
+    return suppressed
+
+
+def _terminal_message_values(state, *, now, user, reason, superseded_by=None) -> dict:
+    return {"state": state, "state_changed_at": now, "terminal_at": now, "terminal_by": user if _username(user) else None,
+            "terminal_by_username": _username(user), "terminal_reason": reason, "next_due_at": None,
+            "superseded_by": superseded_by}
+
+
+def _expire_locked(policy, now, *, actor_kind):
+    """Expire every ACTIVE message whose expiry has passed (policy lock held).
+    One generation change for the whole sweep."""
+    due = (ActiveBroadcastMessage.objects.filter(state=M.ACTIVE, expires_at__lte=now)
+           .values_list("id", flat=True))
+    rows = [row for row in _lock_messages(list(due)).values()
+            if row.state == M.ACTIVE and row.expires_at is not None and row.expires_at <= now]
+    if not rows:
+        return policy, []
+    policy = _bump(policy)
+    expired = []
+    for row in rows:
+        stored = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.ACTIVE},
+                              values=_terminal_message_values(M.EXPIRED, now=now, user=None, reason="expired"))
+        _event("expired", message=stored, from_state=M.ACTIVE, to_state=M.EXPIRED, generation=policy.generation,
+               actor_kind=actor_kind, detail={"expires_at": _iso(row.expires_at)})
+        expired.append(stored)
+    _suppress_stale(policy, now=now, actor_kind=actor_kind)
+    return policy, expired
+
+
+# -- message media -------------------------------------------------------------------------------
+
+def _check_message_media(media, *, actor, control: bool) -> Decimal:
+    if media.kind == ProductionMedia.KIND_BED:
+        raise MediaRefused("station beds are not producer messages", code="bed_not_message")
+    if media.owner_id != actor.pk and not control:
+        raise MediaRefused("only your own recordings and uploads can be bound", code="not_your_media")
+    duration = media.decoded_duration_seconds
+    if duration is None or duration <= 0:
+        raise MediaRefused("the media has no measured duration", code="duration_unknown")
+    if duration > MAX_MESSAGE_SECONDS:
+        raise LimitExceeded(f"a message is at most {MAX_MESSAGE_SECONDS} seconds", code="message_too_long")
+    return duration
+
+
+# -- message lifecycle --------------------------------------------------------------------------
+
+def prepare_message(*, actor, kind, title="", expires_at=None, now=None) -> ActiveBroadcastMessage:
+    """A new PREPARED message produced by ``actor`` (needs active_message.produce)."""
+    _require(actor, PRODUCE)
+    now = _now(now)
+    if kind not in MessageKind.values:
+        raise InvalidRequest("kind is urgent or public_address", code="invalid_kind")
+    if not isinstance(title, str) or len(title) > TITLE_LIMIT:
+        raise InvalidRequest(f"title is text of at most {TITLE_LIMIT} characters")
+    expires_at = _aware_future(expires_at, now, "expires_at")
+    with transaction.atomic():
+        _store.ensure_policy()
+        generation = ActiveBroadcastPolicy.objects.values_list("generation", flat=True).get(pk=POLICY_ID)
+        row = _store.insert(
+            ActiveBroadcastMessage, id=uuid.uuid4(), kind=kind, state=M.PREPARED, title=title, producer=actor,
+            producer_key=f"user:{actor.pk}", producer_username=_username(actor), expires_at=expires_at,
+            state_changed_at=now)
+        _event("prepared", message=row, to_state=M.PREPARED, generation=generation, actor_kind=ActorKind.USER,
+               user=actor, detail={"kind": kind, "expires_at": _iso(expires_at)})
+    return row
+
+
+def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
+    """Bind (or replace) the exact media a PREPARED message will air.
+
+    Only the producer -- or a control-capable operator -- binds, and only to
+    a PREPARED message: an ACTIVE message's media is immutable. Rebinding the
+    same media is a no-op."""
+    _require(actor, PRODUCE)
+    media_id = getattr(media, "pk", media)
+    with transaction.atomic():
+        row = _lock_message(message)
+        if row.state != M.PREPARED:
+            raise InvalidTransition(f"a {row.state} message's media cannot change", code="media_immutable")
+        control = can(actor, CONTROL)
+        if row.producer_id != actor.pk and not control:
+            raise NotPermitted("only the producer binds media to a prepared message")
+        if row.message_media_id is not None and str(row.message_media_id) == str(media_id):
+            return row
+        bound = _lock_media(media_id)
+        duration = _check_message_media(bound, actor=actor, control=control)
+        previous = row.message_media_id
+        row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.PREPARED, "message_media": previous},
+                           values={"message_media": bound})
+        generation = ActiveBroadcastPolicy.objects.values_list("generation", flat=True).get(pk=POLICY_ID)
+        _event("media_bound", message=row, from_state=M.PREPARED, to_state=M.PREPARED, generation=generation,
+               actor_kind=ActorKind.USER, user=actor,
+               detail={"media": str(bound.pk), "sha256": bound.sha256, "duration_seconds": str(duration),
+                       "replaced": None if previous is None else str(previous)})
+    return row
+
+
+def set_message_expiry(message, expires_at, *, actor, now=None) -> ActiveBroadcastMessage:
+    """Set or remove a message's expiry. PREPARED: its producer or a
+    control-capable operator. ACTIVE: control only (the composition does not
+    change until the expiry sweep actually expires it). To end a message now,
+    clear it."""
+    now = _now(now)
+    expires_at = _aware_future(expires_at, now, "expires_at")
+    if not can(actor, CONTROL):
+        _require(actor, PRODUCE)
+    with transaction.atomic():
+        policy = _lock_policy()
+        row = _lock_message(message)
+        if row.state == M.ACTIVE:
+            _require(actor, CONTROL)
+        elif row.state == M.PREPARED:
+            if row.producer_id != actor.pk and not can(actor, CONTROL):
+                raise NotPermitted("only the producer changes a prepared message")
+        else:
+            raise InvalidTransition(f"a {row.state} message is final", code="terminal")
+        if row.expires_at == expires_at:
+            return row
+        previous = row.expires_at
+        row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": row.state, "expires_at": previous},
+                           values={"expires_at": expires_at})
+        _event("expiry_set", message=row, from_state=row.state, to_state=row.state, generation=policy.generation,
+               actor_kind=ActorKind.USER, user=actor,
+               detail={"expires_at": _iso(expires_at), "previous": _iso(previous)})
+    return row
+
+
+def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
+    """PREPARED -> ACTIVE (control). Atomically supersedes the same producer's
+    ACTIVE message of the same kind. The new message is due immediately (it
+    airs at the next safe program boundary once D2 exists). Idempotent: an
+    already-ACTIVE message is returned unchanged."""
+    _require(actor, CONTROL)
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        target = (ActiveBroadcastMessage.objects.filter(pk=_message_id(message))
+                  .values("producer_key", "kind").first())
+        if target is None:
+            raise InvalidRequest("no such active message", code="unknown_message")
+        # Under the policy lock the active set cannot change, and producer_key/kind never change.
+        previous_id = _current_active_id(target["producer_key"], target["kind"], exclude=_message_id(message))
+        rows = _lock_messages([_message_id(message)] + ([previous_id] if previous_id else []))
+        row = rows[_message_id(message)]
+        if row.state == M.ACTIVE:
+            return row
+        if row.state != M.PREPARED:
+            raise InvalidTransition(f"a {row.state} message cannot be activated", code="terminal")
+        if row.message_media_id is None:
+            raise InvalidTransition("bind the message's media first", code="media_required")
+        if row.expires_at is not None and row.expires_at <= now:
+            raise InvalidTransition("the message has already expired", code="already_expired")
+        media = _lock_media(row.message_media_id)
+        duration = media.decoded_duration_seconds
+        if duration is None or duration <= 0 or duration > MAX_MESSAGE_SECONDS:
+            raise LimitExceeded("the message's media is outside the message bounds", code="message_too_long")
+        others = [other for other in _active_messages() if other.pk != previous_id]
+        if len(others) + 1 > composition.MAX_COMPONENTS:
+            raise LimitExceeded(f"at most {composition.MAX_COMPONENTS} messages can be active together",
+                                code="too_many_active")
+        total = duration + sum((other.message_media.decoded_duration_seconds for other in others), Decimal(0))
+        if total > MAX_AGGREGATE_SECONDS:
+            raise LimitExceeded(f"the active set would exceed {MAX_AGGREGATE_SECONDS} seconds", code="aggregate_too_long")
+
+        policy = _bump(policy)
+        if previous_id:
+            previous = _store.write(
+                ActiveBroadcastMessage, previous_id, match={"state": M.ACTIVE},
+                values=_terminal_message_values(M.CLEARED, now=now, user=actor, reason="superseded",
+                                                superseded_by=row.pk))
+            _event("superseded", message=previous, from_state=M.ACTIVE, to_state=M.CLEARED,
+                   generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
+                   detail={"superseded_by": str(row.pk)})
+        row = _store.write(
+            ActiveBroadcastMessage, row.pk, match={"state": M.PREPARED, "message_media": media.pk},
+            values={"state": M.ACTIVE, "state_changed_at": now, "activation_generation": policy.generation,
+                    "activated_by": actor, "activated_by_username": _username(actor), "activated_at": now,
+                    "replay_interval_seconds": policy.default_replay_interval_seconds, "next_due_at": now})
+        _event("activated", message=row, from_state=M.PREPARED, to_state=M.ACTIVE, generation=policy.generation,
+               actor_kind=ActorKind.USER, user=actor,
+               detail={"media": str(media.pk), "sha256": media.sha256,
+                       "replay_interval_seconds": policy.default_replay_interval_seconds,
+                       "supersedes": None if previous_id is None else str(previous_id)})
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+    return row
+
+
+def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMessage:
+    """Clear exactly this message (never "the producer's current one").
+
+    ACTIVE -> CLEARED (control): a new generation; it is in no future airing.
+    An airing already on air is not cut (that is the engine's, D2B).
+    PREPARED -> CLEARED (discard): its producer or a control-capable operator;
+    the composition does not change.
+    Idempotent: a cleared or expired message is returned unchanged."""
+    if not (can(actor, PRODUCE) or can(actor, CONTROL)):
+        _require(actor, CONTROL)
+    if not isinstance(reason, str) or len(reason) > REASON_LIMIT:
+        raise InvalidRequest(f"reason is text of at most {REASON_LIMIT} characters")
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        row = _lock_message(message)
+        if row.state in TERMINAL_MESSAGE_STATES:
+            return row
+        if row.state == M.PREPARED:
+            if row.producer_id != actor.pk and not can(actor, CONTROL):
+                raise NotPermitted("only the producer discards a prepared message")
+            row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.PREPARED},
+                               values=_terminal_message_values(M.CLEARED, now=now, user=actor, reason=reason))
+            _event("discarded", message=row, from_state=M.PREPARED, to_state=M.CLEARED, generation=policy.generation,
+                   actor_kind=ActorKind.USER, user=actor, detail={"reason": reason})
+            return row
+        _require(actor, CONTROL)
+        policy = _bump(policy)
+        row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.ACTIVE},
+                           values=_terminal_message_values(M.CLEARED, now=now, user=actor, reason=reason))
+        _event("cleared", message=row, from_state=M.ACTIVE, to_state=M.CLEARED, generation=policy.generation,
+               actor_kind=ActorKind.USER, user=actor, detail={"reason": reason})
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+    return row
+
+
+def expire_due_messages(*, now=None, actor_kind=ActorKind.SYSTEM) -> list:
+    """The expiry sweep: every ACTIVE message whose expiry has passed becomes
+    EXPIRED (one generation change for the sweep). Returns the expired rows."""
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        _policy, expired = _expire_locked(policy, now, actor_kind=actor_kind)
+    return expired
+
+
+# -- executions ----------------------------------------------------------------------------------
+
+def _stinger(policy, messages):
+    if not policy.stinger_key or not any(message.kind == MessageKind.URGENT for message in messages):
+        return None, ""
+    try:
+        return reference_audio.current_pin(policy.stinger_key), ""
+    except reference_audio.ReferenceAudioError as exc:
+        return None, exc.code
+
+
+def _warn_stinger(code, key):
+    def emit():
+        from monitoring.models import emit_event
+        emit_event("active_messages", "Active messages: stinger unavailable", level="warning",
+                   detail={"stinger_key": key, "code": code}, dedupe_key=f"active_messages|stinger|{code}")
+    transaction.on_commit(emit)
+
+
+def _create_execution(policy, messages, *, reason, due_at, now, event, actor_kind, user=None, request_token=None):
+    stinger_pin, unavailable = _stinger(policy, messages)
+    try:
+        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable)
+    except composition.CompositionError as exc:
+        raise LimitExceeded(str(exc), code=exc.code) from None
+    digest = composition.digest(snapshot)
+    execution = _store.insert(
+        ActiveBroadcastExecution, id=uuid.uuid4(), reason=reason, state=X.PENDING_RENDER, open_slot=1,
+        policy_generation=policy.generation, composition_digest=digest, composition_snapshot=snapshot,
+        component_count=len(snapshot["components"]), requested_by=user if _username(user) else None,
+        requested_by_username=_username(user), due_at=due_at)
+    _event(event, execution=execution, to_state=X.PENDING_RENDER, generation=policy.generation, actor_kind=actor_kind,
+           user=user, request_token=request_token,
+           detail={"reason": reason, "digest": digest, "components": len(snapshot["components"]),
+                   "stinger_unavailable": unavailable or None})
+    if unavailable:
+        _warn_stinger(unavailable, policy.stinger_key)
+    return execution
+
+
+def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
+    """Create the one due airing if the active set is due, else return the
+    unfinished one (coalesced), else None. Expiry runs first, in the same
+    transaction: an expired message is never in a new airing.
+
+    Concurrent callers serialize on the policy lock, and the database allows
+    only one unfinished execution: two workers get the same occurrence."""
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        policy, _expired = _expire_locked(policy, now, actor_kind=actor_kind)
+        _suppress_stale(policy, now=now, actor_kind=actor_kind)
+        unfinished = _open_execution()
+        if unfinished is not None:
+            return unfinished
+        messages = _active_messages()
+        due = [message.next_due_at for message in messages if message.next_due_at <= now]
+        if not due:
+            return None
+        return _create_execution(policy, messages, reason=ExecutionReason.SCHEDULED, due_at=min(due), now=now,
+                                 event="execution_materialized", actor_kind=actor_kind)
+
+
+def request_manual_replay(*, actor, request_token, now=None):
+    """Replay Now (control), idempotent on ``request_token`` (a client UUID):
+    the same token always resolves to the same execution. An unfinished
+    airing of the CURRENT composition absorbs the request (no second airing)."""
+    _require(actor, CONTROL)
+    try:
+        token = uuid.UUID(str(request_token))
+    except (TypeError, ValueError):
+        raise InvalidRequest("request_token is a UUID", code="invalid_request_token") from None
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        prior = _prior_request(token)
+        if prior is not None:
+            if prior.actor_id != actor.pk:
+                raise InvalidRequest("that request token belongs to another request", code="request_token_conflict")
+            return prior.execution
+        policy, _expired = _expire_locked(policy, now, actor_kind=ActorKind.SYSTEM)
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+        unfinished = _open_execution()
+        if unfinished is not None:
+            if unfinished.policy_generation != policy.generation:
+                raise ExecutionBusy("an airing of an earlier composition is still with the engine")
+            _event("replay_coalesced", execution=unfinished, generation=policy.generation, actor_kind=ActorKind.USER,
+                   user=actor, request_token=token, detail={"state": unfinished.state})
+            return unfinished
+        messages = _active_messages()
+        if not messages:
+            raise NothingActive("no message is active")
+        return _create_execution(policy, messages, reason=ExecutionReason.MANUAL, due_at=now, now=now,
+                                 event="replay_requested", actor_kind=ActorKind.USER, user=actor,
+                                 request_token=token)
+
+
+def snapshot_active_composition() -> dict:
+    """The composition (snapshot + digest + generation) an airing created now
+    would carry. Read-only; takes the policy lock for a consistent view."""
+    with transaction.atomic():
+        policy = _lock_policy()
+        messages = _active_messages()
+        if not messages:
+            return {"generation": policy.generation, "snapshot": None, "digest": None}
+        stinger_pin, unavailable = _stinger(policy, messages)
+        snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable)
+        return {"generation": policy.generation, "snapshot": snapshot, "digest": composition.digest(snapshot)}
+
+
+# -- air evidence (applied by the D2B engine path; unreachable in D1) ---------------------------------
+
+def _lock_for_evidence(execution):
+    """Lock order: policy -> the airing's messages (UUID order) -> execution."""
+    policy = _lock_policy()
+    snapshot = (ActiveBroadcastExecution.objects.filter(pk=getattr(execution, "pk", execution))
+                .values_list("composition_snapshot", flat=True).first())
+    if snapshot is None:
+        raise InvalidRequest("no such execution", code="unknown_execution")
+    messages = _lock_messages(composition.message_ids(snapshot))
+    row = (ActiveBroadcastExecution.objects.select_for_update(of=("self",))
+           .get(pk=getattr(execution, "pk", execution)))
+    return policy, messages, row
+
+
+def _apply_cadence(policy, execution, messages, *, anchor, completed, actor_kind):
+    """Each still-ACTIVE participant is next due one interval after the
+    airing's last air evidence. Messages activated after the airing was built
+    keep their own due time (they were not in it)."""
+    for message in messages.values():
+        if message.state != M.ACTIVE:
+            continue
+        values = {"next_due_at": anchor + timedelta(seconds=message.replay_interval_seconds)}
+        if completed:
+            values["last_completed_at"] = anchor
+        stored = _store.write(ActiveBroadcastMessage, message.pk, match={"state": M.ACTIVE}, values=values)
+        _event("aired" if completed else "air_interrupted", message=stored, execution=execution,
+               generation=policy.generation, actor_kind=actor_kind,
+               detail={"next_due_at": _iso(stored.next_due_at)})
+
+
+def _check_evidence(row, attempt_token, ended_at, duration):
+    if row.attempt_token is None or str(row.attempt_token) != str(attempt_token):
+        raise EvidenceRefused("the evidence is not from the execution's current attempt", code="attempt_mismatch")
+    if ended_at is None or timezone.is_naive(ended_at) or ended_at < row.started_at:
+        raise EvidenceRefused("the air evidence ends before it started", code="evidence_order")
+    if duration is not None and (not isinstance(duration, Decimal) or duration < 0):
+        raise EvidenceRefused("confirmed duration is a non-negative Decimal", code="evidence_duration")
+
+
+def record_air_completed(execution, *, attempt_token, ended_at, confirmed_duration_seconds, now=None,
+                         actor_kind=ActorKind.ENGINE):
+    """STARTED -> COMPLETED from a clean end of the aggregate, then the cadence:
+    every still-active participant is next due ``ended_at + its interval``
+    (completed-air-to-next-due). Idempotent for the same attempt."""
+    now = _now(now)
+    with transaction.atomic():
+        policy, messages, row = _lock_for_evidence(execution)
+        if row.state == X.COMPLETED and str(row.attempt_token) == str(attempt_token):
+            return row
+        if row.state != X.STARTED:
+            raise InvalidTransition(f"a {row.state} execution cannot complete", code="not_on_air")
+        _check_evidence(row, attempt_token, ended_at, confirmed_duration_seconds)
+        if confirmed_duration_seconds is None:
+            raise EvidenceRefused("completion needs the confirmed duration", code="evidence_duration")
+        row = _store.write(ActiveBroadcastExecution, row.pk, match={"state": X.STARTED, "attempt_token": row.attempt_token},
+                           values={"state": X.COMPLETED, "open_slot": None, "ended_at": ended_at, "terminal_at": now,
+                                   "confirmed_duration_seconds": confirmed_duration_seconds})
+        _event("air_completed", execution=row, from_state=X.STARTED, to_state=X.COMPLETED, generation=policy.generation,
+               actor_kind=actor_kind, detail={"ended_at": _iso(ended_at),
+                                              "confirmed_duration_seconds": str(confirmed_duration_seconds)})
+        _apply_cadence(policy, row, messages, anchor=ended_at, completed=True, actor_kind=actor_kind)
+    return row
+
+
+def record_air_interrupted(execution, *, attempt_token, last_evidence_at, confirmed_duration_seconds=None, now=None,
+                           actor_kind=ActorKind.ENGINE):
+    """STARTED -> INTERRUPTED (the airing really began but did not end
+    cleanly, e.g. an engine restart). No immediate re-airing: participants are
+    next due one interval after the last air evidence."""
+    now = _now(now)
+    with transaction.atomic():
+        policy, messages, row = _lock_for_evidence(execution)
+        if row.state == X.INTERRUPTED and str(row.attempt_token) == str(attempt_token):
+            return row
+        if row.state != X.STARTED:
+            raise InvalidTransition(f"a {row.state} execution cannot be interrupted", code="not_on_air")
+        _check_evidence(row, attempt_token, last_evidence_at, confirmed_duration_seconds)
+        row = _store.write(ActiveBroadcastExecution, row.pk, match={"state": X.STARTED, "attempt_token": row.attempt_token},
+                           values={"state": X.INTERRUPTED, "open_slot": None, "ended_at": last_evidence_at,
+                                   "terminal_at": now, "confirmed_duration_seconds": confirmed_duration_seconds})
+        _event("air_interrupted", execution=row, from_state=X.STARTED, to_state=X.INTERRUPTED,
+               generation=policy.generation, actor_kind=actor_kind,
+               detail={"last_evidence_at": _iso(last_evidence_at)})
+        _apply_cadence(policy, row, messages, anchor=last_evidence_at, completed=False, actor_kind=actor_kind)
+    return row
+
+
+# -- policy --------------------------------------------------------------------------------------
+
+def current_policy() -> ActiveBroadcastPolicy:
+    _store.ensure_policy()
+    return ActiveBroadcastPolicy.objects.get(pk=POLICY_ID)
+
+
+def _policy_write(policy, actor, now, values) -> ActiveBroadcastPolicy:
+    return _store.write(ActiveBroadcastPolicy, POLICY_ID, match={"generation": policy.generation},
+                        values={**values, "updated_at": now, "updated_by": actor,
+                                "updated_by_username": _username(actor)})
+
+
+def set_default_replay_interval(seconds, *, actor, now=None) -> ActiveBroadcastPolicy:
+    """The interval NEW activations snapshot. Active messages keep theirs; the
+    composition does not change, so neither does the generation."""
+    _require(actor, CONTROL)
+    if (not isinstance(seconds, int) or isinstance(seconds, bool)
+            or not REPLAY_INTERVAL_MIN_SECONDS <= seconds <= REPLAY_INTERVAL_MAX_SECONDS):
+        raise InvalidRequest(f"the interval is {REPLAY_INTERVAL_MIN_SECONDS}..{REPLAY_INTERVAL_MAX_SECONDS} seconds")
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        if policy.default_replay_interval_seconds == seconds:
+            return policy
+        previous = policy.default_replay_interval_seconds
+        policy = _policy_write(policy, actor, now, {"default_replay_interval_seconds": seconds})
+        _event("policy_replay_interval", generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
+               detail={"seconds": seconds, "previous": previous})
+    return policy
+
+
+def set_stinger_key(key, *, actor, now=None) -> ActiveBroadcastPolicy:
+    """Name the ReferenceAudio key whose current registration precedes urgent
+    aggregates ("" for none). Output-affecting: a new generation."""
+    _require(actor, CONTROL)
+    if key != "":
+        try:
+            reference_audio.check_key(key)
+        except reference_audio.ReferenceAudioError as exc:
+            raise InvalidRequest(str(exc), code=exc.code) from None
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        if policy.stinger_key == key:
+            return policy
+        previous = policy.stinger_key
+        policy = _bump(policy)
+        policy = _policy_write(policy, actor, now, {"stinger_key": key})
+        _event("policy_stinger", generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
+               detail={"stinger_key": key, "previous": previous})
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+    return policy
+
+
+def set_native_airing(enabled: bool, *, actor, now=None) -> ActiveBroadcastPolicy:
+    """The dormant gate. It cannot be opened before D2B
+    (NATIVE_AIRING_AVAILABLE); closing it is a new generation."""
+    _require(actor, CONTROL)
+    if not isinstance(enabled, bool):
+        raise InvalidRequest("enabled is a boolean")
+    if enabled and not NATIVE_AIRING_AVAILABLE:
+        raise NativeAiringUnavailable("native airing is not available in this release; OGRemote stays authoritative")
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        if policy.native_airing_enabled == enabled:
+            return policy
+        policy = _bump(policy)
+        policy = _policy_write(policy, actor, now, {"native_airing_enabled": enabled})
+        _event("policy_native_airing", generation=policy.generation, actor_kind=ActorKind.USER, user=actor,
+               detail={"enabled": enabled})
+        _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
+    return policy

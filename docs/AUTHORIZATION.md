@@ -393,6 +393,8 @@ this document.
 | `monitoring.restart_service` | no | **yes** (2.5A) |
 | `monitoring.reset_listener_counters` | no | **yes** (2.5D) — peak/TLH resets |
 | `aircheck.control` | no | **yes** (2.5D) — start/stop Aircheck recording |
+| `active_message.produce` | no | **yes** (2.22D1) — prepare urgent/public-address messages, bind media (`active_messages.services`; see docs/ACTIVE_MESSAGES.md) |
+| `active_message.control` | no | **yes** (2.22D1) — activate, Replay Now, clear, expiry, domain policy |
 | `system.administer` | no | no (reserved; nothing is gated on it yet) |
 
 **Vocabulary correction in 2.5C** (`authz.migrations.0006_correct_remote_host_
@@ -726,7 +728,7 @@ endpoint with no other check at all:
    `api_track_repick_cue_points`, and the three blocked-slot toggle
    endpoints. Now requires `library.manage_tracks`.
 
-## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006` and `authz.0007`)
+## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006` and `authz.0007`; extended by `authz.0008`)
 
 | Role | Bound Group | Capabilities |
 |---|---|---|
@@ -742,6 +744,10 @@ Station Administrator and grants that Role both new 2.5D capabilities,
 `monitoring.reset_listener_counters` and `aircheck.control`. Remote Host
 receives neither new administrative capability. The resulting Station
 Administrator seed contains the complete capability vocabulary.
+
+`authz.0008` (iPortal Phase D1) adds `active_message.produce` and
+`active_message.control` to Station Administrator only; Remote Host and
+Contributor receive neither.
 
 The seed migration only binds `GroupRole` rows for `Contributor` and
 `remote_dj` because those are the only groups with real, existing

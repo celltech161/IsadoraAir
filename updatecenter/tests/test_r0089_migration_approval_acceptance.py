@@ -44,13 +44,14 @@ R0092_LIBRARY_LEAF = ("library", "0085_remote_dj_queue_set_next_access")
 
 
 def _r0092_leaf_nodes(nodes, graph=None):
-    """The r0092 tree: library and updatecenter at their r0092 leaves; apps
-    that did not exist then and depend on later library migrations (2.22C:
-    spoken) are left out."""
+    """The r0092 tree: library, updatecenter and authz at their r0092 leaves
+    (2.22D1 added authz.0008); apps that did not exist then and depend on
+    later library migrations (2.22C: spoken) are left out."""
     if graph is None:
         graph = MigrationExecutor(connection).loader.graph
     return hold_dependents(graph, nodes, {"library": R0092_LIBRARY_LEAF[1],
-                                          "updatecenter": "0003_updatejob_migration_plan_review_and_more"},
+                                          "updatecenter": "0003_updatejob_migration_plan_review_and_more",
+                                          "authz": "0007_authorization_closeout_capabilities"},
                            drop_unapplied=True)
 
 

@@ -91,8 +91,9 @@ class LivePlanClassificationTests(TransactionTestCase):
             # so unapplying production also unapplies it; production.0001 is
             # still planned first and judged on its own.
             self.assertEqual(refs[0], REF)
+            # 2.22D1: and active_messages.0001, which depends on production.0002.
             self.assertEqual(set(refs) - {REF}, {"library.0089_voicetrack_media", "production.0002_referenceaudio",
-                                                 "spoken.0001_initial"})
+                                                 "spoken.0001_initial", "active_messages.0001_initial"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])

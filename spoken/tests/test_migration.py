@@ -89,7 +89,10 @@ class LivePlanClassificationTests(TransactionTestCase):
         call_command("migrate", "production", "0001", verbosity=0)
         try:
             payload = probe.build_probe_payload()
-            self.assertEqual([item["ref"] for item in payload["plan"]], REFS)
+            # 2.22D1: active_messages.0001 depends on production.0002, so unapplying
+            # production.0002 unapplies it too (it has its own classifier test).
+            self.assertEqual([item["ref"] for item in payload["plan"]],
+                             ["production.0002_referenceaudio", "active_messages.0001_initial", "spoken.0001_initial"])
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
             for item in payload["plan"]:

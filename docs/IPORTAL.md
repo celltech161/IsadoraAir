@@ -9,7 +9,7 @@ without giving either a shared workflow.
 | Shared (production app) | Not shared (each domain owns it) |
 | --- | --- |
 | `ProductionMedia`: immutable, validated bytes | evergreen VoiceTrack identity and lifecycle |
-| the recorder/editor and its upload/import intake | (later) occurrence VoiceTrack, produced content, active messages |
+| the recorder/editor and its upload/import intake | (later) occurrence VoiceTrack, produced content, active messages (docs/ACTIVE_MESSAGES.md) |
 | validation, now OS-confined | what "save" / "remove" mean for the domain |
 | preview / range / export via the safe open | authorization rules for the domain |
 | derivation provenance, retention foundation | |
