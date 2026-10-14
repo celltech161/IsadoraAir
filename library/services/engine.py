@@ -137,6 +137,8 @@ CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 # iPortal D2B: this engine process's identity for native active-message
 # claims (a previous process's accepted/claimed attempt is rotated at start-up).
 ENGINE_INSTANCE = uuid.uuid4().hex
+# A native not-aired report that could not be recorded is retried no sooner.
+ACTIVE_MESSAGE_REPORT_RETRY_SECONDS = 3.0
 # Urgent insertions that keep emergency priority over a native urgent/PA
 # aggregate waiting at the same boundary (Weather and AMBER share WxAlert).
 EMERGENCY_URGENT_CATEGORY_CODES = frozenset({"WxAlert"})
@@ -1975,6 +1977,10 @@ class PlaybackEngine:
         # Checked by _next_queue_item BEFORE normal cursor logic.
         self._forced_next_items = []
         self._urgent_retry_counts = {}  # {category_code: count} -- per-category, not shared
+        # iPortal D2B: native LogItems this process inserted and has not yet
+        # handed to a deck ({log_item_id: attempt}); one that leaves the queue
+        # unaired is reported to the active-message domain.
+        self._active_message_held = {}
         # Sub-second program-artifact transport evidence. Streaming callbacks only replace
         # tiny in-memory snapshots; the independent sampler owns every procfs
         # read and tmpfs append/rotation operation.
@@ -6420,6 +6426,7 @@ class PlaybackEngine:
                 dedupe_key=f"engine|skip|item={item.id}",
             )
             self._queue_cursor += 1
+            self._note_active_message_discard(item)
         return None
 
     def _next_queue_item(self):
@@ -6473,6 +6480,7 @@ class PlaybackEngine:
                     detail={"log_item_id": item.id, "reason": reason},
                     dedupe_key=f"engine|skip-forced|item={item.id}",
                 )
+                self._note_active_message_discard(item)
                 continue
             if (
                 self.current_log and item.playlist_log_id == self.current_log.id
@@ -6523,6 +6531,7 @@ class PlaybackEngine:
                 },
                 dedupe_key=f"engine|skip|item={item.id}",
             )
+            self._note_active_message_discard(item)
 
     def _get_upcoming_preview(self):
         """Every remaining item in the current hour's log — however many
@@ -6635,10 +6644,14 @@ class PlaybackEngine:
                 return
 
         self._next_triggered = False
+        # iPortal D2B: from here a native item is the deck path's (claimed at
+        # deck open) -- no longer an unaired queue entry.
+        native_held = self.__dict__.get("_active_message_held", {}).pop(log_item.id, None) is not None
         deck = self._create_deck(slot, log_item)
         if deck is None:
             # File missing — move on to whatever's after it for this slot.
-            self._report_active_message_not_opened(log_item)
+            if native_held or _active_message_candidate(getattr(log_item, "track", None)):
+                self._report_active_message_left(log_item.id, "deck_not_opened")
             self._start_next_track(slot=slot)
             return
 
@@ -9602,6 +9615,7 @@ class PlaybackEngine:
         if forced:
             self._queue_cursor += 1
             self._forced_next_items.insert(_leading_emergency(self._forced_next_items), native_item)
+        self.__dict__.setdefault("_active_message_held", {})[native_item.id] = str(admission.attempt)
         print(f"  Inserted native urgent/PA aggregate at queue position {insert_at}: {admission.track.title}")
         getattr(self, "_active_message_retry_counts", {}).pop(data.get("attempt"), None)
 
@@ -9620,23 +9634,58 @@ class PlaybackEngine:
             return                       # the worker re-sends a command never accepted
         GLib.timeout_add_seconds(1, lambda: self._insert_active_message(data) or False)
 
-    def _report_active_message_not_opened(self, log_item):
-        """A native aggregate's deck was not opened (refused or failed):
-        let the domain re-send its airing, or nothing if it went stale."""
-        track = getattr(log_item, "track", None)
-        if log_item is None or not isinstance(log_item, LogItem) or not _active_message_candidate(track):
+    def _note_active_message_discard(self, item):
+        """A queue item was just discarded as unplayable. Report it to the
+        active-message domain if it is (or may be) a native insertion: one this
+        process inserted, a native-named Track, or a Track-less ghost (the
+        domain correlates by the insertion's LogItem snapshot). Ordinary
+        skipped Tracks are untouched -- no lookup, no change."""
+        if item is None or not isinstance(item, LogItem):
             return
-        GLib.idle_add(self._report_active_message_not_opened_now, log_item.id)
+        held = item.id in self.__dict__.get("_active_message_held", {})
+        track = getattr(item, "track", None) if item.track_id is not None else None
+        if held or item.track_id is None or _active_message_candidate(track):
+            self._report_active_message_left(item.id, "discarded")
 
-    @_glib_safe(default_return=False)
-    def _report_active_message_not_opened_now(self, log_item_id):
+    def _report_active_message_left(self, log_item_id, stage):
+        """Positive evidence that a native LogItem left this process's queue
+        unaired (see active_messages.playout.report_not_aired). Non-fatal and
+        retried: until the domain has recorded it the item stays held, so the
+        queue sweep reports it again."""
         from active_messages import playout as active_playout
+        held = self.__dict__.setdefault("_active_message_held", {})
         try:
             _close_old_connections()
-            active_playout.report_not_opened(log_item_id)
-        except Exception as exc:  # noqa: BLE001 -- the worker's evidence pass recovers
-            print(f"  Native urgent/PA re-send failed (non-fatal): {exc}")
-        return False
+            outcome = active_playout.report_not_aired(log_item_id, ENGINE_INSTANCE, stage=stage)
+        except Exception as exc:  # noqa: BLE001 -- the sweep retries
+            held.setdefault(log_item_id, None)
+            # Bounded: the sweep retries no sooner than the queue reload would.
+            self._active_message_report_retry_at = time.monotonic() + ACTIVE_MESSAGE_REPORT_RETRY_SECONDS
+            print(f"  Native urgent/PA not-aired report failed (retrying): {exc}")
+            return False
+        held.pop(log_item_id, None)
+        if outcome != "unknown":
+            print(f"  Native urgent/PA log_item={log_item_id} left the queue unaired ({stage}): {outcome}")
+        return True
+
+    def _sweep_active_message_queue(self):
+        """Report native items this process inserted that are no longer
+        reachable -- not in the queue ahead of the cursor, not forced, not
+        resuming and not on a deck -- because a queue replacement/takeover
+        (play-now, reload, early next-hour install, a cursor jump) or a
+        consumed-without-deck path dropped them. In-memory; nothing to do
+        (and no database work) when nothing native is held."""
+        held = self.__dict__.get("_active_message_held")
+        if not held or time.monotonic() < getattr(self, "_active_message_report_retry_at", 0.0):
+            return
+        reachable = {item.id for item in self.log_items[self._queue_cursor:]}
+        reachable.update(item.id for item in self._forced_next_items)
+        resume_item = getattr(self, "_resume_item", None)
+        if resume_item is not None:
+            reachable.add(resume_item.id)
+        reachable.update(d.log_item.id for d in self.decks.values() if d is not None and d.log_item is not None)
+        for log_item_id in [i for i in held if i not in reachable]:
+            self._report_active_message_left(log_item_id, "left_queue")
 
     @_glib_safe(default_return=False)
     def _sync_active_message_evidence(self, log_item_id):
@@ -13722,6 +13771,7 @@ class PlaybackEngine:
         self._check_commands()
         self._check_stuck_decks()
         self._reload_queue_if_changed()
+        self._sweep_active_message_queue()
 
         leading = self._leading_deck()
         if not leading or leading.finished:

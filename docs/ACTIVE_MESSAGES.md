@@ -422,6 +422,28 @@ placement and commit); other bytes there are never overwritten
 parity) and is NOT Ready-to-Air, so neither rotation nor a category-only
 `insert_urgent` (Weather/AMBER, legacy OGRemote's mix) ever selects it.
 
+**Publication failures are classified.** Once D2A has produced a valid READY
+aggregate, a local-library delivery problem never throws it away:
+
+| Code | Class | Effect |
+| --- | --- | --- |
+| `analysis_failed` (analysis/waveform, `sync_track_file` refusal) | retryable | SAME execution stays READY, same `mix_media` |
+| `library_unavailable` (filesystem I/O) | retryable | 〃 |
+| `category_missing` (UrgentPA not configured) | retryable | 〃 |
+| `publication_failed` (any other unexpected error) | retryable | 〃 |
+| `aggregate_unavailable` (stored bytes missing/corrupt/invalid) | permanent | FAILED with that code, attention |
+| `destination_conflict` (other bytes at the reserved path) | permanent | FAILED with that code, attention |
+| `publication_unavailable` (published Track deleted / file gone, found at re-send) | permanent | FAILED with that code, attention |
+
+A retryable failure records a `publication_retry` event (bounded detail) and
+backs off exponentially exactly like D2A's render retry (15 s doubling, capped
+at 600 s), with deduplicated operator attention (`publication_unavailable`)
+from the third consecutive failure. No other execution is created and nothing
+is re-rendered: the worker's pass ends there (`run_once` returns `playout`),
+and once the condition is corrected the same execution publishes, inserts and
+airs. A permanent failure ends the execution; the next occurrence then follows
+D1/D2A as usual (reusing a proven rendition when one exists).
+
 **Correlation** (migration `active_messages.0002`, CreateModel only):
 `ActiveBroadcastPublication` (execution → media → Track, with a Track id
 snapshot) and `ActiveBroadcastInsertion` (one per engine-inserted LogItem:
@@ -435,15 +457,34 @@ ordinary Tracks query-free on the engine's hot paths (as spoken's
 **Attempts.** Every dispatch is a new attempt token on the execution. Only
 the insertion of the CURRENT attempt may open a deck, so a duplicate command
 (that attempt is already inserted), a delayed or superseded one, and a
-LogItem from an earlier attempt are all harmless. Re-sends:
+LogItem from an earlier attempt are all harmless.
 
-| Situation | Who | Action |
+Recovery acts only on **positive evidence** that the current attempt can no
+longer air -- never on elapsed time alone. ACCEPTED means an exact LogItem is
+queued; it may legitimately wait behind long-form programming, a Manual hold,
+the microphone or Remote DJ for any length of time and consumes no attempts.
+CLAIMED means deck-open authority authorized it and a deck may exist; it is
+never superseded by age.
+
+| Positive evidence | Who | Action |
 | --- | --- | --- |
-| command not accepted within 60 s (lost) | worker | new attempt, re-sent |
-| accepted/claimed by a previous engine process, not started | engine at start-up | new attempt, re-sent |
-| deck refused or failed to open (not stale) | engine | new attempt, re-sent |
-| accepted/claimed but not started after 600 s (queue replaced) | worker | new attempt, re-sent |
+| command not accepted within 60 s (READY, or a re-sent attempt) | worker | new attempt, re-sent |
+| native item discarded as unplayable before a deck (`_next_queue_item`, `_peek_playable_at_cursor`) | engine, at once | `report_not_aired`: current → re-sent; stale → SUPPRESSED; Track/file gone → FAILED `publication_unavailable` |
+| native item this process inserted is no longer reachable (queue replaced by play-now/reload/early next-hour install, cursor moved past it, consumed without a deck) | engine queue sweep (in memory, each poll tick) | 〃 |
+| deck-open refused or construction returned no deck | engine, at once | ACCEPTED → re-sent (it never passed deck-open authority); CLAIMED → re-sent only if this process claimed it AND the LogItem's playback claim (committed before any deck construction) never committed and there is no air evidence; otherwise held + attention `claimed_not_aired` |
+| the accepted LogItem row was deleted | worker | new attempt, re-sent |
+| accepted/claimed by a previous engine process, not started | engine at start-up (the restart fences the old process's audio) | new attempt, re-sent |
+| CLAIMED without air evidence for 600 s | worker | attention `claimed_not_started` only -- never re-sent |
 | 50 attempts | -- | FAILED `dispatch_exhausted` |
+
+The engine reports a discard with the LogItem id; the domain correlates it
+through `ActiveBroadcastInsertion.log_item_id_snapshot`, so a ghost whose
+Track FK became NULL is still recognized. Ordinary unplayable items are
+skipped exactly as before (no lookup); the lookup happens only for an
+already-unplayable item that this process inserted, that carries a native
+file name, or whose Track is gone. A report that cannot be recorded (e.g. a
+lock timeout) stays held in the engine and the sweep repeats it. Deck-open
+authority never claims an occurrence whose LogItem row no longer exists.
 
 **Priority.** The native item takes the same "next boundary" place as any
 urgent insertion, but behind every not-yet-played Weather/AMBER (`WxAlert`)
@@ -463,9 +504,10 @@ anything else → refused (a stale ACCEPTED one is SUPPRESSED
 same rule read-only to queued items, so a stale aggregate is skipped exactly
 like any unplayable item: the next ordinary item plays, nothing is consumed
 or duplicated, Weather/AMBER items and dedication follow-ups are untouched,
-and the worker suppresses the execution. Clear, replacement, expiry and any
-generation change all behave this way. Song-request substitution and
-dedication splicing never apply (they act on music-kind items only).
+and the discard report (or the worker) suppresses the execution. Clear,
+replacement, expiry and any generation change all behave this way.
+Song-request substitution and dedication splicing never apply (they act on
+music-kind items only).
 
 **Evidence.** No new detector. Queueing, LogItem creation, deck construction
 and PLAYING are not STARTED. `sync_evidence` reads the deck's own committed
@@ -518,3 +560,7 @@ and untouched.
   evidence projection after the existing air-start and terminal-ledger
   commits, start-up reconciliation. No GStreamer change.
 * Native airing stays impossible: `NATIVE_AIRING_AVAILABLE` is False.
+* **Required before production (Phase G): retention.** Every airing leaves one
+  immutable `UrgentPA/am-<execution>.flac` and its Track; no cleanup is
+  designed yet. It must never remove a publication still referenced by a
+  queued or historical occurrence.

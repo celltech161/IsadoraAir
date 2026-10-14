@@ -16,12 +16,13 @@ from datetime import timedelta
 
 import gi
 from django.test import TransactionTestCase
+from django.utils import timezone
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 import library.services.engine as eng_module  # noqa: E402
-from active_messages import playout, services  # noqa: E402
+from active_messages import playout, rendering, services, worker  # noqa: E402
 from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastMessage  # noqa: E402
 from library.models import LogItem, PlayEvent  # noqa: E402
 from library.services import royalty_reports  # noqa: E402
@@ -122,3 +123,43 @@ class RealDeckTests(Playout, TransactionTestCase):
             self.assertTrue(_wait_until(lambda: self.state(execution) == "completed", timeout=15.0),
                             deck.milestone_snapshot())
         self.assertIsNotNone(eng_module.ENGINE_INSTANCE)
+
+    def test_a_transient_publication_failure_airs_the_same_execution_without_a_rerender(self):
+        """D2A READY -> publication analysis fails (transient) -> the SAME
+        execution stays READY, nothing else is materialized or rendered ->
+        analysis recovers -> that exact execution publishes, inserts and airs."""
+        self.real_active(self.producer, kind="urgent", seconds=1.0)
+        renders = []
+
+        def counting_render(execution):
+            renders.append(execution.pk)
+            return rendering.render(execution)
+
+        start = timezone.now()
+        with unittest.mock.patch("library.management.commands.sync_track_file.analyze_one_track",
+                                 return_value=False):
+            self.assertEqual(worker.run_once(now=start, render_fn=counting_render).result, "ready")
+            execution = ActiveBroadcastExecution.objects.get()
+            mix = execution.mix_media_id
+            self.assertEqual((execution.state, len(renders)), ("ready", 1))
+            for seconds, expected in ((5, "publication_backoff"), (20, "publication_retry"),
+                                      (25, "publication_backoff")):
+                outcome = worker.run_once(now=start + timedelta(seconds=seconds), render_fn=counting_render)
+                self.assertEqual((outcome.result, outcome.code), ("playout", expected))
+        outcome = worker.run_once(now=start + timedelta(seconds=120), render_fn=counting_render)
+        self.assertEqual((outcome.result, outcome.code), ("playout", "dispatched"))
+        self.assertEqual(renders, [execution.pk])                               # no second D2A render
+        self.assertEqual(ActiveBroadcastExecution.objects.count(), 1)           # no second execution
+        stored = ActiveBroadcastExecution.objects.get(pk=execution.pk)
+        self.assertEqual((stored.state, stored.mix_media_id), ("ready", mix))
+        command = self.commands[-1]
+        self.assertEqual(command["active_execution"], str(execution.pk))
+        self.engine._dispatch_engine_command(command)
+        item, _forced = self.engine._next_queue_item()
+        deck = self.engine._create_deck("A", item)
+        self.assertIsNotNone(deck)
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+        self.assertTrue(_wait_until(lambda: self.state(execution) == "completed", timeout=15.0),
+                        deck.milestone_snapshot())
+        self.assertEqual(PlayEvent.objects.get(log_item_id_snapshot=item.pk).track_id,
+                         playout.ActiveBroadcastPublication.objects.get(execution=execution).track_id_snapshot)

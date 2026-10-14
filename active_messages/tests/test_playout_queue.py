@@ -150,12 +150,16 @@ class StalenessTests(Playout, TransactionTestCase):
         return execution, LogItem.objects.get(category__code="UrgentPA")
 
     def assert_skipped_to_song_b(self, execution):
+        sent = len(self.commands)
         item, _forced = self.engine._next_queue_item()
         self.assertEqual(item.id, self.song_b.id)                # the stale aggregate skipped, B not lost
         self.assertEqual(self.engine._queue_cursor, len(self.engine.log_items))   # ...and B handed out once
-        self.assertEqual(playout.advance(), "suppressed")
+        # The discard itself was reported: a stale aggregate is SUPPRESSED, never re-sent.
         stored = ActiveBroadcastExecution.objects.get(pk=execution.pk)
         self.assertEqual((stored.state, stored.failure_code), ("suppressed", "stale_generation"))
+        self.assertEqual(len(self.commands), sent)
+        self.assertEqual(playout.advance(), "none")
+        self.assertFalse(self.engine._active_message_held)
 
     def test_clear_after_render_before_publication(self):
         execution = self.ready_execution(actor=self.producer)
@@ -263,25 +267,15 @@ class DeckOpenAuthorityTests(Playout, TransactionTestCase):
 
     def test_a_deck_that_could_not_open_re_sends_the_airing(self):
         with self.committing():
-            playout.report_not_opened(self.native.pk)
+            self.assertEqual(playout.report_not_aired(self.native.pk, INSTANCE, stage="deck_not_opened"), "resent")
         self.assertEqual(len(self.commands), 2)
         self.assertNotEqual(self.commands[-1]["attempt"], self.commands[0]["attempt"])
-
-    def test_a_stranded_acceptance_is_re_sent_and_the_stranded_log_item_is_dead(self):
-        # The engine's queue was replaced (play-now / reload / takeover): the
-        # accepted LogItem will never be reached. After the bound it is re-sent.
-        later = timezone.now() + timedelta(seconds=playout.ENGINE_HELD_RESEND_SECONDS + 1)
-        with self.committing():
-            self.assertEqual(playout.advance(now=later), "resent")
-        self.assertFalse(playout.inspect(self.native, INSTANCE).allowed)          # superseded forever
-        self.assertFalse(playout.authorize_open(self.native, INSTANCE).allowed)
-        self.engine._dispatch_engine_command(self.commands[-1])
-        self.assertEqual(ActiveBroadcastInsertion.objects.count(), 2)
+        self.assertFalse(playout.authorize_open(self.native, INSTANCE).allowed)   # superseded forever
 
     def test_attempts_are_bounded(self):
         from active_messages.tests.support import raw
         raw(ActiveBroadcastExecution).filter(pk=self.execution.pk).update(attempt_count=playout.MAX_ATTEMPTS)
         with self.committing():
-            playout.report_not_opened(self.native.pk)
+            playout.report_not_aired(self.native.pk, INSTANCE, stage="discarded")
         stored = ActiveBroadcastExecution.objects.get(pk=self.execution.pk)
         self.assertEqual((stored.state, stored.failure_code), ("failed", "dispatch_exhausted"))

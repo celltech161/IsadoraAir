@@ -37,9 +37,35 @@ ordinary Tracks query-free on the engine's hot paths (as spoken does).
 
 Every attempt has its own token. Only the insertion of the execution's
 CURRENT attempt may open a deck, so a duplicate, delayed or superseded
-command and a stranded LogItem from an earlier attempt are all harmless. A
-lost command (never accepted) is redispatched by the worker; an attempt
-stranded by an engine restart is rotated by the new engine at start-up.
+command and a stranded LogItem from an earlier attempt are all harmless.
+
+Recovery acts only on POSITIVE evidence that the current attempt can no
+longer air -- never on elapsed time alone (an accepted priority item may
+legitimately wait behind long-form programming, a Manual hold, the mic or
+Remote DJ for any length of time):
+
+* a command never ACCEPTED within DISPATCH_TIMEOUT_SECONDS is re-sent;
+* the engine reports an unaired insertion that left its queue
+  (``report_not_aired``): discarded as unusable before a deck, dropped by a
+  queue replacement/takeover, or refused/failed at deck open. An ACCEPTED
+  attempt never reached deck-open authority, so it is re-sent (or
+  SUPPRESSED if stale). A CLAIMED attempt is re-sent only when this process
+  positively never built a deck for it (the LogItem's playback claim, which
+  precedes every deck construction, never committed); otherwise it is held
+  for operator attention and the restart fence;
+* the accepted LogItem row was deleted (worker);
+* the engine process that held an unstarted attempt is gone: the new engine
+  rotates it at start-up (a restart fences the old process's audio).
+
+A CLAIMED attempt is never superseded by age.
+
+Publication failures are classified: a RETRYABLE one (analysis, waveform,
+library I/O, category configuration) keeps the SAME READY execution and its
+exact ``mix_media`` -- ``publication_retry`` events, exponential backoff,
+deduplicated operator attention -- and the worker does not move on to another
+occurrence meanwhile; a PERMANENT integrity contradiction (the aggregate no
+longer proves its bytes, other bytes at the reserved path, a deleted
+publication) FAILS the execution with its own code.
 
 Nothing here can air in production: every step requires the native-airing
 gate (services.NATIVE_AIRING_AVAILABLE and the policy switch), which stays
@@ -77,19 +103,31 @@ CATEGORY_CODE = "UrgentPA"
 TRACK_TITLE = TRACK_ARTIST = "Urgent PA"          # what legacy OGRemote's mix carried
 _NATIVE_NAME = re.compile(r"am-[0-9a-f]{32}\.flac")
 DISPATCH_TIMEOUT_SECONDS = 60                     # a command not accepted by then is presumed lost
-# An accepted/claimed attempt that has not STARTED by then is presumed
-# stranded (its LogItem left the engine's queue: play-now, a log reload, a
-# mid-hour takeover) and is re-sent. Always safe: the earlier LogItem can
-# then never open a deck (superseded attempt).
-ENGINE_HELD_RESEND_SECONDS = 600
+# A CLAIMED attempt without air evidence by then raises operator attention.
+# Attention only: a claimed attempt is never superseded by age.
+CLAIMED_ATTENTION_SECONDS = 600
 MAX_ATTEMPTS = 50                                 # then FAILED dispatch_exhausted (operator attention)
 CLEAN_END_REASONS = frozenset({"eos", "eos_deferred"})
 ENGINE_HELD = (X.ACCEPTED, X.CLAIMED)
 _COPY_CHUNK = 1024 * 1024
+# Publication retry backoff, as D2A's render retry.
+PUBLICATION_BACKOFF_BASE_SECONDS = 15
+PUBLICATION_BACKOFF_MAX_SECONDS = 600
+PUBLICATION_ATTENTION_AFTER = 3
 
 # Stable codes of D2B outcomes (execution failure_code / event detail).
-PUBLICATION_FAILED = "publication_failed"
+ANALYSIS_FAILED = "analysis_failed"
+LIBRARY_UNAVAILABLE = "library_unavailable"
+CATEGORY_MISSING = "category_missing"
+PUBLICATION_FAILED = "publication_failed"          # an unclassified publication error (retryable)
+AGGREGATE_UNAVAILABLE = "aggregate_unavailable"
+DESTINATION_CONFLICT = "destination_conflict"
+PUBLICATION_UNAVAILABLE = "publication_unavailable"  # the published Track/file is gone
 DISPATCH_EXHAUSTED = "dispatch_exhausted"
+# The exact READY aggregate is still valid: retry publication of the SAME execution.
+PUBLICATION_RETRYABLE = frozenset({ANALYSIS_FAILED, LIBRARY_UNAVAILABLE, CATEGORY_MISSING, PUBLICATION_FAILED})
+# Integrity/authority contradictions: the execution FAILS with the code.
+PUBLICATION_PERMANENT = frozenset({AGGREGATE_UNAVAILABLE, DESTINATION_CONFLICT})
 
 
 class PlayoutError(services.ActiveMessageError):
@@ -195,10 +233,12 @@ def publish(execution, *, now=None) -> ActiveBroadcastPublication:
     overwrites), ``sync_track_file`` into a scratch waveform directory, move
     the waveform into the real directory, record the publication -- all in
     one transaction, rolled back with the placed file and waveform on any
-    failure."""
-    from library.management.commands.analyze_tracks import get_waveforms_dir
-    from library.management.commands.sync_track_file import sync_track_file
-    from library.models import Artist, Category, Track
+    failure.
+
+    Raises PlayoutError: a code in PUBLICATION_RETRYABLE leaves the exact
+    aggregate valid (retry this execution); one in PUBLICATION_PERMANENT is
+    an integrity contradiction."""
+    from library.models import Category
 
     now = now or timezone.now()
     row = ActiveBroadcastExecution.objects.select_related("mix_media").get(pk=getattr(execution, "pk", execution))
@@ -217,16 +257,37 @@ def publish(execution, *, now=None) -> ActiveBroadcastPublication:
         media_io.verify_integrity(media)
     except (MediaPurged, MediaInconsistent):
         raise PlayoutError("the aggregate's stored bytes are missing or do not verify",
-                           code="aggregate_unavailable") from None
+                           code=AGGREGATE_UNAVAILABLE) from None
     if not media.is_valid:
-        raise PlayoutError("the aggregate is not valid", code="aggregate_unavailable")
+        raise PlayoutError("the aggregate is not valid", code=AGGREGATE_UNAVAILABLE)
     category = Category.objects.filter(code=CATEGORY_CODE).first()
     if category is None:
-        raise PlayoutError(f"no {CATEGORY_CODE} category exists", code="category_missing")
+        raise PlayoutError(f"no {CATEGORY_CODE} category exists", code=CATEGORY_MISSING)
 
     relpath = relpath_for(row.pk)
     dest = _library_root() / relpath
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return _place_and_ingest(row, media, dest, relpath, now)
+    except OSError as exc:                  # the lock/scratch directory itself (library I/O)
+        raise PlayoutError(f"the library is unavailable: {type(exc).__name__}", code=LIBRARY_UNAVAILABLE) from exc
+
+
+def _retry_code(exc) -> str:
+    """The retryable code of an unexpected error during placement/ingest."""
+    from django.core.management.base import CommandError
+    if isinstance(exc, CommandError):       # sync_track_file: analysis or category configuration
+        return ANALYSIS_FAILED
+    if isinstance(exc, OSError):
+        return LIBRARY_UNAVAILABLE
+    return PUBLICATION_FAILED
+
+
+def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublication:
+    from library.management.commands.analyze_tracks import get_waveforms_dir
+    from library.management.commands.sync_track_file import sync_track_file
+    from library.models import Artist, Track
+
     with _destination_lock(dest):
         existing = ActiveBroadcastPublication.objects.filter(execution=row).first()
         if existing is not None:
@@ -241,11 +302,16 @@ def publish(execution, *, now=None) -> ActiveBroadcastPublication:
                     # Only an interrupted earlier publish of THIS execution can have
                     # placed it; it is reused only if it is exactly the aggregate.
                     if _file_sha256(dest) != media.sha256:
-                        raise PlayoutError("the reserved destination holds other bytes", code="destination_conflict")
+                        raise PlayoutError("the reserved destination holds other bytes", code=DESTINATION_CONFLICT)
                 else:
                     staged = scratch / "aggregate.flac"
-                    if _copy_verified(media, staged) != media.sha256:
-                        raise PlayoutError("the aggregate bytes changed while copying", code="aggregate_unavailable")
+                    try:
+                        copied = _copy_verified(media, staged)
+                    except (MediaPurged, MediaInconsistent):
+                        raise PlayoutError("the aggregate's stored bytes are missing or do not verify",
+                                           code=AGGREGATE_UNAVAILABLE) from None
+                    if copied != media.sha256:
+                        raise PlayoutError("the aggregate bytes changed while copying", code=AGGREGATE_UNAVAILABLE)
                     os.chmod(staged, 0o644)
                     os.link(staged, dest)                 # atomic and never overwrites
                     placed = True
@@ -253,7 +319,7 @@ def publish(execution, *, now=None) -> ActiveBroadcastPublication:
                     track, _created = sync_track_file(str(dest), ready2air=False, wave_dir=wave_scratch)
                     scratch_wave = wave_scratch / f"{track.id}.json"
                     if not scratch_wave.is_file():
-                        raise PlayoutError("analysis wrote no waveform", code="analysis_failed")
+                        raise PlayoutError("analysis wrote no waveform", code=ANALYSIS_FAILED)
                     real_wave = Path(get_waveforms_dir()) / f"{track.id}.json"
                     shutil.move(str(scratch_wave), str(real_wave))
                     artist, _ = Artist.get_or_create_ci(TRACK_ARTIST)
@@ -272,8 +338,52 @@ def publish(execution, *, now=None) -> ActiveBroadcastPublication:
                     dest.unlink(missing_ok=True)
                 if isinstance(exc, PlayoutError) or not isinstance(exc, Exception):
                     raise
-                raise PlayoutError(f"publication failed: {type(exc).__name__}", code=PUBLICATION_FAILED) from exc
+                code = _retry_code(exc)
+                raise PlayoutError(f"publication failed ({code}): {type(exc).__name__}: {exc}", code=code) from exc
     return publication
+
+
+def _publication_backoff_remaining(row, now) -> float:
+    """Seconds until the next publication retry of ``row`` is due (the same
+    exponential shape as D2A's render retry)."""
+    from .models import ActiveBroadcastMessageEvent
+    retries = list(ActiveBroadcastMessageEvent.objects.filter(execution=row, event="publication_retry")
+                   .order_by("-id").values_list("created_at", flat=True)[:12])
+    if not retries:
+        return 0.0
+    wait = min(PUBLICATION_BACKOFF_BASE_SECONDS * 2 ** (len(retries) - 1), PUBLICATION_BACKOFF_MAX_SECONDS)
+    return max(0.0, (retries[0] + timedelta(seconds=wait) - now).total_seconds())
+
+
+def record_publication_retry(execution, *, code, detail="") -> int:
+    """A retryable publication failure of a READY execution: a
+    ``publication_retry`` event (the backoff reads these); the execution and
+    its exact ``mix_media`` are unchanged. Returns the consecutive failure
+    count (0 when the execution is no longer READY)."""
+    from .models import ActiveBroadcastMessageEvent
+    with transaction.atomic():
+        services._lock_policy()
+        row = services._lock_execution(execution)
+        if row.state != X.READY:
+            return 0
+        _event("publication_retry", row, actor_kind=ActorKind.WORKER,
+               detail={"code": str(code)[:64], "detail": services._bounded_detail(detail)})
+    failures = ActiveBroadcastMessageEvent.objects.filter(execution=row, event="publication_retry").count()
+    if failures >= PUBLICATION_ATTENTION_AFTER:
+        _attention("publication_unavailable", row.pk, f"{failures} attempts; last {code}: {detail}",
+                   level="warning")
+    return failures
+
+
+def _publication_problem(publication) -> str:
+    """Why a recorded publication can no longer be inserted, or "" (a
+    database read plus one stat -- no hashing)."""
+    current = ActiveBroadcastPublication.objects.filter(pk=publication.pk).values_list("track_id", flat=True).first()
+    if current is None:
+        return "the published Track was deleted"
+    if not (_library_root() / publication.library_relpath).is_file():
+        return "the published file is missing"
+    return ""
 
 
 # -- dispatch -------------------------------------------------------------------------------
@@ -342,6 +452,18 @@ def _new_attempt(row, publication, *, now, actor_kind, redispatch) -> uuid.UUID 
     return token
 
 
+def _redispatch(row, publication, *, now, actor_kind, redispatch=True) -> uuid.UUID | None:
+    """A new attempt for ``row`` (locks held), after proving its publication
+    is still insertable; a deleted Track or missing file FAILS the execution
+    (publication_unavailable) instead of re-sending a command that can only
+    be refused."""
+    problem = _publication_problem(publication)
+    if problem:
+        _fail(row, PUBLICATION_UNAVAILABLE, problem, actor_kind=actor_kind)
+        return None
+    return _new_attempt(row, publication, now=now, actor_kind=actor_kind, redispatch=redispatch)
+
+
 def dispatch(execution, *, now=None):
     """READY and published -> queue the exact insertion (a new attempt). A
     command not accepted within DISPATCH_TIMEOUT_SECONDS is presumed lost and
@@ -358,8 +480,8 @@ def dispatch(execution, *, now=None):
             return None
         if row.dispatched_at is not None and now - row.dispatched_at < timedelta(seconds=DISPATCH_TIMEOUT_SECONDS):
             return None                                        # in flight
-        return _new_attempt(row, publication, now=now, actor_kind=ActorKind.WORKER,
-                            redispatch=row.dispatched_at is not None)
+        return _redispatch(row, publication, now=now, actor_kind=ActorKind.WORKER,
+                           redispatch=row.dispatched_at is not None)
 
 
 # -- engine side: admission inside the splice transaction ------------------------------------
@@ -494,6 +616,11 @@ def authorize_open(log_item, engine_instance, *, now=None) -> Decision | None:
                 _suppress(row, actor_kind=ActorKind.ENGINE)
             return Decision(False, reason)
         if row.state == X.ACCEPTED:
+            from library.models import LogItem
+            if not LogItem.objects.filter(pk=log_item.pk).exists():
+                # Never claim for a deleted occurrence: it stays ACCEPTED, so
+                # the engine's not-aired report re-sends it.
+                return Decision(False, "native LogItem no longer exists")
             stored = _store.write(ActiveBroadcastExecution, row.pk,
                                   match={"state": X.ACCEPTED, "attempt_token": row.attempt_token},
                                   values={"state": X.CLAIMED, "claimed_at": now, "engine_instance": engine_instance})
@@ -502,23 +629,67 @@ def authorize_open(log_item, engine_instance, *, now=None) -> Decision | None:
         return Decision(True)
 
 
-def report_not_opened(log_item_id, *, now=None) -> None:
-    """The engine skipped (or could not open) the current attempt's LogItem
-    for a reason other than staleness: re-send it under a new attempt so the
-    airing still happens at the next boundary (or SUPPRESS it if stale)."""
+NOT_AIRED_STAGES = frozenset({"discarded", "left_queue", "deck_not_opened"})
+
+
+def report_not_aired(log_item_id, engine_instance, *, stage, now=None) -> str:
+    """The engine's POSITIVE report that a native LogItem left its queue
+    without airing (``stage``): ``discarded`` as unusable before a deck,
+    ``left_queue`` (a queue replacement/takeover dropped it, or it was
+    consumed without a deck), or ``deck_not_opened`` (deck-open refused or
+    construction returned without a deck). Correlated by the insertion's
+    ``log_item_id_snapshot`` -- also after the Track or LogItem row is gone.
+
+    Only the execution's CURRENT, unstarted attempt is acted on:
+
+    * a stale one (composition moved on, gate closed) is SUPPRESSED -- never
+      re-sent;
+    * ACCEPTED never passed deck-open authority, so nothing of it can have
+      reached program: re-sent under a new attempt (the reported LogItem is
+      then superseded forever);
+    * CLAIMED is re-sent only when THIS process claimed it and positively
+      never built a deck for it: the LogItem's playback claim -- committed
+      before any deck construction, in every process -- never committed, and
+      there is no air evidence. Anything less is ambiguous (a deck may have
+      existed): it is held for operator attention and the restart fence,
+      never re-sent.
+
+    Returns a short outcome."""
+    from library.models import LogItem
+    if stage not in NOT_AIRED_STAGES:
+        raise ValueError(f"unknown stage {stage!r}")
+    if not ActiveBroadcastInsertion.objects.filter(log_item_id_snapshot=log_item_id).exists():
+        return "unknown"                     # not native (e.g. an ordinary Track-less ghost): no lock taken
     now = now or timezone.now()
     with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '250ms'")
         policy = services._lock_policy()
         insertion = _insertion_for(log_item_id)
         if insertion is None:
-            return
+            return "unknown"
         row = services._lock_execution(insertion.execution_id)
-        if row.state not in ENGINE_HELD or row.attempt_token != insertion.attempt_token or row.started_at:
-            return
+        if row.attempt_token != insertion.attempt_token:
+            return "superseded"
+        if row.state not in ENGINE_HELD or row.started_at is not None:
+            return row.state
+        if _play_event(log_item_id) is not None:
+            return "evidence"                                   # sync_evidence decides
+        detail = {"stage": stage, "log_item": log_item_id, "attempt": str(row.attempt_token)}
+        if row.state == X.CLAIMED:
+            facts = (LogItem.objects.filter(pk=log_item_id)
+                     .values_list("playback_claimed_at", "played_at").first())
+            if row.engine_instance != engine_instance or facts != (None, None):
+                _event("claimed_not_aired", row, actor_kind=ActorKind.ENGINE, detail=detail)
+                transaction.on_commit(lambda: _attention(
+                    "claimed_not_aired", row.pk, f"{stage}; held for the restart fence", level="warning"))
+                return "held"
         if row.policy_generation != policy.generation or not gate_open(policy):
             _suppress(row, actor_kind=ActorKind.ENGINE)
-            return
-        _new_attempt(row, insertion.publication, now=now, actor_kind=ActorKind.ENGINE, redispatch=True)
+            return "suppressed"
+        _event("not_aired", row, actor_kind=ActorKind.ENGINE, detail=detail)
+        token = _redispatch(row, insertion.publication, now=now, actor_kind=ActorKind.ENGINE)
+        return "resent" if token else "failed"
 
 
 # -- evidence -----------------------------------------------------------------------------------
@@ -602,8 +773,9 @@ def engine_started(engine_instance, *, now=None) -> None:
     executions; end as INTERRUPTED any airing a previous process had STARTED
     (never resumed, never replayed at once); and rotate any attempt a previous
     process accepted or claimed but never started -- its LogItem may be gone
-    with that process's queue -- so the airing still happens. A stale one is
-    SUPPRESSED."""
+    with that process's queue, and that process can no longer produce audio
+    (the restart is the fence) -- so the airing still happens. A stale one
+    is SUPPRESSED."""
     now = now or timezone.now()
     for execution_id in (ActiveBroadcastExecution.objects
                          .filter(state__in=(*ENGINE_HELD, X.STARTED)).values_list("pk", flat=True)):
@@ -623,16 +795,84 @@ def engine_started(engine_instance, *, now=None) -> None:
                 continue
             publication = ActiveBroadcastPublication.objects.filter(execution=row).first()
             if publication is not None:
-                _new_attempt(row, publication, now=now, actor_kind=ActorKind.ENGINE, redispatch=True)
+                _redispatch(row, publication, now=now, actor_kind=ActorKind.ENGINE)
 
 
 # -- the worker's playout step --------------------------------------------------------------------
 
+def _engine_held_step(row, now) -> str:
+    """Worker step for an ACCEPTED/CLAIMED execution after evidence sync.
+    Never rotates an attempt because time passed: an ACCEPTED item may
+    legitimately wait in the queue indefinitely, and a CLAIMED one may have
+    a deck. Acts only on positive evidence:
+
+    * a stale ACCEPTED one is SUPPRESSED (deck-open would refuse it);
+    * a re-sent attempt the engine never ACCEPTED within the command-delivery
+      bound is re-sent again (as for a READY dispatch);
+    * an ACCEPTED one whose LogItem row was deleted is re-sent;
+    * a CLAIMED one without air evidence after CLAIMED_ATTENTION_SECONDS
+      raises attention -- only."""
+    with transaction.atomic():
+        policy = services._lock_policy()
+        locked = services._lock_execution(row.pk)
+        if locked.state not in ENGINE_HELD:
+            return locked.state
+        insertion = (ActiveBroadcastInsertion.objects.select_related("publication")
+                     .filter(execution=locked, attempt_token=locked.attempt_token).first())
+        stale = locked.policy_generation != policy.generation or not gate_open(policy)
+        if stale and (locked.state == X.ACCEPTED or insertion is None):
+            _suppress(locked, actor_kind=ActorKind.WORKER)
+            return "suppressed"
+        if insertion is None:
+            # The current attempt was re-sent and its command not yet accepted.
+            if (locked.dispatched_at is not None
+                    and now - locked.dispatched_at < timedelta(seconds=DISPATCH_TIMEOUT_SECONDS)):
+                return "in_flight"
+            publication = ActiveBroadcastPublication.objects.filter(execution=locked).first()
+            if publication is None:
+                return locked.state
+            return "resent" if _redispatch(locked, publication, now=now, actor_kind=ActorKind.WORKER) else "failed"
+        if locked.state == X.ACCEPTED and insertion.log_item_id is None:
+            _event("not_aired", locked, actor_kind=ActorKind.WORKER,
+                   detail={"stage": "log_item_deleted", "log_item": insertion.log_item_id_snapshot,
+                           "attempt": str(locked.attempt_token)})
+            return "resent" if _redispatch(locked, insertion.publication, now=now,
+                                           actor_kind=ActorKind.WORKER) else "failed"
+        if (locked.state == X.CLAIMED and locked.claimed_at is not None
+                and now - locked.claimed_at > timedelta(seconds=CLAIMED_ATTENTION_SECONDS)):
+            transaction.on_commit(lambda: _attention(
+                "claimed_not_started", locked.pk, "claimed without air evidence; not re-sent (restart fences)",
+                level="warning"))
+        return locked.state
+
+
+def _publication_step(row, now) -> str:
+    """Publish a READY execution (or retry its publication) and dispatch."""
+    if not ActiveBroadcastPublication.objects.filter(execution=row).exists():
+        if _publication_backoff_remaining(row, now) > 0:
+            return "publication_backoff"
+        try:
+            publish(row, now=now)
+        except PlayoutError as exc:
+            if exc.code in PUBLICATION_RETRYABLE:
+                record_publication_retry(row, code=exc.code, detail=str(exc))
+                return "publication_retry"
+            if exc.code in PUBLICATION_PERMANENT:
+                with transaction.atomic():
+                    services._lock_policy()
+                    locked = services._lock_execution(row.pk)
+                    if locked.state == X.READY:
+                        _fail(locked, exc.code, str(exc))
+                return "publication_failed"
+            return exc.code                                    # not_ready / stale_generation / gate (a race)
+    return "dispatched" if dispatch(row, now=now) else "in_flight"
+
+
 def advance(*, now=None) -> str:
     """One worker step for the current unfinished execution past rendering:
-    project deck evidence (engine-held states), suppress an engine-held
-    execution whose composition moved on, and publish + dispatch a READY one
-    (gate permitting). Returns a short outcome."""
+    project deck evidence (engine-held states), act on positive recovery
+    evidence, and publish + dispatch a READY one (gate permitting). Returns a
+    short outcome."""
     now = now or timezone.now()
     row = (ActiveBroadcastExecution.objects
            .filter(state__in=(X.READY, *ENGINE_HELD, X.STARTED)).first())
@@ -641,35 +881,8 @@ def advance(*, now=None) -> str:
     if row.state in (*ENGINE_HELD, X.STARTED):
         row = sync_evidence(row)
         if row.state in ENGINE_HELD:
-            with transaction.atomic():
-                policy = services._lock_policy()
-                locked = services._lock_execution(row.pk)
-                if locked.state == X.ACCEPTED and locked.policy_generation != policy.generation:
-                    _suppress(locked, actor_kind=ActorKind.WORKER)
-                    return "suppressed"
-                held_since = locked.claimed_at if locked.state == X.CLAIMED else locked.accepted_at
-                if (locked.state in ENGINE_HELD and held_since is not None
-                        and now - held_since > timedelta(seconds=ENGINE_HELD_RESEND_SECONDS)):
-                    publication = ActiveBroadcastPublication.objects.filter(execution=locked).first()
-                    if locked.policy_generation != policy.generation or not gate_open(policy):
-                        _suppress(locked, actor_kind=ActorKind.WORKER)
-                        return "suppressed"
-                    if publication is not None:
-                        _new_attempt(locked, publication, now=now, actor_kind=ActorKind.WORKER, redispatch=True)
-                        return "resent"
+            return _engine_held_step(row, now)
         return row.state
     if not gate_open():
         return "gated"
-    try:
-        publish(row, now=now)
-    except PlayoutError as exc:
-        if exc.code in ("aggregate_unavailable", "destination_conflict", "analysis_failed", PUBLICATION_FAILED,
-                        "category_missing"):
-            with transaction.atomic():
-                services._lock_policy()
-                locked = services._lock_execution(row.pk)
-                if locked.state == X.READY:
-                    _fail(locked, PUBLICATION_FAILED, f"{exc.code}: {exc}")
-            return "publication_failed"
-        return exc.code
-    return "dispatched" if dispatch(row, now=now) else "in_flight"
+    return _publication_step(row, now)

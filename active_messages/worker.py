@@ -43,8 +43,11 @@ for the execution past rendering, if any -- project the deck's own evidence
 (STARTED / COMPLETED / INTERRUPTED), suppress an engine-held execution whose
 composition moved on, publish a READY aggregate into UrgentPA and dispatch
 its exact urgent insertion -- and a freshly READY aggregate is published and
-dispatched in the same pass. Publication and dispatch need the native-airing
-gate, which stays closed in production (OGRemote remains authoritative).
+dispatched in the same pass. A retryable publication failure keeps that SAME
+READY execution (and its exact aggregate) in flight with backoff -- the pass
+ends there: nothing else is materialized or rendered. Publication and
+dispatch need the native-airing gate, which stays closed in production
+(OGRemote remains authoritative).
 """
 from __future__ import annotations
 
@@ -233,9 +236,14 @@ def run_once(*, now=None, render_fn=rendering.render) -> Outcome:
 
 # Playout outcomes after which no execution past rendering remains in flight.
 # "gated": with the native-airing gate closed a READY execution simply waits
-# (production until Phase G), exactly as in D2A.
+# (production until Phase G), exactly as in D2A. "publication_failed" is a
+# PERMANENT integrity failure (the execution FAILED). A retryable publication
+# failure ("publication_retry" / "publication_backoff") is NOT settled: the
+# same READY execution stays the one in flight and no other occurrence is
+# materialized or rendered in that pass. The remaining codes are races in
+# which the READY execution is no longer current (D1 authority settles it).
 _PLAYOUT_SETTLED = frozenset({"none", "gated", "completed", "interrupted", "suppressed", "failed",
-                              "publication_failed"})
+                              "publication_failed", "stale_generation", "not_ready", "native_airing_closed"})
 
 
 def _render_pass(now, render_fn) -> Outcome:
