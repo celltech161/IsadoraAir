@@ -11,7 +11,7 @@ Phase D keeps the legacy OGRemote *product* behavior and replaces its
 | --- | --- |
 | several producers active at once; newest message per producer and kind | newest-file-by-mtime → one ACTIVE row per (producer, kind), database-enforced |
 | one combined mix: stinger, urgent, then public address, oldest first | mutable `urgent_pa_mix.mp3` → an immutable aggregate per exact composition |
-| insertion at the next track boundary, ordinary programming between plays | single-slot command file / `insert_urgent` → its own execution ledger (D2B) |
+| insertion at the next track boundary, ordinary programming between plays | remote processing + polling + a mutable mix Track → a local, per-execution UrgentPA Track inserted by the same `insert_urgent` splice, with exact execution correlation (D2B) |
 | periodic replay (default 20 minutes) until recalled | JSON state file + remote `processed` flag → PostgreSQL authority, backed up with the database |
 | a producer recalls their own message | file deletion → an exact-UUID clear |
 
@@ -30,8 +30,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | Step | Scope | Can it change on-air audio? |
 | --- | --- | --- |
 | **D1** | domain authority: policy/generation, messages, executions, events, media binding, composition, due/replay/expiry, authz, admin diagnostics | **no** — no renderer, no engine path |
-| **D2A** (this) | constrained `assemble` render operation (`active_message_mix`), exact provenance, rendition reuse, the worker, `bind_execution_mix` (PENDING_RENDER → READY) | **no** — READY waits for D2B; no engine command |
-| D2B | `active_message_play`, engine re-read, interstitial playback, evidence, restart reconciliation | yes — its own acceptance gate |
+| **D2A** | constrained `assemble` render operation (`active_message_mix`), exact provenance, rendition reuse, the worker, `bind_execution_mix` (PENDING_RENDER → READY) | **no** — no engine command |
+| **D2B** (this) | publish the READY aggregate as an ordinary UrgentPA Track; the existing `insert_urgent` splice for that exact Track; deck-open authority; the deck's own evidence → STARTED/COMPLETED/INTERRUPTED | only through the existing A/B decks, and **only with the native-airing gate open** (closed in production until Phase G) |
 | D3 | recorder adapter, iPortal operator board, monitoring | gate still closed |
 
 ## Authority
@@ -44,14 +44,23 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | exactly what one airing contains | `ActiveBroadcastExecution.composition_snapshot` / `composition_digest` (frozen) |
 | the aggregate authorized for one airing | `ActiveBroadcastExecution.mix_media` (D2A) |
 | whether an airing is due | `next_due_at` of the ACTIVE rows |
-| delivery to the engine | the existing engine-command FIFO (a wake-up only; D2B) |
-| whether the engine may still play it | a fresh database re-read by the engine (D2B) |
+| playback representation | an ordinary library `Track` (UrgentPA) and `LogItem` -- representations, never message authority (D2B) |
+| delivery to the engine | the existing engine-command FIFO and `insert_urgent` (D2B) |
+| whether the engine may still play it | the deck-open authority's fresh database re-read (D2B) |
+| what actually aired | the deck's own evidence: `LogItem.played_at` / `PlayEvent` (first real post-primer buffer) and its terminal ledger |
 | what happened | `ActiveBroadcastExecution` state + `ActiveBroadcastMessageEvent` (append-only) |
 | operator attention | `monitoring.SystemEvent` (never the history) |
-| music royalty evidence | `PlayEvent` — Phase D never writes one |
+| music royalty evidence | `PlayEvent` with the existing UrgentPA classification (kind Spot) — never counted as music |
 
-No Track, LogItem, SpokenItem/SpokenAsset or PlayEvent is ever created by this
-domain, and no path is ever authority.
+**Correction (D2B).** D1/D2A stated that active messages create no Track,
+LogItem or PlayEvent; that belonged to the rejected special-interstitial
+design. Under the adopted architecture an airing IS ordinary library content:
+D2B publishes one UrgentPA Track per airing, the engine's own urgent splice
+creates its LogItem, and the ordinary deck writes the ordinary PlayEvent.
+Message and execution authority stay in `active_messages`; Track and LogItem
+are playback representations. (With the native-airing gate closed -- every
+production installation until Phase G -- none of them is ever created.) No
+SpokenItem/SpokenAsset is ever created, and no path is ever authority.
 
 ## Models (`active_messages/models.py`)
 
@@ -374,21 +383,113 @@ identical inputs cannot succeed. An operator change makes a new generation.
 SystemEvent is operator attention only; the history is the execution and its
 events.
 
-## D2B contract (not implemented)
+## Ordinary playout (D2B)
 
-* **D2B:** command `active_message_play` {execution_id, attempt_token,
-  policy_generation, composition_digest, mix_media_id} over
-  `enqueue_engine_command` — never a path or a Track. The engine re-reads the
-  execution (gate open, unfinished, current generation, digest and media
-  match, media present and valid) with a bounded wait equal to the 250 ms
-  playlist-lock contract; if authority cannot be established promptly the
-  airing stays pending. Re-read again at the boundary before opening media.
-  Interstitial transition (not an overlay, no FX bus): program transitions out,
-  the aggregate owns program output, then the exact next ordinary queue item
-  transitions in; the queue cursor is not consumed. Weather/AMBER `insert_urgent`
-  wins a contested not-yet-started boundary; an already-STARTED aggregate is
-  never torn down for it. Remote DJ, studio mic/PTT or an independent Manual
-  hold: never seized — the airing waits and raises operator attention.
+D2B changes **where OGRemote's processing happens, not how IsadoraAir plays the
+result**. There is no active-message player, lane, mixer, bin or command: a
+READY aggregate becomes the same kind of library content Weather/AMBER and
+legacy OGRemote already deliver, and the existing automation plays it
+(`active_messages/playout.py`; hooks in `library/services/engine.py`).
+
+```
+READY execution
+ → publish: exact mix_media bytes (verified) → LIBRARY_ROOT/UrgentPA/am-<execution hex>.flac
+            (per-execution, immutable, placed with os.link: never overwritten)
+            → sync_track_file (normal Track, analysis, waveform), Ready-to-Air OFF
+ → dispatch: {"command": "insert_urgent", "category": "UrgentPA", "track": <id>,
+              "active_execution": <uuid>, "attempt": <uuid>}
+ → engine: _insert_active_message → _locked_playlist_log → admit → _splice_log_item_db_at
+           → record_insertion (same transaction)                         [ACCEPTED]
+           → _apply_log_item_insert (+ forced queue, behind Weather/AMBER)
+ → _next_queue_item → _start_next_track → _create_deck
+           (deck-open authority: authorize_open)                          [CLAIMED]
+ → first real post-primer buffer: LogItem.played_at + PlayEvent           [STARTED]
+ → clean EOS: terminal ledger, termination "eos"/"eos_deferred"           [COMPLETED → D1 cadence]
+   anything else after a real start (skip, error, crash, shutdown)        [INTERRUPTED, no replay at once]
+```
+
+**Publication.** The source is the execution's exact `mix_media`: present,
+valid, its stored bytes re-hashed to the recorded SHA-256 and hashed again
+while copied (opened by identity -- never a caller's path). Under a
+destination flock: stage in a hidden scratch directory beside the
+destination, place atomically with `os.link`, `sync_track_file` into a
+scratch waveform directory, move the waveform into the real directory,
+record `ActiveBroadcastPublication` -- one transaction; any failure removes
+the placed file and waveform and rolls the Track back. A file already at the
+reserved path is reused only if it is exactly the aggregate (a crash between
+placement and commit); other bytes there are never overwritten
+(`destination_conflict`). The Track carries title/artist "Urgent PA" (legacy
+parity) and is NOT Ready-to-Air, so neither rotation nor a category-only
+`insert_urgent` (Weather/AMBER, legacy OGRemote's mix) ever selects it.
+
+**Correlation** (migration `active_messages.0002`, CreateModel only):
+`ActiveBroadcastPublication` (execution → media → Track, with a Track id
+snapshot) and `ActiveBroadcastInsertion` (one per engine-inserted LogItem:
+execution, **attempt token** (unique), LogItem with id snapshot (unique),
+engine process). Both reference library rows SET_NULL with snapshots (a Track
+can be deleted, a LogItem is pruned with its log). The reserved file name
+`am-<32 hex>.flac` is only the database-free candidate test that keeps
+ordinary Tracks query-free on the engine's hot paths (as spoken's
+`spoken-<hex>.flac`); authority is always the exact insertion.
+
+**Attempts.** Every dispatch is a new attempt token on the execution. Only
+the insertion of the CURRENT attempt may open a deck, so a duplicate command
+(that attempt is already inserted), a delayed or superseded one, and a
+LogItem from an earlier attempt are all harmless. Re-sends:
+
+| Situation | Who | Action |
+| --- | --- | --- |
+| command not accepted within 60 s (lost) | worker | new attempt, re-sent |
+| accepted/claimed by a previous engine process, not started | engine at start-up | new attempt, re-sent |
+| deck refused or failed to open (not stale) | engine | new attempt, re-sent |
+| accepted/claimed but not started after 600 s (queue replaced) | worker | new attempt, re-sent |
+| 50 attempts | -- | FAILED `dispatch_exhausted` |
+
+**Priority.** The native item takes the same "next boundary" place as any
+urgent insertion, but behind every not-yet-played Weather/AMBER (`WxAlert`)
+item at the front of the queue or forced list; a Weather/AMBER alert that
+arrives later still goes to the very front (unchanged). With a dedication
+follow-up pending, the forced order is Weather/AMBER, native, follow-up. A
+playing deck is never touched: once an aggregate has STARTED it finishes,
+and a newly arriving alert gets the next boundary.
+
+**Staleness.** Before a deck opens, the deck-open authority re-reads
+committed state (bounded 250 ms lock wait): current attempt, native-airing
+gate, ACCEPTED with the CURRENT generation and the same aggregate → CLAIMED
+(from here it airs even if a clear commits a moment later); this engine
+process's own CLAIMED/STARTED (a seek or pause continuation) → allowed;
+anything else → refused (a stale ACCEPTED one is SUPPRESSED
+`stale_generation`). The engine's existing playability filter applies the
+same rule read-only to queued items, so a stale aggregate is skipped exactly
+like any unplayable item: the next ordinary item plays, nothing is consumed
+or duplicated, Weather/AMBER items and dedication follow-ups are untouched,
+and the worker suppresses the execution. Clear, replacement, expiry and any
+generation change all behave this way. Song-request substitution and
+dedication splicing never apply (they act on music-kind items only).
+
+**Evidence.** No new detector. Queueing, LogItem creation, deck construction
+and PLAYING are not STARTED. `sync_evidence` reads the deck's own committed
+ledger for the current attempt: a PlayEvent (written only at the first real
+post-primer buffer) → STARTED with its exact timestamp; the terminal ledger →
+COMPLETED only for a clean natural end (`complete`, `ended_at`, last segment
+`eos`/`eos_deferred`) with the confirmed duration -- D1 then sets each
+participant's `next_due_at` -- otherwise INTERRUPTED at the last real
+evidence. The engine runs it from its own air-start and terminal-ledger
+commits; the worker repeats it (crash recovery). After an engine restart the
+new process closes a STARTED airing of the previous one as INTERRUPTED (even
+when a clean shutdown left the ledger open) and never resumes it: no
+duplicate emergency/PA audio after a crash.
+
+**Accounting.** The ordinary PlayEvent is written with UrgentPA's existing
+category kind (Spot); royalty/SoundExchange reports select only Music, so an
+aggregate is never a music performance (legacy OGRemote's UrgentPA mix was
+classified the same way). Nothing was special-cased.
+
+**Gate.** Publication, dispatch, admission and deck-open all require
+`services.NATIVE_AIRING_AVAILABLE` (False in code) AND the policy switch.
+Tests open it only with an explicit patch. Production cutover (Phase G) needs
+that code change; D2B does not make it. Legacy OGRemote stays authoritative
+and untouched.
 
 ## Release notes for D1
 
@@ -405,3 +506,15 @@ events.
 * isadoraair-render gains the `assemble` operation (protocol v1 unchanged for
   `render`); its descriptor bound rises from 5 to 25.
 * `manage.py active_message_worker` -- no systemd unit in D2A.
+
+## Release notes for D2B
+
+* `active_messages.0002_playout_correlation` -- CreateModel ×2 (additive,
+  automatic).
+* `insert_urgent` accepts optional `track` / `active_execution` / `attempt`;
+  the category-only form is unchanged.
+* Engine hooks: native branch of `insert_urgent`, the deck-open authority and
+  playability filter (database work for `am-<hex>.flac` candidates only),
+  evidence projection after the existing air-start and terminal-ledger
+  commits, start-up reconciliation. No GStreamer change.
+* Native airing stays impossible: `NATIVE_AIRING_AVAILABLE` is False.

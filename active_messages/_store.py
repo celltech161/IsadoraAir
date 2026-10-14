@@ -1,4 +1,6 @@
-"""PRIVATE writer for active_messages.services -- not an application API.
+"""PRIVATE writer for active_messages.services (and, for the D2B playout
+correlation and its execution transitions, active_messages.playout) -- not an
+application API.
 
 Writes go through Django's base ``QuerySet`` (no model signals, never
 ``Model.save()``), so nothing between the service's decision and the SQL can

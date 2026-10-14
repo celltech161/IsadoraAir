@@ -497,3 +497,103 @@ class ActiveBroadcastMessageEvent(models.Model):
 
     def delete(self, *args, **kwargs):
         guard.refuse("active-message events are append-only")
+
+
+# -- playout representation (iPortal Phase D2B) ------------------------------------------------
+#
+# A READY aggregate airs the way every other station element does: as an
+# ordinary library Track in the UrgentPA category, inserted by the existing
+# urgent splice and played by the existing A/B decks. These two rows are the
+# DURABLE correlation between the domain and that ordinary playout -- never
+# authority over playback itself (the deck's own LogItem/PlayEvent evidence
+# is):
+#
+#     ActiveBroadcastExecution 1--1 ActiveBroadcastPublication --> library.Track
+#                              1--* ActiveBroadcastInsertion   --> library.LogItem
+#
+# Both reference library rows SET_NULL with an immutable id snapshot: a Track
+# can be deleted by an operator and a LogItem is pruned with its PlaylistLog,
+# while the correlation history must survive.
+
+PUBLICATION_RELPATH_PATTERN = r"^UrgentPA/am-[0-9a-f]{32}\.flac$"
+
+
+class PublicationQuerySet(guard.GuardedQuerySet):
+    model_label = "active-message publications"
+    # Django's SET_NULL when the library Track is deleted (the snapshot stays).
+    user_foreign_keys = guard.user_fk_names("track")
+
+
+class ActiveBroadcastPublication(models.Model):
+    """The exact library representation of one execution's aggregate: the
+    execution-specific, immutable file ``UrgentPA/am-<execution hex>.flac``
+    holding exactly ``media``'s bytes, and the ordinary Track for it."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    execution = models.OneToOneField(ActiveBroadcastExecution, on_delete=models.PROTECT, related_name="publication")
+    media = models.ForeignKey(ProductionMedia, on_delete=models.PROTECT, related_name="active_message_publications")
+    library_relpath = models.CharField(max_length=255, unique=True)
+    sha256 = models.CharField(max_length=64)
+    track = models.ForeignKey("library.Track", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    track_id_snapshot = models.BigIntegerField(unique=True)
+    published_at = models.DateTimeField()
+
+    objects = PublicationQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-published_at"]
+        base_manager_name = "objects"
+        constraints = [
+            models.CheckConstraint(condition=Q(library_relpath__regex=PUBLICATION_RELPATH_PATTERN),
+                                   name="active_publication_relpath_shape"),
+            models.CheckConstraint(condition=Q(sha256__regex=SHA256_PATTERN), name="active_publication_sha256"),
+        ]
+
+    def __str__(self):
+        return f"publication of {self.execution_id} as {self.library_relpath}"
+
+    def save(self, *args, **kwargs):
+        guard.refuse("active-message publications are written only by active_messages.playout")
+
+    def delete(self, *args, **kwargs):
+        guard.refuse("active-message publications are never deleted")
+
+
+class InsertionQuerySet(guard.GuardedQuerySet):
+    model_label = "active-message insertions"
+    # Django's SET_NULL when the LogItem is pruned with its PlaylistLog.
+    user_foreign_keys = guard.user_fk_names("log_item")
+
+
+class ActiveBroadcastInsertion(models.Model):
+    """One LogItem the engine spliced for one dispatch ATTEMPT of an
+    execution (written in the engine's own splice transaction). Only the
+    insertion of the execution's CURRENT attempt may open a deck."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    execution = models.ForeignKey(ActiveBroadcastExecution, on_delete=models.PROTECT, related_name="insertions")
+    publication = models.ForeignKey(ActiveBroadcastPublication, on_delete=models.PROTECT, related_name="insertions")
+    attempt_token = models.UUIDField(unique=True)
+    log_item = models.ForeignKey("library.LogItem", null=True, blank=True, on_delete=models.SET_NULL,
+                                 related_name="+")
+    log_item_id_snapshot = models.BigIntegerField(unique=True)
+    engine_instance = models.CharField(max_length=64)
+    inserted_at = models.DateTimeField()
+
+    objects = InsertionQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["-inserted_at"]
+        base_manager_name = "objects"
+        constraints = [
+            models.CheckConstraint(condition=~Q(engine_instance=""), name="active_insertion_engine_named"),
+        ]
+
+    def __str__(self):
+        return f"insertion {self.attempt_token} of {self.execution_id} as log item {self.log_item_id_snapshot}"
+
+    def save(self, *args, **kwargs):
+        guard.refuse("active-message insertions are written only by active_messages.playout")
+
+    def delete(self, *args, **kwargs):
+        guard.refuse("active-message insertions are never deleted")

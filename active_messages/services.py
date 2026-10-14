@@ -992,6 +992,35 @@ def _check_evidence(row, attempt_token, ended_at, duration):
         raise EvidenceRefused("confirmed duration is a non-negative Decimal", code="evidence_duration")
 
 
+def record_air_started(execution, *, attempt_token, started_at, claimed_at=None, now=None,
+                       actor_kind=ActorKind.ENGINE):
+    """ACCEPTED/CLAIMED -> STARTED (D2B) from the deck's OWN first-real-buffer
+    evidence (``LogItem.played_at`` / ``PlayEvent.started_at``) -- never from
+    queueing, deck construction or PLAYING state. ``claimed_at`` fills a claim
+    the engine committed without its own CLAIMED step. Idempotent for the same
+    attempt."""
+    now = _now(now)
+    if started_at is None or timezone.is_naive(started_at):
+        raise EvidenceRefused("air start evidence is a timezone-aware time", code="evidence_order")
+    with transaction.atomic():
+        policy = _lock_policy()
+        row = ActiveBroadcastExecution.objects.select_for_update(of=("self",)).get(
+            pk=getattr(execution, "pk", execution))
+        if row.attempt_token is None or str(row.attempt_token) != str(attempt_token):
+            raise EvidenceRefused("the evidence is not from the execution's current attempt", code="attempt_mismatch")
+        if row.state in (X.STARTED, X.COMPLETED, X.INTERRUPTED) and row.started_at is not None:
+            return row
+        if row.state not in (X.ACCEPTED, X.CLAIMED):
+            raise InvalidTransition(f"a {row.state} execution cannot start", code="not_engine_held")
+        claimed = row.claimed_at or claimed_at or started_at
+        row = _store.write(ActiveBroadcastExecution, row.pk, match={"state": row.state,
+                                                                    "attempt_token": row.attempt_token},
+                           values={"state": X.STARTED, "claimed_at": claimed, "started_at": started_at})
+        _event("air_started", execution=row, from_state=X.CLAIMED, to_state=X.STARTED, generation=policy.generation,
+               actor_kind=actor_kind, detail={"started_at": _iso(started_at)})
+    return row
+
+
 def record_air_completed(execution, *, attempt_token, ended_at, confirmed_duration_seconds, now=None,
                          actor_kind=ActorKind.ENGINE):
     """STARTED -> COMPLETED from a clean end of the aggregate, then the cadence:

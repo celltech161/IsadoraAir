@@ -134,6 +134,30 @@ RESUME_STATE_MAX_AGE_SECONDS = 90.0
 RESUME_REPLAY_OVERLAP_SECONDS = 0.25
 RESUME_END_GUARD_SECONDS = 0.25
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
+# iPortal D2B: this engine process's identity for native active-message
+# claims (a previous process's accepted/claimed attempt is rotated at start-up).
+ENGINE_INSTANCE = uuid.uuid4().hex
+# Urgent insertions that keep emergency priority over a native urgent/PA
+# aggregate waiting at the same boundary (Weather and AMBER share WxAlert).
+EMERGENCY_URGENT_CATEGORY_CODES = frozenset({"WxAlert"})
+
+
+def _active_message_candidate(track):
+    """Database-free: is this a native active-message aggregate Track?"""
+    from active_messages import playout
+    return playout.is_candidate(track)
+
+
+def _leading_emergency(items):
+    """How many not-yet-played Weather/AMBER urgent items lead ``items`` -- a
+    native aggregate is placed behind them, never ahead."""
+    count = 0
+    for item in items:
+        code = getattr(getattr(item, "category", None), "code", None) if getattr(item, "category_id", None) else None
+        if code not in EMERGENCY_URGENT_CATEGORY_CODES or getattr(item, "played_at", None) is not None:
+            break
+        count += 1
+    return count
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 # Deliberately a SEPARATE file from NOW_PLAYING_PATH above, not an
 # extra key folded into that JSON -- NOW_PLAYING_PATH is also consumed
@@ -1012,6 +1036,17 @@ def _log_item_playable(log_item):
                 return False, authority.reason
             track = authority.track
             log_item.track = track
+        # iPortal D2B: a native urgent/PA aggregate is advisory-checked against
+        # its exact insertion (database work for candidates only). The deck-open
+        # authority below is the binding re-check.
+        if _active_message_candidate(track):
+            from active_messages import playout as active_playout
+            try:
+                decision = active_playout.inspect(log_item, ENGINE_INSTANCE)
+            except Exception:  # noqa: BLE001 -- advisory only; the deck-open authority decides
+                decision = None
+            if decision is not None and not decision.allowed:
+                return False, decision.reason
     fp = track.filepath
     if not fp:
         return False, f"track id={track.id} has no filepath"
@@ -1077,6 +1112,17 @@ def _deck_open_authority(log_item):
                 yield None, authority.reason
                 return
             log_item.track = authority.track
+            # iPortal D2B: a native urgent/PA aggregate opens only for its current
+            # insertion attempt of a still-current execution (claimed here), or as
+            # this process's own continuation. None for every ordinary Track.
+            from active_messages import playout as active_playout
+            try:
+                native = active_playout.authorize_open(log_item, ENGINE_INSTANCE)
+            except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
+                native = active_playout.Decision(False, f"active-message authority unavailable: {exc}")
+            if native is not None and not native.allowed:
+                yield None, native.reason
+                return
             yield authority.track, None
     finally:
         _DECK_OPEN.depth -= (1 if real else 0)
@@ -2001,6 +2047,7 @@ class PlaybackEngine:
         # stale segments after that validation so an on-disk hint for a
         # regenerated/missing occurrence cannot leave a clean event open.
         self._reconcile_playback_duration_state()
+        self._reconcile_active_message_playout()
 
         if not self.log_items and not self._forced_next_items:
             print("No approved log for current hour. Waiting...")
@@ -6591,6 +6638,7 @@ class PlaybackEngine:
         deck = self._create_deck(slot, log_item)
         if deck is None:
             # File missing — move on to whatever's after it for this slot.
+            self._report_active_message_not_opened(log_item)
             self._start_next_track(slot=slot)
             return
 
@@ -6847,6 +6895,9 @@ class PlaybackEngine:
                     f"  [{slot}] Playing: "
                     f"{deck.track.artist.name if deck.track.artist else '?'} - {deck.track.title}"
                 )
+                if _active_message_candidate(deck.track):
+                    # The deck's own committed first-real-buffer evidence -> STARTED.
+                    GLib.idle_add(self._sync_active_message_evidence, log_item_id)
             return False
         except Exception as exc:
             with deck._air_start_lock:
@@ -7814,6 +7865,9 @@ class PlaybackEngine:
                 deck.mark_duration_persisted(
                     segment.id, segment.confirmed_duration_seconds
                 )
+            if occurrence_terminal and _active_message_candidate(deck.track):
+                # The deck's own committed terminal ledger -> COMPLETED/INTERRUPTED.
+                GLib.idle_add(self._sync_active_message_evidence, deck.log_item.id)
             return True
         except Exception as exc:
             print(f"  Playback duration persistence failed (non-fatal): {exc}")
@@ -9289,7 +9343,12 @@ class PlaybackEngine:
         elif cmd == "set_manual_mode":
             self._set_manual_mode(bool(data.get("active")))
         elif cmd == "insert_urgent":
-            self._insert_urgent_next(data.get("category", "WxAlert"))
+            if data.get("active_execution"):
+                # iPortal D2B: the same urgent insertion, for an EXACT Track
+                # of one native active-message execution attempt.
+                self._insert_active_message(data)
+            else:
+                self._insert_urgent_next(data.get("category", "WxAlert"))
         elif cmd == "remote_dj_gate":
             self._remote_dj_set_gate(bool(data.get("active")))
         elif cmd == "remote_dj_disconnect":
@@ -9505,6 +9564,101 @@ class PlaybackEngine:
             self._urgent_retry_counts[category_code] = 0
             return
         GLib.timeout_add_seconds(1, lambda: self._insert_urgent_next(category_code) or False)
+
+    def _insert_active_message(self, data):
+        """iPortal D2B: the urgent insertion of ONE native active-message
+        aggregate -- the exact Track named by the command, through the same
+        splice/apply/forced-queue path as _insert_urgent_next, placed behind
+        any not-yet-played Weather/AMBER items (they keep emergency
+        priority). The domain admits the exact execution attempt and records
+        the insertion in the SAME transaction as the LogItem, so a duplicate,
+        delayed or superseded command inserts nothing. Never touches a
+        playing deck."""
+        try:
+            self._insert_active_message_inner(data)
+        except Exception as exc:
+            self._schedule_active_message_retry(data, exc)
+
+    def _insert_active_message_inner(self, data):
+        from active_messages import playout as active_playout
+        if not self.current_log or not self.log_items:
+            raise RuntimeError("No live log loaded")
+        _close_old_connections()
+        forced = bool(self._forced_next_items)
+        with transaction.atomic():
+            with self._locked_playlist_log():
+                try:
+                    admission = active_playout.admit(data)
+                except active_playout.Refused as refused:
+                    print(f"  Native urgent/PA insertion refused ({data.get('active_execution')}): {refused}")
+                    return
+                insert_at = (
+                    self._queue_cursor if forced
+                    else self._queue_cursor + _leading_emergency(self.log_items[self._queue_cursor:])
+                )
+                native_item = self._splice_log_item_db_at(insert_at, admission.track, admission.category)
+                active_playout.record_insertion(admission, native_item, ENGINE_INSTANCE)
+        self._apply_log_item_insert(insert_at, native_item)
+        if forced:
+            self._queue_cursor += 1
+            self._forced_next_items.insert(_leading_emergency(self._forced_next_items), native_item)
+        print(f"  Inserted native urgent/PA aggregate at queue position {insert_at}: {admission.track.title}")
+        getattr(self, "_active_message_retry_counts", {}).pop(data.get("attempt"), None)
+
+    def _schedule_active_message_retry(self, data, exc):
+        counts = self.__dict__.setdefault("_active_message_retry_counts", {})
+        attempt = data.get("attempt")
+        counts[attempt] = counts.get(attempt, 0) + 1
+        print(f"  Native urgent/PA insertion failed ({exc}); retrying shortly")
+        if counts[attempt] > 5:
+            counts.pop(attempt, None)
+            emit_event(
+                category="engine", level="error", title="Native urgent/PA insertion repeatedly failed",
+                detail={"execution": data.get("active_execution"), "last_error": str(exc)},
+                dedupe_key="engine|active-message-insert-failed",
+            )
+            return                       # the worker re-sends a command never accepted
+        GLib.timeout_add_seconds(1, lambda: self._insert_active_message(data) or False)
+
+    def _report_active_message_not_opened(self, log_item):
+        """A native aggregate's deck was not opened (refused or failed):
+        let the domain re-send its airing, or nothing if it went stale."""
+        track = getattr(log_item, "track", None)
+        if log_item is None or not isinstance(log_item, LogItem) or not _active_message_candidate(track):
+            return
+        GLib.idle_add(self._report_active_message_not_opened_now, log_item.id)
+
+    @_glib_safe(default_return=False)
+    def _report_active_message_not_opened_now(self, log_item_id):
+        from active_messages import playout as active_playout
+        try:
+            _close_old_connections()
+            active_playout.report_not_opened(log_item_id)
+        except Exception as exc:  # noqa: BLE001 -- the worker's evidence pass recovers
+            print(f"  Native urgent/PA re-send failed (non-fatal): {exc}")
+        return False
+
+    @_glib_safe(default_return=False)
+    def _sync_active_message_evidence(self, log_item_id):
+        """Project this deck's committed evidence onto its native execution
+        (STARTED / COMPLETED / INTERRUPTED). Non-fatal: the worker repeats it."""
+        from active_messages import playout as active_playout
+        try:
+            _close_old_connections()
+            active_playout.sync_for_log_item(log_item_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Native urgent/PA evidence sync failed (non-fatal): {exc}")
+        return False
+
+    def _reconcile_active_message_playout(self):
+        """Start-up: after the deck ledger's own reconciliation, settle native
+        executions a previous engine process held (never resumed, never
+        replayed at once; an unstarted attempt is re-sent)."""
+        from active_messages import playout as active_playout
+        try:
+            active_playout.engine_started(ENGINE_INSTANCE)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Native urgent/PA start-up reconciliation failed (non-fatal): {exc}")
 
     def _maybe_insert_dedication_intro(self, log_item):
         """Thin, blanket-fail-open wrapper matching maybe_schedule_song_

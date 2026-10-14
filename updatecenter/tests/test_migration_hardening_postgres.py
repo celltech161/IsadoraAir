@@ -278,7 +278,9 @@ class RealGraphReconstructionTests(TransactionTestCase):
             # unapplies every later library migration (2.22B: 0089), which the
             # probe then correctly plans after the historical pair.
             # 2.22C: and spoken.0001, which depends on library.0089.
-            self.assertTrue(all((ref.startswith("library.") and ref > "library.0088") or ref == "spoken.0001_initial"
+            # 2.22D2B: and active_messages.0002, which depends on library.0089.
+            self.assertTrue(all((ref.startswith("library.") and ref > "library.0088")
+                                or ref in ("spoken.0001_initial", "active_messages.0002_playout_correlation")
                                 for ref in refs[2:]), refs)
             MigrationExecutor(connection).migrate(after_m1)
             resumed = build_probe_payload(**context, recovery_plan_refs=refs)

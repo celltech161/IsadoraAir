@@ -1,6 +1,6 @@
-"""active_messages.0001 is additive under the REAL runtime-11 classifier (the
-protected updater's own probe functions): CreateModel only, every constraint
-and index folded in. The capability seed (authz.0008, RunPython) is Phase
+"""active_messages.0001 (D1) and 0002 (D2B playout correlation) are additive
+under the REAL runtime-11 classifier (the protected updater's own probe
+functions): CreateModel only, every constraint and index folded in. The capability seed (authz.0008, RunPython) is Phase
 D1's ONE manual operation -- it needs a companion or local approval at release
 time -- and is isolated in its own migration.
 """
@@ -17,8 +17,9 @@ from updatecenter.management.commands import updatecenter_probe as probe
 
 REPO = Path(__file__).resolve().parents[2]
 INITIAL = REPO / "active_messages" / "migrations" / "0001_initial.py"
+PLAYOUT = REPO / "active_messages" / "migrations" / "0002_playout_correlation.py"
 SEED = REPO / "authz" / "migrations" / "0008_active_message_capabilities.py"
-REFS = ["active_messages.0001_initial"]
+REFS = ["active_messages.0001_initial", "active_messages.0002_playout_correlation"]
 SEED_REF = "authz.0008_active_message_capabilities"
 
 
@@ -41,6 +42,16 @@ class StructureTests(SimpleTestCase):
                           "AddField", "AlterField", "Capability", "get_model"):
             self.assertNotIn(forbidden, text)
 
+    def test_the_playout_migration_is_createmodel_only(self):
+        self.assertEqual(_migration_calls(PLAYOUT), ["CreateModel"] * 2)
+        text = PLAYOUT.read_text()
+        for forbidden in ("RunPython", "RunSQL", "SeparateDatabaseAndState", "AddConstraint", "AddIndex",
+                          "AddField", "AlterField", "get_model"):
+            self.assertNotIn(forbidden, text)
+        for model in (domain.ActiveBroadcastPublication, domain.ActiveBroadcastInsertion):
+            for name in _declared(model, "constraints") | _declared(model, "indexes"):
+                self.assertIn(f"name='{name}'", text)
+
     def test_every_declared_constraint_and_index_is_in_the_initial_migration(self):
         text = INITIAL.read_text()
         names = set()
@@ -55,7 +66,9 @@ class StructureTests(SimpleTestCase):
         loader = MigrationLoader(None)
         self.assertTrue(loader.disk_migrations[("active_messages", "0001_initial")].atomic)
         self.assertTrue(loader.disk_migrations[("authz", "0008_active_message_capabilities")].atomic)
-        self.assertEqual(sorted(p.name for p in INITIAL.parent.glob("*.py")), ["0001_initial.py", "__init__.py"])
+        self.assertTrue(loader.disk_migrations[("active_messages", "0002_playout_correlation")].atomic)
+        self.assertEqual(sorted(p.name for p in INITIAL.parent.glob("*.py")),
+                         ["0001_initial.py", "0002_playout_correlation.py", "__init__.py"])
         self.assertEqual(_migration_calls(SEED), ["RunPython"])
 
 
@@ -63,7 +76,8 @@ class StaticClassificationTests(SimpleTestCase):
     def test_the_domain_schema_is_additive_with_zero_manual_operations(self):
         plan = probe._serialize_exact_plan(MigrationLoader(None), REFS)
         self.assertEqual([item["ref"] for item in plan], REFS)
-        self.assertEqual({op["classification"] for op in plan[0]["operations"]}, {"additive"})
+        for item in plan:
+            self.assertEqual({op["classification"] for op in item["operations"]}, {"additive"}, item["ref"])
         self.assertEqual(probe.extract_manual_operations(plan), [])
 
     def test_the_capability_seed_is_the_one_manual_operation(self):

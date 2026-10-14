@@ -639,8 +639,10 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # 2.22C: spoken.0001 depends on library.0089 (Category/Track FKs), so
             # unapplying library also unapplies it; library.0089 still plans
             # first and is judged on its own (spoken has its own classifier test).
+            # 2.22D2B: and active_messages.0002, which depends on library.0089.
             self.assertEqual([item["ref"] for item in payload["plan"]],
-                             ["library.0089_voicetrack_media", "spoken.0001_initial"])
+                             ["library.0089_voicetrack_media", "active_messages.0002_playout_correlation",
+                              "spoken.0001_initial"])
             item = payload["plan"][0]
             self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
                              [("AddField", "additive")])

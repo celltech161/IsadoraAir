@@ -1,4 +1,5 @@
-"""Keep ``active_messages.services`` the ONLY writer of active-message authority.
+"""Keep ``active_messages.services`` (with ``active_messages.playout`` for the
+D2B playout correlation) the ONLY writer of active-message authority.
 
 Every ordinary ORM write path of the four domain models refuses:
 

@@ -91,8 +91,10 @@ class LivePlanClassificationTests(TransactionTestCase):
             payload = probe.build_probe_payload()
             # 2.22D1: active_messages.0001 depends on production.0002, so unapplying
             # production.0002 unapplies it too (it has its own classifier test).
+            # 2.22D2B: and active_messages.0002 after it.
             self.assertEqual([item["ref"] for item in payload["plan"]],
-                             ["production.0002_referenceaudio", "active_messages.0001_initial", "spoken.0001_initial"])
+                             ["production.0002_referenceaudio", "active_messages.0001_initial",
+                              "active_messages.0002_playout_correlation", "spoken.0001_initial"])
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
             for item in payload["plan"]:

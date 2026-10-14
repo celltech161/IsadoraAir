@@ -38,8 +38,13 @@ Outcomes:
   change, another worker) -> nothing is bound; the finished rendition stays an
   immutable, unbound orphan for ordinary retention.
 
-No engine command is ever sent and nothing airs: the native-airing gate stays
-closed and READY executions wait for D2B.
+D2B: each pass first runs the playout step (active_messages.playout.advance)
+for the execution past rendering, if any -- project the deck's own evidence
+(STARTED / COMPLETED / INTERRUPTED), suppress an engine-held execution whose
+composition moved on, publish a READY aggregate into UrgentPA and dispatch
+its exact urgent insertion -- and a freshly READY aggregate is published and
+dispatched in the same pass. Publication and dispatch need the native-airing
+gate, which stays closed in production (OGRemote remains authoritative).
 """
 from __future__ import annotations
 
@@ -54,7 +59,7 @@ from django.utils import timezone
 from production.services.render import client
 from production.services.render.engine import RenderError
 
-from . import rendering, services
+from . import playout, rendering, services
 from .models import UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessageEvent, ExecutionState
 
 # (namespace, key) of the worker's session advisory lock. "AMSG" as an int32.
@@ -81,7 +86,7 @@ POLL_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class Outcome:
-    result: str                 # busy | idle | blocked | backoff | ready | reused | retry | failed | superseded
+    result: str                 # busy | idle | blocked | backoff | ready | reused | retry | failed | superseded | playout
     execution: str = ""
     code: str = ""
 
@@ -217,30 +222,48 @@ def run_once(*, now=None, render_fn=rendering.render) -> Outcome:
     with worker_lock() as held:
         if not held:
             return Outcome("busy")
-        orphan = _unreconciled()
-        if orphan is not None:
-            successor = _reconcile(orphan)
-            if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
-                return process(successor, now=now, render_fn=render_fn)
-        blocked = _blocked()
-        if blocked:
-            return Outcome("blocked", code=blocked)
-        execution = _occurrence(now)
-        if execution is None or execution.state != ExecutionState.PENDING_RENDER:
-            return Outcome("idle", "" if execution is None else str(execution.pk))
-        outcome = process(execution, now=now, render_fn=render_fn)
-        if outcome.result == "failed" and outcome.code == services.STINGER_PIN_UNAVAILABLE:
-            # Reconcile at once from CURRENT authority, independent of cadence (a
-            # Replay Now is not lost): the successor omits an unusable stinger and
-            # keeps every urgent/PA component.
-            successor = _reconcile(execution)
-            if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
-                return process(successor, now=now, render_fn=render_fn)
+        step = playout.advance(now=now)
+        if step not in _PLAYOUT_SETTLED:
+            return Outcome("playout", code=step)        # one execution past rendering is still in flight
+        outcome = _render_pass(now, render_fn)
+        if outcome.result in ("ready", "reused"):
+            playout.advance(now=now)                    # publish + dispatch at once (gate permitting)
         return outcome
+
+
+# Playout outcomes after which no execution past rendering remains in flight.
+# "gated": with the native-airing gate closed a READY execution simply waits
+# (production until Phase G), exactly as in D2A.
+_PLAYOUT_SETTLED = frozenset({"none", "gated", "completed", "interrupted", "suppressed", "failed",
+                              "publication_failed"})
+
+
+def _render_pass(now, render_fn) -> Outcome:
+    """The D2A part of a pass (worker lock held)."""
+    orphan = _unreconciled()
+    if orphan is not None:
+        successor = _reconcile(orphan)
+        if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
+            return process(successor, now=now, render_fn=render_fn)
+    blocked = _blocked()
+    if blocked:
+        return Outcome("blocked", code=blocked)
+    execution = _occurrence(now)
+    if execution is None or execution.state != ExecutionState.PENDING_RENDER:
+        return Outcome("idle", "" if execution is None else str(execution.pk))
+    outcome = process(execution, now=now, render_fn=render_fn)
+    if outcome.result == "failed" and outcome.code == services.STINGER_PIN_UNAVAILABLE:
+        # Reconcile at once from CURRENT authority, independent of cadence (a
+        # Replay Now is not lost): the successor omits an unusable stinger and
+        # keeps every urgent/PA component.
+        successor = _reconcile(execution)
+        if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
+            return process(successor, now=now, render_fn=render_fn)
+    return outcome
 
 
 def run_forever(*, poll_seconds=POLL_SECONDS, stop=lambda: False, sleep=time.sleep) -> None:
     while not stop():
         outcome = run_once()
-        if outcome.result in ("idle", "busy", "blocked", "backoff", "retry"):
+        if outcome.result in ("idle", "busy", "blocked", "backoff", "retry", "playout"):
             sleep(poll_seconds)
