@@ -263,6 +263,180 @@ def request_render(source, recipe_key, recipe_params=None, *, item=None, lease=N
     return output
 
 
+# -- assemblies (iPortal Phase D2A) ------------------------------------------------------------
+
+STINGER_UNAVAILABLE = "stinger_pin_unavailable"
+INPUT_UNAVAILABLE = "input_unavailable"
+
+
+def _hash_file(handle) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    offset = 0
+    fd = handle.fileno()
+    while True:
+        chunk = os.pread(fd, 1024 * 1024, offset)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
+def _open_pinned_stinger(pin: dict):
+    """The EXACT pinned registration's bytes -- never the key's current one.
+    (OpenedMedia, protocol entry) or RenderError(stinger_pin_unavailable)."""
+    from ...models import ReferenceAudio
+    try:
+        row = ReferenceAudio.objects.get(pk=pin["reference"])
+    except (ReferenceAudio.DoesNotExist, ValueError, TypeError, KeyError):
+        raise RenderError(STINGER_UNAVAILABLE, "the pinned stinger registration does not exist",
+                          stage="input0") from None
+    if (row.key, str(row.media_id), row.sha256) != (pin.get("key"), pin.get("media"), pin.get("sha256")):
+        raise RenderError(STINGER_UNAVAILABLE, "the pinned stinger registration does not name the pinned bytes",
+                          stage="input0")
+    try:
+        opened = media_io.open_media(row.media_id, require_valid=True)
+    except (MediaPurged, MediaNotValidated, MediaInconsistent):
+        raise RenderError(STINGER_UNAVAILABLE, "the pinned stinger media is missing, purged or not valid",
+                          stage="input0") from None
+    if opened.media.sha256 != pin["sha256"] or _hash_file(opened.file) != pin["sha256"]:
+        opened.close()
+        raise RenderError(STINGER_UNAVAILABLE, "the pinned stinger bytes do not hash to the pin", stage="input0")
+    entry = {**_media_entry(opened.media), "role": "stinger", "key": row.key, "reference": str(row.pk)}
+    return opened, entry
+
+
+def _open_message(component: dict, index: int):
+    """The exact frozen message media. (OpenedMedia, protocol entry) or
+    RenderError(input_unavailable)."""
+    try:
+        opened = media_io.open_media(component["media"], require_valid=True)
+    except (MediaPurged, MediaNotValidated, MediaInconsistent):
+        raise RenderError(INPUT_UNAVAILABLE, "a message's media is missing, purged or not valid",
+                          stage=f"input{index}") from None
+    if opened.media.sha256 != component["sha256"] or _hash_file(opened.file) != component["sha256"]:
+        opened.close()
+        raise RenderError(INPUT_UNAVAILABLE, "a message's bytes do not hash to the frozen identity",
+                          stage=f"input{index}")
+    entry = {**_media_entry(opened.media), "role": "message", "message": component["message"],
+             "kind": component["kind"]}
+    return opened, entry
+
+
+def request_assembly(recipe_key, *, stinger, components, execution, timeout_seconds=None) -> ExecutorOutput:
+    """Assemble ``stinger`` (an exact ReferenceAudio pin, or None) and the
+    ordered ``components`` ({"message", "kind", "media", "sha256"} each)
+    through the render service. Every input is opened by exact identity and
+    hash-verified HERE first (so a failure names the stinger or a message),
+    then re-verified by the service. The output's ``source_id`` is the first
+    message's media -- the rendition's ``derived_from``; the full ordered
+    identity is its provenance digest. Raises RenderError."""
+    try:
+        recipe = provenance.assembly(recipe_key)
+    except registry.UnknownRecipe as exc:
+        raise RenderError("unknown_recipe", str(exc)) from exc
+    if not components or len(components) > protocol.MAX_ASSEMBLE_MESSAGES:
+        raise RenderError("invalid_request", "an assembly holds 1..24 messages")
+    opened, entries, sock = [], [], None
+    try:
+        if stinger is not None:
+            handle, entry = _open_pinned_stinger(stinger)
+            opened.append(handle)
+            entries.append(entry)
+        for index, component in enumerate(components, start=len(entries)):
+            handle, entry = _open_message(component, index)
+            opened.append(handle)
+            entries.append(entry)
+        expected = provenance.digest(provenance.assembly_document(
+            recipe, [protocol.assembly_input_of(entry) for entry in entries]))
+        timeout = float(timeout_seconds or DEFAULT_TIMEOUT_SECONDS)
+        request_id = secrets.token_hex(16)
+        body = {"v": protocol.PROTOCOL_VERSION, "op": "assemble", "request_id": request_id,
+                "correlation": {"execution": str(execution)},
+                "recipe": {"key": recipe.key, "version": recipe.version},
+                "inputs": entries, "expected_digest": expected,
+                "timeout": min(timeout, protocol.MAX_TIMEOUT_SECONDS)}
+        line = (json.dumps(body, sort_keys=True) + "\n").encode()
+        if len(line) > protocol.REQUEST_LIMIT_BYTES:
+            raise RenderError("invalid_request", "the assembly request exceeds its bound")
+        sock = _connect_and_send(line, [handle.file.fileno() for handle in opened])
+    finally:
+        for handle in opened:
+            handle.close()
+    first_message = next(entry for entry in entries if entry["role"] == "message")
+    return _await_output(sock, request_id, recipe, expected, first_message["media"], timeout)
+
+
+def _connect_and_send(line: bytes, fds) -> socket.socket:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+    sock.settimeout(CONNECT_TIMEOUT_SECONDS)
+    try:
+        sock.connect(_socket_path())
+        from ..confinement import peer_uid
+        if peer_uid(sock) != os.geteuid():
+            raise RenderError("service_unavailable", "the render socket belongs to another account", retryable=True)
+        sock.sendmsg([line], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+    except BlockingIOError:
+        sock.close()
+        raise RenderError("busy", "the render service's accept queue is full", retryable=True) from None
+    except OSError as exc:
+        sock.close()
+        raise RenderError("service_unavailable", f"render service unavailable: {exc.strerror or exc}",
+                          retryable=True) from None
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def _await_output(sock, request_id, recipe, expected, source_id, timeout) -> ExecutorOutput:
+    """The answer to one request: verified exactly as request_render does."""
+    try:
+        data, fds = _receive(sock, time.monotonic() + timeout + RESPONSE_GRACE_SECONDS)
+    finally:
+        sock.close()
+    try:
+        answer = json.loads(data.decode("utf-8")) if data else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or answer.get("v") != protocol.PROTOCOL_VERSION:
+        _close_all(fds)
+        raise RenderError("service_unavailable", "the render service gave no valid answer", retryable=True)
+    if answer.get("status") != "ok":
+        _close_all(fds)
+        code = answer.get("code") if answer.get("code") in protocol.CODES else "render_failed"
+        raise RenderError(code, f"the render service refused or failed ({code})",
+                          retryable=protocol.CODES.get(code, False), stage=str(answer.get("stage", ""))[:40])
+    if len(fds) != 1:
+        _close_all(fds)
+        raise RenderError("descriptor_invalid", "a successful render returns exactly one descriptor")
+    fd = fds[0]
+    try:
+        _verify_output(fd, answer)
+        document = answer.get("provenance")
+        if (answer.get("request_id") != request_id
+                or answer.get("recipe") != {"key": recipe.key, "version": recipe.version}
+                or answer.get("digest") != expected or not isinstance(document, dict)
+                or provenance.digest(document) != expected):
+            raise RenderError("provenance_mismatch", "the render service answered for another render")
+        toolchain = answer.get("toolchain")
+        if not isinstance(toolchain, str) or not toolchain.endswith(protocol.EXECUTOR_MARKER) \
+                or len(toolchain) > 200:
+            raise RenderError("provenance_mismatch", "the render answer carries no executor identity")
+        measured = answer.get("measured_input") if isinstance(answer.get("measured_input"), dict) else {}
+    except BaseException:
+        os.close(fd)
+        raise
+    output = ExecutorOutput(fd=fd, request_id=request_id, source_id=str(source_id), recipe_key=recipe.key,
+                            recipe_version=recipe.version, digest=expected,
+                            provenance_json=json.dumps(document, sort_keys=True), toolchain=toolchain,
+                            sha256=answer["output"]["sha256"], size=answer["output"]["bytes"],
+                            measured_input=measured)
+    _ISSUED.add(output)
+    _FINALIZERS[output] = weakref.finalize(output, _close_quiet, fd)
+    return output
+
+
 def _close_quiet(fd):
     try:
         os.close(fd)

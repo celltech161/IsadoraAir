@@ -50,6 +50,7 @@ from decimal import Decimal
 from . import params as params_mod
 from . import protocol, provenance, registry
 from .engine import RenderError, parse_loudnorm
+from .steps import EncodeFlac
 
 SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 _HASH_CHUNK = 1024 * 1024
@@ -326,6 +327,125 @@ def execute(request: dict, source_fd: int, reference_fds: dict, *, run_step, ffm
         raise
     finally:
         for fd in (*opened, *held.values(), output):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+# -- assemblies (iPortal Phase D2A) ------------------------------------------------------------
+
+def plan_assembly(request: dict) -> tuple:
+    """(assembly, digest, document) of a shape-checked ``assemble`` request --
+    or RenderError. Pure."""
+    try:
+        recipe = provenance.assembly(request["recipe_key"])
+    except registry.UnknownRecipe as exc:
+        raise RenderError("unknown_recipe", str(exc)) from exc
+    if request["recipe_version"] != recipe.version:
+        raise RenderError("recipe_version_mismatch", "the assembly version is not the registered one")
+    document = provenance.assembly_document(recipe, [protocol.assembly_input_of(entry) for entry in request["inputs"]])
+    digest = provenance.digest(document)
+    if digest != request["expected_digest"]:
+        raise RenderError("provenance_mismatch", "the expected provenance is not what this assembly produces")
+    return recipe, digest, document
+
+
+_ASSEMBLY_PREPARE = "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo"
+# Raw PCM of the rendition format: 48 kHz, stereo, signed 16-bit LE (s16le).
+_PCM_ARGS = ["-c:a", "pcm_s16le", "-f", "s16le"]
+_PCM_FRAME_BYTES = 4
+
+
+def _append(target: int, source: int) -> int:
+    """Append a sealed memfd's bytes to ``target``; returns the count."""
+    offset = 0
+    while True:
+        chunk = os.pread(source, _HASH_CHUNK, offset)
+        if not chunk:
+            return offset
+        _write_all(target, chunk)
+        offset += len(chunk)
+
+
+def execute_assembly(request: dict, fds: list, *, run_step, ffmpeg: str, deadline: float, release=None) -> Rendered:
+    """Assemble one shape-checked ``assemble`` request. ``fds``: the caller's
+    descriptors in input order (each read ONCE, into a sealed snapshot whose
+    size and SHA-256 must be the claimed ones).
+
+    Each input is decoded ALONE, in its own confined step, to raw PCM of the
+    rendition format (48 kHz stereo s16le); the executor appends those
+    identically formatted samples in input order -- a sequential join with no
+    gap, overlap or processing -- and one final single-input step encodes the
+    FLAC. (One ffmpeg over 25 inputs would need a demuxer and decoder thread
+    per input, beyond the render sandbox's task limit.)"""
+    recipe, digest, document = plan_assembly(request)
+    inputs = request["inputs"]
+    if len(fds) != len(inputs):
+        raise RenderError("invalid_request", "one descriptor per input")
+    if sum(entry["bytes"] for entry in inputs) > MAX_INPUT_BYTES:
+        raise RenderError("input_too_large", "the inputs are larger than one render may hold", stage="snapshot")
+    common = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-y", "-protocol_whitelist", "fd", "-loglevel", "error"]
+    snapshots, opened, output, joined, piece = [], [], None, None, None
+
+    def step(stage, argv, pass_fds):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RenderError("render_timeout", "the assembly exceeded its time limit", retryable=True, stage=stage)
+        _status(run_step(argv, tuple(pass_fds), remaining), stage)
+
+    def fresh_ro(fd):
+        handle = reopen_read_only(fd)
+        opened.append(handle)
+        return handle
+
+    def close_opened():
+        while opened:
+            os.close(opened.pop())
+
+    try:
+        for index, (fd, entry) in enumerate(zip(fds, inputs)):
+            snapshots.append(snapshot_input(fd, entry, f"input{index}"))
+        if release is not None:
+            release()                               # the caller's descriptors are no longer authoritative
+        joined = new_memfd("assembly-pcm")
+        for index in range(len(snapshots)):
+            piece = new_memfd(f"pcm{index}")
+            source = fresh_ro(snapshots[index])
+            step(f"prepare{index}", [*common, "-fd", str(source), "-i", "fd:", "-map", "0:a:0", "-vn", "-sn", "-dn",
+                                     "-af", _ASSEMBLY_PREPARE, *_PCM_ARGS, "-fd", str(piece), "fd:"],
+                 (source, piece))
+            close_opened()
+            os.close(snapshots[index])
+            snapshots[index] = None
+            size = os.fstat(piece).st_size
+            if size == 0 or size % _PCM_FRAME_BYTES:
+                raise RenderError("render_failed", "an input decoded to no whole audio frames", stage=f"prepare{index}")
+            fcntl.fcntl(piece, fcntl.F_ADD_SEALS, SEALS)
+            _append(joined, piece)
+            os.close(piece)
+            piece = None
+        fcntl.fcntl(joined, fcntl.F_ADD_SEALS, SEALS)
+        output = new_memfd("assembly")
+        pcm = fresh_ro(joined)
+        step("encode", [*common, "-f", "s16le", "-ar", "48000", "-ac", "2", "-fd", str(pcm), "-i", "fd:",
+                        *EncodeFlac().output_args(), "-f", "flac", "-fd", str(output), "fd:"], (pcm, output))
+        close_opened()
+        if os.fstat(output).st_size == 0:
+            raise RenderError("render_failed", "the encoder produced no output", stage="encode")
+        fcntl.fcntl(output, fcntl.F_ADD_SEALS, SEALS)
+        rendered = Rendered(fd=output, sha256=fd_sha256(output), size=os.fstat(output).st_size, digest=digest,
+                            provenance=document, measured_input={}, recipe_key=recipe.key,
+                            recipe_version=recipe.version)
+        output = None                                    # ownership passes to the caller
+        return rendered
+    except OSError as exc:
+        if exc.errno in _RESOURCE_ERRNOS:
+            raise RenderError("render_resource_limit", "no room for the assembly") from None
+        raise
+    finally:
+        for fd in (*opened, *snapshots, piece, joined, output):
             if fd is not None:
                 try:
                     os.close(fd)

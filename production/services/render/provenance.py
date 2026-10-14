@@ -99,3 +99,49 @@ def expected(recipe_key, recipe_params, *, pin=reference_audio.current_pin) -> E
     doc = document(recipe, resolved, references)
     return ExpectedRender(recipe_key=recipe.key, recipe_version=recipe.version, params=resolved,
                           references=references, document=doc, digest=digest(doc))
+
+
+# -- assemblies (iPortal Phase D2A) ------------------------------------------------------------
+#
+# An ASSEMBLY joins an exact ordered list of inputs end to end. It is not a
+# RenderPlan recipe: it has no voice, bed, loudness or configurable parameter
+# at all -- only a code-defined key/version and its fixed output format. Its
+# provenance document names every input by identity AND exact bytes, in order:
+#
+#     {"assembly": key, "version": n, "engine": ENGINE_VERSION,
+#      "params": {fixed output format},
+#      "inputs": [{"role": "stinger", "key", "reference", "media", "sha256"},
+#                 {"role": "message", "message", "kind", "media", "sha256"}, ...]}
+#
+# so the rendition's ``recipe_params_digest`` (the canonical SHA-256 of this
+# document) proves the complete ordered input identity: two renditions with
+# equal digests were assembled from the same inputs, in the same order, by
+# the same assembly version and engine.
+
+
+@dataclass(frozen=True)
+class Assembly:
+    key: str
+    version: int
+    params: dict          # fixed, output-affecting; never caller-supplied
+
+
+ASSEMBLIES = {
+    # Sequential program interstitial: inputs end to end, no gap, no overlap,
+    # no bed, no loudness processing; FLAC 48 kHz stereo 16-bit (steps.EncodeFlac).
+    "active_message_mix": Assembly(key="active_message_mix", version=1, params={
+        "join": "sequential", "gap_ms": 0, "sample_rate": 48000, "channels": 2, "sample_fmt": "s16",
+        "codec": "flac"}),
+}
+
+
+def assembly(key) -> Assembly:
+    if not isinstance(key, str) or key not in ASSEMBLIES:
+        raise registry.UnknownRecipe(f"unknown assembly {str(key)[:64]!r}")
+    return ASSEMBLIES[key]
+
+
+def assembly_document(recipe: Assembly, inputs) -> dict:
+    """``inputs``: the ordered provenance identities (protocol.assembly_input_of)."""
+    return {"assembly": recipe.key, "version": recipe.version, "engine": ENGINE_VERSION,
+            "params": dict(recipe.params), "inputs": [dict(entry) for entry in inputs]}

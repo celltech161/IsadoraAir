@@ -721,6 +721,150 @@ def snapshot_active_composition() -> dict:
                 "ineligible": ineligible}
 
 
+# -- aggregate binding and render outcomes (iPortal Phase D2A) ---------------------------------
+#
+# The render itself runs OUTSIDE any database lock (active_messages.worker /
+# rendering). These short transactions re-read and re-lock authority, prove
+# nothing relevant changed, and only then record an outcome. Lock order:
+# policy -> media (lock_for_binding) -> execution. Rendering never changes a
+# message, the generation or a snapshot.
+
+# Stable, bounded D2A outcome codes (ActiveBroadcastExecution.failure_code and
+# event detail). Retryable infrastructure failures never terminate an
+# execution; they are recorded as ``render_retry`` events.
+RENDER_RETRYABLE = "render_unavailable"
+FAILURE_CODES = frozenset({
+    "input_unavailable",          # a frozen message's media is missing, purged, invalid or does not hash
+    "stinger_pin_unavailable",    # the FROZEN stinger pin is unusable (never re-resolved; reconciled anew)
+    "provenance_mismatch",        # the rendition does not prove this exact frozen aggregate
+    "rendition_invalid",          # the rendered aggregate failed validation
+    "aggregate_too_long",         # the measured aggregate exceeds the CURRENT aggregate limit (never truncated)
+    "render_failed",              # any other permanent render failure
+})
+FAILURE_DETAIL_LIMIT = 200
+
+
+class MixRefused(ActiveMessageError):
+    """The offered rendition may not become this execution's aggregate.
+    ``code`` is a FAILURE_CODES member, or ``rendition_unavailable`` (the
+    rendition vanished: render again), or ``execution_not_pending`` /
+    ``stale_generation`` (authority moved on: nothing to bind to)."""
+
+
+def _lock_execution(execution) -> ActiveBroadcastExecution:
+    try:
+        return ActiveBroadcastExecution.objects.select_for_update(of=("self",)).get(
+            pk=getattr(execution, "pk", execution))
+    except (ActiveBroadcastExecution.DoesNotExist, ValueError, TypeError):
+        raise InvalidRequest("no such execution", code="unknown_execution") from None
+
+
+def _bounded_detail(text) -> str:
+    """Operator-visible detail: one line, no paths, bounded."""
+    cleaned = " ".join(str(text or "").split())
+    cleaned = " ".join(word for word in cleaned.split(" ") if "/" not in word)
+    return cleaned[:FAILURE_DETAIL_LIMIT]
+
+
+def bind_execution_mix(execution, media, *, now=None, actor_kind=ActorKind.WORKER) -> ActiveBroadcastExecution:
+    """PENDING_RENDER -> READY: bind the rendered aggregate ``media``.
+
+    Under policy -> media (lock_for_binding) -> execution, it proves:
+    the execution is still PENDING_RENDER and of the CURRENT generation; its
+    frozen snapshot still hashes to its composition digest; ``media`` is a
+    valid, present rendition whose stored provenance digest is exactly the
+    assembly of the frozen inputs (stinger pin included) -- the complete
+    ordered identity, nothing else -- derived from the first message's media,
+    by the render executor; and its MEASURED duration is within the CURRENT
+    aggregate limit. Idempotent: the same media bound again returns the
+    READY row. Raises MixRefused having written nothing -- except a stale
+    execution, which is suppressed (committed) before stale_generation."""
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        try:
+            bound = retention.lock_for_binding(media)
+        except (MediaPurged, MediaNotValidated, MediaInconsistent):
+            raise MixRefused("the rendition is missing, purged or not valid", code="rendition_unavailable") from None
+        row = _lock_execution(execution)
+        if row.state == X.READY and row.mix_media_id == bound.pk:
+            return row
+        if row.state != X.PENDING_RENDER:
+            raise MixRefused(f"a {row.state} execution takes no aggregate", code="execution_not_pending")
+        stale = row.policy_generation != policy.generation
+        if stale:
+            # Built for another generation: suppress it truthfully (stale_generation);
+            # that write COMMITS, and the refusal is raised after the transaction.
+            _suppress_stale(policy, now=now, actor_kind=actor_kind)
+        else:
+            row = _bind_proven(policy, row, bound, now=now, actor_kind=actor_kind)
+    if stale:
+        raise MixRefused("the execution is no longer the current composition", code="stale_generation")
+    return row
+
+
+def _bind_proven(policy, row, bound, *, now, actor_kind):
+    """Inside bind_execution_mix's transaction, every lock held: prove, then
+    write READY and its event -- or raise MixRefused having written nothing."""
+    from . import rendering
+    snapshot = row.composition_snapshot
+    if composition.digest(snapshot) != row.composition_digest:
+        raise MixRefused("the frozen snapshot no longer hashes to its digest", code="provenance_mismatch")
+    if not rendering.proves(bound, snapshot):
+        raise MixRefused("the rendition is not the aggregate of this frozen composition", code="provenance_mismatch")
+    seconds = bound.decoded_duration_seconds
+    if seconds is None or seconds <= 0:
+        raise MixRefused("the rendition has no measured duration", code="rendition_invalid")
+    if seconds > policy.max_aggregate_seconds:
+        raise MixRefused(f"the rendered aggregate is {seconds} s; the aggregate limit is "
+                         f"{policy.max_aggregate_seconds} s", code="aggregate_too_long")
+    row = _store.write(ActiveBroadcastExecution, row.pk,
+                       match={"state": X.PENDING_RENDER, "policy_generation": row.policy_generation, "mix_media": None},
+                       values={"state": X.READY, "mix_media": bound, "ready_at": now})
+    _event("mix_bound", execution=row, from_state=X.PENDING_RENDER, to_state=X.READY, generation=policy.generation,
+           actor_kind=actor_kind,
+           detail={"media": str(bound.pk), "sha256": bound.sha256, "seconds": str(seconds),
+                   "provenance_digest": bound.recipe_params_digest})
+    return row
+
+
+def fail_execution(execution, *, code, detail="", now=None, actor_kind=ActorKind.WORKER) -> ActiveBroadcastExecution:
+    """PENDING_RENDER -> FAILED with a stable FAILURE_CODES code. A stale
+    execution is suppressed instead (stale_generation); one that already
+    left PENDING_RENDER is returned unchanged (its new state is the truth)."""
+    if code not in FAILURE_CODES:
+        raise InvalidRequest(f"unknown render failure code {str(code)[:64]!r}")
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        row = _lock_execution(execution)
+        if row.state != X.PENDING_RENDER:
+            return row
+        if row.policy_generation != policy.generation:
+            _suppress_stale(policy, now=now, actor_kind=actor_kind)
+            return ActiveBroadcastExecution.objects.get(pk=row.pk)
+        row = _store.write(ActiveBroadcastExecution, row.pk, match={"state": X.PENDING_RENDER},
+                           values={"state": X.FAILED, "open_slot": None, "terminal_at": now, "failure_code": code,
+                                   "failure_detail": _bounded_detail(detail)})
+        _event("render_failed", execution=row, from_state=X.PENDING_RENDER, to_state=X.FAILED,
+               generation=policy.generation, actor_kind=actor_kind, detail={"code": code})
+    return row
+
+
+def record_render_retry(execution, *, code, now=None, actor_kind=ActorKind.WORKER):
+    """A retryable infrastructure failure of a PENDING_RENDER execution: an
+    event only (the worker's backoff reads these). Returns the event, or None
+    when the execution is no longer PENDING_RENDER."""
+    now = _now(now)
+    with transaction.atomic():
+        policy = _lock_policy()
+        row = _lock_execution(execution)
+        if row.state != X.PENDING_RENDER:
+            return None
+        return _event("render_retry", execution=row, generation=policy.generation, actor_kind=actor_kind,
+                      detail={"code": str(code)[:64]})
+
+
 # -- air evidence (applied by the D2B engine path; unreachable in D1) ---------------------------------
 
 def _lock_for_evidence(execution):

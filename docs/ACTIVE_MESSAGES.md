@@ -29,8 +29,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 
 | Step | Scope | Can it change on-air audio? |
 | --- | --- | --- |
-| **D1** (this) | domain authority: policy/generation, messages, executions, events, media binding, composition, due/replay/expiry, authz, admin diagnostics | **no** — no renderer, no engine path |
-| D2A | constrained multi-input `active_message_mix` renderer recipe, mix binding with provenance check, the worker | no (fake engine receiver) |
+| **D1** | domain authority: policy/generation, messages, executions, events, media binding, composition, due/replay/expiry, authz, admin diagnostics | **no** — no renderer, no engine path |
+| **D2A** (this) | constrained `assemble` render operation (`active_message_mix`), exact provenance, rendition reuse, the worker, `bind_execution_mix` (PENDING_RENDER → READY) | **no** — READY waits for D2B; no engine command |
 | D2B | `active_message_play`, engine re-read, interstitial playback, evidence, restart reconciliation | yes — its own acceptance gate |
 | D3 | recorder adapter, iPortal operator board, monitoring | gate still closed |
 
@@ -157,9 +157,10 @@ immutable `{key, reference, media, sha256}` pin. D2A must render that pin and
 must never re-resolve the key and substitute a newer registration. Its
 adversarial suite must replace a ReferenceAudio registration after execution
 materialization but before render and prove the frozen pin is honored. If a
-valid frozen pin itself becomes unusable before render, the correct D2A
-reconciliation/degradation outcome remains a D2A design decision; D1 does not
-silently change the execution.
+valid frozen pin itself becomes unusable before render, D2A fails that
+occurrence `stinger_pin_unavailable` (its snapshot is never edited) and
+materializes a fresh one from current authority -- see "Aggregate render
+(D2A)".
 
 ## Executions, due time and cadence
 
@@ -249,13 +250,105 @@ itself. The admin is read-only diagnostics, except the policy's three
 composition limits, which it changes only through `services.set_limits`
 (control).
 
-## Intended D2 contract (not implemented in D1)
+## Aggregate render (D2A)
 
-* **D2A:** `bind_execution_mix` — under policy → media → execution, verify the
-  rendition's provenance names exactly the snapshot's ordered inputs and
-  stinger pin, require the current generation, **refuse a mix whose measured
-  duration exceeds the policy's aggregate limit** (fail closed — never
-  truncate), then PENDING_RENDER → READY. Render failure → FAILED with a code.
+D2A turns a PENDING_RENDER execution into READY: one immutable, validated
+aggregate rendition of exactly its FROZEN composition, bound with proven
+provenance. Nothing airs: no engine command exists, the gate stays closed,
+READY executions wait for D2B.
+
+**Renderer operation.** The Phase C `render` protocol is one source plus at
+most four keyed references -- it cannot express an ordered list. D2A adds a
+separate `assemble` operation to isadoraair-render (production.services.render:
+protocol, client, executor, service) -- identities and read-only descriptors
+only, never a path, command, filter, URL or parameter:
+
+* inputs: at most one stinger (first, and only ahead of urgent material),
+  then 1..24 messages, urgent before public address, each message once; one
+  descriptor per input, in order (at most 25); every input's size, SHA-256
+  and duration, ≤ 1200 s each and in total, ≤ 1 GiB of bytes; the service
+  re-checks all of it, snapshots each descriptor into a sealed memfd while
+  proving its size and SHA-256, and refuses anything else before a step runs;
+* assembly `active_message_mix` v1 (code-defined, `provenance.ASSEMBLIES`):
+  each input decoded alone, in its own confined step, to raw 48 kHz stereo
+  s16 PCM; the executor appends the samples in order -- no gap, overlap, bed
+  or loudness processing (legacy concat parity) -- and one step encodes FLAC
+  48 kHz stereo 16-bit (bitexact; identical inputs give identical bytes);
+* the result goes through the sole rendition intake (validated by
+  isadoraair-validation) as an immutable `rendition` whose `derived_from` is
+  the first message's media.
+
+**Provenance.** The rendition's `recipe_params_digest` is the canonical SHA-256
+of `{assembly, version, engine, params (fixed output format), inputs: [ordered
+{role, key, reference, media, sha256} | {role, message, kind, media,
+sha256}]}`. It therefore proves the complete ordered input identity -- the
+exact stinger registration UUID and bytes included -- and nothing is resolved
+by key, filename, path or mtime.
+
+**The frozen stinger.** The client opens the stinger by its pinned
+ReferenceAudio *registration UUID* and refuses unless that registration
+still names the pinned media and SHA-256 and the stored bytes hash to it; it
+never asks the key for its current registration. A newer registration under
+the same key does not change the render. If the frozen pin is unusable
+(missing, invalid, corrupt bytes), that occurrence FAILS
+`stinger_pin_unavailable` -- its snapshot is never edited -- and in the same
+worker pass a fresh occurrence is materialized from current D1 authority: D1
+omits an unusable stinger (operator warning) and keeps every urgent/PA
+component, or pins a newer good registration. Urgent material is never
+stranded behind its stinger. (A fresh occurrence is created only while the
+messages are due; a failed Replay Now is not re-requested automatically.)
+
+**Binding** (`services.bind_execution_mix`, policy → media
+(`lock_for_binding`) → execution, one short transaction): the execution must
+be PENDING_RENDER of the CURRENT generation (a stale one is suppressed
+`stale_generation`), its snapshot must still hash to its composition digest,
+the rendition must be valid and present with a stored provenance digest equal
+to the assembly of the frozen inputs, derived from the first message's media,
+by the render executor -- and its MEASURED duration must be within the
+CURRENT aggregate limit (else `aggregate_too_long`: never truncated, never
+READY, messages untouched). Then `mix_media`, `ready_at`, READY and the
+`mix_bound` event commit together.
+
+**Reuse.** A rendition is reused only when its stored provenance digest
+proves it is exactly the required aggregate (a composition-digest string
+match is not enough) and it is valid and present. Lookup is bounded through
+the indexed `derived_from` foreign key, then the exact digest, kind,
+recipe key/version, executor marker, validity and presence.
+
+**Worker** (`active_messages.worker`, `manage.py active_message_worker`): a
+PostgreSQL session advisory lock (tried, never waited for) keeps a second
+worker from rendering the same occurrence; correctness never depends on it.
+Each pass: obtain the one current occurrence from
+`materialize_due_execution`; honour its retry backoff; reuse or render
+**with no database lock held**; bind. Authority that moved on during the
+render (clear, replacement, expiry, a limit change, another worker) binds
+nothing; the finished rendition stays an immutable, unbound orphan for
+ordinary retention. A crash between render and bind is recovered by reuse.
+D2A ships no systemd unit for it -- deploying the worker is a D2B/release
+decision (a new managed unit is a signed protected-policy change).
+
+**Outcome codes** (stable, bounded; detail ≤ 200 chars, no paths or tool
+output):
+
+| Code | Meaning | Execution |
+| --- | --- | --- |
+| `render_unavailable` (event `render_retry`) | busy, unavailable, sandbox, timeout, unvalidated rendition, rendition lost before binding | stays PENDING_RENDER; backoff 15 s doubling to 10 min; attention after 3 |
+| `stale_generation` | authority moved on | SUPPRESSED (D1 rule) |
+| `input_unavailable` | a frozen message's media missing/invalid/corrupt | FAILED |
+| `stinger_pin_unavailable` | the frozen stinger pin unusable | FAILED, then a fresh occurrence |
+| `provenance_mismatch` | the rendition does not prove the frozen aggregate | FAILED |
+| `rendition_invalid` | the aggregate failed validation | FAILED |
+| `aggregate_too_long` | measured aggregate over the current limit | FAILED |
+| `render_failed` | any other permanent render failure | FAILED |
+
+After a permanent failure other than the stinger's, the worker does not
+re-materialize the same composition at the same generation (`blocked`):
+identical inputs cannot succeed. An operator change makes a new generation.
+SystemEvent is operator attention only; the history is the execution and its
+events.
+
+## D2B contract (not implemented)
+
 * **D2B:** command `active_message_play` {execution_id, attempt_token,
   policy_generation, composition_digest, mix_media_id} over
   `enqueue_engine_command` — never a path or a Track. The engine re-reads the
@@ -277,3 +370,11 @@ composition limits, which it changes only through `services.set_limits`
   operation; ship a migration-authorization companion or approve locally
   (docs/UPDATE_CENTER.md, "Trusted companion migration authorization").
 * No new service, unit, protected-runtime change, setting or file path.
+
+## Release notes for D2A
+
+* No migration: D1's execution model already carries `mix_media`, `ready_at`,
+  FAILED and its failure code.
+* isadoraair-render gains the `assemble` operation (protocol v1 unchanged for
+  `render`); its descriptor bound rises from 5 to 25.
+* `manage.py active_message_worker` -- no systemd unit in D2A.

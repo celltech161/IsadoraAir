@@ -225,6 +225,19 @@ bind; the source is never touched; retries make new renditions. A render that
 completion later finds outdated stays an immutable, unbindable orphan for
 ordinary retention.
 
+### Assemblies (`assemble`, iPortal Phase D2A)
+
+The render service has a second, separate operation for the active-message
+domain: `assemble` joins an exact, bounded, ORDERED list of inputs (an
+optional stinger, then 1..24 messages, urgent before public address) end to
+end. It is code-defined (`provenance.ASSEMBLIES`, key `active_message_mix`,
+version 1) with no parameters at all; each input is decoded alone in its own
+confined step to raw 48 kHz stereo s16 PCM, the executor appends them, and one
+step encodes the FLAC. No loudness processing, bed, gap or overlap. Its
+provenance document names every input by role, identity and SHA-256 in order.
+The `render` operation is unchanged. See docs/ACTIVE_MESSAGES.md, "Aggregate
+render (D2A)".
+
 ### Render completion (`transitions.complete_processing`)
 
 `render()` returns a `RenderResult`; its `.evidence` is a frozen

@@ -16,8 +16,10 @@ For each connection it:
    anything (descriptors sent with it are discarded by the kernel);
 3. reads ONE request (render.protocol, version 1) and its descriptors within
    REQUEST_READ_TIMEOUT_SECONDS: exactly one ``render`` of a code-registered
-   recipe, the source and pinned references as read-only descriptors. There
-   is no command, executable, option, filter, path or URL in the protocol;
+   recipe, the source and pinned references as read-only descriptors -- or
+   one ``assemble`` (Phase D2A) of a code-defined assembly over an exact,
+   bounded, ordered list of inputs. There is no command, executable, option,
+   filter, path or URL in the protocol;
 4. waits for a run slot (ONE render at a time -- ACTIVE_MAX is 1) within the
    request's own deadline, cancelling if the client goes away;
 5. snapshots every input into a sealed, service-owned memfd in the same read
@@ -399,15 +401,25 @@ class RenderService:
             conn.close()
 
     def render(self, request, fds, conn) -> executor.Rendered:
+        assemble = protocol.operation_of(request) == "assemble"
         try:
-            parsed = protocol.parse_request(request, max_bytes=_max_bytes(), max_seconds=MAX_SOURCE_SECONDS)
+            if assemble:
+                parsed = protocol.parse_assemble(request, max_bytes=_max_bytes())
+            else:
+                parsed = protocol.parse_request(request, max_bytes=_max_bytes(), max_seconds=MAX_SOURCE_SECONDS)
         except protocol.ProtocolError as exc:
             raise _Refused(exc.code, fds) from None
-        if len(fds) != 1 + len(parsed["references"]):
-            raise _Refused("invalid_request", fds)
-        source_fd = fds[0]
-        reference_fds = dict(zip(sorted(parsed["references"]), fds[1:]))
-        deadline = time.monotonic() + render_deadline_seconds(parsed["source"]["duration_seconds"], parsed["timeout"])
+        if assemble:
+            if len(fds) != len(parsed["inputs"]):
+                raise _Refused("invalid_request", fds)
+            seconds = sum(entry["duration_seconds"] for entry in parsed["inputs"])
+        else:
+            if len(fds) != 1 + len(parsed["references"]):
+                raise _Refused("invalid_request", fds)
+            source_fd = fds[0]
+            reference_fds = dict(zip(sorted(parsed["references"]), fds[1:]))
+            seconds = parsed["source"]["duration_seconds"]
+        deadline = time.monotonic() + render_deadline_seconds(seconds, parsed["timeout"])
 
         def cancelled():
             return _client_gone(conn) or self.stopping.is_set()
@@ -428,11 +440,15 @@ class RenderService:
             (whose inodes can still change) are closed before any step runs."""
             while fds:
                 os.close(fds.pop())
+        def step(argv, pass_fds, timeout):
+            return self.run_step(argv, pass_fds, timeout, cancelled)
         try:
+            if assemble:
+                return executor.execute_assembly(parsed, list(fds), deadline=deadline, ffmpeg=self.ffmpeg,
+                                                 release=release, run_step=step)
             return executor.execute(
                 parsed, source_fd, reference_fds, deadline=deadline, max_seconds=MAX_SOURCE_SECONDS,
-                ffmpeg=self.ffmpeg, release=release,
-                run_step=lambda argv, pass_fds, timeout: self.run_step(argv, pass_fds, timeout, cancelled))
+                ffmpeg=self.ffmpeg, release=release, run_step=step)
         finally:
             self.slots.release()
             self._count("active", -1)
