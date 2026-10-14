@@ -159,8 +159,8 @@ adversarial suite must replace a ReferenceAudio registration after execution
 materialization but before render and prove the frozen pin is honored. If a
 valid frozen pin itself becomes unusable before render, D2A fails that
 occurrence `stinger_pin_unavailable` (its snapshot is never edited) and
-materializes a fresh one from current authority -- see "Aggregate render
-(D2A)".
+reconciles it into one RECONCILE successor built from current authority --
+see "Aggregate render (D2A)".
 
 ## Executions, due time and cadence
 
@@ -274,6 +274,15 @@ only, never a path, command, filter, URL or parameter:
   s16 PCM; the executor appends the samples in order -- no gap, overlap, bed
   or loudness processing (legacy concat parity) -- and one step encodes FLAC
   48 kHz stereo 16-bit (bitexact; identical inputs give identical bytes);
+* the service's ceilings bind the ACTUAL decoded audio, not the claimed
+  durations: each decode is cut off by the step itself just past what may
+  still be allowed (`-t`, from the ceilings only), and each input's real
+  duration -- its PCM byte count, 4 bytes a 48 kHz frame -- must be ≤ 1200 s
+  and the running total ≤ 1200 s, or the assembly is refused
+  (`decoded_too_long`) before that input is appended. Declared and decoded
+  durations may differ slightly; only the ceilings are absolute (and
+  binding still re-checks the measured rendition against the current
+  policy limit);
 * the result goes through the sole rendition intake (validated by
   isadoraair-validation) as an immutable `rendition` whose `derived_from` is
   the first message's media.
@@ -291,12 +300,27 @@ still names the pinned media and SHA-256 and the stored bytes hash to it; it
 never asks the key for its current registration. A newer registration under
 the same key does not change the render. If the frozen pin is unusable
 (missing, invalid, corrupt bytes), that occurrence FAILS
-`stinger_pin_unavailable` -- its snapshot is never edited -- and in the same
-worker pass a fresh occurrence is materialized from current D1 authority: D1
-omits an unusable stinger (operator warning) and keeps every urgent/PA
-component, or pins a newer good registration. Urgent material is never
-stranded behind its stinger. (A fresh occurrence is created only while the
-messages are due; a failed Replay Now is not re-requested automatically.)
+`stinger_pin_unavailable` -- its snapshot is never edited, and a Replay Now
+request token keeps resolving to it -- and in the same worker pass
+`services.reconcile_stinger_failure` records exactly ONE outcome for it (a
+`reconciled` event on it, so retries and crash recovery never make a second
+successor; each worker pass also reconciles any such failure a crash left
+behind):
+
+* the composition moved on since it was built (clear, expiry, replacement,
+  policy change -- a new generation) → no successor: nothing cleared or
+  expired is resurrected, and the D1 rules for the new composition govern;
+* an unfinished current occurrence exists → it absorbs this one;
+* nothing is active → no successor;
+* otherwise ONE successor, reason `reconcile`, due now and independent of
+  cadence -- so a Replay Now made while nothing was due still airs -- built
+  from CURRENT authority: the current active set and the key's current
+  stinger (an unusable one omitted with a warning, a newer valid
+  registration pinned). Its `reconciles` event names the predecessor.
+
+A current set that breaks a policy limit fails closed (CompositionIneligible,
+operator alert) and records nothing until an operator change. Urgent material
+is never stranded behind its stinger.
 
 **Binding** (`services.bind_execution_mix`, policy → media
 (`lock_for_binding`) → execution, one short transaction): the execution must
@@ -311,7 +335,10 @@ READY, messages untouched). Then `mix_media`, `ready_at`, READY and the
 
 **Reuse.** A rendition is reused only when its stored provenance digest
 proves it is exactly the required aggregate (a composition-digest string
-match is not enough) and it is valid and present. Lookup is bounded through
+match is not enough), it is valid and present, AND its stored bytes still
+re-hash to its recorded SHA-256 (`media_io.verify_integrity`, done with no
+database lock held); a missing, size-inconsistent or corrupt candidate is
+never reused or bound -- a fresh render follows. Lookup is bounded through
 the indexed `derived_from` foreign key, then the exact digest, kind,
 recipe key/version, executor marker, validity and presence.
 
@@ -335,10 +362,10 @@ output):
 | `render_unavailable` (event `render_retry`) | busy, unavailable, sandbox, timeout, unvalidated rendition, rendition lost before binding | stays PENDING_RENDER; backoff 15 s doubling to 10 min; attention after 3 |
 | `stale_generation` | authority moved on | SUPPRESSED (D1 rule) |
 | `input_unavailable` | a frozen message's media missing/invalid/corrupt | FAILED |
-| `stinger_pin_unavailable` | the frozen stinger pin unusable | FAILED, then a fresh occurrence |
+| `stinger_pin_unavailable` | the frozen stinger pin unusable | FAILED, then at most one RECONCILE successor |
 | `provenance_mismatch` | the rendition does not prove the frozen aggregate | FAILED |
 | `rendition_invalid` | the aggregate failed validation | FAILED |
-| `aggregate_too_long` | measured aggregate over the current limit | FAILED |
+| `aggregate_too_long` | measured aggregate over the current limit, or the service's `decoded_too_long` | FAILED |
 | `render_failed` | any other permanent render failure | FAILED |
 
 After a permanent failure other than the stinger's, the worker does not

@@ -33,10 +33,23 @@ def stinger(actor, *, key="stinger", seconds=1.0, frequency=STINGER_HZ) -> Refer
     return reference_audio.register(key, bed, actor=actor)
 
 
-def fake_rendition(snapshot, *, seconds="10.000000", digest=None, derived_from=None, **overrides):
-    """A rendition ROW (no bytes; raw insert as the render executor's intake
-    would make) claiming the given provenance -- for binding-proof tests."""
+def fake_rendition(snapshot, *, seconds="10.000000", digest=None, derived_from=None, stored=None, **overrides):
+    """A rendition ROW (raw insert as the render executor's intake would make)
+    claiming the given provenance -- for binding/reuse tests. ``stored``:
+    bytes to place in the isolated media store as its file (its SHA-256 and
+    size become the row's); by default the row has no stored bytes."""
+    import hashlib
+    import uuid as _uuid
+
+    from production.services import layout
     from active_messages import rendering
+    if stored is not None:
+        media_id = overrides.setdefault("id", _uuid.uuid4())
+        overrides.update(sha256=hashlib.sha256(stored).hexdigest(), byte_size=len(stored))
+        path = layout.resolve_storage_path(layout.storage_key_for(media_id))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(stored)
+        path.chmod(0o440)
     recipe = provenance.assembly(rendering.ASSEMBLY_KEY)
     values = dict(kind=ProductionMedia.KIND_RENDITION, container="flac", codec="flac", sample_rate=48000,
                   channels=2, decoded_duration_seconds=seconds, validation_state="valid", validation_code="ok",

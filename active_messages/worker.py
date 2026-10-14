@@ -25,9 +25,12 @@ Outcomes:
   after ATTENTION_AFTER consecutive failures);
 * the FROZEN stinger pin is unusable -> that occurrence FAILS
   (``stinger_pin_unavailable``; its snapshot is never edited) and, in the
-  same pass, a fresh occurrence is materialized from current D1 authority --
-  which omits an unusable stinger and keeps every urgent/PA component -- and
-  processed. The stinger is never re-resolved for the old occurrence;
+  same pass, ``services.reconcile_stinger_failure`` creates at most one
+  RECONCILE successor from current authority -- independent of cadence, so a
+  Replay Now is not lost -- which omits an unusable stinger (or pins a newer
+  valid registration) and keeps every urgent/PA component; it is then
+  processed. The stinger is never re-resolved for the old occurrence. A pass
+  also first reconciles any such failure a crash left unreconciled;
 * any other permanent failure (input_unavailable, provenance_mismatch,
   rendition_invalid, aggregate_too_long, render_failed) -> FAILED with that
   code and operator attention;
@@ -68,6 +71,7 @@ BLOCKING_CODES = frozenset({"input_unavailable", "provenance_mismatch", "renditi
 _PERMANENT = {
     client.INPUT_UNAVAILABLE: "input_unavailable",
     client.STINGER_UNAVAILABLE: "stinger_pin_unavailable",
+    "decoded_too_long": "aggregate_too_long",          # the service's absolute decoded-duration ceiling
     "provenance_mismatch": "provenance_mismatch",
     "rendition_authority": "provenance_mismatch",
     "rendition_invalid": "rendition_invalid",
@@ -124,6 +128,24 @@ def _backoff_remaining(execution, now) -> float:
         return 0.0
     wait = min(BACKOFF_BASE_SECONDS * 2 ** (len(retries) - 1), BACKOFF_MAX_SECONDS)
     return max(0.0, (retries[0] + timedelta(seconds=wait) - now).total_seconds())
+
+
+def _unreconciled():
+    """The oldest stinger-failed occurrence of the CURRENT generation with no
+    recorded reconciliation (a crash between failing and reconciling), or None."""
+    generation = services.current_policy().generation
+    return (ActiveBroadcastExecution.objects
+            .filter(state=ExecutionState.FAILED, failure_code=services.STINGER_PIN_UNAVAILABLE,
+                    policy_generation=generation)
+            .exclude(events__event="reconciled").order_by("created_at", "id").first())
+
+
+def _reconcile(failed):
+    """The successor of a stinger-failed occurrence (services), or None."""
+    try:
+        return services.reconcile_stinger_failure(failed)
+    except services.CompositionIneligible:
+        return None                     # already failed closed with operator attention
 
 
 def _occurrence(now):
@@ -195,6 +217,11 @@ def run_once(*, now=None, render_fn=rendering.render) -> Outcome:
     with worker_lock() as held:
         if not held:
             return Outcome("busy")
+        orphan = _unreconciled()
+        if orphan is not None:
+            successor = _reconcile(orphan)
+            if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
+                return process(successor, now=now, render_fn=render_fn)
         blocked = _blocked()
         if blocked:
             return Outcome("blocked", code=blocked)
@@ -202,12 +229,13 @@ def run_once(*, now=None, render_fn=rendering.render) -> Outcome:
         if execution is None or execution.state != ExecutionState.PENDING_RENDER:
             return Outcome("idle", "" if execution is None else str(execution.pk))
         outcome = process(execution, now=now, render_fn=render_fn)
-        if outcome.result == "failed" and outcome.code == "stinger_pin_unavailable":
-            # Reconcile at once from CURRENT authority: the fresh occurrence omits an
-            # unusable stinger (D1 degrades it) and keeps every urgent/PA component.
-            fresh = _occurrence(now)
-            if fresh is not None and fresh.state == ExecutionState.PENDING_RENDER and fresh.pk != execution.pk:
-                return process(fresh, now=now, render_fn=render_fn)
+        if outcome.result == "failed" and outcome.code == services.STINGER_PIN_UNAVAILABLE:
+            # Reconcile at once from CURRENT authority, independent of cadence (a
+            # Replay Now is not lost): the successor omits an unusable stinger and
+            # keeps every urgent/PA component.
+            successor = _reconcile(execution)
+            if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
+                return process(successor, now=now, render_fn=render_fn)
         return outcome
 
 

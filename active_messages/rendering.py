@@ -27,7 +27,10 @@ complete ordered input identity (and the assembly version and engine) -- not
 merely a matching composition-digest string. The lookup is bounded: it goes
 through the rendition's ``derived_from`` foreign key (indexed; always the
 first message's media) and then the exact digest, kind, recipe key/version,
-executor marker, validity and presence.
+executor marker, validity and presence. Finally its STORED bytes are re-hashed
+against the row's SHA-256 (media_io.verify_integrity) -- outside every
+database lock -- and a missing, size-inconsistent or corrupt candidate is
+never reused.
 
 Nothing here touches the database's domain rows: binding is
 ``services.bind_execution_mix`` (authority, locks, provenance re-proof).
@@ -91,9 +94,22 @@ def proves(media: ProductionMedia, snapshot: dict) -> bool:
             and media.toolchain.endswith(protocol.EXECUTOR_MARKER))
 
 
+def _bytes_intact(media) -> bool:
+    """The stored bytes still exist, have the recorded size and hash to the
+    recorded SHA-256 (production's own integrity check -- the media row is
+    the only authority). Slow for a long aggregate: callers hold no lock."""
+    try:
+        media_io.verify_integrity(media)
+    except (MediaPurged, MediaInconsistent):
+        return False
+    return True
+
+
 def find_reusable(snapshot: dict):
     """The oldest valid, present rendition proven to be exactly this
-    aggregate, or None."""
+    aggregate AND whose stored bytes still verify, or None. A missing,
+    size-inconsistent or corrupt candidate is skipped (never bound); the
+    caller then renders afresh. Call with no database lock held."""
     recipe = assembly()
     candidates = (ProductionMedia.objects
                   .filter(derived_from_id=first_message_media(snapshot), kind=ProductionMedia.KIND_RENDITION,
@@ -102,7 +118,7 @@ def find_reusable(snapshot: dict):
                           validation_state=ProductionMedia.VALIDATION_VALID,
                           retention_state=ProductionMedia.RETENTION_PRESENT)
                   .order_by("created_at", "id")[:5])
-    return next((media for media in candidates if proves(media, snapshot)), None)
+    return next((media for media in candidates if proves(media, snapshot) and _bytes_intact(media)), None)
 
 
 def timeout_seconds(snapshot: dict) -> float:

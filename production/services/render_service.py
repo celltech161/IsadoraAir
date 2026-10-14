@@ -440,6 +440,7 @@ class RenderService:
             (whose inodes can still change) are closed before any step runs."""
             while fds:
                 os.close(fds.pop())
+
         def step(argv, pass_fds, timeout):
             return self.run_step(argv, pass_fds, timeout, cancelled)
         try:

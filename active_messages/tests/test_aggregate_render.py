@@ -193,3 +193,23 @@ class DeterminismTests(RealAudio, TestCase):
         self.assertEqual((first.media.sha256, first.media.recipe_params_digest),
                          (second.media.sha256, second.media.recipe_params_digest))
         self.assertTrue(rendering.proves(first.media, execution.composition_snapshot))
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class CachedAggregateIntegrityTests(RealAudio, TestCase):
+    def test_a_same_size_corrupted_cached_aggregate_is_skipped_and_a_fresh_one_is_bound(self):
+        from .support import corrupt_stored_bytes
+        self.real_active(kind="urgent", seconds=1.0)
+        first = ActiveBroadcastExecution.objects.get(pk=worker.run_once().execution)
+        cached = first.mix_media
+        services.set_limits(actor=self.admin, max_aggregate_seconds=500)        # new generation: re-materialized
+        size = cached.byte_size
+        corrupt_stored_bytes(cached)                                           # same size, wrong bytes
+        self.assertEqual(layout.resolve_storage_path(cached.storage_key).stat().st_size, size)
+        outcome = worker.run_once()
+        second = ActiveBroadcastExecution.objects.get(pk=outcome.execution)
+        self.assertEqual((outcome.result, second.state), ("ready", "ready"))  # rendered, not "reused"
+        self.assertNotEqual(second.mix_media_id, cached.pk)
+        self.assertEqual(second.mix_media.recipe_params_digest, cached.recipe_params_digest)
+        from production.services import media_io
+        media_io.verify_integrity(second.mix_media)                            # the bound one verifies

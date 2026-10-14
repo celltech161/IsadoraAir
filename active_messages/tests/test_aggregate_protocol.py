@@ -3,6 +3,7 @@ ordered request -- identities and descriptors only, never a path, command,
 filter or parameter -- re-checked by the service against its own rules."""
 import hashlib
 import os
+import time
 import uuid
 from decimal import Decimal
 
@@ -210,3 +211,104 @@ class DescriptorTests(SimpleTestCase):
             self.assertIn("-protocol_whitelist", argv)
             for value in argv:
                 self.assertFalse(value.startswith("/") and value != "/usr/bin/ffmpeg", value)
+
+
+class DecodedDurationTests(SimpleTestCase):
+    """The service's ceilings bind the ACTUAL decoded PCM: a request that
+    understates its durations cannot pass more audio than the ceilings allow.
+    (Ceilings patched small so the tests stay small.)"""
+
+    def setUp(self):
+        from unittest import mock
+        for name, value in (("MAX_ASSEMBLE_INPUT_SECONDS", Decimal(2)), ("MAX_ASSEMBLE_TOTAL_SECONDS", Decimal(3))):
+            patcher = mock.patch.object(protocol, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def descriptor(self, data):
+        fd = os.memfd_create("t")
+        os.write(fd, data)
+        reopened = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+        os.close(fd)
+        self.addCleanup(os.close, reopened)
+        return reopened
+
+    def scripted(self, decoded_seconds):
+        """A fake run_step: each prepare writes ``decoded_seconds[i]`` of PCM,
+        whatever the request claimed; records every argv."""
+        calls = []
+
+        def run_step(argv, pass_fds, timeout):
+            calls.append(argv)
+            out = int(argv[len(argv) - 2])
+            if "-t" in argv:
+                seconds = decoded_seconds[len([c for c in calls if "-t" in c]) - 1]
+                os.write(out, b"\0" * int(seconds * 48000) * 4)
+            else:
+                os.write(out, b"flac")
+            return {"status": "ok"}
+        return run_step, calls
+
+    def run_assembly(self, decoded, *, claimed="1.000000"):
+        data = b"x" * 100
+        sha = hashlib.sha256(data).hexdigest()
+        inputs = [message("urgent", sha256=sha, bytes=100, duration_seconds=claimed)]
+        inputs += [message("public_address", sha256=sha, bytes=100, duration_seconds=claimed)
+                   for _ in decoded[1:]]
+        run_step, calls = self.scripted(decoded)
+        try:
+            rendered = executor.execute_assembly(parse(request(inputs)), [self.descriptor(data) for _ in inputs],
+                                                 deadline=10 ** 12, ffmpeg="/usr/bin/ffmpeg", run_step=run_step)
+        except RenderError as exc:
+            return exc, calls
+        os.close(rendered.fd)
+        return None, calls
+
+    def test_an_input_decoding_past_the_input_ceiling_is_refused_before_encoding(self):
+        error, calls = self.run_assembly([2.5])
+        self.assertEqual((error.code, error.stage), ("decoded_too_long", "prepare0"))
+        self.assertFalse(error.retryable)
+        self.assertFalse(protocol.CODES["decoded_too_long"])
+        self.assertEqual(len(calls), 1)                                        # never appended, never encoded
+
+    def test_inputs_decoding_past_the_total_ceiling_are_refused_before_the_append(self):
+        error, calls = self.run_assembly([1.8, 1.8])
+        self.assertEqual((error.code, error.stage), ("decoded_too_long", "prepare1"))
+        self.assertEqual(len(calls), 2)
+
+    def test_each_decode_is_cut_off_just_past_what_may_still_be_allowed(self):
+        error, calls = self.run_assembly([1.5, 1.0])
+        self.assertIsNone(error)
+        limits = [argv[argv.index("-t") + 1] for argv in calls if "-t" in argv]
+        self.assertEqual(limits, ["3.000000", "2.500000"])                     # min(2, 3 - used) + 1 s
+        self.assertNotIn("-t", calls[-1])                                      # the encode step
+
+    def test_exactly_at_the_ceilings_is_allowed(self):
+        error, _calls = self.run_assembly([2.0, 1.0])
+        self.assertIsNone(error)
+
+    def test_real_ffmpeg_decoding_an_understated_input_is_refused(self):
+        import shutil
+        import subprocess
+
+        from spoken.tests import support as audio
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg not available")
+        data = audio.tone_wav([(5.0, 440.0, 0.3)])                             # really 5 s
+        inputs = [message("urgent", sha256=hashlib.sha256(data).hexdigest(), bytes=len(data),
+                          duration_seconds="1.000000")]                         # claims 1 s
+        produced = []
+
+        def run_step(argv, pass_fds, timeout):
+            result = subprocess.run(argv, pass_fds=pass_fds, capture_output=True, timeout=timeout)
+            if "-t" in argv:
+                produced.append(os.fstat(int(argv[len(argv) - 2])).st_size)
+            return {"status": "ok" if result.returncode == 0 else "error", "returncode": result.returncode,
+                    "stderr": result.stderr.decode(errors="replace")}
+        with self.assertRaises(RenderError) as caught:
+            executor.execute_assembly(parse(request(inputs)), [self.descriptor(data)],
+                                      deadline=time.monotonic() + 60, ffmpeg=ffmpeg, run_step=run_step)
+        self.assertEqual(caught.exception.code, "decoded_too_long")
+        self.assertLessEqual(executor.pcm_seconds(produced[0]), Decimal(3))     # the decoder itself was cut off
+        self.assertGreater(executor.pcm_seconds(produced[0]), Decimal(2))

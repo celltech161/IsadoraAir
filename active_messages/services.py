@@ -656,6 +656,93 @@ def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
     raise refusal
 
 
+STINGER_PIN_UNAVAILABLE = "stinger_pin_unavailable"
+
+
+def _reconciliation_of(failed):
+    """(already reconciled?, successor or None) -- from the predecessor's one
+    authoritative ``reconciled`` event."""
+    record = (ActiveBroadcastMessageEvent.objects.filter(execution=failed, event="reconciled")
+              .order_by("id").first())
+    if record is None:
+        return False, None
+    successor = record.detail.get("successor")
+    return True, (None if successor is None else ActiveBroadcastExecution.objects.get(pk=successor))
+
+
+def reconcile_stinger_failure(execution, *, now=None, actor_kind=ActorKind.WORKER):
+    """After an occurrence FAILED because its FROZEN stinger pin became
+    unusable (D2A), make sure the airing it stood for still happens -- whatever
+    created it (due cadence, Replay Now) -- without touching it: its snapshot
+    stays the truth of what it was, and a Replay Now request token keeps
+    resolving to it.
+
+    Under the policy lock (expiry first, stale airings suppressed), exactly one
+    outcome is recorded per failed occurrence, as a ``reconciled`` event on it
+    (so the operation is idempotent across retries and crashes):
+
+    * the active composition moved on since it was built (a clear, an expiry,
+      a replacement, a policy change: a new generation) -> no successor: the
+      D1 rules for the new composition govern, and nothing cleared or
+      expired is resurrected;
+    * an unfinished current occurrence already exists -> it absorbs this one;
+    * nothing is active -> no successor;
+    * otherwise ONE successor, reason RECONCILE, due now, independent of
+      cadence, built from CURRENT authority: the current active set and the
+      key's current stinger (an unusable one omitted with a warning; a newer
+      valid registration pinned). It carries a ``reconciles`` event naming its
+      predecessor.
+
+    A current set that breaks a policy limit fails closed (CompositionIneligible,
+    operator alert) and records nothing: an operator change resolves it.
+    Returns the successor (new or absorbing), or None."""
+    now = _now(now)
+    refusal = None
+    with transaction.atomic():
+        policy = _lock_policy()
+        # FAILED is terminal: the row cannot change, so it is read, not locked
+        # (the lock order is policy -> messages -> media -> execution).
+        try:
+            failed = ActiveBroadcastExecution.objects.get(pk=getattr(execution, "pk", execution))
+        except (ActiveBroadcastExecution.DoesNotExist, ValueError, TypeError):
+            raise InvalidRequest("no such execution", code="unknown_execution") from None
+        if failed.state != X.FAILED or failed.failure_code != STINGER_PIN_UNAVAILABLE:
+            raise InvalidRequest("only an occurrence failed by its frozen stinger is reconciled",
+                                 code="not_reconcilable")
+        done, successor = _reconciliation_of(failed)
+        if done:
+            return successor
+
+        def record(outcome, successor=None):
+            _event("reconciled", execution=failed, generation=policy.generation, actor_kind=actor_kind,
+                   detail={"outcome": outcome, "successor": None if successor is None else str(successor.pk)})
+            return successor
+
+        policy, _expired = _expire_locked(policy, now, actor_kind=actor_kind)
+        _suppress_stale(policy, now=now, actor_kind=actor_kind)
+        if failed.policy_generation != policy.generation:
+            return record("composition_changed")
+        unfinished = _open_execution()
+        if unfinished is not None:
+            return record("absorbed", unfinished)
+        messages = _active_messages()
+        if not messages:
+            return record("nothing_active")
+        stinger = _stinger(policy, messages)
+        try:
+            _check_eligible(policy, messages, stinger[2])
+        except CompositionIneligible as exc:
+            refusal = exc
+        else:
+            successor = _create_execution(policy, messages, stinger, reason=ExecutionReason.RECONCILE, due_at=now,
+                                          now=now, event="execution_reconciled", actor_kind=actor_kind)
+            _event("reconciles", execution=successor, generation=policy.generation, actor_kind=actor_kind,
+                   detail={"predecessor": str(failed.pk), "predecessor_reason": failed.reason})
+            return record("successor", successor)
+    _alert_ineligible(refusal)
+    raise refusal
+
+
 def request_manual_replay(*, actor, request_token, now=None):
     """Replay Now (control), idempotent on ``request_token`` (a client UUID):
     the same token always resolves to the same execution. An unfinished

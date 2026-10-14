@@ -233,7 +233,9 @@ optional stinger, then 1..24 messages, urgent before public address) end to
 end. It is code-defined (`provenance.ASSEMBLIES`, key `active_message_mix`,
 version 1) with no parameters at all; each input is decoded alone in its own
 confined step to raw 48 kHz stereo s16 PCM, the executor appends them, and one
-step encodes the FLAC. No loudness processing, bed, gap or overlap. Its
+step encodes the FLAC; the absolute ceilings bind each input's ACTUAL
+decoded duration (`decoded_too_long`). No loudness processing, bed, gap or
+overlap. Its
 provenance document names every input by role, identity and SHA-256 in order.
 The `render` operation is unchanged. See docs/ACTIVE_MESSAGES.md, "Aggregate
 render (D2A)".

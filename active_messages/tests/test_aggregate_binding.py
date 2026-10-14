@@ -158,12 +158,33 @@ class ReuseTests(Domain, TestCase):
         self.snapshot = self.execution.composition_snapshot
 
     def test_a_proven_rendition_is_reused_instead_of_rendering(self):
-        mix = fake_rendition(self.snapshot)
+        mix = fake_rendition(self.snapshot, stored=b"aggregate-bytes")
         render = mock.Mock(side_effect=AssertionError("must not render"))
         outcome = worker.run_once(render_fn=render)
         self.assertEqual((outcome.result, outcome.execution), ("reused", str(self.execution.pk)))
         self.assertEqual(ActiveBroadcastExecution.objects.get(pk=self.execution.pk).mix_media_id, mix.pk)
         render.assert_not_called()
+
+    def test_a_cached_aggregate_whose_stored_bytes_no_longer_verify_is_not_reused(self):
+        from production.services import layout
+        cases = {"missing": lambda path: path.unlink(),
+                 "size-inconsistent": lambda path: path.write_bytes(b"short"),
+                 "same-size corrupt": lambda path: path.write_bytes(b"aggregate-bytez")}
+        for label, damage in cases.items():
+            with self.subTest(label):
+                cached = fake_rendition(self.snapshot, stored=b"aggregate-bytes")
+                path = layout.resolve_storage_path(cached.storage_key)
+                path.chmod(0o640)
+                damage(path)
+                self.assertIsNone(rendering.find_reusable(self.snapshot))
+                # The cached row itself is untouched authority: still VALID and PRESENT.
+                self.assertEqual((ProductionMedia.objects.get(pk=cached.pk).validation_state,
+                                  ProductionMedia.objects.get(pk=cached.pk).retention_state), ("valid", "present"))
+        fresh = []
+        outcome = worker.run_once(render_fn=lambda execution: result_of(
+            fresh.append(fake_rendition(execution.composition_snapshot, stored=b"fresh-aggregate")) or fresh[-1]))
+        self.assertEqual(outcome.result, "ready")                          # rendered anew, not "reused"
+        self.assertEqual(ActiveBroadcastExecution.objects.get(pk=self.execution.pk).mix_media_id, fresh[0].pk)
 
     def test_reuse_needs_full_proof_not_a_matching_composition_digest(self):
         fake_rendition(self.snapshot, digest=self.execution.composition_digest)    # the composition digest string
@@ -180,7 +201,7 @@ class ReuseTests(Domain, TestCase):
         made = []
 
         def render_then_crash(execution):
-            made.append(fake_rendition(execution.composition_snapshot))
+            made.append(fake_rendition(execution.composition_snapshot, stored=b"aggregate-bytes"))
             raise KeyboardInterrupt("worker killed after the render, before binding")
         with self.assertRaises(KeyboardInterrupt):
             worker.run_once(render_fn=render_then_crash)

@@ -356,6 +356,15 @@ _ASSEMBLY_PREPARE = "aresample=48000,aformat=sample_fmts=s16:channel_layouts=ste
 # Raw PCM of the rendition format: 48 kHz, stereo, signed 16-bit LE (s16le).
 _PCM_ARGS = ["-c:a", "pcm_s16le", "-f", "s16le"]
 _PCM_FRAME_BYTES = 4
+_PCM_RATE = 48000
+# How far past the remaining allowance a decode may run before the step itself
+# stops it: enough to PROVE an over-long input, never an unbounded write.
+_DECODE_OVERRUN_SECONDS = Decimal(1)
+
+
+def pcm_seconds(byte_count: int) -> Decimal:
+    """The ACTUAL duration of raw 48 kHz stereo s16le PCM (4 bytes a frame)."""
+    return Decimal(byte_count // _PCM_FRAME_BYTES) / _PCM_RATE
 
 
 def _append(target: int, source: int) -> int:
@@ -379,7 +388,16 @@ def execute_assembly(request: dict, fds: list, *, run_step, ffmpeg: str, deadlin
     identically formatted samples in input order -- a sequential join with no
     gap, overlap or processing -- and one final single-input step encodes the
     FLAC. (One ffmpeg over 25 inputs would need a demuxer and decoder thread
-    per input, beyond the render sandbox's task limit.)"""
+    per input, beyond the render sandbox's task limit.)
+
+    The service's absolute ceilings bind the ACTUAL decoded audio, not the
+    durations the request claims: each decode is cut off by the step itself
+    just past what may still be allowed (``-t``, from the ceilings only), and
+    each input's real duration -- its PCM byte count -- must be within
+    MAX_ASSEMBLE_INPUT_SECONDS and, cumulatively, MAX_ASSEMBLE_TOTAL_SECONDS,
+    or the assembly is refused (``decoded_too_long``) before that input is
+    appended. Declared and decoded durations may differ slightly (codec and
+    container timing); only the ceilings are absolute."""
     recipe, digest, document = plan_assembly(request)
     inputs = request["inputs"]
     if len(fds) != len(inputs):
@@ -410,11 +428,14 @@ def execute_assembly(request: dict, fds: list, *, run_step, ffmpeg: str, deadlin
         if release is not None:
             release()                               # the caller's descriptors are no longer authoritative
         joined = new_memfd("assembly-pcm")
+        decoded_total = Decimal(0)
         for index in range(len(snapshots)):
+            allowance = min(protocol.MAX_ASSEMBLE_INPUT_SECONDS, protocol.MAX_ASSEMBLE_TOTAL_SECONDS - decoded_total)
             piece = new_memfd(f"pcm{index}")
             source = fresh_ro(snapshots[index])
             step(f"prepare{index}", [*common, "-fd", str(source), "-i", "fd:", "-map", "0:a:0", "-vn", "-sn", "-dn",
-                                     "-af", _ASSEMBLY_PREPARE, *_PCM_ARGS, "-fd", str(piece), "fd:"],
+                                     "-af", _ASSEMBLY_PREPARE, "-t", f"{allowance + _DECODE_OVERRUN_SECONDS:.6f}",
+                                     *_PCM_ARGS, "-fd", str(piece), "fd:"],
                  (source, piece))
             close_opened()
             os.close(snapshots[index])
@@ -422,6 +443,14 @@ def execute_assembly(request: dict, fds: list, *, run_step, ffmpeg: str, deadlin
             size = os.fstat(piece).st_size
             if size == 0 or size % _PCM_FRAME_BYTES:
                 raise RenderError("render_failed", "an input decoded to no whole audio frames", stage=f"prepare{index}")
+            seconds = pcm_seconds(size)
+            if seconds > protocol.MAX_ASSEMBLE_INPUT_SECONDS:
+                raise RenderError("decoded_too_long", "an input decodes longer than one input may be",
+                                  stage=f"prepare{index}")
+            if decoded_total + seconds > protocol.MAX_ASSEMBLE_TOTAL_SECONDS:
+                raise RenderError("decoded_too_long", "the inputs decode longer than one assembly may be",
+                                  stage=f"prepare{index}")
+            decoded_total += seconds
             fcntl.fcntl(piece, fcntl.F_ADD_SEALS, SEALS)
             _append(joined, piece)
             os.close(piece)

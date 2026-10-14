@@ -94,7 +94,7 @@ CODES = {
     "invalid_parameters": False, "reference_mismatch": False, "descriptor_invalid": False,
     "descriptor_mismatch": False, "provenance_mismatch": False, "source_too_long": False, "input_too_large": False,
     "empty_voice": False, "silent_render": False, "loudness_analysis_failed": False, "render_failed": False,
-    "render_resource_limit": False, "input_order": False,
+    "render_resource_limit": False, "input_order": False, "decoded_too_long": False,
     "busy": True, "render_timeout": True, "render_unavailable": True, "sandbox_unavailable": True,
     "service_unavailable": True, "cancelled": True,
 }
