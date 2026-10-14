@@ -494,6 +494,25 @@ follow-up pending, the forced order is Weather/AMBER, native, follow-up. A
 playing deck is never touched: once an aggregate has STARTED it finishes,
 and a newly arriving alert gets the next boundary.
 
+**Serialization.** Insertion and deck-open authority take the active-message
+locks in the established order, policy → execution, exactly like every
+composition change (clear, replacement, expiry, policy/limit change -- all
+of which lock the policy first). `admit` takes them inside the engine's
+splice transaction (PlaylistLog lock, 250 ms bound) and holds them until
+`record_insertion` commits; `authorize_open` holds them in one short
+transaction through the gate, generation, attempt and LogItem checks, the
+claim and its event, and releases them when the claim commits -- never
+through deck construction or the file open. So a change that wins the policy
+lock first is always seen (no admission, no claim, no deck), and a claim that
+wins first stands (a later change does not cut a claimed airing). A lock wait
+beyond 250 ms fails closed: nothing is inserted (the engine retries; the
+worker re-sends a command never accepted) or no deck opens (the not-aired
+report recovers it). The PlaylistLog lock is the engine's outer context; no
+active-message service ever takes it, so there is no reverse dependency. The
+engine's advisory reads (`inspect`, `current_policy`) never wait on a lock,
+and its evidence-sync hook uses the same 250 ms bound (the worker repeats a
+timed-out projection).
+
 **Staleness.** Before a deck opens, the deck-open authority re-reads
 committed state (bounded 250 ms lock wait): current attempt, native-airing
 gate, ACCEPTED with the CURRENT generation and the same aggregate → CLAIMED

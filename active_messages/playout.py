@@ -110,6 +110,9 @@ MAX_ATTEMPTS = 50                                 # then FAILED dispatch_exhaust
 CLEAN_END_REASONS = frozenset({"eos", "eos_deferred"})
 ENGINE_HELD = (X.ACCEPTED, X.CLAIMED)
 _COPY_CHUNK = 1024 * 1024
+# The engine-thread bound on every active-message lock wait (deck-open
+# authority, not-aired reports): contention fails closed, never open.
+AUTHORITY_LOCK_TIMEOUT = "250ms"
 # Publication retry backoff, as D2A's render retry.
 PUBLICATION_BACKOFF_BASE_SECONDS = 15
 PUBLICATION_BACKOFF_MAX_SECONDS = 600
@@ -503,7 +506,16 @@ def admit(data) -> Admission:
     """Inside the engine's splice transaction (PlaylistLog lock held, bounded
     lock_timeout set): may this exact insertion command splice its Track?
     Raises Refused for a duplicate, delayed, superseded, stale or mismatched
-    command -- nothing is inserted then."""
+    command -- nothing is inserted then.
+
+    Authority is taken in the established order, policy -> execution, and
+    both locks are held by the splice transaction until ``record_insertion``
+    commits: a composition change that won the policy lock first is seen
+    (stale: refused); one that comes later waits, and deck-open authority
+    remains the final binding check. The PlaylistLog lock is the engine's
+    outer context; no active-message service ever takes it, so there is no
+    reverse dependency. A lock-wait timeout raises: nothing is inserted (the
+    engine retries; a command never accepted is re-sent by the worker)."""
     from library.models import Category, Track
     try:
         execution_id = uuid.UUID(str(data.get("active_execution")))
@@ -511,6 +523,7 @@ def admit(data) -> Admission:
         track_id = int(data.get("track"))
     except (TypeError, ValueError):
         raise Refused("malformed native insertion command") from None
+    policy = services._lock_policy()
     row = ActiveBroadcastExecution.objects.select_for_update(of=("self",)).filter(pk=execution_id).first()
     if row is None:
         raise Refused("unknown execution")
@@ -520,7 +533,6 @@ def admit(data) -> Admission:
         raise Refused("duplicate command: this attempt is already inserted")
     if row.state not in (X.READY, *ENGINE_HELD):
         raise Refused(f"execution is {row.state}")
-    policy = services.current_policy()
     if row.policy_generation != policy.generation:
         raise Refused("stale generation")
     if not gate_open(policy):
@@ -592,23 +604,32 @@ def inspect(log_item, engine_instance) -> Decision:
 
 def authorize_open(log_item, engine_instance, *, now=None) -> Decision | None:
     """THE deck-open authority for native Tracks (None for every other Track,
-    query-free). Re-reads committed state with a bounded lock wait and either
-    CLAIMS the execution (ACCEPTED -> CLAIMED: from here it airs even if a
-    clear commits later) or refuses -- a stale one is SUPPRESSED so its slot
-    frees; the caller simply moves on to the next queued item."""
+    query-free). Either CLAIMS the execution (ACCEPTED -> CLAIMED: from here
+    it airs even if a clear commits later) or refuses -- a stale one is
+    SUPPRESSED so its slot frees; the caller simply moves on to the next
+    queued item.
+
+    Serialized against composition changes by the policy lock, in the
+    established order policy -> execution, both held in ONE short
+    transaction through the gate, generation, attempt and LogItem checks,
+    the claim and its event -- and released when it commits, before any
+    deck construction or file open. A change that won the policy lock first
+    is seen (no claim); a claim that won first stands. A lock wait beyond
+    AUTHORITY_LOCK_TIMEOUT raises: the engine treats that as a refusal (no
+    deck), and its not-aired report recovers the airing."""
     track = getattr(log_item, "track", None)
     if not is_candidate(track):
         return None
     now = now or timezone.now()
     with transaction.atomic():
         with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL lock_timeout = '250ms'")
+            cursor.execute(f"SET LOCAL lock_timeout = '{AUTHORITY_LOCK_TIMEOUT}'")
         insertion = _insertion_for(log_item.pk)
         if insertion is None:
             return Decision(False, "native urgent/PA Track without insertion authority")
-        row = ActiveBroadcastExecution.objects.select_for_update(of=("self",)).get(pk=insertion.execution_id)
+        policy = services._lock_policy()
+        row = services._lock_execution(insertion.execution_id)
         insertion.execution = row
-        policy = services.current_policy()
         reason = _judge(insertion, track, engine_instance, policy)
         if reason:
             if (row.state == X.ACCEPTED and row.attempt_token == insertion.attempt_token
@@ -663,7 +684,7 @@ def report_not_aired(log_item_id, engine_instance, *, stage, now=None) -> str:
     now = now or timezone.now()
     with transaction.atomic():
         with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL lock_timeout = '250ms'")
+            cursor.execute(f"SET LOCAL lock_timeout = '{AUTHORITY_LOCK_TIMEOUT}'")
         policy = services._lock_policy()
         insertion = _insertion_for(log_item_id)
         if insertion is None:
@@ -745,9 +766,17 @@ def sync_evidence(execution) -> ActiveBroadcastExecution:
 
 
 def sync_for_log_item(log_item_id):
-    """Engine hook after its own air-start / terminal accounting commits."""
+    """Engine hook after its own air-start / terminal accounting commits.
+    Runs on the engine's thread, so its lock waits are bounded
+    (AUTHORITY_LOCK_TIMEOUT); a timeout raises and the worker's evidence pass
+    repeats the projection."""
     insertion = ActiveBroadcastInsertion.objects.filter(log_item_id_snapshot=log_item_id).first()
-    return None if insertion is None else sync_evidence(insertion.execution_id)
+    if insertion is None:
+        return None
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute(f"SET LOCAL lock_timeout = '{AUTHORITY_LOCK_TIMEOUT}'")
+        return sync_evidence(insertion.execution_id)
 
 
 def _abandoned_air(row):

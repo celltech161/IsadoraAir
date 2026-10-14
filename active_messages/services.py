@@ -1072,8 +1072,15 @@ def record_air_interrupted(execution, *, attempt_token, last_evidence_at, confir
 # -- policy --------------------------------------------------------------------------------------
 
 def current_policy() -> ActiveBroadcastPolicy:
-    _store.ensure_policy()
-    return ActiveBroadcastPolicy.objects.get(pk=POLICY_ID)
+    """The committed policy -- a plain read that never waits on a lock (the
+    engine's advisory checks call this on its audio thread). The singleton
+    is created only when it does not exist yet: the conflict-ignoring insert
+    would otherwise wait on any uncommitted policy change."""
+    policy = ActiveBroadcastPolicy.objects.filter(pk=POLICY_ID).first()
+    if policy is None:
+        _store.ensure_policy()
+        policy = ActiveBroadcastPolicy.objects.get(pk=POLICY_ID)
+    return policy
 
 
 def _policy_write(policy, actor, now, values) -> ActiveBroadcastPolicy:
