@@ -10,7 +10,7 @@ from django.utils import timezone
 from active_messages import composition, services
 from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastMessage, ActiveBroadcastMessageEvent
 
-from .support import Domain, media
+from .support import Domain, corrupt_stored_bytes, media, registered_stinger
 
 X = ActiveBroadcastExecution
 
@@ -71,13 +71,53 @@ class CompositionTests(Domain, TestCase):
 
     def test_an_unavailable_stinger_is_recorded_and_attention_raised_but_urgent_material_still_airs(self):
         from monitoring.models import SystemEvent
-        services.set_stinger_key("missing-stinger", actor=self.admin)
-        self.active(kind="urgent")
+        from production.services import reference_audio
+        registered_stinger(self.admin)
+        services.set_stinger_key("stinger", actor=self.admin)
+        reference_audio.retire("stinger", actor=self.admin, reason="test disappearance after configuration")
+        urgent = self.active(self.producer, kind="urgent")
+        public_address = self.active(self.producer2, kind="public_address")
         with self.captureOnCommitCallbacks(execute=True):
             execution = services.materialize_due_execution()
         self.assertIsNone(execution.composition_snapshot["stinger"])
         self.assertEqual(execution.composition_snapshot["stinger_unavailable"], "reference_missing")
-        self.assertTrue(SystemEvent.objects.filter(category="active_messages", level="warning").exists())
+        components = execution.composition_snapshot["components"]
+        self.assertEqual([component["message"] for component in components], [str(urgent.pk), str(public_address.pk)])
+        self.assertEqual([component["media"] for component in components],
+                         [str(urgent.message_media_id), str(public_address.message_media_id)])
+        warning = SystemEvent.objects.get(category="active_messages", level="warning")
+        self.assertEqual(warning.detail, {"stinger_key": "stinger", "code": "reference_missing"})
+
+    def test_a_stinger_corrupted_after_configuration_is_omitted_without_changing_urgent_content(self):
+        from monitoring.models import SystemEvent
+        bed = registered_stinger(self.admin)
+        services.set_stinger_key("stinger", actor=self.admin)
+        corrupt_stored_bytes(bed)
+        urgent = self.active(self.producer, kind="urgent")
+        public_address = self.active(self.producer2, kind="public_address")
+        with self.captureOnCommitCallbacks(execute=True):
+            execution = services.materialize_due_execution()
+        snapshot = execution.composition_snapshot
+        self.assertEqual((snapshot["stinger"], snapshot["stinger_unavailable"]),
+                         (None, "reference_hash_mismatch"))
+        self.assertEqual([component["message"] for component in snapshot["components"]],
+                         [str(urgent.pk), str(public_address.pk)])
+        self.assertEqual(SystemEvent.objects.get(category="active_messages", level="warning").detail,
+                         {"stinger_key": "stinger", "code": "reference_hash_mismatch"})
+
+    def test_a_materialized_stinger_pin_does_not_follow_a_later_replacement(self):
+        from production.services import reference_audio
+        first = registered_stinger(self.admin)
+        services.set_stinger_key("stinger", actor=self.admin)
+        self.active(kind="urgent")
+        execution = services.materialize_due_execution()
+        frozen = execution.composition_snapshot["stinger"]
+        second = registered_stinger(self.admin, key="replacement")
+        reference_audio.register("stinger", second, actor=self.admin)
+        stored = X.objects.get(pk=execution.pk)
+        self.assertEqual(stored.composition_snapshot["stinger"], frozen)
+        self.assertEqual((frozen["media"], frozen["sha256"]), (str(first.pk), first.sha256))
+        self.assertNotEqual(frozen["media"], str(second.pk))
 
 
 class MaterializationTests(Domain, TestCase):

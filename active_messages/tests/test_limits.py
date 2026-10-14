@@ -6,6 +6,7 @@ longer fits fails closed with an operator alert."""
 import io
 import uuid
 from decimal import Decimal
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
@@ -17,7 +18,7 @@ from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastMess
     ActiveBroadcastPolicy
 from production.models import ProductionMedia
 
-from .support import Domain, media, raw
+from .support import Domain, media, raw, registered_stinger
 from .test_concurrency import Sessions
 
 User = get_user_model()
@@ -303,7 +304,8 @@ class AdminTests(Domain, TestCase):
         self.url = reverse("admin:active_messages_activebroadcastpolicy_change", args=[1])
 
     def post(self, **values):
-        data = {"max_active_messages": 16, "max_message_seconds": 300, "max_aggregate_seconds": 600, "_save": "Save"}
+        data = {"max_active_messages": 16, "max_message_seconds": 300, "max_aggregate_seconds": 600,
+                "stinger_key": "", "_save": "Save"}
         data.update(values)
         return self.client.post(self.url, data)
 
@@ -326,6 +328,30 @@ class AdminTests(Domain, TestCase):
         self.assertEqual((event.actor_username, event.detail["limits"]),
                          ("root", {"max_active_messages": 4, "max_message_seconds": 90}))
 
+    def test_admin_stinger_selection_and_blank_both_use_the_service(self):
+        registered_stinger(self.superuser)
+        self.client.get(reverse("admin:active_messages_activebroadcastpolicy_changelist"))
+        generation = self.policy().generation
+        with mock.patch.object(services, "set_stinger_key", wraps=services.set_stinger_key) as setter:
+            response = self.post(stinger_key="stinger")
+        self.assertEqual(response.status_code, 302)
+        setter.assert_called_once()
+        self.assertEqual((self.policy().stinger_key, self.policy().generation), ("stinger", generation + 1))
+        self.assertEqual(ActiveBroadcastMessageEvent.objects.filter(event="policy_stinger").count(), 1)
+
+        with mock.patch.object(services, "set_stinger_key", wraps=services.set_stinger_key) as setter:
+            response = self.post(stinger_key="")
+        self.assertEqual(response.status_code, 302)
+        setter.assert_called_once()
+        self.assertEqual((self.policy().stinger_key, self.policy().generation), ("", generation + 2))
+
+    def test_admin_rejects_an_unregistered_stinger_and_never_writes_the_model_directly(self):
+        self.client.get(reverse("admin:active_messages_activebroadcastpolicy_changelist"))
+        response = self.post(stinger_key="not-registered")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("stinger_key", response.context["adminform"].form.errors)
+        self.assertEqual((self.policy().stinger_key, self.policy().generation), ("", 0))
+
     def test_the_admin_form_refuses_out_of_range_and_inconsistent_values(self):
         self.client.get(reverse("admin:active_messages_activebroadcastpolicy_changelist"))
         generation = self.policy().generation
@@ -342,7 +368,7 @@ class AdminTests(Domain, TestCase):
 
     def test_other_policy_fields_and_the_domain_rows_are_read_only_in_admin(self):
         self.client.get(reverse("admin:active_messages_activebroadcastpolicy_changelist"))
-        self.post(generation=999, native_airing_enabled="on", stinger_key="x", default_replay_interval_seconds=60)
+        self.post(generation=999, native_airing_enabled="on", default_replay_interval_seconds=60)
         policy = self.policy()
         self.assertEqual((policy.generation, policy.native_airing_enabled, policy.stinger_key,
                           policy.default_replay_interval_seconds), (0, False, "", 1200))

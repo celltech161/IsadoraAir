@@ -1,16 +1,20 @@
 """Staff-only engineering diagnostics for the active-message domain.
 
 Messages, executions and events are READ-ONLY here: they change only through
-active_messages.services. The one configuration surface is the policy's
-composition limits, and even that never writes the model: a valid form is
-handed to ``services.set_limits`` (capability check, absolute ceilings,
-one generation step, stale-airing suppression). The models refuse every
-ordinary write regardless.
+active_messages.services. The policy's composition limits and ReferenceAudio
+stinger key are editable, but the admin never writes the model: a valid form
+is handed to ``services.set_limits`` / ``services.set_stinger_key``
+(capability checks, one generation step, stale-airing suppression). The
+models refuse every ordinary write regardless.
 """
+from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.urls import reverse
 from django.utils.html import format_html
+
+from production.models import ReferenceAudio
 
 from . import _store, services
 from .models import ActiveBroadcastExecution, ActiveBroadcastMessage, ActiveBroadcastMessageEvent, ActiveBroadcastPolicy
@@ -61,18 +65,53 @@ class ExecutionEventInline(EventInline):
 LIMIT_FIELDS = ("max_active_messages", "max_message_seconds", "max_aggregate_seconds")
 
 
+class ActiveBroadcastPolicyAdminForm(forms.ModelForm):
+    stinger_key = forms.ChoiceField(
+        required=False,
+        choices=(),
+        help_text=("Optional ReferenceAudio registration played before urgent messages. "
+                   "Blank means no stinger; filesystem paths are never accepted."),
+    )
+
+    class Meta:
+        model = ActiveBroadcastPolicy
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        keys = list(ReferenceAudio.objects.filter(retired_at__isnull=True).order_by("key")
+                    .values_list("key", flat=True).distinct())
+        current = getattr(self.instance, "stinger_key", "")
+        choices = [("", "No stinger")]
+        choices.extend((key, key) for key in keys)
+        # A registration can disappear after configuration. Keep that value
+        # visible so it can be cleared, without presenting it as healthy.
+        if current and current not in keys:
+            choices.append((current, f"{current} (currently unavailable)"))
+        self.fields["stinger_key"].choices = choices
+
+    def clean_stinger_key(self):
+        key = self.cleaned_data["stinger_key"]
+        try:
+            services.validate_stinger_key(key)
+        except services.InvalidRequest as exc:
+            raise forms.ValidationError(str(exc), code=exc.code) from None
+        return key
+
+
 @admin.register(ActiveBroadcastPolicy)
 class ActiveBroadcastPolicyAdmin(admin.ModelAdmin):
-    """The composition limits are editable (through services.set_limits);
+    """Limits and stinger are editable through their domain services;
     everything else on the policy is read-only diagnostics."""
 
     actions = None
+    form = ActiveBroadcastPolicyAdminForm
     list_display = ("id", "generation", "native_airing_enabled", "max_active_messages", "max_message_seconds",
                     "max_aggregate_seconds", "default_replay_interval_seconds", "stinger_key", "updated_at",
                     "updated_by_username")
     fields = LIMIT_FIELDS + ("generation", "native_airing_enabled", "default_replay_interval_seconds", "stinger_key",
                              "updated_at", "updated_by_username")
-    readonly_fields = ("generation", "native_airing_enabled", "default_replay_interval_seconds", "stinger_key",
+    readonly_fields = ("generation", "native_airing_enabled", "default_replay_interval_seconds",
                        "updated_at", "updated_by_username")
 
     def changelist_view(self, request, extra_context=None):
@@ -90,17 +129,24 @@ class ActiveBroadcastPolicyAdmin(admin.ModelAdmin):
 
     def save_model(self, request, obj, form, change):
         changes = {name: form.cleaned_data[name] for name in LIMIT_FIELDS if name in form.changed_data}
-        if not changes:
+        stinger_changed = "stinger_key" in form.changed_data
+        if not changes and not stinger_changed:
             return
         try:
-            services.set_limits(actor=request.user, **changes)
+            # The admin never saves ``obj``. Each changed value reaches its
+            # sole domain service, and a combined submission is atomic.
+            with transaction.atomic():
+                if changes:
+                    services.set_limits(actor=request.user, **changes)
+                if stinger_changed:
+                    services.set_stinger_key(form.cleaned_data["stinger_key"], actor=request.user)
         except services.NotPermitted as exc:
             raise PermissionDenied(str(exc)) from None
         except services.InvalidRequest as exc:
             # The form already validated ceilings and the cross-field rule (the
             # model's validators and constraints); only a concurrent change gets
             # here. Nothing was written.
-            self.message_user(request, f"Limits not changed: {exc}", level=messages.ERROR)
+            self.message_user(request, f"Policy not changed: {exc}", level=messages.ERROR)
 
 
 @admin.register(ActiveBroadcastMessage)

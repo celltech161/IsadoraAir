@@ -6,6 +6,7 @@ root or the production database.
 """
 from __future__ import annotations
 
+import io
 from datetime import timedelta
 from decimal import Decimal
 
@@ -44,6 +45,25 @@ def media(owner=None, *, kind=ProductionMedia.KIND_RECORDING, seconds="30.000000
     return make_row(kind=kind, **values)
 
 
+def registered_stinger(actor, *, key="stinger", seconds=1.0):
+    """A real, validated ReferenceAudio registration with stored bytes."""
+    from production.services import intake, reference_audio
+    from spoken.tests import support as audio
+    bed = intake.ingest_stream(io.BytesIO(audio.bed(seconds)), kind=ProductionMedia.KIND_BED, validate=True).media
+    reference_audio.register(key, bed, actor=actor)
+    return bed
+
+
+def corrupt_stored_bytes(media):
+    """Corrupt a test media object's isolated stored bytes in place."""
+    from production.services import layout
+    path = layout.resolve_storage_path(media.storage_key)
+    path.chmod(0o640)
+    data = bytearray(path.read_bytes())
+    data[-1] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
 def raw(model) -> models.QuerySet:
     """Django's base QuerySet: a deliberate guard bypass (= raw SQL) for
     proving database-level invariants and preparing D2B-only states."""
@@ -52,8 +72,8 @@ def raw(model) -> models.QuerySet:
 
 class Domain(IsolatedMediaRootMixin):
     """Users: ``admin`` (Station Administrator role), ``producer`` and
-    ``producer2`` (produce only, through a custom role), ``host`` (Remote Host),
-    ``nobody`` (no role)."""
+    ``producer2`` (produce only, through a custom role), ``controller``
+    (control only), ``host`` (Remote Host), ``nobody`` (no role)."""
 
     def setUp(self):
         super().setUp()
@@ -61,9 +81,13 @@ class Domain(IsolatedMediaRootMixin):
         from authz.models import Capability, RoleCapability
         RoleCapability.objects.get_or_create(role=produce_only,
                                              capability=Capability.objects.get(slug=services.PRODUCE))
+        control_only, _ = Role.objects.get_or_create(name="Test Controller")
+        RoleCapability.objects.get_or_create(role=control_only,
+                                             capability=Capability.objects.get(slug=services.CONTROL))
         self.admin = user_with_role("admin", "Station Administrator")
         self.producer = user_with_role("producer", "Test Producer")
         self.producer2 = user_with_role("producer2", "Test Producer")
+        self.controller = user_with_role("controller", "Test Controller")
         self.host = user_with_role("host", "Remote Host")
         self.nobody = user_with_role("nobody")
 

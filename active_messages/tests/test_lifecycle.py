@@ -12,7 +12,7 @@ from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastMess
 from production.models import ProductionMedia
 from production.services import retention
 
-from .support import Domain, media
+from .support import Domain, corrupt_stored_bytes, media, registered_stinger
 
 M = ActiveBroadcastMessage
 
@@ -22,7 +22,7 @@ class AuthorizationTests(Domain, TestCase):
         from authz.models import Role
         admin_role = set(Role.objects.get(name="Station Administrator").capabilities.values_list("slug", flat=True))
         self.assertLessEqual({services.PRODUCE, services.CONTROL}, admin_role)
-        for role in Role.objects.exclude(name__in=("Station Administrator", "Test Producer")):
+        for role in Role.objects.exclude(name__in=("Station Administrator", "Test Producer", "Test Controller")):
             with self.subTest(role=role.name):
                 self.assertFalse(role.capabilities.filter(slug__startswith="active_message.").exists())
 
@@ -60,6 +60,23 @@ class AuthorizationTests(Domain, TestCase):
             services.bind_message_media(mine, media(self.producer2), actor=self.producer)
         self.assertEqual(caught.exception.code, "not_your_media")
         self.assertEqual(services.clear_message(mine, actor=self.producer).state, "cleared")       # discard own draft
+
+    def test_media_binding_has_independent_produce_and_control_paths(self):
+        mine = services.prepare_message(actor=self.producer, kind="urgent")
+        own = media(self.producer)
+        self.assertEqual(services.bind_message_media(mine, own, actor=self.producer).message_media_id, own.pk)
+
+        other = services.prepare_message(actor=self.producer2, kind="public_address")
+        controlled = media(self.producer)
+        self.assertFalse(services.can(self.controller, services.PRODUCE))
+        self.assertTrue(services.can(self.controller, services.CONTROL))
+        self.assertEqual(services.bind_message_media(other, controlled, actor=self.controller).message_media_id,
+                         controlled.pk)
+
+        unbound = services.prepare_message(actor=self.producer, kind="public_address")
+        with self.assertRaises(services.NotPermitted):
+            services.bind_message_media(unbound, media(self.nobody), actor=self.nobody)
+        self.assertIsNone(M.objects.get(pk=unbound.pk).message_media_id)
 
     def test_a_producer_cannot_clear_an_active_message(self):
         message = self.active(self.producer)
@@ -279,12 +296,38 @@ class PolicyTests(Domain, TestCase):
                 services.set_default_replay_interval(bad, actor=self.admin)
 
     def test_stinger_changes_are_output_affecting(self):
+        registered_stinger(self.admin)
         generation = self.policy().generation
         self.assertEqual(services.set_stinger_key("stinger", actor=self.admin).generation, generation + 1)
         self.assertEqual(services.set_stinger_key("stinger", actor=self.admin).generation, generation + 1)
+        self.assertEqual(services.set_stinger_key("", actor=self.admin).generation, generation + 2)
+        self.assertEqual(services.set_stinger_key("", actor=self.admin).generation, generation + 2)
+        with self.assertRaises(services.InvalidRequest) as missing:
+            services.set_stinger_key("missing-stinger", actor=self.admin)
+        self.assertEqual(missing.exception.code, "reference_missing")
         with self.assertRaises(services.InvalidRequest):
             services.set_stinger_key("../stinger.mp3", actor=self.admin)
-        self.assertEqual(ActiveBroadcastMessageEvent.objects.filter(event="policy_stinger").count(), 1)
+        self.assertEqual(ActiveBroadcastMessageEvent.objects.filter(event="policy_stinger").count(), 2)
+
+    def test_stinger_configuration_rejects_a_registered_key_with_corrupt_stored_bytes(self):
+        bed = registered_stinger(self.admin)
+        corrupt_stored_bytes(bed)
+        with self.assertRaises(services.InvalidRequest) as caught:
+            services.set_stinger_key("stinger", actor=self.admin)
+        self.assertEqual(caught.exception.code, "reference_hash_mismatch")
+        self.assertEqual((self.policy().stinger_key, self.policy().generation), ("", 0))
+
+    def test_a_stinger_change_suppresses_old_pending_work_in_one_generation_step(self):
+        registered_stinger(self.admin, key="first")
+        registered_stinger(self.admin, key="second")
+        services.set_stinger_key("first", actor=self.admin)
+        self.active(kind="urgent")
+        pending = services.materialize_due_execution()
+        generation = self.policy().generation
+        changed = services.set_stinger_key("second", actor=self.admin)
+        self.assertEqual(changed.generation, generation + 1)
+        stored = ActiveBroadcastExecution.objects.get(pk=pending.pk)
+        self.assertEqual((stored.state, stored.failure_code), ("suppressed", "stale_generation"))
 
     def test_generation_never_moves_backward(self):
         seen = [self.policy().generation]

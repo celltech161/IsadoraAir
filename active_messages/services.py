@@ -380,7 +380,11 @@ def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
     Only the producer -- or a control-capable operator -- binds, and only to
     a PREPARED message: an ACTIVE message's media is immutable. Rebinding the
     same media is a no-op."""
-    _require(actor, PRODUCE)
+    # CONTROL is independently sufficient: a control-room operator may bind
+    # eligible media to any draft without also being a producer. Everyone
+    # else must hold PRODUCE and remains confined to their own draft/media.
+    if not can(actor, CONTROL):
+        _require(actor, PRODUCE)
     media_id = getattr(media, "pk", media)
     with transaction.atomic():
         row = _lock_message(message)
@@ -539,19 +543,50 @@ def expire_due_messages(*, now=None, actor_kind=ActorKind.SYSTEM) -> list:
 
 # -- executions ----------------------------------------------------------------------------------
 
+def _usable_stinger(key):
+    """Return an exact, currently usable ReferenceAudio pin and duration.
+
+    This deliberately resolves through ReferenceAudio's authority, including
+    validation, retention and stored-byte hashing. A runtime failure is data,
+    not an exception that may suppress urgent content: callers omit the
+    stinger and retain the stable failure code for operator attention.
+    """
+    try:
+        resolved = reference_audio.resolve(key)
+    except reference_audio.ReferenceAudioError as exc:
+        return None, exc.code, None
+    try:
+        duration = resolved.media.decoded_duration_seconds
+        if duration is None or duration <= 0:
+            return None, "reference_duration_unknown", None
+        return resolved.provenance(), "", duration
+    finally:
+        resolved.close()
+
+
+def validate_stinger_key(key):
+    """Validate the optional ReferenceAudio key at configuration time.
+
+    Blank explicitly disables the stinger. A nonblank key must resolve now to
+    present, valid, hash-matching media with a measured duration. This is
+    early operator feedback only; runtime still degrades to no stinger if a
+    once-valid registration later becomes unavailable.
+    """
+    if key == "":
+        return None
+    pin, unavailable, duration = _usable_stinger(key)
+    if unavailable:
+        raise InvalidRequest(f"the stinger ReferenceAudio key is not usable ({unavailable})", code=unavailable)
+    return pin, duration
+
+
 def _stinger(policy, messages):
     """(pin, unavailable code, validated decoded duration) of the stinger this
     set would use -- (None, "", None) when no component is urgent or none is
     configured."""
     if not policy.stinger_key or not any(message.kind == MessageKind.URGENT for message in messages):
         return None, "", None
-    try:
-        pin = reference_audio.current_pin(policy.stinger_key)
-    except reference_audio.ReferenceAudioError as exc:
-        return None, exc.code, None
-    seconds = (ProductionMedia.objects.filter(pk=pin["media"])
-               .values_list("decoded_duration_seconds", flat=True).first())
-    return pin, "", seconds
+    return _usable_stinger(policy.stinger_key)
 
 
 def _warn_stinger(code, key):
@@ -810,11 +845,7 @@ def set_stinger_key(key, *, actor, now=None) -> ActiveBroadcastPolicy:
     """Name the ReferenceAudio key whose current registration precedes urgent
     aggregates ("" for none). Output-affecting: a new generation."""
     _require(actor, CONTROL)
-    if key != "":
-        try:
-            reference_audio.check_key(key)
-        except reference_audio.ReferenceAudioError as exc:
-            raise InvalidRequest(str(exc), code=exc.code) from None
+    validate_stinger_key(key)
     now = _now(now)
     with transaction.atomic():
         policy = _lock_policy()

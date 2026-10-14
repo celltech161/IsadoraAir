@@ -139,7 +139,9 @@ later) are left to the engine's own re-read (D2B).
 2. oldest activation first;
 3. message UUID as the tie-breaker;
 4. the stinger (the current registration of `stinger_key`) first, only when a
-   component is urgent.
+   component is urgent. Blank means no stinger. Django admin offers current
+   ReferenceAudio keys; paths are never configuration authority, and every
+   update goes through `services.set_stinger_key`.
 
 The snapshot holds message, media and reference identities with SHA-256s and
 producer snapshots — never a path. The **digest** covers only what determines
@@ -148,6 +150,16 @@ set keeps its digest across replays and D2A can reuse its aggregate. If the
 configured stinger is unavailable, the airing proceeds without it
 (`stinger_unavailable` in the snapshot) and a SystemEvent warning is raised:
 an urgent message is never held back for its stinger.
+
+Materialization may resolve whichever ReferenceAudio registration is current
+at that moment. Once the execution exists, its `stinger` object is an exact
+immutable `{key, reference, media, sha256}` pin. D2A must render that pin and
+must never re-resolve the key and substitute a newer registration. Its
+adversarial suite must replace a ReferenceAudio registration after execution
+materialization but before render and prove the frozen pin is honored. If a
+valid frozen pin itself becomes unusable before render, the correct D2A
+reconciliation/degradation outcome remains a D2A design decision; D1 does not
+silently change the execution.
 
 ## Executions, due time and cadence
 
@@ -200,7 +212,7 @@ and the database.
 | --- | --- | --- | --- |
 | `max_active_messages` | 16 | 1..24 | **24**: each component is one sealed input descriptor in a single aggregate render (D2A), plus the stinger; and at the aggregate ceiling 24 components already average only 50 s — typical PSA length — so more could not carry meaningful messages anyway |
 | `max_message_seconds` | 300 | 1..600, ≤ aggregate | **600 s**: a 10-minute "message" is programming, not an announcement; half the aggregate ceiling, so at least two producers always fit |
-| `max_aggregate_seconds` | 600 | 1..1200 | **1200 s**: the legacy (and default) 20-minute replay cadence — an aggregate any longer would put more PA audio than ordinary programming between plays |
+| `max_aggregate_seconds` | 600 | 1..1200 | **1200 s**: an exceptional absolute resource and playout ceiling for one aggregate; it does not promise an airtime ratio, because the configured replay interval may be shorter |
 
 Aggregate accounting is every component's validated decoded duration **plus
 the stinger's** when an urgent component brings it in (the stinger is

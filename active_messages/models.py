@@ -52,7 +52,7 @@ DEFAULT_MAX_MESSAGE_SECONDS = 300
 DEFAULT_MAX_AGGREGATE_SECONDS = 600
 ABSOLUTE_MAX_ACTIVE_MESSAGES = 24       # one sealed render input each (+ stinger); avg 50 s within 1200 s
 ABSOLUTE_MAX_MESSAGE_SECONDS = 600      # a 10-minute "message" is programming, not an announcement
-ABSOLUTE_MAX_AGGREGATE_SECONDS = 1200   # = the legacy 20-minute cadence: never more PA than programming between plays
+ABSOLUTE_MAX_AGGREGATE_SECONDS = 1200   # exceptional absolute resource/playout ceiling; independent of cadence
 
 
 class ActorKind(models.TextChoices):
