@@ -5,6 +5,7 @@
   <h1 style="font-size:1.2rem;">{{ verb }} this item?</h1>
   <table style="font-size:0.9rem; margin: 0.5rem 0 1rem;">
     <tr><th style="text-align:left; padding-right:1rem;">Content type</th><td>{{ produced.name }} ({{ produced.key }})</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">Producer</th><td>{{ item.submitted_by_username|default:"unknown" }}</td></tr>
     <tr><th style="text-align:left; padding-right:1rem;">Title</th><td>{{ item.title|default:"untitled" }}</td></tr>
     <tr><th style="text-align:left; padding-right:1rem;">State</th><td>{{ item.get_state_display }}</td></tr>
   </table>

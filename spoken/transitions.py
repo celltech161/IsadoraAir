@@ -98,6 +98,31 @@ def is_manager(user) -> bool:
                 and (user.is_staff or user.is_superuser))
 
 
+# 2.22D3C: a domain that OWNS some content types through an explicit link (a
+# produced_content.ProducedContentType's managed backend) may name who manages
+# the items of exactly those types. Consulted ONLY by recall (pre-delivery
+# withdrawal and delivered recall), under the item's row lock, and only for the
+# item's own type: an unlinked standalone type gains nothing.
+_TYPE_RECALL_AUTHORITIES: list = []
+
+
+def register_recall_authority(check) -> None:
+    """``check(user, content_type_id) -> bool`` -- from an owning domain's
+    AppConfig.ready(). Registering the same function twice is a no-op."""
+    if check not in _TYPE_RECALL_AUTHORITIES:
+        _TYPE_RECALL_AUTHORITIES.append(check)
+
+
+def may_recall_as_manager(user, row) -> bool:
+    """A manager (staff), or a user an owning domain names as managing this
+    exact item's type (see register_recall_authority)."""
+    if is_manager(user):
+        return True
+    if user is None or getattr(user, "pk", None) is None:
+        return False
+    return any(check(user, row.content_type_id) for check in _TYPE_RECALL_AUTHORITIES)
+
+
 def _actor_columns(actor, actor_kind):
     if actor_kind == ActorKind.USER:
         if actor is None or getattr(actor, "pk", None) is None:
@@ -534,8 +559,9 @@ def reject(item, *, actor, note="") -> SpokenItem:
 
 
 def recall(item, *, actor, reason="") -> SpokenItem:
-    """Recall. Before delivery: managers always; the submitter while the
-    type's recall policy allows it. A delivered (or superseded) item's recall
+    """Recall. Before delivery: managers always (and, for an explicitly linked
+    type, whoever its owning domain names -- may_recall_as_manager); the
+    submitter while the type's recall policy allows it. A delivered (or superseded) item's recall
     removes projected content, so it is the projection service's
     (spoken.delivery.recall_delivered)."""
     state = SpokenItem.objects.filter(pk=getattr(item, "pk", item)).values_list("state", flat=True).first()
@@ -544,7 +570,7 @@ def recall(item, *, actor, reason="") -> SpokenItem:
         return delivery.recall_delivered(item, actor=actor, reason=reason)
 
     def check(row, user, now):
-        if is_manager(user):
+        if may_recall_as_manager(user, row):
             return
         if row.content_type.recall_policy == RecallPolicy.MANAGERS_ONLY:
             raise NotPermitted("only managers may recall this type")

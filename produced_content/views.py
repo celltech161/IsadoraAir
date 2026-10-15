@@ -6,7 +6,8 @@ address stay on My Messages):
 
 * regular  target category, single/accumulating, recipe, a configuration problem;
            the station's current edition (single); the producer's own recent
-           items with their exact Phase-C state; start a submission; continue a
+           items (station control: every producer's) with their exact Phase-C
+           state; start a submission; continue a
            draft in the shared recorder; abandon / withdraw / recall one exact
            item of their own;
 * test     the producer's saved test take (kept seven days after the most
@@ -15,7 +16,8 @@ address stay on My Messages):
 Every change is a CSRF-protected POST naming one exact type key or one exact
 item UUID, and goes through produced_content.regular, which authorizes again:
 a shown or hidden button is never the authorization. Another producer's item
-is a 404 here.
+is a 404 here -- except for station control, which may withdraw/recall any
+producer's item of a managed type (never a standalone Phase-C one).
 """
 from __future__ import annotations
 
@@ -59,9 +61,10 @@ def _withdraw_verb(item) -> str:
 
 
 def _item_row(user, item, *, writable, current_item_id=None):
+    mine = regular.is_owner(user, item)
     return {
-        "item": item, "recorder_url": recorder_url(item=item.pk),
-        "can_continue": item.state == S.DRAFT and writable,
+        "item": item, "recorder_url": recorder_url(item=item.pk), "mine": mine,
+        "can_continue": item.state == S.DRAFT and writable and mine,
         "can_withdraw": item.state not in regular.NOT_WITHDRAWABLE,
         "withdraw_verb": _withdraw_verb(item),
         "is_current": current_item_id is not None and item.pk == current_item_id,
@@ -81,6 +84,10 @@ def my_content(request):
     user = request.user
     _require_workspace(user)
     control = authority.can(user, authority.CONTROL)
+    # Station control (CONTROL / spoken manager) sees and can withdraw every
+    # producer's items of the MANAGED types; a producer only their own.
+    station = authority.is_station_control(user)
+    scope = {} if station else {"submitted_by": user}
     regular_rows, test_rows, listed = [], [], set()
     for content_type in authority.content_types_for(user).select_related("target_category",
                                                                            "spoken_content_type"):
@@ -100,23 +107,25 @@ def my_content(request):
             current = (_current_edition(backing) if content_type.output_mode == OutputMode.SINGLE else None)
             mine = [_item_row(user, item, writable=writable, current_item_id=getattr(current, "pk", None))
                     for item in SpokenItem.objects.select_related("submission_media")
-                    .filter(content_type=backing, submitted_by=user).order_by("-created_at")[:RECENT_ITEMS]]
+                    .filter(content_type=backing, **scope).order_by("-created_at")[:RECENT_ITEMS]]
         regular_rows.append({
             "type": content_type, "problem": problem, "can_start": not problem,
             "items": mine, "single": content_type.output_mode == OutputMode.SINGLE,
             "current": current, "current_is_mine": current is not None and current.submitted_by_id == user.pk,
         })
-    # The producer's own unfinished items of types no longer offered here
-    # (assignment removed, type disabled): visible, so they can still be withdrawn.
+    # Unfinished items of managed types no longer offered here (assignment
+    # removed, type disabled) -- the producer's own, or for station control
+    # everyone's: visible, so they can still be withdrawn.
     others = [_item_row(user, item, writable=False)
               for item in SpokenItem.objects.select_related("content_type")
-              .filter(submitted_by=user, content_type__produced_content_type__isnull=False)
+              .filter(content_type__produced_content_type__isnull=False, **scope)
               .exclude(content_type_id__in=listed).exclude(state__in=regular.NOT_WITHDRAWABLE)
               .order_by("-created_at")[:RECENT_ITEMS]]
     for row in others:
         row["type_name"] = row["item"].content_type.produced_content_type.name
     return render(request, "produced_content/my_content.html", {
         "regular_rows": regular_rows, "test_rows": test_rows, "others": others, "control": control,
+        "station": station,
         "nothing_airs": NOTHING_AIRS, "retention_days": TEST_TAKE_RETENTION_DAYS,
     })
 
@@ -145,7 +154,7 @@ def withdraw(request, item_id):
     one exact item of the producer's own, after a confirmation."""
     _require_workspace(request.user)
     found = regular.managed_item(item_id)
-    if found is None or not regular.is_owner(request.user, found[0]):
+    if found is None or not regular.may_see(request.user, found[0]):
         raise Http404("no such item")
     item, produced = found
     verb = _withdraw_verb(item)
@@ -154,7 +163,8 @@ def withdraw(request, item_id):
             return _back(request, f"That item is {item.get_state_display().lower()} now.", "info")
         return render(request, "produced_content/confirm.html", {"item": item, "produced": produced, "verb": verb})
     try:
-        regular.withdraw(request.user, item.pk, reason=f"{verb.lower()} by its producer",
+        regular.withdraw(request.user, item.pk, reason=(f"{verb.lower()} by its producer" if regular.is_owner(request.user, item)
+                                            else f"{verb.lower()} by station control"),
                          expected_state=request.POST.get("expected_state") or None)
     except regular.NotFound:
         raise Http404("no such item") from None

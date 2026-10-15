@@ -15,8 +15,11 @@ a linked backing row read-only. Backend identity is a generated, durable
 ``produced-<uuid hex>`` code -- never the producer-facing key, and ownership
 is never inferred from names: only the explicit link counts.
 
-``ensure_regular_backend`` is the only writer of the link. It locks the exact
-produced type first (lock order: ProducedContentType -> SpokenContentType ->
+``ensure_regular_backend`` is the only writer of the link (the model's queryset
+refuses every other link write; see produced_content.models). Callers authorize
+the exact type BEFORE calling it (produced_content.regular): nothing here
+authorizes, and a refused request must cause no backend side effect. It locks
+the exact produced type first (lock order: ProducedContentType -> SpokenContentType ->
 SpokenItem -> ProductionMedia, i.e. this row ahead of Phase C's own order),
 so concurrent first synchronizations create exactly one backing row. Every
 regular producer operation goes through it, so production always runs on a
@@ -35,7 +38,7 @@ from dataclasses import dataclass
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from .models import DeliveryMode, OutputMode, ProducedContentType
+from .models import DeliveryMode, OutputMode, ProducedContentType, _grant_backend_link
 
 # The five accepted Phase-C recipes (spoken.recipes) -- reused, never reimplemented.
 D3C_RECIPES = ("cal_events", "usd239min", "news_item", "3min_ctr", "lcl_psa")
@@ -147,7 +150,8 @@ def ensure_regular_backend(content_type):
             if row.spoken_content_type_id is None:
                 backing = SpokenContentType(code=_new_code(), **values)
                 backing.save()
-                ProducedContentType.objects.filter(pk=row.pk).update(spoken_content_type=backing)
+                with _grant_backend_link(row.pk, backing.pk):          # the one exact first link
+                    ProducedContentType.objects.filter(pk=row.pk).update(spoken_content_type=backing)
             else:
                 backing = SpokenContentType.objects.select_for_update().get(pk=row.spoken_content_type_id)
                 changed = [name for name, value in values.items() if getattr(backing, name) != value]

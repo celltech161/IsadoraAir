@@ -629,8 +629,10 @@ def _recover_barrier(asset, ctype, now, *, report, apply) -> bool:
 # -- leaving delivery: recall and expiry -----------------------------------------------------------
 
 def recall_delivered(item, *, actor, reason="") -> SpokenItem:
-    """delivered/superseded -> recalled. Managers always; the submitter only
-    while the type's recall policy is ``owner_anytime``."""
+    """delivered/superseded -> recalled. Managers always (for an explicitly
+    linked type also whoever its owning domain names --
+    transitions.may_recall_as_manager); the submitter only while the type's
+    recall policy is ``owner_anytime``."""
     return _end(getattr(item, "pk", item), S.RECALLED, actor=actor, actor_kind=ActorKind.USER, reason=reason)
 
 
@@ -680,7 +682,7 @@ def _end_locked(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
         changes = {}
         if to_state == S.RECALLED:
             user, username = transitions._actor_columns(actor, ActorKind.USER)
-            if not transitions.is_manager(user):
+            if not transitions.may_recall_as_manager(user, row):
                 if ctype.recall_policy != RecallPolicy.OWNER_ANYTIME or row.submitted_by_id != user.pk:
                     raise transitions.NotPermitted("only a manager may recall delivered content of this type")
             changes = {"recalled_by": user, "recalled_at": now, "recalled_by_username": username,

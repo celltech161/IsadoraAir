@@ -1,17 +1,20 @@
 """Regular produced content: the producer's actions, on the Phase-C backend (D3C).
 
-    start     authorize the exact type -> backend.ensure_regular_backend ->
+    start     lock + authorize the exact type (authority.lock_for_production)
+              -> only then backend.ensure_regular_backend ->
               spoken.transitions.create_item (one DRAFT SpokenItem, the
               producer as submitter). No Track, no render work.
-    submit    the recorder's commit: re-authorize, re-prove the backend, lock
+    submit    the recorder's commit: lock + re-authorize the type, prove the
+              item is the user's own, then re-prove the backend, lock
               the exact DRAFT item, compare the optimistic revision UNDER the
               row lock, then spoken.transitions.submit + record_validation in
               ONE transaction -> VALIDATED (or INVALID). Nothing renders or
               projects in the request: the existing leased spoken render worker
               takes VALIDATED items on (render -> processed -> delivered ->
               ordinary library Track), with no review for a managed type.
-    withdraw  the owner abandons a draft or recalls their item through the
-              existing spoken lifecycle (transitions.recall, which hands a
+    withdraw  the owner (or station control: CONTROL / a spoken manager, for any
+              producer's item of a MANAGED type) abandons a draft or recalls an
+              item through the existing spoken lifecycle (transitions.recall, which hands a
               delivered/superseded item to spoken.delivery.recall_delivered).
               Recall needs no current assignment -- losing it refuses only
               NEW production -- and a PROCESSING item cannot be interrupted
@@ -104,10 +107,17 @@ def item_revision(item) -> str:
     return hashlib.sha256(f"{pk}|{row['state']}|{row['submission_media_id']}|{last}".encode()).hexdigest()[:32]
 
 
-def _refusal_to_error(user, content_type) -> None:
-    refusal = authority.production_refusal(user, content_type)
-    if refusal:
-        raise NotPermitted(refusal, code="type_disabled" if not content_type.enabled else "not_permitted")
+def may_see(user, item) -> bool:
+    """Its own producer, or station control (CONTROL / spoken manager)."""
+    return is_owner(user, item) or authority.is_station_control(user)
+
+
+def _authorized(user, produced) -> ProducedContentType:
+    """Lock + authorize the exact type before ANY side effect."""
+    try:
+        return authority.lock_for_production(user, produced, mode=DeliveryMode.REGULAR)
+    except authority.ProductionRefused as exc:
+        raise (NotFound if exc.code == "unknown_type" else NotPermitted)(str(exc), code=exc.code) from None
 
 
 def _backend(content_type):
@@ -118,16 +128,15 @@ def _backend(content_type):
 
 
 def start(user, content_type, *, title="") -> SpokenItem:
-    """A new DRAFT of one exact regular type, submitted by ``user``."""
-    try:
-        produced = authority.resolve(content_type)
-    except authority.UnknownContentType:
-        raise NotFound("no such content type") from None
-    if produced.delivery_mode != DeliveryMode.REGULAR:
-        raise NotFound("no such regular content type")
+    """A new DRAFT of one exact regular type, submitted by ``user``.
+
+    Order (one transaction): lock + re-read the exact type and prove it
+    enabled and the user's authority over it; ONLY THEN create/synchronize
+    the backend; then create the item. A refused start creates or touches
+    nothing."""
     with transaction.atomic():
-        backing = _backend(produced)                         # locks the produced type, then the backend
-        _refusal_to_error(user, ProducedContentType.objects.get(pk=produced.pk))
+        produced = _authorized(user, content_type)
+        backing = _backend(produced)
         try:
             return transitions.create_item(backing, actor=user, title=str(title or "").strip()[:200])
         except transitions.SpokenServiceError as exc:
@@ -136,20 +145,21 @@ def start(user, content_type, *, title="") -> SpokenItem:
 
 def submit(user, item, media, *, expected_revision) -> SpokenItem:
     """DRAFT -> SUBMITTED -> VALIDATED|INVALID, as one transaction, by the
-    item's own producer with a valid take of their own."""
+    item's own producer with a valid take of their own. Lock order: produced
+    type (authorized first) -> spoken backend -> item -> media."""
     found = managed_item(getattr(item, "pk", item))
     if found is None:
         raise NotFound("no such item")
     _row, produced = found
     with transaction.atomic():
+        _authorized(user, produced)                          # before the backend is touched
+        if not is_owner(user, _row):                         # submitted_by never changes
+            raise NotPermitted("only the item's own producer submits it")
         _backend(produced)                                   # re-proven before new production
-        _refusal_to_error(user, ProducedContentType.objects.get(pk=produced.pk))
         row = SpokenItem.objects.select_for_update(of=("self",)).get(pk=_row.pk)
         current = item_revision(row)
         if not expected_revision or expected_revision != current:
             raise RevisionConflict("this item changed since the editor opened it", current_revision=current)
-        if not is_owner(user, row):
-            raise NotPermitted("only the item's own producer submits it")
         if row.state != S.DRAFT:
             raise StateConflict(f"this item is {row.get_state_display().lower()}; it was already submitted")
         candidate = ProductionMedia.objects.filter(pk=getattr(media, "pk", media)).first()
@@ -167,9 +177,12 @@ def submit(user, item, media, *, expected_revision) -> SpokenItem:
 
 
 def withdraw(user, item, *, reason="", expected_state=None) -> SpokenItem:
-    """The owner abandons (DRAFT) or recalls their own item."""
+    """The owner -- or station control, for any producer's item of a managed
+    type -- abandons (DRAFT), withdraws or recalls one exact item. Spoken's own
+    recall authority decides (for control: transitions.may_recall_as_manager,
+    which names CONTROL only for explicitly linked types)."""
     found = managed_item(getattr(item, "pk", item))
-    if found is None or not is_owner(user, found[0]):
+    if found is None or not may_see(user, found[0]):
         raise NotFound("no such item")                       # never disclose another producer's item
     row = found[0]
     if expected_state is not None and row.state != expected_state:

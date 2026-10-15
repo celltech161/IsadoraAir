@@ -47,6 +47,58 @@ def production_refusal(user, content_type) -> str:
     return ""
 
 
+def is_station_control(user) -> bool:
+    """Station control of produced content: CONTROL, or a spoken manager (staff)."""
+    from spoken.transitions import is_manager
+    return can(user, CONTROL) or is_manager(user)
+
+
+class ProductionRefused(Exception):
+    """Refused BEFORE any side effect (no backend, link, item or take)."""
+
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+def lock_for_production(user, content_type, *, mode) -> ProducedContentType:
+    """THE production authorization, inside the caller's transaction and
+    before any side effect: lock and re-read the exact type row (the lock a
+    mode change and the backend bridge take too), require ``mode``, prove it
+    enabled, then CONTROL -- or PRODUCE and an assignment to it (the assignment
+    row is locked, so its removal waits for this transaction). Returns the
+    locked row."""
+    from django.db import transaction
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("lock_for_production must run inside transaction.atomic()")
+    try:
+        pk = resolve(content_type).pk
+    except UnknownContentType:
+        raise ProductionRefused("no such content type", code="unknown_type") from None
+    row = ProducedContentType.objects.select_for_update(of=("self",)).filter(pk=pk).first()
+    if row is None or row.delivery_mode != mode:
+        raise ProductionRefused("no such content type", code="unknown_type")
+    if not row.enabled:
+        raise ProductionRefused(f"{row.name} is disabled.", code="type_disabled")
+    if can(user, CONTROL):
+        return row
+    if not can(user, PRODUCE):
+        raise ProductionRefused("Your account cannot produce content.", code="not_permitted")
+    if not ProducedContentTypeAssignment.objects.select_for_update().filter(
+            user_id=user.pk, content_type_id=row.pk).exists():
+        raise ProductionRefused(f"You are not assigned to {row.name}.", code="not_assigned")
+    return row
+
+
+def controls_managed_type(user, spoken_content_type_id) -> bool:
+    """spoken.transitions recall authority (registered in AppConfig.ready):
+    CONTROL manages the items of a spoken type ONLY when it is the explicitly
+    linked backend of a regular produced type -- never a standalone one."""
+    return (ProducedContentType.objects.filter(spoken_content_type_id=spoken_content_type_id,
+                                               delivery_mode=DeliveryMode.REGULAR).exists()
+            and can(user, CONTROL))
+
+
 def content_types_for(user):
     """The enabled regular and test types the user may produce: all of them
     for CONTROL, the assigned ones for a producer."""

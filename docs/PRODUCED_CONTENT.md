@@ -73,8 +73,27 @@ row (generated durable code `produced-<uuid hex>` — never the producer key) or
 re-synchronizes it, and returns it. Every regular producer operation (start,
 submit) goes through it, so production always runs on a re-proven
 configuration; concurrent first synchronizations create exactly one backend
-(the produced type's row lock). An ordinary `ProducedContentType.save()` never
-writes the link (a stale admin form cannot clear it).
+(the produced type's row lock).
+
+**The link is bridge-only identity**, enforced at the ORM boundary and in the
+database:
+
+* an ordinary `ProducedContentType.save()` never writes the link (a stale
+  admin form cannot erase it) and refuses an instance whose link was attached,
+  replaced or cleared in memory; `save(update_fields=[...link...])` is refused;
+* the model's queryset refuses `update()` / `bulk_update()` / `bulk_create()`
+  of the link, except the bridge's single granted FIRST link of one exact,
+  still-unlinked regular row;
+* `produced_type_backend_regular_only` (CHECK, `produced_content.0004`): a
+  backend implies a regular type; a backed type's mode is fixed.
+
+**Authorization precedes every side effect.** The bridge itself authorizes
+nothing; `produced_content.regular` first locks and re-reads the exact type
+and proves it enabled and the user's (`authority.lock_for_production`:
+CONTROL, or PRODUCE plus an assignment, whose row is locked too) -- and for a
+submission that the item is the user's own -- and only then calls the bridge.
+A refused start or submit creates, links or synchronizes no backend and
+creates no item.
 
 | ProducedContentType | backing SpokenContentType |
 | --- | --- |
@@ -99,8 +118,10 @@ the backend link and its health and synchronizes on save. Unlinked
 SpokenContentTypes remain ordinary Phase-C configuration. Phase C's own
 validation and locking inside `SpokenContentType.save()` are unchanged.
 
-Lock order: `ProducedContentType -> SpokenContentType -> SpokenItem ->
-ProductionMedia` (the produced type ahead of Phase C's own order).
+Lock order: `ProducedContentType (-> its assignment) -> SpokenContentType ->
+SpokenItem -> ProductionMedia` (the produced type ahead of Phase C's own
+order). `ProducedContentType.save()` takes the same type-row lock first, so a
+mode change is serialized against a first backend link or first test take.
 
 ### Delivery semantics (exactly Phase C's)
 
@@ -116,7 +137,8 @@ ProductionMedia` (the produced type ahead of Phase C's own order).
 
 ### Recall, withdrawal, abandonment
 
-The owner withdraws one exact item through the existing spoken lifecycle
+The owner -- or station control (below) -- withdraws one exact item through
+the existing spoken lifecycle
 (`spoken.transitions.recall`, which hands delivered/superseded items to
 `spoken.delivery.recall_delivered`): a DRAFT is abandoned, a submitted /
 validated / processed / failed item is withdrawn, a delivered item is recalled
@@ -137,10 +159,20 @@ capabilities are the broad Produced Content producer / control capabilities:
   (assignment is scope, not role);
 * CONTROL produces any enabled regular/test type without an assignment.
 
-My Content shows only the signed-in user's own items, so no D3C operation
-depends on Phase C's spoken *manager* predicate (staff); control users are the
-owners of what they produce. Station-wide management stays with the existing
-spoken authority (D3D/E bring operator boards).
+**Station control** (CONTROL, or a spoken manager/staff) manages station
+Regular material across producers: My Content lists every producer's items of
+the managed types for it, read-only in the recorder (only an item's own
+producer records or submits it), and it can abandon / withdraw / recall any
+of them wherever the spoken lifecycle permits (PROCESSING stays
+non-interruptible; a stale recall of a superseded edition never touches the
+newer one). The spoken domain was adapted narrowly for this: a registered
+recall authority (`spoken.transitions.register_recall_authority` /
+`may_recall_as_manager`, consulted only by recall, under the item's row lock)
+through which `produced_content` names CONTROL as manager of exactly the
+spoken types explicitly linked by `ProducedContentType.spoken_content_type`.
+Standalone, unlinked Phase-C types gain nothing (their manager is still only
+staff); retry, review and reattach are unchanged. An ordinary producer sees and
+withdraws only their own items (another producer's is a 404).
 
 ## The workspace: My Content (`/iportal/content/`)
 
@@ -187,6 +219,13 @@ ProductionMedia` (unique per user and type; media PROTECT while bound; opaque
 revision; `expires_at`). Temporary media state, not broadcast history; no
 event subsystem.
 
+A save locks in the order `ProducedContentType -> ProducedContentTestTake ->
+ProductionMedia`: the exact type is locked, re-read and proven still TEST,
+enabled and the user's BEFORE the binding is locked or created, so a binding
+always names a type that is TEST at the commit point (a concurrent mode change
+either commits first -- the save is refused -- or waits and is then refused
+itself because test takes exist).
+
 A producer may record, import, edit, validate, save, preview, replace and
 remove their test take. The recorder says **TEST / NO AIR**, **Save test
 take**, *Nothing in this workspace can air.* Saving binds under
@@ -218,11 +257,13 @@ logged and never stops rendering. No new service, unit or timer.
 | `produced_content.0003_recipe_key_leading_digit` | RemoveConstraint `produced_type_recipe_key_shape` | manual |
 | | AlterField `recipe_key` (validator `^[a-z0-9][a-z0-9_]{0,63}$`) | manual |
 | | AddConstraint `produced_type_recipe_key_shape` (the widened pattern) | manual |
+| `produced_content.0004_backend_regular_only` | AddConstraint `produced_type_backend_regular_only` (a backend implies a regular type) | manual |
 
 No data migration, no station seed, no authz migration; existing
 compatibility types stay valid (no backend required). 0003 only widens the
-pattern (every existing row satisfies it); its three manual operations need a
-release migration authorization when D3C ships.
+pattern (every existing row satisfies it); 0004 only guards what the bridge
+already guarantees (every existing row satisfies it). Their four manual
+operations need a release migration authorization when D3C ships.
 
 ## Not in D3C
 

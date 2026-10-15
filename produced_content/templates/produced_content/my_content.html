@@ -53,6 +53,7 @@
       recipe: {{ row.type.recipe_key|default:"none" }} ·
       {% if row.single %}a new delivery replaces the current edition{% else %}each delivery adds an item{% endif %}
       {% if control %} · <em>control: you may produce every enabled type</em>{% endif %}
+      {% if station %} · <em>station control: every producer's items are listed and can be withdrawn</em>{% endif %}
     </div>
     {% if row.problem %}
     <div class="pc-banner warn" data-health-text>{{ row.type.name }} cannot be produced right now: {{ row.problem }}. Ask the station to fix its configuration.</div>
@@ -74,6 +75,7 @@
     <div class="pc-item{% if entry.is_current %} current{% endif %}" data-item="{{ entry.item.pk }}" data-state="{{ entry.item.state }}">
       <span class="pc-badge{% if entry.is_current %} current{% endif %}">{{ entry.item.get_state_display|upper }}{% if entry.is_current %} · CURRENT{% endif %}</span>
       <strong>{{ entry.item.title|default:"untitled" }}</strong>
+      {% if not entry.mine %}<span class="pc-muted" data-producer>by {{ entry.item.submitted_by_username|default:"unknown" }}</span>{% endif %}
       <span class="pc-muted">started {{ entry.item.created_at|date:"Y-m-d H:i" }}{% if entry.item.delivered_at %} · delivered {{ entry.item.delivered_at|date:"Y-m-d H:i" }}{% endif %}{% if entry.item.failure_code %} · problem: {{ entry.item.failure_code }}{% endif %}</span>
       <div class="pc-row">
         {% if entry.can_continue %}
@@ -125,13 +127,13 @@
 
   {% if others %}
   <section class="pc-type" id="pcOtherItems">
-    <h2>Your other items</h2>
-    <div class="pc-facts">Items of content types no longer offered to you. You can still withdraw them.</div>
+    <h2>{% if station %}Other items{% else %}Your other items{% endif %}</h2>
+    <div class="pc-facts">Items of content types no longer offered here. They can still be withdrawn.</div>
     {% for entry in others %}
     <div class="pc-item" data-item="{{ entry.item.pk }}" data-state="{{ entry.item.state }}">
       <span class="pc-badge">{{ entry.item.get_state_display|upper }}</span>
       <strong>{{ entry.item.title|default:"untitled" }}</strong>
-      <span class="pc-muted">{{ entry.type_name }}</span>
+      <span class="pc-muted">{{ entry.type_name }}{% if not entry.mine %} · by {{ entry.item.submitted_by_username|default:"unknown" }}{% endif %}</span>
       <div class="pc-row">
         <a class="pc-btn" href="{{ entry.recorder_url }}">Open</a>
         {% if entry.can_withdraw %}

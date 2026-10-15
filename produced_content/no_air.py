@@ -6,7 +6,8 @@ The ONLY durable effect of the TEST workspace. It calls no spoken transition,
 renderer or projection, creates no Track, log item, active message or queue
 entry and sends no engine command: TEST is structurally incapable of airing.
 
-* save      re-authorize; lock the user's binding; compare its optimistic
+* save      lock + re-read + authorize the exact type (still TEST, enabled,
+            the user's); then lock the user's binding; compare its optimistic
             revision under that lock (a stale tab gets a conflict, never a
             silent overwrite); bind the user's own VALID take under
             ``lock_for_binding``; the retention clock restarts
@@ -111,12 +112,20 @@ def _locked_take(user, content_type, expected_revision):
 
 
 def save_take(user, content_type, media, *, expected_revision) -> ProducedContentTestTake:
-    """Bind the user's own valid take as their current test take of this exact type."""
-    ctype = resolve_test_type(content_type)
-    refusal = authority.production_refusal(user, ctype)
-    if refusal:
-        raise NotPermitted(refusal)
+    """Bind the user's own valid take as their current test take of this exact type.
+
+    Lock order: ProducedContentType -> ProducedContentTestTake -> ProductionMedia.
+    The exact type is locked, re-read and proven TEST, enabled and the user's
+    (CONTROL, or PRODUCE + assignment) BEFORE the binding is locked or created,
+    so a binding always names a type that is still TEST at the commit point: a
+    concurrent mode change (ProducedContentType.save takes the same row lock)
+    either commits first -- and this save is refused -- or waits and then sees
+    the committed take and is refused itself."""
     with transaction.atomic():
+        try:
+            ctype = authority.lock_for_production(user, content_type, mode=DeliveryMode.TEST)
+        except authority.ProductionRefused as exc:
+            raise (NotFound if exc.code == "unknown_type" else NotPermitted)(str(exc), code=exc.code) from None
         take = _locked_take(user, ctype, expected_revision)
         candidate = ProductionMedia.objects.filter(pk=getattr(media, "pk", media)).first()
         if candidate is None or candidate.owner_id != user.pk:

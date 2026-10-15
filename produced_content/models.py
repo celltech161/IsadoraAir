@@ -39,10 +39,14 @@ saved test takes.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
+from dataclasses import dataclass
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models import Q
 
 from production.models import ProductionMedia
@@ -82,6 +86,71 @@ def _null(*names, isnull=True) -> Q:
 
 _ACTIVE_ONLY = ("recallable", "producer_self_publish", "replay_interval_seconds")
 _REGULAR_TEXT = ("output_mode", "recipe_key", "artist_tag")
+
+
+# -- the spoken backend link is bridge-only identity ----------------------------------------
+# ``ProducedContentType.spoken_content_type`` is domain identity, not an ordinary
+# editable foreign key: it is FIRST-linked by produced_content.backend (under the
+# type's row lock) and never attached, replaced or cleared by anything else. An
+# ordinary save never writes it (a stale instance cannot erase it) and refuses an
+# instance whose link was changed in memory; the queryset refuses link writes
+# except the bridge's one exact granted first link; the database refuses a backend
+# on a non-regular type (produced_type_backend_regular_only).
+LINK_FIELDS = frozenset({"spoken_content_type", "spoken_content_type_id"})
+BRIDGE_ONLY = "The spoken backend is linked only by produced_content.backend."
+
+
+class BackendLinkRefused(ValidationError):
+    """A write of the spoken backend link outside the bridge's exact grant."""
+
+
+@dataclass(frozen=True)
+class _LinkGrant:
+    type_pk: int
+    backing_pk: object
+
+
+_LINK_GRANT: contextvars.ContextVar = contextvars.ContextVar("produced_backend_link_grant", default=None)
+
+
+@contextlib.contextmanager
+def _grant_backend_link(type_pk, backing_pk):
+    """produced_content.backend only: authorize ONE first link of one exact type."""
+    token = _LINK_GRANT.set(_LinkGrant(type_pk, backing_pk))
+    try:
+        yield
+    finally:
+        _LINK_GRANT.reset(token)
+
+
+def _refuse_link(message=BRIDGE_ONLY):
+    raise BackendLinkRefused({"spoken_content_type": message})
+
+
+class ProducedContentTypeQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if LINK_FIELDS & set(kwargs):
+            grant = _LINK_GRANT.get()
+            value = kwargs.get("spoken_content_type", kwargs.get("spoken_content_type_id"))
+            backing_pk = getattr(value, "pk", value)
+            if grant is None or len(kwargs) != 1 or backing_pk is None or str(backing_pk) != str(grant.backing_pk):
+                _refuse_link()
+            # exactly the granted, regular, still unlinked row
+            if list(self.values_list("pk", "delivery_mode", "spoken_content_type_id")) != [
+                    (grant.type_pk, DeliveryMode.REGULAR, None)]:
+                _refuse_link("The bridge first-links one exact unlinked regular type.")
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        if LINK_FIELDS & set(fields):
+            _refuse_link()
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = list(objs)
+        if any(getattr(obj, "spoken_content_type_id", None) is not None for obj in objs):
+            _refuse_link()
+        return super().bulk_create(objs, *args, **kwargs)
 
 
 class ProducedContentType(models.Model):
@@ -131,6 +200,8 @@ class ProducedContentType(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = ProducedContentTypeQuerySet.as_manager()
+
     class Meta:
         ordering = ["sort_order", "name", "key"]
         verbose_name = "produced content type"
@@ -163,6 +234,9 @@ class ProducedContentType(models.Model):
                 condition=~Q(delivery_mode=DeliveryMode.TEST)
                 | (_null("target_category") & _blank(*_REGULAR_TEXT) & _null(*_ACTIVE_ONLY)),
                 name="produced_type_test_inert"),
+            # D3C: only a regular type has a spoken processing backend.
+            models.CheckConstraint(condition=Q(spoken_content_type__isnull=True) | Q(delivery_mode=DeliveryMode.REGULAR),
+                                   name="produced_type_backend_regular_only"),
         ]
 
     def __str__(self):
@@ -178,6 +252,24 @@ class ProducedContentType(models.Model):
                 self.recallable = True
             if self.producer_self_publish is None:
                 self.producer_self_publish = True
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        instance._loaded_backend_id = instance.__dict__.get("spoken_content_type_id")
+        return instance
+
+    def refresh_from_db(self, *args, **kwargs):
+        super().refresh_from_db(*args, **kwargs)
+        self._loaded_backend_id = self.__dict__.get("spoken_content_type_id")
+
+    def _link_changed_in_memory(self) -> bool:
+        """Did the caller attach, replace or clear the link on this instance?
+        (The value it was loaded with is not a change: a stale instance whose
+        row the bridge linked meanwhile is just stale -- see save().)"""
+        if "spoken_content_type_id" not in self.__dict__:
+            return False
+        return self.__dict__["spoken_content_type_id"] != getattr(self, "_loaded_backend_id", None)
 
     def _stored(self):
         if self.pk is None:
@@ -213,7 +305,9 @@ class ProducedContentType(models.Model):
             if stored["spoken_content_type_id"] is not None and self.delivery_mode != DeliveryMode.REGULAR:
                 errors.setdefault("delivery_mode", "Only a regular type has a spoken processing backend.")
         elif self.spoken_content_type_id is not None:
-            errors["spoken_content_type"] = "The spoken backend is linked only by produced_content.backend."
+            errors["spoken_content_type"] = BRIDGE_ONLY
+        if self._link_changed_in_memory():
+            errors["spoken_content_type"] = BRIDGE_ONLY
         return errors
 
     def clean(self):
@@ -246,17 +340,31 @@ class ProducedContentType(models.Model):
             raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
-        self._apply_mode_defaults()
-        errors = self._identity_errors()
-        if errors:
-            raise ValidationError(errors)
-        if not self._state.adding and kwargs.get("update_fields") is None:
-            # The backend link is written ONLY by produced_content.backend
-            # (under this row's lock); an ordinary save -- an admin form loaded
-            # before a producer's first submission -- never overwrites it.
-            kwargs["update_fields"] = [field.name for field in self._meta.concrete_fields
-                                       if not field.primary_key and field.name != "spoken_content_type"]
-        super().save(*args, **kwargs)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None and LINK_FIELDS & set(update_fields):
+            _refuse_link()
+        if self._link_changed_in_memory():
+            _refuse_link()
+        using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=using):
+            if self.pk is not None and not self._state.adding:
+                # The row lock every producer operation (backend bridge, test
+                # take) takes first: a mode change and a first backend link or
+                # first test take are serialized, so the frozen-mode check
+                # below sees whichever committed first.
+                type(self).objects.db_manager(using).select_for_update().filter(pk=self.pk).values_list("pk").first()
+            self._apply_mode_defaults()
+            errors = self._identity_errors()
+            if errors:
+                raise ValidationError(errors)
+            if not self._state.adding and update_fields is None:
+                # The backend link is written ONLY by produced_content.backend
+                # (under this row's lock); an ordinary save -- an admin form
+                # loaded before a producer's first submission -- never
+                # overwrites it.
+                kwargs["update_fields"] = [field.name for field in self._meta.concrete_fields
+                                           if not field.primary_key and field.name != "spoken_content_type"]
+            super().save(*args, **kwargs)
 
 
 class ProducedContentTypeAssignment(models.Model):
