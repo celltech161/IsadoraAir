@@ -99,14 +99,24 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  "active_messages.0002_playout_correlation",
                                                  "produced_content.0001_initial",
                                                  "active_messages.0003_message_content_type",
-                                                 "active_messages.0004_message_content_type_identity"})
+                                                 "active_messages.0004_message_content_type_identity",
+                                                 # r0111: the iPortal nav seed (on library.0089)
+                                                 "library.0090_seed_iportal_nav_item",
+                                                 # 2.22D3C: the spoken backend link / test takes, and
+                                                 # the recipe-key pattern correction
+                                                 "produced_content.0002_d3c_spoken_backend_and_test_take",
+                                                 "produced_content.0003_recipe_key_leading_digit"})
             self.assertEqual(payload["conflicts"], {})
-            self.assertEqual([(entry["ref"], entry["operation"])
-                              for entry in probe.extract_manual_operations(payload["plan"])],
-                             [("active_messages.0003_message_content_type", "RunPython"),
-                              ("active_messages.0004_message_content_type_identity", "AlterField"),
-                              ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
-                              ("active_messages.0004_message_content_type_identity", "AddConstraint")])
+            self.assertEqual(sorted((entry["ref"], entry["operation"])
+                                    for entry in probe.extract_manual_operations(payload["plan"])),
+                             sorted([("active_messages.0003_message_content_type", "RunPython"),
+                                     ("active_messages.0004_message_content_type_identity", "AlterField"),
+                                     ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
+                                     ("active_messages.0004_message_content_type_identity", "AddConstraint"),
+                                     ("library.0090_seed_iportal_nav_item", "RunPython"),
+                                     ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
+                                     ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
+                                     ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

@@ -693,6 +693,20 @@ re-rendering an item whose rendition became outdated before delivery (it
 stays `processed`; recall and resubmit), any HTTP/recorder surface, enabling
 any production type.
 
+## Managed backends (iPortal D3C)
+
+A `SpokenContentType` may be the MANAGED backend of a regular
+`produced_content.ProducedContentType` -- linked explicitly by
+`ProducedContentType.spoken_content_type` (never by matching names). The
+produced type is then the configuration authority: `produced_content.backend`
+creates and synchronizes the managed fields (current_edition/accumulating,
+recipe, category, artist, no review, Ready-to-Air delivery, retire on
+current recall, owner-anytime recall, item-title titles, no lifetime) before
+every producer operation, and Django Admin shows the backend read-only.
+Producer items on it are ordinary SpokenItems through this domain's own
+lifecycle, worker, recipes and projection -- nothing here changed for D3C,
+and unlinked types behave exactly as before. See docs/PRODUCED_CONTENT.md.
+
 ## Not in C1 / C2A / C2B
 
 Any HTTP/recorder surface for spoken content; enabling any content type;

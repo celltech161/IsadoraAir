@@ -6,7 +6,12 @@
 
 Renders happen in isadoraair-render; this process only claims, asks, ingests
 and completes. It never runs in the web request path.
+
+D3C: the loop also runs produced_content's bounded TEST / NO-AIR take expiry
+(at most once a minute) -- isolated: a failure there is logged and never
+stops rendering.
 """
+import logging
 import signal
 import time
 
@@ -14,6 +19,23 @@ from django.core.management.base import BaseCommand
 from django.db import close_old_connections
 
 from spoken import worker
+
+log = logging.getLogger(__name__)
+TEST_TAKE_SWEEP_SECONDS = 60.0
+
+
+def sweep_test_takes(state, *, clock=time.monotonic) -> int:
+    """Expire due produced-content test takes, throttled; never raises."""
+    now = clock()
+    if state.get("at") is not None and now - state["at"] < TEST_TAKE_SWEEP_SECONDS:
+        return 0
+    state["at"] = now
+    try:
+        from produced_content import no_air
+        return no_air.expire_due()
+    except Exception:                                      # noqa: BLE001 -- never stops rendering
+        log.exception("produced-content test take expiry failed; rendering continues")
+        return 0
 
 
 class Command(BaseCommand):
@@ -36,7 +58,11 @@ class Command(BaseCommand):
         findings = [f for f in delivery.reconcile() if f.get("action") not in ("none", "skipped")]
         if findings:
             self.stdout.write(f"projection reconcile: {len(findings)} change(s)")
+        sweep_state = {}
         while not stopping:
+            expired = sweep_test_takes(sweep_state)
+            if expired:
+                self.stdout.write(f"test takes expired: {expired}")
             for advanced in worker.advance_ready():
                 self.stdout.write(f"{advanced.item_id}: {advanced.result} {advanced.code}".rstrip())
             outcome = worker.process_one()

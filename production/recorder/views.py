@@ -73,7 +73,7 @@ def _adapter_and_subject(adapter_key, params, user, operation):
     adapter = registry.get(adapter_key)
     if not adapter.authorize(user, operation):
         raise Forbidden("forbidden", "you are not allowed to do that here")
-    subject = adapter.resolve(params)
+    subject = adapter.resolve_for(user, params)
     if not adapter.authorize_subject(user, subject, operation):
         raise Forbidden("forbidden", "you are not allowed to do that here")
     return adapter, subject
@@ -310,8 +310,8 @@ def api_commit(request, adapter):
         adapter_obj, subject = _adapter_and_subject(adapter, body.get("subject") or {}, request.user, "save")
         media = _accessible_media(adapter_obj, request.user, subject, body.get("media_id"))
         adapter_obj.commit(request.user, subject, media, str(body.get("revision") or ""))
-        return JsonResponse({"ok": True, "context": adapter_obj.context(request, adapter_obj.resolve(
-            adapter_obj.subject_params(subject))).as_json()})
+        return JsonResponse({"ok": True, "context": adapter_obj.context(request, adapter_obj.resolve_for(
+            request.user, adapter_obj.subject_params(subject))).as_json()})
     except Conflict as exc:
         response = _error(exc)
         return response
@@ -326,8 +326,8 @@ def api_remove(request, adapter):
         body = _json_body(request)
         adapter_obj, subject = _adapter_and_subject(adapter, body.get("subject") or {}, request.user, "remove")
         adapter_obj.remove(request.user, subject, str(body.get("revision") or ""))
-        return JsonResponse({"ok": True, "context": adapter_obj.context(request, adapter_obj.resolve(
-            adapter_obj.subject_params(subject))).as_json()})
+        return JsonResponse({"ok": True, "context": adapter_obj.context(request, adapter_obj.resolve_for(
+            request.user, adapter_obj.subject_params(subject))).as_json()})
     except RecorderError as exc:
         return _error(exc)
 

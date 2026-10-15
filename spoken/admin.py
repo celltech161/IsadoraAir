@@ -1,10 +1,13 @@
 """Staff-only engineering diagnostics for the spoken domain.
 
 Content types are configurable here (validated on every save; the code is
-read-only once used). Items, events, assets and editions are READ-ONLY:
+read-only once used) -- except a D3C-managed backend of a Produced Content
+type, which is shown read-only (its produced type is the configuration
+authority). Items, events, assets and editions are READ-ONLY:
 lifecycle changes go through spoken.transitions, never through admin.
 """
 from django.contrib import admin
+from django.core.exceptions import ObjectDoesNotExist
 from django.urls import reverse
 from django.utils.html import format_html
 
@@ -29,19 +32,56 @@ class ReadOnlyAdmin(admin.ModelAdmin):
         return False
 
 
+def managing_produced_type(obj):
+    """The produced-content type that manages this backend (D3C), or None --
+    by the explicit link only."""
+    if obj is None or obj.pk is None:
+        return None
+    try:
+        return obj.produced_content_type
+    except ObjectDoesNotExist:
+        return None
+
+
 @admin.register(SpokenContentType)
 class SpokenContentTypeAdmin(admin.ModelAdmin):
-    list_display = ("name", "code", "enabled", "delivery_mode", "recipe_key", "target_category", "requires_review")
+    """Unlinked types are ordinary Phase-C configuration. A type linked to a
+    Produced Content type (D3C) is that type's MANAGED backend: read-only here
+    (configure the produced type; it synchronizes the backend)."""
+    list_display = ("name", "code", "enabled", "delivery_mode", "recipe_key", "target_category", "requires_review",
+                    "managed_by")
     list_filter = ("enabled", "delivery_mode", "recipe_key")
     search_fields = ("name", "code")
 
+    @admin.display(description="Managed by")
+    def managed_by(self, obj):
+        produced = managing_produced_type(obj)
+        if produced is None:
+            return "-"
+        url = reverse("admin:produced_content_producedcontenttype_change", args=[produced.pk])
+        return format_html('Produced Content: <a href="{}">{}</a>', url, produced.key)
+
     def get_readonly_fields(self, request, obj=None):
-        fields = ["created_at", "updated_at"]
+        fields = ["created_at", "updated_at", "managed_by"]
         if obj is not None and obj.items.exists():
             fields.append("code")
         return fields
 
+    def get_fields(self, request, obj=None):
+        fields = list(super().get_fields(request, obj))
+        if managing_produced_type(obj) is not None and "managed_by" in fields:
+            fields.remove("managed_by")
+            fields.insert(0, "managed_by")
+        return fields
+
+    def has_change_permission(self, request, obj=None):
+        if managing_produced_type(obj) is not None:
+            return False               # managed by Produced Content: view only, never independently edited
+        return super().has_change_permission(request, obj)
+
     def has_delete_permission(self, request, obj=None):
+        if managing_produced_type(obj) is not None:
+            return False
         return obj is None or not obj.items.exists()
 
 

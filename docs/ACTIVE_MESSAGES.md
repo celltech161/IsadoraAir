@@ -35,7 +35,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D2B** (this) | publish the READY aggregate as an ordinary UrgentPA Track; the existing `insert_urgent` splice for that exact Track; deck-open authority; the deck's own evidence → STARTED/COMPLETED/INTERRUPTED | only through the existing A/B decks, and **only with the native-airing gate open** (closed in production until Phase G) |
 | **D3A** | native produced-content authority: `ProducedContentType` (regular / public address / urgent / test) and producer assignments; active messages keyed by the exact content type; producer self-publish and recall | **no** — authority and configuration only |
 | **D3B** | the producer workspace: "My Messages" (`/iportal/messages/`) and the shared iPortal recorder on one exact message (adapter `active-message`); Save audio ≠ Publish; producer recall/discard | **no** — gate still closed |
-| D3C+ | regular processing (D3C), operator board, Replay Now UI, monitoring | gate still closed |
+| D3C | regular produced content through a managed Phase-C spoken backend, TEST / NO AIR, "My Content" (docs/PRODUCED_CONTENT.md) -- no active-message change | gate still closed |
+| D3D+ | operator board, Replay Now UI, monitoring | gate still closed |
 
 ## Authority
 
@@ -148,14 +149,16 @@ Legacy OGRemote has station-defined producer content types, many per user
   `description`, `enabled`, `sort_order`, and one **delivery mode**:
   * `regular` — ordinary library content: `target_category` (PROTECT),
     `output_mode` (`single` / `accumulating`), an optional LOGICAL
-    `recipe_key` and `artist_tag`. Configuration only (processing is D3C);
-    never an active message.
+    `recipe_key` and `artist_tag`. Processed and delivered (D3C) by the
+    Phase-C spoken pipeline through an explicit managed backend
+    (docs/PRODUCED_CONTENT.md); never an active message.
   * `public_address` / `urgent` — an active message: `producer_self_publish`
     (default yes), `recallable` (default yes), optional
     `replay_interval_seconds` override (60..86400; NULL = the policy default,
     frozen onto the message at activation).
   * `test` — explicitly non-airing: none of the delivery settings, and never
-    an active message.
+    an active message (D3C: a producer's saved TEST / NO AIR take is
+    temporary ProductionMedia only).
 
   No field is executable (no paths, scripts, dotted imports or commands; the
   recipe key's shape forbids dots, slashes and spaces). Incompatible field

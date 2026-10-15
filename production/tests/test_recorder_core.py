@@ -453,6 +453,25 @@ class SubjectAuthorizationTests(IsolatedMediaRootMixin, TestCase):
                                                                      "revision": "absent"}).status_code, 404)
         self.assertEqual(self.client.get(f"/api/guarded/media/{media_id}/?slot=a").status_code, 200)
 
+    def test_every_subject_is_resolved_for_the_authenticated_user(self):
+        """2.22D3C: ``resolve_for(user, params)`` -- for a per-user subject the
+        identity comes from the session, never from the browser -- is the
+        recorder's one resolution path, including the post-commit context."""
+        seen, original = [], GuardedScratchAdapter.resolve_for
+
+        def spy(adapter, user, params):
+            seen.append(user.pk)
+            return original(adapter, user, params)
+
+        with mock.patch.object(GuardedScratchAdapter, "resolve_for", spy):
+            self.assertEqual(self.client.get("/api/guarded/context/?slot=a").status_code, 200)
+            media_id = self.take("a").json()["media"]["media_id"]
+            response = self.post_json("/api/guarded/commit/", {"subject": {"slot": "a"}, "media_id": media_id,
+                                                               "revision": "absent"})
+            self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(seen, [self.user.pk] * 4)            # context, take, commit, post-commit context
+        self.assertEqual(ScratchPadAdapter().resolve_for(self.user, {"slot": "a"}), "a")   # default: resolve()
+
     def test_the_default_hook_keeps_existing_consumers_unchanged(self):
         plain = ScratchPadAdapter()
         self.assertTrue(plain.authorize_subject(self.user, "anything", "save"))

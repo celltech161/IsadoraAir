@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}My Content — iPortal — IsadoraAir{% endblock %}
+{% block extra_css %}
+<style>
+  .pc-wrap { max-width: 1000px; margin: 0 auto; }
+  .pc-muted { color: var(--text-muted); font-size: 0.85rem; }
+  .pc-banner { padding: 0.6rem 0.8rem; border-radius: 6px; margin: 0.5rem 0; border: 1px solid var(--border, #333); }
+  .pc-banner.warn { border-color: #b45309; background: rgba(180, 83, 9, 0.12); }
+  .pc-banner.ok { border-color: #15803d; background: rgba(21, 128, 61, 0.12); }
+  .pc-banner.error { border-color: #b91c1c; background: rgba(185, 28, 28, 0.12); }
+  .pc-type { margin: 1rem 0; padding: 0.75rem 0.9rem; border: 1px solid var(--border, #333); border-radius: 8px; }
+  .pc-type h2 { font-size: 1rem; margin: 0 0 0.25rem; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .pc-badge { font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; border: 1px solid var(--border, #444); }
+  .pc-badge.test { border-color: #b45309; color: #fcd34d; }
+  .pc-badge.current { border-color: #15803d; color: #86efac; }
+  .pc-badge.bad { border-color: #b91c1c; color: #fca5a5; }
+  .pc-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.35rem 0; }
+  .pc-row form { display: inline; margin: 0; }
+  .pc-item { padding: 0.4rem 0.5rem; border-left: 3px solid var(--border, #444); margin: 0.4rem 0; }
+  .pc-item.current { border-left-color: #15803d; }
+  .pc-btn { font: inherit; font-size: 0.85rem; padding: 0.25rem 0.6rem; border-radius: 5px; cursor: pointer;
+            border: 1px solid var(--border, #444); background: transparent; color: inherit; text-decoration: none; }
+  .pc-btn.primary { border-color: var(--accent, #2563eb); color: var(--accent, #60a5fa); }
+  .pc-btn.danger { border-color: #b91c1c; color: #fca5a5; }
+  .pc-facts { font-size: 0.8rem; color: var(--text-muted); }
+</style>
+{% endblock %}
+{% block content %}
+<div class="pc-wrap" id="producedContentWorkspace">
+  <div class="pc-row" style="justify-content: space-between;">
+    <h1 style="font-size:1.3rem; margin:0;">My Content</h1>
+    <a href="/iportal/" class="pc-muted">&larr; iPortal</a>
+  </div>
+  <p class="pc-muted">
+    Your produced segments. Record or import audio for a submission, then <strong>submit</strong> it: the station
+    processes it automatically and delivers it into its library category for ordinary scheduling. Nothing is
+    submitted until you submit.
+  </p>
+  {% for item in messages %}
+  <div class="pc-banner {% if item.tags == 'error' %}error{% elif item.tags == 'success' %}ok{% else %}warn{% endif %}">{{ item }}</div>
+  {% endfor %}
+
+  {% for row in regular_rows %}
+  <section class="pc-type" data-content-type="{{ row.type.key }}" data-mode="regular">
+    <h2>
+      {{ row.type.name }}
+      <span class="pc-badge">{% if row.single %}Single{% else %}Accumulating{% endif %}</span>
+      <span class="pc-muted">{{ row.type.key }}</span>
+      {% if row.problem %}<span class="pc-badge bad" data-health="bad">not available</span>{% endif %}
+    </h2>
+    <div class="pc-facts">
+      Library category: {{ row.type.target_category.name }} ({{ row.type.target_category.code }}) ·
+      recipe: {{ row.type.recipe_key|default:"none" }} ·
+      {% if row.single %}a new delivery replaces the current edition{% else %}each delivery adds an item{% endif %}
+      {% if control %} · <em>control: you may produce every enabled type</em>{% endif %}
+    </div>
+    {% if row.problem %}
+    <div class="pc-banner warn" data-health-text>{{ row.type.name }} cannot be produced right now: {{ row.problem }}. Ask the station to fix its configuration.</div>
+    {% endif %}
+
+    {% if row.single %}
+    <div class="pc-item{% if row.current %} current{% endif %}" data-current-edition>
+      {% if row.current %}
+      <span class="pc-badge current">CURRENT EDITION</span>
+      {% if row.current_is_mine %}<strong>{{ row.current.title|default:"untitled" }}</strong> — yours,{% else %}another producer's edition,{% endif %}
+      delivered {{ row.current.delivered_at|date:"Y-m-d H:i" }}
+      {% else %}
+      <span class="pc-muted">No current edition is delivered for this type.</span>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% for entry in row.items %}
+    <div class="pc-item{% if entry.is_current %} current{% endif %}" data-item="{{ entry.item.pk }}" data-state="{{ entry.item.state }}">
+      <span class="pc-badge{% if entry.is_current %} current{% endif %}">{{ entry.item.get_state_display|upper }}{% if entry.is_current %} · CURRENT{% endif %}</span>
+      <strong>{{ entry.item.title|default:"untitled" }}</strong>
+      <span class="pc-muted">started {{ entry.item.created_at|date:"Y-m-d H:i" }}{% if entry.item.delivered_at %} · delivered {{ entry.item.delivered_at|date:"Y-m-d H:i" }}{% endif %}{% if entry.item.failure_code %} · problem: {{ entry.item.failure_code }}{% endif %}</span>
+      <div class="pc-row">
+        {% if entry.can_continue %}
+        <a class="pc-btn primary" href="{{ entry.recorder_url }}">Continue</a>
+        {% else %}
+        <a class="pc-btn" href="{{ entry.recorder_url }}">Open</a>
+        {% endif %}
+        {% if entry.can_withdraw %}
+        <a class="pc-btn danger" href="{% url 'produced_content:withdraw' entry.item.pk %}">{{ entry.withdraw_verb }}…</a>
+        {% endif %}
+      </div>
+    </div>
+    {% empty %}
+    <div class="pc-muted">You have no submissions of this type yet.</div>
+    {% endfor %}
+
+    {% if row.can_start %}
+    <form method="post" action="{% url 'produced_content:start' %}" class="pc-row">{% csrf_token %}
+      <input type="hidden" name="content_type" value="{{ row.type.key }}">
+      <input type="text" name="title" maxlength="200" placeholder="Title (optional; default: the submission date)" style="flex:1; min-width:12rem;">
+      <button type="submit" class="pc-btn primary">New submission</button>
+    </form>
+    {% endif %}
+  </section>
+  {% endfor %}
+
+  {% for row in test_rows %}
+  <section class="pc-type" data-content-type="{{ row.type.key }}" data-mode="test">
+    <h2>
+      {{ row.type.name }}
+      <span class="pc-badge test">TEST / NO AIR</span>
+      <span class="pc-muted">{{ row.type.key }}</span>
+    </h2>
+    <div class="pc-facts">{{ nothing_airs }} A saved test take is kept {{ retention_days }} days after your most recent save.</div>
+    <div class="pc-row">
+      {% if row.take %}
+      <span class="pc-muted" data-test-take>Saved test take{% if row.take.media.decoded_duration_seconds %} ({{ row.take.media.decoded_duration_seconds|floatformat:1 }} s){% endif %} · saved {{ row.take.updated_at|date:"Y-m-d H:i" }} · kept until {{ row.take.expires_at|date:"Y-m-d H:i" }}</span>
+      {% else %}
+      <span class="pc-muted">No saved test take.</span>
+      {% endif %}
+      <a class="pc-btn primary" href="{{ row.recorder_url }}">Open test workspace</a>
+    </div>
+  </section>
+  {% endfor %}
+
+  {% if not regular_rows and not test_rows %}
+  <p>No regular or test content types are assigned to your account.</p>
+  {% endif %}
+
+  {% if others %}
+  <section class="pc-type" id="pcOtherItems">
+    <h2>Your other items</h2>
+    <div class="pc-facts">Items of content types no longer offered to you. You can still withdraw them.</div>
+    {% for entry in others %}
+    <div class="pc-item" data-item="{{ entry.item.pk }}" data-state="{{ entry.item.state }}">
+      <span class="pc-badge">{{ entry.item.get_state_display|upper }}</span>
+      <strong>{{ entry.item.title|default:"untitled" }}</strong>
+      <span class="pc-muted">{{ entry.type_name }}</span>
+      <div class="pc-row">
+        <a class="pc-btn" href="{{ entry.recorder_url }}">Open</a>
+        {% if entry.can_withdraw %}
+        <a class="pc-btn danger" href="{% url 'produced_content:withdraw' entry.item.pk %}">{{ entry.withdraw_verb }}…</a>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+</div>
+{% endblock %}
