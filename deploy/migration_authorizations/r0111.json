@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "release_id": "r0111",
+  "target_commit": "96e3f2ce966915ac0a12ba41880a2f4988fa08da",
+  "manifest_sha256": "8ae14cd59054502ed485ac7a2c84e6964d649737d76593704d315bfae64bdd49",
+  "authorized_manual_operations": [
+    {
+      "ref": "library.0090_seed_iportal_nav_item",
+      "migration_file_sha256": "6e726dd89f62181e645397fb0d6e80b74e7ab6861d3d81a06dea26e63c253eeb",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    }
+  ]
+}
