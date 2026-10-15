@@ -51,6 +51,17 @@ def _git(*args) -> str:
                           text=True).stdout.strip()
 
 
+def _release_commit() -> str:
+    """r0110's immutable introducing commit: the unique addition of its
+    manifest. Historical assertions are bounded by it, never by HEAD, so later
+    releases cannot break them."""
+    commits = _git("log", "--full-history", "--no-renames", "--diff-filter=A", "--format=%H", "HEAD", "--",
+                   "deploy/releases/r0110.json").split()
+    if len(commits) != 1:
+        raise AssertionError(f"r0110.json must have exactly one introducing commit, found {commits!r}")
+    return commits[0]
+
+
 def _migration_path(ref: str) -> str:
     app, name = ref.split(".", 1)
     return f"{app}/migrations/{name}.py"
@@ -81,8 +92,9 @@ class R0110ManifestTests(SimpleTestCase):
         self.assertNotIn("migration_authorization", self.data)
         self.assertEqual(self.raw, (json.dumps(self.data, indent=2) + "\n").encode())
 
-    def test_the_six_migrations_are_exactly_those_introduced_since_r0109(self):
-        added = _git("diff", "--name-only", "--diff-filter=A", R0109, "HEAD", "--", "*/migrations/0*.py").split()
+    def test_the_six_migrations_are_exactly_those_introduced_by_r0110(self):
+        added = _git("diff", "--name-only", "--diff-filter=A", R0109, _release_commit(), "--",
+                     "*/migrations/0*.py").split()
         self.assertEqual(sorted(added), sorted(_migration_path(ref) for ref in PHASE_D_PLAN))
 
     def test_the_classifier_finds_exactly_the_five_manual_operations(self):
@@ -95,7 +107,7 @@ class R0110ManifestTests(SimpleTestCase):
         self.assertEqual(plan[3]["operations"][0]["classification"], "additive")
 
     def test_no_protected_runtime_unit_static_or_package_surface_changed_beyond_the_declared(self):
-        changed = set(_git("diff", "--name-only", R0109, "HEAD").split())
+        changed = set(_git("diff", "--name-only", R0109, _release_commit()).split())
         for forbidden in ("deploy/updater_runtime/", "deploy/updater_attestations/", "requirements.txt",
                           "deploy/isadoraair.nginx", "ogremote/"):
             self.assertFalse([path for path in changed if path.startswith(forbidden)], forbidden)
@@ -114,19 +126,14 @@ class R0110ManifestTests(SimpleTestCase):
 class R0110CompanionTests(SimpleTestCase):
     """The companion is introduced AFTER the release commit (its own
     metadata-only commit), so before that commit exists this only proves
-    nothing stray is there."""
-
-    def release_commit(self) -> str:
-        commits = _git("log", "--full-history", "--no-renames", "--diff-filter=A", "--format=%H", "HEAD", "--",
-                       "deploy/releases/r0110.json").split()
-        self.assertEqual(len(commits), 1)
-        return commits[0]
+    nothing stray is there. Its provenance (never modified, deleted or
+    re-added) is validated against the current trusted tip, HEAD, by design."""
 
     def test_the_companion_authorizes_exactly_the_classifiers_manual_operations(self):
         if not COMPANION.exists():
             self.assertFalse(list(COMPANION.parent.glob("*")) if COMPANION.parent.exists() else [])
             self.skipTest("the r0110 companion is introduced after the release commit")
-        release = self.release_commit()
+        release = _release_commit()
         record = migration_authorization.parse_companion(COMPANION.read_bytes())
         self.assertEqual((record["release_id"], record["target_commit"]), ("r0110", release))
         manifest_at_release = subprocess.run(
