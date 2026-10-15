@@ -10,8 +10,10 @@ Each type has exactly one DELIVERY MODE:
 
 * ``regular`` -- ordinary library content: a target library Category, an
   output mode (``single`` replaces, ``accumulating`` adds) and a LOGICAL
-  recipe key. Configuration only: processing is Phase D3C. Never an active
-  message.
+  recipe key. Processed and delivered (D3C) by the Phase-C ``spoken`` domain
+  through an EXPLICIT, managed backing ``spoken.SpokenContentType``
+  (``spoken_content_type``; produced_content.backend keeps it synchronized --
+  this type is the configuration authority). Never an active message.
 * ``public_address`` / ``urgent`` -- an active message (active_messages):
   ``recallable`` (may the producer withdraw their own ACTIVE message?),
   ``producer_self_publish`` (may an assigned producer activate their own
@@ -19,7 +21,9 @@ Each type has exactly one DELIVERY MODE:
   new type -- and an optional replay interval override (NULL: the
   ActiveBroadcastPolicy default). (The two compatibility types the D3A
   migration creates set both to no explicitly, preserving D1 authority.)
-* ``test`` -- explicitly non-airing (no delivery of any kind).
+* ``test`` -- explicitly non-airing (no delivery of any kind): a producer's
+  current saved take is a ``ProducedContentTestTake`` (validated, temporary
+  ProductionMedia only) -- never spoken, never library, never air.
 
 An assignment is SCOPE, not a role: the broad capability still comes from
 ``authz`` (e.g. ``active_message.produce``); the assignment narrows it to
@@ -30,7 +34,8 @@ Incompatible field combinations are refused by ``clean()`` (forms, admin)
 and by database CHECK constraints. ``key`` is the durable identity (history
 and execution snapshots record it) and never changes; neither does the
 delivery mode of a type that active messages already reference (their
-frozen ``kind`` was derived from it).
+frozen ``kind`` was derived from it), that has a spoken backend, or that has
+saved test takes.
 """
 from __future__ import annotations
 
@@ -40,10 +45,14 @@ from django.core.validators import MaxValueValidator, MinValueValidator, RegexVa
 from django.db import models
 from django.db.models import Q
 
+from production.models import ProductionMedia
+
 KEY_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
 # A logical recipe identifier only (D3C maps it to a local, built-in recipe):
 # no dots (no dotted imports), no slashes (no paths), no spaces (no commands).
-RECIPE_KEY_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+# It may start with a digit: the accepted Phase-C recipe ``3min_ctr`` does
+# (D3A's first pattern refused it; produced_content.0003 corrects that).
+RECIPE_KEY_PATTERN = r"^[a-z0-9][a-z0-9_]{0,63}$"
 REPLAY_INTERVAL_MIN_SECONDS = 60          # the active-message bounds (active_messages.models)
 REPLAY_INTERVAL_MAX_SECONDS = 86400
 
@@ -96,6 +105,12 @@ class ProducedContentType(models.Model):
         max_length=64, blank=True, validators=[RegexValidator(RECIPE_KEY_PATTERN)],
         help_text="Regular only, optional: a logical local recipe identifier (not a path, script or import).")
     artist_tag = models.CharField(max_length=200, blank=True, help_text="Regular only, optional.")
+    # The explicit identity of the Phase-C execution backend (D3C). Written
+    # only by produced_content.backend; never inferred from key/code names.
+    spoken_content_type = models.OneToOneField(
+        "spoken.SpokenContentType", null=True, blank=True, editable=False, on_delete=models.PROTECT,
+        related_name="produced_content_type",
+        help_text="Regular only: the managed spoken content type that processes and delivers this type.")
 
     # -- public address / urgent -----------------------------------------------------------------
     recallable = models.BooleanField(
@@ -167,11 +182,23 @@ class ProducedContentType(models.Model):
     def _stored(self):
         if self.pk is None:
             return None
-        return type(self).objects.filter(pk=self.pk).values("key", "delivery_mode").first()
+        return type(self).objects.filter(pk=self.pk).values("key", "delivery_mode", "spoken_content_type_id").first()
 
     def _referenced_by_messages(self) -> bool:
         related = getattr(self, "active_broadcast_messages", None)
         return related is not None and self.pk is not None and related.exists()
+
+    def _mode_frozen_reason(self) -> str:
+        """Why this type's delivery mode can no longer change ("" if it can)."""
+        if self._referenced_by_messages():
+            return ("Active messages of this type exist; their kind was derived from this delivery mode, so it "
+                    "can no longer change.")
+        stored = self._stored()
+        if stored is not None and stored["spoken_content_type_id"] is not None:
+            return "This type has a spoken processing backend (it has produced content), so its mode is fixed."
+        if self.pk is not None and ProducedContentTestTake.objects.filter(content_type_id=self.pk).exists():
+            return "Producers have saved test takes of this type, so its mode is fixed."
+        return ""
 
     def _identity_errors(self) -> dict:
         stored = self._stored()
@@ -179,9 +206,14 @@ class ProducedContentType(models.Model):
         if stored is not None:
             if stored["key"] != self.key:
                 errors["key"] = "The key is a durable identifier and never changes."
-            if stored["delivery_mode"] != self.delivery_mode and self._referenced_by_messages():
-                errors["delivery_mode"] = ("Active messages of this type exist; their kind was derived from "
-                                           "this delivery mode, so it can no longer change.")
+            if stored["delivery_mode"] != self.delivery_mode:
+                reason = self._mode_frozen_reason()
+                if reason:
+                    errors["delivery_mode"] = reason
+            if stored["spoken_content_type_id"] is not None and self.delivery_mode != DeliveryMode.REGULAR:
+                errors.setdefault("delivery_mode", "Only a regular type has a spoken processing backend.")
+        elif self.spoken_content_type_id is not None:
+            errors["spoken_content_type"] = "The spoken backend is linked only by produced_content.backend."
         return errors
 
     def clean(self):
@@ -218,6 +250,12 @@ class ProducedContentType(models.Model):
         errors = self._identity_errors()
         if errors:
             raise ValidationError(errors)
+        if not self._state.adding and kwargs.get("update_fields") is None:
+            # The backend link is written ONLY by produced_content.backend
+            # (under this row's lock); an ordinary save -- an admin form loaded
+            # before a producer's first submission -- never overwrites it.
+            kwargs["update_fields"] = [field.name for field in self._meta.concrete_fields
+                                       if not field.primary_key and field.name != "spoken_content_type"]
         super().save(*args, **kwargs)
 
 
@@ -238,3 +276,40 @@ class ProducedContentTypeAssignment(models.Model):
 
     def __str__(self):
         return f"{self.user} → {self.content_type.key}"
+
+
+TEST_TAKE_RETENTION_DAYS = 7
+
+
+class ProducedContentTestTake(models.Model):
+    """A producer's CURRENT saved take of one exact TEST / NO-AIR type:
+
+        (user, test type) -> one validated ProductionMedia
+
+    Temporary media state, never broadcast history: no spoken item, no
+    rendition, no library Track, no log, no active message, no engine command
+    -- nothing that could air. Written only by produced_content.no_air
+    (binding under ``lock_for_binding``; an optimistic ``revision``; expiry
+    ``TEST_TAKE_RETENTION_DAYS`` after the most recent save, then the binding is
+    removed and the media goes to ordinary safe production retention)."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+                             related_name="produced_content_test_takes")
+    content_type = models.ForeignKey(ProducedContentType, on_delete=models.PROTECT, related_name="test_takes")
+    media = models.ForeignKey(ProductionMedia, on_delete=models.PROTECT, related_name="produced_content_test_takes")
+    revision = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["content_type__sort_order", "content_type__name", "user_id"]
+        verbose_name = "produced content test take"
+        constraints = [
+            models.UniqueConstraint(fields=["user", "content_type"], name="produced_test_take_one_per_user_type"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="produced_test_take_revision_positive"),
+        ]
+        indexes = [models.Index(fields=["expires_at"], name="produced_test_take_expiry")]
+
+    def __str__(self):
+        return f"test take of {self.content_type_id} by {self.user_id} (r{self.revision})"

@@ -30,6 +30,10 @@ IDENTITY = REPO / "active_messages" / "migrations" / "0004_message_content_type_
 PRODUCED = REPO / "produced_content" / "migrations" / "0001_initial.py"
 REFS = ["active_messages.0001_initial", "active_messages.0002_playout_correlation"]
 D3A_REFS = ["active_messages.0003_message_content_type", "active_messages.0004_message_content_type_identity"]
+D3C_REFS = ["produced_content.0002_d3c_spoken_backend_and_test_take", "produced_content.0003_recipe_key_leading_digit"]
+D3C_MANUAL = [("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
+              ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
+              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")]
 PRODUCED_REF = "produced_content.0001_initial"
 SEED_REF = "authz.0008_active_message_capabilities"
 D3A_MANUAL = [("active_messages.0003_message_content_type", "RunPython"),
@@ -149,12 +153,13 @@ class LivePlanClassificationTests(TransactionTestCase):
         call_command("migrate", "authz", "0007", verbosity=0)
         try:
             payload = probe.build_probe_payload()
+            # 2.22D3C: produced_content's later migrations (its own classifier test).
             self.assertEqual(sorted(item["ref"] for item in payload["plan"]),
-                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF]))
+                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF] + D3C_REFS))
             self.assertEqual(payload["conflicts"], {})
             manual = probe.extract_manual_operations(payload["plan"])
             self.assertEqual(sorted((entry["ref"], entry["operation"]) for entry in manual),
-                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL))
+                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL + D3C_MANUAL))
         finally:
             call_command("migrate", verbosity=0)
         self.assertEqual(Capability.objects.filter(slug__startswith="active_message.").count(), 2)

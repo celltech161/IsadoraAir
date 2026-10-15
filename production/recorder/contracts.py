@@ -6,8 +6,9 @@ about VoiceTracks, logs, news or messages. A consuming domain plugs in through
 an explicit ``RecordingAdapter`` registered under a fixed key (see registry):
 
 * the domain resolves a *subject* from a few validated request parameters
-  (e.g. ``track`` + ``position``) -- never a model name, a Python path or a
-  generic foreign key;
+  (e.g. ``track`` + ``position``) and, where the subject is per user, the
+  authenticated user (``resolve_for``) -- never a model name, a Python path
+  or a generic foreign key;
 * the domain supplies a ``RecordingContext`` -- an in-memory description the
   recorder renders, never persisted: there is no generic "recording job";
 * the domain authorizes every operation server-side -- broadly
@@ -147,6 +148,13 @@ class RecordingAdapter:
         """Resolve the subject from request parameters (a QueryDict or dict).
         Raise SubjectNotFound / RecorderError; never trust anything else."""
         raise NotImplementedError
+
+    def resolve_for(self, user, params) -> object:
+        """The subject for this AUTHENTICATED user -- for a domain whose subject
+        is per user (e.g. "this user's own binding for one exact type"): the
+        identity always comes from the session, never from the browser. The
+        recorder calls this, never ``resolve`` directly. Default: ``resolve``."""
+        return self.resolve(params)
 
     def subject_params(self, subject) -> dict:
         raise NotImplementedError

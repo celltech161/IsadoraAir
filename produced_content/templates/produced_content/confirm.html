@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ verb }} item — iPortal — IsadoraAir{% endblock %}
+{% block content %}
+<div style="max-width: 640px; margin: 0 auto;">
+  <h1 style="font-size:1.2rem;">{{ verb }} this item?</h1>
+  <table style="font-size:0.9rem; margin: 0.5rem 0 1rem;">
+    <tr><th style="text-align:left; padding-right:1rem;">Content type</th><td>{{ produced.name }} ({{ produced.key }})</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">Title</th><td>{{ item.title|default:"untitled" }}</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">State</th><td>{{ item.get_state_display }}</td></tr>
+  </table>
+  <p style="color:var(--text-muted);">
+    {% if item.state == "draft" %}The draft is closed; nothing was submitted.
+    {% elif item.state == "delivered" %}It is removed from the library and will not air again. No earlier edition comes back.
+    {% elif item.state == "superseded" %}It was already replaced; recalling it changes nothing that airs.
+    {% else %}It will not be processed or delivered.{% endif %}
+    Its history is kept.
+  </p>
+  <form method="post" action="{% url 'produced_content:withdraw' item.pk %}">
+    {% csrf_token %}
+    <input type="hidden" name="expected_state" value="{{ item.state }}">
+    <button type="submit" style="font:inherit; padding:0.3rem 0.8rem; border-radius:5px; border:1px solid #b91c1c; background:transparent; color:#fca5a5; cursor:pointer;">{{ verb }} “{{ item.title|default:"untitled" }}”</button>
+    <a href="{% url 'produced_content:my-content' %}" style="margin-left:1rem;">Cancel</a>
+  </form>
+</div>
+{% endblock %}

@@ -9,7 +9,7 @@ without giving either a shared workflow.
 | Shared (production app) | Not shared (each domain owns it) |
 | --- | --- |
 | `ProductionMedia`: immutable, validated bytes | evergreen VoiceTrack identity and lifecycle |
-| the recorder/editor and its upload/import intake | (later) occurrence VoiceTrack; produced content -- station content types and producer assignments are `produced_content` (D3A); active messages (docs/ACTIVE_MESSAGES.md) |
+| the recorder/editor and its upload/import intake | (later) occurrence VoiceTrack; produced content -- station content types and producer assignments are `produced_content` (D3A), regular and TEST / NO AIR production (D3C, docs/PRODUCED_CONTENT.md); active messages (docs/ACTIVE_MESSAGES.md) |
 | validation, now OS-confined | what "save" / "remove" mean for the domain |
 | preview / range / export via the safe open | authorization rules for the domain |
 | derivation provenance, retention foundation | |
@@ -27,6 +27,9 @@ model, an import path, a storage key or a filesystem path.
 The adapter supplies:
 
 * `resolve(params)` → the *subject* (for VoiceTrack: `(Track, position)`);
+  the core calls `resolve_for(user, params)` (2.22D3C; default: `resolve`),
+  which a domain whose subject is per user overrides -- the identity then
+  comes from the authenticated session, never from the browser;
 * `context(request, subject)` → a `RecordingContext` rendered by the page and
   **never persisted**: title, purpose, allowed operations, max duration and
   bytes, an opaque optimistic `revision`, the current on-air audio (if any),
@@ -58,10 +61,13 @@ The recorder core imports nothing from any consumer (enforced by
 `production/tests/test_recorder_core.py`, which runs the whole core through a
 scratch non-VoiceTrack adapter).
 
-Consumers: evergreen VoiceTrack (`evergreen-voicetrack`, below) and, since
+Consumers: evergreen VoiceTrack (`evergreen-voicetrack`, below); since
 2.22D3B, urgent/public-address messages (`active-message`: the subject is one
 exact message UUID; saving binds audio to a draft and never publishes it —
-docs/ACTIVE_MESSAGES.md, "Producer workspace").
+docs/ACTIVE_MESSAGES.md, "Producer workspace"); and since 2.22D3C, produced
+content (`produced-content`: one exact regular SpokenItem, whose save is the
+explicit "Submit for processing", or the signed-in user's own TEST / NO AIR
+take of one exact test type — docs/PRODUCED_CONTENT.md).
 
 ## The browser workstation
 

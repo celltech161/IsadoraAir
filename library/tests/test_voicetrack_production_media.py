@@ -642,10 +642,16 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # 2.22D2B: and active_messages.0002, which depends on library.0089.
             # 2.22D3A: and produced_content.0001 (on library.0089) with active_messages.0003/0004,
             # whose backfill/identity operations are D3A's own manual ones -- nothing of library's.
+            # r0111: and library.0090 (the iPortal nav seed, its own manual RunPython).
+            # 2.22D3C: and produced_content.0002/0003 (on spoken.0001); 0003's recipe-key
+            # pattern correction is D3C's own manual operations.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
-                              "active_messages.0004_message_content_type_identity", "spoken.0001_initial"])
+                              "active_messages.0004_message_content_type_identity",
+                              "library.0090_seed_iportal_nav_item", "spoken.0001_initial",
+                              "produced_content.0002_d3c_spoken_backend_and_test_take",
+                              "produced_content.0003_recipe_key_leading_digit"])
             item = payload["plan"][0]
             self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
                              [("AddField", "additive")])
@@ -654,7 +660,11 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                              [("active_messages.0003_message_content_type", "RunPython"),
                               ("active_messages.0004_message_content_type_identity", "AlterField"),
                               ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
-                              ("active_messages.0004_message_content_type_identity", "AddConstraint")])
+                              ("active_messages.0004_message_content_type_identity", "AddConstraint"),
+                              ("library.0090_seed_iportal_nav_item", "RunPython"),
+                              ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
+                              ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
+                              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")])
             self.assertEqual((payload["conflicts"], payload["replacements"]), ({}, []))
             self.assertIn("production.0001_initial", item["dependencies"])
         finally:
