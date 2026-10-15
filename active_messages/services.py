@@ -28,6 +28,20 @@ Rules the code below keeps:
 * An execution's composition is frozen at creation. Clear and expiry act on
   FUTURE airings; nothing here stops audio that is already on air.
 * Every state change appends its event in the same transaction.
+* A message's producer slot is its exact produced-content type (D3A). Who
+  may do what (server side, ``produced_content`` scope + ``authz``
+  capabilities):
+
+  - prepare / bind / set a draft's expiry: CONTROL on any ENABLED urgent or
+    public-address type; otherwise PRODUCE + an assignment to that exact
+    enabled type (and, after preparing, only one's own draft);
+  - activate: CONTROL; or the message's own producer with PRODUCE, assigned
+    to the exact enabled type, when the type allows producer self-publish;
+  - clear an ACTIVE message: CONTROL; or its own producer (PRODUCE) when the
+    type is recallable -- no assignment or self-publish needed to withdraw;
+  - Replay Now, stinger, limits, the gate: CONTROL only.
+
+  A disabled type refuses new production and activation for everyone.
 
 D1 contains no renderer and no engine path: executions are created
 PENDING_RENDER and stay there until D2A binds their aggregate. The functions
@@ -46,6 +60,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from authz.evaluator import authorize
+from produced_content import authority as content_authority
+from produced_content.models import ACTIVE_MESSAGE_MODES, ProducedContentType
 from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
 from production.services import reference_audio, retention
@@ -127,6 +143,14 @@ class EvidenceRefused(ActiveMessageError):
 
 class NativeAiringUnavailable(ActiveMessageError):
     code = "native_airing_unavailable"
+
+
+class ContentTypeRefused(InvalidRequest):
+    """The exact produced-content type cannot be used here: unknown, disabled,
+    not an urgent/public-address type (regular and test never enter this
+    domain), or its delivery mode no longer matches the message's frozen kind."""
+
+    code = "content_type_refused"
 
 
 # -- small helpers -------------------------------------------------------------------------
@@ -233,9 +257,11 @@ def _open_execution():
             .filter(state__in=UNFINISHED_EXECUTION_STATES).first())
 
 
-def _current_active_id(producer_key, kind, *, exclude):
-    """The producer's ACTIVE message of this kind (the one an activation supersedes)."""
-    return (ActiveBroadcastMessage.objects.filter(state=M.ACTIVE, producer_key=producer_key, kind=kind)
+def _current_active_id(producer_key, content_type_id, *, exclude):
+    """The producer's ACTIVE message of this exact content type (the one an
+    activation supersedes) -- never another type, even of the same kind."""
+    return (ActiveBroadcastMessage.objects.filter(state=M.ACTIVE, producer_key=producer_key,
+                                                  content_type_id=content_type_id)
             .exclude(pk=exclude).values_list("id", flat=True).first())
 
 
@@ -245,7 +271,8 @@ def _prior_request(token):
 
 
 def _active_messages():
-    return list(ActiveBroadcastMessage.objects.select_related("message_media").filter(state=M.ACTIVE))
+    return list(ActiveBroadcastMessage.objects.select_related("message_media", "content_type")
+                .filter(state=M.ACTIVE))
 
 
 # -- generation and staleness ----------------------------------------------------------------
@@ -302,6 +329,51 @@ def _expire_locked(policy, now, *, actor_kind):
     return policy, expired
 
 
+# -- produced-content type scope (D3A) -------------------------------------------------------------
+
+def _producer_key(actor) -> str:
+    return f"user:{actor.pk}"
+
+
+def _is_producer(row, actor) -> bool:
+    return actor is not None and getattr(actor, "pk", None) is not None and row.producer_key == _producer_key(actor)
+
+
+def _content_type(value) -> ProducedContentType:
+    """The exact type (re-read), refusing anything that is not an enabled
+    urgent/public-address type."""
+    try:
+        content_type = content_authority.resolve(value)
+    except content_authority.UnknownContentType:
+        raise ContentTypeRefused("no such produced content type", code="unknown_content_type") from None
+    if content_type.delivery_mode not in ACTIVE_MESSAGE_MODES:
+        raise ContentTypeRefused(
+            f"{content_type.key} is a {content_type.get_delivery_mode_display()} type, not an urgent or "
+            f"public-address type", code="not_an_active_message_type")
+    if not content_type.enabled:
+        raise ContentTypeRefused(f"{content_type.key} is disabled", code="content_type_disabled")
+    return content_type
+
+
+def _message_type(row) -> ProducedContentType:
+    """A message's own type, usable for NEW work: enabled, and still of the
+    delivery mode its frozen kind was derived from."""
+    content_type = _content_type(row.content_type_id)
+    if content_type.delivery_mode != row.kind:
+        raise ContentTypeRefused(f"{content_type.key} is no longer a {row.kind} type",
+                                 code="content_type_mode_changed")
+    return content_type
+
+
+def _require_assignment(actor, content_type) -> None:
+    """CONTROL works across enabled types; everyone else needs PRODUCE (the
+    caller checked it) AND an assignment to this exact type."""
+    if can(actor, CONTROL):
+        return
+    if not content_authority.is_assigned(actor, content_type):
+        raise NotPermitted(f"you are not assigned to {content_type.key}", code="not_assigned")
+
+
 # -- message media -------------------------------------------------------------------------------
 
 def _check_message_media(media, *, actor, control: bool, max_seconds: int) -> Decimal:
@@ -353,12 +425,20 @@ def _alert_ineligible(exc: CompositionIneligible) -> None:
 
 # -- message lifecycle --------------------------------------------------------------------------
 
-def prepare_message(*, actor, kind, title="", expires_at=None, now=None) -> ActiveBroadcastMessage:
-    """A new PREPARED message produced by ``actor`` (needs active_message.produce)."""
-    _require(actor, PRODUCE)
+def prepare_message(*, actor, content_type, title="", expires_at=None, now=None) -> ActiveBroadcastMessage:
+    """A new PREPARED message of the exact produced-content ``content_type``
+    (an instance, primary key or durable key) produced by ``actor``: CONTROL,
+    or PRODUCE plus an assignment to that type. The type must be enabled and
+    urgent or public address; its delivery mode becomes the message's FROZEN
+    ``kind``."""
+    if not can(actor, CONTROL):
+        _require(actor, PRODUCE)
     now = _now(now)
-    if kind not in MessageKind.values:
-        raise InvalidRequest("kind is urgent or public_address", code="invalid_kind")
+    content_type = _content_type(content_type)
+    _require_assignment(actor, content_type)
+    kind = content_type.delivery_mode
+    if kind not in MessageKind.values:                      # ACTIVE_MESSAGE_MODES == MessageKind
+        raise ContentTypeRefused(f"{content_type.key} has no message kind", code="not_an_active_message_type")
     if not isinstance(title, str) or len(title) > TITLE_LIMIT:
         raise InvalidRequest(f"title is text of at most {TITLE_LIMIT} characters")
     expires_at = _aware_future(expires_at, now, "expires_at")
@@ -366,11 +446,11 @@ def prepare_message(*, actor, kind, title="", expires_at=None, now=None) -> Acti
         _store.ensure_policy()
         generation = ActiveBroadcastPolicy.objects.values_list("generation", flat=True).get(pk=POLICY_ID)
         row = _store.insert(
-            ActiveBroadcastMessage, id=uuid.uuid4(), kind=kind, state=M.PREPARED, title=title, producer=actor,
-            producer_key=f"user:{actor.pk}", producer_username=_username(actor), expires_at=expires_at,
-            state_changed_at=now)
+            ActiveBroadcastMessage, id=uuid.uuid4(), kind=kind, content_type=content_type, state=M.PREPARED,
+            title=title, producer=actor, producer_key=_producer_key(actor), producer_username=_username(actor),
+            expires_at=expires_at, state_changed_at=now)
         _event("prepared", message=row, to_state=M.PREPARED, generation=generation, actor_kind=ActorKind.USER,
-               user=actor, detail={"kind": kind, "expires_at": _iso(expires_at)})
+               user=actor, detail={"kind": kind, "content_type": content_type.key, "expires_at": _iso(expires_at)})
     return row
 
 
@@ -393,6 +473,7 @@ def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
         control = can(actor, CONTROL)
         if row.producer_id != actor.pk and not control:
             raise NotPermitted("only the producer binds media to a prepared message")
+        _require_assignment(actor, _message_type(row))
         if row.message_media_id is not None and str(row.message_media_id) == str(media_id):
             return row
         bound = _lock_media(media_id)
@@ -427,6 +508,7 @@ def set_message_expiry(message, expires_at, *, actor, now=None) -> ActiveBroadca
         elif row.state == M.PREPARED:
             if row.producer_id != actor.pk and not can(actor, CONTROL):
                 raise NotPermitted("only the producer changes a prepared message")
+            _require_assignment(actor, _message_type(row))
         else:
             raise InvalidTransition(f"a {row.state} message is final", code="terminal")
         if row.expires_at == expires_at:
@@ -440,27 +522,52 @@ def set_message_expiry(message, expires_at, *, actor, now=None) -> ActiveBroadca
     return row
 
 
+def _require_activation(actor, row, control: bool) -> None:
+    """CONTROL activates any message. Its own producer may, when assigned to
+    the exact type and the type allows producer self-publish (PRODUCE was
+    checked by the caller); otherwise activation waits for CONTROL -- the
+    message simply stays PREPARED (awaiting publication)."""
+    if control:
+        return
+    if not _is_producer(row, actor):
+        raise NotPermitted("only control activates another producer's message", code="not_your_message")
+    content_type = ProducedContentType.objects.filter(pk=row.content_type_id).first()
+    if content_type is None or not content_authority.is_assigned(actor, content_type):
+        raise NotPermitted("you are not assigned to this message's content type", code="not_assigned")
+    if not content_type.producer_self_publish:
+        raise NotPermitted(f"{content_type.key} needs control to activate (no producer self-publish)",
+                           code="self_publish_disabled")
+
+
 def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
-    """PREPARED -> ACTIVE (control). Atomically supersedes the same producer's
-    ACTIVE message of the same kind. The new message is due immediately (it
-    airs at the next safe program boundary once D2 exists). Idempotent: an
-    already-ACTIVE message is returned unchanged."""
-    _require(actor, CONTROL)
+    """PREPARED -> ACTIVE. CONTROL, or the message's own assigned producer when
+    its exact type allows producer self-publish. Atomically supersedes the
+    same producer's ACTIVE message of the same EXACT content type (never
+    another type, even of the same kind). The new message is due
+    immediately. Its replay interval is the type's override, else the policy
+    default. Idempotent: an already-ACTIVE message is returned unchanged."""
+    control = can(actor, CONTROL)
+    if not control:
+        _require(actor, PRODUCE)
     now = _now(now)
     with transaction.atomic():
         policy = _lock_policy()
         target = (ActiveBroadcastMessage.objects.filter(pk=_message_id(message))
-                  .values("producer_key", "kind").first())
+                  .values("producer_key", "content_type_id").first())
         if target is None:
             raise InvalidRequest("no such active message", code="unknown_message")
-        # Under the policy lock the active set cannot change, and producer_key/kind never change.
-        previous_id = _current_active_id(target["producer_key"], target["kind"], exclude=_message_id(message))
+        # Under the policy lock the active set cannot change, and producer_key/content_type never change.
+        previous_id = _current_active_id(target["producer_key"], target["content_type_id"],
+                                         exclude=_message_id(message))
         rows = _lock_messages([_message_id(message)] + ([previous_id] if previous_id else []))
         row = rows[_message_id(message)]
+        _require_activation(actor, row, control)
         if row.state == M.ACTIVE:
             return row
         if row.state != M.PREPARED:
             raise InvalidTransition(f"a {row.state} message cannot be activated", code="terminal")
+        content_type = _message_type(row)
+        interval = content_type.replay_interval_seconds or policy.default_replay_interval_seconds
         if row.message_media_id is None:
             raise InvalidTransition("bind the message's media first", code="media_required")
         if row.expires_at is not None and row.expires_at <= now:
@@ -485,20 +592,37 @@ def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
             ActiveBroadcastMessage, row.pk, match={"state": M.PREPARED, "message_media": media.pk},
             values={"state": M.ACTIVE, "state_changed_at": now, "activation_generation": policy.generation,
                     "activated_by": actor, "activated_by_username": _username(actor), "activated_at": now,
-                    "replay_interval_seconds": policy.default_replay_interval_seconds, "next_due_at": now})
+                    "replay_interval_seconds": interval, "next_due_at": now})
         _event("activated", message=row, from_state=M.PREPARED, to_state=M.ACTIVE, generation=policy.generation,
                actor_kind=ActorKind.USER, user=actor,
-               detail={"media": str(media.pk), "sha256": media.sha256,
-                       "replay_interval_seconds": policy.default_replay_interval_seconds,
+               detail={"media": str(media.pk), "sha256": media.sha256, "content_type": content_type.key,
+                       "replay_interval_seconds": interval, "self_published": not control,
                        "supersedes": None if previous_id is None else str(previous_id)})
         _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
     return row
 
 
+def _require_recall(actor, row) -> bool:
+    """May ``actor`` clear this ACTIVE message? CONTROL: any. Its own producer
+    (PRODUCE, checked by the caller): when the exact type is recallable --
+    without needing an assignment or self-publish, so withdrawing obsolete
+    material is never stranded. Returns True for a producer recall."""
+    if can(actor, CONTROL):
+        return False
+    if not _is_producer(row, actor):
+        raise NotPermitted("only control clears another producer's message", code="not_your_message")
+    content_type = ProducedContentType.objects.filter(pk=row.content_type_id).first()
+    if content_type is None or not content_type.recallable:
+        raise NotPermitted("this message's content type is not recallable by its producer; ask control",
+                           code="not_recallable")
+    return True
+
+
 def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMessage:
     """Clear exactly this message (never "the producer's current one").
 
-    ACTIVE -> CLEARED (control): a new generation; it is in no future airing.
+    ACTIVE -> CLEARED (control, or the producer's own recall of a recallable
+    type): a new generation; it is in no future airing.
     An airing already on air is not cut (that is the engine's, D2B).
     PREPARED -> CLEARED (discard): its producer or a control-capable operator;
     the composition does not change.
@@ -521,12 +645,12 @@ def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMess
             _event("discarded", message=row, from_state=M.PREPARED, to_state=M.CLEARED, generation=policy.generation,
                    actor_kind=ActorKind.USER, user=actor, detail={"reason": reason})
             return row
-        _require(actor, CONTROL)
+        recall = _require_recall(actor, row)
         policy = _bump(policy)
         row = _store.write(ActiveBroadcastMessage, row.pk, match={"state": M.ACTIVE},
                            values=_terminal_message_values(M.CLEARED, now=now, user=actor, reason=reason))
         _event("cleared", message=row, from_state=M.ACTIVE, to_state=M.CLEARED, generation=policy.generation,
-               actor_kind=ActorKind.USER, user=actor, detail={"reason": reason})
+               actor_kind=ActorKind.USER, user=actor, detail={"reason": reason, "producer_recall": recall})
         _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
     return row
 

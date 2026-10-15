@@ -93,8 +93,8 @@ class DatabaseInvariantTests(Domain, TestCase):
         self.now = timezone.now()
 
     def insert_message(self, **values):
-        columns = dict(id=uuid.uuid4(), kind="urgent", state="prepared", producer_key="user:1",
-                       producer_username="someone")
+        columns = dict(id=uuid.uuid4(), kind="urgent", content_type=self.urgent_type, state="prepared",
+                       producer_key="user:1", producer_username="someone")
         columns.update(values)
         with transaction.atomic():
             raw(ActiveBroadcastMessage).bulk_create([ActiveBroadcastMessage(**columns)])
@@ -112,13 +112,22 @@ class DatabaseInvariantTests(Domain, TestCase):
         with transaction.atomic():
             raw(ActiveBroadcastExecution).bulk_create([ActiveBroadcastExecution(**columns)])
 
-    def test_one_active_message_per_producer_and_kind(self):
+    def test_one_active_message_per_producer_and_exact_content_type(self):
+        from .support import content_type
+        second_urgent = content_type("urgent_b", "urgent", recallable=False)
         self.insert_message(**self.active_values())
-        self.insert_message(**self.active_values(kind="public_address"))          # other kind: fine
+        self.insert_message(**self.active_values(kind="public_address", content_type=self.pa_type))  # other type
+        self.insert_message(**self.active_values(content_type=second_urgent))     # same kind, other type: fine
         self.insert_message(**self.active_values(producer_key="user:2"))          # other producer: fine
         self.insert_message(state="cleared", terminal_at=self.now)                # inactive rows: fine
         with self.assertRaises(IntegrityError):
             self.insert_message(**self.active_values())
+        with self.assertRaises(IntegrityError):
+            self.insert_message(**self.active_values(content_type=second_urgent))
+
+    def test_every_message_has_its_exact_content_type(self):
+        with self.assertRaises(IntegrityError):
+            self.insert_message(content_type=None)
 
     def test_state_shape_constraints(self):
         cases = {
@@ -187,7 +196,7 @@ class DatabaseInvariantTests(Domain, TestCase):
                 raw(ActiveBroadcastPolicy).filter(pk=1).update(**values)
 
     def test_event_invariants(self):
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         execution_id = uuid.uuid4()
         self.insert_execution(id=execution_id)
         token = uuid.uuid4()

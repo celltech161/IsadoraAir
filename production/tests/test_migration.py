@@ -92,11 +92,21 @@ class LivePlanClassificationTests(TransactionTestCase):
             # still planned first and judged on its own.
             self.assertEqual(refs[0], REF)
             # 2.22D1: and active_messages.0001, which depends on production.0002.
+            # 2.22D3A: and produced_content.0001 (on library.0089) and active_messages.0003/0004,
+            # whose backfill/identity operations are D3A's own manual ones -- nothing of production's.
             self.assertEqual(set(refs) - {REF}, {"library.0089_voicetrack_media", "production.0002_referenceaudio",
                                                  "spoken.0001_initial", "active_messages.0001_initial",
-                                                 "active_messages.0002_playout_correlation"})
+                                                 "active_messages.0002_playout_correlation",
+                                                 "produced_content.0001_initial",
+                                                 "active_messages.0003_message_content_type",
+                                                 "active_messages.0004_message_content_type_identity"})
             self.assertEqual(payload["conflicts"], {})
-            self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
+            self.assertEqual([(entry["ref"], entry["operation"])
+                              for entry in probe.extract_manual_operations(payload["plan"])],
+                             [("active_messages.0003_message_content_type", "RunPython"),
+                              ("active_messages.0004_message_content_type_identity", "AlterField"),
+                              ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
+                              ("active_messages.0004_message_content_type_identity", "AddConstraint")])
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

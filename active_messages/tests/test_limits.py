@@ -159,7 +159,7 @@ class GenerationTests(Domain, TestCase):
 class IndividualDurationTests(Domain, TestCase):
     def test_binding_refuses_media_longer_than_the_configured_limit_and_never_truncates(self):
         services.set_limits(actor=self.admin, max_message_seconds=60, max_aggregate_seconds=600)
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         long = media(self.admin, seconds="60.001000")
         before = ProductionMedia.objects.count()
         with self.assertRaises(services.LimitExceeded) as caught:

@@ -640,13 +640,21 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # unapplying library also unapplies it; library.0089 still plans
             # first and is judged on its own (spoken has its own classifier test).
             # 2.22D2B: and active_messages.0002, which depends on library.0089.
+            # 2.22D3A: and produced_content.0001 (on library.0089) with active_messages.0003/0004,
+            # whose backfill/identity operations are D3A's own manual ones -- nothing of library's.
             self.assertEqual([item["ref"] for item in payload["plan"]],
-                             ["library.0089_voicetrack_media", "active_messages.0002_playout_correlation",
-                              "spoken.0001_initial"])
+                             ["library.0089_voicetrack_media", "produced_content.0001_initial",
+                              "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
+                              "active_messages.0004_message_content_type_identity", "spoken.0001_initial"])
             item = payload["plan"][0]
             self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
                              [("AddField", "additive")])
-            self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
+            self.assertEqual([(entry["ref"], entry["operation"])
+                              for entry in probe.extract_manual_operations(payload["plan"])],
+                             [("active_messages.0003_message_content_type", "RunPython"),
+                              ("active_messages.0004_message_content_type_identity", "AlterField"),
+                              ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
+                              ("active_messages.0004_message_content_type_identity", "AddConstraint")])
             self.assertEqual((payload["conflicts"], payload["replacements"]), ({}, []))
             self.assertIn("production.0001_initial", item["dependencies"])
         finally:

@@ -9,11 +9,12 @@ Phase D keeps the legacy OGRemote *product* behavior and replaces its
 
 | Kept from OGRemote | Replaced |
 | --- | --- |
-| several producers active at once; newest message per producer and kind | newest-file-by-mtime → one ACTIVE row per (producer, kind), database-enforced |
+| several producers active at once; newest message per producer and content type | newest-file-by-mtime → one ACTIVE row per (producer, exact content type), database-enforced (D3A) |
 | one combined mix: stinger, urgent, then public address, oldest first | mutable `urgent_pa_mix.mp3` → an immutable aggregate per exact composition |
 | insertion at the next track boundary, ordinary programming between plays | remote processing + polling + a mutable mix Track → a local, per-execution UrgentPA Track inserted by the same `insert_urgent` splice, with exact execution correlation (D2B) |
 | periodic replay (default 20 minutes) until recalled | JSON state file + remote `processed` flag → PostgreSQL authority, backed up with the database |
-| a producer recalls their own message | file deletion → an exact-UUID clear |
+| station-defined producer content types, several per user | the legacy category table → native `produced_content` types and assignments (D3A) |
+| a producer recalls their own message | file deletion → an exact-UUID clear (when the type is recallable) |
 
 **OGRemote stays authoritative** until Phase G's cutover. Phase D ships
 dormant: `ActiveBroadcastPolicy.native_airing_enabled` is False on every
@@ -32,13 +33,16 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D1** | domain authority: policy/generation, messages, executions, events, media binding, composition, due/replay/expiry, authz, admin diagnostics | **no** — no renderer, no engine path |
 | **D2A** | constrained `assemble` render operation (`active_message_mix`), exact provenance, rendition reuse, the worker, `bind_execution_mix` (PENDING_RENDER → READY) | **no** — no engine command |
 | **D2B** (this) | publish the READY aggregate as an ordinary UrgentPA Track; the existing `insert_urgent` splice for that exact Track; deck-open authority; the deck's own evidence → STARTED/COMPLETED/INTERRUPTED | only through the existing A/B decks, and **only with the native-airing gate open** (closed in production until Phase G) |
-| D3 | recorder adapter, iPortal operator board, monitoring | gate still closed |
+| **D3A** | native produced-content authority: `ProducedContentType` (regular / public address / urgent / test) and producer assignments; active messages keyed by the exact content type; producer self-publish and recall | **no** — authority and configuration only |
+| D3B+ | recorder adapter, producer pages, regular processing (D3C), operator board, monitoring | gate still closed |
 
 ## Authority
 
 | Authority | Owner |
 | --- | --- |
 | immutable message / aggregate bytes | `ProductionMedia` (PROTECT, bound under `retention.lock_for_binding`) |
+| which content types exist, their delivery mode and policy | `produced_content.ProducedContentType` (D3A) |
+| who may produce which type | `produced_content.ProducedContentTypeAssignment` (scope) + `authz` capabilities |
 | which messages are active | `ActiveBroadcastMessage.state` |
 | what an aggregate would contain right now | `ActiveBroadcastPolicy.generation` + the ACTIVE rows |
 | exactly what one airing contains | `ActiveBroadcastExecution.composition_snapshot` / `composition_digest` (frozen) |
@@ -73,8 +77,11 @@ SpokenItem/SpokenAsset is ever created, and no path is ever authority.
 * **ActiveBroadcastMessage** — one producer's lifecycle. `producer_key` is the
   durable identity (`user:<pk>` for a native account; other namespaces are
   reserved for the Phase G import), with `producer` as an optional SET_NULL
-  link and a username snapshot. `message_media` is the exact media that airs;
-  its edit lineage is ProductionMedia's own `derived_from`.
+  link and a username snapshot. `content_type` (D3A, PROTECT, NOT NULL) is
+  the exact produced-content type — the producer slot; `kind` is the FROZEN
+  broad composition class (urgent / public address) derived from it when the
+  message was prepared. `message_media` is the exact media that airs; its
+  edit lineage is ProductionMedia's own `derived_from`.
 * **ActiveBroadcastExecution** — one logical airing of the aggregate.
 * **ActiveBroadcastMessageEvent** — the authoritative history (append-only).
 
@@ -83,9 +90,11 @@ Every ordinary ORM write path refuses (`active_messages/guard.py`): `save()`,
 Django's own SET_NULL of a deleted user. `active_messages.services` writes
 through a private compare-and-write store with read-back.
 
-### Database invariants (all in `active_messages.0001`, CreateModel-only)
+### Database invariants (`active_messages.0001`, CreateModel-only; D3A's in 0004)
 
-* at most one ACTIVE message per `(producer_key, kind)` (partial unique);
+* at most one ACTIVE message per `(producer_key, content_type)` (partial
+  unique; D3A replaced D1's `(producer_key, kind)`), and every message has
+  its content type;
 * state/timestamp shapes: PREPARED has no activation; ACTIVE has media,
   activation generation/time, interval and `next_due_at`; CLEARED/EXPIRED are
   dated; EXPIRED was active and had an expiry; only CLEARED rows are
@@ -105,11 +114,11 @@ through a private compare-and-write store with read-back.
 
 | From | Action | To | Who |
 | --- | --- | --- | --- |
-| — | `prepare_message` | PREPARED | produce |
-| PREPARED | `bind_message_media` (replace allowed) | PREPARED | its producer, or control |
-| PREPARED | `activate_message` | ACTIVE | control |
-| ACTIVE | activation of the same producer's same-kind message | CLEARED (`superseded_by`) | control |
-| ACTIVE | `clear_message` | CLEARED | control |
+| — | `prepare_message(content_type=…)` | PREPARED | control; or produce + assigned to the exact type |
+| PREPARED | `bind_message_media` (replace allowed) | PREPARED | its (still assigned) producer, or control |
+| PREPARED | `activate_message` | ACTIVE | control; or its own assigned producer when the type allows self-publish |
+| ACTIVE | activation of the same producer's message of the **same exact type** | CLEARED (`superseded_by`) | whoever activated |
+| ACTIVE | `clear_message` | CLEARED | control; or its own producer when the type is recallable |
 | PREPARED | `clear_message` (discard) | CLEARED | its producer, or control |
 | ACTIVE | expiry sweep (`expire_due_messages`) | EXPIRED | system |
 
@@ -125,7 +134,76 @@ activation re-checks every limit under the policy lock. The replaced media is re
 identity in the event detail, not by foreign key, so it stays purgeable.
 
 There is **no default expiry**. `expires_at` is optional; `set_message_expiry`
-changes it (PREPARED: producer or control; ACTIVE: control).
+changes it (PREPARED: its assigned producer or control; ACTIVE: control).
+
+## Produced-content types and producer scope (D3A)
+
+Legacy OGRemote has station-defined producer content types, many per user
+(`usd239min`, `cal_events`, `3min_ctr`, `lcl_psa`, `news_item`, `usd239sc`,
+`urgent_pa`, `public_address`, `test_audio`, …). Their native authority is the
+`produced_content` app (never the legacy `ogremote` app):
+
+* **`ProducedContentType`** — `key` (durable slug; never changes), `name`,
+  `description`, `enabled`, `sort_order`, and one **delivery mode**:
+  * `regular` — ordinary library content: `target_category` (PROTECT),
+    `output_mode` (`single` / `accumulating`), an optional LOGICAL
+    `recipe_key` and `artist_tag`. Configuration only (processing is D3C);
+    never an active message.
+  * `public_address` / `urgent` — an active message: `producer_self_publish`
+    (default yes), `recallable` (default no), optional
+    `replay_interval_seconds` override (60..86400; NULL = the policy default,
+    frozen onto the message at activation).
+  * `test` — explicitly non-airing: none of the delivery settings, and never
+    an active message.
+
+  No field is executable (no paths, scripts, dotted imports or commands; the
+  recipe key's shape forbids dots, slashes and spaces). Incompatible field
+  combinations are refused by `clean()` (admin forms) **and** by database
+  CHECK constraints. The delivery mode of a type that active messages
+  reference cannot change (their kind was derived from it); types are never
+  deleted (PROTECT; disable instead).
+* **`ProducedContentTypeAssignment`** — `(user, content_type)`, unique. Scope,
+  not a role: the broad capability still comes from `authz`.
+
+Both are managed in Django Admin (types with an assignment inline; a separate
+assignment list).
+
+**Active messages are keyed by the exact type.** `prepare_message` takes the
+exact `content_type` (instance, id or durable key); the service re-reads it,
+requires it to be enabled and urgent or public address, authorizes the actor
+for that exact type, and stores its delivery mode as the frozen `kind`.
+Composition order (urgent, then public address), rendering and playout read
+only `kind` and the frozen execution snapshot — never the mutable type
+configuration. Regular and test types are refused
+(`not_an_active_message_type`); unknown and disabled ones too
+(`unknown_content_type`, `content_type_disabled`).
+
+One producer may have several public-address types, several urgent types, or
+both, ACTIVE together; activating a replacement supersedes only that
+producer's ACTIVE message of the **same exact type** — never another one
+merely because both are public address. Several producers may each have the
+same type active.
+
+| Action | CONTROL (incl. staff/superuser) | Ordinary producer (`active_message.produce`) |
+| --- | --- | --- |
+| prepare / bind / set a draft's expiry | any enabled urgent/PA type | assigned to the exact enabled type; own draft only |
+| activate | any valid PREPARED message | own message, assigned, type enabled, `producer_self_publish` on — otherwise it stays PREPARED (awaiting publication) for control |
+| clear an ACTIVE message | any | own message when the type is `recallable` — no assignment or self-publish needed, so losing an assignment never strands obsolete material; never someone else's |
+| discard a PREPARED message | any | own |
+| Replay Now, stinger, limits, the gate | yes | no |
+
+A disabled type refuses new production and activation for everyone,
+including control; recall and clear still work. Every check is made server
+side on every call (an assignment removed between steps takes effect at the
+next step).
+
+**Compatibility types.** `active_messages.0003` creates two native types if
+absent — `urgent_pa` (urgent) and `public_address` (public address) — with
+D1's authority unchanged (no producer self-publish, not recallable, policy
+replay default) and backfills every existing message from its frozen kind.
+Nothing is imported from legacy OGRemote (category table, users,
+assignments, submissions, files): that belongs to the migration/cutover
+phases.
 
 ## Generation and lock order
 
@@ -152,10 +230,16 @@ later) are left to the engine's own re-read (D2B).
    ReferenceAudio keys; paths are never configuration authority, and every
    update goes through `services.set_stinger_key`.
 
-The snapshot holds message, media and reference identities with SHA-256s and
-producer snapshots — never a path. The **digest** covers only what determines
-the audio (ordered message/kind/media/sha256 + stinger pin), so an unchanged
-set keeps its digest across replays and D2A can reuse its aggregate. If the
+The snapshot holds message, media and reference identities with SHA-256s,
+producer snapshots and (D3A) each component's exact content type
+(`content_type` id and `content_type_key`, so two public-address types stay
+distinguishable in history) — never a path. The **digest** covers only what
+determines the audio (ordered message/kind/media/sha256 + stinger pin), so an
+unchanged set keeps its digest across replays and D2A can reuse its
+aggregate. D3A deliberately left the digest unchanged: the content type adds
+no audio-relevant identity (it never changes for a message, whose UUID is
+already in the digest), and snapshots from before D3A simply lack the two
+fields. If the
 configured stinger is unavailable, the airing proceeds without it
 (`stinger_unavailable` in the snapshot) and a SystemEvent warning is raised:
 an urgent message is never held back for its stinger.
@@ -251,11 +335,14 @@ detail at most 4 KiB.
 
 ## Authorization
 
-`active_message.produce` (prepare, bind) and `active_message.control`
-(activate, Replay Now, clear, expiry on active messages, policy), seeded to
-Station Administrator only by `authz.0008`; staff/superuser keep
-`authorize()`'s compatibility bypass. Every service checks `authorize()`
-itself. The admin is read-only diagnostics, except the policy's three
+`active_message.produce` (prepare, bind, and -- per type -- self-publish and
+recall) and `active_message.control` (activate, Replay Now, clear, expiry on
+active messages, policy), seeded to Station Administrator only by
+`authz.0008`; staff/superuser keep `authorize()`'s compatibility bypass.
+Since D3A an ordinary producer's capability is narrowed to the exact
+produced-content types they are assigned to, and each type decides whether
+they may self-publish and recall (see "Produced-content types and producer
+scope"). Every service checks `authorize()` and the assignment itself. The admin is read-only diagnostics, except the policy's three
 composition limits, which it changes only through `services.set_limits`
 (control).
 
@@ -583,3 +670,21 @@ and untouched.
   immutable `UrgentPA/am-<execution>.flac` and its Track; no cleanup is
   designed yet. It must never remove a publication still referenced by a
   queued or historical occurrence.
+
+## Release notes for D3A
+
+* `produced_content.0001_initial` -- CreateModel ×2 (additive, automatic).
+* `active_messages.0003_message_content_type` -- AddField (additive) +
+  RunPython (compatibility types + backfill), and
+  `active_messages.0004_message_content_type_identity` -- AlterField (NOT
+  NULL), RemoveConstraint/AddConstraint (the producer slot becomes
+  `(producer_key, content_type)`): D3A's manual operations. Ship a
+  migration-authorization companion or approve locally
+  (docs/UPDATE_CENTER.md, "Trusted companion migration authorization").
+* No new capability: `active_message.produce` / `control` are reused.
+* `prepare_message` takes `content_type` (was `kind`); no caller outside the
+  tests existed.
+* No engine, render, GStreamer, service-unit or file-path change. Native
+  airing stays impossible: `NATIVE_AIRING_AVAILABLE` is False.
+* Not in D3A: producer pages, the recorder adapter, regular recipes and
+  delivery (D3C), the operator board, OGRemote data import, cutover.

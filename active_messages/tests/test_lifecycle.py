@@ -33,7 +33,7 @@ class AuthorizationTests(Domain, TestCase):
         for user in (self.host, self.nobody):
             with self.subTest(user=user.username):
                 with self.assertRaises(services.NotPermitted):
-                    services.prepare_message(actor=user, kind="urgent")
+                    services.prepare_message(actor=user, content_type="urgent_pa")
         message = self.prepared(self.producer)
         for action in (lambda: services.activate_message(message, actor=self.producer),
                        lambda: services.request_manual_replay(actor=self.producer, request_token="0" * 32),
@@ -42,7 +42,7 @@ class AuthorizationTests(Domain, TestCase):
             with self.assertRaises(services.NotPermitted):
                 action()
         with self.assertRaises(services.NotPermitted):
-            services.prepare_message(actor=None, kind="urgent")
+            services.prepare_message(actor=None, content_type="urgent_pa")
 
     def test_staff_keep_the_compatibility_bypass(self):
         from django.contrib.auth import get_user_model
@@ -51,7 +51,7 @@ class AuthorizationTests(Domain, TestCase):
         self.assertEqual(services.activate_message(message, actor=staff).state, "active")
 
     def test_a_producer_works_only_on_their_own_prepared_messages(self):
-        mine = services.prepare_message(actor=self.producer, kind="urgent")
+        mine = services.prepare_message(actor=self.producer, content_type="urgent_pa")
         with self.assertRaises(services.NotPermitted):
             services.bind_message_media(mine, media(self.producer2), actor=self.producer2)
         with self.assertRaises(services.NotPermitted):
@@ -62,18 +62,18 @@ class AuthorizationTests(Domain, TestCase):
         self.assertEqual(services.clear_message(mine, actor=self.producer).state, "cleared")       # discard own draft
 
     def test_media_binding_has_independent_produce_and_control_paths(self):
-        mine = services.prepare_message(actor=self.producer, kind="urgent")
+        mine = services.prepare_message(actor=self.producer, content_type="urgent_pa")
         own = media(self.producer)
         self.assertEqual(services.bind_message_media(mine, own, actor=self.producer).message_media_id, own.pk)
 
-        other = services.prepare_message(actor=self.producer2, kind="public_address")
+        other = services.prepare_message(actor=self.producer2, content_type="public_address")
         controlled = media(self.producer)
         self.assertFalse(services.can(self.controller, services.PRODUCE))
         self.assertTrue(services.can(self.controller, services.CONTROL))
         self.assertEqual(services.bind_message_media(other, controlled, actor=self.controller).message_media_id,
                          controlled.pk)
 
-        unbound = services.prepare_message(actor=self.producer, kind="public_address")
+        unbound = services.prepare_message(actor=self.producer, content_type="public_address")
         with self.assertRaises(services.NotPermitted):
             services.bind_message_media(unbound, media(self.nobody), actor=self.nobody)
         self.assertIsNone(M.objects.get(pk=unbound.pk).message_media_id)
@@ -86,7 +86,7 @@ class AuthorizationTests(Domain, TestCase):
 
 class PrepareAndBindTests(Domain, TestCase):
     def test_prepare_records_the_durable_producer_identity(self):
-        message = services.prepare_message(actor=self.producer, kind="urgent", title="Road closed")
+        message = services.prepare_message(actor=self.producer, content_type="urgent_pa", title="Road closed")
         self.assertEqual((message.state, message.kind, message.producer_key, message.producer_username, message.title),
                          ("prepared", "urgent", f"user:{self.producer.pk}", "producer", "Road closed"))
         self.assertEqual(self.events(message), ["prepared"])
@@ -101,14 +101,14 @@ class PrepareAndBindTests(Domain, TestCase):
                 self.assertEqual(caught.exception.code, "unknown_message")
 
     def test_prepare_validates_its_input(self):
-        for kwargs in (dict(kind="emergency"), dict(kind="urgent", title="x" * 201),
-                       dict(kind="urgent", expires_at=timezone.now() - timedelta(seconds=1))):
+        for kwargs in (dict(content_type="emergency"), dict(content_type="urgent_pa", title="x" * 201),
+                       dict(content_type="urgent_pa", expires_at=timezone.now() - timedelta(seconds=1))):
             with self.subTest(kwargs), self.assertRaises(services.InvalidRequest):
                 services.prepare_message(actor=self.admin, **kwargs)
 
     def test_binding_takes_only_valid_present_message_media(self):
         # (A valid media always has a measured duration: production_media_valid_has_facts.)
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         purged = media(self.admin)
         with self.captureOnCommitCallbacks(execute=True):
             retention.purge_media(purged)
@@ -129,7 +129,7 @@ class PrepareAndBindTests(Domain, TestCase):
         self.assertIsNone(M.objects.get(pk=message.pk).message_media_id)
 
     def test_prepared_media_can_be_replaced_and_rebinding_is_a_no_op(self):
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         first, second = media(self.admin), media(self.admin)
         services.bind_message_media(message, first, actor=self.admin)
         services.bind_message_media(message, first, actor=self.admin)
@@ -169,7 +169,7 @@ class ActivationTests(Domain, TestCase):
         self.assertEqual(self.events(message).count("activated"), 1)
 
     def test_activation_needs_media_and_a_future_expiry(self):
-        bare = services.prepare_message(actor=self.admin, kind="urgent")
+        bare = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         with self.assertRaises(services.InvalidTransition) as caught:
             services.activate_message(bare, actor=self.admin)
         self.assertEqual(caught.exception.code, "media_required")

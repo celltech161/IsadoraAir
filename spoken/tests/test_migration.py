@@ -92,12 +92,22 @@ class LivePlanClassificationTests(TransactionTestCase):
             # 2.22D1: active_messages.0001 depends on production.0002, so unapplying
             # production.0002 unapplies it too (it has its own classifier test).
             # 2.22D2B: and active_messages.0002 after it.
+            # 2.22D3A: and active_messages.0003/0004 -- whose backfill/identity
+            # operations are D3A's own manual ones (active_messages has its own
+            # classifier test); spoken and production stay purely additive.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["production.0002_referenceaudio", "active_messages.0001_initial",
-                              "active_messages.0002_playout_correlation", "spoken.0001_initial"])
+                              "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
+                              "active_messages.0004_message_content_type_identity", "spoken.0001_initial"])
             self.assertEqual(payload["conflicts"], {})
-            self.assertEqual(probe.extract_manual_operations(payload["plan"]), [])
+            self.assertEqual([(entry["ref"], entry["operation"])
+                              for entry in probe.extract_manual_operations(payload["plan"])],
+                             [("active_messages.0003_message_content_type", "RunPython"),
+                              ("active_messages.0004_message_content_type_identity", "AlterField"),
+                              ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
+                              ("active_messages.0004_message_content_type_identity", "AddConstraint")])
             for item in payload["plan"]:
-                self.assertEqual({op["classification"] for op in item["operations"]}, {"additive"})
+                if not item["ref"].startswith(("active_messages.0003", "active_messages.0004")):
+                    self.assertEqual({op["classification"] for op in item["operations"]}, {"additive"}, item["ref"])
         finally:
             call_command("migrate", verbosity=0)

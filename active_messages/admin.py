@@ -151,10 +151,11 @@ class ActiveBroadcastPolicyAdmin(admin.ModelAdmin):
 
 @admin.register(ActiveBroadcastMessage)
 class ActiveBroadcastMessageAdmin(ReadOnlyAdmin):
-    list_display = ("id", "kind", "state", "producer_username", "title", "activated_at", "last_completed_at",
-                    "next_due_at", "expires_at")
-    list_filter = ("state", "kind")
-    search_fields = ("id", "producer_username", "producer_key", "title")
+    list_display = ("id", "kind", "content_type", "state", "producer_username", "title", "activated_at",
+                    "last_completed_at", "next_due_at", "expires_at")
+    list_filter = ("state", "kind", "content_type")
+    search_fields = ("id", "producer_username", "producer_key", "title", "content_type__key")
+    list_select_related = ("content_type",)
     readonly_fields = ("media",)
     inlines = [MessageEventInline]
 

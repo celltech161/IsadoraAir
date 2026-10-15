@@ -77,6 +77,7 @@ INSTALLED_APPS = [
     'updatecenter',
     'production',
     'spoken',
+    'produced_content',
     'active_messages',
     'axes',
 ]

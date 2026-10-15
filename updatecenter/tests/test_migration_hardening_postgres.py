@@ -279,8 +279,12 @@ class RealGraphReconstructionTests(TransactionTestCase):
             # probe then correctly plans after the historical pair.
             # 2.22C: and spoken.0001, which depends on library.0089.
             # 2.22D2B: and active_messages.0002, which depends on library.0089.
+            # 2.22D3A: and produced_content.0001 (on library.0089) with active_messages.0003/0004.
             self.assertTrue(all((ref.startswith("library.") and ref > "library.0088")
-                                or ref in ("spoken.0001_initial", "active_messages.0002_playout_correlation")
+                                or ref in ("spoken.0001_initial", "active_messages.0002_playout_correlation",
+                                           "produced_content.0001_initial",
+                                           "active_messages.0003_message_content_type",
+                                           "active_messages.0004_message_content_type_identity")
                                 for ref in refs[2:]), refs)
             MigrationExecutor(connection).migrate(after_m1)
             resumed = build_probe_payload(**context, recovery_plan_refs=refs)

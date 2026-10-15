@@ -15,7 +15,7 @@ from production.services.render import provenance
 from production.tests.support import make_row
 from spoken.tests import support as audio
 
-from .support import Domain
+from .support import Domain, compatibility_type
 
 STINGER_HZ, URGENT_HZ, URGENT2_HZ, PA_HZ = 1500.0, 440.0, 660.0, 880.0
 
@@ -65,7 +65,7 @@ class RealAudio(Domain):
 
     def real_message(self, actor=None, *, kind="public_address", seconds=1.0, frequency=PA_HZ):
         actor = actor or self.admin
-        message = services.prepare_message(actor=actor, kind=kind)
+        message = services.prepare_message(actor=actor, content_type=compatibility_type(kind))
         return services.bind_message_media(message, ingest(tone(seconds, frequency), owner=actor), actor=actor)
 
     def real_active(self, actor=None, *, kind="public_address", seconds=1.0, frequency=PA_HZ, now=None):

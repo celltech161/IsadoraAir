@@ -83,10 +83,10 @@ class UniquenessReverseProofTests(Domain, TestCase):
                 self.assertRaises(IntegrityError), transaction.atomic():
             services.request_manual_replay(actor=self.admin, request_token=token)
 
-    def test_without_both_active_barriers_one_producer_has_two_active_messages_of_a_kind(self):
+    def test_without_both_active_barriers_one_producer_has_two_active_messages_of_a_type(self):
         self.active(self.producer, kind="urgent")
         new = self.prepared(self.producer, kind="urgent")
-        _drop_constraint(ActiveBroadcastMessage, "active_message_one_active_per_producer_kind")
+        _drop_constraint(ActiveBroadcastMessage, "active_message_one_active_per_producer_type")
         with mock.patch("active_messages.services._current_active_id", return_value=None):
             services.activate_message(new, actor=self.admin)
         self.assertEqual(ActiveBroadcastMessage.objects.filter(
@@ -128,7 +128,7 @@ class IdentityReverseProofTests(Domain, TestCase):
 
 class BindingLockReverseProofTests(Sessions):
     def test_without_lock_for_binding_a_purge_slips_past_an_uncommitted_bind(self):
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         candidate = media(self.admin)
         bound, release = threading.Event(), threading.Event()
         careless = lambda media_id: ProductionMedia.objects.get(pk=getattr(media_id, "pk", media_id))  # noqa: E731

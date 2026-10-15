@@ -25,6 +25,31 @@ from production.tests.support import VALID_FACTS, IsolatedMediaRootMixin, make_r
 
 User = get_user_model()
 DOMAIN_MODELS = (ActiveBroadcastPolicy, ActiveBroadcastMessage, ActiveBroadcastExecution, ActiveBroadcastMessageEvent)
+# The native compatibility types active_messages.0003 creates (D1 authority:
+# no producer self-publish, not recallable) -- the two broad kinds' types.
+COMPATIBILITY_TYPE_KEYS = {"urgent": "urgent_pa", "public_address": "public_address"}
+
+
+def compatibility_type(kind):
+    """The migration-created compatibility type of ``kind`` (re-created with the
+    same configuration if a TransactionTestCase flush removed it)."""
+    from produced_content.models import ProducedContentType
+    key = COMPATIBILITY_TYPE_KEYS[kind]
+    content_type, _ = ProducedContentType.objects.get_or_create(key=key, defaults=dict(
+        name=key, delivery_mode=kind, recallable=False, producer_self_publish=False))
+    return content_type
+
+
+def content_type(key, mode="public_address", **values):
+    """A station-defined produced-content type (D3A)."""
+    from produced_content.models import ProducedContentType
+    return ProducedContentType.objects.create(key=key, name=key, delivery_mode=mode, **values)
+
+
+def assign(user, *content_types):
+    from produced_content.models import ProducedContentTypeAssignment
+    for item in content_types:
+        ProducedContentTypeAssignment.objects.get_or_create(user=user, content_type=item)
 
 
 def user_with_role(username, role_name=None, **flags):
@@ -90,15 +115,23 @@ class Domain(IsolatedMediaRootMixin):
         self.controller = user_with_role("controller", "Test Controller")
         self.host = user_with_role("host", "Remote Host")
         self.nobody = user_with_role("nobody")
+        # D3A: a producer works only on the exact types they are assigned to.
+        # The D1-era tests' producers produce both compatibility types.
+        self.urgent_type, self.pa_type = compatibility_type("urgent"), compatibility_type("public_address")
+        for producer in (self.producer, self.producer2):
+            assign(producer, self.urgent_type, self.pa_type)
 
     # -- builders ------------------------------------------------------------------------------
-    def prepared(self, actor=None, *, kind="public_address", seconds="30.000000", **kwargs):
+    def type_for(self, kind=None, content_type=None):
+        return content_type if content_type is not None else compatibility_type(kind or "public_address")
+
+    def prepared(self, actor=None, *, kind="public_address", content_type=None, seconds="30.000000", **kwargs):
         actor = actor or self.admin
-        message = services.prepare_message(actor=actor, kind=kind, **kwargs)
+        message = services.prepare_message(actor=actor, content_type=self.type_for(kind, content_type), **kwargs)
         return services.bind_message_media(message, media(actor, seconds=seconds), actor=actor)
 
-    def active(self, actor=None, *, kind="public_address", now=None, **kwargs):
-        message = self.prepared(actor, kind=kind, **kwargs)
+    def active(self, actor=None, *, kind="public_address", content_type=None, now=None, **kwargs):
+        message = self.prepared(actor, kind=kind, content_type=content_type, **kwargs)
         return services.activate_message(message, actor=self.admin, now=now)
 
     def policy(self):

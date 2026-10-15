@@ -11,11 +11,16 @@ component is urgent and the policy names a stinger key.
 
 The snapshot is bounded and path-free: message, media and reference
 identities with their SHA-256s, producer snapshots for historical
-explanation, and the durations D1 can account for. The DIGEST covers only
-what determines the audio -- ordered (message, kind, media, sha256) and the
-stinger pin -- never the generation, durations, display names or timestamps,
-so an unchanged active set keeps its digest (and, in D2A, its already-rendered
-aggregate) across replays.
+explanation, the exact produced-content type of each component (D3A: its id
+and durable key, so two public-address types stay distinguishable in
+history), and the durations D1 can account for. The DIGEST covers only what
+determines the audio -- ordered (message, kind, media, sha256) and the
+stinger pin -- never the generation, durations, display names, content-type
+identity or timestamps, so an unchanged active set keeps its digest (and, in
+D2A, its already-rendered aggregate) across replays. (A message's content
+type never changes, and the message UUID is already in the digest, so the
+type adds no audio-relevant identity; snapshots written before D3A simply
+lack the two content-type fields.)
 """
 from __future__ import annotations
 
@@ -83,6 +88,8 @@ def build(messages, *, stinger_pin: dict | None, stinger_unavailable: str = "", 
             {
                 "message": str(message.pk),
                 "kind": message.kind,
+                "content_type": message.content_type_id,
+                "content_type_key": message.content_type.key,
                 "media": str(message.message_media.pk),
                 "sha256": message.message_media.sha256,
                 "producer_key": message.producer_key,

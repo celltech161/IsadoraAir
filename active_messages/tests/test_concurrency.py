@@ -151,7 +151,7 @@ class LifecycleRaceTests(Sessions):
 
 class BindingRaceTests(Sessions):
     def test_purge_waits_for_a_binding_and_then_refuses(self):
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         candidate = media(self.admin)
         first, second = self.race(lambda: services.bind_message_media(message, candidate, actor=self.admin),
                                   lambda: retention.purge_media(candidate),
@@ -161,7 +161,7 @@ class BindingRaceTests(Sessions):
         self.assertEqual(ActiveBroadcastMessage.objects.get(pk=message.pk).message_media_id, candidate.pk)
 
     def test_a_binding_that_waits_for_a_purge_refuses_the_purged_media(self):
-        message = services.prepare_message(actor=self.admin, kind="urgent")
+        message = services.prepare_message(actor=self.admin, content_type="urgent_pa")
         candidate = media(self.admin)
         first, second = self.race(lambda: retention.purge_media(candidate),
                                   lambda: services.bind_message_media(message, candidate, actor=self.admin),

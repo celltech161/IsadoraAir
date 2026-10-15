@@ -3,6 +3,12 @@ under the REAL runtime-11 classifier (the protected updater's own probe
 functions): CreateModel only, every constraint and index folded in. The capability seed (authz.0008, RunPython) is Phase
 D1's ONE manual operation -- it needs a companion or local approval at release
 time -- and is isolated in its own migration.
+
+D3A (exact produced-content identity): produced_content.0001 is CreateModel
+only (additive); active_messages.0003 (AddField + the compatibility-type
+backfill, RunPython) and 0004 (NOT NULL, the uniqueness swap) are D3A's
+manual operations -- exactly those, nothing else -- and the backfill is
+proven against a D2B-era schema with real rows.
 """
 import ast
 from pathlib import Path
@@ -19,8 +25,19 @@ REPO = Path(__file__).resolve().parents[2]
 INITIAL = REPO / "active_messages" / "migrations" / "0001_initial.py"
 PLAYOUT = REPO / "active_messages" / "migrations" / "0002_playout_correlation.py"
 SEED = REPO / "authz" / "migrations" / "0008_active_message_capabilities.py"
+BACKFILL = REPO / "active_messages" / "migrations" / "0003_message_content_type.py"
+IDENTITY = REPO / "active_messages" / "migrations" / "0004_message_content_type_identity.py"
+PRODUCED = REPO / "produced_content" / "migrations" / "0001_initial.py"
 REFS = ["active_messages.0001_initial", "active_messages.0002_playout_correlation"]
+D3A_REFS = ["active_messages.0003_message_content_type", "active_messages.0004_message_content_type_identity"]
+PRODUCED_REF = "produced_content.0001_initial"
 SEED_REF = "authz.0008_active_message_capabilities"
+D3A_MANUAL = [("active_messages.0003_message_content_type", "RunPython"),
+              ("active_messages.0004_message_content_type_identity", "AlterField"),
+              ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
+              ("active_messages.0004_message_content_type_identity", "AddConstraint")]
+# D3A replaced the D1 uniqueness; the new one is declared in 0004.
+D3A_CONSTRAINTS = {"active_message_one_active_per_producer_type"}
 
 
 def _migration_calls(path):
@@ -59,8 +76,23 @@ class StructureTests(SimpleTestCase):
                       domain.ActiveBroadcastMessageEvent):
             names |= _declared(model, "constraints") | _declared(model, "indexes")
         self.assertGreaterEqual(len(names), 40)
-        for name in names:
+        for name in names - D3A_CONSTRAINTS:
             self.assertIn(f"name='{name}'", text)
+        for name in D3A_CONSTRAINTS:
+            self.assertIn(f'name="{name}"', IDENTITY.read_text())
+        self.assertIn("name='active_message_one_active_per_producer_kind'", text)       # removed by 0004
+        self.assertIn('name="active_message_one_active_per_producer_kind"', IDENTITY.read_text())
+
+    def test_the_d3a_migrations_have_exactly_their_declared_operations(self):
+        from produced_content import models as produced
+        self.assertEqual(_migration_calls(PRODUCED), ["CreateModel"] * 2 + ["swappable_dependency"])
+        for name in (_declared(produced.ProducedContentType, "constraints")
+                     | _declared(produced.ProducedContentTypeAssignment, "constraints")):
+            self.assertIn(f"name='{name}'", PRODUCED.read_text())
+        self.assertEqual(_migration_calls(BACKFILL), ["AddField", "RunPython"])
+        self.assertEqual(_migration_calls(IDENTITY), ["AddConstraint", "AlterField", "RemoveConstraint"])
+        for forbidden in ("ogremote", "RunSQL", "SeparateDatabaseAndState"):
+            self.assertNotIn(forbidden, BACKFILL.read_text().replace("legacy OGRemote", ""))
 
     def test_one_atomic_migration_each(self):
         loader = MigrationLoader(None)
@@ -68,8 +100,12 @@ class StructureTests(SimpleTestCase):
         self.assertTrue(loader.disk_migrations[("authz", "0008_active_message_capabilities")].atomic)
         self.assertTrue(loader.disk_migrations[("active_messages", "0002_playout_correlation")].atomic)
         self.assertEqual(sorted(p.name for p in INITIAL.parent.glob("*.py")),
-                         ["0001_initial.py", "0002_playout_correlation.py", "__init__.py"])
+                         ["0001_initial.py", "0002_playout_correlation.py", "0003_message_content_type.py",
+                          "0004_message_content_type_identity.py", "__init__.py"])
         self.assertEqual(_migration_calls(SEED), ["RunPython"])
+        for ref in D3A_REFS + [PRODUCED_REF]:
+            app, name = ref.split(".")
+            self.assertTrue(loader.disk_migrations[(app, name)].atomic, ref)
 
 
 class StaticClassificationTests(SimpleTestCase):
@@ -84,6 +120,13 @@ class StaticClassificationTests(SimpleTestCase):
         plan = probe._serialize_exact_plan(MigrationLoader(None), [SEED_REF])
         manual = probe.extract_manual_operations(plan)
         self.assertEqual([(entry["ref"], entry["operation"]) for entry in manual], [(SEED_REF, "RunPython")])
+
+    def test_d3a_is_additive_except_its_backfill_and_identity_tightening(self):
+        plan = probe._serialize_exact_plan(MigrationLoader(None), [PRODUCED_REF] + D3A_REFS)
+        self.assertEqual([item["ref"] for item in plan], [PRODUCED_REF] + D3A_REFS)
+        self.assertEqual({op["classification"] for op in plan[0]["operations"]}, {"additive"})
+        manual = probe.extract_manual_operations(plan)
+        self.assertEqual([(entry["ref"], entry["operation"]) for entry in manual], D3A_MANUAL)
 
 
 class SeedTests(TestCase):
@@ -100,15 +143,93 @@ class LivePlanClassificationTests(TransactionTestCase):
 
     serialized_rollback = True
 
-    def test_the_pending_plan_is_additive_except_the_seed(self):
+    def test_the_pending_plan_is_additive_except_the_seed_and_the_d3a_identity(self):
         call_command("migrate", "active_messages", "zero", verbosity=0)
+        call_command("migrate", "produced_content", "zero", verbosity=0)
         call_command("migrate", "authz", "0007", verbosity=0)
         try:
             payload = probe.build_probe_payload()
-            self.assertEqual(sorted(item["ref"] for item in payload["plan"]), sorted(REFS + [SEED_REF]))
+            self.assertEqual(sorted(item["ref"] for item in payload["plan"]),
+                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF]))
             self.assertEqual(payload["conflicts"], {})
             manual = probe.extract_manual_operations(payload["plan"])
-            self.assertEqual([(entry["ref"], entry["operation"]) for entry in manual], [(SEED_REF, "RunPython")])
+            self.assertEqual(sorted((entry["ref"], entry["operation"]) for entry in manual),
+                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL))
         finally:
             call_command("migrate", verbosity=0)
         self.assertEqual(Capability.objects.filter(slug__startswith="active_message.").count(), 2)
+
+
+class CompatibilityTypeTests(TestCase):
+    """A fresh database (the test database is built by the migrations)."""
+
+    def test_the_compatibility_types_exist_with_d1_authority(self):
+        from produced_content.models import ProducedContentType
+        rows = {row.key: row for row in ProducedContentType.objects.filter(key__in=("urgent_pa", "public_address"))}
+        self.assertEqual({key: (row.delivery_mode, row.enabled, row.producer_self_publish, row.recallable,
+                                row.replay_interval_seconds, row.target_category_id)
+                          for key, row in rows.items()},
+                         {"urgent_pa": ("urgent", True, False, False, None, None),
+                          "public_address": ("public_address", True, False, False, None, None)})
+
+
+class BackfillTests(TransactionTestCase):
+    """An upgraded D1-D2B database: real rows written against the 0002 schema
+    are backfilled to their exact compatibility type, deterministically, and
+    keep everything else."""
+
+    serialized_rollback = True
+
+    def test_d1_d2b_rows_backfill_to_their_compatibility_types(self):
+        import uuid
+
+        from django.db import connection
+        from django.db.migrations.executor import MigrationExecutor
+        from django.utils import timezone
+
+        from production.tests.support import VALID_FACTS, make_row
+        call_command("migrate", "active_messages", "0002", verbosity=0)
+        call_command("migrate", "produced_content", "zero", verbosity=0)
+        try:
+            state = MigrationExecutor(connection).loader.project_state(
+                [("active_messages", "0002_playout_correlation")])
+            Message = state.apps.get_model("active_messages", "ActiveBroadcastMessage")
+            now = timezone.now()
+            media = make_row(kind="recording", **{**VALID_FACTS, "decoded_duration_seconds": "5.000000",
+                                                   "validated_at": now})
+            base = dict(producer_key="user:7", producer_username="seven", state="prepared")
+            active = dict(state="active", message_media_id=media.pk, activation_generation=1, activated_at=now,
+                          replay_interval_seconds=1200, next_due_at=now)
+            rows = {
+                "urgent-prepared": dict(base, kind="urgent"),
+                "urgent-active": dict(base, kind="urgent", **active),
+                "pa-active": dict(base, kind="public_address", **active),
+                "pa-cleared": dict(base, kind="public_address", state="cleared", terminal_at=now),
+            }
+            ids = {}
+            for label, values in rows.items():
+                ids[label] = uuid.uuid4()
+                Message.objects.create(id=ids[label], **values)
+            call_command("migrate", verbosity=0)
+            from active_messages.models import ActiveBroadcastMessage
+            got = {label: ActiveBroadcastMessage.objects.select_related("content_type").get(pk=pk)
+                   for label, pk in ids.items()}
+            self.assertEqual({label: (row.kind, row.content_type.key, row.state) for label, row in got.items()},
+                             {"urgent-prepared": ("urgent", "urgent_pa", "prepared"),
+                              "urgent-active": ("urgent", "urgent_pa", "active"),
+                              "pa-active": ("public_address", "public_address", "active"),
+                              "pa-cleared": ("public_address", "public_address", "cleared")})
+            self.assertEqual(got["urgent-active"].message_media_id, media.pk)
+            # The new producer slot is in force: the same producer/type cannot have two ACTIVE rows.
+            with connection.cursor() as cursor:
+                constraints = connection.introspection.get_constraints(cursor, ActiveBroadcastMessage._meta.db_table)
+            self.assertIn("active_message_one_active_per_producer_type", constraints)
+            self.assertNotIn("active_message_one_active_per_producer_kind", constraints)
+            column = ActiveBroadcastMessage._meta.get_field("content_type").column
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT is_nullable FROM information_schema.columns "
+                               "WHERE table_name = %s AND column_name = %s",
+                               [ActiveBroadcastMessage._meta.db_table, column])
+                self.assertEqual(cursor.fetchone()[0], "NO")
+        finally:
+            call_command("migrate", verbosity=0)

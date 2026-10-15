@@ -185,13 +185,23 @@ class ActiveBroadcastMessage(models.Model):
     ``message_media`` is immutable -- editing an active message means
     preparing a new one and activating it, which supersedes this one.
 
-    At most one ACTIVE message per (producer_key, kind), enforced by the
-    database. ``producer_key`` is the durable producer identity (native
+    Its producer SLOT is the exact ``content_type`` (a ProducedContentType of
+    delivery mode urgent or public address, D3A): at most one ACTIVE message
+    per (producer_key, content_type), enforced by the database -- so one
+    producer may have several public-address types, several urgent types, or
+    both, active together, and a replacement supersedes only the same exact
+    type. ``kind`` is the FROZEN broad composition class derived from the
+    type when the message was prepared; rendering and playout read only
+    ``kind`` and the frozen execution snapshot, never the mutable type
+    configuration. ``producer_key`` is the durable producer identity (native
     accounts are optional: ``producer`` is SET_NULL, the key and username
     snapshot stay)."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     kind = models.CharField(max_length=16, choices=MessageKind.choices)
+    content_type = models.ForeignKey(
+        "produced_content.ProducedContentType", on_delete=models.PROTECT, related_name="active_broadcast_messages",
+    )
     state = models.CharField(max_length=10, choices=MessageState.choices, default=MessageState.PREPARED)
     title = models.CharField(max_length=200, blank=True)
 
@@ -241,8 +251,8 @@ class ActiveBroadcastMessage(models.Model):
             models.CheckConstraint(condition=Q(producer_key__regex=PRODUCER_KEY_PATTERN),
                                    name="active_message_producer_key_shape"),
             models.CheckConstraint(condition=~Q(producer_username=""), name="active_message_producer_named"),
-            models.UniqueConstraint(fields=["producer_key", "kind"], condition=Q(state="active"),
-                                    name="active_message_one_active_per_producer_kind"),
+            models.UniqueConstraint(fields=["producer_key", "content_type"], condition=Q(state="active"),
+                                    name="active_message_one_active_per_producer_type"),
             models.CheckConstraint(
                 condition=~Q(state="prepared") | Q(
                     activation_generation__isnull=True, activated_at__isnull=True, next_due_at__isnull=True,
@@ -274,7 +284,7 @@ class ActiveBroadcastMessage(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.get_kind_display()} from {self.producer_username} [{self.state}]"
+        return f"{self.get_kind_display()} ({self.content_type_id}) from {self.producer_username} [{self.state}]"
 
     def save(self, *args, **kwargs):
         guard.refuse("active messages change only through active_messages.services")
