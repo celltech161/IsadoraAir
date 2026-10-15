@@ -68,10 +68,15 @@ def _error(exc: RecorderError) -> JsonResponse:
 
 
 def _adapter_and_subject(adapter_key, params, user, operation):
+    """Broad authorization, subject resolution, then the subject-aware check --
+    for every operation, before anything else happens."""
     adapter = registry.get(adapter_key)
     if not adapter.authorize(user, operation):
         raise Forbidden("forbidden", "you are not allowed to do that here")
-    return adapter, adapter.resolve(params)
+    subject = adapter.resolve(params)
+    if not adapter.authorize_subject(user, subject, operation):
+        raise Forbidden("forbidden", "you are not allowed to do that here")
+    return adapter, subject
 
 
 def _parse_media_id(value):
@@ -153,7 +158,7 @@ def _maybe_sweep_abandoned():
 @require_GET
 def workspace_index(request):
     """The iPortal workspace hub: the media tools this user may use."""
-    tools = [adapter for adapter in registry.all_adapters() if adapter.authorize(request.user, "open")]
+    tools = [adapter for adapter in registry.all_adapters() if adapter.show_in_hub(request.user)]
     return render(request, "production/iportal/index.html", {"tools": tools})
 
 

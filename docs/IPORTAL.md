@@ -30,9 +30,18 @@ The adapter supplies:
 * `context(request, subject)` → a `RecordingContext` rendered by the page and
   **never persisted**: title, purpose, allowed operations, max duration and
   bytes, an opaque optimistic `revision`, the current on-air audio (if any),
-  domain display rows, a return URL and a `blocked_reason`;
+  domain display rows, a return URL, a `blocked_reason` and optional `terms`
+  -- the workstation's wording for the committed state (default: the "on
+  air" wording; a consumer whose save does not put anything on air words it
+  differently);
 * `authorize(user, operation)` — server-side, for every operation (`open`,
   `record`, `import`, `edit`, `save`, `remove`, `export`);
+* `authorize_subject(user, subject, operation)` (2.22D3B) — the same, for the
+  EXACT resolved subject, called by the core for every operation right after
+  `resolve` and before any intake, preview, source or commit work (False →
+  403; raise `SubjectNotFound` to not disclose the subject). Default: allow;
+* `show_in_hub(user)` (2.22D3B) — whether the `/iportal/` hub lists the tool
+  (presentation only). Default: `authorize(user, "open")`;
 * `media_policy(subject)` — the domain's `MediaPolicy` bounds;
 * `can_access_media(user, subject, media)` — which UUIDs this user may preview
   or derive from here;
@@ -48,6 +57,11 @@ consumer's existing access rules apply. `/iportal/` is the workspace hub.
 The recorder core imports nothing from any consumer (enforced by
 `production/tests/test_recorder_core.py`, which runs the whole core through a
 scratch non-VoiceTrack adapter).
+
+Consumers: evergreen VoiceTrack (`evergreen-voicetrack`, below) and, since
+2.22D3B, urgent/public-address messages (`active-message`: the subject is one
+exact message UUID; saving binds audio to a draft and never publishes it —
+docs/ACTIVE_MESSAGES.md, "Producer workspace").
 
 ## The browser workstation
 

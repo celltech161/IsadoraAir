@@ -6,5 +6,6 @@ from production.recorder.urls import recorder_urlpatterns
 
 urlpatterns = [
     *recorder_urlpatterns("scratch-pad", page="scratch/", api="api/scratch/"),
+    *recorder_urlpatterns("scratch-guard", page="guarded/", api="api/guarded/"),
     path("", include("isadoraair.urls")),        # the real site (base.html links into it)
 ]

@@ -349,3 +349,131 @@ class RecorderCoreTests(IsolatedMediaRootMixin, TestCase):
         with mock.patch("production.services.reconcile.timezone.now", return_value=later):
             self.upload(fixture("wav16_mono.wav"))
         self.assertTrue(again.exists())                                   # throttled: at most once per interval
+
+
+class GuardedScratchAdapter(ScratchPadAdapter):
+    """A consumer whose authorization depends on the EXACT subject (2.22D3B):
+    slot ``a`` is open to everyone the broad check admits; slot ``b`` is
+    refused (403); slot ``h`` is hidden (404, existence never disclosed)."""
+
+    seen: list = []
+
+    def __init__(self):
+        RecordingAdapter.__init__(self, key="scratch-guard", label="Guarded pad", description="test consumer",
+                                  entry_url="/guarded/")
+
+    def authorize_subject(self, user, subject, operation):
+        GuardedScratchAdapter.seen.append((subject, operation))
+        if subject == "h":
+            raise SubjectNotFound("bad_subject", "no such slot")
+        return subject != "b"
+
+    def show_in_hub(self, user):
+        return getattr(user, "username", "") == "hub-visible"
+
+    def context(self, request, subject):
+        context = super().context(request, subject)
+        from dataclasses import replace
+        return replace(context, adapter=self.key, terms={"badge": "SAVED", "save": "Save to slot"})
+
+    def source(self, subject):
+        media_id = self.committed.get(subject)
+        return ("production_media", ProductionMedia.objects.get(pk=media_id)) if media_id else None
+
+
+@override_settings(ROOT_URLCONF=URLS, SECURE_SSL_REDIRECT=False)
+class SubjectAuthorizationTests(IsolatedMediaRootMixin, TestCase):
+    """The generic subject-aware hook: called for every operation right after
+    resolve, and a refusal happens before ANY intake, preview, source or
+    commit work."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.adapter = registry.register(GuardedScratchAdapter())
+        registry.register(ScratchPadAdapter())
+
+    @classmethod
+    def tearDownClass(cls):
+        registry._ADAPTERS.pop("scratch-guard", None)
+        registry._ADAPTERS.pop("scratch-pad", None)
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        ScratchPadAdapter.committed = {}
+        GuardedScratchAdapter.seen = []
+        self.user = User.objects.create_user("producer", password="x", is_staff=True)
+        self.client = Client(enforce_csrf_checks=True)
+        self.client.force_login(self.user)
+        self.client.get("/guarded/?slot=a")
+        self.csrf = self.client.cookies["csrftoken"].value
+
+    def take(self, slot, **extra):
+        query = "&".join(f"{key}={value}" for key, value in {"slot": slot, "mode": "record", **extra}.items())
+        return self.client.generic("POST", f"/api/guarded/take/?{query}", fixture("wav16_mono.wav"),
+                                   content_type="audio/wav", HTTP_X_CSRFTOKEN=self.csrf)
+
+    def post_json(self, url, data):
+        return self.client.post(url, json.dumps(data), content_type="application/json", HTTP_X_CSRFTOKEN=self.csrf)
+
+    def test_one_exact_subject_is_refused_while_another_is_allowed(self):
+        self.assertEqual(self.client.get("/guarded/?slot=a").status_code, 200)
+        self.assertEqual(self.client.get("/guarded/?slot=b").status_code, 403)
+        self.assertEqual(self.client.get("/guarded/?slot=h").status_code, 404)
+        self.assertEqual(self.client.get("/api/guarded/context/?slot=a").status_code, 200)
+        self.assertEqual(self.client.get("/api/guarded/context/?slot=b").json()["error"], "forbidden")
+        self.assertEqual(self.client.get("/api/guarded/context/?slot=h").json()["error"], "bad_subject")
+        self.assertIn(("b", "open"), GuardedScratchAdapter.seen)
+
+    def test_a_refused_subject_gets_no_intake_preview_source_or_commit_work(self):
+        allowed = self.take("a")
+        self.assertEqual(allowed.status_code, 201, allowed.content)
+        media_id = allowed.json()["media"]["media_id"]
+        rows = ProductionMedia.objects.count()
+        with mock.patch("production.services.intake.ingest_stream", side_effect=AssertionError("intake")), \
+                mock.patch("production.services.intake.ingest_derivative", side_effect=AssertionError("intake")):
+            for slot, status in (("b", 403), ("h", 404)):
+                with self.subTest(slot=slot):
+                    self.assertEqual(self.take(slot).status_code, status)
+                    self.assertEqual(self.take(slot, mode="edit", derived_from=media_id).status_code, status)
+        self.assertEqual(ProductionMedia.objects.count(), rows)                 # nothing was ingested
+        ScratchPadAdapter.committed["b"] = media_id                             # (b has audio, but...)
+        with mock.patch("production.services.media_io.open_media", side_effect=AssertionError("opened")):
+            self.assertEqual(self.client.get(f"/api/guarded/media/{media_id}/?slot=b").status_code, 403)
+            self.assertEqual(self.client.get("/api/guarded/source/?slot=b").status_code, 403)
+        with mock.patch.object(GuardedScratchAdapter, "commit", side_effect=AssertionError("commit")):
+            self.assertEqual(self.post_json("/api/guarded/commit/", {"subject": {"slot": "b"}, "media_id": media_id,
+                                                                     "revision": "absent"}).status_code, 403)
+            self.assertEqual(self.post_json("/api/guarded/revalidate/", {"subject": {"slot": "b"},
+                                                                         "media_id": media_id}).status_code, 403)
+            self.assertEqual(self.post_json("/api/guarded/remove/", {"subject": {"slot": "h"},
+                                                                     "revision": "absent"}).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/guarded/media/{media_id}/?slot=a").status_code, 200)
+
+    def test_the_default_hook_keeps_existing_consumers_unchanged(self):
+        plain = ScratchPadAdapter()
+        self.assertTrue(plain.authorize_subject(self.user, "anything", "save"))
+        self.assertEqual(plain.show_in_hub(self.user), plain.authorize(self.user, "open"))
+        context = plain.context(None, "a").as_json()
+        from production.recorder.contracts import DEFAULT_TERMS
+        self.assertEqual(context["terms"], DEFAULT_TERMS)                       # the original wording
+        page = self.client.get("/scratch/?slot=a")
+        self.assertContains(page, "ON AIR")
+        self.assertContains(page, "Save &amp; put on air")
+
+    def test_a_consumer_may_word_its_committed_state(self):
+        page = self.client.get("/guarded/?slot=a")
+        self.assertContains(page, "SAVED")
+        self.assertContains(page, "Save to slot")
+        self.assertNotContains(page, "Save &amp; put on air")
+        with self.assertRaises(ValueError):
+            RecordingContext(adapter="x", subject={}, title="", purpose="", allowed_operations=(),
+                             max_duration_seconds=1, max_bytes=1, revision="", terms={"bogus": "x"})
+
+    def test_the_hub_uses_the_presentation_hook(self):
+        self.assertNotContains(self.client.get("/iportal/"), "Guarded pad")
+        self.assertContains(self.client.get("/iportal/"), "Scratch pad")
+        visible = Client()
+        visible.force_login(User.objects.create_user("hub-visible", password="x", is_staff=True))
+        self.assertContains(visible.get("/iportal/"), "Guarded pad")

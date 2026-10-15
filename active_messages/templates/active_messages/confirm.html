@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}{{ verb }} message — iPortal — IsadoraAir{% endblock %}
+{% block content %}
+<div style="max-width: 640px; margin: 0 auto;">
+  <h1 style="font-size:1.2rem;">{{ verb }} this message?</h1>
+  <table style="font-size:0.9rem; margin: 0.5rem 0 1rem;">
+    <tr><th style="text-align:left; padding-right:1rem;">Content type</th><td>{{ message.content_type.name }} ({{ message.content_type.key }})</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">Class</th><td>{{ message.get_kind_display }}</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">Title</th><td>{{ message.title|default:message.content_type.name }}</td></tr>
+    <tr><th style="text-align:left; padding-right:1rem;">State</th><td>{{ message.get_state_display }}</td></tr>
+  </table>
+  <p style="color:var(--text-muted);">{{ explain }}</p>
+  <form method="post" action="{% if action == 'recall' %}{% url 'active_messages:recall' message.pk %}{% else %}{% url 'active_messages:discard' message.pk %}{% endif %}">
+    {% csrf_token %}
+    <button type="submit" style="font:inherit; padding:0.3rem 0.8rem; border-radius:5px; border:1px solid #b91c1c; background:transparent; color:#fca5a5; cursor:pointer;">{{ verb }} “{{ message.title|default:message.content_type.name }}”</button>
+    <a href="{% url 'active_messages:my-messages' %}" style="margin-left:1rem;">Cancel</a>
+  </form>
+</div>
+{% endblock %}

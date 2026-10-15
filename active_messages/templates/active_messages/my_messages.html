@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}My Messages — iPortal — IsadoraAir{% endblock %}
+{% block extra_css %}
+<style>
+  .am-wrap { max-width: 1000px; margin: 0 auto; }
+  .am-muted { color: var(--text-muted); font-size: 0.85rem; }
+  .am-banner { padding: 0.6rem 0.8rem; border-radius: 6px; margin: 0.5rem 0; border: 1px solid var(--border, #333); }
+  .am-banner.warn { border-color: #b45309; background: rgba(180, 83, 9, 0.12); }
+  .am-banner.ok { border-color: #15803d; background: rgba(21, 128, 61, 0.12); }
+  .am-banner.error { border-color: #b91c1c; background: rgba(185, 28, 28, 0.12); }
+  .am-type { margin: 1rem 0; padding: 0.75rem 0.9rem; border: 1px solid var(--border, #333); border-radius: 8px; }
+  .am-type h2 { font-size: 1rem; margin: 0 0 0.25rem; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .am-badge { font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; border: 1px solid var(--border, #444); }
+  .am-badge.urgent { border-color: #b91c1c; color: #fca5a5; }
+  .am-badge.active { border-color: #15803d; color: #86efac; }
+  .am-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin: 0.35rem 0; }
+  .am-row form { display: inline; margin: 0; }
+  .am-msg { padding: 0.4rem 0.5rem; border-left: 3px solid var(--border, #444); margin: 0.4rem 0; }
+  .am-msg.active { border-left-color: #15803d; }
+  .am-btn { font: inherit; font-size: 0.85rem; padding: 0.25rem 0.6rem; border-radius: 5px; cursor: pointer;
+            border: 1px solid var(--border, #444); background: transparent; color: inherit; text-decoration: none; }
+  .am-btn.primary { border-color: var(--accent, #2563eb); color: var(--accent, #60a5fa); }
+  .am-btn.danger { border-color: #b91c1c; color: #fca5a5; }
+  .am-facts { font-size: 0.8rem; color: var(--text-muted); }
+</style>
+{% endblock %}
+{% block content %}
+<div class="am-wrap" id="activeMessagesWorkspace">
+  <div class="am-row" style="justify-content: space-between;">
+    <h1 style="font-size:1.3rem; margin:0;">My Messages</h1>
+    <a href="/iportal/" class="am-muted">&larr; iPortal</a>
+  </div>
+  <p class="am-muted">
+    Your urgent and public-address messages. Record audio for a draft, then publish it. Saving audio never
+    publishes it: <strong>Save audio</strong> and <strong>Publish</strong> are separate steps. A published
+    message replaces only your active message of the same content type.
+  </p>
+  {% if not gate_open %}
+  <div class="am-banner warn" id="amGateClosed"><strong>Not on air:</strong> {{ gate_message }}
+    Messages can be prepared, published and recalled here, but nothing airs from them yet.</div>
+  {% endif %}
+  {% for item in messages %}
+  <div class="am-banner {% if item.tags == 'error' %}error{% elif item.tags == 'success' %}ok{% else %}warn{% endif %}">{{ item }}</div>
+  {% endfor %}
+
+  {% for row in rows %}
+  <section class="am-type" data-content-type="{{ row.type.key }}">
+    <h2>
+      {{ row.type.name }}
+      <span class="am-badge {% if row.type.delivery_mode == 'urgent' %}urgent{% endif %}">{{ row.type.get_delivery_mode_display }}</span>
+      <span class="am-muted">{{ row.type.key }}</span>
+    </h2>
+    <div class="am-facts">
+      Replay every {{ row.replay_seconds }} s{% if row.replay_is_default %} (station default){% endif %} ·
+      {% if row.type.producer_self_publish %}you publish your own messages{% else %}publishing needs operator approval{% endif %} ·
+      {% if row.type.recallable %}you can recall your active message{% else %}an operator clears active messages{% endif %}
+      {% if control %} · <em>control: you may publish and clear any of yours</em>{% endif %}
+    </div>
+
+    {% for entry in row.active %}
+    <div class="am-msg active" data-message="{{ entry.message.pk }}" data-state="active">
+      <span class="am-badge active">ACTIVE</span>
+      <strong>{{ entry.message.title|default:row.type.name }}</strong>
+      <span class="am-muted">since {{ entry.message.activated_at|date:"Y-m-d H:i" }}{% if entry.duration %} · {{ entry.duration|floatformat:1 }} s{% endif %}</span>
+      <div class="am-row">
+        <a class="am-btn" href="{{ entry.recorder_url }}">Listen</a>
+        {% if entry.can_recall %}
+        <a class="am-btn danger" href="{% url 'active_messages:recall' entry.message.pk %}">Recall…</a>
+        {% endif %}
+      </div>
+    </div>
+    {% empty %}
+    <div class="am-muted">No active message of this type.</div>
+    {% endfor %}
+
+    {% for entry in row.drafts %}
+    <div class="am-msg" data-message="{{ entry.message.pk }}" data-state="prepared">
+      <span class="am-badge">DRAFT</span>
+      <strong>{{ entry.message.title|default:row.type.name }}</strong>
+      <span class="am-muted">started {{ entry.message.created_at|date:"Y-m-d H:i" }} ·
+        {% if entry.duration %}audio saved ({{ entry.duration|floatformat:1 }} s){% else %}no audio yet{% endif %}</span>
+      <div class="am-row">
+        <a class="am-btn primary" href="{{ entry.recorder_url }}">Continue</a>
+        {% if entry.can_publish %}
+        <form method="post" action="{% url 'active_messages:publish' entry.message.pk %}">{% csrf_token %}
+          <button type="submit" class="am-btn primary">{% if row.active %}Publish replacement{% else %}Publish{% endif %}</button>
+        </form>
+        {% elif not entry.has_audio %}
+        <span class="am-muted">{% if entry.self_publish %}Save audio before publishing.{% else %}Save audio; it then awaits operator approval.{% endif %}</span>
+        {% else %}
+        <span class="am-badge" data-awaiting="approval">Awaiting operator approval</span>
+        {% endif %}
+        <a class="am-btn danger" href="{% url 'active_messages:discard' entry.message.pk %}">Discard…</a>
+      </div>
+    </div>
+    {% endfor %}
+    {% if row.drafts|length > 1 %}
+    <div class="am-muted">You have {{ row.drafts|length }} drafts of this type; each is separate.</div>
+    {% endif %}
+
+    <form method="post" action="{% url 'active_messages:start' %}" class="am-row">{% csrf_token %}
+      <input type="hidden" name="content_type" value="{{ row.type.key }}">
+      <input type="text" name="title" maxlength="200" placeholder="Title (optional): {{ row.type.name }}" style="flex:1; min-width:12rem;">
+      <button type="submit" class="am-btn{% if not row.drafts %} primary{% endif %}">{% if row.drafts %}Start another draft{% else %}New message{% endif %}</button>
+    </form>
+  </section>
+  {% empty %}
+  <p>No urgent or public-address content types are assigned to your account.</p>
+  {% endfor %}
+
+  {% if others %}
+  <section class="am-type" id="amOtherMessages">
+    <h2>Your other messages</h2>
+    <div class="am-facts">Messages of content types no longer offered to you. You can still withdraw them.</div>
+    {% for entry in others %}
+    <div class="am-msg{% if entry.message.state == 'active' %} active{% endif %}" data-message="{{ entry.message.pk }}" data-state="{{ entry.message.state }}">
+      <span class="am-badge">{{ entry.message.get_state_display|upper }}</span>
+      <strong>{{ entry.message.title|default:entry.message.content_type.name }}</strong>
+      <span class="am-muted">{{ entry.message.content_type.name }}</span>
+      <div class="am-row">
+        <a class="am-btn" href="{{ entry.recorder_url }}">Open</a>
+        {% if entry.message.state == 'prepared' %}
+        <a class="am-btn danger" href="{% url 'active_messages:discard' entry.message.pk %}">Discard…</a>
+        {% elif entry.can_recall %}
+        <a class="am-btn danger" href="{% url 'active_messages:recall' entry.message.pk %}">Recall…</a>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+  <p class="am-muted">Longest message: {{ max_message_seconds }} s.</p>
+</div>
+{% endblock %}

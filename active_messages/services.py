@@ -51,6 +51,7 @@ nothing in D1 can move an execution to STARTED.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import timedelta
@@ -143,6 +144,17 @@ class EvidenceRefused(ActiveMessageError):
 
 class NativeAiringUnavailable(ActiveMessageError):
     code = "native_airing_unavailable"
+
+
+class RevisionConflict(ActiveMessageError):
+    """The message changed since the caller's revision was issued (another
+    editor bound other media, or it left PREPARED). Nothing was changed."""
+
+    code = "stale_revision"
+
+    def __init__(self, message: str, *, current_revision: str):
+        super().__init__(message)
+        self.current_revision = current_revision
 
 
 class ContentTypeRefused(InvalidRequest):
@@ -454,12 +466,34 @@ def prepare_message(*, actor, content_type, title="", expires_at=None, now=None)
     return row
 
 
-def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
+def message_revision(message) -> str:
+    """Opaque optimistic-concurrency token for one exact message (D3B): it
+    changes whenever the bound media changes -- including a rebind back to an
+    earlier media (each bind appends a ``media_bound`` event) -- and whenever
+    the message changes state (it leaves PREPARED). Derived from durable
+    domain facts; nothing extra is stored. Compare it only under the message
+    row lock (``bind_message_media(expected_revision=...)``)."""
+    # Always the stored row (never a caller's possibly stale instance); inside
+    # bind_message_media that is the row it has locked.
+    row = (ActiveBroadcastMessage.objects.filter(pk=_message_id(message))
+           .values("id", "state", "message_media_id").first())
+    if row is None:
+        raise InvalidRequest("no such active message", code="unknown_message")
+    last_bind = (ActiveBroadcastMessageEvent.objects.filter(message_id=row["id"], event="media_bound")
+                 .order_by("-id").values_list("id", flat=True).first())
+    material = f"{row['id']}|{row['state']}|{row['message_media_id'] or ''}|{last_bind or 0}"
+    return hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def bind_message_media(message, media, *, actor, expected_revision=None) -> ActiveBroadcastMessage:
     """Bind (or replace) the exact media a PREPARED message will air.
 
     Only the producer -- or a control-capable operator -- binds, and only to
     a PREPARED message: an ACTIVE message's media is immutable. Rebinding the
-    same media is a no-op."""
+    same media is a no-op. With ``expected_revision`` (an editor's
+    ``message_revision``), the bind happens only if the message is still
+    exactly that revision, checked under the message row lock: a stale editor
+    gets RevisionConflict and never overwrites a newer binding."""
     # CONTROL is independently sufficient: a control-room operator may bind
     # eligible media to any draft without also being a producer. Everyone
     # else must hold PRODUCE and remains confined to their own draft/media.
@@ -468,6 +502,13 @@ def bind_message_media(message, media, *, actor) -> ActiveBroadcastMessage:
     media_id = getattr(media, "pk", media)
     with transaction.atomic():
         row = _lock_message(message)
+        if expected_revision is not None:
+            if row.producer_id != actor.pk and not can(actor, CONTROL):
+                raise NotPermitted("only the producer binds media to a prepared message")
+            current = message_revision(row)
+            if str(expected_revision) != current:
+                raise RevisionConflict("the message changed since this editor opened it",
+                                       current_revision=current)
         if row.state != M.PREPARED:
             raise InvalidTransition(f"a {row.state} message's media cannot change", code="media_immutable")
         control = can(actor, CONTROL)
@@ -618,7 +659,7 @@ def _require_recall(actor, row) -> bool:
     return True
 
 
-def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMessage:
+def clear_message(message, *, actor, reason="", now=None, expected_state=None) -> ActiveBroadcastMessage:
     """Clear exactly this message (never "the producer's current one").
 
     ACTIVE -> CLEARED (control, or the producer's own recall of a recallable
@@ -626,7 +667,13 @@ def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMess
     An airing already on air is not cut (that is the engine's, D2B).
     PREPARED -> CLEARED (discard): its producer or a control-capable operator;
     the composition does not change.
-    Idempotent: a cleared or expired message is returned unchanged."""
+    Idempotent: a cleared or expired message is returned unchanged.
+    ``expected_state`` (D3B: "discard this draft" / "recall this active
+    message"): act only if the message is still in that state, checked under
+    its row lock -- a discard can never become a recall of a message that was
+    activated meanwhile (InvalidTransition ``state_changed``)."""
+    if expected_state is not None and expected_state not in (M.PREPARED, M.ACTIVE):
+        raise InvalidRequest("expected_state is prepared or active")
     if not (can(actor, PRODUCE) or can(actor, CONTROL)):
         _require(actor, CONTROL)
     if not isinstance(reason, str) or len(reason) > REASON_LIMIT:
@@ -637,6 +684,8 @@ def clear_message(message, *, actor, reason="", now=None) -> ActiveBroadcastMess
         row = _lock_message(message)
         if row.state in TERMINAL_MESSAGE_STATES:
             return row
+        if expected_state is not None and row.state != expected_state:
+            raise InvalidTransition(f"the message is {row.state}, not {expected_state}", code="state_changed")
         if row.state == M.PREPARED:
             if row.producer_id != actor.pk and not can(actor, CONTROL):
                 raise NotPermitted("only the producer discards a prepared message")

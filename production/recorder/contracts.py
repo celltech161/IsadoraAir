@@ -10,9 +10,11 @@ an explicit ``RecordingAdapter`` registered under a fixed key (see registry):
   generic foreign key;
 * the domain supplies a ``RecordingContext`` -- an in-memory description the
   recorder renders, never persisted: there is no generic "recording job";
-* the domain authorizes every operation server-side and decides what
-  "commit" means for it (for an evergreen VoiceTrack: atomically repoint the
-  binding through the locked binding service).
+* the domain authorizes every operation server-side -- broadly
+  (``authorize``) and, once the subject is resolved, for that EXACT subject
+  (``authorize_subject``, before any intake, preview, source or commit work)
+  -- and decides what "commit" means for it (for an evergreen VoiceTrack:
+  atomically repoint the binding through the locked binding service).
 
 The recorder's only durable output is a validated, immutable ProductionMedia
 created through production.services.intake; the domain's only durable output
@@ -27,6 +29,19 @@ from production.policy import MediaPolicy
 # Operations a context may allow. The recorder renders only what is allowed;
 # the server authorizes each one again regardless.
 OPERATIONS = ("open", "record", "import", "edit", "save", "remove", "export")
+
+# The workstation's wording for the domain's committed state. The defaults are
+# the original wording; a domain whose "save" does not put anything on air (a
+# draft that is published separately) supplies its own (RecordingContext.terms).
+DEFAULT_TERMS = {
+    "badge": "ON AIR",                                        # badge over the committed audio panel
+    "save": "Save & put on air",                              # the save button
+    "current": "on-air take",                                 # the committed take, as a noun
+    "current_exists": "A take is already on air here",        # the editor is empty but a take is committed
+    "none": "Nothing on air yet.",                            # nothing is committed
+    "changed": "The on-air audio has changed since then.",    # a browser draft predates the committed audio
+    "saved": "",                                              # after a save ("" = derived from air_label)
+}
 
 
 class RecorderError(Exception):
@@ -82,11 +97,18 @@ class RecordingContext:
     return_url: str = ""
     blocked_reason: str = ""         # why recording/saving is unavailable right now, if it is
     air_label: str = "On air"        # what the domain calls the committed state
+    terms: dict = field(default_factory=dict)   # overrides of DEFAULT_TERMS (wording only)
+
+    def __post_init__(self):
+        unknown = set(self.terms) - set(DEFAULT_TERMS)
+        if unknown:
+            raise ValueError(f"unknown recorder terms: {sorted(unknown)}")
 
     def as_json(self) -> dict:
         data = asdict(self)
         data["allowed_operations"] = list(self.allowed_operations)
         data["display"] = [list(row) for row in self.display]
+        data["terms"] = {**DEFAULT_TERMS, **{key: str(value) for key, value in self.terms.items()}}
         return data
 
 
@@ -103,6 +125,19 @@ class RecordingAdapter:
     # -- authorization (server-side, authoritative) ------------------------
     def authorize(self, user, operation: str) -> bool:
         raise NotImplementedError
+
+    def authorize_subject(self, user, subject, operation: str) -> bool:
+        """May ``user`` perform ``operation`` on this EXACT resolved subject?
+        The recorder calls it for every operation right after ``resolve`` and
+        before any intake, preview, source or commit work. False -> 403; a
+        domain that must not disclose the subject's existence raises
+        SubjectNotFound instead. Default: the broad ``authorize`` decides."""
+        return True
+
+    def show_in_hub(self, user) -> bool:
+        """Should the iPortal hub list this tool for ``user``? A presentation
+        choice, never authorization. Default: whoever may open it."""
+        return self.authorize(user, "open")
 
     # -- the subject ---------------------------------------------------------
     def resolve(self, params) -> object:

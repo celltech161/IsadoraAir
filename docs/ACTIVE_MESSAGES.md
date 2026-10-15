@@ -34,7 +34,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D2A** | constrained `assemble` render operation (`active_message_mix`), exact provenance, rendition reuse, the worker, `bind_execution_mix` (PENDING_RENDER → READY) | **no** — no engine command |
 | **D2B** (this) | publish the READY aggregate as an ordinary UrgentPA Track; the existing `insert_urgent` splice for that exact Track; deck-open authority; the deck's own evidence → STARTED/COMPLETED/INTERRUPTED | only through the existing A/B decks, and **only with the native-airing gate open** (closed in production until Phase G) |
 | **D3A** | native produced-content authority: `ProducedContentType` (regular / public address / urgent / test) and producer assignments; active messages keyed by the exact content type; producer self-publish and recall | **no** — authority and configuration only |
-| D3B+ | recorder adapter, producer pages, regular processing (D3C), operator board, monitoring | gate still closed |
+| **D3B** | the producer workspace: "My Messages" (`/iportal/messages/`) and the shared iPortal recorder on one exact message (adapter `active-message`); Save audio ≠ Publish; producer recall/discard | **no** — gate still closed |
+| D3C+ | regular processing (D3C), operator board, Replay Now UI, monitoring | gate still closed |
 
 ## Authority
 
@@ -208,6 +209,68 @@ backfills every existing message from its frozen kind.
 Nothing is imported from legacy OGRemote (category table, users,
 assignments, submissions, files): that belongs to the migration/cutover
 phases.
+
+## Producer workspace (D3B)
+
+**My Messages** — `/iportal/messages/` (the iPortal hub's entry for this tool;
+the hub lists it for control, and for a producer with at least one enabled
+assigned public-address/urgent type). For each enabled urgent/public-address
+type the user may produce (assigned types; every enabled one for control —
+never regular or test types) it shows the class, replay interval, whether
+the producer may self-publish and recall, the producer's own ACTIVE message
+of that type and **every** PREPARED draft (several drafts are shown, never
+guessed between). The producer's own unfinished messages of types no longer
+offered (assignment removed, type disabled) stay listed so they can still be
+withdrawn. Non-staff users reach it through the station's GroupAccess
+allowlist (grant `/iportal/` to producer groups); staff bypass it.
+
+| Action | How | Service |
+| --- | --- | --- |
+| new draft | POST, exact content type key, optional title | `prepare_message` |
+| record / import / edit / **Save audio** | the shared recorder on `?message=<uuid>` | `bind_message_media(expected_revision=…)` |
+| **Publish** / Publish replacement | POST on the exact UUID; offered only when the type allows self-publish (control: always) — otherwise the draft shows "Awaiting operator approval" | `activate_message` |
+| Recall | confirmation page naming type and title, then POST on the exact UUID (offered when recallable) | `clear_message(expected_state=active)` |
+| Discard draft | confirmation page, then POST on the exact UUID | `clear_message(expected_state=prepared)` |
+
+Saving audio **never** publishes: a PREPARED message with audio is still a
+draft (and, when the type has no producer self-publish, it awaits operator
+approval — PREPARED is the review state; there is no other approval
+lifecycle). Every POST is CSRF-protected and authorized again by the
+services; another producer's message is a 404. `expected_state` makes a
+stale "discard" unable to recall a message that was activated meanwhile.
+
+**The recorder subject is one exact message UUID** (`active_messages/iportal.py`):
+never a producer/kind pair, "the current message", a type name, a path or a
+generic key. Per message (the recorder's subject-aware check, before any
+intake, preview, source or commit work):
+
+* PREPARED — control on an enabled type, or its own producer while holding
+  `active_message.produce` and still assigned to the exact enabled type, may
+  record/import/edit/save; otherwise it opens read-only with the reason;
+* ACTIVE — read-only: its owner or control may preview/export its exact bound
+  audio; a change means preparing and publishing a replacement;
+* CLEARED/EXPIRED — read-only;
+* anyone else — 404; `remove` is never offered (discard is a lifecycle
+  action on the Messages page).
+
+Media access: one's own takes, and the audio bound to this exact message —
+assignment to the same type never grants another producer's takes. Intake
+uses the shared `MediaPolicy`: engine-decodable, at most the current
+`max_message_seconds`, within the platform byte ceiling; `bind_message_media`
+remains the final validation.
+
+**Optimistic revision.** `services.message_revision(message)` is an opaque
+token derived from durable facts — the state, the bound media and the id of
+the latest `media_bound` event (so A→B→A still changes it); nothing extra is
+stored. The recorder's commit passes it to `bind_message_media`, which
+compares it **under the message row lock**: a second editor holding an older
+revision gets `RevisionConflict` (HTTP 409) and the first binding stands; a
+save racing an activation can never change an ACTIVE message's media.
+
+While native airing is unavailable (every installation until Phase G), the
+page and the recorder say so: "Native Active Message airing is not enabled on
+this installation." The workflow itself still works (prepare, save, publish,
+recall) and dispatches nothing to the engine.
 
 ## Generation and lock order
 
@@ -692,3 +755,20 @@ and untouched.
   airing stays impossible: `NATIVE_AIRING_AVAILABLE` is False.
 * Not in D3A: producer pages, the recorder adapter, regular recipes and
   delivery (D3C), the operator board, OGRemote data import, cutover.
+
+## Release notes for D3B
+
+* No migration, no new table or field: the draft revision is derived from
+  existing durable facts.
+* The shared recorder gains two backward-compatible adapter hooks --
+  `authorize_subject(user, subject, operation)` (default: allow) and
+  `show_in_hub(user)` (default: `authorize(user, "open")`) -- and optional
+  `RecordingContext.terms` wording (defaults: the original "on air" wording).
+  Evergreen VoiceTrack is unchanged.
+* New pages under `/iportal/messages/`; grant `/iportal/` to producer groups
+  in GroupAccess for non-staff producers.
+* `bind_message_media(expected_revision=...)` and
+  `clear_message(expected_state=...)` are optional; existing callers are
+  unchanged.
+* No engine, renderer, GStreamer or service change; `NATIVE_AIRING_AVAILABLE`
+  stays False.

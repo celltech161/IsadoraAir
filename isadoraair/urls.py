@@ -42,5 +42,6 @@ urlpatterns = [
     path('', include('webrequests.urls')),
     path('', include('aircheck.urls')),
     path('', include('production.urls')),
+    path('', include('active_messages.urls')),
     path('', include('library.urls')),
 ]

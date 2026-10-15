@@ -49,6 +49,14 @@
   S.baseRevision = S.ctx.revision;
 
   function allowed(op) { return S.ctx.allowed_operations.indexOf(op) >= 0; }
+  // The domain's wording for its committed state (RecordingContext.terms);
+  // the fallbacks are the original wording.
+  var DEFAULT_TERMS = {
+    badge: "ON AIR", save: "Save & put on air", current: "on-air take",
+    current_exists: "A take is already on air here", none: "Nothing on air yet.",
+    changed: "The on-air audio has changed since then.", saved: "",
+  };
+  function term(name) { return (S.ctx.terms && S.ctx.terms[name]) || DEFAULT_TERMS[name]; }
   // Drafts are keyed by the SERVER-provided per-user namespace + workspace +
   // subject: another person using this browser profile never sees them.
   var DRAFT_KEY_PREFIX = "u:" + S.page.draft_namespace + "|";
@@ -73,6 +81,10 @@
     var c = S.ctx;
     $("ipTitle").textContent = c.title;
     $("ipPurpose").textContent = c.purpose;
+    $("ipAirBadge").textContent = term("badge");
+    $("ipSave").textContent = term("save");
+    $("ipLoadCurrent").textContent = $("ipLoadCurrentEmpty").textContent = "Edit the " + term("current");
+    $("ipEditorEmptyText").textContent = term("current_exists");
     $("ipMax").textContent = fmt(c.max_duration_seconds);
     var blocked = $("ipBlocked");
     blocked.hidden = !c.blocked_reason;
@@ -95,7 +107,7 @@
       audio.addEventListener("play", function () { if (S.recorder) S.recorder.release(); });
       cur.appendChild(label); cur.appendChild(audio);
     } else {
-      cur.textContent = "Nothing on air yet.";
+      cur.textContent = term("none");
     }
     $("ipLoadCurrent").hidden = !(c.current && allowed("edit"));
     $("ipRemove").hidden = !allowed("remove");
@@ -254,10 +266,10 @@
     if (!S.pcm || !A.length(S.pcm)) {
       // An existing on-air take is never implied away: say it is not loaded.
       var onAir = !!S.ctx.current;
-      $("ipSelection").textContent = onAir ? "Editor empty — the on-air take is not loaded." : "No audio yet.";
+      $("ipSelection").textContent = onAir ? "Editor empty — the " + term("current") + " is not loaded." : "No audio yet.";
       if (onAir) {
         ctx2d.fillStyle = "#9ca3af"; ctx2d.font = "14px sans-serif"; ctx2d.textAlign = "center";
-        ctx2d.fillText("The on-air take is not loaded — use “Edit the on-air take” to edit it.", w / 2, h / 2);
+        ctx2d.fillText("The " + term("current") + " is not loaded — use “Edit the " + term("current") + "” to edit it.", w / 2, h / 2);
       }
       return;
     }
@@ -332,9 +344,9 @@
       S.view = { start: 0, end: A.duration(pcm) };
       S.dirty = false;
       draw(); refreshControls();
-      message("Loaded the on-air take into the editor. Your edits become a NEW take when you save.", "info");
+      message("Loaded the " + term("current") + " into the editor. Your edits become a NEW take when you save.", "info");
     } catch (err) {
-      message("The on-air take could not be loaded for editing.", "error");
+      message("The " + term("current") + " could not be loaded for editing.", "error");
     }
   }
 
@@ -414,7 +426,7 @@
     return draftTx("readonly", function (store) { return store.get(subjectKey()); }).then(function (draft) {
       if (!draft || !draft.channels) return;
       S.draft = draft;
-      var changed = draft.revision !== S.ctx.revision ? " The on-air audio has changed since then." : "";
+      var changed = draft.revision !== S.ctx.revision ? " " + term("changed") : "";
       $("ipDraftText").textContent = "You have an unsaved draft from " + new Date(draft.savedAt).toLocaleString() + "." + changed;
       $("ipDraftBanner").hidden = false;
     }).catch(function () {});
@@ -537,7 +549,7 @@
     S.undo.clear();
     await deleteDraft();
     renderContext();
-    message("Saved. This take is now " + S.ctx.air_label.toLowerCase() + ".", "ok");
+    message(term("saved") || ("Saved. This take is now " + S.ctx.air_label.toLowerCase() + "."), "ok");
     $("ipSaveState").textContent = "No unsaved changes.";
     refreshControls();
   }
