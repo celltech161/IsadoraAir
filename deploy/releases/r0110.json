@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "release_id": "r0110",
+  "previous_release_id": "r0109",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Phase D active messages, dormant: native urgent/public-address message authority, aggregate render, exact UrgentPA Track playout projection via existing insert_urgent, produced-content types and producer assignments, producer My Messages workspace on the shared iPortal recorder. NATIVE_AIRING_AVAILABLE=False: nothing native can air; OGRemote stays authoritative. Six migrations (manual ops covered by the r0110 companion); collectstatic; Gunicorn+engine restart; runtime 13 unchanged.",
+  "migrations_required": [
+    "produced_content.0001_initial",
+    "active_messages.0001_initial",
+    "active_messages.0002_playout_correlation",
+    "active_messages.0003_message_content_type",
+    "active_messages.0004_message_content_type_identity",
+    "authz.0008_active_message_capabilities"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
