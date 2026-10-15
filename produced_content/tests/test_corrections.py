@@ -9,7 +9,14 @@ C. The ProducedContentType -> SpokenContentType link is bridge-only identity:
    no ordinary save or queryset write attaches, replaces or clears it, and a
    non-regular type never holds one (database CHECK too).
 D. A TEST take always binds a type that is still TEST at the commit point
-   (type row locked first; a concurrent mode change is serialized)."""
+   (type row locked first; a concurrent mode change is serialized).
+
+Final pass:
+E. The guard also covers ProducedContentType._base_manager.
+F. A withdrawal's expected state is authoritative only under the lifecycle's
+   own lock: spoken checks it on the locked item (pre-delivery: _apply;
+   delivered/superseded: spoken.delivery after advisory -> type -> item), so a
+   stale confirmation never recalls an item that moved on."""
 import threading
 import time
 from unittest import mock
@@ -45,8 +52,7 @@ def no_bridge(*args, **kwargs):
     raise AssertionError("a refused request must never reach the backend bridge")
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
-class Case(People, ProjectionMixin, TestCase):
+class Producing(People, ProjectionMixin):
     def setUp(self):
         super().setUp()
         self.news = regular_type("town_news", output_mode="single", recipe_key="lcl_psa", name="Town News")
@@ -74,6 +80,11 @@ class Case(People, ProjectionMixin, TestCase):
         with self.captureOnCommitCallbacks(execute=True):
             return self.post(user, f"{PAGE}{item.pk}/withdraw/",
                              {"expected_state": expected or SpokenItem.objects.get(pk=item.pk).state})
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class Case(Producing, TestCase):
+    pass
 
 
 class ControlAuthorityTests(Case):
@@ -419,3 +430,184 @@ class TestFirstSaveRaceTests(People, TransactionTestCase):
         self.assertIsInstance(error, no_air.NotFound)            # no longer a test type at its commit point
         self.assertEqual(ProducedContentType.objects.get(pk=self.practice.pk).delivery_mode, "public_address")
         self.assertFalse(ProducedContentTestTake.objects.exists())
+
+
+class BaseManagerGuardTests(TestCase):
+    """E. Django's base manager is the guarded one too (spoken's pattern)."""
+
+    def setUp(self):
+        self.linked = regular_type("bm_linked", recipe_key="lcl_psa")
+        self.backing = backend.ensure_regular_backend(self.linked)
+        self.unlinked = regular_type("bm_unlinked", recipe_key="lcl_psa", category_code="PCBM")
+        self.other = SpokenContentType.objects.create(code="bm-stray", name="Stray", delivery_mode="accumulating",
+                                                      recipe_key="lcl_psa", target_category=self.backing.target_category)
+
+    def link_of(self, row):
+        return ProducedContentType._base_manager.get(pk=row.pk).spoken_content_type_id
+
+    def test_the_base_manager_is_the_guarded_manager(self):
+        from produced_content.models import ProducedContentTypeQuerySet
+        self.assertIsInstance(ProducedContentType._base_manager.all(), ProducedContentTypeQuerySet)
+
+    def test_base_manager_attach_replace_and_clear_are_refused_outside_the_grant(self):
+        cases = [(self.unlinked, self.other.pk, None),            # first attachment
+                 (self.linked, self.other.pk, self.backing.pk),    # replacement
+                 (self.linked, None, self.backing.pk)]             # clearing
+        for row, value, before in cases:
+            for field in ("spoken_content_type", "spoken_content_type_id"):
+                with self.subTest(row=row.key, value=value, field=field), self.assertRaises(BackendLinkRefused):
+                    ProducedContentType._base_manager.filter(pk=row.pk).update(**{field: value})
+                self.assertEqual(self.link_of(row), before)
+        # a grant for one exact first link never covers a replacement or another row
+        with self.assertRaises(BackendLinkRefused), _grant_backend_link(self.linked.pk, self.other.pk):
+            ProducedContentType._base_manager.filter(pk=self.linked.pk).update(spoken_content_type_id=self.other.pk)
+        with self.assertRaises(BackendLinkRefused), _grant_backend_link(self.unlinked.pk, self.other.pk):
+            ProducedContentType._base_manager.filter(pk=self.linked.pk).update(spoken_content_type_id=self.other.pk)
+
+    def test_the_bridge_still_links_and_raw_sql_still_meets_the_check(self):
+        linked = backend.ensure_regular_backend(self.unlinked)
+        self.assertEqual(self.link_of(self.unlinked), linked.pk)
+        practice = no_air_type("bm_practice")
+        with self.assertRaises(IntegrityError), transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute(f"UPDATE {PRODUCED_TABLE} SET spoken_content_type_id = %s WHERE id = %s",
+                           [self.other.pk, practice.pk])
+
+
+class ExpectedStateTests(Case):
+    """F (sequential): the spoken API checks the expected state on the locked row."""
+
+    def test_pre_delivery_recall_refuses_a_stale_expected_state_without_change(self):
+        item = self.submitted(self.producer, self.news, "moved on")              # VALIDATED
+        with self.assertRaises(transitions.InvalidTransition) as caught:
+            transitions.recall(item.pk, actor=self.producer, expected_state=S.DRAFT)
+        self.assertEqual(caught.exception.code, "state_changed")
+        self.assertEqual(SpokenItem.objects.get(pk=item.pk).state, S.VALIDATED)
+        self.assertEqual(transitions.recall(item.pk, actor=self.producer, expected_state=S.VALIDATED).state,
+                         S.RECALLED)                                             # a match recalls normally
+
+    def test_delivered_recall_refuses_a_superseded_item_expected_delivered(self):
+        old = self.delivered(self.producer, self.news, "old")
+        new = self.delivered(self.producer, self.news, "new")
+        with self.assertRaises(transitions.InvalidTransition) as caught:
+            delivery.recall_delivered(old.pk, actor=self.producer, expected_state=S.DELIVERED)
+        self.assertEqual(caught.exception.code, "state_changed")
+        self.assertEqual(SpokenItem.objects.get(pk=old.pk).state, S.SUPERSEDED)
+        with self.captureOnCommitCallbacks(execute=True):
+            recalled = transitions.recall(new.pk, actor=self.controller, expected_state=S.DELIVERED)
+        self.assertEqual(recalled.state, S.RECALLED)                             # a match recalls normally
+
+    def test_omitting_the_expected_state_keeps_the_existing_behavior(self):
+        old = self.delivered(self.producer, self.news, "old")
+        self.delivered(self.producer, self.news, "new")
+        self.assertEqual(transitions.recall(old.pk, actor=self.producer).state, S.RECALLED)   # superseded: no effect
+        draft = regular.start(self.producer, self.news)
+        self.assertEqual(transitions.recall(draft.pk, actor=self.producer).state, S.RECALLED)
+
+
+def _wait_for_lock_waiter(test, table, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                           "AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query ILIKE %s",
+                           [f"%{table}%"])
+            if cursor.fetchone()[0]:
+                return
+        time.sleep(0.005)
+    test.fail(f"nobody waited for a lock on {table}")
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class StaleWithdrawalRaceTests(Producing, TransactionTestCase):
+    """F (concurrent): real concurrent transactions, each party on its own
+    connection. Party A holds an OLD confirmation (it passes the unlocked
+    presentation check); party B moves the item on and commits; A's spoken
+    recall then sees the new state under the authoritative lock and refuses."""
+
+    serialized_rollback = True
+
+    def withdraw_after(self, item, expected, *, between):
+        """A: regular.withdraw(expected_state=expected), with ``between`` (party
+        B, its own thread and connection, committed) run after A's unlocked
+        presentation check and before A's spoken recall locks anything."""
+        real_recall = transitions.recall
+
+        def paused_recall(*args, **kwargs):
+            other = _Party(between)
+            other.start()
+            _result, error = other.finish()
+            if error is not None:
+                raise error
+            return real_recall(*args, **kwargs)
+
+        with mock.patch("spoken.transitions.recall", side_effect=paused_recall):
+            party = _Party(lambda: regular.withdraw(self.producer, item.pk, expected_state=expected))
+            party.start()
+            return party.finish()
+
+    def recalled_events(self, item):
+        return SpokenItem.objects.get(pk=item.pk).events.filter(event="recalled").count()
+
+    def test_a_stale_draft_confirmation_never_recalls_the_validated_item(self):
+        draft = regular.start(self.producer, self.news, title="draft")
+        take = media_row(self.producer)
+        _result, error = self.withdraw_after(draft, S.DRAFT, between=lambda: regular.submit(
+            self.producer, draft.pk, take, expected_revision=regular.item_revision(draft.pk)))
+        self.assertIsInstance(error, regular.StateConflict)
+        self.assertEqual(error.code, "state_changed")
+        self.assertEqual(SpokenItem.objects.get(pk=draft.pk).state, S.VALIDATED)
+        self.assertEqual(self.recalled_events(draft), 0)
+
+    def test_a_stale_draft_confirmation_waits_for_the_submission_lock_and_then_refuses(self):
+        """The lock-wait order: B holds the item row (submit + validation, not
+        yet committed); A's withdrawal passes its unlocked check, then WAITS on
+        the item lock inside spoken, and refuses once B commits."""
+        draft = regular.start(self.producer, self.news, title="draft")
+        take = media_row(self.producer)
+        ready, release = threading.Event(), threading.Event()
+
+        def submit_and_hold():
+            with transaction.atomic():
+                regular.submit(self.producer, draft.pk, take, expected_revision=regular.item_revision(draft.pk))
+                ready.set()
+                release.wait(30)
+
+        holder = _Party(submit_and_hold)
+        holder.start()
+        self.assertTrue(ready.wait(30))
+        withdrawer = _Party(lambda: regular.withdraw(self.producer, draft.pk, expected_state=S.DRAFT))
+        withdrawer.start()
+        _wait_for_lock_waiter(self, SpokenItem._meta.db_table)             # inside spoken, on the item row
+        release.set()
+        self.assertIsNone(holder.finish()[1])
+        _result, error = withdrawer.finish()
+        self.assertIsInstance(error, regular.StateConflict)
+        self.assertEqual(SpokenItem.objects.get(pk=draft.pk).state, S.VALIDATED)
+        self.assertEqual(self.recalled_events(draft), 0)
+
+    def test_a_stale_delivered_confirmation_never_recalls_the_superseded_item(self):
+        old = self.delivered(self.producer, self.news, "old")
+        replacement = self.submitted(self.producer, self.news, "replacement")
+        replacement, token = transitions.start_processing(replacement, lease_seconds=600)
+        rendition = self.stored_rendition(replacement, flac(next(self._lengths)))
+        transitions.complete_processing(replacement, lease_token=token, evidence=render.RenderEvidence(
+            rendition_id=str(rendition.pk), source_id=str(rendition.derived_from_id),
+            recipe_key=rendition.recipe_key, recipe_version=rendition.recipe_version,
+            provenance_digest=rendition.recipe_params_digest))
+        _result, error = self.withdraw_after(old, S.DELIVERED, between=lambda: delivery.deliver_item(replacement.pk))
+        self.assertIsInstance(error, regular.StateConflict)
+        self.assertEqual(error.code, "state_changed")
+        self.assertEqual(SpokenItem.objects.get(pk=old.pk).state, S.SUPERSEDED)
+        self.assertEqual(self.recalled_events(old), 0)
+        asset = SpokenAsset.objects.get(content_type__produced_content_type=self.news)
+        self.assertEqual((asset.state, asset.current_item_id), (AssetState.LIVE, replacement.pk))
+        self.assertTrue(Track.objects.get(pk=asset.track_id).ready2air)
+        self.assertEqual(self.sha_on_disk(asset.library_relpath), rendition.sha256)   # bytes unchanged
+
+    def test_a_matching_expected_state_still_recalls(self):
+        live = self.delivered(self.producer, self.news, "live")
+        recalled = regular.withdraw(self.producer, live.pk, expected_state=S.DELIVERED)
+        self.assertEqual(recalled.state, S.RECALLED)
+        asset = SpokenAsset.objects.get(content_type__produced_content_type=self.news)
+        self.assertEqual(asset.state, AssetState.PENDING)
+        self.assertFalse(Track.objects.get(pk=asset.track_id).ready2air)

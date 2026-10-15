@@ -367,6 +367,12 @@ class ProducedContentType(models.Model):
             super().save(*args, **kwargs)
 
 
+# The guarded queryset is the BASE manager too (Django's ``_base_manager``,
+# related-object access), as spoken does for its projection models: set on
+# ``_meta`` rather than in ``Meta`` so it changes no migration state.
+ProducedContentType._meta.base_manager_name = "objects"
+
+
 class ProducedContentTypeAssignment(models.Model):
     """User U may produce content of type T (scope; the capability is authz's)."""
 

@@ -81,9 +81,10 @@ database:
 * an ordinary `ProducedContentType.save()` never writes the link (a stale
   admin form cannot erase it) and refuses an instance whose link was attached,
   replaced or cleared in memory; `save(update_fields=[...link...])` is refused;
-* the model's queryset refuses `update()` / `bulk_update()` / `bulk_create()`
-  of the link, except the bridge's single granted FIRST link of one exact,
-  still-unlinked regular row;
+* the model's queryset -- its default AND base manager (`_base_manager`, set
+  on `_meta` as spoken does, no migration) -- refuses `update()` /
+  `bulk_update()` / `bulk_create()` of the link, except the bridge's single
+  granted FIRST link of one exact, still-unlinked regular row;
 * `produced_type_backend_regular_only` (CHECK, `produced_content.0004`): a
   backend implies a regular type; a backed type's mode is fixed.
 
@@ -165,7 +166,17 @@ the managed types for it, read-only in the recorder (only an item's own
 producer records or submits it), and it can abandon / withdraw / recall any
 of them wherever the spoken lifecycle permits (PROCESSING stays
 non-interruptible; a stale recall of a superseded edition never touches the
-newer one). The spoken domain was adapted narrowly for this: a registered
+newer one).
+
+A withdrawal carries the state its confirmation showed (`expected_state`).
+The page's early comparison is presentation only; the AUTHORITATIVE check is
+inside spoken under the lifecycle's own locks (`transitions.recall(...,
+expected_state=)`: on the locked item row for pre-delivery recall, and inside
+`spoken.delivery` after its advisory -> type -> item locks for delivered /
+superseded recall). A stale confirmation -- a draft submitted meanwhile, a
+delivered item superseded meanwhile -- is refused with no change.
+`produced_content` never locks the item itself before entering projection
+recall (that would invert the projection lock order). The spoken domain was adapted narrowly for this: a registered
 recall authority (`spoken.transitions.register_recall_authority` /
 `may_recall_as_manager`, consulted only by recall, under the item's row lock)
 through which `produced_content` names CONTROL as manager of exactly the

@@ -709,7 +709,10 @@ lifecycle, worker, recipes and projection. One narrow adaptation: recall
 manager (staff) and the policy-permitted owner, whoever an owning domain names
 for the item's EXACT type (`transitions.register_recall_authority` /
 `may_recall_as_manager`) -- produced_content names CONTROL for its linked
-backends only. Unlinked types behave exactly as before. See
+backends only. Recall also takes an optional `expected_state`, compared only on
+the authoritatively locked item (pre-delivery: `_apply`; delivered/superseded:
+`delivery._end_locked`), refusing with `state_changed`; callers that omit it
+behave exactly as before. Unlinked types behave exactly as before. See
 docs/PRODUCED_CONTENT.md.
 
 ## Not in C1 / C2A / C2B

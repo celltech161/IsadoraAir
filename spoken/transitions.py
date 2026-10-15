@@ -558,18 +558,32 @@ def reject(item, *, actor, note="") -> SpokenItem:
                   detail={"note": str(note)[:1000]})
 
 
-def recall(item, *, actor, reason="") -> SpokenItem:
+def require_expected_state(row, expected_state) -> None:
+    """``expected_state`` (optional): the state the caller decided on (e.g. a
+    confirmation page). Checked ONLY on the authoritatively locked row; a
+    mismatch refuses without any change."""
+    if expected_state is not None and row.state != expected_state:
+        raise InvalidTransition(f"the item is {row.state} now, not {expected_state}", code="state_changed")
+
+
+def recall(item, *, actor, reason="", expected_state=None) -> SpokenItem:
     """Recall. Before delivery: managers always (and, for an explicitly linked
     type, whoever its owning domain names -- may_recall_as_manager); the
     submitter while the type's recall policy allows it. A delivered (or superseded) item's recall
     removes projected content, so it is the projection service's
-    (spoken.delivery.recall_delivered)."""
+    (spoken.delivery.recall_delivered).
+
+    ``expected_state`` (optional; omitted = unchanged behavior) is verified
+    under the lifecycle's own lock: here under the locked item row (_apply),
+    and for delivered/superseded items inside spoken.delivery after its
+    advisory -> type -> item locks. The unlocked read below only routes."""
     state = SpokenItem.objects.filter(pk=getattr(item, "pk", item)).values_list("state", flat=True).first()
     if state in (S.DELIVERED, S.SUPERSEDED):
         from . import delivery
-        return delivery.recall_delivered(item, actor=actor, reason=reason)
+        return delivery.recall_delivered(item, actor=actor, reason=reason, expected_state=expected_state)
 
     def check(row, user, now):
+        require_expected_state(row, expected_state)
         if may_recall_as_manager(user, row):
             return
         if row.content_type.recall_policy == RecallPolicy.MANAGERS_ONLY:
