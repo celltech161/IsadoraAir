@@ -51,7 +51,7 @@
       <span class="am-muted">{{ row.type.key }}</span>
     </h2>
     <div class="am-facts">
-      Replay every {{ row.replay_seconds }} s{% if row.replay_is_default %} (station default){% endif %} ·
+      <span data-replay="new">New publishes: replay every {{ row.replay_seconds }} s ({% if row.replay_is_default %}station default{% else %}this content type{% endif %})</span> ·
       {% if row.type.producer_self_publish %}you publish your own messages{% else %}publishing needs operator approval{% endif %} ·
       {% if row.type.recallable %}you can recall your active message{% else %}an operator clears active messages{% endif %}
       {% if control %} · <em>control: you may publish and clear any of yours</em>{% endif %}
@@ -61,7 +61,8 @@
     <div class="am-msg active" data-message="{{ entry.message.pk }}" data-state="active">
       <span class="am-badge active">ACTIVE</span>
       <strong>{{ entry.message.title|default:row.type.name }}</strong>
-      <span class="am-muted">since {{ entry.message.activated_at|date:"Y-m-d H:i" }}{% if entry.duration %} · {{ entry.duration|floatformat:1 }} s{% endif %}</span>
+      <span class="am-muted">since {{ entry.message.activated_at|date:"Y-m-d H:i" }}{% if entry.duration %} · {{ entry.duration|floatformat:1 }} s{% endif %}
+        · <span data-replay="frozen">replay every {{ entry.message.replay_interval_seconds }} s (frozen at activation)</span></span>
       <div class="am-row">
         <a class="am-btn" href="{{ entry.recorder_url }}">Listen</a>
         {% if entry.can_recall %}
@@ -116,7 +117,8 @@
     <div class="am-msg{% if entry.message.state == 'active' %} active{% endif %}" data-message="{{ entry.message.pk }}" data-state="{{ entry.message.state }}">
       <span class="am-badge">{{ entry.message.get_state_display|upper }}</span>
       <strong>{{ entry.message.title|default:entry.message.content_type.name }}</strong>
-      <span class="am-muted">{{ entry.message.content_type.name }}</span>
+      <span class="am-muted">{{ entry.message.content_type.name }}{% if entry.message.state == 'active' %}
+        · <span data-replay="frozen">replay every {{ entry.message.replay_interval_seconds }} s (frozen at activation)</span>{% endif %}</span>
       <div class="am-row">
         <a class="am-btn" href="{{ entry.recorder_url }}">Open</a>
         {% if entry.message.state == 'prepared' %}

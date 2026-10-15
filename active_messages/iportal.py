@@ -213,13 +213,17 @@ class ActiveMessageAdapter(RecordingAdapter):
                 "saved": ("Saved to this draft. It is not active until you publish it from your Messages page."
                           if self_publish else
                           "Saved to this draft. It is not active: it now awaits operator approval."),
+                "editor_hint": "browser only; saving updates this draft but does not publish it",
+                "restored": "Draft restored. Saving updates this draft; publishing is a separate step.",
             }
             air_label = "Saved to this draft (not active)"
         else:
             purpose = {M.ACTIVE: "This message is active. Its audio is immutable; prepare a replacement to "
                                  "change it."}.get(message.state, "This message is no longer active (read-only).")
             terms = {"badge": message.get_state_display().upper(), "current": "message's audio",
-                     "current_exists": "This message has audio", "none": "This message has no audio."}
+                     "current_exists": "This message has audio", "none": "This message has no audio.",
+                     "editor_hint": "browser only; this message is read-only",
+                     "restored": "Draft restored for preview only; this message is read-only."}
             air_label = message.get_state_display()
         if not gate_open:
             purpose = f"{purpose} {NATIVE_AIRING_CLOSED}"

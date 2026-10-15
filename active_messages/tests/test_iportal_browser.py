@@ -80,6 +80,11 @@ class ActiveMessageWorkstationBrowserTests(Domain, StaticLiveServerTestCase):
         self.assertEqual(page.text_content("#ipSave"), "Save audio to this draft")
         self.assertIn(NATIVE_AIRING_CLOSED, page.text_content("#ipPurpose"))
         self.assertIn("No audio saved to this draft yet.", page.text_content("#ipAirCurrent"))
+        self.assertEqual(page.text_content("#ipEditorHint"),
+                         "browser only; saving updates this draft but does not publish it")
+        body = page.text_content("body")
+        self.assertNotIn("on air until you save", body)                         # the misleading default is gone
+        self.assertNotIn("Save & put on air", body)
         page.click("#ipArm")
         page.wait_for_function("window.IPortalWorkstation.recorder && window.IPortalWorkstation.recorder.state === 'armed'")
         page.click("#ipRecord")

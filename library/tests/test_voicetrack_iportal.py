@@ -71,6 +71,11 @@ class EvergreenVoiceTrackWorkspaceTests(IsolatedMediaRootMixin, TestCase):
         self.assertEqual(client.page.status_code, 200)
         self.assertContains(client.page, "Intro voice track")
         self.assertContains(client.page, "Intro ends at")
+        # 2.22D3B: the shared workstation's default (historical) on-air wording is VoiceTrack's.
+        for wording in ("ON AIR", "Save &amp; put on air", "browser only; nothing here is on air until you save"):
+            self.assertContains(client.page, wording)
+        terms = client.page.context["recording_context"]["terms"]
+        self.assertEqual(terms["restored"], "Draft restored. It is not on air until you save.")
 
     def test_users_without_the_capability_are_refused_server_side(self):
         client = self.session(self.listener)

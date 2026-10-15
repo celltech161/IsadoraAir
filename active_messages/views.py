@@ -107,6 +107,8 @@ def my_messages(request):
         recallable = control or bool(content_type.recallable)
         rows.append({
             "type": content_type,
+            # What a NEWLY published message of this type would get; an ACTIVE
+            # message shows its own interval, frozen at its activation.
             "replay_seconds": content_type.replay_interval_seconds or policy.default_replay_interval_seconds,
             "replay_is_default": not content_type.replay_interval_seconds,
             "active": [message_row(m, publishable=False, recallable=recallable) for m in found["active"]],

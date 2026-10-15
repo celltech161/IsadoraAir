@@ -30,9 +30,10 @@ from production.policy import MediaPolicy
 # the server authorizes each one again regardless.
 OPERATIONS = ("open", "record", "import", "edit", "save", "remove", "export")
 
-# The workstation's wording for the domain's committed state. The defaults are
-# the original wording; a domain whose "save" does not put anything on air (a
-# draft that is published separately) supplies its own (RecordingContext.terms).
+# The workstation's wording for the domain's committed state -- what "save"
+# commits to. The defaults are the original wording, for a domain whose save
+# puts the take on air; a domain whose save commits to something else (a draft
+# that is published separately) supplies its own (RecordingContext.terms).
 DEFAULT_TERMS = {
     "badge": "ON AIR",                                        # badge over the committed audio panel
     "save": "Save & put on air",                              # the save button
@@ -41,6 +42,8 @@ DEFAULT_TERMS = {
     "none": "Nothing on air yet.",                            # nothing is committed
     "changed": "The on-air audio has changed since then.",    # a browser draft predates the committed audio
     "saved": "",                                              # after a save ("" = derived from air_label)
+    "editor_hint": "browser only; nothing here is on air until you save",   # the editor panel's header
+    "restored": "Draft restored. It is not on air until you save.",          # a browser draft was restored
 }
 
 
@@ -76,7 +79,7 @@ class CurrentAudio:
     """What the subject currently has (if anything), for display and editing."""
 
     origin: str                      # "production_media" | "legacy"
-    label: str                       # e.g. "Current on-air take"
+    label: str                       # e.g. "Current on-air take" (the domain's committed audio)
     duration_seconds: float | None
     media_id: str | None = None      # only for origin == production_media
     preview_url: str = ""            # an authorization-checked recorder URL; never a path

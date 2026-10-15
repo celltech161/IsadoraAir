@@ -2,13 +2,14 @@
  *
  * Domain-neutral: everything domain-specific arrives in the RecordingContext
  * JSON the server rendered (title, display rows, allowed operations, limits,
- * revision, current on-air audio). The page never names a path or a storage
+ * revision, the current committed audio). The page never names a path or a storage
  * key; it talks to the adapter's own recorder endpoints with Django's session
  * cookie and CSRF token.
  *
  * Three states are kept visibly distinct: the PREVIEW (browser-local edit,
- * never on air), a saved take (immutable ProductionMedia, not yet on air),
- * and ON AIR (the domain's committed binding).
+ * never on air), a saved take (immutable ProductionMedia, not yet committed),
+ * and the domain's committed binding (by default worded ON AIR; a domain
+ * supplies its own wording through RecordingContext.terms).
  */
 (function (root) {
   "use strict";
@@ -55,6 +56,8 @@
     badge: "ON AIR", save: "Save & put on air", current: "on-air take",
     current_exists: "A take is already on air here", none: "Nothing on air yet.",
     changed: "The on-air audio has changed since then.", saved: "",
+    editor_hint: "browser only; nothing here is on air until you save",
+    restored: "Draft restored. It is not on air until you save.",
   };
   function term(name) { return (S.ctx.terms && S.ctx.terms[name]) || DEFAULT_TERMS[name]; }
   // Drafts are keyed by the SERVER-provided per-user namespace + workspace +
@@ -62,8 +65,8 @@
   var DRAFT_KEY_PREFIX = "u:" + S.page.draft_namespace + "|";
   function subjectKey() { return DRAFT_KEY_PREFIX + S.ctx.adapter + "|" + JSON.stringify(S.ctx.subject); }
   // Content that no longer derives from an older editing session (a fresh
-  // recording, an import, the on-air take just loaded) is based on what the
-  // page currently knows is on air.
+  // recording, an import, the committed take just loaded) is based on what the
+  // page currently knows is committed.
   function rebase() { S.baseRevision = S.ctx.revision; }
 
   function message(text, kind) {
@@ -85,6 +88,7 @@
     $("ipSave").textContent = term("save");
     $("ipLoadCurrent").textContent = $("ipLoadCurrentEmpty").textContent = "Edit the " + term("current");
     $("ipEditorEmptyText").textContent = term("current_exists");
+    $("ipEditorHint").textContent = term("editor_hint");
     $("ipMax").textContent = fmt(c.max_duration_seconds);
     var blocked = $("ipBlocked");
     blocked.hidden = !c.blocked_reason;
@@ -111,7 +115,7 @@
     }
     $("ipLoadCurrent").hidden = !(c.current && allowed("edit"));
     $("ipRemove").hidden = !allowed("remove");
-    draw();                                          // the empty editor's text depends on what is on air
+    draw();                                          // the empty editor's text depends on what is committed
     refreshControls();
   }
 
@@ -264,7 +268,7 @@
     var w = canvas.width = canvas.clientWidth || canvas.width, h = canvas.height;
     ctx2d.fillStyle = "#0b0d10"; ctx2d.fillRect(0, 0, w, h);
     if (!S.pcm || !A.length(S.pcm)) {
-      // An existing on-air take is never implied away: say it is not loaded.
+      // An existing committed take is never implied away: say it is not loaded.
       var onAir = !!S.ctx.current;
       $("ipSelection").textContent = onAir ? "Editor empty — the " + term("current") + " is not loaded." : "No audio yet.";
       if (onAir) {
@@ -443,7 +447,7 @@
     S.view = { start: 0, end: A.duration(S.pcm) }; S.selection = null;
     $("ipDraftBanner").hidden = true;
     markDirty();
-    message("Draft restored. It is not on air until you save.", "info");
+    message(term("restored"), "info");
   }
 
   // -- save / commit -------------------------------------------------------------
@@ -616,7 +620,7 @@
     $("ipCancelUpload").hidden = !busy;
     $("ipImportBtn").disabled = !allowed("import") || capturing || busy;
     $("ipPunchKeepTail").disabled = $("ipPunchReplace").disabled = !$("ipPunch").checked || capturing;
-    // Reopened with a take already on air and nothing in the editor: show
+    // Reopened with a take already committed and nothing in the editor: show
     // that state and offer the take -- never load or create anything by itself.
     var emptyWithTake = !has && !!S.ctx.current && allowed("edit");
     $("ipEditorEmpty").hidden = !emptyWithTake;

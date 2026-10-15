@@ -374,7 +374,9 @@ class GuardedScratchAdapter(ScratchPadAdapter):
     def context(self, request, subject):
         context = super().context(request, subject)
         from dataclasses import replace
-        return replace(context, adapter=self.key, terms={"badge": "SAVED", "save": "Save to slot"})
+        return replace(context, adapter=self.key, terms={"badge": "SAVED", "save": "Save to slot",
+                                                         "editor_hint": "browser only; saving keeps it in this slot",
+                                                         "restored": "Restored for this slot."})
 
     def source(self, subject):
         media_id = self.committed.get(subject)
@@ -458,15 +460,23 @@ class SubjectAuthorizationTests(IsolatedMediaRootMixin, TestCase):
         context = plain.context(None, "a").as_json()
         from production.recorder.contracts import DEFAULT_TERMS
         self.assertEqual(context["terms"], DEFAULT_TERMS)                       # the original wording
+        self.assertEqual((DEFAULT_TERMS["badge"], DEFAULT_TERMS["save"], DEFAULT_TERMS["editor_hint"],
+                          DEFAULT_TERMS["restored"]),
+                         ("ON AIR", "Save & put on air", "browser only; nothing here is on air until you save",
+                          "Draft restored. It is not on air until you save."))
         page = self.client.get("/scratch/?slot=a")
         self.assertContains(page, "ON AIR")
         self.assertContains(page, "Save &amp; put on air")
+        self.assertContains(page, "browser only; nothing here is on air until you save")
 
     def test_a_consumer_may_word_its_committed_state(self):
         page = self.client.get("/guarded/?slot=a")
         self.assertContains(page, "SAVED")
         self.assertContains(page, "Save to slot")
         self.assertNotContains(page, "Save &amp; put on air")
+        self.assertContains(page, "saving keeps it in this slot")               # the editor hint, too
+        self.assertNotContains(page, "nothing here is on air until you save")
+        self.assertEqual(page.context["recording_context"]["terms"]["restored"], "Restored for this slot.")
         with self.assertRaises(ValueError):
             RecordingContext(adapter="x", subject={}, title="", purpose="", allowed_operations=(),
                              max_duration_seconds=1, max_bytes=1, revision="", terms={"bogus": "x"})

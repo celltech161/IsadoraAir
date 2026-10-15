@@ -93,8 +93,12 @@ docs/ACTIVE_MESSAGES.md, "Producer workspace").
   loads it (unchanged, not dirty — Save stays disabled until an edit). A
   browser draft, if any, is still offered separately.
 * **Three visibly distinct states** — **PREVIEW** (the browser-local edit, never
-  on air), a saved take (immutable ProductionMedia, not yet on air), and **ON
-  AIR** (the domain's committed binding). Preview plays in the browser only:
+  on air), a saved take (immutable ProductionMedia, not yet committed), and the
+  domain's committed binding — **ON AIR** for evergreen VoiceTrack; a consumer
+  whose save commits to something else words it through
+  `RecordingContext.terms` (an active-message draft: **DRAFT AUDIO**, saved
+  but not published). The quoted wording in this section is the default
+  (VoiceTrack) wording. Preview plays in the browser only:
   it never opens the program output, never acquires a deck, never creates a
   PlayEvent or touches royalty evidence, recency or RDS.
 * **Save** — upload the take (exact Content-Length, CSRF) → server validation

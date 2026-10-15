@@ -133,6 +133,14 @@ class RecorderIntegrationTests(WorkspaceCase):
         self.assertIn(NATIVE_AIRING_CLOSED, context["purpose"])
         self.assertEqual((context["terms"]["badge"], context["terms"]["save"]), ("DRAFT AUDIO", "Save audio to this draft"))
         self.assertIn("awaits operator approval", context["terms"]["saved"])
+        self.assertEqual(context["terms"]["editor_hint"],
+                         "browser only; saving updates this draft but does not publish it")
+        self.assertEqual(context["terms"]["restored"],
+                         "Draft restored. Saving updates this draft; publishing is a separate step.")
+        page = self.client_for(self.producer).get(f"{RECORDER}?message={message.pk}")
+        self.assertContains(page, "saving updates this draft but does not publish it")
+        for misleading in ("on air until you save", "Save &amp; put on air", "Edit the on-air take"):
+            self.assertNotContains(page, misleading)
         self.assertEqual(context["return_url"], PAGE)
         self.assertNotIn("remove", context["allowed_operations"])
         self.assertTrue({"record", "import", "save"} <= set(context["allowed_operations"]))
@@ -186,6 +194,8 @@ class RecorderIntegrationTests(WorkspaceCase):
         services.activate_message(message, actor=self.producer)
         context = self.context(self.producer, message).json()["context"]
         self.assertEqual(sorted(context["allowed_operations"]), ["export", "open"])
+        self.assertEqual(context["terms"]["restored"], "Draft restored for preview only; this message is read-only.")
+        self.assertNotIn("save", context["terms"]["editor_hint"])
         self.assertIn("prepare a replacement", context["blocked_reason"])
         rows = ProductionMedia.objects.count()
         for mode in ("record", "import"):
@@ -374,6 +384,29 @@ class MessagesPageTests(WorkspaceCase):
         self.assertContains(page, f"/iportal/messages/{message.pk}/recall/")
         self.post(self.producer, f"{PAGE}{message.pk}/recall/")
         self.assertEqual(M.objects.get(pk=message.pk).state, "cleared")
+
+    def test_an_active_message_shows_its_frozen_cadence_beside_the_types_current_setting(self):
+        timed = content_type("timed_notice", "public_address", replay_interval_seconds=300)
+        assign(self.producer, timed)
+        message = self.saved_draft(self.producer, timed)
+        services.activate_message(message, actor=self.producer)
+        timed.replay_interval_seconds = 900                                         # reconfigured afterwards
+        timed.save()
+        page = self.page(self.producer)
+        section = page.content.decode().split('data-content-type="timed_notice"')[1].split("</section>")[0]
+        self.assertIn("New publishes: replay every 900 s (this content type)", section)
+        self.assertIn("replay every 300 s (frozen at activation)", section)
+        self.assertEqual(M.objects.get(pk=message.pk).replay_interval_seconds, 300)  # cadence itself untouched
+
+    def test_a_policy_default_cadence_is_frozen_the_same_way(self):
+        default = services.current_policy().default_replay_interval_seconds
+        message = self.saved_draft(self.producer, self.pa)                         # no type override
+        services.activate_message(message, actor=self.producer)
+        services.set_default_replay_interval(default + 600, actor=self.admin)        # the station default moves
+        page = self.page(self.producer)
+        section = page.content.decode().split('data-content-type="town_notice"')[1].split("</section>")[0]
+        self.assertIn(f"New publishes: replay every {default + 600} s (station default)", section)
+        self.assertIn(f"replay every {default} s (frozen at activation)", section)
 
     def test_csrf_and_authentication_are_enforced(self):
         message = self.draft(self.producer, self.pa)
