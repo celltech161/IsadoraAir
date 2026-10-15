@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0111",
+  "previous_release_id": "r0110",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal polish adds the Track Detail white triangle-tipped live playhead, browser-local Preview cursor tracking with correct stop/end/selection behavior, and a GroupAccess-filtered top-level iPortal navigation item. One data-only manual RunPython migration seeds the nav row. Collectstatic is required; no service restart, package, unit, nginx, schema, broadcast-path or protected-runtime change.",
+  "migrations_required": [
+    "library.0090_seed_iportal_nav_item"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
