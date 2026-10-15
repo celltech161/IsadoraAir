@@ -628,12 +628,15 @@ def _recover_barrier(asset, ctype, now, *, report, apply) -> bool:
 
 # -- leaving delivery: recall and expiry -----------------------------------------------------------
 
-def recall_delivered(item, *, actor, reason="") -> SpokenItem:
+def recall_delivered(item, *, actor, reason="", expected_state=None) -> SpokenItem:
     """delivered/superseded -> recalled. Managers always (for an explicitly
     linked type also whoever its owning domain names --
     transitions.may_recall_as_manager); the submitter only while the type's
-    recall policy is ``owner_anytime``."""
-    return _end(getattr(item, "pk", item), S.RECALLED, actor=actor, actor_kind=ActorKind.USER, reason=reason)
+    recall policy is ``owner_anytime``. ``expected_state`` (optional) is
+    compared only after the item row is locked (advisory -> type -> item), so a
+    stale "delivered" request never recalls an item superseded meanwhile."""
+    return _end(getattr(item, "pk", item), S.RECALLED, actor=actor, actor_kind=ActorKind.USER, reason=reason,
+                expected_state=expected_state)
 
 
 def expire_item(item) -> SpokenItem:
@@ -658,7 +661,7 @@ def expire_due(*, limit=200) -> list:
     return expired
 
 
-def _end(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
+def _end(item_pk, to_state, *, actor, actor_kind, reason, expected_state=None) -> SpokenItem:
     # Take the cross-transaction lock before the row-lock order.  If a
     # replacement already owns it, recall/expiry waits; after promotion the
     # old item is superseded and the lifecycle transition proceeds with no
@@ -668,14 +671,16 @@ def _end(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
                 .values_list("pk", flat=True).first())
     scope = projection_lock.session(asset_id, wait=True) if asset_id is not None else nullcontext(True)
     with scope:
-        return _end_locked(item_pk, to_state, actor=actor, actor_kind=actor_kind, reason=reason)
+        return _end_locked(item_pk, to_state, actor=actor, actor_kind=actor_kind, reason=reason,
+                           expected_state=expected_state)
 
 
-def _end_locked(item_pk, to_state, *, actor, actor_kind, reason) -> SpokenItem:
+def _end_locked(item_pk, to_state, *, actor, actor_kind, reason, expected_state=None) -> SpokenItem:
     removed = None
     with transaction.atomic():
         ctype = _lock_type(item_pk)
         row = _lock_item(item_pk)
+        transitions.require_expected_state(row, expected_state)          # on the locked row only
         if row.state not in (S.DELIVERED, S.SUPERSEDED):
             raise transitions.InvalidTransition(f"{row.state} items are not delivered", code="not_delivered")
         now = timezone.now()

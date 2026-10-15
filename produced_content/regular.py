@@ -185,6 +185,8 @@ def withdraw(user, item, *, reason="", expected_state=None) -> SpokenItem:
     if found is None or not may_see(user, found[0]):
         raise NotFound("no such item")                       # never disclose another producer's item
     row = found[0]
+    # Presentation only (a friendly early answer); the AUTHORITATIVE expected-
+    # state check happens inside spoken under the lifecycle's own locks.
     if expected_state is not None and row.state != expected_state:
         raise StateConflict(f"this item is {row.get_state_display().lower()} now")
     if row.state in NOT_WITHDRAWABLE:
@@ -192,7 +194,7 @@ def withdraw(user, item, *, reason="", expected_state=None) -> SpokenItem:
                             if row.state == S.PROCESSING else
                             f"this item is {row.get_state_display().lower()}; there is nothing to withdraw")
     try:
-        return transitions.recall(row.pk, actor=user, reason=str(reason)[:500])
+        return transitions.recall(row.pk, actor=user, reason=str(reason)[:500], expected_state=expected_state)
     except transitions.NotPermitted as exc:
         raise NotPermitted(str(exc), code=exc.code) from exc
     except transitions.SpokenServiceError as exc:
