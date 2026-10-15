@@ -43,6 +43,7 @@
     parentMediaId: null, importFile: null, importUnedited: false,
     selection: null, view: null, playhead: 0,
     undo: new A.UndoStack(), recorder: null, playing: null,
+    previewTiming: null, previewFrame: null,
     pendingTake: null, upload: null,
   };
   root.IPortalWorkstation = S;      // exposed for tests / debugging only
@@ -204,6 +205,7 @@
   function punchMode() { return $("ipPunchReplace").checked ? "replace" : "insert"; }
 
   function record() {
+    stopPlayback();
     var rec = ensureRecorder();
     S.punch = $("ipPunch").checked && S.pcm ? { at: S.playhead, mode: punchMode() } : null;
     rec.start();
@@ -220,6 +222,7 @@
   }
 
   function acceptTake(take) {
+    stopPlayback();
     if (S.punch && S.pcm) {
       pushUndo("punch-in");
       S.pcm = A.punchIn(S.pcm, take, S.punch.at, S.punch.mode);
@@ -237,6 +240,7 @@
     S.punch = null;
     S.selection = null;
     S.view = { start: 0, end: A.duration(S.pcm) };
+    S.playhead = Math.max(0, Math.min(S.playhead, A.duration(S.pcm)));
     markDirty();
   }
 
@@ -253,6 +257,7 @@
 
   function edit(label, fn) {
     if (!S.pcm) return;
+    stopPlayback();
     pushUndo(label);
     S.pcm = fn(S.pcm);
     S.ops.push(label);
@@ -286,8 +291,19 @@
     ctx2d.strokeStyle = "#22c55e"; ctx2d.beginPath();
     peaks.forEach(function (p, x) { ctx2d.moveTo(x + 0.5, h / 2 - p[1] * h / 2); ctx2d.lineTo(x + 0.5, h / 2 - p[0] * h / 2); });
     ctx2d.stroke();
-    var px = (S.playhead - v.start) / span * w;
-    ctx2d.strokeStyle = "#f59e0b"; ctx2d.beginPath(); ctx2d.moveTo(px, 0); ctx2d.lineTo(px, h); ctx2d.stroke();
+    // Draw the playhead last, matching Track Detail's white line and
+    // triangle-tipped silhouette. A zoomed-out cursor is not projected onto
+    // an edge: it simply is not part of this view.
+    if (S.playhead >= v.start && S.playhead <= v.end) {
+      var px = (S.playhead - v.start) / span * w;
+      ctx2d.strokeStyle = "#ffffff"; ctx2d.lineWidth = 2;
+      ctx2d.beginPath(); ctx2d.moveTo(px, 0); ctx2d.lineTo(px, h); ctx2d.stroke();
+      ctx2d.fillStyle = "#ffffff";
+      ctx2d.beginPath();
+      ctx2d.moveTo(px - 4, 0); ctx2d.lineTo(px + 4, 0); ctx2d.lineTo(px, 5); ctx2d.closePath(); ctx2d.fill();
+      ctx2d.beginPath();
+      ctx2d.moveTo(px - 4, h); ctx2d.lineTo(px + 4, h); ctx2d.lineTo(px, h - 5); ctx2d.closePath(); ctx2d.fill();
+    }
     var sel = S.selection ? " · selection " + fmt(S.selection.start) + "–" + fmt(S.selection.end) : "";
     $("ipSelection").textContent = "Length " + fmt(A.duration(S.pcm)) + " · playhead " + fmt(S.playhead) + sel;
   }
@@ -316,6 +332,7 @@
 
   async function importFile(file) {
     if (!file) return;
+    stopPlayback();
     if (file.size > S.ctx.max_bytes) { message("That file is larger than the limit for this workspace.", "error"); return; }
     try {
       var bytes = await file.arrayBuffer();
@@ -328,6 +345,7 @@
       S.pcm = pcm; S.sourceKind = "import"; S.importFile = file; S.importUnedited = true;
       rebase();
       S.parentMediaId = null; S.ops = []; S.selection = null; S.view = { start: 0, end: A.duration(pcm) };
+      S.playhead = Math.max(0, Math.min(S.playhead, A.duration(pcm)));
       markDirty();
       message("Imported " + file.name + ". Edit it here, or save it as is.", "ok");
     } catch (err) {
@@ -336,6 +354,7 @@
   }
 
   async function loadCurrent() {
+    stopPlayback();
     try {
       var resp = await fetch(S.api.source + "?" + query(S.ctx.subject), { credentials: "same-origin" });
       if (!resp.ok) throw new Error("http " + resp.status);
@@ -346,6 +365,7 @@
       S.parentMediaId = S.sourceKind === "edit-media" ? S.ctx.current.media_id : null;
       S.importFile = null; S.ops = []; S.undo.clear(); S.selection = null;
       S.view = { start: 0, end: A.duration(pcm) };
+      S.playhead = Math.max(0, Math.min(S.playhead, A.duration(pcm)));
       S.dirty = false;
       draw(); refreshControls();
       message("Loaded the " + term("current") + " into the editor. Your edits become a NEW take when you save.", "info");
@@ -355,8 +375,41 @@
   }
 
   // -- preview playback (browser-local; never the station output) --------------
+  function clampPlayhead(seconds) {
+    var total = S.pcm ? A.duration(S.pcm) : 0;
+    seconds = Number(seconds);
+    if (!isFinite(seconds)) seconds = 0;
+    return Math.max(0, Math.min(total, seconds));
+  }
+  function cancelPreviewFrame() {
+    if (S.previewFrame !== null) root.cancelAnimationFrame(S.previewFrame);
+    S.previewFrame = null;
+  }
+  function updatePreviewPlayhead() {
+    var timing = S.previewTiming;
+    if (!timing) return;
+    var elapsed = Math.max(0, timing.context.currentTime - timing.startedAt);
+    S.playhead = clampPlayhead(Math.min(timing.end, timing.from + elapsed));
+  }
+  function previewTick() {
+    S.previewFrame = null;
+    if (!S.playing || !S.previewTiming) return;
+    updatePreviewPlayhead();
+    draw();
+    if (S.playing && S.previewTiming) S.previewFrame = root.requestAnimationFrame(previewTick);
+  }
+  function startPreviewLoop() {
+    cancelPreviewFrame();
+    S.previewFrame = root.requestAnimationFrame(previewTick);
+  }
   function stopPlayback() {
-    if (S.playing) { try { S.playing.stop(); } catch (e) { /* ignore */ } S.playing = null; }
+    var source = S.playing;
+    if (S.previewTiming) updatePreviewPlayhead();
+    S.playing = null;
+    S.previewTiming = null;
+    cancelPreviewFrame();
+    if (source) { try { source.stop(); } catch (e) { /* ignore */ } }
+    draw();
     refreshControls();
   }
   function play() {
@@ -369,11 +422,24 @@
     var src = ac.createBufferSource();
     src.buffer = A.toAudioBuffer(ac, S.pcm);
     src.connect(ac.destination);
-    var from = S.selection ? S.selection.start : S.playhead;
-    var dur = S.selection ? S.selection.end - S.selection.start : undefined;
-    src.onended = function () { if (S.playing === src) { S.playing = null; refreshControls(); } };
-    src.start(0, from, dur);
+    var total = A.duration(S.pcm);
+    var from = clampPlayhead(S.selection ? S.selection.start : S.playhead);
+    var end = clampPlayhead(S.selection ? S.selection.end : total);
+    end = Math.max(from, end);
+    if (end <= from) { S.playhead = end; draw(); refreshControls(); return; }
+    src.onended = function () {
+      if (S.playing !== src) return;
+      S.playhead = clampPlayhead(end);
+      S.playing = null;
+      S.previewTiming = null;
+      cancelPreviewFrame();
+      draw();
+      refreshControls();
+    };
     S.playing = src;
+    S.previewTiming = { context: ac, startedAt: ac.currentTime, from: from, end: end };
+    src.start(0, from, end - from);
+    startPreviewLoop();
     refreshControls();
   }
 
@@ -438,6 +504,7 @@
   function restoreDraft() {
     var d = S.draft;
     if (!d) return;
+    stopPlayback();
     S.pcm = A.make(d.sampleRate, d.channels);
     // The draft was made against d.revision: saving it must be checked against
     // THAT, so a newer save by someone else is a conflict, never overwritten.
@@ -445,6 +512,7 @@
     S.sourceKind = d.sourceKind === "import" ? "recording" : d.sourceKind;   // the original import bytes are not kept
     S.parentMediaId = d.parentMediaId; S.ops = d.ops || []; S.importFile = null; S.importUnedited = false;
     S.view = { start: 0, end: A.duration(S.pcm) }; S.selection = null;
+    S.playhead = Math.max(0, Math.min(S.playhead, A.duration(S.pcm)));
     $("ipDraftBanner").hidden = true;
     markDirty();
     message(term("restored"), "info");
@@ -688,7 +756,9 @@
     $("ipUndo").addEventListener("click", function () {
       var item = S.undo.pop();
       if (!item) return;
+      stopPlayback();
       S.pcm = item.pcm; S.ops.pop(); S.selection = null; S.view = { start: 0, end: A.duration(S.pcm) };
+      S.playhead = Math.max(0, Math.min(S.playhead, A.duration(S.pcm)));
       if (item.meta) S.baseRevision = item.meta.baseRevision;     // the restored audio's own base
       markDirty();
     });
@@ -698,11 +768,14 @@
     $("ipCancelUpload").addEventListener("click", function () { if (S.upload) S.upload.abort(); });
     $("ipDiscard").addEventListener("click", function () {
       if (S.dirty && !root.confirm("Discard your unsaved edit?")) return;
+      stopPlayback();
       S.pcm = null; S.dirty = false; S.ops = []; S.undo.clear(); S.sourceKind = "none";
+      S.selection = null; S.view = null; S.playhead = 0;
       rebase(); deleteDraft(); draw(); refreshControls();
     });
     $("ipRemove").addEventListener("click", removeFromAir);
     $("ipConflictReload").addEventListener("click", function () {
+      stopPlayback();
       S.pcm = null; S.dirty = false; S.undo.clear(); deleteDraft(); draw(); reloadContext();
     });
     $("ipDraftRestore").addEventListener("click", restoreDraft);

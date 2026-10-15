@@ -133,6 +133,23 @@ class RecorderBrowserTests(IsolatedMediaRootMixin, StaticLiveServerTestCase):
     def duration(self, page):
         return page.evaluate("IPortalAudio.duration(window.IPortalWorkstation.pcm)")
 
+    def load_browser_pcm(self, page, seconds=1.2):
+        """Install deterministic browser-local PCM without opening capture.
+
+        This exercises the real editor canvas and Web Audio preview path while
+        keeping the focused cursor tests quick and independent of microphone
+        scheduling.
+        """
+        page.evaluate("""seconds => {
+          const A = window.IPortalAudio, S = window.IPortalWorkstation;
+          const rate = 48000, samples = new Float32Array(Math.round(rate * seconds));
+          for (let i = 0; i < samples.length; i++) samples[i] = 0.2 * Math.sin(2 * Math.PI * 440 * i / rate);
+          S.pcm = A.make(rate, [samples]);
+          S.sourceKind = 'recording'; S.selection = null; S.playhead = 0;
+          S.view = {start: 0, end: A.duration(S.pcm)};
+          const fit = document.getElementById('ipZoomFit'); fit.disabled = false; fit.click();
+        }""", seconds)
+
     def assert_clean(self, page):
         self.assertEqual(page.errors, [])
         self.assertFalse([url for url in page.requests if "/api/engine" in url or "/api/fx" in url],
@@ -261,6 +278,131 @@ class RecorderBrowserTests(IsolatedMediaRootMixin, StaticLiveServerTestCase):
             page.click("#ipExport")
         self.assertEqual(Path(download.value.path()).read_bytes()[:4], b"RIFF")
         self.assertFalse(ProductionMedia.objects.exists())          # nothing is saved by editing or export
+        self.assert_clean(page)
+
+    @in_browser
+    def test_waveform_cursor_style_click_and_drag_selection_remain_editor_state(self):
+        page = self.open()
+        self.load_browser_pcm(page, 2.0)
+        page.evaluate("""() => {
+          const S = window.IPortalWorkstation;
+          S.playhead = 1.0;
+          document.getElementById('ipZoomFit').click();
+        }""")
+        pixels = page.evaluate("""() => {
+          const canvas = document.getElementById('ipWave'), S = window.IPortalWorkstation;
+          const x = Math.round((S.playhead - S.view.start) / (S.view.end - S.view.start) * canvas.width);
+          const ctx = canvas.getContext('2d'), h = canvas.height;
+          const white = (y) => {
+            const data = ctx.getImageData(x - 5, y, 11, 1).data;
+            let count = 0;
+            for (let i = 0; i < data.length; i += 4) {
+              if (data[i] > 240 && data[i + 1] > 240 && data[i + 2] > 240 && data[i + 3] > 0) count++;
+            }
+            return count;
+          };
+          const middle = Array.from(ctx.getImageData(x, Math.floor(h / 2), 1, 1).data);
+          return {top: white(0), bottom: white(h - 1), middle};
+        }""")
+        self.assertGreaterEqual(pixels["top"], 6)       # triangle is visibly wider than the 2 px line
+        self.assertGreaterEqual(pixels["bottom"], 6)
+        self.assertTrue(all(channel > 240 for channel in pixels["middle"][:3]), pixels)
+
+        box = page.locator("#ipWave").bounding_box()
+        y = box["y"] + box["height"] / 2
+        page.mouse.click(box["x"] + box["width"] * 0.25, y)
+        self.assertAlmostEqual(page.evaluate("IPortalWorkstation.playhead"), 0.5, delta=0.03)
+        self.assertIsNone(page.evaluate("IPortalWorkstation.selection"))
+
+        page.mouse.move(box["x"] + box["width"] * 0.25, y)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] * 0.60, y, steps=5)
+        page.mouse.up()
+        selection = page.evaluate("IPortalWorkstation.selection")
+        self.assertAlmostEqual(selection["start"], 0.5, delta=0.03)
+        self.assertAlmostEqual(selection["end"], 1.2, delta=0.03)
+        self.assert_clean(page)
+
+    @in_browser
+    def test_preview_moves_and_freezes_one_canonical_playhead(self):
+        page = self.open(init_script="""(() => {
+          const raf = window.requestAnimationFrame.bind(window);
+          const caf = window.cancelAnimationFrame.bind(window);
+          window.__iportalActiveFrames = new Set();
+          window.requestAnimationFrame = (callback) => {
+            let id = 0;
+            id = raf((time) => { window.__iportalActiveFrames.delete(id); callback(time); });
+            window.__iportalActiveFrames.add(id);
+            return id;
+          };
+          window.cancelAnimationFrame = (id) => { window.__iportalActiveFrames.delete(id); caf(id); };
+        })()""")
+        self.load_browser_pcm(page, 1.2)
+
+        page.evaluate("""() => {
+          IPortalWorkstation.playhead = 0.1;
+          document.getElementById('ipPlay').disabled = false;
+        }""")
+        page.click("#ipPlay")
+        page.wait_for_timeout(250)
+        moving = page.evaluate("""() => ({
+          playhead: IPortalWorkstation.playhead,
+          frames: window.__iportalActiveFrames.size,
+          timing: !!IPortalWorkstation.previewTiming,
+        })""")
+        self.assertGreater(moving["playhead"], 0.25)
+        self.assertEqual(moving["frames"], 1)
+        self.assertTrue(moving["timing"])
+
+        page.evaluate("window.__firstPreviewSource = IPortalWorkstation.playing")
+        page.click("#ipPlay")
+        page.wait_for_timeout(80)
+        restarted = page.evaluate("""() => ({
+          replaced: window.__firstPreviewSource !== IPortalWorkstation.playing,
+          frames: window.__iportalActiveFrames.size,
+        })""")
+        self.assertTrue(restarted["replaced"])
+        self.assertEqual(restarted["frames"], 1)
+
+        page.click("#ipPlayStop")
+        stopped = page.evaluate("IPortalWorkstation.playhead")
+        page.wait_for_timeout(200)
+        self.assertAlmostEqual(page.evaluate("IPortalWorkstation.playhead"), stopped, delta=0.015)
+        self.assertEqual(page.evaluate("window.__iportalActiveFrames.size"), 0)
+        self.assertIsNone(page.evaluate("IPortalWorkstation.previewTiming"))
+
+        # A full preview naturally ends at PCM duration.
+        page.evaluate("""() => {
+          const S = IPortalWorkstation;
+          S.selection = null; S.playhead = IPortalAudio.duration(S.pcm) - 0.16;
+        }""")
+        page.click("#ipPlay")
+        page.wait_for_function("IPortalWorkstation.playing === null")
+        self.assertAlmostEqual(page.evaluate("IPortalWorkstation.playhead"), 1.2, delta=0.01)
+
+        # Selection preview traverses and stops exactly at the selection end.
+        page.evaluate("""() => {
+          const S = IPortalWorkstation;
+          S.selection = {start: 0.2, end: 0.55}; S.playhead = 0;
+        }""")
+        page.click("#ipPlay")
+        page.wait_for_timeout(120)
+        self.assertTrue(0.25 < page.evaluate("IPortalWorkstation.playhead") < 0.55)
+        page.wait_for_function("IPortalWorkstation.playing === null")
+        self.assertAlmostEqual(page.evaluate("IPortalWorkstation.playhead"), 0.55, delta=0.01)
+
+        # Punch-in consumes that same cursor; preview has not created a second
+        # playhead or a separate position concept.
+        punch_at = page.evaluate("""() => {
+          const S = IPortalWorkstation;
+          S.recorder = {state: 'armed', start() { this.state = 'recording'; }, elapsedSeconds() { return 0; }};
+          S.canRecord = true;
+          document.getElementById('ipPunch').checked = true;
+          document.getElementById('ipRecord').disabled = false;
+          document.getElementById('ipRecord').click();
+          return S.punch.at;
+        }""")
+        self.assertAlmostEqual(punch_at, 0.55, delta=0.01)
         self.assert_clean(page)
 
     @in_browser
