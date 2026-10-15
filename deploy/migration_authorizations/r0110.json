@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "release_id": "r0110",
+  "target_commit": "38e0fef801728b01f51df00422767b2c5210dc8c",
+  "manifest_sha256": "5ede221c223b0a054ad821f88cacdcb9bbfec0bbd68ae983803a3ddd02be098f",
+  "authorized_manual_operations": [
+    {
+      "ref": "active_messages.0003_message_content_type",
+      "migration_file_sha256": "ee7b8f28dfa1544160359d0a6e2a6a4991404f7945178cb3101568a2b42eaf91",
+      "operation_index": 1,
+      "operation": "RunPython",
+      "classification": "manual"
+    },
+    {
+      "ref": "active_messages.0004_message_content_type_identity",
+      "migration_file_sha256": "ea13aeac4d90df01ca0821f7fc84b9f9fbe6044dab91106071e2615ec5e70f96",
+      "operation_index": 0,
+      "operation": "AlterField",
+      "classification": "manual"
+    },
+    {
+      "ref": "active_messages.0004_message_content_type_identity",
+      "migration_file_sha256": "ea13aeac4d90df01ca0821f7fc84b9f9fbe6044dab91106071e2615ec5e70f96",
+      "operation_index": 1,
+      "operation": "RemoveConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "active_messages.0004_message_content_type_identity",
+      "migration_file_sha256": "ea13aeac4d90df01ca0821f7fc84b9f9fbe6044dab91106071e2615ec5e70f96",
+      "operation_index": 2,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "authz.0008_active_message_capabilities",
+      "migration_file_sha256": "8b0ad81d53f53d17dfe47c9b955bddc70fdbdd67c7e765c0c813d3ba52d83bf0",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    }
+  ]
+}
