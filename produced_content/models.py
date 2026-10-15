@@ -15,8 +15,10 @@ Each type has exactly one DELIVERY MODE:
 * ``public_address`` / ``urgent`` -- an active message (active_messages):
   ``recallable`` (may the producer withdraw their own ACTIVE message?),
   ``producer_self_publish`` (may an assigned producer activate their own
-  message, or does activation need CONTROL?) and an optional replay
-  interval override (NULL: the ActiveBroadcastPolicy default).
+  message, or does activation need CONTROL?) -- both default to yes for a
+  new type -- and an optional replay interval override (NULL: the
+  ActiveBroadcastPolicy default). (The two compatibility types the D3A
+  migration creates set both to no explicitly, preserving D1 authority.)
 * ``test`` -- explicitly non-airing (no delivery of any kind).
 
 An assignment is SCOPE, not a role: the broad capability still comes from
@@ -99,7 +101,7 @@ class ProducedContentType(models.Model):
     recallable = models.BooleanField(
         null=True, blank=True,
         help_text="Public address / urgent only: the producer may withdraw their own ACTIVE message. "
-                  "Default: no.")
+                  "Default: yes.")
     producer_self_publish = models.BooleanField(
         null=True, blank=True,
         help_text="Public address / urgent only: an assigned producer may activate their own message; "
@@ -158,7 +160,7 @@ class ProducedContentType(models.Model):
     def _apply_mode_defaults(self):
         if self.delivery_mode in ACTIVE_MESSAGE_MODES:
             if self.recallable is None:
-                self.recallable = False
+                self.recallable = True
             if self.producer_self_publish is None:
                 self.producer_self_publish = True
 

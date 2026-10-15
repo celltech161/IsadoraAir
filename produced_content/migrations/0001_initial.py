@@ -29,7 +29,7 @@ class Migration(migrations.Migration):
                 ('output_mode', models.CharField(blank=True, choices=[('single', 'Single (replaces the previous item)'), ('accumulating', 'Accumulating (adds items)')], help_text='Regular only.', max_length=16)),
                 ('recipe_key', models.CharField(blank=True, help_text='Regular only, optional: a logical local recipe identifier (not a path, script or import).', max_length=64, validators=[django.core.validators.RegexValidator('^[a-z][a-z0-9_]{0,63}$')])),
                 ('artist_tag', models.CharField(blank=True, help_text='Regular only, optional.', max_length=200)),
-                ('recallable', models.BooleanField(blank=True, help_text='Public address / urgent only: the producer may withdraw their own ACTIVE message. Default: no.', null=True)),
+                ('recallable', models.BooleanField(blank=True, help_text='Public address / urgent only: the producer may withdraw their own ACTIVE message. Default: yes.', null=True)),
                 ('producer_self_publish', models.BooleanField(blank=True, help_text='Public address / urgent only: an assigned producer may activate their own message; otherwise activation needs control authority. Default: yes.', null=True)),
                 ('replay_interval_seconds', models.PositiveIntegerField(blank=True, help_text='Public address / urgent only, optional: replay interval for messages of this type (60..86400 s). Empty: the active-message policy default.', null=True, validators=[django.core.validators.MinValueValidator(60), django.core.validators.MaxValueValidator(86400)])),
                 ('created_at', models.DateTimeField(auto_now_add=True)),

@@ -150,7 +150,7 @@ Legacy OGRemote has station-defined producer content types, many per user
     `recipe_key` and `artist_tag`. Configuration only (processing is D3C);
     never an active message.
   * `public_address` / `urgent` — an active message: `producer_self_publish`
-    (default yes), `recallable` (default no), optional
+    (default yes), `recallable` (default yes), optional
     `replay_interval_seconds` override (60..86400; NULL = the policy default,
     frozen onto the message at activation).
   * `test` — explicitly non-airing: none of the delivery settings, and never
@@ -160,8 +160,10 @@ Legacy OGRemote has station-defined producer content types, many per user
   recipe key's shape forbids dots, slashes and spaces). Incompatible field
   combinations are refused by `clean()` (admin forms) **and** by database
   CHECK constraints. The delivery mode of a type that active messages
-  reference cannot change (their kind was derived from it); types are never
-  deleted (PROTECT; disable instead).
+  reference cannot change (their kind was derived from it). Deletion:
+  Django Admin does not offer deleting a type; a type referenced by an
+  `ActiveBroadcastMessage` is protected by the database (PROTECT); the
+  normal station lifecycle is to disable a type rather than delete it.
 * **`ProducedContentTypeAssignment`** — `(user, content_type)`, unique. Scope,
   not a role: the broad capability still comes from `authz`.
 
@@ -200,7 +202,9 @@ next step).
 **Compatibility types.** `active_messages.0003` creates two native types if
 absent — `urgent_pa` (urgent) and `public_address` (public address) — with
 D1's authority unchanged (no producer self-publish, not recallable, policy
-replay default) and backfills every existing message from its frozen kind.
+replay default), set explicitly rather than taken from the model defaults
+(which give a NEW public-address/urgent type self-publish and recall), and
+backfills every existing message from its frozen kind.
 Nothing is imported from legacy OGRemote (category table, users,
 assignments, submissions, files): that belongs to the migration/cutover
 phases.

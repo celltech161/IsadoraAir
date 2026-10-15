@@ -36,7 +36,7 @@ class ProducedContentTypeAdmin(admin.ModelAdmin):
         ("Public address / urgent", {
             "fields": ["producer_self_publish", "recallable", "replay_interval_seconds"],
             "description": "Only for public-address and urgent types. Leave blank for the defaults "
-                           "(self-publish: yes; recall: no; replay: the active-message policy default).",
+                           "(self-publish: yes; producer recall: yes; replay: the active-message policy default).",
         }),
         ("History", {"fields": ["created_at", "updated_at"]}),
     ]

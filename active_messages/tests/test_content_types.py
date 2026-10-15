@@ -27,8 +27,9 @@ M = ActiveBroadcastMessage
 class ContentTypeCase(Domain, TestCase):
     def setUp(self):
         super().setUp()
-        self.pa_a = content_type("lcl_psa", "public_address")                    # self-publish on, recall off
-        self.pa_b = content_type("usd239sc", "public_address", recallable=True)
+        # pa_a: self-publish on (default), producer recall explicitly off; pa_b: the defaults (both on).
+        self.pa_a = content_type("town_notice", "public_address", recallable=False)
+        self.pa_b = content_type("usd239sc", "public_address")
         self.urgent_a = content_type("school_urgent", "urgent", recallable=True)
         self.reviewed = content_type("reviewed_pa", "public_address", producer_self_publish=False,
                                      recallable=True)
@@ -51,7 +52,7 @@ class IdentityTests(ContentTypeCase):
         self.live(self.producer, self.pa_a)
         self.live(self.producer, self.pa_b)
         self.live(self.producer, self.urgent_a)
-        self.assertEqual(self.active_types(self.producer), {"lcl_psa", "usd239sc", "school_urgent"})
+        self.assertEqual(self.active_types(self.producer), {"town_notice", "usd239sc", "school_urgent"})
 
     def test_a_replacement_supersedes_only_the_same_exact_type(self):
         first_a = self.live(self.producer, self.pa_a)
@@ -61,9 +62,9 @@ class IdentityTests(ContentTypeCase):
         rows = {row.pk: row for row in M.objects.filter(pk__in=[first_a.pk, b.pk, urgent.pk, second_a.pk])}
         self.assertEqual((rows[first_a.pk].state, rows[first_a.pk].superseded_by_id), ("cleared", second_a.pk))
         self.assertEqual({rows[b.pk].state, rows[urgent.pk].state, rows[second_a.pk].state}, {"active"})
-        self.assertEqual(self.active_types(self.producer), {"lcl_psa", "usd239sc", "school_urgent"})
+        self.assertEqual(self.active_types(self.producer), {"town_notice", "usd239sc", "school_urgent"})
         detail = ActiveBroadcastMessageEvent.objects.get(message=second_a, event="activated").detail
-        self.assertEqual((detail["content_type"], detail["supersedes"]), ("lcl_psa", str(first_a.pk)))
+        self.assertEqual((detail["content_type"], detail["supersedes"]), ("town_notice", str(first_a.pk)))
 
     def test_several_producers_each_have_the_same_type_active(self):
         assign(self.producer2, self.pa_a)
@@ -86,7 +87,7 @@ class IdentityTests(ContentTypeCase):
         components = {component["message"]: component for component in composed["snapshot"]["components"]}
         self.assertEqual({(components[str(row.pk)]["kind"], components[str(row.pk)]["content_type_key"],
                            components[str(row.pk)]["content_type"]) for row in (a, b)},
-                         {("public_address", "lcl_psa", self.pa_a.pk), ("public_address", "usd239sc", self.pa_b.pk)})
+                         {("public_address", "town_notice", self.pa_a.pk), ("public_address", "usd239sc", self.pa_b.pk)})
         stripped = {**composed["snapshot"], "components": [
             {key: value for key, value in component.items() if not key.startswith("content_type")}
             for component in composed["snapshot"]["components"]]}

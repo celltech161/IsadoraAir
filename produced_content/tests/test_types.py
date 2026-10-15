@@ -39,15 +39,42 @@ class DeliveryModeTests(TestCase):
                 row.save()
         stored = {row.key: row for row in ProducedContentType.objects.filter(key__in=rows)}
         self.assertEqual((stored["usd239min"].output_mode, stored["usd239min"].recallable), ("single", None))
-        # Public-address/urgent defaults: self-publish on, recall off, replay = the policy default.
+        # Public-address/urgent defaults: self-publish on, producer recall on, replay = the policy default.
         self.assertEqual((stored["usd239sc"].producer_self_publish, stored["usd239sc"].recallable,
-                          stored["usd239sc"].replay_interval_seconds), (True, False, None))
+                          stored["usd239sc"].replay_interval_seconds), (True, True, None))
         self.assertEqual((stored["urgent_custom"].producer_self_publish, stored["urgent_custom"].recallable,
                           stored["urgent_custom"].replay_interval_seconds), (False, True, 900))
         self.assertEqual((stored["test_audio"].producer_self_publish, stored["test_audio"].recallable,
                           stored["test_audio"].target_category_id), (None, None, None))
         self.assertTrue(stored["usd239sc"].is_active_message_type)
         self.assertFalse(stored["usd239min"].is_active_message_type or stored["test_audio"].is_active_message_type)
+
+    def test_new_pa_and_urgent_types_default_to_self_publish_and_recall(self):
+        for mode in ("public_address", "urgent"):
+            with self.subTest(mode=mode):
+                created = ProducedContentType.objects.create(key=f"new_{mode}", name=mode, delivery_mode=mode)
+                stored = ProducedContentType.objects.get(pk=created.pk)
+                self.assertEqual((stored.producer_self_publish, stored.recallable), (True, True))
+                cleaned = build(f"form_{mode}", mode)
+                cleaned.full_clean()                                             # the admin/form path
+                self.assertEqual((cleaned.producer_self_publish, cleaned.recallable), (True, True))
+
+    def test_an_explicit_no_is_kept(self):
+        for mode in ("public_address", "urgent"):
+            with self.subTest(mode=mode):
+                row = ProducedContentType.objects.create(key=f"closed_{mode}", name=mode, delivery_mode=mode,
+                                                         recallable=False, producer_self_publish=False)
+                stored = ProducedContentType.objects.get(pk=row.pk)
+                self.assertEqual((stored.producer_self_publish, stored.recallable), (False, False))
+        self.assertFalse(ProducedContentType.objects.create(
+            key="no_recall", name="x", delivery_mode="public_address", recallable=False).recallable)
+
+    def test_the_migration_compatibility_types_keep_d1_authority(self):
+        """Created by active_messages.0003 with explicit values: the model
+        defaults never give them producer authority."""
+        rows = {row.key: (row.producer_self_publish, row.recallable)
+                for row in ProducedContentType.objects.filter(key__in=("urgent_pa", "public_address"))}
+        self.assertEqual(rows, {"urgent_pa": (False, False), "public_address": (False, False)})
 
     def test_incompatible_combinations_are_refused_by_clean(self):
         cat = category()
@@ -131,7 +158,7 @@ class AssignmentTests(TestCase):
     def setUp(self):
         self.alice, self.bob = User.objects.create_user("alice"), User.objects.create_user("bob")
         self.news = build("news_item", "regular", target_category=category(), output_mode="accumulating")
-        self.psa = build("lcl_psa", "public_address")
+        self.psa = build("town_notice", "public_address")
         self.urgent = build("urgent_custom", "urgent")
         for row in (self.news, self.psa, self.urgent):
             row.save()
@@ -141,7 +168,7 @@ class AssignmentTests(TestCase):
             ProducedContentTypeAssignment.objects.create(user=self.alice, content_type=row)
         ProducedContentTypeAssignment.objects.create(user=self.bob, content_type=self.psa)
         self.assertEqual(set(authority.assigned_types(self.alice).values_list("key", flat=True)),
-                         {"news_item", "lcl_psa", "urgent_custom"})
+                         {"news_item", "town_notice", "urgent_custom"})
         self.assertEqual(set(self.psa.assignments.values_list("user__username", flat=True)), {"alice", "bob"})
         self.assertTrue(authority.is_assigned(self.bob, self.psa))
         self.assertFalse(authority.is_assigned(self.bob, self.urgent))          # exact type, not "some PA/urgent"
@@ -160,8 +187,8 @@ class AssignmentTests(TestCase):
         self.assertTrue(authority.assigned_types(self.alice, enabled_only=False).exists())
 
     def test_resolve_is_exact_and_rereads(self):
-        self.assertEqual(authority.resolve("lcl_psa").pk, self.psa.pk)
-        self.assertEqual(authority.resolve(self.psa.pk).key, "lcl_psa")
+        self.assertEqual(authority.resolve("town_notice").pk, self.psa.pk)
+        self.assertEqual(authority.resolve(self.psa.pk).key, "town_notice")
         stale = ProducedContentType.objects.get(pk=self.psa.pk)
         self.psa.enabled = False
         self.psa.save()
@@ -193,7 +220,7 @@ class AdminTests(TestCase):
         created = self.client.post(add, {**base, "key": "usd239sc", "delivery_mode": "public_address"})
         self.assertEqual(created.status_code, 302)
         row = ProducedContentType.objects.get(key="usd239sc")
-        self.assertEqual((row.producer_self_publish, row.recallable), (True, False))
+        self.assertEqual((row.producer_self_publish, row.recallable), (True, True))
         change = self.client.get(reverse("admin:produced_content_producedcontenttype_change", args=[row.pk]))
         self.assertEqual(change.status_code, 200)
         self.assertNotContains(change, 'name="key"')                             # the durable key is read-only
