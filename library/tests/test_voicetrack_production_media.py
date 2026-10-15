@@ -651,7 +651,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "active_messages.0004_message_content_type_identity",
                               "library.0090_seed_iportal_nav_item", "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
-                              "produced_content.0003_recipe_key_leading_digit"])
+                              "produced_content.0003_recipe_key_leading_digit",
+                              "produced_content.0004_backend_regular_only"])
             item = payload["plan"][0]
             self.assertEqual([(op["operation"], op["classification"]) for op in item["operations"]],
                              [("AddField", "additive")])
@@ -664,7 +665,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("library.0090_seed_iportal_nav_item", "RunPython"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
-                              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")])
+                              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
+                              ("produced_content.0004_backend_regular_only", "AddConstraint")])
             self.assertEqual((payload["conflicts"], payload["replacements"]), ({}, []))
             self.assertIn("production.0001_initial", item["dependencies"])
         finally:

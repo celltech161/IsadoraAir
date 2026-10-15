@@ -6,7 +6,10 @@
 * produced_content.0003 -- the recipe-key pattern correction (D3A's pattern
   refused the accepted recipe ``3min_ctr``): RemoveConstraint, AlterField
   (validator), AddConstraint -- MANUAL operations a release must authorize.
-  Widening only: every existing row satisfies the new constraint."""
+  Widening only: every existing row satisfies the new constraint.
+* produced_content.0004 (review correction) -- the database guard of the
+  bridge-only link: a spoken backend implies a regular type (AddConstraint:
+  MANUAL). Every existing row satisfies it."""
 from django.core.management import call_command
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
@@ -18,21 +21,24 @@ from updatecenter.management.commands import updatecenter_probe as probe
 
 from .support import category
 
-D3C_REFS = ["produced_content.0002_d3c_spoken_backend_and_test_take", "produced_content.0003_recipe_key_leading_digit"]
+D3C_REFS = ["produced_content.0002_d3c_spoken_backend_and_test_take", "produced_content.0003_recipe_key_leading_digit",
+            "produced_content.0004_backend_regular_only"]
 
 
 class ClassificationTests(SimpleTestCase):
-    def test_0002_is_additive_and_0003_is_exactly_three_manual_operations(self):
+    def test_0002_is_additive_and_0003_0004_are_exactly_four_manual_operations(self):
         plan = probe._serialize_exact_plan(MigrationLoader(None), D3C_REFS)
         self.assertEqual([item["ref"] for item in plan], D3C_REFS)
         self.assertEqual([(op["operation"], op["classification"]) for op in plan[0]["operations"]],
                          [("AddField", "additive"), ("CreateModel", "additive")])
         self.assertEqual([(op["operation"], op["classification"]) for op in plan[1]["operations"]],
                          [("RemoveConstraint", "manual"), ("AlterField", "manual"), ("AddConstraint", "manual")])
+        self.assertEqual([(op["operation"], op["classification"]) for op in plan[2]["operations"]],
+                         [("AddConstraint", "manual")])
         self.assertEqual([(entry["ref"], entry["operation_index"], entry["operation"])
                           for entry in probe.extract_manual_operations(plan)],
                          [(D3C_REFS[1], 0, "RemoveConstraint"), (D3C_REFS[1], 1, "AlterField"),
-                          (D3C_REFS[1], 2, "AddConstraint")])
+                          (D3C_REFS[1], 2, "AddConstraint"), (D3C_REFS[2], 0, "AddConstraint")])
 
     def test_the_migrations_depend_only_on_what_they_reference(self):
         loader = MigrationLoader(None)
@@ -42,6 +48,8 @@ class ClassificationTests(SimpleTestCase):
                                  ("spoken", "0001_initial"), ("auth", "__first__")]))
         third = loader.get_migration("produced_content", "0003_recipe_key_leading_digit")
         self.assertEqual(third.dependencies, [("produced_content", "0002_d3c_spoken_backend_and_test_take")])
+        fourth = loader.get_migration("produced_content", "0004_backend_regular_only")
+        self.assertEqual(fourth.dependencies, [("produced_content", "0003_recipe_key_leading_digit")])
 
     def test_no_data_migration_and_no_station_seed(self):
         loader = MigrationLoader(None)

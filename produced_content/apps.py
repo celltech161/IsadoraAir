@@ -14,3 +14,9 @@ class ProducedContentConfig(AppConfig):
 
         from .iportal import ADAPTER as produced_content_recorder_adapter
         recorder_registry.register(produced_content_recorder_adapter)
+        # CONTROL withdraws/recalls the items of D3C-managed backends -- and only
+        # those (spoken.transitions.may_recall_as_manager).
+        from spoken import transitions as spoken_transitions
+
+        from .authority import controls_managed_type
+        spoken_transitions.register_recall_authority(controls_managed_type)

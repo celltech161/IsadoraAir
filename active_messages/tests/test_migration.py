@@ -30,10 +30,12 @@ IDENTITY = REPO / "active_messages" / "migrations" / "0004_message_content_type_
 PRODUCED = REPO / "produced_content" / "migrations" / "0001_initial.py"
 REFS = ["active_messages.0001_initial", "active_messages.0002_playout_correlation"]
 D3A_REFS = ["active_messages.0003_message_content_type", "active_messages.0004_message_content_type_identity"]
-D3C_REFS = ["produced_content.0002_d3c_spoken_backend_and_test_take", "produced_content.0003_recipe_key_leading_digit"]
+D3C_REFS = ["produced_content.0002_d3c_spoken_backend_and_test_take", "produced_content.0003_recipe_key_leading_digit",
+            "produced_content.0004_backend_regular_only"]
 D3C_MANUAL = [("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
-              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")]
+              ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
+              ("produced_content.0004_backend_regular_only", "AddConstraint")]
 PRODUCED_REF = "produced_content.0001_initial"
 SEED_REF = "authz.0008_active_message_capabilities"
 D3A_MANUAL = [("active_messages.0003_message_content_type", "RunPython"),
@@ -90,9 +92,12 @@ class StructureTests(SimpleTestCase):
     def test_the_d3a_migrations_have_exactly_their_declared_operations(self):
         from produced_content import models as produced
         self.assertEqual(_migration_calls(PRODUCED), ["CreateModel"] * 2 + ["swappable_dependency"])
+        # 2.22D3C added one constraint later, in its own migration (produced_content.0004).
+        d3c = {"produced_type_backend_regular_only": PRODUCED.parent / "0004_backend_regular_only.py"}
         for name in (_declared(produced.ProducedContentType, "constraints")
                      | _declared(produced.ProducedContentTypeAssignment, "constraints")):
-            self.assertIn(f"name='{name}'", PRODUCED.read_text())
+            self.assertIn(f"name='{name}'", d3c.get(name, PRODUCED).read_text())
+        self.assertNotIn("produced_type_backend_regular_only", PRODUCED.read_text())
         self.assertEqual(_migration_calls(BACKFILL), ["AddField", "RunPython"])
         self.assertEqual(_migration_calls(IDENTITY), ["AddConstraint", "AlterField", "RemoveConstraint"])
         for forbidden in ("ogremote", "RunSQL", "SeparateDatabaseAndState"):

@@ -182,15 +182,24 @@ class RegularRecorderTests(WorkspaceCase):
         stray = transitions.create_item(standalone, actor=self.producer)
         self.assertEqual(self.context(self.producer, self.query(stray)).status_code, 404)
 
-    def test_another_producer_or_control_never_sees_the_item(self):
+    def test_another_producer_never_sees_the_item_and_control_sees_it_read_only(self):
         item = self.draft()
         take = self.recorded(self.producer, self.query(item))
-        for user in (self.producer2, self.controller):
-            with self.subTest(user=user.username):
-                self.assertEqual(self.context(user, self.query(item)).status_code, 404)
-                self.assertEqual(self.take(user, self.query(item)).status_code, 404)
-                self.assertEqual(self.submit(user, item, take, "x").status_code, 404)
-                self.assertEqual(self.client_for(user).get(f"{API}media/{take}/?{self.query(item)}").status_code, 404)
+        self.assertEqual(self.context(self.producer2, self.query(item)).status_code, 404)
+        self.assertEqual(self.take(self.producer2, self.query(item)).status_code, 404)
+        self.assertEqual(self.submit(self.producer2, item, take, "x").status_code, 404)
+        self.assertEqual(self.client_for(self.producer2).get(f"{API}media/{take}/?{self.query(item)}").status_code,
+                         404)
+        # Station control: visible, read-only -- only its producer records and submits it.
+        context = self.context(self.controller, self.query(item)).json()["context"]
+        self.assertEqual(set(context["allowed_operations"]), {"open", "export"})
+        self.assertIn("Only its own producer", context["blocked_reason"])
+        self.assertEqual(dict(context["display"])["Producer"], "producer")
+        self.assertEqual(self.take(self.controller, self.query(item)).status_code, 403)
+        revision = self.revision(self.producer, item)
+        self.assertEqual(self.submit(self.controller, item, take, revision).status_code, 403)
+        self.assertEqual(self.client_for(self.controller).get(f"{API}media/{take}/?{self.query(item)}").status_code,
+                         404)                                             # an unbound take of another's
         self.assertEqual(self.context(self.host, self.query(item)).status_code, 403)     # no capability at all
         self.assertEqual(SpokenItem.objects.get(pk=item.pk).state, S.DRAFT)
 
@@ -310,7 +319,6 @@ class WithdrawTests(WorkspaceCase):
         confirm = self.client_for(self.producer).get(f"{PAGE}{item.pk}/withdraw/")
         self.assertContains(confirm, "Abandon this item?")
         self.assertEqual(self.post(self.producer2, f"{PAGE}{item.pk}/withdraw/").status_code, 404)
-        self.assertEqual(self.post(self.controller, f"{PAGE}{item.pk}/withdraw/").status_code, 404)
         response = self.post(self.producer, f"{PAGE}{item.pk}/withdraw/", {"expected_state": "draft"})
         self.assertRedirects(response, PAGE, fetch_redirect_response=False)
         item = SpokenItem.objects.get(pk=item.pk)

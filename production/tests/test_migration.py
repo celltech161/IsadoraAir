@@ -105,7 +105,8 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  # 2.22D3C: the spoken backend link / test takes, and
                                                  # the recipe-key pattern correction
                                                  "produced_content.0002_d3c_spoken_backend_and_test_take",
-                                                 "produced_content.0003_recipe_key_leading_digit"})
+                                                 "produced_content.0003_recipe_key_leading_digit",
+                                                 "produced_content.0004_backend_regular_only"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(sorted((entry["ref"], entry["operation"])
                                     for entry in probe.extract_manual_operations(payload["plan"])),
@@ -116,7 +117,8 @@ class LivePlanClassificationTests(TransactionTestCase):
                                      ("library.0090_seed_iportal_nav_item", "RunPython"),
                                      ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                                      ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
-                                     ("produced_content.0003_recipe_key_leading_digit", "AddConstraint")]))
+                                     ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
+                                     ("produced_content.0004_backend_regular_only", "AddConstraint")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

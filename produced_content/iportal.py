@@ -6,10 +6,10 @@ subject is server-resolved to exactly one object -- never a model name, path,
 filename, category, script or "my current item":
 
 * ``?item=<uuid>``      REGULAR: one exact SpokenItem of a D3C-managed backend
-                        (produced_content.regular). Only its own producer sees
-                        it (anyone else: 404). A DRAFT is writable by its
-                        producer while they may still produce the exact enabled
-                        type; its recorder "save" is the explicit SUBMISSION
+                        (produced_content.regular). Its own producer -- and,
+                        read-only, station control -- sees it (anyone else:
+                        404). A DRAFT is writable ONLY by its producer, while
+                        they may still produce the exact enabled type; its recorder "save" is the explicit SUBMISSION
                         (``regular.submit``: revision under the row lock, then
                         submit + validation in one transaction). Submitted and
                         later items are read-only previews.
@@ -76,6 +76,8 @@ class TestSubject:
 def regular_write_refusal(user, subject) -> str:
     """Why this exact regular item cannot be recorded onto / submitted now."""
     item, produced = subject.item, subject.produced
+    if not regular.is_owner(user, item):
+        return "Only its own producer records and submits this item; station control can withdraw it on My Content."
     if item.state != S.DRAFT:
         return f"This item is {item.get_state_display().lower()}; it is read-only here."
     refusal = authority.production_refusal(user, produced)
@@ -107,11 +109,11 @@ class ProducedContentAdapter(RecordingAdapter):
 
     def authorize_subject(self, user, subject, operation):
         if isinstance(subject, RegularSubject):
-            if not regular.is_owner(user, subject.item):
+            if not regular.may_see(user, subject.item):
                 raise SubjectNotFound("bad_subject", "no such item")          # never disclose another's item
             if operation in READ_OPERATIONS:
                 return True
-            if operation == "save" and subject.item.state != S.DRAFT:
+            if operation == "save" and subject.item.state != S.DRAFT and regular.is_owner(user, subject.item):
                 # An editor opened on the draft, saving after the item moved on
                 # (another tab submitted it): a conflict, never a replacement.
                 raise Conflict("stale_revision", "this item was already submitted",
@@ -207,6 +209,7 @@ class ProducedContentAdapter(RecordingAdapter):
             ("Output", produced.get_output_mode_display()),
             ("Processing recipe", produced.recipe_key or "none"),
             ("Artist", produced.artist_tag or produced.name),
+            ("Producer", item.submitted_by_username or "unknown"),
             ("Title", item.title or "the submission date"),
             ("State", item.get_state_display()),
         ]
