@@ -105,7 +105,11 @@ HANDOFF_WIRE_PROTOCOL = SUPPORTED_WIRE_PROTOCOLS[0]
 # boundary: release MANIFESTS are unchanged and stay protocol 5 (see below), so
 # a runtime-10 worker can always parse the whole chain and reach the handoff.
 # The daemon wire protocol remains v4.
-RUNTIME_VERSION = 11
+#
+# 11 -> 12 (r0112): explicit restart authority/order for the already-managed
+# isadoraair-spoken-render-worker. No release-manifest schema, daemon wire
+# protocol, bootstrap protocol, or managed-unit activation semantics changed.
+RUNTIME_VERSION = 12
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared

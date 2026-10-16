@@ -9,10 +9,14 @@ import tempfile
 from django.test import SimpleTestCase
 
 from .phase_b_helpers import create_release_repository, git
+from isadoraair_updater import MANIFEST_PROTOCOL_VERSION, PROTOCOL_VERSION, RUNTIME_VERSION, SUPPORTED_WIRE_PROTOCOLS
+from isadoraair_updater_bootstrap import BOOTSTRAP_PROTOCOL_VERSION
 from isadoraair_updater.process import CommandRunner, ProcessResult
 from isadoraair_updater.release import (
-    ReleaseError, TrustedRepository, derive_plan, load_chain, manual_blockers,
+    CORE_SERVICES, RESTART_ORDER, ReleaseError, TrustedRepository,
+    derive_plan, load_chain, manual_blockers,
 )
+from updatecenter import manifest as application_manifest, planner as application_planner
 from isadoraair_updater.staging import StagingError, cleanup, materialize
 
 
@@ -41,6 +45,43 @@ class TrustedReleaseTests(SimpleTestCase):
         self.assertEqual(plan.installed_commit, self.r0002)
         self.assertEqual(plan.target_commit, self.r0003)
         self.assertEqual(len(plan.fingerprint), 64)
+
+
+    def test_future_release_derives_gunicorn_then_spoken_worker(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            _author, upstream, _bootstrap, r0002, _r0003 = create_release_repository(
+                Path(scratch),
+                third_release_changes={
+                    "services_requiring_restart": [
+                        "isadoraair-spoken-render-worker", "isadoraair-gunicorn",
+                    ],
+                },
+            )
+            repository = TrustedRepository(
+                Path(scratch) / "trusted.git", str(upstream), "main", CommandRunner()
+            )
+            tip = repository.fetch()
+            plan = derive_plan(repository, tip, r0002, "r0003")
+        self.assertEqual(
+            plan.services_requiring_restart,
+            ("isadoraair-gunicorn", "isadoraair-spoken-render-worker"),
+        )
+
+    def test_application_and_protected_restart_contracts_are_in_lockstep(self):
+        self.assertEqual(application_manifest.CORE_RESTARTABLE_SERVICES, CORE_SERVICES)
+        self.assertEqual(application_planner.RESTART_ORDER, RESTART_ORDER)
+        self.assertEqual(
+            RESTART_ORDER,
+            ("isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
+             "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds"),
+        )
+
+    def test_runtime_12_keeps_all_protocols_unchanged(self):
+        self.assertEqual(RUNTIME_VERSION, 12)
+        self.assertEqual(MANIFEST_PROTOCOL_VERSION, 5)
+        self.assertEqual(PROTOCOL_VERSION, 4)
+        self.assertEqual(SUPPORTED_WIRE_PROTOCOLS, (3, 4))
+        self.assertEqual(BOOTSTRAP_PROTOCOL_VERSION, 1)
 
     def test_live_unreleased_commit_rejected(self):
         (self.author / "extra").write_text("x", encoding="utf-8")

@@ -119,7 +119,7 @@ MIGRATION_COMPATIBILITY_VALUES = frozenset({"additive", "destructive"})
 
 # Fixed, closed set -- NOT "anything named services_requiring_restart
 # says," matching the architecture report's explicit "known service
-# names" requirement. Adding a 6th core service to this project is a
+# names" requirement. Adding another long-running application service is a
 # real, rare, reviewable event; this set is deliberately not derived
 # from scanning `deploy/*.service` (that would accept any of the 100+
 # optional/companion units here too, which must never be silently
@@ -127,6 +127,7 @@ MIGRATION_COMPATIBILITY_VALUES = frozenset({"additive", "destructive"})
 CORE_RESTARTABLE_SERVICES = frozenset({
     "isadoraair-gunicorn",
     "isadoraair-engine",
+    "isadoraair-spoken-render-worker",
     "isadoraair-encoders",
     "isadoraair-monitoring",
     "isadoraair-rbds",

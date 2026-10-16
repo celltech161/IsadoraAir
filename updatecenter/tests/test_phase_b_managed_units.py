@@ -106,7 +106,7 @@ def _create_promotion_repository(root: Path, *, promoted_units, promote_release_
 
 
 class ManagedUnitPolicyMapTests(SimpleTestCase):
-    def test_all_five_core_services_are_enable_now(self):
+    def test_all_explicit_restartable_services_are_enable_now(self):
         for name in CORE_SERVICES:
             self.assertIs(MANAGED_UNIT_POLICIES[f"{name}.service"], UnitActivationPolicy.ENABLE_NOW)
 
@@ -377,7 +377,7 @@ class ManifestProtocolBumpTests(SimpleTestCase):
         # constant, and bumping it broke every existing daemon-socket
         # client's request shape).
         self.assertEqual(PROTOCOL_VERSION, 4)
-        self.assertEqual(RUNTIME_VERSION, 11)
+        self.assertEqual(RUNTIME_VERSION, 12)
 
     def test_old_updater_protocol_rejects_a_release_requiring_the_new_one(self):
         """Simulates an updater still running protocol-3 code (as it

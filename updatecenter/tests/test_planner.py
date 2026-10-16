@@ -406,6 +406,20 @@ class ValidUpdateTests(TestCase):
                 ("isadoraair-gunicorn", "isadoraair-engine", "isadoraair-rbds"),
             )
 
+    def test_future_release_orders_gunicorn_and_spoken_worker_identically(self):
+        repo, releases_dir, bootstrap_sha = self._two_release_repo({
+            "services_requiring_restart": [
+                "isadoraair-spoken-render-worker", "isadoraair-gunicorn",
+            ],
+        })
+        with repo:
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertEqual(
+                plan.services_requiring_restart,
+                ("isadoraair-gunicorn", "isadoraair-spoken-render-worker"),
+            )
+
     def test_incompatible_migration_requires_manual_gate(self):
         repo, releases_dir, bootstrap_sha = self._two_release_repo(
             {"migrations_required": ["library.0079_mediaplaybackincident"], "migration_compatibility": "destructive"},

@@ -94,6 +94,15 @@ class ValidManifestsTests(SimpleTestCase):
         self.assertEqual(parsed.services_requiring_restart, ("isadoraair-gunicorn",))
         self.assertFalse(parsed.collectstatic_required)
 
+    def test_spoken_render_worker_is_an_explicit_restartable_service(self):
+        parsed = m.validate_manifest_dict(_valid_followup(
+            services_requiring_restart=[
+                "isadoraair-gunicorn", "isadoraair-spoken-render-worker",
+            ],
+        ))
+        self.assertEqual(parsed.services_requiring_restart,
+                         ("isadoraair-gunicorn", "isadoraair-spoken-render-worker"))
+
     def test_actual_r0005_manifest_is_low_risk_and_automatic(self):
         path = Path(__file__).resolve().parents[2] / "deploy" / "releases" / "r0005.json"
         parsed = m.validate_manifest_dict(
@@ -223,6 +232,12 @@ class RejectionTests(SimpleTestCase):
     def test_unknown_service_name_rejected(self):
         with self.assertRaisesMessage(m.ManifestError, "unknown service"):
             m.validate_manifest_dict(_valid_followup(services_requiring_restart=["some-random-service"]))
+
+    def test_managed_service_is_not_restartable_without_explicit_authority(self):
+        with self.assertRaisesMessage(m.ManifestError, "unknown service"):
+            m.validate_manifest_dict(
+                _valid_followup(services_requiring_restart=["isadoraair-render"])
+            )
 
     def test_invalid_unit_name_shape_rejected(self):
         with self.assertRaises(m.ManifestError):

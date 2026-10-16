@@ -46,11 +46,11 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:service|timer)$")
 PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*$")
 CORE_SERVICES = frozenset({
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",
-    "isadoraair-monitoring", "isadoraair-rbds",
+    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-rbds",
 })
 RESTART_ORDER = (
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
-    "isadoraair-encoders", "isadoraair-rbds",
+    "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds",
 )
 
 
@@ -64,7 +64,7 @@ class UnitActivationPolicy(enum.Enum):
 
     #: Installed, then `systemctl enable --now`d and verified active/
     #: healthy -- the only behavior a "required" unit had before this
-    #: policy existed (still exactly how the five core services work).
+    #: policy existed (still exactly how the explicit core services work).
     ENABLE_NOW = "enable_now"
 
     #: Installed and daemon-reloaded, but NEVER enabled and NEVER

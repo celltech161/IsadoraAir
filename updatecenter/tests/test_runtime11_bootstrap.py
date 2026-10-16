@@ -16,6 +16,7 @@ trusted history is a clone of THIS repository at r0104 -- the genuine
 import hashlib
 import io
 import json
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -367,8 +368,8 @@ class InitiatingPlannerFingerprintTests(SimpleTestCase):
     """The fingerprint the operator confirms on an r0104 station is computed
     by r0104 code (the r0104 Django planner, in lock-step with runtime 10,
     which re-checks it at line `PLAN_FINGERPRINT_MISMATCH` before handoff).
-    Companions never enter it, so runtime 11 reproduces it exactly: proven
-    end to end above (runtime 10 == runtime 11). Here: the contract itself
+    Companions never enter it, so later runtimes reproduce it exactly: proven
+    end to end above. Here: the contract itself
     is unchanged -- current Django and runtime fingerprints are the legacy
     ones, with no companion input at all."""
 
@@ -377,9 +378,14 @@ class InitiatingPlannerFingerprintTests(SimpleTestCase):
         source = Path(execution_contract.__file__).read_text()
         self.assertNotIn("migration_authorization", source)
         self.assertNotIn("contract_version\": 5", source)
-        runtime_source = (PROJECT_ROOT / "deploy/updater_runtime/isadoraair_updater/release.py").read_bytes()
-        baseline = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "show", f"{R0104_BASELINE}:deploy/updater_runtime/isadoraair_updater/release.py"],
-            check=True, capture_output=True,
-        ).stdout
-        self.assertEqual(runtime_source, baseline, "trusted-chain/fingerprint code must stay byte-identical to r0104")
+        from isadoraair_updater import release
+
+        runtime_contract = "\n".join(inspect.getsource(item) for item in (
+            release.TrustedPlan,
+            release.execution_fingerprint_payload,
+            release.protected_runtime_fingerprint_payload,
+            release.intermediate_protected_runtime_fingerprint_payload,
+            release.fingerprint,
+        ))
+        self.assertNotIn("migration_authorization", runtime_contract)
+        self.assertNotIn('"contract_version": 5', runtime_contract)

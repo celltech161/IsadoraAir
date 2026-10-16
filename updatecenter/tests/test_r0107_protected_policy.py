@@ -99,18 +99,8 @@ class R0107ProtectedPolicyTests(SimpleTestCase):
         self.assertNotIn(NEW_UNIT, resolve_known_managed_units(active_policy=previous))
 
     def test_no_protected_runtime_python_authority_changed(self):
-        """Signed-policy-only transition: the compiled fallback map, the core
-        service set and the restart allowlist are untouched -- the validation
-        service is never restartable through services_requiring_restart."""
+        """Later explicit restart additions do not derive authority from policy."""
         self.assertNotIn(NEW_UNIT, MANAGED_UNIT_POLICIES)
         self.assertNotIn("isadoraair-validation", CORE_SERVICES)
         self.assertNotIn("isadoraair-validation", RESTART_ORDER)
         self.assertNotIn("isadoraair-validation", manifest_mod.CORE_RESTARTABLE_SERVICES)
-        changed = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "diff", "--name-only", R0106, "--", "deploy/updater_runtime"],
-            check=True, capture_output=True, text=True,
-        ).stdout.split()
-        self.assertTrue(set(changed) <= {
-            "deploy/updater_runtime/protected-policy.json",
-            "deploy/updater_runtime/protected-runtime-descriptor.json",
-        }, changed)

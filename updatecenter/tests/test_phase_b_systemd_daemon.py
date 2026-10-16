@@ -106,6 +106,16 @@ class SystemdReconciliationTests(SimpleTestCase):
         with self.assertRaises(SystemdError):
             self.manager.restart_declared(("isadoraair-engine", "isadoraair-gunicorn"))
 
+    def test_spoken_worker_is_restartable_but_policy_only_render_service_is_not(self):
+        restarted = self.manager.restart_declared(("isadoraair-spoken-render-worker",))
+        self.assertEqual(restarted, ["isadoraair-spoken-render-worker"])
+        self.assertTrue(any(
+            call[-1] == "isadoraair-spoken-render-worker.service"
+            for call in self.runner.calls if "restart" in call
+        ))
+        with self.assertRaises(SystemdError):
+            self.manager.restart_declared(("isadoraair-render",))
+
     def test_symlink_destination_refused(self):
         self._unit()
         self.config.systemd_unit_root.mkdir(parents=True)

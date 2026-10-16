@@ -50,7 +50,7 @@ number, deliberately kept separate from the socket wire `PROTOCOL_VERSION`
 above, which stays 3) and replaces "every `systemd_units_new_required` unit
 gets `enable --now`" with a closed, protected-runtime-compiled policy map,
 `release.MANAGED_UNIT_POLICIES`: `ENABLE_NOW` (unchanged existing behavior —
-the five core services, and a companion `.timer`) or `INSTALL_ONLY`
+the explicit core services, and a companion `.timer`) or `INSTALL_ONLY`
 (installed and daemon-reloaded, but never enabled or started — a
 `Type=oneshot` companion `.service` meant only to be triggered by its own
 paired `.timer`). `_cross_check()` also now permits a manifest to promote an

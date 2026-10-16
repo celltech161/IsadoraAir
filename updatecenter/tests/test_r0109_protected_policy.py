@@ -29,6 +29,7 @@ from updatecenter import manifest as manifest_mod
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY = PROJECT_ROOT / "deploy" / "updater_runtime" / "protected-policy.json"
 R0108 = "4703a8648e0e0e3c02620d46c7684e2c0a569a18"          # generation 12 policy, as deployed
+R0109 = "6694b15672f520815b73e2b0e054639f9263d2ba"          # generation 13 policy, as deployed
 NEW_UNITS = {
     "isadoraair-render.service": "ENABLE_NOW",
     "isadoraair-spoken-render-worker.service": "ENABLE_NOW",
@@ -102,22 +103,21 @@ class R0109ProtectedPolicyTests(SimpleTestCase):
                 # generation 12's runtime, by contrast, never heard of them
                 self.assertNotIn(unit, resolve_known_managed_units(active_policy=previous))
 
-    def test_no_protected_runtime_python_authority_changed(self):
-        """Signed-policy-only transition: the compiled fallback map, the core
-        service set and the restart allowlist are untouched -- neither new
-        service is ever restartable through services_requiring_restart."""
-        for unit in NEW_UNITS:
-            service = unit.removesuffix(".service")
-            with self.subTest(unit=unit):
-                self.assertNotIn(unit, MANAGED_UNIT_POLICIES)
-                self.assertNotIn(service, CORE_SERVICES)
-                self.assertNotIn(service, RESTART_ORDER)
-                self.assertNotIn(service, manifest_mod.CORE_RESTARTABLE_SERVICES)
-        changed = subprocess.run(
-            ["git", "-C", str(PROJECT_ROOT), "diff", "--name-only", R0108, "--", "deploy/updater_runtime"],
-            check=True, capture_output=True, text=True,
-        ).stdout.split()
-        self.assertTrue(set(changed) <= {
-            "deploy/updater_runtime/protected-policy.json",
-            "deploy/updater_runtime/protected-runtime-descriptor.json",
-        }, changed)
+    def test_r0112_restart_authority_is_explicit_and_policy_bytes_stay_r0109(self):
+        self.assertEqual(self.value, _policy_at(R0109))
+
+        worker = "isadoraair-spoken-render-worker"
+        render = "isadoraair-render"
+        mapping = self.document.as_mapping()
+        self.assertEqual(mapping[f"{worker}.service"], "ENABLE_NOW")
+        self.assertEqual(mapping[f"{render}.service"], "ENABLE_NOW")
+
+        self.assertIn(worker, CORE_SERVICES)
+        self.assertIn(worker, RESTART_ORDER)
+        self.assertIn(worker, manifest_mod.CORE_RESTARTABLE_SERVICES)
+        self.assertIn(f"{worker}.service", MANAGED_UNIT_POLICIES)
+
+        self.assertNotIn(f"{render}.service", MANAGED_UNIT_POLICIES)
+        self.assertNotIn(render, CORE_SERVICES)
+        self.assertNotIn(render, RESTART_ORDER)
+        self.assertNotIn(render, manifest_mod.CORE_RESTARTABLE_SERVICES)

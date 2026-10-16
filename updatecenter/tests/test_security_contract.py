@@ -128,12 +128,12 @@ class ManifestFieldContractTests(SimpleTestCase):
     def test_core_restartable_services_is_a_closed_set_not_derived_from_deploy_dir(self):
         """Deliberately NOT scanned from deploy/*.service -- that would
         accept any of the 100+ optional/companion units as eligible
-        for an unattended restart. Confirms the set is exactly the 5
-        core services, no more."""
+        for an unattended restart. Confirms the exact finite set."""
         self.assertEqual(
             m.CORE_RESTARTABLE_SERVICES,
             {"isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",
-             "isadoraair-monitoring", "isadoraair-rbds"},
+             "isadoraair-monitoring", "isadoraair-spoken-render-worker",
+             "isadoraair-rbds"},
         )
 
 
