@@ -27,7 +27,6 @@ from protected_bootstrap.policy import parse_policy_dict
 from updatecenter import manifest as manifest_mod
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-POLICY = PROJECT_ROOT / "deploy" / "updater_runtime" / "protected-policy.json"
 R0108 = "4703a8648e0e0e3c02620d46c7684e2c0a569a18"          # generation 12 policy, as deployed
 R0109 = "6694b15672f520815b73e2b0e054639f9263d2ba"          # generation 13 policy, as deployed
 NEW_UNITS = {
@@ -44,9 +43,33 @@ def _policy_at(commit: str) -> dict:
     return json.loads(raw)
 
 
+def _git_show(commit: str, path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "show", f"{commit}:{path}"], check=True, capture_output=True,
+    ).stdout
+
+
+def _exists_at(commit: str, path: str) -> bool:
+    return subprocess.run(["git", "-C", str(PROJECT_ROOT), "cat-file", "-e", f"{commit}:{path}"],
+                          capture_output=True).returncode == 0
+
+
+def _runtime_changes(previous: str, release: str) -> set:
+    return set(subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "diff", "--name-only", previous, release, "--", "deploy/updater_runtime"],
+        check=True, capture_output=True, text=True,
+    ).stdout.split())
+
+
+RELEASE_PY = "deploy/updater_runtime/isadoraair_updater/release.py"
+POLICY_ONLY = {"deploy/updater_runtime/protected-policy.json", "deploy/updater_runtime/protected-runtime-descriptor.json"}
+
+
 class R0109ProtectedPolicyTests(SimpleTestCase):
     def setUp(self):
-        self.raw = POLICY.read_bytes()
+        # Pinned to what r0109 shipped (generation 13): later generations
+        # (r0112's 14) carry their own release tests.
+        self.raw = _git_show(R0109, "deploy/updater_runtime/protected-policy.json")
         self.value = json.loads(self.raw)
         self.document = parse_policy_dict(self.value, label="protected-policy.json")
 
@@ -90,7 +113,7 @@ class R0109ProtectedPolicyTests(SimpleTestCase):
     def test_every_policy_unit_has_a_real_template(self):
         for unit in self.document.as_mapping():
             with self.subTest(unit=unit):
-                self.assertTrue((PROJECT_ROOT / "deploy" / unit).is_file())
+                self.assertTrue(_exists_at(R0109, f"deploy/{unit}"))          # at r0109 itself
 
     def test_the_candidate_runtime_recognizes_and_enables_the_new_units(self):
         known = resolve_known_managed_units(active_policy=self.document)
@@ -103,9 +126,25 @@ class R0109ProtectedPolicyTests(SimpleTestCase):
                 # generation 12's runtime, by contrast, never heard of them
                 self.assertNotIn(unit, resolve_known_managed_units(active_policy=previous))
 
-    def test_r0112_restart_authority_is_explicit_and_policy_bytes_stay_r0109(self):
-        self.assertEqual(self.value, _policy_at(R0109))
+    def test_no_protected_runtime_python_authority_changed_at_r0109(self):
+        """Signed-policy-only transition, bounded by r0109's OWN release commit
+        (never the moving tree): r0109 changed only the policy and descriptor in
+        the protected runtime; its compiled fallback map, core service set and
+        restart allowlist (release.py, and the application allowlist) are
+        r0108's -- neither Phase C service was restartable at r0109."""
+        self.assertEqual(_runtime_changes(R0108, R0109), POLICY_ONLY)
+        release_py = _git_show(R0109, RELEASE_PY)
+        self.assertEqual(release_py, _git_show(R0108, RELEASE_PY))
+        for unit in NEW_UNITS:
+            service = unit.removesuffix(".service").encode()
+            with self.subTest(unit=unit):
+                self.assertNotIn(service, release_py)
+                self.assertNotIn(service, _git_show(R0109, "updatecenter/manifest.py"))
+                self.assertNotIn(service, _git_show(R0109, "updatecenter/planner.py"))
 
+    def test_current_restart_authority_is_explicit_never_derived_from_policy(self):
+        """Current behavior (r0112+): the worker is explicitly restartable; the
+        renderer stays ENABLE_NOW in the signed policy yet never restartable."""
         worker = "isadoraair-spoken-render-worker"
         render = "isadoraair-render"
         mapping = self.document.as_mapping()

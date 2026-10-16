@@ -42,6 +42,48 @@ from isadoraair_updater.release import (
 from isadoraair_updater.runtime_handoff import handoff_required
 
 R0104_BASELINE = "557413534c3dfb1658ea130e86f8fb5094e8c520"
+# The protected release.py is pinned WHOLE: the r0104 baseline bytes plus exactly
+# the reviewed edits of each later protected-runtime release that changed it --
+# every (old, new) pair must occur exactly once. Any other change anywhere in the
+# file (trusted chain, parsing, planning, blockers, restart validation,
+# fingerprints) fails test_fingerprint_contract_has_no_companion_input.
+#
+# r0112 (generation 14 / runtime 12; release commit 02b10fe): explicit restart
+# authority and order for isadoraair-spoken-render-worker.
+REVIEWED_RELEASE_PY_EDITS = (
+    (b'CORE_SERVICES = frozenset({\n'
+     b'    "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",\n'
+     b'    "isadoraair-monitoring", "isadoraair-rbds",\n'
+     b'})\n',
+     b'CORE_SERVICES = frozenset({\n'
+     b'    "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",\n'
+     b'    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-rbds",\n'
+     b'})\n'),
+    (b'RESTART_ORDER = (\n'
+     b'    "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",\n'
+     b'    "isadoraair-encoders", "isadoraair-rbds",\n'
+     b')\n',
+     b'RESTART_ORDER = (\n'
+     b'    "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",\n'
+     b'    "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds",\n'
+     b')\n'),
+    (b'    #: policy existed (still exactly how the five core services work).\n',
+     b'    #: policy existed (still exactly how the explicit core services work).\n'),
+)
+# The signed r0112 descriptor's recorded digest of release.py (generation 14).
+R0112_RELEASE_PY_SHA256 = "034ba10f0de4f16e6e5b66ef94ff1e998fcd15eb057f91361736f567afc4ab6c"
+
+
+def expected_release_py(baseline: bytes, edits=REVIEWED_RELEASE_PY_EDITS) -> bytes:
+    """r0104 baseline bytes + exactly the reviewed substitutions, each of which
+    must be present exactly once (never a parse, re-render or normalization)."""
+    expected = baseline
+    for old, new in edits:
+        count = expected.count(old)
+        if count != 1:
+            raise AssertionError(f"reviewed release.py edit matches {count} times (must be exactly 1): {old!r}")
+        expected = expected.replace(old, new, 1)
+    return expected
 
 _OLD_RUNTIME_DRIVER = r"""
 import json, sys
@@ -378,6 +420,15 @@ class InitiatingPlannerFingerprintTests(SimpleTestCase):
         source = Path(execution_contract.__file__).read_text()
         self.assertNotIn("migration_authorization", source)
         self.assertNotIn("contract_version\": 5", source)
+        runtime_source = (PROJECT_ROOT / "deploy/updater_runtime/isadoraair_updater/release.py").read_bytes()
+        baseline = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "show", f"{R0104_BASELINE}:deploy/updater_runtime/isadoraair_updater/release.py"],
+            check=True, capture_output=True,
+        ).stdout
+        expected = expected_release_py(baseline)
+        self.assertEqual(hashlib.sha256(expected).hexdigest(), R0112_RELEASE_PY_SHA256)    # = the signed bytes
+        self.assertEqual(runtime_source, expected,
+                         "trusted-chain/fingerprint code must stay byte-identical to r0104 plus the reviewed edits")
         from isadoraair_updater import release
 
         runtime_contract = "\n".join(inspect.getsource(item) for item in (

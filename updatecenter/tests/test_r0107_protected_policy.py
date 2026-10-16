@@ -41,6 +41,28 @@ def _policy_at(commit: str) -> dict:
     return json.loads(raw)
 
 
+def _git_show(commit: str, path: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "show", f"{commit}:{path}"], check=True, capture_output=True,
+    ).stdout
+
+
+def _exists_at(commit: str, path: str) -> bool:
+    return subprocess.run(["git", "-C", str(PROJECT_ROOT), "cat-file", "-e", f"{commit}:{path}"],
+                          capture_output=True).returncode == 0
+
+
+def _runtime_changes(previous: str, release: str) -> set:
+    return set(subprocess.run(
+        ["git", "-C", str(PROJECT_ROOT), "diff", "--name-only", previous, release, "--", "deploy/updater_runtime"],
+        check=True, capture_output=True, text=True,
+    ).stdout.split())
+
+
+RELEASE_PY = "deploy/updater_runtime/isadoraair_updater/release.py"
+POLICY_ONLY = {"deploy/updater_runtime/protected-policy.json", "deploy/updater_runtime/protected-runtime-descriptor.json"}
+
+
 class R0107ProtectedPolicyTests(SimpleTestCase):
     def setUp(self):
         self.raw = subprocess.run(
@@ -88,7 +110,7 @@ class R0107ProtectedPolicyTests(SimpleTestCase):
     def test_every_policy_unit_has_a_real_template(self):
         for unit in self.document.as_mapping():
             with self.subTest(unit=unit):
-                self.assertTrue((PROJECT_ROOT / "deploy" / unit).is_file())
+                self.assertTrue(_exists_at(R0107, f"deploy/{unit}"))          # at r0107 itself
 
     def test_the_candidate_runtime_recognizes_and_enables_the_new_unit(self):
         known = resolve_known_managed_units(active_policy=self.document)
@@ -98,8 +120,21 @@ class R0107ProtectedPolicyTests(SimpleTestCase):
         previous = parse_policy_dict(_policy_at(R0106), label="generation 11")
         self.assertNotIn(NEW_UNIT, resolve_known_managed_units(active_policy=previous))
 
-    def test_no_protected_runtime_python_authority_changed(self):
-        """Later explicit restart additions do not derive authority from policy."""
+    def test_no_protected_runtime_python_authority_changed_at_r0107(self):
+        """Signed-policy-only transition, bounded by r0107's OWN release commit
+        (never the moving tree): r0107 changed only the policy and descriptor in
+        the protected runtime; its compiled fallback map, core service set and
+        restart allowlist (release.py) are r0106's, and never name the
+        validation service."""
+        self.assertEqual(_runtime_changes(R0106, R0107), POLICY_ONLY)
+        release_py = _git_show(R0107, RELEASE_PY)
+        self.assertEqual(release_py, _git_show(R0106, RELEASE_PY))
+        self.assertNotIn(b"isadoraair-validation", release_py)
+        self.assertNotIn(b"isadoraair-validation", _git_show(R0107, "updatecenter/manifest.py"))
+
+    def test_validation_is_still_not_restartable_now(self):
+        """Current behavior: later explicit restart additions (r0112) never
+        derive authority from policy."""
         self.assertNotIn(NEW_UNIT, MANAGED_UNIT_POLICIES)
         self.assertNotIn("isadoraair-validation", CORE_SERVICES)
         self.assertNotIn("isadoraair-validation", RESTART_ORDER)
