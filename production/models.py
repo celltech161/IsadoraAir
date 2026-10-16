@@ -35,6 +35,16 @@ There is deliberately no database trigger (that would need a manual migration).
   ``unvalidated`` row; ``present -> purged``). There is no ``purged -> present``.
 * Editing audio means a NEW ProductionMedia with ``derived_from`` pointing at
   the original -- never an in-place overwrite.
+
+NO-AIR provenance (r0113 / D3C). ``airing_prohibited`` is fixed at creation
+like every other column. Intake sets it for media made under a TEST / NO AIR
+recorder subject (the adapter decides from the server-resolved subject), and a
+derivative can only keep or strengthen its parent's restriction: every insert
+path refuses a child of a prohibited parent that is not itself prohibited
+(``save()``, the guarded ``bulk_create``, and the rendition authority). The
+canonical binding (``retention.lock_for_binding``) refuses prohibited media,
+so no air-capable domain can reference it -- whether or not a TEST binding
+still exists.
 """
 from __future__ import annotations
 
@@ -89,7 +99,7 @@ STORAGE_KEY_PATTERN = r"^[0-9a-f]{2}/[0-9a-f]{32}$"
 RENDITION_BOUND_FIELDS = frozenset({
     "id", "kind", "owner_id", "owner_username", "storage_key", "sha256", "byte_size", "original_filename",
     "declared_content_type", "derived_from_id", "recipe_key", "recipe_version", "recipe_params_digest",
-    "toolchain",
+    "toolchain", "airing_prohibited",
 })
 # INITIAL -- unknown until validation / retention: must hold exactly these
 # canonical values at insert (validation alone establishes the facts):
@@ -143,6 +153,9 @@ def rendition_authority(row: dict):
         raise _rendition_refused("a rendition authority names every bound column, and only those")
     if row["kind"] != ProductionMedia.KIND_RENDITION or row["derived_from_id"] is None:
         raise _rendition_refused("a rendition authority names a rendition derived from its source")
+    if not isinstance(row["airing_prohibited"], bool) or _launders_restriction(
+            row["derived_from_id"], row["airing_prohibited"]):
+        raise _rendition_refused("a rendition keeps its source's no-air restriction")
     expected = {**row, **RENDITION_INITIAL_VALUES}
     grant = _RenditionGrant(expected, connection, connection.atomic_blocks[-1], timezone.now())
     token = _rendition.set(grant)
@@ -151,6 +164,20 @@ def rendition_authority(row: dict):
     finally:
         grant.closed = True
         _rendition.reset(token)
+
+
+def _launders_restriction(parent_id, airing_prohibited) -> bool:
+    """Would a child of ``parent_id`` with this flag drop a NO-AIR restriction?
+    The parent's flag is immutable, so an unlocked read is authoritative."""
+    if parent_id is None or airing_prohibited is True:
+        return False
+    return ProductionMedia._base_manager.filter(pk=parent_id, airing_prohibited=True).exists()
+
+
+def _refuse_laundering(objs) -> None:
+    for obj in objs:
+        if _launders_restriction(getattr(obj, "derived_from_id", None), getattr(obj, "airing_prohibited", False)):
+            raise ImmutableMediaError("a derivative of no-air media is itself no-air", code="airing_prohibited")
 
 
 def _same(field, mine, theirs) -> bool:
@@ -217,6 +244,7 @@ class ProductionMediaQuerySet(models.QuerySet):
         objs = list(objs)
         if any(getattr(obj, "kind", None) == ProductionMedia.KIND_RENDITION for obj in objs):
             raise _rendition_refused("renditions are created only by the render executor's intake")
+        _refuse_laundering(objs)
         return super().bulk_create(objs, *args, update_conflicts=update_conflicts, **kwargs)
 
     def delete(self):
@@ -327,6 +355,13 @@ class ProductionMedia(models.Model):
     )
     purged_at = models.DateTimeField(null=True, blank=True)
 
+    # --- no-air provenance (immutable; see the module docstring) -------------
+    airing_prohibited = models.BooleanField(
+        default=False, editable=False,
+        help_text="Made under a TEST / NO AIR subject, or derived from such media: "
+                  "no air-capable binding may ever reference it.",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = ProductionMediaQuerySet.as_manager()
@@ -426,6 +461,7 @@ class ProductionMedia(models.Model):
             if self.kind == self.KIND_RENDITION:
                 # Never through save(): only insert_rendition's exact write.
                 raise _rendition_refused("renditions are created only by the render executor's intake")
+            _refuse_laundering([self])
             if self.owner_id and not self.owner_username:
                 self.owner_username = self.owner.get_username()[:150]
             super().save(*args, **kwargs)

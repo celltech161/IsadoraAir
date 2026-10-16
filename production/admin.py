@@ -32,7 +32,7 @@ class ProductionMediaAdmin(admin.ModelAdmin):
         "id", "kind", "owner_username", "validation_state", "validation_code", "retention_state",
         "container", "codec", "decoded_duration_seconds", "byte_size", "created_at",
     )
-    list_filter = ("kind", "validation_state", "retention_state", "container", "codec")
+    list_filter = ("kind", "validation_state", "retention_state", "airing_prohibited", "container", "codec")
     search_fields = ("id", "sha256", "owner_username", "original_filename", "storage_key")
     ordering = ("-created_at",)
     list_select_related = ("owner",)
@@ -49,6 +49,7 @@ class ProductionMediaAdmin(admin.ModelAdmin):
         ("Validation", {"fields": ("validation_state", "validation_code", "validated_at")}),
         ("Derivation", {"fields": (
             "derived_from", "recipe_key", "recipe_version", "recipe_params_digest", "toolchain",
+            "airing_prohibited",
         )}),
         ("Retention", {"fields": ("retention_state", "purged_at")}),
     )
@@ -59,7 +60,7 @@ class ProductionMediaAdmin(admin.ModelAdmin):
             "decoded_duration_seconds", "header_duration_seconds", "probe", "original_filename",
             "declared_content_type", "validation_state", "validation_code", "validated_at",
             "derived_from", "recipe_key", "recipe_version", "recipe_params_digest", "toolchain",
-            "retention_state", "purged_at",
+            "airing_prohibited", "retention_state", "purged_at",
         )
     )
 

@@ -374,7 +374,7 @@ class TestFirstSaveRaceTests(People, TransactionTestCase):
         super().setUp()
         self.practice = no_air_type("practice")
         assign(self.producer, self.practice)
-        self.media = media_row(self.producer)
+        self.media = media_row(self.producer, airing_prohibited=True)      # a TEST recorder take
 
     def change_mode(self):
         row = ProducedContentType.objects.get(pk=self.practice.pk)

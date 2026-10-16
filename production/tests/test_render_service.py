@@ -1100,7 +1100,7 @@ FORGERIES = {
     "toolchain": "forged", "container": "flac", "codec": "flac", "sample_rate": 44100, "channels": 1,
     "decoded_duration_seconds": Decimal("9.5"), "header_duration_seconds": Decimal("9.5"), "probe": {"forged": 1},
     "validation_state": "valid", "validation_code": "ok", "validated_at": FORGED_AT, "retention_state": "purged",
-    "purged_at": FORGED_AT, "created_at": FORGED_AT,
+    "purged_at": FORGED_AT, "created_at": FORGED_AT, "airing_prohibited": True,
 }
 # The Codex attack: a valid verdict with its facts, forged together (the
 # database constraints accept the combination; only the authority refuses it).
@@ -1129,7 +1129,7 @@ class RenditionRows(MediaFixtures):
                   "storage_key": f"{media_id.hex[:2]}/{media_id.hex}", "sha256": "d" * 64, "byte_size": 10,
                   "original_filename": "", "declared_content_type": "", "derived_from_id": self.source.pk,
                   "recipe_key": "lcl_psa", "recipe_version": 1, "recipe_params_digest": "e" * 64,
-                  "toolchain": f"x; {protocol.EXECUTOR_MARKER}"}
+                  "toolchain": f"x; {protocol.EXECUTOR_MARKER}", "airing_prohibited": False}
         values.update(overrides)
         return values
 
@@ -1461,3 +1461,44 @@ class RenderHealthTests(IsolatedMediaRootMixin, SimpleTestCase):
         status, detail = probes._render_readiness(check, {"NRestarts": "0"},
                                                   {"active_state": "inactive", "sub_state": "dead"})
         self.assertEqual((status, detail["reason"]), ("critical", "service_inactive"))
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class RenditionNoAirProvenanceTests(RenditionRows, TestCase):
+    """r0113: a rendition never launders a NO-AIR source's restriction --
+    through the real executor, at the authority, or below the model."""
+
+    def no_air_source(self):
+        return intake.ingest_stream(io.BytesIO(audio.voice(1.0)), kind=ProductionMedia.KIND_RECORDING, validate=True,
+                                    airing_prohibited=True).media
+
+    def test_a_real_rendition_of_no_air_media_is_no_air_and_never_bindable_for_air(self):
+        from production.errors import MediaAiringProhibited
+        source = self.no_air_source()
+        made = rendition.ingest(client.request_render(source, "lcl_psa"), source).media
+        self.assertEqual((made.kind, made.validation_state, made.airing_prohibited), ("rendition", "valid", True))
+        with self.assertRaises(MediaAiringProhibited), transaction.atomic():
+            retention.lock_for_binding(made)
+        ordinary = rendition.ingest(client.request_render(self.source, "lcl_psa"), self.source).media
+        self.assertFalse(ordinary.airing_prohibited)
+
+    def test_the_authority_refuses_a_row_that_drops_or_garbles_the_restriction(self):
+        source = self.no_air_source()
+        for value in (False, None, 0, "yes"):
+            with self.subTest(value=value):
+                with self.assertRaises(ImmutableMediaError) as raised, transaction.atomic(), \
+                        rendition_authority(self.row(derived_from_id=source.pk, airing_prohibited=value)):
+                    models_mod.insert_rendition()
+                self.assertEqual(raised.exception.code, "rendition_authority")
+        self.assertFalse(self.renditions().exists())
+        with transaction.atomic(), rendition_authority(self.row(derived_from_id=source.pk, airing_prohibited=True)):
+            self.assertTrue(models_mod.insert_rendition().airing_prohibited)
+
+    def test_dropping_the_restriction_below_the_model_is_refused_and_rolled_back(self):
+        source = self.no_air_source()
+        with self.assertRaises(ImmutableMediaError) as raised, transaction.atomic(), \
+                rendition_authority(self.row(derived_from_id=source.pk, airing_prohibited=True)), \
+                _tampering({"airing_prohibited": False}):
+            models_mod.insert_rendition()
+        self.assertIn("airing_prohibited", str(raised.exception))
+        self.assertFalse(self.renditions().exists())

@@ -224,7 +224,9 @@ def api_take(request, adapter):
     """Stream one take into ProductionMedia. Query string: the adapter's
     subject parameters, ``mode`` (record|import|edit), and for ``edit`` the
     ``derived_from`` media UUID plus an ``operations`` JSON list (provenance).
-    Body: the audio bytes, exactly Content-Length long. Never binds anything."""
+    Body: the audio bytes, exactly Content-Length long. Never binds anything.
+    The adapter's ``media_airing_prohibited(subject)`` is stamped on the new
+    media (a NO-AIR take; a derivative also inherits its parent's)."""
     mode = request.GET.get("mode", "")
     if mode not in MODES:
         return _error(RecorderError("bad_mode", "mode must be record, import or edit"))
@@ -256,11 +258,16 @@ def api_take(request, adapter):
                 raise RecorderError("bad_operations", "malformed edit operations")
             recipe = dict(recipe_key=EDITOR_RECIPE_KEY, recipe_version=EDITOR_RECIPE_VERSION,
                           recipe_params={"operations": operations}, toolchain="iportal-browser-editor")
+        # NO-AIR provenance comes from the resolved subject alone (never the
+        # request); a non-bool answer is a broken adapter -- refuse, never guess.
+        airing_prohibited = adapter_obj.media_airing_prohibited(subject)
+        if type(airing_prohibited) is not bool:
+            raise RecorderError("adapter_error", "this workspace cannot accept takes right now", status=500)
         _maybe_sweep_abandoned()
         source = _ExactLengthReader(request, length)
         filename = (request.headers.get("X-Recorder-Filename") or "")[:255]
         common = dict(owner=request.user, original_filename=filename, declared_content_type=content_type,
-                      policy=policy)
+                      policy=policy, airing_prohibited=airing_prohibited)
         if parent is not None:
             result = intake.ingest_derivative(parent, source, **recipe, **common)
         else:

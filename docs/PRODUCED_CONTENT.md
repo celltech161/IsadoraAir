@@ -226,8 +226,8 @@ source or commit work.
 ## TEST / NO AIR (`produced_content/no_air.py`)
 
 `ProducedContentTestTake` — `(user, exact test type) → one validated
-ProductionMedia` (unique per user and type; media PROTECT while bound; opaque
-revision; `expires_at`). Temporary media state, not broadcast history; no
+NO-AIR ProductionMedia` (unique per user and type; media PROTECT while bound;
+opaque revision; `expires_at`). Temporary media state, not broadcast history; no
 event subsystem.
 
 A save locks in the order `ProducedContentType -> ProducedContentTestTake ->
@@ -240,14 +240,30 @@ itself because test takes exist).
 A producer may record, import, edit, validate, save, preview, replace and
 remove their test take. The recorder says **TEST / NO AIR**, **Save test
 take**, *Nothing in this workspace can air.* Saving binds under
-`lock_for_binding` and compares the revision under the binding's row lock (a
-stale tab gets 409, never a silent overwrite).
+`retention.lock_for_no_air_binding` -- which accepts only NO-AIR media, so an
+ordinary take is refused (`not_test_media`) -- and compares the revision under
+the binding's row lock (a stale tab gets 409, never a silent overwrite).
 
-TEST is **structurally incapable of airing**: no TEST type has a spoken
-backend, and the TEST code calls no spoken transition, renderer or projection
-and creates no SpokenItem, rendition, SpokenAsset, Track, LogItem, active
-message, execution, queue entry or engine command (asserted directly by the
-tests).
+TEST is **structurally incapable of airing**, at two levels:
+
+* the TEST code: no TEST type has a spoken backend, and the TEST code calls no
+  spoken transition, renderer or projection and creates no SpokenItem,
+  rendition, SpokenAsset, Track, LogItem, active message, execution, queue
+  entry or engine command (asserted directly by the tests);
+* the media itself (r0113 correction -- the D3C candidate let a saved test
+  take be committed to a REGULAR draft and delivered as a Ready-to-Air Track):
+  every take the TEST recorder makes -- record, import or edit, saved or never
+  saved -- is NO-AIR `ProductionMedia` **from intake on**
+  (`airing_prohibited`, stamped from the adapter's
+  `media_airing_prohibited(subject)`, never from the request). It is immutable
+  and every descendant inherits it -- an edit of a TEST take made in the
+  regular, VoiceTrack or active-message workspace is NO-AIR too. The canonical
+  air-capable binding (`retention.lock_for_binding`) refuses it, so regular
+  submission (HTTP, `regular.submit`, `spoken.transitions.submit` -- as owner
+  or manager), VoiceTrack, active-message media, aggregates and reference
+  audio all refuse it (`airing_prohibited`). Replacing, discarding or expiring
+  the TEST binding does **not** remove the restriction, even when another
+  reference keeps the bytes alive. See docs/PRODUCTION_MEDIA.md.
 
 Retention: **7 days after the most recent save** (fixed; not configurable in
 D3C). When a binding is replaced, removed or expires, only the binding is
@@ -269,12 +285,14 @@ logged and never stops rendering. No new service, unit or timer.
 | | AlterField `recipe_key` (validator `^[a-z0-9][a-z0-9_]{0,63}$`) | manual |
 | | AddConstraint `produced_type_recipe_key_shape` (the widened pattern) | manual |
 | `produced_content.0004_backend_regular_only` | AddConstraint `produced_type_backend_regular_only` (a backend implies a regular type) | manual |
+| `production.0003_media_airing_prohibited` (r0113 correction) | AddField `ProductionMedia.airing_prohibited` (non-null boolean, explicit literal default `False`: existing rows stay air-eligible) | additive |
 
 No data migration, no station seed, no authz migration; existing
 compatibility types stay valid (no backend required). 0003 only widens the
 pattern (every existing row satisfies it); 0004 only guards what the bridge
 already guarantees (every existing row satisfies it). Their four manual
-operations need a release migration authorization when D3C ships.
+operations need a release migration authorization when D3C ships; the
+additive `production.0003` adds no manual operation.
 
 ## Not in D3C
 

@@ -35,6 +35,12 @@ Three distinct guarantees, deliberately not conflated:
    power loss between (e) and (g) leaves a durable orphan file and no row,
    which reconciliation removes.
 
+NO-AIR provenance: ``airing_prohibited=True`` (the recorder passes it for a
+TEST / NO AIR subject) creates media no air-capable binding will ever accept.
+A derivative is prohibited when requested OR when its parent is -- the
+parent's flag is re-read under its binding lock -- so no edit or rendition can
+launder the restriction away; a caller cannot ask for less.
+
 Whole files are never buffered in memory (one CHUNK_SIZE at a time) and nothing
 is staged in /tmp.
 
@@ -164,7 +170,10 @@ def _promote(part: Path, destination: Path) -> None:
         raise IntakeError("could not finalize the upload", code="promotion_failed") from exc
 
 
-def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params, *, rendition_insert=None):
+def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params, *, rendition_insert=None,
+                   airing_prohibited=False):
+    if type(airing_prohibited) is not bool:
+        raise IntakeError("airing_prohibited must be True or False", code="invalid_request")
     if kind not in dict(ProductionMedia.KIND_CHOICES):
         raise IntakeError("unknown media kind", code="invalid_kind")
     if (kind == ProductionMedia.KIND_RENDITION) != (rendition_insert is not None):
@@ -198,7 +207,7 @@ def _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe
 def ingest_stream(
     source, *, kind, owner=None, original_filename="", declared_content_type="",
     policy=None, validate=True, retain_invalid=False, derived_from=None,
-    recipe_key="", recipe_version=None, recipe_params=None, toolchain="",
+    recipe_key="", recipe_version=None, recipe_params=None, toolchain="", airing_prohibited=False,
 ) -> IngestResult:
     """Store ``source`` (anything with ``read(n)``) as a new immutable
     ProductionMedia.
@@ -212,11 +221,14 @@ def ingest_stream(
       is stored ``unvalidated`` and the returned outcome says why.
     * ``kind="rendition"`` is refused: renditions come only from the render
       executor's intake (production.services.render.rendition).
+    * ``airing_prohibited=True``: NO-AIR media (a TEST / NO AIR subject's). A
+      derivative of a prohibited parent is prohibited regardless.
     """
     return _ingest(source, kind=kind, owner=owner, original_filename=original_filename,
                    declared_content_type=declared_content_type, policy=policy, validate=validate,
                    retain_invalid=retain_invalid, derived_from=derived_from, recipe_key=recipe_key,
-                   recipe_version=recipe_version, recipe_params=recipe_params, toolchain=toolchain)
+                   recipe_version=recipe_version, recipe_params=recipe_params, toolchain=toolchain,
+                   airing_prohibited=airing_prohibited)
 
 
 def _insert_generic(columns, outcome) -> ProductionMedia:
@@ -230,7 +242,7 @@ def _insert_generic(columns, outcome) -> ProductionMedia:
 
 def _ingest(source, *, kind, owner=None, original_filename="", declared_content_type="", policy=None,
             validate=True, retain_invalid=False, derived_from=None, recipe_key="", recipe_version=None,
-            recipe_params=None, toolchain="", rendition_insert=None) -> IngestResult:
+            recipe_params=None, toolchain="", rendition_insert=None, airing_prohibited=False) -> IngestResult:
     """ingest_stream's body. ``rendition_insert(columns, outcome) -> media`` is
     given only by the rendition intake: it inserts the row (from ``columns``,
     with every validation fact unset) inside THIS function's insertion
@@ -240,7 +252,7 @@ def _ingest(source, *, kind, owner=None, original_filename="", declared_content_
     if recipe_params is not None:
         recipe_digest = digest_recipe_params(recipe_params)
     parent = _check_request(kind, owner, derived_from, recipe_key, recipe_version, recipe_params,
-                            rendition_insert=rendition_insert)
+                            rendition_insert=rendition_insert, airing_prohibited=airing_prohibited)
 
     layout.ensure_layout()
     part = layout.new_part_path()
@@ -269,7 +281,7 @@ def _ingest(source, *, kind, owner=None, original_filename="", declared_content_
             original_filename=_display_name(original_filename),
             declared_content_type=_display_type(declared_content_type),
             derived_from=parent, recipe_key=recipe_key[:64], recipe_version=recipe_version,
-            recipe_params_digest=recipe_digest, toolchain=toolchain[:200],
+            recipe_params_digest=recipe_digest, toolchain=toolchain[:200], airing_prohibited=airing_prohibited,
         )
         with transaction.atomic():
             if parent is not None:
@@ -278,12 +290,15 @@ def _ingest(source, *, kind, owner=None, original_filename="", declared_content_
                 # derived_from reference, so a concurrent purge either waits and
                 # then sees this child, or wins first and this bind refuses. The
                 # lock is held only for this short insert, never while streaming.
+                # The derivation lock admits a no-air parent; its restriction
+                # is then inherited (monotonic: requested OR parent's).
                 try:
-                    columns["derived_from"] = retention.lock_for_binding(parent, require_valid=True)
+                    columns["derived_from"] = retention.lock_parent_for_derivation(parent, require_valid=True)
                 except MediaPurged as exc:
                     raise IntakeError("the parent media was purged", code="parent_purged") from exc
                 except MediaNotValidated as exc:
                     raise IntakeError("the parent media is not valid", code="parent_not_valid") from exc
+                columns["airing_prohibited"] = airing_prohibited or columns["derived_from"].airing_prohibited
             media = (rendition_insert or _insert_generic)(columns, outcome)
     except Exception:
         # Not a hard kill: tidy up. (A hard kill is covered by the reconciler.)

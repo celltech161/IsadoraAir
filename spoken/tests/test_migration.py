@@ -99,13 +99,16 @@ class LivePlanClassificationTests(TransactionTestCase):
             # spoken.0001 / production.0002) with 0003 -- the recipe-key pattern
             # correction, and 0004 -- backend implies regular -- D3C's own manual
             # operations (produced_content's test).
+            # r0113: and production.0003 (the NO-AIR provenance column, on
+            # production.0002) -- additive, no manual operation.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["production.0002_referenceaudio", "active_messages.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
                               "active_messages.0004_message_content_type_identity", "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
-                              "produced_content.0004_backend_regular_only"])
+                              "produced_content.0004_backend_regular_only",
+                              "production.0003_media_airing_prohibited"])
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual([(entry["ref"], entry["operation"])
                               for entry in probe.extract_manual_operations(payload["plan"])],

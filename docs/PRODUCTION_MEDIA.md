@@ -63,6 +63,10 @@ UUID primary key. Custody: `owner` (nullable, `SET_NULL`) plus an
 * **Derivation:** `derived_from` (self, `PROTECT`), `recipe_key`,
   `recipe_version`, `recipe_params_digest`, `toolchain`.
 * **Retention:** `retention_state` (`present` / `purged`), `purged_at`.
+* **No-air provenance** (r0113, `production.0003`): `airing_prohibited`
+  (boolean, default `False`; existing rows stay air-eligible). Set at intake
+  for media made under a TEST / NO AIR recorder subject; see
+  [No-air provenance](#no-air-provenance-r0113).
 
 `production.0001` carries these invariants (all `CreateModel`, no `RunPython`,
 no seed data): unique `storage_key`; `sha256` is 64 lowercase hex;
@@ -358,6 +362,38 @@ child. If the parent was purged meanwhile the bind refuses (`parent_purged`)
 and the already-promoted child bytes are removed. Real separate-session tests
 cover both orderings, both rollbacks, a stale in-memory parent and a purge
 committed mid-stream (`test_binding_race.py`).
+
+### No-air provenance (r0113)
+
+`airing_prohibited` is fixed at creation like every other column (the
+immutability table above applies to it unchanged). It is set by intake:
+
+* `ingest_stream(..., airing_prohibited=True)` -- the shared recorder's
+  `api_take` passes the adapter's `media_airing_prohibited(subject)` (a TEST /
+  NO AIR subject's record, import and edit); only a real `bool` is accepted;
+* a derivative (`ingest_derivative`, and a rendition) is prohibited when
+  requested **or** when its parent is -- the parent's flag is re-read under its
+  binding lock, so no edit or render can launder the restriction, and a caller
+  cannot ask for less. Every insert path enforces the same rule at the model:
+  `save()`/`create()`, the guarded `bulk_create` (default and base manager) and
+  the rendition authority (`airing_prohibited` is a BOUND rendition column,
+  and a rendition of a prohibited source must be prohibited).
+
+`lock_for_binding` is the **air-capable** binding: besides present/valid it
+refuses prohibited media with `MediaAiringProhibited` (`airing_prohibited`),
+with no opt-out, so every consumer is protected without remembering to be:
+spoken submission and rendition delivery, VoiceTrack, active-message media and
+aggregates, and reference audio (beds and stingers). Each maps it to its own
+fail-closed error. Exactly two closed exceptions handle prohibited media, each
+a named function:
+
+| Function | Accepts | Used by |
+|---|---|---|
+| `lock_for_no_air_binding` | prohibited media **only** (`MediaAiringNotProhibited` otherwise) | `produced_content.no_air.save_take` (a TEST take) |
+| `lock_parent_for_derivation` | either | intake's parent lock for a derivative (which then inherits) |
+
+Removing a TEST binding (replace, discard, expiry) never removes the
+restriction: it belongs to the media and its descendants.
 
 For Phase B and later: a consumer must route every binding through ONE service
 that does the above -- never a naked FK assignment scattered across views or

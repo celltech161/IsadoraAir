@@ -165,6 +165,15 @@ class RecordingAdapter:
     def media_policy(self, subject) -> MediaPolicy:
         raise NotImplementedError
 
+    def media_airing_prohibited(self, subject) -> bool:
+        """Is every take made for this EXACT resolved subject NO-AIR media?
+        Security authority, not presentation: ``api_take`` stamps the answer
+        onto the new ProductionMedia at intake (immutable; inherited by every
+        derivative), and no air-capable binding will ever accept it. Decided
+        from the server-resolved subject only -- there is no request parameter.
+        Must return a real bool. Default: ordinary, air-eligible media."""
+        return False
+
     # -- media the recorder may show or derive from --------------------------
     def can_access_media(self, user, subject, media) -> bool:
         raise NotImplementedError

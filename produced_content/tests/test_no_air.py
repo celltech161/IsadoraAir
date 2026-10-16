@@ -199,7 +199,7 @@ class RetentionTests(NoAirCase):
     def test_a_purge_refusal_is_harmless(self):
         recorded = self.saved()
         child = media_row(self.producer, derived_from=ProductionMedia.objects.get(pk=recorded),
-                          kind=ProductionMedia.KIND_EDIT)                      # something else references it
+                          kind=ProductionMedia.KIND_EDIT, airing_prohibited=True)  # something else references it
         take = ProducedContentTestTake.objects.get()
         with self.captureOnCommitCallbacks(execute=True):
             self.assertEqual(no_air.expire_due(now=take.expires_at), 1)

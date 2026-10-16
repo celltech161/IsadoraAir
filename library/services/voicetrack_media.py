@@ -38,7 +38,7 @@ from pathlib import Path
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from production.errors import MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged
 from production.policy import MediaPolicy
 from production.services import retention
 
@@ -166,6 +166,8 @@ def bind_media(*, track_id, position, media_id, user, expected_revision, source=
                 raise VoiceTrackMediaRefused("media_not_valid", "this take has not been validated") from exc
             except MediaInconsistent as exc:
                 raise VoiceTrackMediaRefused("unknown_media", "no such take") from exc
+            except MediaAiringProhibited as exc:
+                raise VoiceTrackMediaRefused("airing_prohibited", "this media was made under TEST / NO AIR and can never air") from exc
             code = policy_error(media)
             if code is not None:
                 raise VoiceTrackMediaRefused(code, f"this take does not fit a voice track ({code})")

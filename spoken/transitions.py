@@ -43,7 +43,7 @@ from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 
-from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from production.errors import MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
 from production.services import reference_audio, render, retention
 from production.services.render import protocol as render_protocol
@@ -301,6 +301,8 @@ def _apply(item, to_state, *, actor=None, actor_kind=ActorKind.USER, expected_fr
         if media is not None:
             try:
                 bound = retention.lock_for_binding(media, require_valid=require_valid_media)
+            except MediaAiringProhibited as exc:
+                raise EvidenceRefused("this media was made under TEST / NO AIR and can never air", code="airing_prohibited") from exc
             except (MediaPurged, MediaNotValidated, MediaInconsistent) as exc:
                 raise EvidenceRefused("the media is missing, purged or not valid", code="media_unusable") from exc
         if verify is not None:

@@ -26,8 +26,10 @@ EXPECTED_CONSTRAINTS = {
 class MigrationStructureTests(SimpleTestCase):
     def test_it_is_the_only_migration_and_contains_exactly_one_createmodel(self):
         names = sorted(path.name for path in MIGRATION.parent.glob("*.py"))
-        # 2.22C adds 0002 (ReferenceAudio) -- see spoken/tests/test_migration.py.
-        self.assertEqual(names, ["0001_initial.py", "0002_referenceaudio.py", "__init__.py"])
+        # 2.22C adds 0002 (ReferenceAudio) -- see spoken/tests/test_migration.py; r0113 adds 0003
+        # (the NO-AIR provenance column) -- see test_airing_prohibited.AiringProhibitedMigrationTests.
+        self.assertEqual(names, ["0001_initial.py", "0002_referenceaudio.py", "0003_media_airing_prohibited.py",
+                                 "__init__.py"])
         tree = ast.parse(MIGRATION.read_text())
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
@@ -106,7 +108,9 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  # the recipe-key pattern correction
                                                  "produced_content.0002_d3c_spoken_backend_and_test_take",
                                                  "produced_content.0003_recipe_key_leading_digit",
-                                                 "produced_content.0004_backend_regular_only"})
+                                                 "produced_content.0004_backend_regular_only",
+                                                 # r0113: the NO-AIR provenance column
+                                                 "production.0003_media_airing_prohibited"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(sorted((entry["ref"], entry["operation"])
                                     for entry in probe.extract_manual_operations(payload["plan"])),

@@ -39,7 +39,7 @@ from django.db import transaction
 from django.db.models import QuerySet
 from django.utils import timezone
 
-from ..errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from ..errors import MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged
 from ..models import REFERENCE_KEY_PATTERN, ProductionMedia, ReferenceAudio, reference_registration
 from . import media_io, retention
 
@@ -159,6 +159,9 @@ def register(key: str, media, *, actor=None, label: str = "", note: str = "") ->
         current = _current_locked(key)
         try:
             row = retention.lock_for_binding(media, require_valid=True)        # THE binding rule
+        except MediaAiringProhibited as exc:
+            raise ReferenceAudioError("reference_airing_prohibited",
+                                      "TEST / NO AIR media can never be reference audio") from exc
         except (MediaPurged, MediaNotValidated, MediaInconsistent) as exc:
             raise ReferenceAudioError("reference_media_unusable", "reference audio must be present and valid") from exc
         if row.kind != ProductionMedia.KIND_BED:

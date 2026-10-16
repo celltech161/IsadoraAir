@@ -174,6 +174,11 @@ class ProducedContentAdapter(RecordingAdapter):
         return MediaPolicy(max_bytes=PLATFORM_MAX_BYTES, max_duration_seconds=float(PLATFORM_MAX_DURATION_SECONDS),
                            require_engine_decode=True)
 
+    def media_airing_prohibited(self, subject):
+        # TEST / NO AIR: every take made here -- record, import or edit -- is
+        # NO-AIR media from intake on, whether or not it is ever saved.
+        return isinstance(subject, TestSubject)
+
     def _media_url(self, subject, media_id):
         base = reverse(f"produced_content:{url_name(ADAPTER_KEY, 'media')}", kwargs={"media_id": media_id})
         key, value = next(iter(self.subject_params(subject).items()))

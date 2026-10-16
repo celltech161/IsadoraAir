@@ -61,6 +61,9 @@ def _expected_row(columns: dict, output) -> dict:
         "derived_from_id": getattr(parent, "pk", None), "recipe_key": columns["recipe_key"],
         "recipe_version": columns["recipe_version"], "recipe_params_digest": columns["recipe_params_digest"],
         "toolchain": columns["toolchain"],
+        # inherited from the source under its binding lock (intake): a
+        # rendition never launders a NO-AIR restriction
+        "airing_prohibited": columns["airing_prohibited"],
     }
     assert set(row) == RENDITION_BOUND_FIELDS
     if ((str(row["derived_from_id"]), row["recipe_key"], row["recipe_version"], row["recipe_params_digest"],

@@ -4,13 +4,18 @@
 
 The ONLY durable effect of the TEST workspace. It calls no spoken transition,
 renderer or projection, creates no Track, log item, active message or queue
-entry and sends no engine command: TEST is structurally incapable of airing.
+entry and sends no engine command. And the media itself can never air: every
+take made in the TEST recorder is NO-AIR ProductionMedia from intake on
+(``airing_prohibited``, immutable, inherited by every derivative), which the
+canonical air-capable binding refuses -- while it is a test take, after it is
+replaced, discarded or expires, and if it was never saved at all.
 
 * save      lock + re-read + authorize the exact type (still TEST, enabled,
             the user's); then lock the user's binding; compare its optimistic
             revision under that lock (a stale tab gets a conflict, never a
-            silent overwrite); bind the user's own VALID take under
-            ``lock_for_binding``; the retention clock restarts
+            silent overwrite); bind the user's own VALID NO-AIR take under
+            ``lock_for_no_air_binding`` (ordinary media is refused:
+            not_test_media); the retention clock restarts
             (TEST_TAKE_RETENTION_DAYS from the most recent save);
 * discard   the producer removes their binding (same revision rule);
 * expire    a bounded sweep (``expire_due``) removes bindings past their
@@ -30,7 +35,9 @@ from datetime import timedelta
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged, PurgeRefused
+from production.errors import (
+    MediaAiringNotProhibited, MediaInconsistent, MediaNotValidated, MediaPurged, PurgeRefused,
+)
 from production.models import ProductionMedia
 from production.services import retention
 
@@ -133,7 +140,12 @@ def save_take(user, content_type, media, *, expected_revision) -> ProducedConten
         if candidate.kind not in TAKE_KINDS:
             raise MediaRefused("a test take is a recording, upload or edit", code="media_kind")
         try:
-            bound = retention.lock_for_binding(candidate)
+            # The NO-AIR binding lock: only media made under a TEST / NO AIR
+            # subject (immutable, from intake) -- never ordinary media.
+            bound = retention.lock_for_no_air_binding(candidate)
+        except MediaAiringNotProhibited as exc:
+            raise MediaRefused("only a take made in this TEST / NO AIR workspace can be saved here",
+                               code="not_test_media") from exc
         except (MediaPurged, MediaNotValidated, MediaInconsistent) as exc:
             raise MediaRefused("the take is missing or not validated as usable audio",
                                code="media_not_valid") from exc

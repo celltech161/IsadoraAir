@@ -63,7 +63,7 @@ from django.utils import timezone
 from authz.evaluator import authorize
 from produced_content import authority as content_authority
 from produced_content.models import ACTIVE_MESSAGE_MODES, ProducedContentType
-from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from production.errors import MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
 from production.services import reference_audio, retention
 
@@ -260,6 +260,8 @@ def _lock_media(media) -> ProductionMedia:
         raise MediaRefused("the media's bytes have been purged", code="media_purged") from None
     except MediaNotValidated:
         raise MediaRefused("the media has not been validated as valid", code="media_not_valid") from None
+    except MediaAiringProhibited:
+        raise MediaRefused("this media was made under TEST / NO AIR and can never air", code="airing_prohibited") from None
     except MediaInconsistent:
         raise MediaRefused("no such production media", code="unknown_media") from None
 
@@ -1044,6 +1046,10 @@ def bind_execution_mix(execution, media, *, now=None, actor_kind=ActorKind.WORKE
         policy = _lock_policy()
         try:
             bound = retention.lock_for_binding(media)
+        except MediaAiringProhibited:
+            # a permanent, truthful failure (FAILURE_CODES): its input lineage is NO-AIR media
+            raise MixRefused("the rendition derives from TEST / NO AIR media and can never air",
+                             code="input_unavailable") from None
         except (MediaPurged, MediaNotValidated, MediaInconsistent):
             raise MixRefused("the rendition is missing, purged or not valid", code="rendition_unavailable") from None
         row = _lock_execution(execution)

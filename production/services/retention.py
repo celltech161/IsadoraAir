@@ -39,6 +39,20 @@ References through GenericForeignKey, or from another database, are NOT
 supported and must not be used: they are invisible to ``find_references``.
 ``reconcile.find_purged_media_still_referenced`` reports any violation.
 
+NO-AIR PROVENANCE (r0113 / D3C)
+-------------------------------
+``lock_for_binding`` is the AIR-CAPABLE binding: it also refuses media whose
+immutable ``airing_prohibited`` is set (MediaAiringProhibited), so every
+consumer inherits the protection without opting in. Exactly two closed
+exceptions handle no-air media, each by its own named function:
+
+* ``lock_for_no_air_binding`` -- a TEST / NO AIR binding
+  (produced_content.no_air): REQUIRES prohibited media
+  (MediaAiringNotProhibited otherwise);
+* ``lock_parent_for_derivation`` -- intake's parent lock for a derivative:
+  accepts either; intake then makes the child prohibited whenever the parent
+  is (the model refuses a laundered child on every insert path).
+
 Crash ordering: the state change commits first; the bytes are unlinked after
 the commit (``transaction.on_commit``). A crash in between leaves a purged row
 with bytes still on disk -- harmless, and swept by the reconciler. The reverse
@@ -55,7 +69,10 @@ from django.db import transaction
 from django.utils import timezone
 
 from .. import transitions
-from ..errors import MediaInconsistent, MediaNotValidated, MediaPurged, PurgeRefused
+from ..errors import (
+    MediaAiringNotProhibited, MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged,
+    PurgeRefused,
+)
 from ..models import ProductionMedia
 from . import layout
 
@@ -129,14 +146,7 @@ def purge_media(media, *, now=None) -> ProductionMedia:
     return ProductionMedia.objects.get(pk=pk)
 
 
-def lock_for_binding(media, *, require_valid=True) -> ProductionMedia:
-    """THE canonical binding lock (see "THE BINDING RULE" above).
-
-    Call inside the ``transaction.atomic()`` that writes the reference, and
-    reference the returned row. Takes the same row lock purge_media takes,
-    RE-READS the authoritative row (a stale in-memory object passed in is used
-    only for its identity), and refuses a purged -- or, by default, not-valid --
-    media with MediaPurged / MediaNotValidated."""
+def _lock(media, *, require_valid) -> ProductionMedia:
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("lock_for_binding must be called inside transaction.atomic()")
     try:
@@ -148,3 +158,36 @@ def lock_for_binding(media, *, require_valid=True) -> ProductionMedia:
     if require_valid and not row.is_valid:
         raise MediaNotValidated("media has not been validated as valid")
     return row
+
+
+def lock_for_binding(media, *, require_valid=True) -> ProductionMedia:
+    """THE canonical binding lock (see "THE BINDING RULE" above) -- for an
+    AIR-CAPABLE reference.
+
+    Call inside the ``transaction.atomic()`` that writes the reference, and
+    reference the returned row. Takes the same row lock purge_media takes,
+    RE-READS the authoritative row (a stale in-memory object passed in is used
+    only for its identity), and refuses a purged -- or, by default, not-valid --
+    media with MediaPurged / MediaNotValidated, and NO-AIR media with
+    MediaAiringProhibited (always; there is no opt-out here)."""
+    row = _lock(media, require_valid=require_valid)
+    if row.airing_prohibited:
+        raise MediaAiringProhibited("this media was made under a TEST / NO AIR subject and can never air")
+    return row
+
+
+def lock_for_no_air_binding(media, *, require_valid=True) -> ProductionMedia:
+    """The binding lock for a TEST / NO AIR reference (only
+    produced_content.no_air): the same lock and checks, but it REQUIRES
+    no-air media -- ordinary media never becomes a test take."""
+    row = _lock(media, require_valid=require_valid)
+    if not row.airing_prohibited:
+        raise MediaAiringNotProhibited("only media made under a TEST / NO AIR subject can be bound here")
+    return row
+
+
+def lock_parent_for_derivation(media, *, require_valid=True) -> ProductionMedia:
+    """The binding lock intake takes on a derivative's parent (the
+    ``derived_from`` reference): no-air parents are allowed, because intake
+    makes the child no-air too (and the model refuses a child that is not)."""
+    return _lock(media, require_valid=require_valid)

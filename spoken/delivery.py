@@ -81,7 +81,7 @@ from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
 
-from production.errors import MediaInconsistent, MediaNotValidated, MediaPurged
+from production.errors import MediaAiringProhibited, MediaInconsistent, MediaNotValidated, MediaPurged
 from production.models import ProductionMedia
 from production.services import reference_audio, render, retention
 from production.services.render import protocol as render_protocol
@@ -307,6 +307,9 @@ def _bind_rendition(row) -> ProductionMedia:
         raise ProjectionError("the item has no rendition", code="rendition_missing")
     try:
         rendition = retention.lock_for_binding(row.rendition_media_id, require_valid=True)
+    except MediaAiringProhibited as exc:
+        raise ProjectionError("the rendition derives from TEST / NO AIR media and can never air",
+                              code="airing_prohibited") from exc
     except (MediaPurged, MediaNotValidated, MediaInconsistent) as exc:
         raise ProjectionError("the rendition is missing, purged or not valid", code="rendition_unusable") from exc
     if (rendition.kind != ProductionMedia.KIND_RENDITION or rendition.derived_from_id != row.submission_media_id

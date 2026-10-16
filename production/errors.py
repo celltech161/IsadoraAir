@@ -66,6 +66,21 @@ class MediaInconsistent(ProductionMediaError):
     code = "media_inconsistent"
 
 
+class MediaAiringProhibited(ProductionMediaError):
+    """An air-capable binding was asked to reference media whose immutable
+    provenance prohibits airing (made under a TEST / NO AIR subject, or derived
+    from such media). Never retryable: the restriction is permanent."""
+
+    code = "airing_prohibited"
+
+
+class MediaAiringNotProhibited(ProductionMediaError):
+    """A NO-AIR binding (a TEST / NO AIR take) was asked to reference ordinary,
+    air-eligible media: only media made under a NO-AIR subject belongs there."""
+
+    code = "airing_not_prohibited"
+
+
 class PurgeRefused(ProductionMediaError):
     code = "purge_refused"
 

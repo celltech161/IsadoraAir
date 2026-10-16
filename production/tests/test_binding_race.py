@@ -5,7 +5,9 @@ PostgreSQL session) and the real purge_media() in another. Interleavings are
 forced with events at two seams that do not change behaviour:
 
 * after the derivative's final transaction has taken the parent's binding
-  lock (a wrapper around retention.lock_for_binding);
+  lock (a wrapper around retention.lock_parent_for_derivation -- since r0113
+  the derivation's own named binding lock, the same row lock, which admits a
+  NO-AIR parent so the child can inherit its restriction);
 * after the purge has taken the same row lock (a wrapper around
   retention.find_references, which purge_media calls under the lock).
 
@@ -25,7 +27,7 @@ from production.services import intake, layout, retention
 from .support import IsolatedMediaRootMixin, fixture
 
 WAIT = 30
-REAL_LOCK_FOR_BINDING = retention.lock_for_binding
+REAL_LOCK_PARENT_FOR_DERIVATION = retention.lock_parent_for_derivation
 REAL_FIND_REFERENCES = retention.find_references
 
 
@@ -72,7 +74,7 @@ class BindingRaceTests(IsolatedMediaRootMixin, TransactionTestCase):
         locked, release = threading.Event(), threading.Event()
 
         def wrapper(media, **kwargs):
-            row = REAL_LOCK_FOR_BINDING(media, **kwargs)
+            row = REAL_LOCK_PARENT_FOR_DERIVATION(media, **kwargs)
             if threading.current_thread().name == "binder":
                 locked.set()
                 assert release.wait(WAIT)
@@ -110,7 +112,7 @@ class BindingRaceTests(IsolatedMediaRootMixin, TransactionTestCase):
     def test_binder_wins_purge_waits_then_refuses_because_the_child_exists(self):
         from unittest import mock
         wrapper, locked, release = self.pause_binder_after_lock()
-        with mock.patch.object(retention, "lock_for_binding", side_effect=wrapper):
+        with mock.patch.object(retention, "lock_parent_for_derivation", side_effect=wrapper):
             binder, binder_box = self.run_thread("binder", self.derive)
             self.assertTrue(locked.wait(WAIT))
             purger, purger_box = self.run_thread("purger", lambda: retention.purge_media(self.parent))
@@ -147,7 +149,7 @@ class BindingRaceTests(IsolatedMediaRootMixin, TransactionTestCase):
     def test_binder_rollback_lets_the_purge_succeed(self):
         from unittest import mock
         wrapper, locked, release = self.pause_binder_after_lock(abort=True)
-        with mock.patch.object(retention, "lock_for_binding", side_effect=wrapper):
+        with mock.patch.object(retention, "lock_parent_for_derivation", side_effect=wrapper):
             binder, binder_box = self.run_thread("binder", self.derive)
             self.assertTrue(locked.wait(WAIT))
             purger, purger_box = self.run_thread("purger", lambda: retention.purge_media(self.parent))
@@ -226,8 +228,8 @@ class BindingRaceTests(IsolatedMediaRootMixin, TransactionTestCase):
         def spy(media, **kwargs):
             seen["in_atomic"] = connection.in_atomic_block
             seen["require_valid"] = kwargs.get("require_valid")
-            return REAL_LOCK_FOR_BINDING(media, **kwargs)
-        with mock.patch.object(retention, "lock_for_binding", side_effect=spy):
+            return REAL_LOCK_PARENT_FOR_DERIVATION(media, **kwargs)
+        with mock.patch.object(retention, "lock_parent_for_derivation", side_effect=spy):
             child = self.derive().media
         self.assertEqual(seen, {"in_atomic": True, "require_valid": True})
         self.assertEqual(child.derived_from_id, self.parent.pk)

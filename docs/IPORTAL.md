@@ -46,6 +46,13 @@ The adapter supplies:
 * `show_in_hub(user)` (2.22D3B) — whether the `/iportal/` hub lists the tool
   (presentation only). Default: `authorize(user, "open")`;
 * `media_policy(subject)` — the domain's `MediaPolicy` bounds;
+* `media_airing_prohibited(subject)` (r0113) — whether every take made for this
+  exact resolved subject is NO-AIR media; `api_take` stamps it on the new
+  `ProductionMedia` at intake (immutable, inherited by every derivative, refused
+  by every air-capable binding — see docs/PRODUCTION_MEDIA.md). Security
+  authority from the server-resolved subject only: no request parameter, and a
+  non-`bool` answer refuses the take. Default: `False`. `produced-content`
+  answers `True` for its TEST subject only;
 * `can_access_media(user, subject, media)` — which UUIDs this user may preview
   or derive from here;
 * `source(subject)` — the audio an edit starts from (a ProductionMedia, or a
