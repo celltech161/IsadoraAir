@@ -39,9 +39,14 @@ There is deliberately no database trigger (that would need a manual migration).
 NO-AIR provenance (r0113 / D3C). ``airing_prohibited`` is fixed at creation
 like every other column. Intake sets it for media made under a TEST / NO AIR
 recorder subject (the adapter decides from the server-resolved subject), and a
-derivative can only keep or strengthen its parent's restriction: every insert
-path refuses a child of a prohibited parent that is not itself prohibited
-(``save()``, the guarded ``bulk_create``, and the rendition authority). The
+derivative can only keep or strengthen its parent's restriction: the ORM
+insert paths (``save()``/``create()``, the guarded ``bulk_create`` on both
+managers, and the rendition authority) refuse a child of a prohibited parent
+that is not itself prohibited, and refuse a derived row whose parent does not
+already exist (a same-batch or child-first insert could otherwise pair a
+prohibited parent with an unrestricted child, since foreign keys are deferred).
+The plain ``models.QuerySet.bulk_create`` and raw SQL stay outside the
+boundary, as for every other column. The
 canonical binding (``retention.lock_for_binding``) refuses prohibited media,
 so no air-capable domain can reference it -- whether or not a TEST binding
 still exists.
@@ -153,8 +158,8 @@ def rendition_authority(row: dict):
         raise _rendition_refused("a rendition authority names every bound column, and only those")
     if row["kind"] != ProductionMedia.KIND_RENDITION or row["derived_from_id"] is None:
         raise _rendition_refused("a rendition authority names a rendition derived from its source")
-    if not isinstance(row["airing_prohibited"], bool) or _launders_restriction(
-            row["derived_from_id"], row["airing_prohibited"]):
+    if not isinstance(row["airing_prohibited"], bool) or _inheritance_problem(
+            [(row["derived_from_id"], row["airing_prohibited"])]) is not None:
         raise _rendition_refused("a rendition keeps its source's no-air restriction")
     expected = {**row, **RENDITION_INITIAL_VALUES}
     grant = _RenditionGrant(expected, connection, connection.atomic_blocks[-1], timezone.now())
@@ -166,18 +171,46 @@ def rendition_authority(row: dict):
         _rendition.reset(token)
 
 
-def _launders_restriction(parent_id, airing_prohibited) -> bool:
-    """Would a child of ``parent_id`` with this flag drop a NO-AIR restriction?
-    The parent's flag is immutable, so an unlocked read is authoritative."""
-    if parent_id is None or airing_prohibited is True:
-        return False
-    return ProductionMedia._base_manager.filter(pk=parent_id, airing_prohibited=True).exists()
+def _inheritance_problem(pairs):
+    """``pairs``: (derived_from_id, airing_prohibited) for rows about to be
+    inserted. Returns (code, message) for the first violation, else None.
+
+    A derived row's parent must already EXIST: foreign keys are deferred, so a
+    parent inserted later -- in the same batch, or after the child in the same
+    transaction -- would otherwise escape this check and let a prohibited
+    parent have an air-eligible child. Every supported path derives from a
+    parent it has already locked (intake, the rendition authority). A child of
+    a prohibited parent must itself be prohibited. The parent's flag is
+    immutable, so one unlocked read is authoritative."""
+    wanted = {}
+    for parent_id, _flag in pairs:
+        if parent_id is None:
+            continue
+        try:
+            wanted[parent_id] = uuid.UUID(str(parent_id))
+        except (TypeError, ValueError, AttributeError):
+            return "parent_not_persisted", "a derived media names a parent that does not exist"
+    if not wanted:
+        return None
+    stored = dict(ProductionMedia._base_manager.filter(pk__in=set(wanted.values()))
+                  .values_list("pk", "airing_prohibited"))
+    for parent_id, flag in pairs:
+        if parent_id is None:
+            continue
+        prohibited = stored.get(wanted[parent_id])
+        if prohibited is None:
+            return "parent_not_persisted", "a derived media's parent must already exist when it is inserted"
+        if prohibited and flag is not True:
+            return "airing_prohibited", "a derivative of no-air media is itself no-air"
+    return None
 
 
 def _refuse_laundering(objs) -> None:
-    for obj in objs:
-        if _launders_restriction(getattr(obj, "derived_from_id", None), getattr(obj, "airing_prohibited", False)):
-            raise ImmutableMediaError("a derivative of no-air media is itself no-air", code="airing_prohibited")
+    problem = _inheritance_problem([(getattr(obj, "derived_from_id", None), getattr(obj, "airing_prohibited", False))
+                                    for obj in objs])
+    if problem is not None:
+        code, message = problem
+        raise ImmutableMediaError(message, code=code)
 
 
 def _same(field, mine, theirs) -> bool:
@@ -244,7 +277,7 @@ class ProductionMediaQuerySet(models.QuerySet):
         objs = list(objs)
         if any(getattr(obj, "kind", None) == ProductionMedia.KIND_RENDITION for obj in objs):
             raise _rendition_refused("renditions are created only by the render executor's intake")
-        _refuse_laundering(objs)
+        _refuse_laundering(objs)                 # before any insert: all or nothing, any batch_size
         return super().bulk_create(objs, *args, update_conflicts=update_conflicts, **kwargs)
 
     def delete(self):
@@ -356,8 +389,11 @@ class ProductionMedia(models.Model):
     purged_at = models.DateTimeField(null=True, blank=True)
 
     # --- no-air provenance (immutable; see the module docstring) -------------
+    # db_default: PostgreSQL keeps DEFAULT false, so a still-running r0112
+    # writer (no such field in its model) can insert after production.0003 is
+    # applied and before the updater restarts it -- and gets False.
     airing_prohibited = models.BooleanField(
-        default=False, editable=False,
+        default=False, db_default=False, editable=False,
         help_text="Made under a TEST / NO AIR subject, or derived from such media: "
                   "no air-capable binding may ever reference it.",
     )

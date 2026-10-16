@@ -244,7 +244,9 @@ take**, *Nothing in this workspace can air.* Saving binds under
 ordinary take is refused (`not_test_media`) -- and compares the revision under
 the binding's row lock (a stale tab gets 409, never a silent overwrite).
 
-TEST is **structurally incapable of airing**, at two levels:
+TEST media cannot reach air through any application path (the services and
+the guarded ORM; raw SQL and Django's plain `models.QuerySet` stay outside
+that boundary, as for every ProductionMedia invariant), at two levels:
 
 * the TEST code: no TEST type has a spoken backend, and the TEST code calls no
   spoken transition, renderer or projection and creates no SpokenItem,
@@ -285,14 +287,17 @@ logged and never stops rendering. No new service, unit or timer.
 | | AlterField `recipe_key` (validator `^[a-z0-9][a-z0-9_]{0,63}$`) | manual |
 | | AddConstraint `produced_type_recipe_key_shape` (the widened pattern) | manual |
 | `produced_content.0004_backend_regular_only` | AddConstraint `produced_type_backend_regular_only` (a backend implies a regular type) | manual |
-| `production.0003_media_airing_prohibited` (r0113 correction) | AddField `ProductionMedia.airing_prohibited` (non-null boolean, explicit literal default `False`: existing rows stay air-eligible) | additive |
+| `production.0003_media_airing_prohibited` (r0113 correction) | AddField `ProductionMedia.airing_prohibited` (non-null boolean, Python default and PostgreSQL `DEFAULT false` kept: existing rows, and rows an older still-running writer inserts before the restart, are air-eligible) | manual (database default) |
 
 No data migration, no station seed, no authz migration; existing
 compatibility types stay valid (no backend required). 0003 only widens the
 pattern (every existing row satisfies it); 0004 only guards what the bridge
 already guarantees (every existing row satisfies it). Their four manual
-operations need a release migration authorization when D3C ships; the
-additive `production.0003` adds no manual operation.
+operations need a release migration authorization when D3C ships, and
+`production.0003` adds a fifth: its database default is deliberate (the
+updater migrates before it restarts, and r0112 processes insert
+ProductionMedia without the new column -- a dropped default would make those
+inserts fail), and the classifier reviews any database default.
 
 ## Not in D3C
 

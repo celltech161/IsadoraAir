@@ -122,7 +122,9 @@ class LivePlanClassificationTests(TransactionTestCase):
                                      ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                                      ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                                      ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
-                                     ("produced_content.0004_backend_regular_only", "AddConstraint")]))
+                                     ("produced_content.0004_backend_regular_only", "AddConstraint"),
+                                     # r0113: a database default (old-writer compatibility) is manual
+                                     ("production.0003_media_airing_prohibited", "AddField")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

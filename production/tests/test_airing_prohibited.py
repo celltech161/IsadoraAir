@@ -15,14 +15,15 @@ import io
 import uuid
 
 from django.core.management import call_command
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.loader import MigrationLoader
 from django.db.models import NOT_PROVIDED
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 from production.errors import (
-    ImmutableMediaError, IntakeError, MediaAiringNotProhibited, MediaAiringProhibited, MediaPurged,
+    ImmutableMediaError, IntakeError, MediaAiringNotProhibited, MediaAiringProhibited, MediaInconsistent,
+    MediaPurged,
 )
 from production.models import ProductionMedia, ReferenceAudio
 from production.services import intake, layout, reference_audio, retention
@@ -119,6 +120,89 @@ class ImmutabilityTests(IsolatedMediaRootMixin, TestCase):
         self.assertFalse(make_row(kind=EDIT, derived_from=self.ordinary).airing_prohibited)
 
 
+class ParentMustExistTests(IsolatedMediaRootMixin, TestCase):
+    """r0113 re-review blocker A: a derived row's parent must already EXIST when
+    the child is inserted. Foreign keys are deferred, so otherwise a prohibited
+    parent and an unrestricted child could be inserted together -- in one
+    bulk_create (either order, either guarded manager, any batch size or
+    conflict mode) or child-first inside one transaction -- and the child would
+    be air-eligible. Every supported path (intake, the rendition authority)
+    derives from a parent it has already locked."""
+
+    MANAGERS = (("objects", ProductionMedia.objects), ("_base_manager", ProductionMedia._base_manager))
+
+    def chain(self, *flags):
+        """Unsaved rows, each derived from the previous one."""
+        rows, parent = [], None
+        for flag in flags:
+            values = row_values(airing_prohibited=flag)
+            if parent is not None:
+                values.update(kind=EDIT, derived_from=parent)
+            parent = ProductionMedia(**values)
+            rows.append(parent)
+        return rows
+
+    def assert_refused(self, attempt, rows, code="parent_not_persisted"):
+        with self.assertRaises(ImmutableMediaError) as raised:
+            attempt()
+        self.assertEqual(raised.exception.code, code)
+        ids = [row.pk for row in rows]
+        self.assertFalse(ProductionMedia.objects.filter(pk__in=ids).exists())          # nothing, not even a prefix
+        for pk in ids:
+            with self.subTest(unbindable=pk), self.assertRaises(MediaInconsistent), transaction.atomic():
+                retention.lock_for_binding(pk)
+
+    def test_the_verified_reproduction_is_refused(self):
+        parent, child = self.chain(True, False)
+        self.assert_refused(lambda: ProductionMedia.objects.bulk_create([parent, child]), [parent, child])
+
+    def test_either_order_either_manager_any_batch_size_or_conflict_mode(self):
+        for label, manager in self.MANAGERS:
+            for order in ("parent first", "child first"):
+                for options in ({}, {"batch_size": 1}, {"ignore_conflicts": True}):
+                    with self.subTest(manager=label, order=order, options=options):
+                        parent, child = self.chain(True, False)
+                        batch = [parent, child] if order == "parent first" else [child, parent]
+                        self.assert_refused(lambda: manager.bulk_create(batch, **options), [parent, child])
+
+    def test_multi_hop_batches_cannot_drop_the_restriction(self):
+        for flags in ((True, True, False), (True, False, True), (True, False, False)):
+            for reverse in (False, True):
+                with self.subTest(flags=flags, reverse=reverse):
+                    rows = self.chain(*flags)
+                    batch = list(reversed(rows)) if reverse else rows
+                    self.assert_refused(lambda: ProductionMedia.objects.bulk_create(batch), rows)
+
+    def test_a_same_batch_derivation_is_unsupported_even_when_honest(self):
+        for flags in ((True, True), (False, False)):
+            with self.subTest(flags=flags):
+                rows = self.chain(*flags)
+                self.assert_refused(lambda: ProductionMedia.objects.bulk_create(rows), rows)
+
+    def test_a_child_inserted_before_its_parent_in_one_transaction_is_refused(self):
+        parent, child = self.chain(True, False)
+        self.assert_refused(child.save, [child])                      # save() / create() path
+        parent, child = self.chain(True, False)
+        self.assert_refused(lambda: ProductionMedia.objects.bulk_create([child]), [child])
+        self.assertFalse(ProductionMedia.objects.filter(pk=parent.pk).exists())
+
+    def test_persisted_parents_still_derive_as_before(self):
+        prohibited, ordinary = make_row(airing_prohibited=True), make_row()
+        self.assertTrue(make_row(kind=EDIT, derived_from=prohibited, airing_prohibited=True).airing_prohibited)
+        with self.assertRaises(ImmutableMediaError) as raised:
+            make_row(kind=EDIT, derived_from=prohibited)
+        self.assertEqual(raised.exception.code, "airing_prohibited")
+        made = ProductionMedia.objects.bulk_create([
+            ProductionMedia(**row_values(kind=EDIT, derived_from=ordinary)),
+            ProductionMedia(**row_values(kind=EDIT, derived_from=prohibited, airing_prohibited=True)),
+            ProductionMedia(**row_values()),
+        ])
+        self.assertEqual([m.airing_prohibited for m in ProductionMedia.objects.filter(pk__in=[m.pk for m in made])
+                          .order_by("airing_prohibited")], [False, False, True])
+        with transaction.atomic():
+            self.assertEqual(retention.lock_for_binding(made[0], require_valid=False).pk, made[0].pk)  # bindable
+
+
 class BindingLockTests(IsolatedMediaRootMixin, TestCase):
     def setUp(self):
         super().setUp()
@@ -173,13 +257,16 @@ class ReferenceAudioTests(IsolatedMediaRootMixin, TestCase):
 
 
 class AiringProhibitedMigrationTests(IsolatedMediaRootMixin, SimpleTestCase):
-    """production.0003 is exactly one AddField the REAL classifier judges
-    additive (non-null, explicit simple literal default, no database default,
-    not unique, not indexed, not relational) -- no manual operation."""
+    """production.0003 is exactly one AddField: a non-null boolean with BOTH a
+    Python default and a DATABASE default (False), so a still-running r0112
+    writer -- which inserts rows without the column, between the updater's
+    migration and its restart -- keeps working. The REAL classifier judges a
+    database default manual (reviewed); that is its correct classification,
+    and the r0113 migration authorization must name it."""
 
     REF = "production.0003_media_airing_prohibited"
 
-    def test_one_additive_add_field_and_nothing_else(self):
+    def test_one_add_field_with_a_database_default_classified_manual(self):
         loader = MigrationLoader(None, ignore_no_migrations=True)
         migration = loader.disk_migrations[("production", "0003_media_airing_prohibited")]
         self.assertEqual(migration.dependencies, [("production", "0002_referenceaudio")])
@@ -188,32 +275,76 @@ class AiringProhibitedMigrationTests(IsolatedMediaRootMixin, SimpleTestCase):
         self.assertEqual((type(operation).__name__, operation.model_name, operation.name),
                          ("AddField", "productionmedia", "airing_prohibited"))
         field = operation.field
-        self.assertEqual((type(field).__name__, field.null, field.default, field.unique, field.db_index),
-                         ("BooleanField", False, False, False, False))
-        self.assertIs(field.db_default, NOT_PROVIDED)
+        self.assertEqual((type(field).__name__, field.null, field.default, field.db_default, field.unique,
+                          field.db_index), ("BooleanField", False, False, False, False, False))
         (plan,) = probe._serialize_exact_plan(loader, [self.REF])
-        self.assertEqual([(op["operation"], op["classification"]) for op in plan["operations"]],
-                         [("AddField", "additive")])
-        self.assertEqual(probe.extract_manual_operations([plan]), [])
+        self.assertEqual([(op["operation"], op["classification"], op["detail"]) for op in plan["operations"]],
+                         [("AddField", "manual", "non-null AddField uses database default")])
+        self.assertEqual([(m["ref"], m["operation_index"], m["operation"])
+                          for m in probe.extract_manual_operations([plan])], [(self.REF, 0, "AddField")])
+
+    def test_the_model_keeps_the_database_default(self):
+        field = ProductionMedia._meta.get_field("airing_prohibited")
+        self.assertEqual((field.null, field.default, field.db_default), (False, False, False))
 
 
-class ExistingRowsMigrationTests(IsolatedMediaRootMixin, TransactionTestCase):
-    """Rows that predate the column keep their historical, air-eligible meaning.
-    serialized_rollback: its teardown must not re-emit post_migrate into a
-    flushed database a later serialized-rollback class then reloads into."""
+class OldWriterCompatibilityTests(IsolatedMediaRootMixin, TransactionTestCase):
+    """The deployment boundary, on real PostgreSQL: the updater applies
+    migrations, then advances the source, then restarts -- so r0112 processes
+    (whose model has no airing_prohibited) keep inserting ProductionMedia after
+    production.0003 is applied. serialized_rollback: its teardown must not
+    re-emit post_migrate into a flushed database a later serialized-rollback
+    class then reloads into."""
 
     serialized_rollback = True
+    BEFORE = ("production", "0002_referenceaudio")
+    AFTER = ("production", "0003_media_airing_prohibited")
+
+    def old_model(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate([self.BEFORE])
+        executor.loader.build_graph()
+        return executor.loader.project_state(self.BEFORE).apps.get_model("production", "ProductionMedia")
+
+    def apply(self):
+        MigrationExecutor(connection).migrate([self.AFTER])
+
+    def column(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT column_default, is_nullable, data_type FROM information_schema.columns "
+                           "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                           [ProductionMedia._meta.db_table, "airing_prohibited"])
+            return cursor.fetchone()
 
     def test_existing_rows_become_air_eligible(self):
-        executor = MigrationExecutor(connection)
-        before, after = [("production", "0002_referenceaudio")], [("production", "0003_media_airing_prohibited")]
-        executor.migrate(before)
+        old = self.old_model()
         try:
-            executor.loader.build_graph()
-            historical = executor.loader.project_state(before[0]).apps.get_model("production", "ProductionMedia")
-            row = historical.objects.create(**row_values())
-            executor = MigrationExecutor(connection)
-            executor.migrate(after)
+            row = old.objects.create(**row_values())
+            self.assertIsNone(self.column())                            # the column does not exist yet
+            self.apply()
             self.assertIs(ProductionMedia.objects.get(pk=row.pk).airing_prohibited, False)
         finally:
             call_command("migrate", verbosity=0)
+
+    def test_an_old_writer_still_inserts_after_the_migration_and_gets_false(self):
+        old = self.old_model()
+        try:
+            self.apply()                                                # migrated; r0112 code still running
+            row = old.objects.create(**row_values())                     # its INSERT never names the column
+            self.assertIs(ProductionMedia.objects.get(pk=row.pk).airing_prohibited, False)
+            self.assertEqual(self.column(), ("false", "NO", "boolean"))  # the DATABASE default survives
+            explicit = make_row(airing_prohibited=True)                  # the default never overrides an explicit value
+            self.assertIs(ProductionMedia.objects.get(pk=explicit.pk).airing_prohibited, True)
+            self.assertIs(ProductionMedia.objects.get(pk=make_row().pk).airing_prohibited, False)
+            with self.assertRaises(IntegrityError), transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(f"UPDATE {ProductionMedia._meta.db_table} SET airing_prohibited = NULL "
+                               "WHERE id = %s", [row.pk])                # still NOT NULL
+        finally:
+            call_command("migrate", verbosity=0)
+
+    def test_the_migration_sql_keeps_the_default(self):
+        out = io.StringIO()
+        call_command("sqlmigrate", "production", "0003_media_airing_prohibited", stdout=out)
+        sql = out.getvalue()
+        self.assertIn('ADD COLUMN "airing_prohibited" boolean DEFAULT false NOT NULL', sql)
+        self.assertNotIn("DROP DEFAULT", sql)

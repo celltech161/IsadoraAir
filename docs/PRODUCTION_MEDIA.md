@@ -1,8 +1,11 @@
 # iPortal production media (the `production` app)
 
-**Status: Phase A (P1 2.22A) — deployable unused.** Nothing in playout, the
-library, scheduling, Voice Tracking, Remote DJ, OGRemote, weather or Update
-Center depends on it yet.
+**Status:** shipped as Phase A (P1 2.22A, r0107) and now in use: evergreen
+Voice Tracking binds it (`VoiceTrack.media`, 2.22B), Phase-C spoken content
+(submissions, renditions, reference audio) and Phase-D active messages
+reference it, and D3C produced content (regular items, TEST / NO AIR takes)
+builds on those. The sections below describe the substrate; "Phase A" headings
+record what that first release contained.
 
 iPortal is the product/UI name for IsadoraAir's browser audio-production
 workspace. Internally, **what is common across its workflows is the
@@ -64,7 +67,9 @@ UUID primary key. Custody: `owner` (nullable, `SET_NULL`) plus an
   `recipe_version`, `recipe_params_digest`, `toolchain`.
 * **Retention:** `retention_state` (`present` / `purged`), `purged_at`.
 * **No-air provenance** (r0113, `production.0003`): `airing_prohibited`
-  (boolean, default `False`; existing rows stay air-eligible). Set at intake
+  (non-null boolean with a Python **and a PostgreSQL** default of `False`;
+  existing rows, and rows a not-yet-restarted older writer inserts without the
+  column, are air-eligible). Set at intake
   for media made under a TEST / NO AIR recorder subject; see
   [No-air provenance](#no-air-provenance-r0113).
 
@@ -374,10 +379,17 @@ immutability table above applies to it unchanged). It is set by intake:
 * a derivative (`ingest_derivative`, and a rendition) is prohibited when
   requested **or** when its parent is -- the parent's flag is re-read under its
   binding lock, so no edit or render can launder the restriction, and a caller
-  cannot ask for less. Every insert path enforces the same rule at the model:
-  `save()`/`create()`, the guarded `bulk_create` (default and base manager) and
-  the rendition authority (`airing_prohibited` is a BOUND rendition column,
-  and a rendition of a prohibited source must be prohibited).
+  cannot ask for less. The model's insert paths -- `save()`/`create()`, the
+  guarded `bulk_create` (default and base manager; checked before any row is
+  written, whatever the `batch_size` or conflict mode) and the rendition
+  authority (`airing_prohibited` is a BOUND rendition column) -- refuse a
+  child of a prohibited parent that is not itself prohibited, **and refuse a
+  derived row whose parent does not already exist** (`parent_not_persisted`):
+  foreign keys are deferred, so a parent inserted in the same batch, or after
+  its child in the same transaction, would otherwise escape the check. Every
+  supported path derives from a parent it has already locked. As for every
+  other column, Django's plain `models.QuerySet.bulk_create` and raw SQL are
+  outside this application boundary.
 
 `lock_for_binding` is the **air-capable** binding: besides present/valid it
 refuses prohibited media with `MediaAiringProhibited` (`airing_prohibited`),

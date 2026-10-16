@@ -13,6 +13,6 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='productionmedia',
             name='airing_prohibited',
-            field=models.BooleanField(default=False, editable=False, help_text='Made under a TEST / NO AIR subject, or derived from such media: no air-capable binding may ever reference it.'),
+            field=models.BooleanField(db_default=False, default=False, editable=False, help_text='Made under a TEST / NO AIR subject, or derived from such media: no air-capable binding may ever reference it.'),
         ),
     ]

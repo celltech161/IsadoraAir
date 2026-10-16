@@ -119,10 +119,14 @@ class LivePlanClassificationTests(TransactionTestCase):
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
-                              ("produced_content.0004_backend_regular_only", "AddConstraint")])
+                              ("produced_content.0004_backend_regular_only", "AddConstraint"),
+                              # r0113: the NO-AIR column keeps a DATABASE default (old writers keep
+                              # inserting before the restart) -- the classifier reviews that: manual
+                              ("production.0003_media_airing_prohibited", "AddField")])
             for item in payload["plan"]:
                 if not item["ref"].startswith(("active_messages.0003", "active_messages.0004",
-                                               "produced_content.0003", "produced_content.0004")):
+                                               "produced_content.0003", "produced_content.0004",
+                                               "production.0003")):
                     self.assertEqual({op["classification"] for op in item["operations"]}, {"additive"}, item["ref"])
         finally:
             call_command("migrate", verbosity=0)
