@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "release_id": "r0113",
+  "previous_release_id": "r0112",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal D3C: native REGULAR produced content on the Phase-C spoken backend (My Content, shared recorder, existing spoken worker, ordinary library Tracks) and a TEST / NO AIR workspace whose media can never air (immutable ProductionMedia.airing_prohibited, inherited, refused by every air binding). Native active-message airing stays closed. Four migrations; five manual operations under the trusted companion. Restarts Gunicorn and the spoken worker; no static, package, unit or runtime change.",
+  "migrations_required": [
+    "produced_content.0002_d3c_spoken_backend_and_test_take",
+    "produced_content.0003_recipe_key_leading_digit",
+    "produced_content.0004_backend_regular_only",
+    "production.0003_media_airing_prohibited"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-spoken-render-worker"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
