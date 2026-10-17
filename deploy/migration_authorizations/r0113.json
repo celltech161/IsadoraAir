@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "release_id": "r0113",
+  "target_commit": "8926fe0068d2008bdf857c73fd7c4920ac1c98b0",
+  "manifest_sha256": "d29f62591ea0a544e1a189dc0576db24394632f3b3fa96a7b77bd71d5d01f5aa",
+  "authorized_manual_operations": [
+    {
+      "ref": "produced_content.0003_recipe_key_leading_digit",
+      "migration_file_sha256": "4d699999e8e30b891352c41126b7527a2946262495b19a22db252c324b3b7d78",
+      "operation_index": 0,
+      "operation": "RemoveConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "produced_content.0003_recipe_key_leading_digit",
+      "migration_file_sha256": "4d699999e8e30b891352c41126b7527a2946262495b19a22db252c324b3b7d78",
+      "operation_index": 1,
+      "operation": "AlterField",
+      "classification": "manual"
+    },
+    {
+      "ref": "produced_content.0003_recipe_key_leading_digit",
+      "migration_file_sha256": "4d699999e8e30b891352c41126b7527a2946262495b19a22db252c324b3b7d78",
+      "operation_index": 2,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "produced_content.0004_backend_regular_only",
+      "migration_file_sha256": "ae11abee01664d779b9643210d6a61fdde333810fa3313a870beef76f5a66c7b",
+      "operation_index": 0,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "production.0003_media_airing_prohibited",
+      "migration_file_sha256": "bf8b9cb037d2f8703279b6b12e2330af61f27a2991753d40704413b4e145ec89",
+      "operation_index": 0,
+      "operation": "AddField",
+      "classification": "manual"
+    }
+  ]
+}
