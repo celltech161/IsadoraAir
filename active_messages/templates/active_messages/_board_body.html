@@ -10,7 +10,7 @@
   <dt>Class</dt><dd>{{ m.get_kind_display }}</dd>
   <dt>Type</dt><dd>{{ m.content_type.name }} <span class="amb-muted">({{ m.content_type.key }})</span>{% if row.problem %} — <strong>{{ row.problem }}</strong>{% endif %}</dd>
   <dt>Producer</dt><dd>{{ m.producer_username|default:m.producer_key }}</dd>
-  <dt>State</dt><dd>{{ m.get_state_display }}{% if row.on_air %} — <strong>on air now</strong>{% elif m.state == "active" %} — {% if gate_open %}not on air now{% else %}not airing (native airing closed){% endif %}{% endif %}</dd>
+  <dt>State</dt><dd>{{ m.get_state_display }}<span data-onair-message="{{ m.pk }}" data-onair-when="on"{% if not row.on_air %} hidden{% endif %}> — <strong>on air now</strong></span>{% if m.state == "active" %}<span data-onair-message="{{ m.pk }}" data-onair-when="off"{% if row.on_air %} hidden{% endif %}> — {% if gate_open %}not on air now{% else %}not airing (native airing closed){% endif %}</span>{% endif %}</dd>
   <dt>Created</dt><dd>{{ m.created_at|date:"Y-m-d H:i T" }}</dd>
   {% if m.activated_at %}<dt>Published</dt><dd>{{ m.activated_at|date:"Y-m-d H:i T" }}{% if m.activated_by_username %} by {{ m.activated_by_username }}{% endif %}</dd>{% endif %}
   {% if m.state == "active" %}

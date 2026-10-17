@@ -14,7 +14,7 @@ from datetime import timedelta
 from unittest import mock
 
 from django.db import connection, connections
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.utils import timezone
 
 from active_messages import services
@@ -213,3 +213,53 @@ class ReviewedPublicationRaceTests(Sessions):
         self.assertIsInstance(second["error"], services.RevisionConflict)
         stored = ActiveBroadcastMessage.objects.get(pk=draft.pk)
         self.assertEqual((stored.state, stored.message_media_id), ("prepared", newer.pk))
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class ReplayOutcomeRaceTests(Sessions):
+    """D3D: two simultaneous posts of one Replay Now token, through the board
+    and two real database sessions -- one airing, and only one response says
+    it created it."""
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth.models import Group
+        from library.models import GroupAccess
+        for group in Group.objects.filter(name__startswith="test-"):
+            GroupAccess.objects.update_or_create(group=group, defaults={"allowed_prefixes": "/iportal/"})
+        patcher = mock.patch.object(services, "NATIVE_AIRING_AVAILABLE", True)   # controlled test conditions only
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        services.set_native_airing(True, actor=self.admin)
+
+    def post_replay(self, token):
+        from django.test import Client
+        client = Client()
+        client.force_login(self.controller)
+
+        def request():
+            response = client.post("/iportal/messages/board/replay/", {"request_token": token})
+            page = client.get(response["Location"]).content.decode()
+            return page.split('class="amb-flash"', 1)[1].split("</ul>", 1)[0]
+        return request
+
+    def test_simultaneous_posts_of_one_token_report_created_once(self):
+        self.active()
+        token = str(uuid.uuid4())
+        first, second = self.race(self.post_replay(token), self.post_replay(token),
+                                  "active_messages.services._create_execution")
+        self.assertIsNone(first["error"])
+        self.assertIsNone(second["error"])
+        execution = ActiveBroadcastExecution.objects.get()
+        short = str(execution.pk)[:8]
+        self.assertIn(f"new airing {short}", first["result"])
+        self.assertIn(f"already requested from this page: airing {short}", second["result"])
+        self.assertNotIn("new airing", second["result"])
+
+    def test_a_simultaneous_different_token_is_reported_as_absorbed(self):
+        self.active()
+        first, second = self.race(self.post_replay(str(uuid.uuid4())), self.post_replay(str(uuid.uuid4())),
+                                  "active_messages.services._create_execution")
+        execution = ActiveBroadcastExecution.objects.get()
+        self.assertIn(f"new airing {str(execution.pk)[:8]}", first["result"])
+        self.assertIn(f"absorbed by the airing already in progress: {str(execution.pk)[:8]}", second["result"])

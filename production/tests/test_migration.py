@@ -120,7 +120,9 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  "produced_content.0003_recipe_key_leading_digit",
                                                  "produced_content.0004_backend_regular_only",
                                                  # r0113: the NO-AIR provenance column
-                                                 "production.0003_media_airing_prohibited"})
+                                                 "production.0003_media_airing_prohibited",
+                                                 # 2.22D3D: the operator board's history indexes
+                                                 "active_messages.0005_execution_history_indexes"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(sorted((entry["ref"], entry["operation"])
                                     for entry in probe.extract_manual_operations(payload["plan"])),
@@ -134,7 +136,10 @@ class LivePlanClassificationTests(TransactionTestCase):
                                      ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
                                      ("produced_content.0004_backend_regular_only", "AddConstraint"),
                                      # r0113: a database default (old-writer compatibility) is manual
-                                     ("production.0003_media_airing_prohibited", "AddField")]))
+                                     ("production.0003_media_airing_prohibited", "AddField"),
+                                     # 2.22D3D: index operations are outside the automatic allowlist
+                                     ("active_messages.0005_execution_history_indexes", "AddIndex"),
+                                     ("active_messages.0005_execution_history_indexes", "AddIndex")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

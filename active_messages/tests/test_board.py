@@ -11,6 +11,7 @@ command is sent."""
 import re
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth.models import Group
@@ -411,24 +412,94 @@ class FilterAndHistoryTests(BoardCase):
 
 
 class AiringVisibilityTests(BoardCase):
+    def on_air_rows(self, response) -> set:
+        """Messages whose row is marked on air AND whose ON AIR badge is shown."""
+        html = self.markup(response)
+        marked = set(re.findall(r'id="m-([0-9a-f-]{36})"[^>]*data-on-air="true"', html))
+        shown = set(re.findall(r'<span class="amb-state onair" data-onair-message="([0-9a-f-]{36})" '
+                               r'data-onair-when="on">', html))
+        self.assertEqual(marked, shown)                          # the two presentations never disagree
+        return marked
+
+    def status(self):
+        return self.client_for(self.controller).get(f"{BOARD}status/").json()
+
+    def started(self, *messages):
+        execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
+        return self.put_on_air(execution)
+
     def test_active_is_not_on_air_without_air_evidence(self):
         message = self.live(self.producer, self.pa)
         page = self.board()
-        self.assertNotIn("ON AIR", self.markup(page))
-        self.assertNotIn("data-onair", self.markup(page))
+        self.assertEqual(self.on_air_rows(page), set())
         self.assertIn("not airing (native airing closed)", self.row(page, message))
         self.assertIn('data-gate="closed"', page.content.decode())
+        self.assertEqual(self.status()["on_air"], {"execution": None, "messages": []})
 
     def test_on_air_is_shown_only_for_the_components_of_a_started_airing(self):
         aired = self.live(self.producer, self.pa)
         execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
-        self.assertNotIn("ON AIR", self.markup(self.board()))                         # pending render: not air
+        self.assertEqual(self.on_air_rows(self.board()), set())                        # pending render: not air
         self.put_on_air(execution)
         later = self.live(self.producer2, self.pa)                                     # not in that airing
         page = self.board()
-        self.assertIn("data-onair", self.row(page, aired))
-        self.assertNotIn("data-onair", self.row(page, later))
+        self.assertEqual(self.on_air_rows(page), {str(aired.pk)})
         self.assertIn("● ON AIR", page.content.decode().split('id="ambAiring"')[1][:200])
+        self.assertEqual(self.status()["on_air"], {"execution": str(execution.pk), "messages": [str(aired.pk)]})
+        self.assertNotIn(str(later.pk), self.status()["on_air"]["messages"])
+
+    def test_on_air_follows_the_frozen_composition_not_the_current_active_set(self):
+        a = self.live(self.producer, self.pa, title="A")
+        b = self.live(self.producer2, self.pa, title="B")
+        execution, _token = self.started()
+        services.clear_message(b, actor=self.admin)                     # cleared while on air: it still airs
+        c = self.live(self.producer, self.urgent, title="C")            # active now, not in the airing
+        status = self.status()
+        self.assertEqual(status["on_air"], {"execution": str(execution.pk),
+                                            "messages": sorted([str(a.pk), str(b.pk)])})
+        self.assertEqual(self.on_air_rows(self.board()), {str(a.pk)})                   # B is in History now
+        self.assertEqual(self.on_air_rows(self.board(filter="history")), {str(b.pk)})
+        self.assertNotIn(str(c.pk), status["on_air"]["messages"])
+
+    def test_accepted_and_claimed_are_not_on_air(self):
+        self.live(self.producer, self.pa)
+        execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
+        mix = media(None, kind=ProductionMedia.KIND_RENDITION,
+                    derived_from=ProductionMedia.objects.get(pk=execution.composition_snapshot["components"][0]["media"]))
+        now = timezone.now()
+        raw(X).filter(pk=execution.pk).update(state="accepted", mix_media=mix, ready_at=now, accepted_at=now,
+                                              attempt_token=uuid.uuid4(), attempt_count=1)
+        for state, label in (("accepted", "Accepted by the engine"), ("claimed", "Claimed (not yet on air)")):
+            raw(X).filter(pk=execution.pk).update(state=state, claimed_at=now if state == "claimed" else None)
+            status = self.status()
+            self.assertEqual(status["on_air"]["messages"], [], state)
+            self.assertEqual((status["chip"]["text"], status["chip"]["class"]), (label, ""), state)
+            self.assertEqual(self.on_air_rows(self.board()), set(), state)
+
+    def test_leaving_started_clears_on_air_from_rows_and_the_indicator(self):
+        message = self.live(self.producer, self.pa)
+        for outcome in ("completed", "interrupted", "failed"):
+            execution, token = self.started()
+            self.assertEqual(self.status()["chip"], {"text": "● ON AIR", "class": "onair"})
+            ended = timezone.now()
+            if outcome == "completed":
+                services.record_air_completed(execution, attempt_token=token, ended_at=ended,
+                                              confirmed_duration_seconds=Decimal("30.000"))
+            elif outcome == "interrupted":
+                services.record_air_interrupted(execution, attempt_token=token, last_evidence_at=ended)
+            else:     # no domain service fails a STARTED airing; the database allows the state -- the board must cope
+                raw(X).filter(pk=execution.pk).update(state="failed", open_slot=None, terminal_at=ended,
+                                                      failure_code="publication_unavailable")
+            status = self.status()
+            self.assertEqual(status["on_air"], {"execution": None, "messages": []}, outcome)
+            self.assertNotEqual(status["chip"]["class"], "onair", outcome)
+            self.assertEqual(status["latest"]["execution"], str(execution.pk), outcome)
+            self.assertEqual(status["latest"]["state"], outcome)
+            self.assertEqual(status["chip"]["class"], "" if outcome == "completed" else "alert", outcome)
+            page = self.board()
+            self.assertEqual(self.on_air_rows(page), set(), outcome)
+            self.assertNotIn(f'data-execution-label="{execution.pk}" data-shown="onair"', page.content.decode())
+            raw(M).filter(pk=message.pk).update(next_due_at=timezone.now())            # cadence aside: due again
 
     def test_the_airing_page_shows_identity_events_and_the_evidence_distinction(self):
         message = self.live(self.producer, self.urgent, title="Shelter in place")
@@ -445,12 +516,54 @@ class AiringVisibilityTests(BoardCase):
         status = response.json()
         self.assertEqual((status["urgent"], status["public_address"], status["review"], status["gate_open"]),
                          (0, 0, 0, False))
+        self.assertEqual((status["chip"], status["latest"]), ({"text": "No airings yet", "class": ""}, None))
         self.assertEqual(response["Cache-Control"], "no-store")
         self.live(self.producer, self.urgent)
         changed = self.client_for(self.controller).get(f"{BOARD}status/").json()
         self.assertEqual(changed["urgent"], 1)
         self.assertNotEqual(changed["version"], status["version"])
         self.assertEqual(self.post(self.controller, f"{BOARD}status/").status_code, 405)
+
+    def test_the_status_poll_does_constant_work(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        self.live(self.producer, self.pa)
+        self.started()
+        self.status()                                                  # warm per-request caches first
+        with CaptureQueriesContext(connection) as small:
+            self.status()
+        for index in range(15):
+            message = services.prepare_message(actor=self.producer2, content_type=self.pa, title=f"old {index}")
+            services.clear_message(message, actor=self.producer2)
+        with CaptureQueriesContext(connection) as large:
+            self.status()
+        self.assertEqual(len(large), len(small))
+        executions = [query["sql"] for query in large if "activebroadcastexecution" in query["sql"]]
+        self.assertEqual(len(executions), 1)                                        # the unfinished one, by slot
+        self.assertIn('"open_slot" = 1', executions[0])
+
+
+class AiringHistoryTests(BoardCase):
+    def test_message_airings_and_all_airings_are_keyset_paginated(self):
+        message = self.live(self.producer, self.pa)
+        made = []
+        for _ in range(board_module.AIRINGS_PAGE + 3):
+            execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
+            raw(X).filter(pk=execution.pk).update(state="suppressed", open_slot=None, terminal_at=timezone.now(),
+                                                  failure_code="stale_generation")
+            made.append(execution.pk)
+        other = self.live(self.producer2, self.pa)
+        newest = list(X.objects.order_by("-created_at", "-id").values_list("id", flat=True))
+        for url in (f"{BOARD}{message.pk}/", f"{BOARD}airings/"):
+            first = self.client_for(self.controller).get(url).content.decode()
+            ids = re.findall(r'<tr data-execution="([0-9a-f-]{36})"', first)
+            self.assertEqual(ids, [str(pk) for pk in newest[:board_module.AIRINGS_PAGE]], url)
+            older = re.search(r'href="([^"]+)" rel="next"', first).group(1).replace("&amp;", "&")
+            rest = re.findall(r'<tr data-execution="([0-9a-f-]{36})"',
+                              self.client_for(self.controller).get(older).content.decode())
+            self.assertEqual(rest, [str(pk) for pk in newest[board_module.AIRINGS_PAGE:]], url)
+        self.assertNotIn("<tr data-execution", self.client_for(self.controller).get(f"{BOARD}{other.pk}/")
+                         .content.decode())                                         # never part of an airing
 
 
 class ReplayNowClosedTests(BoardCase):
@@ -462,7 +575,8 @@ class ReplayNowClosedTests(BoardCase):
         self.assertIn("disabled", button)
         self.assertIn("native airing is closed", button)
         token = re.search(r'name="request_token" value="([0-9a-f-]{36})"', page.content.decode()).group(1)
-        with mock.patch.object(services, "request_manual_replay", side_effect=AssertionError("never called")):
+        with mock.patch.object(services, "request_manual_replay", side_effect=AssertionError("never called")), \
+                mock.patch.object(services, "request_manual_replay_outcome", side_effect=AssertionError("never called")):
             response = self.post(self.controller, f"{BOARD}replay/", {"request_token": token})
         self.assertIn("Replay Now is unavailable", self.flash(self.follow(self.controller, response)))
         self.assertFalse(X.objects.exists())                                          # no dormant airing
@@ -540,6 +654,45 @@ class ReplayNowGateOpenTests(BoardCase):
         self.assertIn("already requested", again)
         self.assertEqual(ActiveBroadcastMessageEvent.objects.filter(request_token=token).count(), 1)
         self.assertNotEqual(self.token(self.board()), token)                   # every page issues a fresh token
+
+    def test_the_reported_outcome_is_the_services_not_a_preflight_guess(self):
+        message = self.live(self.producer, self.pa)
+        execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
+        token = str(uuid.uuid4())                                   # never seen: a preflight would say "new"
+        for outcome, text in ((services.REPLAY_REPEATED, "already requested"),
+                              (services.REPLAY_COALESCED, "absorbed by the airing already in progress"),
+                              (services.REPLAY_CREATED, "new airing")):
+            with mock.patch.object(services, "request_manual_replay_outcome", return_value=(execution, outcome)):
+                self.assertIn(text, self.replay(token))
+        self.assertTrue(message)
+
+    def test_a_token_still_resolves_to_its_airing_after_it_completed(self):
+        self.live(self.producer, self.pa)
+        token = str(uuid.uuid4())
+        self.assertIn("new airing", self.replay(token))
+        execution = X.objects.get()
+        execution, attempt = self.put_on_air(execution)
+        services.record_air_completed(execution, attempt_token=attempt, ended_at=timezone.now(),
+                                      confirmed_duration_seconds=Decimal("30.000"))
+        again = self.replay(token)
+        self.assertIn(f"already requested from this page: airing {str(execution.pk)[:8]} (completed)", again)
+        self.assertEqual(X.objects.count(), 1)
+        self.assertEqual(services.request_manual_replay_outcome(actor=self.controller, request_token=token),
+                         (X.objects.get(), services.REPLAY_REPEATED))
+
+    def test_the_service_reports_each_outcome(self):
+        self.live(self.producer, self.pa)
+        first, second = uuid.uuid4(), uuid.uuid4()
+        created = services.request_manual_replay_outcome(actor=self.admin, request_token=first)
+        self.assertEqual(created[1], services.REPLAY_CREATED)
+        self.assertEqual(services.request_manual_replay_outcome(actor=self.admin, request_token=first),
+                         (created[0], services.REPLAY_REPEATED))
+        self.assertEqual(services.request_manual_replay_outcome(actor=self.admin, request_token=second),
+                         (created[0], services.REPLAY_COALESCED))
+        self.assertEqual(services.request_manual_replay_outcome(actor=self.admin, request_token=second),
+                         (created[0], services.REPLAY_REPEATED))
+        # The original contract is unchanged: the execution alone.
+        self.assertEqual(services.request_manual_replay(actor=self.admin, request_token=first), created[0])
 
     def test_an_unfinished_airing_absorbs_a_new_request(self):
         self.live(self.producer, self.pa)

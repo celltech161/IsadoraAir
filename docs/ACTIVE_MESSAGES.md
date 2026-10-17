@@ -308,13 +308,37 @@ Messages page links to it too. Producers keep My Messages.
   airing closed)" for an ACTIVE message while the gate is closed —,
   publishing rule, expiry, what a publication would replace, UUID), the
   actions, an expiry editor and the latest five events. "History" opens the
-  message's page (up to 200 events and the airings it was part of); each
-  airing has a page with its reason, state, failure code, timestamps
+  message's page (up to 200 events and the airings it was part of, 25 a
+  page); "All airings" lists every airing, 25 a page; each airing has a page with its reason, state, failure code, timestamps
   (accepted and claimed are labelled "not air"; only STARTED is air
   evidence), components in airing order, digest and events;
-* a bounded refresh (every 20 s while visible, at most 90 times) updates the
-  strip's counts and offers "Reload" when anything changed; it never
-  re-renders rows, so expanded rows, focus, filters and typed input stay.
+* a bounded refresh (every 20 s while visible, at most 90 times; at once when
+  a page is restored from the browser cache) on the board and on the message,
+  airing and airings pages. It updates the counts, the airing indicator (text
+  and class) and **every ON AIR indication** -- rows, row facts, airing
+  labels -- from the server's one interpretation, which the page render uses
+  too: only the STARTED airing (ACCEPTED/CLAIMED are labelled as such, never
+  as air) and exactly the messages frozen in its composition, never the
+  current active set. An airing that leaves STARTED loses ON AIR on the next
+  refresh; a later STARTED airing shows its own components. Only the newest
+  response is applied (a late, older one is ignored); a failed refresh or
+  the 90-refresh limit restores nothing and shows "on-air indications may be
+  out of date — Reload". "Reload" is also offered when anything changed. It
+  never re-renders rows, so expanded rows, focus, filters and typed input
+  stay.
+
+**Bounded reads.** Board reads take no lock, and the 20-second refresh does
+constant work however long the history grows: unfinished messages only (the
+`(state, …)` indexes), the one unfinished airing by its `open_slot` unique
+index (also the source of ON AIR), the newest airing by
+`active_execution_recent` `(created_at, id)`, the newest event by primary
+key. Airing lists are newest first, deterministic on equal timestamps
+(`created_at, id`), keyset-paginated (a deep page costs what the first one
+does). "Airings with this message" uses containment on the frozen snapshot
+(`composition_snapshot @> {"components": [{"message": …}]}`) through the
+`active_execution_members` jsonb_path_ops GIN index, run first in a
+MATERIALIZED CTE so the planner cannot trade it for a newest-first scan that
+tests every airing: its work is bounded by that message's own airings.
 
 | Action | How | Service |
 | --- | --- | --- |
@@ -322,7 +346,7 @@ Messages page links to it too. Producers keep My Messages.
 | Decline (a PREPARED draft) | confirmation page naming message and producer, optional reason, POST | `clear_message(expected_state=prepared)` |
 | Clear (an ACTIVE message) | likewise | `clear_message(expected_state=active)` |
 | Set / change / remove expiry | POST with the station-local time and the expiry as shown | `set_message_expiry(expected_expires_at=…)` |
-| Replay now | POST with the request token issued with the page | `request_manual_replay(request_token=…)` |
+| Replay now | POST with the request token issued with the page | `request_manual_replay_outcome(request_token=…)` |
 | Record / edit a draft | the shared recorder on `?message=<uuid>&from=board` (its Back returns to the board, for control) | the D3B adapter, unchanged |
 
 Every POST is CSRF-protected, carries the operator's filter/search/page
@@ -350,11 +374,15 @@ the sweep" — EXPIRED is set only by `expire_due_messages`), and EXPIRED.
 
 **Replay Now while the gate is closed** (every installation until Phase G):
 the button is disabled and names why, and the server refuses the POST BEFORE
-calling `request_manual_replay` — no dormant execution is ever created as if
+calling the Replay Now service — no dormant execution is ever created as if
 it were a live replay. With the gate open (tests patch it; Phase G's cutover
 opens it), the token issued with the page makes a double click or Back +
 resubmit resolve to the same airing ("already requested"); an unfinished
-airing absorbs a new request ("absorbed"); refusals (nothing active, limits,
+airing absorbs a new request ("absorbed"). The outcome --
+`created` / `repeated` / `coalesced` -- comes from
+`request_manual_replay_outcome`, decided inside the service's own
+transaction under the policy lock (never a preflight read), so of two
+simultaneous posts of one token exactly one reports "created"; refusals (nothing active, limits,
 an earlier composition still with the engine, another operator's token) are
 reported and create nothing; a new airing is reported as not on air until
 the engine starts it. The board never opens the gate and never sends an
@@ -863,13 +891,27 @@ and untouched.
 
 ## Release notes for D3D
 
-* No migration, no new table, field, capability or setting.
+* **Migration `active_messages.0005_execution_history_indexes`**: two
+  `AddIndex` on `ActiveBroadcastExecution` -- `active_execution_recent`
+  B-tree `(created_at, id)` and `active_execution_members` GIN
+  `(composition_snapshot jsonb_path_ops)`. Additive in substance (no field,
+  constraint or data change; nothing rewritten) but outside the updater's
+  automatic allowlist, so both operations are **manual**: the release ships a
+  migration-authorization companion (or approves locally). Atomic, plain
+  `CREATE INDEX` (not CONCURRENTLY: a non-atomic migration is manual for a
+  different, worse reason): it holds a SHARE lock on the execution table --
+  blocking only writes to it -- for the build. With the native-airing gate
+  closed nothing creates executions on a station, so the table is expected
+  to be empty or tiny and the build instantaneous; the engine never writes
+  it while the gate is closed.
+* No new table, field, capability or setting.
 * New control-only pages under `/iportal/messages/board/` (inside the existing
   `/iportal/` GroupAccess prefix); templates are self-contained (no new static
   files).
 * `activate_message(expected_revision=...)` and
   `set_message_expiry(expected_expires_at=...)` are optional; existing callers
-  are unchanged.
+  are unchanged. New `request_manual_replay_outcome(...)` returns
+  `(execution, outcome)`; `request_manual_replay` keeps its contract.
 * The recorder contract gains `hub_links(user)` (default none); the hub lists
   it under the tool's one entry. The active-message adapter's Back link
   returns to the board when opened from it by control.

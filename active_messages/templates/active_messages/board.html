@@ -12,9 +12,7 @@
     <span class="amb-chip{% if status.urgent %} urgent{% endif %}" title="Active urgent messages"><b data-count="urgent">{{ status.urgent }}</b> urgent</span>
     <span class="amb-chip" title="Active public-address messages"><b data-count="public_address">{{ status.public_address }}</b> PA</span>
     <a class="amb-chip{% if status.review %} review{% endif %}" href="?filter=review" title="Prepared messages with audio, awaiting review"><b data-count="review">{{ status.review }}</b> to review</a>
-    {% with airing=status.airing %}
-    <a class="amb-chip{% if airing.on_air %} onair{% elif airing.attention %} alert{% endif %}" id="ambAiring" href="#ambAirings" title="Current or most recent airing"><span data-text="airing">{% if airing.on_air %}● ON AIR{% else %}{{ airing_text }}{% endif %}</span></a>
-    {% endwith %}
+    <a class="amb-chip{% if chip.class %} {{ chip.class }}{% endif %}" id="ambAiring" href="#ambAirings" title="Current or most recent airing"><span data-text="airing">{{ chip.text }}</span></a>
     <span class="amb-chip {% if status.gate_open %}ok{% else %}off{% endif %}" id="ambGate" data-gate="{{ status.gate_open|yesno:'open,closed' }}">{% if status.gate_open %}Native airing open{% else %}Native airing closed<span class="amb-sr" id="ambGateText">: {{ gate_message }} Active messages do not air.</span>{% endif %}</span>
     {% if status.load.over %}<span class="amb-chip alert" data-status="over" title="The active set breaks a policy limit and is not aired">Over limit: {{ status.load.over|join:"; " }}</span>{% endif %}
     <form method="post" action="{% url 'active_messages:board-replay' %}" class="amb-replay">{% csrf_token %}
@@ -33,7 +31,7 @@
     {% for item in messages %}<li class="{{ item.tags }}">{{ item }}</li>{% endfor %}
   </ul>
   {% endif %}
-  <div class="amb-changed" id="ambChanged" role="status" hidden>The board has changed. <a href="" id="ambReload">Reload</a></div>
+  {% include "active_messages/_board_notices.html" %}
 
   <div class="amb-bar">
     <nav class="amb-filters" aria-label="Show">
@@ -49,7 +47,7 @@
   <div class="amb-colhead" aria-hidden="true"><span></span><span>Title</span><span>Type</span><span>Producer</span><span>When</span><span>Audio</span><span>Expiry / due</span><span>State</span><span></span></div>
   <ul class="amb-list" id="ambList" aria-label="Messages">
     {% for row in rows %}{% with m=row.message %}
-    <li class="amb-item" id="m-{{ m.pk }}" data-message="{{ m.pk }}" data-state="{{ m.state }}" data-kind="{{ m.kind }}">
+    <li class="amb-item" id="m-{{ m.pk }}" data-message="{{ m.pk }}" data-state="{{ m.state }}" data-kind="{{ m.kind }}" data-on-air="{{ row.on_air|yesno:'true,false' }}">
       <details class="amb-row"{% if open_id == m.pk|stringformat:"s" %} open{% endif %}>
         <summary>
           <span class="amb-kind {% if m.kind == 'urgent' %}urgent{% endif %}" title="{{ m.get_kind_display }}">{% if m.kind == "urgent" %}URG{% else %}PA{% endif %}<span class="amb-sr"> {{ m.get_kind_display }}</span></span>
@@ -61,9 +59,9 @@
             <span class="m-audio{% if not row.audio.ok %} warn{% endif %}">{{ row.audio.label }}</span>
             <span class="m-note{% if row.expiry.soon or row.expiry.passed and m.state != 'expired' %} warn{% endif %}">{% if row.expiry.set and m.state != "cleared" %}{{ row.expiry.label }}{% elif row.next_due %}next due {{ row.next_due|date:"H:i" }}{% endif %}</span>
           </span>
-          {% if row.on_air %}<span class="amb-state onair" data-onair>● ON AIR</span>
-          {% elif m.state == "prepared" %}<span class="amb-state {% if row.audio.ok %}review{% else %}draft{% endif %}">{% if row.audio.ok %}REVIEW{% else %}DRAFT{% endif %}</span>
-          {% else %}<span class="amb-state {{ m.state }}">{{ m.get_state_display|upper }}</span>{% endif %}
+          <span class="amb-state onair" data-onair-message="{{ m.pk }}" data-onair-when="on"{% if not row.on_air %} hidden{% endif %}>● ON AIR</span>
+          {% if m.state == "prepared" %}<span class="amb-state {% if row.audio.ok %}review{% else %}draft{% endif %}" data-onair-message="{{ m.pk }}" data-onair-when="off"{% if row.on_air %} hidden{% endif %}>{% if row.audio.ok %}REVIEW{% else %}DRAFT{% endif %}</span>
+          {% else %}<span class="amb-state {{ m.state }}" data-onair-message="{{ m.pk }}" data-onair-when="off"{% if row.on_air %} hidden{% endif %}>{{ m.get_state_display|upper }}</span>{% endif %}
           <span class="amb-chev" aria-hidden="true">▸</span>
         </summary>
         <div class="amb-body">{% include "active_messages/_board_body.html" with detail=False gate_open=status.gate_open %}</div>
@@ -92,66 +90,16 @@
         <tbody>
         {% for item in airings %}{% with x=item.execution %}
           <tr data-execution="{{ x.pk }}" data-execution-state="{{ x.state }}"><td><a href="{{ item.url }}" class="amb-id">{{ x.pk|stringformat:"s"|slice:":8" }}</a></td>
-            <td>{% if item.on_air %}<strong>● On air</strong>{% else %}{{ x.get_state_display }}{% endif %}</td>
+            <td><strong data-execution-label="{{ x.pk }}" data-shown="{% if item.on_air %}onair{% else %}{{ x.state }}{% endif %}">{% if item.on_air %}● On air{% else %}{{ x.get_state_display }}{% endif %}</strong></td>
             <td class="wide">{{ x.get_reason_display }}</td><td>{{ x.created_at|date:"M j H:i" }}</td>
             <td class="wide">{{ x.started_at|date:"H:i:s"|default:"—" }}</td><td>{{ x.failure_code|default:"" }}</td></tr>
         {% endwith %}{% endfor %}
         </tbody>
       </table>
+      <p class="amb-note"><a href="{% url 'active_messages:board-airings' %}{% if return_query %}?{{ return_query }}{% endif %}">All airings ›</a></p>
       {% else %}<p class="amb-note">No airings yet.</p>{% endif %}
     </div>
   </details>
 </div>
 {% endblock %}
-{% block extra_js %}
-<script>
-(function () {
-  "use strict";
-  var board = document.getElementById("amBoard");
-  if (!board) return;
-  // One submission per form: a double click never sends twice (the server is
-  // idempotent anyway -- exact UUIDs, expected state/revision, request token).
-  document.addEventListener("submit", function (event) {
-    var form = event.target;
-    if (!board.contains(form) || form.getAttribute("method") !== "post") return;
-    if (form.dataset.sent) { event.preventDefault(); return; }
-    form.dataset.sent = "1";
-    form.querySelectorAll("button").forEach(function (button) { button.setAttribute("aria-disabled", "true"); });
-  }, true);
-  window.addEventListener("pageshow", function (event) {
-    if (!event.persisted) return;
-    board.querySelectorAll("form[data-sent]").forEach(function (form) {
-      delete form.dataset.sent;
-      form.querySelectorAll("button").forEach(function (button) { button.removeAttribute("aria-disabled"); });
-    });
-  });
-  // Bounded, unobtrusive status refresh: it updates the counts and offers a
-  // reload when something changed -- it never re-renders rows, so expanded
-  // rows, focus, filters and typed input are untouched.
-  var url = board.dataset.statusUrl, version = board.dataset.version, polls = 0;
-  var EVERY = 20000, LIMIT = 90;
-  var reload = document.getElementById("ambReload");
-  reload.href = window.location.pathname + window.location.search;
-  function text(selector, value) {
-    var node = board.querySelector(selector);
-    if (node && node.textContent !== String(value)) node.textContent = value;
-  }
-  function poll() {
-    if (document.hidden) return;
-    if (++polls > LIMIT) { window.clearInterval(timer); return; }
-    fetch(url, {credentials: "same-origin", cache: "no-store", headers: {"Accept": "application/json"}})
-      .then(function (response) { return response.ok ? response.json() : null; })
-      .then(function (status) {
-        if (!status) return;
-        text('[data-count="urgent"]', status.urgent);
-        text('[data-count="public_address"]', status.public_address);
-        text('[data-count="review"]', status.review);
-        text('[data-text="airing"]', status.on_air ? "● ON AIR" : status.airing);
-        if (status.version !== version) document.getElementById("ambChanged").hidden = false;
-      })
-      .catch(function () {});
-  }
-  var timer = window.setInterval(poll, EVERY);
-})();
-</script>
-{% endblock %}
+{% block extra_js %}{% include "active_messages/_board_live.html" %}{% endblock %}

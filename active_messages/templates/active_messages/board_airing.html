@@ -2,11 +2,12 @@
 {% block title %}Airing {{ execution.pk|stringformat:"s"|slice:":8" }} — Operator board — IsadoraAir{% endblock %}
 {% block extra_css %}{% include "active_messages/_board_style.html" %}{% endblock %}
 {% block content %}
-<div class="amb" id="amAiring" data-execution="{{ execution.pk }}" data-execution-state="{{ execution.state }}">
+<div class="amb" id="amAiring" data-execution="{{ execution.pk }}" data-execution-state="{{ execution.state }}" data-version="{{ status_version }}" data-status-url="{% url 'active_messages:board-status' %}">
   <header class="amb-head">
-    <h1>Airing {{ execution.pk|stringformat:"s"|slice:":8" }} · {% if airing.on_air %}● On air{% else %}{{ execution.get_state_display }}{% endif %}</h1>
+    <h1>Airing {{ execution.pk|stringformat:"s"|slice:":8" }} · <span data-execution-label="{{ execution.pk }}" data-shown="{% if airing.on_air %}onair{% else %}{{ execution.state }}{% endif %}">{% if airing.on_air %}● On air{% else %}{{ execution.get_state_display }}{% endif %}</span></h1>
     <nav aria-label="Back"><a href="{{ back_url }}">‹ Operator board</a></nav>
   </header>
+  {% include "active_messages/_board_notices.html" %}
   <p class="amb-note">{% if execution.started_at %}Air evidence: the engine's first real program buffer at {{ execution.started_at|date:"H:i:s T" }}.{% else %}No air evidence: this airing has not been on air{% if execution.state == "accepted" or execution.state == "claimed" %} (accepted or claimed is not air){% endif %}.{% endif %}{% if not gate_open %} Native airing is closed.{% endif %}</p>
   <dl class="amb-facts">
     <dt>Why</dt><dd>{{ execution.get_reason_display }}{% if execution.requested_by_username %} — {{ execution.requested_by_username }}{% endif %}</dd>
@@ -45,3 +46,4 @@
   </details>
 </div>
 {% endblock %}
+{% block extra_js %}{% include "active_messages/_board_live.html" %}{% endblock %}

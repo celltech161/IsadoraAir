@@ -104,7 +104,9 @@ class LivePlanClassificationTests(TransactionTestCase):
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["production.0002_referenceaudio", "active_messages.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
-                              "active_messages.0004_message_content_type_identity", "spoken.0001_initial",
+                              "active_messages.0004_message_content_type_identity",
+                              # 2.22D3D: the board's history indexes (on 0004 only)
+                              "active_messages.0005_execution_history_indexes", "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
                               "produced_content.0004_backend_regular_only",
@@ -116,6 +118,10 @@ class LivePlanClassificationTests(TransactionTestCase):
                               ("active_messages.0004_message_content_type_identity", "AlterField"),
                               ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
                               ("active_messages.0004_message_content_type_identity", "AddConstraint"),
+                              # 2.22D3D: the board's two history indexes (index operations are
+                              # outside the automatic allowlist)
+                              ("active_messages.0005_execution_history_indexes", "AddIndex"),
+                              ("active_messages.0005_execution_history_indexes", "AddIndex"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
@@ -124,7 +130,7 @@ class LivePlanClassificationTests(TransactionTestCase):
                               # inserting before the restart) -- the classifier reviews that: manual
                               ("production.0003_media_airing_prohibited", "AddField")])
             for item in payload["plan"]:
-                if not item["ref"].startswith(("active_messages.0003", "active_messages.0004",
+                if not item["ref"].startswith(("active_messages.0003", "active_messages.0004", "active_messages.0005",
                                                "produced_content.0003", "produced_content.0004",
                                                "production.0003")):
                     self.assertEqual({op["classification"] for op in item["operations"]}, {"additive"}, item["ref"])

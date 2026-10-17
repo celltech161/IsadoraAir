@@ -29,6 +29,7 @@ every POST is decided again by the services under their locks.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
@@ -64,7 +65,10 @@ SEARCH_LIMIT = 100
 ROW_EVENTS = 5
 DETAIL_EVENTS = 200
 RECENT_AIRINGS = 6
-MESSAGE_AIRINGS = 10
+AIRINGS_PAGE = 25
+# Newest first, deterministic on equal timestamps: the active_execution_recent
+# index (created_at, id), scanned backwards.
+EXECUTION_ORDER = ("-created_at", "-id")
 SOON = timedelta(hours=1)
 REASON_LIMIT = 200
 EXECUTION_ATTENTION = (X.FAILED, X.INTERRUPTED)
@@ -225,6 +229,80 @@ def _components(execution) -> set:
     return {component.get("message") for component in (execution.composition_snapshot or {}).get("components", [])}
 
 
+def _unfinished_execution():
+    """The one unfinished airing, if any -- an indexed single-row lookup: the
+    database allows at most one (open_slot = 1, unique, exactly the unfinished
+    states)."""
+    return ActiveBroadcastExecution.objects.filter(open_slot=1).first()
+
+
+def _on_air(unfinished) -> dict:
+    """THE board's interpretation of "on air", for the page and for every
+    status refresh alike: only a STARTED airing (the engine's first real
+    program buffer -- ACCEPTED and CLAIMED are not air), and exactly the
+    messages frozen in ITS composition -- never the current active set."""
+    if unfinished is None or unfinished.state != X.STARTED:
+        return {"execution": None, "messages": []}
+    return {"execution": str(unfinished.pk), "messages": sorted(_components(unfinished))}
+
+
+def _airing_chip(airing) -> dict:
+    """The strip's airing indicator (text and class), for the page and the refresh."""
+    if airing is None:
+        return {"text": "No airings yet", "class": ""}
+    if airing["on_air"]:
+        return {"text": "● ON AIR", "class": "onair"}
+    return {"text": _airing_text(airing), "class": "alert" if airing["attention"] else ""}
+
+
+def _execution_page(rows, before=None):
+    """One newest-first page of airings, keyset-paginated on (created_at, id):
+    the index range starts at the cursor (``before``, the last airing of the
+    previous page), so a deep page costs what the first one does. Returns
+    (airings, cursor for the next page or None)."""
+    rows = rows.order_by(*EXECUTION_ORDER)
+    if before is not None:
+        rows = rows.filter(created_at__lte=before.created_at).exclude(created_at=before.created_at,
+                                                                        id__gte=before.pk)
+    found = list(rows[:AIRINGS_PAGE + 1])
+    return found[:AIRINGS_PAGE], (found[AIRINGS_PAGE - 1] if len(found) > AIRINGS_PAGE else None)
+
+
+def _cursor(params):
+    try:
+        return ActiveBroadcastExecution.objects.filter(pk=uuid.UUID(params.get("before") or "")).first()
+    except ValueError:
+        return None
+
+
+# Airings whose FROZEN composition includes one exact message, newest first.
+# The containment runs first, alone, in a MATERIALIZED CTE: the jsonb_path_ops
+# GIN index (active_execution_members) finds exactly this message's airings,
+# and only those are sorted and paged. Left to itself the planner may instead
+# walk the newest-first index and test every airing's snapshot -- work that
+# grows with the whole history. Keyset on (created_at, id), like every list.
+MEMBER_SQL = """
+    WITH members AS MATERIALIZED (
+        SELECT id, created_at FROM {table} WHERE composition_snapshot @> %s::jsonb)
+    SELECT airing.* FROM {table} AS airing JOIN members ON members.id = airing.id
+    {after}
+    ORDER BY members.created_at DESC, members.id DESC
+    LIMIT %s"""
+
+
+def _member_page(message, before=None):
+    """One page of the airings this exact message was part of; returns
+    (airings, cursor for the next page or None), like ``_execution_page``."""
+    params = [json.dumps({"components": [{"message": str(message.pk)}]})]
+    after = ""
+    if before is not None:
+        after = "WHERE (members.created_at, members.id) < (%s, %s)"
+        params += [before.created_at, before.pk]
+    sql = MEMBER_SQL.format(table=ActiveBroadcastExecution._meta.db_table, after=after)
+    found = list(ActiveBroadcastExecution.objects.raw(sql, params + [AIRINGS_PAGE + 1]))
+    return found[:AIRINGS_PAGE], (found[AIRINGS_PAGE - 1] if len(found) > AIRINGS_PAGE else None)
+
+
 def _row(message, *, policy, now, events, active_by_slot, on_air_ids, gate_open) -> dict:
     audio = _audio(message.message_media, policy)
     row = {
@@ -304,14 +382,15 @@ def _airing(execution) -> dict | None:
 
 
 def _status(policy) -> dict:
-    counts = ActiveBroadcastMessage.objects.aggregate(
+    # Only unfinished messages are counted, so the poll's work never grows with history.
+    counts = ActiveBroadcastMessage.objects.filter(state__in=(M.ACTIVE, M.PREPARED)).aggregate(
         urgent=Count("id", filter=Q(state=M.ACTIVE, kind=MessageKind.URGENT)),
         public_address=Count("id", filter=Q(state=M.ACTIVE, kind=MessageKind.PUBLIC_ADDRESS)),
         review=Count("id", filter=Q(state=M.PREPARED, message_media__isnull=False)),
         drafts=Count("id", filter=Q(state=M.PREPARED)),
     )
-    unfinished = ActiveBroadcastExecution.objects.filter(state__in=UNFINISHED_EXECUTION_STATES).first()
-    latest = unfinished or ActiveBroadcastExecution.objects.order_by("-created_at").first()
+    unfinished = _unfinished_execution()
+    latest = unfinished or ActiveBroadcastExecution.objects.order_by(*EXECUTION_ORDER).first()
     # Advisory composition load, computed without the policy lock (and without
     # hashing the stinger): activation, materialization and Replay Now decide.
     active = list(ActiveBroadcastMessage.objects.filter(state=M.ACTIVE)
@@ -331,7 +410,7 @@ def _status(policy) -> dict:
     last_event = ActiveBroadcastMessageEvent.objects.order_by("-id").values_list("id", flat=True).first() or 0
     return {
         **counts, "active": counts["urgent"] + counts["public_address"],
-        "airing": _airing(latest), "gate_open": native_airing_open(),
+        "airing": _airing(latest), "on_air": _on_air(unfinished), "gate_open": native_airing_open(),
         "load": {"count": len(active), "max_count": policy.max_active_messages, "seconds": float(total),
                  "stinger_seconds": None if stinger is None else float(stinger),
                  "max_seconds": policy.max_aggregate_seconds, "over": over},
@@ -356,21 +435,22 @@ def board(request):
     now = timezone.now()
     policy = services.current_policy()
     status = _status(policy)
-    started = ActiveBroadcastExecution.objects.filter(state=X.STARTED).first()
     page = Paginator(_messages(state), PAGE_SIZE).get_page(state["page"])
     state["page"] = page.number
-    rows = _rows(list(page.object_list), policy=policy, now=now, on_air_ids=_components(started),
+    rows = _rows(list(page.object_list), policy=policy, now=now, on_air_ids=set(status["on_air"]["messages"]),
                  gate_open=status["gate_open"])
     try:
         open_id = str(uuid.UUID(request.GET.get("open", "")))
     except ValueError:
         open_id = ""
-    airings = [_airing(execution) for execution in ActiveBroadcastExecution.objects.order_by("-created_at")[:RECENT_AIRINGS]]
+    airings = [_airing(execution) for execution in
+               ActiveBroadcastExecution.objects.order_by(*EXECUTION_ORDER)[:RECENT_AIRINGS]]
     return render(request, "active_messages/board.html", {
         "state": state, "filters": [{"key": key, "label": label, "url": _board_url({**state, "filter": key,
                                                                                        "page": 1})}
                                     for key, label in FILTERS.items()],
-        "page": page, "rows": rows, "open_id": open_id, "status": status, "airing_text": _airing_text(status["airing"]),
+        "page": page, "rows": rows, "open_id": open_id, "status": status, "chip": _airing_chip(status["airing"]),
+        "airing_text": _airing_text(status["airing"]),
         "airings": airings, "policy": policy, "gate_message": NATIVE_AIRING_CLOSED,
         "return_query": _query(state), "replay_token": uuid.uuid4(),
         "page_urls": {"previous": _board_url({**state, "page": page.number - 1}) if page.has_previous() else "",
@@ -386,10 +466,12 @@ def board_status(request):
     _require_control(request.user)
     status = _status(services.current_policy())
     airing = status["airing"]
+    latest = airing["execution"] if airing else None
     return JsonResponse({
         "urgent": status["urgent"], "public_address": status["public_address"], "review": status["review"],
-        "gate_open": status["gate_open"], "airing": _airing_text(airing),
-        "on_air": bool(airing and airing["on_air"]), "attention": bool(airing and airing["attention"]),
+        "gate_open": status["gate_open"], "chip": _airing_chip(airing), "on_air": status["on_air"],
+        "latest": None if latest is None else {"execution": str(latest.pk), "state": latest.state,
+                                               "label": latest.get_state_display()},
         "over": status["load"]["over"], "version": status["version"],
     }, headers={"Cache-Control": "no-store"})
 
@@ -402,14 +484,14 @@ def message_detail(request, message_id):
     now = timezone.now()
     policy = services.current_policy()
     gate_open = native_airing_open()
-    started = ActiveBroadcastExecution.objects.filter(state=X.STARTED).first()
-    row = _rows([message], policy=policy, now=now, on_air_ids=_components(started), gate_open=gate_open,
+    status = _status(policy)
+    on_air = status["on_air"]
+    row = _rows([message], policy=policy, now=now, on_air_ids=set(on_air["messages"]), gate_open=gate_open,
                 event_limit=1)[0]
     events = [_event_row(event) for event in
               ActiveBroadcastMessageEvent.objects.filter(message=message).order_by("-id")[:DETAIL_EVENTS]]
-    airings = [_airing(execution) for execution in ActiveBroadcastExecution.objects.filter(
-        composition_snapshot__components__contains=[{"message": str(message.pk)}]).order_by("-created_at")[
-        :MESSAGE_AIRINGS]]
+    found, more = _member_page(message, _cursor(request.GET))
+    airings = [_airing(execution) for execution in found]
     successor = message.superseded_by
     predecessor = ActiveBroadcastMessage.objects.filter(superseded_by=message).first()
     return render(request, "active_messages/board_message.html", {
@@ -417,7 +499,27 @@ def message_detail(request, message_id):
         "airings": airings, "successor": successor, "predecessor": predecessor, "state": state,
         "return_query": _query(state), "back_url": _board_url(state, open_id=message.pk), "policy": policy,
         "gate_open": gate_open, "gate_message": NATIVE_AIRING_CLOSED,
-        "station_tz": timezone.localtime(now).strftime("%Z"),
+        "station_tz": timezone.localtime(now).strftime("%Z"), "on_air": on_air,
+        "older_url": (reverse("active_messages:board-message", args=[message.pk]) + "?"
+                      + _query(state, before=str(more.pk))) if more else "",
+        "status_version": status["version"],
+    })
+
+
+@require_GET
+def airings(request):
+    """Every airing, newest first, keyset-paginated (bounded work per page)."""
+    _require_control(request.user)
+    state = _state(request.GET)
+    found, more = _execution_page(ActiveBroadcastExecution.objects.all(), _cursor(request.GET))
+    status = _status(services.current_policy())
+    return render(request, "active_messages/board_airings.html", {
+        "airings": [_airing(execution) for execution in found], "back_url": _board_url(state),
+        "older_url": (reverse("active_messages:board-airings") + "?" + _query(state, before=str(more.pk)))
+                     if more else "",
+        "first_url": reverse("active_messages:board-airings") + (f"?{_query(state)}" if _query(state) else ""),
+        "paged": bool(request.GET.get("before")), "gate_open": status["gate_open"],
+        "status_version": status["version"],
     })
 
 
@@ -443,6 +545,7 @@ def airing_detail(request, execution_id):
         "accounted_seconds": snapshot.get("accounted_seconds"), "events": events,
         "events_capped": len(events) >= DETAIL_EVENTS, "back_url": _board_url(state),
         "gate_open": native_airing_open(), "gate_message": NATIVE_AIRING_CLOSED,
+        "status_version": _status(services.current_policy())["version"],
     })
 
 
@@ -600,18 +703,17 @@ def replay(request):
     except ValueError:
         flash.error(request, "Replay Now: the request is malformed; reload the board.")
         return redirect(_board_url(state))
-    repeated = ActiveBroadcastMessageEvent.objects.filter(request_token=token).exists()
     try:
-        execution = services.request_manual_replay(actor=request.user, request_token=token)
+        # The outcome is decided by the service, inside its serialized transaction.
+        execution, outcome = services.request_manual_replay_outcome(actor=request.user, request_token=token)
     except services.ActiveMessageError as exc:
         flash.error(request, f"Replay Now refused: {exc}.")
         return redirect(_board_url(state))
-    event = ActiveBroadcastMessageEvent.objects.filter(request_token=token).values_list("event", flat=True).first()
     short, where = str(execution.pk)[:8], execution.get_state_display().lower()
-    if repeated:
+    if outcome == services.REPLAY_REPEATED:
         flash.info(request, f"Replay Now was already requested from this page: airing {short} ({where}). "
                             f"Nothing new was requested.")
-    elif event == "replay_coalesced":
+    elif outcome == services.REPLAY_COALESCED:
         flash.success(request, f"Replay Now absorbed by the airing already in progress: {short} ({where}).")
     else:
         flash.success(request, f"Replay Now requested: new airing {short} ({where}). It is not on air until the "

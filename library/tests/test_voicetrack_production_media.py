@@ -645,10 +645,13 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # r0111: and library.0090 (the iPortal nav seed, its own manual RunPython).
             # 2.22D3C: and produced_content.0002/0003 (on spoken.0001); 0003's recipe-key
             # pattern correction is D3C's own manual operations.
+            # 2.22D3D: and active_messages.0005 (on 0004), the operator board's two
+            # history indexes -- index operations are manual for the updater.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
                               "active_messages.0004_message_content_type_identity",
+                              "active_messages.0005_execution_history_indexes",
                               "library.0090_seed_iportal_nav_item", "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
@@ -662,6 +665,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("active_messages.0004_message_content_type_identity", "AlterField"),
                               ("active_messages.0004_message_content_type_identity", "RemoveConstraint"),
                               ("active_messages.0004_message_content_type_identity", "AddConstraint"),
+                              ("active_messages.0005_execution_history_indexes", "AddIndex"),
+                              ("active_messages.0005_execution_history_indexes", "AddIndex"),
                               ("library.0090_seed_iportal_nav_item", "RunPython"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),

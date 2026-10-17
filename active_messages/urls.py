@@ -18,6 +18,7 @@ urlpatterns = [
     path("iportal/messages/board/", board.board, name="board"),
     path("iportal/messages/board/status/", board.board_status, name="board-status"),
     path("iportal/messages/board/replay/", board.replay, name="board-replay"),
+    path("iportal/messages/board/airings/", board.airings, name="board-airings"),
     path("iportal/messages/board/airings/<uuid:execution_id>/", board.airing_detail, name="board-airing"),
     path("iportal/messages/board/<uuid:message_id>/", board.message_detail, name="board-message"),
     path("iportal/messages/board/<uuid:message_id>/publish/", board.publish, name="board-publish"),

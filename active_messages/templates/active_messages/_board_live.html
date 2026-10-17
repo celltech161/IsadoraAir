@@ -1,0 +1,112 @@
+<script>
+(function () {
+  "use strict";
+  var root = document.querySelector(".amb[data-status-url]");
+  if (!root) return;
+  // One submission per form: a double click never sends twice (the server is
+  // idempotent anyway -- exact UUIDs, expected state/revision, request token).
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!root.contains(form) || form.getAttribute("method") !== "post") return;
+    if (form.dataset.sent) { event.preventDefault(); return; }
+    form.dataset.sent = "1";
+    form.querySelectorAll("button").forEach(function (button) { button.setAttribute("aria-disabled", "true"); });
+  }, true);
+
+  // Live status: every ON AIR indication on the page follows the server's one
+  // interpretation (the STARTED airing and the messages frozen in ITS
+  // composition), on each successful refresh. Only the newest response is
+  // ever applied; a failed or abandoned refresh changes nothing but says the
+  // page may be out of date. Rows are never re-rendered: expanded rows, focus,
+  // filters and typed input stay as they are.
+  var url = root.dataset.statusUrl, version = root.dataset.version;
+  var EVERY = 20000, LIMIT = 90, TIMEOUT = 10000;
+  var polls = 0, sent = 0, applied = 0, lastPoll = Date.now();
+  var stale = document.getElementById("ambStale"), changed = document.getElementById("ambChanged");
+  document.querySelectorAll("[data-reload]").forEach(function (link) {
+    link.href = window.location.pathname + window.location.search;
+  });
+
+  function text(selector, value) {
+    var node = root.querySelector(selector);
+    if (node && node.textContent !== String(value)) node.textContent = value;
+  }
+  function markStale(reason) {
+    root.dataset.statusStale = "1";
+    if (!stale) return;
+    stale.querySelector("[data-stale-reason]").textContent = reason;
+    stale.hidden = false;
+  }
+  function apply(status) {
+    delete root.dataset.statusStale;
+    if (stale) stale.hidden = true;
+    text('[data-count="urgent"]', status.urgent);
+    text('[data-count="public_address"]', status.public_address);
+    text('[data-count="review"]', status.review);
+    var chip = document.getElementById("ambAiring");
+    if (chip) {
+      chip.classList.remove("onair", "alert");
+      if (status.chip["class"]) chip.classList.add(status.chip["class"]);
+      text('[data-text="airing"]', status.chip.text);
+    }
+    var live = {};
+    status.on_air.messages.forEach(function (id) { live[id] = true; });
+    root.querySelectorAll("[data-onair-message]").forEach(function (node) {
+      node.hidden = (node.dataset.onairWhen === "on") !== Boolean(live[node.dataset.onairMessage]);
+    });
+    root.querySelectorAll("li.amb-item[data-message]").forEach(function (item) {
+      item.dataset.onAir = live[item.dataset.message] ? "true" : "false";
+    });
+    root.querySelectorAll("[data-execution-label]").forEach(function (node) {
+      var id = node.dataset.executionLabel;
+      if (status.on_air.execution === id) {
+        node.textContent = "● On air"; node.dataset.shown = "onair";
+      } else if (status.latest && status.latest.execution === id) {
+        node.textContent = status.latest.label; node.dataset.shown = status.latest.state;
+      } else if (node.dataset.shown === "onair") {
+        node.textContent = "No longer on air (reload for its outcome)"; node.dataset.shown = "ended";
+      }
+    });
+    if (changed && status.version !== version) changed.hidden = false;
+  }
+  function poll() {
+    if (++polls > LIMIT) {
+      window.clearInterval(timer);
+      markStale("Auto-refresh paused");
+      return Promise.resolve();
+    }
+    var mine = ++sent;
+    lastPoll = Date.now();
+    var abort = window.AbortController ? new AbortController() : null;
+    var timeout = window.setTimeout(function () { if (abort) abort.abort(); }, TIMEOUT);
+    return fetch(url, {credentials: "same-origin", cache: "no-store", headers: {"Accept": "application/json"},
+                       signal: abort ? abort.signal : undefined})
+      .then(function (response) {
+        if (!response.ok) throw new Error("status " + response.status);
+        return response.json();
+      })
+      .then(function (status) {
+        if (mine <= applied) return;                   // an older response arriving late: never applied
+        applied = mine;
+        apply(status);
+      })
+      .catch(function () {
+        if (mine > applied) markStale("Live status could not be refreshed");
+      })
+      .then(function () { window.clearTimeout(timeout); });
+  }
+  var timer = window.setInterval(function () { if (!document.hidden) poll(); }, EVERY);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && Date.now() - lastPoll > EVERY) poll();
+  });
+  window.addEventListener("pageshow", function (event) {
+    if (!event.persisted) return;
+    root.querySelectorAll("form[data-sent]").forEach(function (form) {
+      delete form.dataset.sent;
+      form.querySelectorAll("button").forEach(function (button) { button.removeAttribute("aria-disabled"); });
+    });
+    poll();                                            // a page restored from the cache is re-checked at once
+  });
+  window.ambBoardStatus = {poll: poll};
+})();
+</script>

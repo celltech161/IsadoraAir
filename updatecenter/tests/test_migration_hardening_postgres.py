@@ -286,6 +286,8 @@ class RealGraphReconstructionTests(TransactionTestCase):
                                            "produced_content.0001_initial",
                                            "active_messages.0003_message_content_type",
                                            "active_messages.0004_message_content_type_identity",
+                                           # 2.22D3D: the operator board's history indexes (on 0004)
+                                           "active_messages.0005_execution_history_indexes",
                                            "produced_content.0002_d3c_spoken_backend_and_test_take",
                                            "produced_content.0003_recipe_key_leading_digit",
                                            "produced_content.0004_backend_regular_only")

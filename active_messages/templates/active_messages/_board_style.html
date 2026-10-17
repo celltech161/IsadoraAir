@@ -7,6 +7,9 @@
   .amb a { color: var(--accent); }
   .amb a.amb-btn { color: var(--text-main); }
   .amb :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .amb [hidden] { display: none !important; }
+  .amb[data-status-stale] .amb-state.onair, .amb[data-status-stale] .amb-chip.onair { opacity: 0.55; }
+  .amb-stale { border-left: 3px solid var(--amb-warn); padding-left: 0.4rem; }
   .amb-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .amb-muted { color: var(--text-muted); }
   .amb-head { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; margin: 0 0 0.4rem; }

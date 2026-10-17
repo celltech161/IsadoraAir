@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 
 from django.conf import settings
+from django.contrib.postgres.indexes import GinIndex
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Q
@@ -431,7 +432,16 @@ class ActiveBroadcastExecution(models.Model):
                                    name="active_execution_failure_coded"),
             models.CheckConstraint(condition=Q(attempt_count__lte=1000), name="active_execution_attempts_bounded"),
         ]
-        indexes = [models.Index(fields=["state", "created_at"], name="active_execution_state")]
+        indexes = [
+            models.Index(fields=["state", "created_at"], name="active_execution_state"),
+            # D3D: the operator board's newest-first airing history across all
+            # states, deterministic on equal timestamps (created_at, id).
+            models.Index(fields=["created_at", "id"], name="active_execution_recent"),
+            # D3D: "airings this message was part of" -- containment
+            # (composition_snapshot @> {"components": [{"message": ...}]}) on
+            # the frozen snapshot.
+            GinIndex(fields=["composition_snapshot"], opclasses=["jsonb_path_ops"], name="active_execution_members"),
+        ]
 
     def __str__(self):
         return f"{self.get_reason_display()} airing {self.id} [{self.state}]"

@@ -2,12 +2,13 @@
 {% block title %}{{ message.title|default:message.content_type.name }} — Operator board — IsadoraAir{% endblock %}
 {% block extra_css %}{% include "active_messages/_board_style.html" %}{% endblock %}
 {% block content %}
-<div class="amb" id="amMessage" data-message="{{ message.pk }}" data-state="{{ message.state }}">
+<div class="amb" id="amMessage" data-message="{{ message.pk }}" data-state="{{ message.state }}" data-version="{{ status_version }}" data-status-url="{% url 'active_messages:board-status' %}">
   <header class="amb-head">
     <h1>{{ message.title|default:message.content_type.name }}</h1>
     <nav aria-label="Back"><a href="{{ back_url }}">‹ Operator board</a></nav>
   </header>
   {% if messages %}<ul class="amb-flash" role="status">{% for item in messages %}<li class="{{ item.tags }}">{{ item }}</li>{% endfor %}</ul>{% endif %}
+  {% include "active_messages/_board_notices.html" %}
   <div class="amb-body" style="padding-left:0;">{% include "active_messages/_board_body.html" with detail=True %}</div>
   {% if predecessor %}<p class="amb-note">Replaced “{{ predecessor.title|default:predecessor.content_type.name }}” (<a href="{% url 'active_messages:board-message' predecessor.pk %}">{{ predecessor.pk|stringformat:"s"|slice:":8" }}</a>).</p>{% endif %}
 
@@ -23,18 +24,20 @@
   </details>
 
   <details class="amb-panel" open>
-    <summary>Airings with this message <span class="amb-muted">· {{ airings|length }}</span></summary>
+    <summary>Airings with this message <span class="amb-muted">· newest first</span></summary>
     <div>
       {% if airings %}
       <table class="amb-table">
         <thead><tr><th>Airing</th><th>State</th><th class="wide">Why</th><th>Created</th><th>Code</th></tr></thead>
         <tbody>{% for item in airings %}{% with x=item.execution %}
-          <tr><td><a class="amb-id" href="{{ item.url }}">{{ x.pk|stringformat:"s"|slice:":8" }}</a></td><td>{% if item.on_air %}<strong>● On air</strong>{% else %}{{ x.get_state_display }}{% endif %}</td>
+          <tr data-execution="{{ x.pk }}"><td><a class="amb-id" href="{{ item.url }}">{{ x.pk|stringformat:"s"|slice:":8" }}</a></td><td><strong data-execution-label="{{ x.pk }}" data-shown="{% if item.on_air %}onair{% else %}{{ x.state }}{% endif %}">{% if item.on_air %}● On air{% else %}{{ x.get_state_display }}{% endif %}</strong></td>
             <td class="wide">{{ x.get_reason_display }}</td><td>{{ x.created_at|date:"M j H:i" }}</td><td>{{ x.failure_code }}</td></tr>
         {% endwith %}{% endfor %}</tbody>
       </table>
+      {% if older_url %}<p class="amb-note"><a href="{{ older_url }}" rel="next">Older airings ›</a></p>{% endif %}
       {% else %}<p class="amb-note">Not part of any airing{% if not gate_open %} (native airing is closed){% endif %}.</p>{% endif %}
     </div>
   </details>
 </div>
 {% endblock %}
+{% block extra_js %}{% include "active_messages/_board_live.html" %}{% endblock %}

@@ -939,10 +939,25 @@ def reconcile_stinger_failure(execution, *, now=None, actor_kind=ActorKind.WORKE
     raise refusal
 
 
+REPLAY_CREATED = "created"           # this request created a new airing
+REPLAY_REPEATED = "repeated"         # this token had already resolved to an airing (same one)
+REPLAY_COALESCED = "coalesced"       # an unfinished airing of the current composition absorbed it
+
+
 def request_manual_replay(*, actor, request_token, now=None):
     """Replay Now (control), idempotent on ``request_token`` (a client UUID):
     the same token always resolves to the same execution. An unfinished
     airing of the CURRENT composition absorbs the request (no second airing)."""
+    return request_manual_replay_outcome(actor=actor, request_token=request_token, now=now)[0]
+
+
+def request_manual_replay_outcome(*, actor, request_token, now=None):
+    """``request_manual_replay``, also returning HOW the request resolved
+    (D3D): ``(execution, REPLAY_CREATED | REPLAY_REPEATED | REPLAY_COALESCED)``.
+    The outcome is decided inside the same transaction, under the policy lock
+    that serializes every Replay Now request -- two simultaneous posts of one
+    token get one "created" and one "repeated", never two "created". Refusals
+    raise exactly as ``request_manual_replay`` does."""
     _require(actor, CONTROL)
     try:
         token = uuid.UUID(str(request_token))
@@ -956,7 +971,7 @@ def request_manual_replay(*, actor, request_token, now=None):
         if prior is not None:
             if prior.actor_id != actor.pk:
                 raise InvalidRequest("that request token belongs to another request", code="request_token_conflict")
-            return prior.execution
+            return prior.execution, REPLAY_REPEATED
         policy, _expired = _expire_locked(policy, now, actor_kind=ActorKind.SYSTEM)
         _suppress_stale(policy, now=now, actor_kind=ActorKind.USER, user=actor)
         unfinished = _open_execution()
@@ -965,7 +980,7 @@ def request_manual_replay(*, actor, request_token, now=None):
                 raise ExecutionBusy("an airing of an earlier composition is still with the engine")
             _event("replay_coalesced", execution=unfinished, generation=policy.generation, actor_kind=ActorKind.USER,
                    user=actor, request_token=token, detail={"state": unfinished.state})
-            return unfinished
+            return unfinished, REPLAY_COALESCED
         messages = _active_messages()
         if not messages:
             raise NothingActive("no message is active")
@@ -977,7 +992,7 @@ def request_manual_replay(*, actor, request_token, now=None):
         else:
             return _create_execution(policy, messages, stinger, reason=ExecutionReason.MANUAL, due_at=now, now=now,
                                      event="replay_requested", actor_kind=ActorKind.USER, user=actor,
-                                     request_token=token)
+                                     request_token=token), REPLAY_CREATED
     _alert_ineligible(refusal)
     raise refusal
 

@@ -27,6 +27,7 @@ PLAYOUT = REPO / "active_messages" / "migrations" / "0002_playout_correlation.py
 SEED = REPO / "authz" / "migrations" / "0008_active_message_capabilities.py"
 BACKFILL = REPO / "active_messages" / "migrations" / "0003_message_content_type.py"
 IDENTITY = REPO / "active_messages" / "migrations" / "0004_message_content_type_identity.py"
+HISTORY = REPO / "active_messages" / "migrations" / "0005_execution_history_indexes.py"
 PRODUCED = REPO / "produced_content" / "migrations" / "0001_initial.py"
 REFS = ["active_messages.0001_initial", "active_messages.0002_playout_correlation"]
 D3A_REFS = ["active_messages.0003_message_content_type", "active_messages.0004_message_content_type_identity"]
@@ -44,6 +45,11 @@ D3A_MANUAL = [("active_messages.0003_message_content_type", "RunPython"),
               ("active_messages.0004_message_content_type_identity", "AddConstraint")]
 # D3A replaced the D1 uniqueness; the new one is declared in 0004.
 D3A_CONSTRAINTS = {"active_message_one_active_per_producer_type"}
+# D3D: the operator board's two execution-history indexes (0005, AddIndex only:
+# manual for the updater -- the classifier's allowlist has no index operation).
+D3D_REF = "active_messages.0005_execution_history_indexes"
+D3D_INDEXES = {"active_execution_recent", "active_execution_members"}
+D3D_MANUAL = [(D3D_REF, "AddIndex"), (D3D_REF, "AddIndex")]
 
 
 def _migration_calls(path):
@@ -82,8 +88,11 @@ class StructureTests(SimpleTestCase):
                       domain.ActiveBroadcastMessageEvent):
             names |= _declared(model, "constraints") | _declared(model, "indexes")
         self.assertGreaterEqual(len(names), 40)
-        for name in names - D3A_CONSTRAINTS:
+        for name in names - D3A_CONSTRAINTS - D3D_INDEXES:
             self.assertIn(f"name='{name}'", text)
+        for name in D3D_INDEXES:
+            self.assertIn(f"name='{name}'", HISTORY.read_text())
+        self.assertEqual(_migration_calls(HISTORY), ["AddIndex", "AddIndex"])
         for name in D3A_CONSTRAINTS:
             self.assertIn(f'name="{name}"', IDENTITY.read_text())
         self.assertIn("name='active_message_one_active_per_producer_kind'", text)       # removed by 0004
@@ -110,9 +119,10 @@ class StructureTests(SimpleTestCase):
         self.assertTrue(loader.disk_migrations[("active_messages", "0002_playout_correlation")].atomic)
         self.assertEqual(sorted(p.name for p in INITIAL.parent.glob("*.py")),
                          ["0001_initial.py", "0002_playout_correlation.py", "0003_message_content_type.py",
-                          "0004_message_content_type_identity.py", "__init__.py"])
+                          "0004_message_content_type_identity.py", "0005_execution_history_indexes.py",
+                          "__init__.py"])
         self.assertEqual(_migration_calls(SEED), ["RunPython"])
-        for ref in D3A_REFS + [PRODUCED_REF]:
+        for ref in D3A_REFS + [PRODUCED_REF, D3D_REF]:
             app, name = ref.split(".")
             self.assertTrue(loader.disk_migrations[(app, name)].atomic, ref)
 
@@ -160,11 +170,11 @@ class LivePlanClassificationTests(TransactionTestCase):
             payload = probe.build_probe_payload()
             # 2.22D3C: produced_content's later migrations (its own classifier test).
             self.assertEqual(sorted(item["ref"] for item in payload["plan"]),
-                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF] + D3C_REFS))
+                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF] + D3C_REFS + [D3D_REF]))
             self.assertEqual(payload["conflicts"], {})
             manual = probe.extract_manual_operations(payload["plan"])
             self.assertEqual(sorted((entry["ref"], entry["operation"]) for entry in manual),
-                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL + D3C_MANUAL))
+                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL + D3C_MANUAL + D3D_MANUAL))
         finally:
             call_command("migrate", verbosity=0)
         self.assertEqual(Capability.objects.filter(slug__startswith="active_message.").count(), 2)

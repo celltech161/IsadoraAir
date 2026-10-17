@@ -6,9 +6,11 @@ click that publishes once, and a browser-local audio preview that never
 reaches the station output. Hardware-free: no audio output device."""
 import io
 import os
+import uuid
 import tempfile
 import unittest
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -18,16 +20,17 @@ from django.test import Client, override_settings
 from django.utils import timezone
 
 from active_messages import services
-from active_messages.models import ActiveBroadcastMessage, ActiveBroadcastMessageEvent
+from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastMessage, ActiveBroadcastMessageEvent
 from library.models import GroupAccess
 from produced_content.models import ProducedContentType
 from production.models import ProductionMedia
 from production.tests.support import ffmpeg_available
 from production.tests.test_recorder_browser import in_browser, sync_playwright
 
-from .support import Domain, assign, content_type, media, user_with_role
+from .support import Domain, assign, content_type, media, raw, user_with_role
 
 M = ActiveBroadcastMessage
+X = ActiveBroadcastExecution
 BOARD = "/iportal/messages/board/"
 PHONES = ((360, 740), (390, 844))
 NO_OVERFLOW = """() => {
@@ -169,11 +172,11 @@ class OperatorBoardBrowserTests(Domain, StaticLiveServerTestCase):
         title = row.locator(".amb-title")
         self.assertTrue(title.evaluate("el => el.scrollWidth > el.clientWidth"))        # ellipsis, not overflow
         self.assertTrue(title.get_attribute("title").startswith("Countywide boil-water advisory"))
-        for part in (".amb-title", ".amb-state", ".m-type", ".m-producer"):
+        for part in (".amb-title", ".amb-state:not([hidden])", ".m-type", ".m-producer"):
             box = row.locator(part).bounding_box()
             self.assertGreater(box["width"], 20, part)
             self.assertLessEqual(box["x"] + box["width"], 360, part)
-        self.assertEqual(row.locator(".amb-state").text_content().strip(), "REVIEW")
+        self.assertEqual(row.locator(".amb-state:not([hidden])").text_content().strip(), "REVIEW")
         page.context.close()
 
     @in_browser
@@ -266,7 +269,7 @@ class OperatorBoardBrowserTests(Domain, StaticLiveServerTestCase):
         self.shot(page, "board-1280")
         row = page.locator(f"#m-{self.review.pk} details.amb-row > summary")
         tops = {part: row.locator(part).bounding_box()["y"]
-                for part in (".amb-title", ".m-type", ".m-producer", ".m-when", ".m-audio", ".amb-state")}
+                for part in (".amb-title", ".m-type", ".m-producer", ".m-when", ".m-audio", ".amb-state:not([hidden])")}
         self.assertLess(max(tops.values()) - min(tops.values()), 4, tops)                 # one line per message
         self.assertLessEqual(row.bounding_box()["height"], 44)
         self.assertTrue(page.locator(".amb-colhead").is_visible())
@@ -329,9 +332,148 @@ class OperatorBoardBrowserTests(Domain, StaticLiveServerTestCase):
                              return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
           const ratio = (a, b) => { const [x, y] = [lum(rgb(a)), lum(rgb(b))].sort((p, q) => q - p); return (x + 0.05) / (y + 0.05); };
           const bg = getComputedStyle(document.body).backgroundColor;
-          return ['.amb-title', '.amb-state', '.amb-chip', '.m-type', '.amb-filters a'].map(sel =>
+          return ['.amb-title', '.amb-state:not([hidden])', '.amb-chip', '.m-type', '.amb-filters a'].map(sel =>
             [sel, ratio(getComputedStyle(document.querySelector(sel)).color, bg)]);
         }""")
         for selector, ratio in colors:
             self.assertGreaterEqual(ratio, 4.5, selector)                                # WCAG AA text contrast
         page.context.close()
+
+
+@unittest.skipIf(sync_playwright is None or not ffmpeg_available(), "Playwright/ffmpeg not available")
+@override_settings(SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False)
+class OnAirRefreshBrowserTests(OperatorBoardBrowserTests):
+    """Finding 1: ON AIR follows the server through every status refresh."""
+
+    def on_air(self, page) -> set:
+        """Rows marked on air, cross-checked against the visible badges."""
+        marked = set(page.eval_on_selector_all("li.amb-item[data-on-air='true']", "els => els.map(e => e.dataset.message)"))
+        shown = set(page.eval_on_selector_all("span.amb-state.onair:not([hidden])",
+                                              "els => els.map(e => e.dataset.onairMessage)"))
+        self.assertEqual(marked, shown)
+        hidden_normal = set(page.eval_on_selector_all("span.amb-state[data-onair-when='off'][hidden]",
+                                                      "els => els.map(e => e.dataset.onairMessage)"))
+        self.assertEqual(hidden_normal, shown)                    # each on-air row hides its normal state badge
+        return shown
+
+    def chip(self, page):
+        return (page.text_content("#ambAiring").strip(),
+                page.eval_on_selector("#ambAiring", "el => [...el.classList].filter(c => c !== 'amb-chip')"))
+
+    def refresh(self, page):
+        page.evaluate("window.ambBoardStatus.poll()")
+
+    def start(self):
+        execution = services.request_manual_replay(actor=self.admin, request_token=uuid.uuid4())
+        return self.put_on_air(execution)
+
+    # Inherited tests are not re-run here.
+    test_phones_show_the_status_and_the_list_first_without_horizontal_overflow = None
+    test_long_names_stay_distinguishable_on_a_phone = None
+    test_expansion_is_predictable_and_keyboard_accessible = None
+    test_a_confirmation_fits_and_cancel_back_and_actions_keep_the_view = None
+    test_a_double_click_publishes_once_and_a_stale_review_is_explained = None
+    test_desktop_gains_columns_and_a_tablet_stays_within_its_width = None
+    test_the_audio_preview_is_browser_local = None
+    test_the_status_refresh_never_disturbs_an_expanded_row_or_typed_input = None
+    test_a_light_station_theme_keeps_the_board_legible = None
+
+    @in_browser
+    def test_on_air_follows_every_transition_without_a_reload(self):
+        a = self.live(self.producer, self.notice, "A")
+        b = self.live(self.producer2, self.notice, "B")
+        idle = self.live(self.long_producer, self.urgent, "Not in the airing")
+        services.clear_message(idle, actor=self.admin)
+        first, token = self.start()
+        idle = self.live(self.long_producer, self.urgent, "Active, not in the airing")
+        page = self.open(width=390, height=844)
+        self.assertEqual(self.on_air(page), {str(a.pk), str(b.pk)})
+        self.assertEqual(self.chip(page), ("● ON AIR", ["onair"]))
+        # Unsaved work and focus that every refresh must leave alone.
+        page.click(f"#m-{a.pk} details.amb-row > summary")
+        page.click(f"#m-{a.pk} .amb-sub > summary")
+        page.fill(f"#exp-{a.pk}", "2031-01-02T03:04")
+        page.focus(f"#exp-{a.pk}")
+
+        # STARTED -> COMPLETED
+        services.record_air_completed(first, attempt_token=token, ended_at=timezone.now(),
+                                      confirmed_duration_seconds=Decimal("30.000"))
+        self.refresh(page)
+        self.assertEqual(self.on_air(page), set())
+        self.assertEqual(self.chip(page), ("Last: Completed", []))
+        self.assertEqual(page.text_content(f"[data-execution-label='{first.pk}']"), "Completed")
+        self.assertIn("not airing", page.text_content(f"#m-{a.pk} .amb-facts"))
+        self.assertNotIn("on air now", page.inner_text(f"#m-{a.pk} .amb-facts"))
+
+        # A later STARTED airing with a different frozen composition (B cleared, the urgent one added)
+        services.clear_message(b, actor=self.admin)
+        second, token = self.start()
+        self.refresh(page)
+        self.assertEqual(self.on_air(page), {str(a.pk), str(idle.pk)})
+        self.assertEqual(self.chip(page), ("● ON AIR", ["onair"]))
+        stale_body = page.evaluate("fetch(document.getElementById('amBoard').dataset.statusUrl)"
+                                   ".then(r => r.text())")                          # a genuine ON AIR response
+
+        # STARTED -> INTERRUPTED, replaced by another STARTED airing before the next refresh
+        services.record_air_interrupted(second, attempt_token=token, last_evidence_at=timezone.now())
+        raw(M).filter(pk=idle.pk).update(next_due_at=timezone.now())
+        services.clear_message(idle, actor=self.admin)
+        third, token = self.start()
+        self.refresh(page)
+        self.assertEqual(self.on_air(page), {str(a.pk)})
+
+        # STARTED -> FAILED (no domain service does this; the database allows it, so the board must cope)
+        raw(X).filter(pk=third.pk).update(state="failed", open_slot=None, terminal_at=timezone.now(),
+                                          failure_code="publication_unavailable")
+        self.refresh(page)
+        self.assertEqual(self.on_air(page), set())
+        self.assertEqual(self.chip(page), ("Last: Failed", ["alert"]))
+
+        # An older response arriving after a newer one is never applied.
+        held = []
+        page.route("**/iportal/messages/board/status/", lambda route: held.append(route) if not held
+                   else route.continue_())
+        page.evaluate("void window.ambBoardStatus.poll()")           # request 1: held
+        page.wait_for_function("true")
+        self.refresh(page)                                             # request 2: applied (nothing on air)
+        self.assertEqual(len(held), 1)
+        held[0].fulfill(status=200, content_type="application/json", body=stale_body)
+        page.wait_for_timeout(300)
+        self.assertEqual(self.on_air(page), set())
+        self.assertEqual(self.chip(page), ("Last: Failed", ["alert"]))
+        self.assertTrue(page.locator("#ambStale").is_hidden())
+
+        # A failed refresh restores nothing and says the page may be out of date.
+        page.unroute("**/iportal/messages/board/status/")
+        page.route("**/iportal/messages/board/status/", lambda route: route.abort())
+        self.refresh(page)
+        self.assertFalse(page.locator("#ambStale").is_hidden())
+        self.assertEqual(self.on_air(page), set())
+        page.unroute("**/iportal/messages/board/status/")
+        self.refresh(page)                                             # a later success clears the warning
+        self.assertTrue(page.locator("#ambStale").is_hidden())
+
+        # Focus, the expanded row and the typed expiry survived every refresh.
+        self.assertTrue(page.locator(f"#m-{a.pk} details.amb-row").evaluate("el => el.open"))
+        self.assertEqual(page.input_value(f"#exp-{a.pk}"), "2031-01-02T03:04")
+        self.assertEqual(page.evaluate("document.activeElement.id"), f"exp-{a.pk}")
+        self.assertEqual(page.errors, [])
+        page.context.close()
+
+    @in_browser
+    def test_detail_pages_follow_the_same_status(self):
+        a = self.live(self.producer, self.notice, "A")
+        execution, token = self.start()
+        message_page = self.open(f"{BOARD}{a.pk}/", width=390, height=844)
+        airing_page = self.open(f"{BOARD}airings/{execution.pk}/", width=390, height=844)
+        self.assertFalse(message_page.locator(f"[data-onair-message='{a.pk}'][data-onair-when='on']").is_hidden())
+        self.assertEqual(airing_page.text_content(f"[data-execution-label='{execution.pk}']"), "● On air")
+        services.record_air_completed(execution, attempt_token=token, ended_at=timezone.now(),
+                                      confirmed_duration_seconds=Decimal("30.000"))
+        for page in (message_page, airing_page):
+            self.refresh(page)
+        self.assertTrue(message_page.locator(f"[data-onair-message='{a.pk}'][data-onair-when='on']").is_hidden())
+        self.assertEqual(message_page.text_content(f"#amMessage [data-execution-label='{execution.pk}']"), "Completed")
+        self.assertEqual(airing_page.text_content(f"[data-execution-label='{execution.pk}']"), "Completed")
+        message_page.context.close()
+        airing_page.context.close()
