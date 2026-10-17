@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0114",
+  "previous_release_id": "r0113",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal recorder UI refinements in the shared workstation (every recorder domain): the input meter uses the console's calibrated dBFS VU scale (RMS bar, peak-hold marker, station minimum read-only); preview is a Play/Pause/Resume + Stop transport (Stop and a natural end return to 0); waveform wheel, trackpad and touch zoom/pan. No migration, service unit, package, nginx or protected-runtime change; collectstatic and a Gunicorn restart only.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
