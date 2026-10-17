@@ -6,6 +6,7 @@ migration, both by exact-plan reconstruction and live over the real graph with
 the migration unapplied.
 """
 import ast
+import json
 from pathlib import Path
 
 from django.core.management import call_command
@@ -75,9 +76,18 @@ class StaticClassificationTests(SimpleTestCase):
         self.assertEqual(probe.extract_manual_operations(plan), [])
 
     def test_no_migration_authorization_companion_mentions_it(self):
+        # production.0001 and 0002 are additive: no companion ever authorizes them. Of production's
+        # migrations only 0003 is manual -- its deliberate database default -- and only r0113's
+        # companion may authorize it.
         repo = Path(__file__).resolve().parents[2]
         for path in (repo / "deploy" / "migration_authorizations").glob("*.json"):
-            self.assertNotIn("production.", path.read_text(), path.name)
+            text = path.read_text()
+            self.assertNotIn(REF, text, path.name)
+            self.assertNotIn("production.0002_referenceaudio", text, path.name)
+            authorized = {entry["ref"] for entry in json.loads(text)["authorized_manual_operations"]
+                          if entry["ref"].startswith("production.")}
+            expected = {"production.0003_media_airing_prohibited"} if path.name == "r0113.json" else set()
+            self.assertEqual(authorized, expected, path.name)
 
 
 class LivePlanClassificationTests(TransactionTestCase):
