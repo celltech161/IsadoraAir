@@ -20,10 +20,12 @@ Security model:
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 
 from django.contrib.auth.decorators import login_required
+from django.db import DatabaseError
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import render
 from django.urls import reverse
@@ -174,8 +176,26 @@ def workstation(request, adapter):
                       {"message": exc.message, "code": exc.code}, status=exc.status)
     return render(request, "production/iportal/workstation.html", {
         "recording_context": context.as_json(), "api": api_urls(request, adapter), "adapter": adapter_obj,
-        "page": {"draft_namespace": draft_namespace(request.user)},
+        "page": {"draft_namespace": draft_namespace(request.user), "vu_min_db": vu_meter_min_db()},
     })
+
+
+VU_DEFAULT_MIN_DB = -40.0
+
+
+def vu_meter_min_db() -> float:
+    """The bottom of the console's VU scale (hardware AudioPipeline.vu_meter_min_db),
+    so the recorder's input meter uses the same calibrated scale (r0114). Display
+    only, and strictly read-only: AudioPipeline.load() would CREATE the singleton,
+    this never writes. Missing or unusable -> the console's own default."""
+    try:
+        from django.apps import apps
+        model = apps.get_model("hardware", "AudioPipeline")
+        value = model.objects.filter(pk=1).values_list("vu_meter_min_db", flat=True).first()
+        value = float(value)
+    except (LookupError, TypeError, ValueError, DatabaseError):
+        return VU_DEFAULT_MIN_DB
+    return value if math.isfinite(value) and -120.0 <= value < 0 else VU_DEFAULT_MIN_DB
 
 
 def draft_namespace(user) -> str:

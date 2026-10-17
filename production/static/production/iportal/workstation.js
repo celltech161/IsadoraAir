@@ -120,6 +120,52 @@
     refreshControls();
   }
 
+  // -- input meter (r0114): the console's calibrated dBFS scale ----------------
+  // The bar is the RMS level; the thin marker is the peak, held and falling
+  // like the console's (audio_core.PeakHold). Display only: nothing here reads
+  // or changes captured samples, the gain or Set Level.
+  var VU_MIN_DB = A.vuMinDb(S.page.vu_min_db);
+  var meterHold = new A.PeakHold();
+  function initMeter() {
+    var bar = $("ipMeter"), marks = A.vuThresholds(VU_MIN_DB);
+    bar.style.setProperty("--ip-vu-yellow", marks.yellow + "%");
+    bar.style.setProperty("--ip-vu-red", marks.red + "%");
+    bar.setAttribute("aria-valuemin", String(VU_MIN_DB));
+    var scale = $("ipMeterScale");
+    scale.innerHTML = "";
+    [{ db: VU_MIN_DB, cls: "first" }, { db: A.VU_YELLOW_DBFS, cls: "emph" }, { db: A.VU_RED_DBFS, cls: "" },
+     { db: 0, cls: "last" }].forEach(function (tick) {
+      if (tick.db < VU_MIN_DB) return;
+      var span = doc.createElement("span");
+      span.className = "ip-tick " + tick.cls;
+      span.style.left = A.vuPercent(tick.db, VU_MIN_DB) + "%";
+      span.textContent = String(Math.round(tick.db));
+      scale.appendChild(span);
+    });
+    renderLevels(null);
+  }
+  function renderLevels(levels) {
+    var bar = $("ipMeter"), mask = $("ipMeterMask"), mark = $("ipMeterPeak");
+    if (!levels) {                                   // no live input: settle, never freeze
+      meterHold.reset();
+      mask.style.width = "100%";
+      mark.hidden = true;
+      bar.dataset.rmsPct = "0"; bar.dataset.peakPct = "0";
+      bar.setAttribute("aria-valuenow", String(VU_MIN_DB));
+      bar.setAttribute("aria-valuetext", "no input");
+      return;
+    }
+    var rmsDb = A.levelDbfs(levels.rms), held = meterHold.update(A.levelDbfs(levels.peak), root.performance.now());
+    var fill = A.vuPercent(rmsDb, VU_MIN_DB), peakPct = A.vuPercent(held, VU_MIN_DB);
+    mask.style.width = (100 - fill) + "%";
+    mark.hidden = !(peakPct > 0);
+    mark.style.left = peakPct + "%";
+    bar.dataset.rmsPct = fill.toFixed(2); bar.dataset.peakPct = peakPct.toFixed(2);
+    var shown = isFinite(rmsDb) ? Math.max(VU_MIN_DB, Math.min(0, rmsDb)) : VU_MIN_DB;
+    bar.setAttribute("aria-valuenow", shown.toFixed(1));
+    bar.setAttribute("aria-valuetext", isFinite(rmsDb) ? rmsDb.toFixed(1) + " dBFS RMS" : "silence");
+  }
+
   // -- recorder ------------------------------------------------------------------
   function capabilityCheck() {
     var caps = root.IPortalRecorder.supported();
@@ -137,7 +183,7 @@
     S.recorder = new root.IPortalRecorder({
       workletUrl: root.IPORTAL_WORKLET_URL,
       maxSeconds: S.ctx.max_duration_seconds,
-      onLevel: function (p) { $("ipMeter").style.width = Math.min(100, Math.round(p * 100)) + "%"; },
+      onLevel: renderLevels,
       onState: function () { refreshControls(); },
       onError: function (code, pcm) {
         if (code === "max_duration") {
@@ -205,7 +251,7 @@
   function punchMode() { return $("ipPunchReplace").checked ? "replace" : "insert"; }
 
   function record() {
-    stopPlayback();
+    haltPreview();
     var rec = ensureRecorder();
     S.punch = $("ipPunch").checked && S.pcm ? { at: S.playhead, mode: punchMode() } : null;
     rec.start();
@@ -222,7 +268,7 @@
   }
 
   function acceptTake(take) {
-    stopPlayback();
+    haltPreview();
     if (S.punch && S.pcm) {
       pushUndo("punch-in");
       S.pcm = A.punchIn(S.pcm, take, S.punch.at, S.punch.mode);
@@ -257,7 +303,7 @@
 
   function edit(label, fn) {
     if (!S.pcm) return;
-    stopPlayback();
+    haltPreview();
     pushUndo(label);
     S.pcm = fn(S.pcm);
     S.ops.push(label);
@@ -308,19 +354,21 @@
     $("ipSelection").textContent = "Length " + fmt(A.duration(S.pcm)) + " · playhead " + fmt(S.playhead) + sel;
   }
 
-  function canvasTime(event) {
-    var canvas = $("ipWave"), rect = canvas.getBoundingClientRect();
-    var v = S.view || { start: 0, end: A.duration(S.pcm) };
-    var x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-    return v.start + (x / rect.width) * (v.end - v.start);
+  // The Zoom +/- buttons centre on the playhead; the wheel and pinch anchor on
+  // the pointer (audio_core.zoomView). Views never leave the clip; zooming and
+  // panning change only S.view -- never the PCM, the playhead or the selection.
+  function currentView() {
+    var total = S.pcm ? A.duration(S.pcm) : 0, v = S.view || { start: 0, end: total };
+    return A.clampView(v.start, v.end - v.start, total);
   }
-
   function zoom(factor) {
     if (!S.pcm) return;
-    var total = A.duration(S.pcm), v = S.view || { start: 0, end: total };
-    var span = Math.max(0.05, Math.min(total, (v.end - v.start) * factor));
-    var start = Math.max(0, Math.min(total - span, S.playhead - span / 2));
-    S.view = { start: start, end: start + span };
+    S.view = A.zoomView(currentView(), A.duration(S.pcm), factor, S.playhead, 0.5);
+    draw();
+  }
+  function fitView() {
+    if (!S.pcm) return;
+    S.view = A.clampView(0, A.duration(S.pcm), A.duration(S.pcm));
     draw();
   }
 
@@ -332,7 +380,7 @@
 
   async function importFile(file) {
     if (!file) return;
-    stopPlayback();
+    haltPreview();
     if (file.size > S.ctx.max_bytes) { message("That file is larger than the limit for this workspace.", "error"); return; }
     try {
       var bytes = await file.arrayBuffer();
@@ -354,7 +402,7 @@
   }
 
   async function loadCurrent() {
-    stopPlayback();
+    haltPreview();
     try {
       var resp = await fetch(S.api.source + "?" + query(S.ctx.subject), { credentials: "same-origin" });
       if (!resp.ok) throw new Error("http " + resp.status);
@@ -375,6 +423,20 @@
   }
 
   // -- preview playback (browser-local; never the station output) --------------
+  // A conventional transport (r0114): S.transport is "stopped" | "playing" |
+  // "paused". Preview ends in exactly three different ways, never conflated:
+  //  * pausePreview() -- the playhead stays where it paused; Play resumes there;
+  //  * stopPreview()  -- the operator's Stop, and a natural end (whole clip or
+  //                      selection): the playhead returns to exactly 0;
+  //  * haltPreview()  -- internal, before recording, punch-in, an edit, an
+  //                      import, a load or a discard: the playhead is KEPT
+  //                      (punch-in and editing use it) and a pause is forgotten.
+  // Every started source carries the generation it was started in; its onended
+  // is detached when it is superseded, and ignored if it still arrives -- a
+  // stale source can never stop or reset newer playback. Only one source is
+  // ever audible: each start first ends the previous one.
+  S.transport = "stopped"; S.previewRange = null; S.previewGen = 0;
+
   function clampPlayhead(seconds) {
     var total = S.pcm ? A.duration(S.pcm) : 0;
     seconds = Number(seconds);
@@ -402,45 +464,110 @@
     cancelPreviewFrame();
     S.previewFrame = root.requestAnimationFrame(previewTick);
   }
-  function stopPlayback() {
+  /* Silence the current source and freeze the playhead where it is; the
+   * caller decides what the transport and the playhead become. */
+  function detachSource() {
     var source = S.playing;
     if (S.previewTiming) updatePreviewPlayhead();
+    S.previewGen += 1;
     S.playing = null;
     S.previewTiming = null;
     cancelPreviewFrame();
-    if (source) { try { source.stop(); } catch (e) { /* ignore */ } }
-    draw();
-    refreshControls();
+    if (source) {
+      source.onended = null;
+      try { source.stop(); } catch (e) { /* ignore */ }
+    }
   }
-  function play() {
-    if (!S.pcm) return;
-    stopPlayback();
+  function settled() { draw(); refreshControls(); }
+  function haltPreview() {
+    detachSource();
+    S.transport = "stopped";
+    S.previewRange = null;
+    settled();
+  }
+  function stopPreview() {
+    detachSource();
+    S.transport = "stopped";
+    S.previewRange = null;
+    S.playhead = 0;
+    settled();
+  }
+  function pausePreview() {
+    if (S.transport !== "playing") return;
+    detachSource();
+    S.transport = "paused";
+    settled();
+  }
+  function sameSelection(a, b) {
+    return (!a && !b) || (!!a && !!b && a.start === b.start && a.end === b.end);
+  }
+  /* Start one source playing [from, end) of the current PCM. */
+  function startSource(from, end) {
+    detachSource();
     var rec = ensureRecorder();
     rec.release();                                   // iOS: free the mic so playback uses the speaker
-    var ac = rec._context();
-    if (ac.state === "suspended") ac.resume();
-    var src = ac.createBufferSource();
-    src.buffer = A.toAudioBuffer(ac, S.pcm);
-    src.connect(ac.destination);
-    var total = A.duration(S.pcm);
-    var from = clampPlayhead(S.selection ? S.selection.start : S.playhead);
-    var end = clampPlayhead(S.selection ? S.selection.end : total);
-    end = Math.max(from, end);
-    if (end <= from) { S.playhead = end; draw(); refreshControls(); return; }
-    src.onended = function () {
-      if (S.playing !== src) return;
-      S.playhead = clampPlayhead(end);
-      S.playing = null;
-      S.previewTiming = null;
-      cancelPreviewFrame();
-      draw();
-      refreshControls();
-    };
-    S.playing = src;
-    S.previewTiming = { context: ac, startedAt: ac.currentTime, from: from, end: end };
-    src.start(0, from, end - from);
+    var ac = rec._context(), gen = S.previewGen;
+    var src;
+    try {
+      src = ac.createBufferSource();
+      src.buffer = A.toAudioBuffer(ac, S.pcm);
+      src.connect(ac.destination);
+      src.onended = function () {
+        if (gen !== S.previewGen || S.playing !== src) return;          // superseded: never ours to end
+        stopPreview();                                                   // a natural end
+      };
+      S.playing = src;
+      S.previewTiming = { context: ac, startedAt: ac.currentTime, from: from, end: end };
+      S.transport = "playing";
+      src.start(0, from, end - from);
+    } catch (err) {
+      haltPreview();
+      message("Preview could not start in this browser.", "warn");
+      return;
+    }
+    if (ac.state === "suspended") {
+      var resumed = ac.resume();
+      if (resumed && resumed.catch) resumed.catch(function () {
+        if (gen !== S.previewGen) return;
+        haltPreview();
+        message("The browser did not allow audio to play. Press Preview again.", "warn");
+      });
+    }
     startPreviewLoop();
     refreshControls();
+  }
+  /* Play from the playhead (or the selection), to the clip (or selection) end. */
+  function startPreview() {
+    if (!S.pcm || !A.length(S.pcm)) return;
+    var total = A.duration(S.pcm), sel = S.selection;
+    var from = clampPlayhead(sel ? sel.start : S.playhead);
+    var end = clampPlayhead(sel ? sel.end : total);
+    if (!sel && from >= end) from = 0;                // parked at the end: play from the top
+    if (end <= from) { haltPreview(); return; }
+    S.previewRange = { from: from, end: end, selection: sel ? { start: sel.start, end: sel.end } : null };
+    startSource(from, end);
+  }
+  /* The Play / Pause / Resume button. */
+  function togglePreview() {
+    if (S.transport === "playing") { pausePreview(); return; }
+    if (S.transport === "paused" && S.previewRange && sameSelection(S.previewRange.selection, S.selection)) {
+      var from = clampPlayhead(S.playhead), end = clampPlayhead(S.previewRange.end);
+      if (from < end) { startSource(from, end); return; }
+    }
+    // stopped, or the paused selection was changed: a fresh start
+    detachSource();
+    S.transport = "stopped";
+    S.previewRange = null;
+    startPreview();
+  }
+  /* A click or tap on the waveform moves the playhead; during playback it seeks. */
+  function seekTo(seconds) {
+    var t = clampPlayhead(seconds), wasPlaying = S.transport === "playing";
+    if (wasPlaying) detachSource();
+    S.playhead = t;
+    S.selection = null;
+    if (wasPlaying) { S.transport = "stopped"; S.previewRange = null; startPreview(); return; }
+    settled();
   }
 
   // -- drafts (IndexedDB, browser-local, bounded) -----------------------------------
@@ -504,7 +631,7 @@
   function restoreDraft() {
     var d = S.draft;
     if (!d) return;
-    stopPlayback();
+    haltPreview();
     S.pcm = A.make(d.sampleRate, d.channels);
     // The draft was made against d.revision: saving it must be checked against
     // THAT, so a newer save by someone else is a conflict, never overwritten.
@@ -678,7 +805,14 @@
     $("ipStop").disabled = !capturing;
     var has = !!S.pcm && A.length(S.pcm) > 0;
     ["ipPlay", "ipZoomIn", "ipZoomOut", "ipZoomFit", "ipNormalize", "ipApplyGain"].forEach(function (id) { $(id).disabled = !has || capturing; });
-    $("ipPlayStop").disabled = !S.playing;
+    // The preview transport: one Play/Pause/Resume button and a Stop that is
+    // live only while something is playing or paused.
+    var label = S.transport === "playing" ? "\u23F8 Pause" : (S.transport === "paused" ? "\u25B6 Resume" : "\u25B6 Preview");
+    $("ipPlay").textContent = label;
+    $("ipPlay").setAttribute("aria-label", S.transport === "playing" ? "Pause preview"
+      : (S.transport === "paused" ? "Resume preview" : "Play preview"));
+    $("ipPlay").dataset.transport = S.transport;
+    $("ipPlayStop").disabled = S.transport === "stopped";
     $("ipKeep").disabled = $("ipDelete").disabled = !has || !S.selection || capturing;
     $("ipUndo").disabled = !S.undo.canUndo() || capturing;
     $("ipExport").disabled = !has || !allowed("export");
@@ -698,6 +832,106 @@
     }
     if (S.dirty) $("ipSaveState").textContent = $("ipSaveState").textContent.indexOf("Upload") === 0
       ? $("ipSaveState").textContent : "Unsaved changes — not on air.";
+  }
+
+  // -- waveform navigation (r0114) ---------------------------------------------
+  // Pointer Events serve mouse, pen and touch alike:
+  //  * click / tap: move the playhead (seek, while previewing);
+  //  * drag with the mouse or ONE finger: select (as before);
+  //  * TWO fingers: pinch to zoom around their midpoint, move to pan -- a
+  //    second finger cancels a selection the first one started, so navigating
+  //    never leaves a stray selection; lifting fingers ends the gesture;
+  //  * wheel: zoom around the cursor; horizontal wheel / trackpad swipe, or
+  //    Shift + wheel: pan; Ctrl + wheel (trackpad pinch): zoom.
+  // The canvas allows native vertical page scrolling (touch-action: pan-y).
+  // Navigation changes S.view only; selection, playhead and PCM stay in
+  // absolute clip seconds and are untouched.
+  var TAP_SLOP_PX = 4, WHEEL_ZOOM_PER_PX = 0.002, LINE_PX = 16;
+  function timeAtX(canvas, clientX) {
+    var rect = canvas.getBoundingClientRect(), v = currentView();
+    var frac = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0;
+    return { time: v.start + frac * (v.end - v.start), frac: frac };
+  }
+  function wireWaveform(canvas) {
+    var pointers = new Map();          // pointerId -> {x, y}
+    var drag = null;                   // one pointer: {id, fromTime, startX, selectionBefore, moved}
+    var gesture = null;                // two fingers: {view, anchorTime, distance}
+    function midpoint() {
+      var pts = Array.from(pointers.values());
+      return { x: (pts[0].x + pts[1].x) / 2, distance: Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)) };
+    }
+    function startGesture() {
+      if (drag) { S.selection = drag.selectionBefore; drag = null; }       // navigation, not selection
+      var m = midpoint(), at = timeAtX(canvas, m.x);
+      gesture = { view: currentView(), anchorTime: at.time, distance: m.distance };
+      draw(); refreshControls();
+    }
+    function moveGesture() {
+      // Zoom by the change in finger distance, keeping the time first under
+      // the midpoint under the midpoint as it moves -- which also pans.
+      var m = midpoint(), at = timeAtX(canvas, m.x);
+      S.view = A.zoomView(gesture.view, A.duration(S.pcm), gesture.distance / m.distance, gesture.anchorTime,
+                          at.frac);
+      draw();
+    }
+    function finish(event, cancelled) {
+      pointers.delete(event.pointerId);
+      if (gesture) {
+        if (pointers.size >= 2) startGesture();                    // a finger left: continue from here
+        else gesture = null;                                       // the remaining finger starts nothing
+        return;
+      }
+      if (!drag || drag.id !== event.pointerId) return;
+      var d = drag;
+      drag = null;
+      if (cancelled) { S.selection = d.selectionBefore; draw(); refreshControls(); return; }
+      if (!d.moved) { seekTo(d.fromTime); return; }
+      draw(); refreshControls();
+    }
+    canvas.addEventListener("pointerdown", function (event) {
+      if (!S.pcm) return;
+      if (event.pointerType === "mouse" && event.button !== 0) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      try { canvas.setPointerCapture(event.pointerId); } catch (e) { /* ignore */ }
+      if (pointers.size >= 2 && event.pointerType === "touch") { startGesture(); return; }   // (re)baseline
+      if (pointers.size > 1 || gesture) return;
+      drag = { id: event.pointerId, fromTime: timeAtX(canvas, event.clientX).time, startX: event.clientX,
+               selectionBefore: S.selection, moved: false };
+    });
+    canvas.addEventListener("pointermove", function (event) {
+      if (!pointers.has(event.pointerId)) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      if (gesture && pointers.size >= 2) { moveGesture(); return; }
+      if (!drag || drag.id !== event.pointerId || !S.pcm) return;
+      if (!drag.moved && Math.abs(event.clientX - drag.startX) < TAP_SLOP_PX) return;
+      drag.moved = true;
+      var t = timeAtX(canvas, event.clientX).time;
+      S.selection = Math.abs(t - drag.fromTime) > 0.01 ? { start: Math.min(t, drag.fromTime), end: Math.max(t, drag.fromTime) } : null;
+      draw(); refreshControls();
+    });
+    canvas.addEventListener("pointerup", function (event) { finish(event, false); });
+    canvas.addEventListener("pointercancel", function (event) { finish(event, true); });
+    canvas.addEventListener("lostpointercapture", function (event) {
+      if (pointers.has(event.pointerId)) finish(event, true);
+    });
+    canvas.addEventListener("wheel", function (event) {
+      if (!S.pcm || !A.length(S.pcm)) return;                       // nothing to navigate: let the page scroll
+      var unit = event.deltaMode === 1 ? LINE_PX : (event.deltaMode === 2 ? canvas.clientWidth || 1 : 1);
+      var dx = event.deltaX * unit, dy = event.deltaY * unit;
+      if (event.shiftKey && !dx) { dx = dy; dy = 0; }               // Shift + wheel: pan with a plain mouse
+      var total = A.duration(S.pcm), v = currentView(), span = v.end - v.start, next;
+      if (!event.ctrlKey && Math.abs(dx) > Math.abs(dy)) {
+        next = A.panView(v, total, dx / Math.max(1, canvas.clientWidth) * span);
+      } else {
+        var at = timeAtX(canvas, event.clientX);
+        var factor = Math.exp(Math.max(-0.7, Math.min(0.7, dy * WHEEL_ZOOM_PER_PX)));
+        next = A.zoomView(v, total, factor, at.time, at.frac);
+      }
+      if (next.start === v.start && next.end === v.end) return;  // at a limit: leave the page its scroll
+      event.preventDefault();
+      S.view = next;
+      draw();
+    }, { passive: false });
   }
 
   function wire() {
@@ -736,11 +970,11 @@
     $("ipLoadCurrent").addEventListener("click", loadCurrent);
     $("ipLoadCurrentEmpty").addEventListener("click", loadCurrent);
     $("ipPunch").addEventListener("change", refreshControls);
-    $("ipPlay").addEventListener("click", play);
-    $("ipPlayStop").addEventListener("click", stopPlayback);
+    $("ipPlay").addEventListener("click", togglePreview);
+    $("ipPlayStop").addEventListener("click", stopPreview);
     $("ipZoomIn").addEventListener("click", function () { zoom(0.5); });
     $("ipZoomOut").addEventListener("click", function () { zoom(2); });
-    $("ipZoomFit").addEventListener("click", function () { if (S.pcm) { S.view = { start: 0, end: A.duration(S.pcm) }; draw(); } });
+    $("ipZoomFit").addEventListener("click", fitView);
     $("ipKeep").addEventListener("click", function () {
       var sel = S.selection; edit("trim-keep", function (p) { return A.trim(p, sel.start, sel.end, "keep"); });
     });
@@ -756,7 +990,7 @@
     $("ipUndo").addEventListener("click", function () {
       var item = S.undo.pop();
       if (!item) return;
-      stopPlayback();
+      haltPreview();
       S.pcm = item.pcm; S.ops.pop(); S.selection = null; S.view = { start: 0, end: A.duration(S.pcm) };
       S.playhead = Math.max(0, Math.min(S.playhead, A.duration(S.pcm)));
       if (item.meta) S.baseRevision = item.meta.baseRevision;     // the restored audio's own base
@@ -768,33 +1002,21 @@
     $("ipCancelUpload").addEventListener("click", function () { if (S.upload) S.upload.abort(); });
     $("ipDiscard").addEventListener("click", function () {
       if (S.dirty && !root.confirm("Discard your unsaved edit?")) return;
-      stopPlayback();
+      haltPreview();
       S.pcm = null; S.dirty = false; S.ops = []; S.undo.clear(); S.sourceKind = "none";
       S.selection = null; S.view = null; S.playhead = 0;
       rebase(); deleteDraft(); draw(); refreshControls();
     });
     $("ipRemove").addEventListener("click", removeFromAir);
     $("ipConflictReload").addEventListener("click", function () {
-      stopPlayback();
+      haltPreview();
       S.pcm = null; S.dirty = false; S.undo.clear(); deleteDraft(); draw(); reloadContext();
     });
     $("ipDraftRestore").addEventListener("click", restoreDraft);
     $("ipDraftDiscard").addEventListener("click", function () { deleteDraft(); $("ipDraftBanner").hidden = true; });
 
-    var canvas = $("ipWave"), dragFrom = null;
-    canvas.addEventListener("mousedown", function (e) { if (!S.pcm) return; dragFrom = canvasTime(e); });
-    canvas.addEventListener("mousemove", function (e) {
-      if (dragFrom === null) return;
-      var t = canvasTime(e);
-      S.selection = Math.abs(t - dragFrom) > 0.01 ? { start: Math.min(t, dragFrom), end: Math.max(t, dragFrom) } : null;
-      draw(); refreshControls();
-    });
-    root.addEventListener("mouseup", function (e) {
-      if (dragFrom === null) return;
-      var t = canvasTime(e);
-      if (Math.abs(t - dragFrom) <= 0.01) { S.playhead = t; S.selection = null; }
-      dragFrom = null; draw(); refreshControls();
-    });
+    wireWaveform($("ipWave"));
+    root.addEventListener("resize", draw);
     root.addEventListener("beforeunload", function (e) {
       if (S.dirty || (S.recorder && (S.recorder.state === "recording" || S.recorder.state === "paused"))) {
         e.preventDefault(); e.returnValue = "";
@@ -803,6 +1025,7 @@
   }
 
   capabilityCheck();
+  initMeter();
   wire();
   renderContext();
   draw();

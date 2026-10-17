@@ -17,7 +17,7 @@ from library.models import Track
 from produced_content import regular
 from produced_content.models import ProducedContentTestTake
 from production.tests.support import ffmpeg_available
-from production.tests.test_recorder_browser import _tone, in_browser, sync_playwright
+from production.tests.test_recorder_browser import _tone, exercise_shared_editor, in_browser, sync_playwright
 from spoken.models import ItemState, SpokenItem
 
 from .support import People, assign, no_air_type, regular_type
@@ -105,6 +105,17 @@ class ProducedContentWorkstationBrowserTests(People, StaticLiveServerTestCase):
         self.assertTrue(page.is_disabled("#ipSave"))
         self.assertEqual(page.errors, [])
         self.assertFalse([url for url in page.requests if "/api/engine" in url or "/api/fx" in url])
+
+    @in_browser
+    def test_the_shared_editor_refinements_behave_the_same_on_regular_and_test(self):
+        """r0114: one centrally implemented meter, transport and navigation on
+        both produced-content subjects; nothing is saved or submitted."""
+        item = regular.start(self.producer, self.news, title="Weekend")
+        for query in (f"item={item.pk}", "test_type=practice"):
+            with self.subTest(query=query):
+                exercise_shared_editor(self, self.open(query))
+        self.assertEqual(SpokenItem.objects.get(pk=item.pk).state, ItemState.DRAFT)
+        self.assertFalse(ProducedContentTestTake.objects.exists())
 
     @in_browser
     def test_a_test_take_is_saved_and_nothing_can_air(self):

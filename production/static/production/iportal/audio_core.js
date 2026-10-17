@@ -7,6 +7,8 @@
  *
  * Behaviour ported from the proven OGRemote workstation (gain range, Set Level,
  * peak normalize, insert/replace punch-in, silent-channel collapse, WAV).
+ * r0114 adds the input meter's display math (the console's dBFS scale) and the
+ * editor's view math (anchored zoom, pan) -- both display-only.
  */
 (function (root) {
   "use strict";
@@ -218,6 +220,106 @@
     return this.items.reduce(function (sum, item) { return sum + byteSize(item.pcm); }, 0);
   };
 
+  // -- input level display (r0114) -- read-only: never touches the audio --------
+  // The console's own scale (library dashboard): VU_MIN -> 0 %, 0 dBFS -> 100 %,
+  // 0 VU = -20 dBFS where yellow begins, red from -6 dBFS. The bottom of the
+  // scale is the station's AudioPipeline.vu_meter_min_db (-40 by default).
+  var VU_DEFAULT_MIN_DB = -40;
+  var VU_YELLOW_DBFS = -20;
+  var VU_RED_DBFS = -6;
+  // The peak marker behaves like the engine's GStreamer level "decay" value
+  // (library/services/engine.py: peak-ttl 300 ms, peak-falloff 20 dB/s).
+  var PEAK_HOLD_MS = 300;
+  var PEAK_FALLOFF_DB_PER_S = 20;
+
+  function vuMinDb(value) {
+    var v = (value === null || value === undefined || value === "") ? NaN : Number(value);
+    return isFinite(v) && v < 0 && v >= -120 ? v : VU_DEFAULT_MIN_DB;
+  }
+  /* Linear amplitude -> dBFS; silence, negatives and garbage are -Infinity. */
+  function levelDbfs(linear) {
+    var v = Number(linear);
+    return isFinite(v) && v > 0 ? 20 * Math.log10(v) : -Infinity;
+  }
+  /* The console's vuDbToPct: minDb -> 0, 0 dBFS -> 100, clamped; anything
+   * non-finite (silence included) is 0. */
+  function vuPercent(db, minDb) {
+    var min = vuMinDb(minDb);
+    if (typeof db !== "number" || !isFinite(db)) return 0;
+    return Math.max(0, Math.min(100, (db - min) / (0 - min) * 100));
+  }
+  function vuThresholds(minDb) {
+    return { yellow: vuPercent(VU_YELLOW_DBFS, minDb), red: vuPercent(VU_RED_DBFS, minDb) };
+  }
+  /* RMS and peak (linear) of one block; a non-finite sample counts as 0. */
+  function measureLevels(samples) {
+    var n = samples && samples.length ? samples.length : 0, peakValue = 0, sum = 0;
+    for (var i = 0; i < n; i++) {
+      var x = samples[i];
+      if (typeof x !== "number" || !isFinite(x)) continue;
+      var a = Math.abs(x);
+      if (a > peakValue) peakValue = a;
+      sum += x * x;
+    }
+    return { peak: peakValue, rms: n ? Math.sqrt(sum / n) : 0 };
+  }
+  /* Peak hold with fall-off: a new higher peak is held PEAK_HOLD_MS, then
+   * falls PEAK_FALLOFF_DB_PER_S. Values in dBFS; times in ms (caller's clock). */
+  function PeakHold() { this.reset(); }
+  PeakHold.prototype.reset = function () { this.db = -Infinity; this.heldAt = 0; };
+  PeakHold.prototype.value = function (nowMs) {
+    if (this.db === -Infinity) return -Infinity;
+    var falling = (nowMs - this.heldAt - PEAK_HOLD_MS) / 1000;
+    return falling > 0 ? this.db - PEAK_FALLOFF_DB_PER_S * falling : this.db;
+  };
+  PeakHold.prototype.update = function (peakDb, nowMs) {
+    var current = this.value(nowMs);
+    if (typeof peakDb === "number" && !isNaN(peakDb) && peakDb >= current && peakDb > -Infinity) {
+      this.db = peakDb;
+      this.heldAt = nowMs;
+      return peakDb;
+    }
+    return current;
+  };
+
+  // -- editor view (r0114) -- which slice of the clip is visible --------------
+  // Times are absolute clip seconds; a view never leaves [0, total] and never
+  // shows less than MIN_VIEW_SECONDS (or the whole clip, when it is shorter).
+  var MIN_VIEW_SECONDS = 0.05;
+  function clampView(start, span, total) {
+    total = Number(total);
+    if (!isFinite(total) || total <= 0) return { start: 0, end: 0 };
+    span = Number(span);
+    if (!isFinite(span) || span <= 0) span = total;
+    span = Math.max(Math.min(total, MIN_VIEW_SECONDS), Math.min(total, span));
+    start = Number(start);
+    if (!isFinite(start)) start = 0;
+    start = Math.max(0, Math.min(total - span, start));
+    return { start: start, end: start + span };
+  }
+  /* Scale the visible span by ``factor`` (< 1 zooms in) keeping ``anchorTime``
+   * at the same fraction of the width (the cursor or pinch midpoint) --
+   * exactly, unless that would leave the clip. */
+  function zoomView(view, total, factor, anchorTime, anchorFraction) {
+    var v = clampView(view ? view.start : 0, view ? view.end - view.start : total, total);
+    var span = v.end - v.start;
+    if (span <= 0) return v;
+    var f = Number(factor);
+    if (!isFinite(f) || f <= 0) f = 1;
+    var t = Number(anchorTime);
+    if (!isFinite(t)) t = v.start + span / 2;
+    var frac = Number(anchorFraction);
+    if (!isFinite(frac)) frac = (t - v.start) / span;
+    frac = Math.max(0, Math.min(1, frac));
+    var next = clampView(0, span * f, total).end;
+    return clampView(t - frac * next, next, total);
+  }
+  function panView(view, total, deltaSeconds) {
+    var v = clampView(view ? view.start : 0, view ? view.end - view.start : total, total);
+    var d = Number(deltaSeconds);
+    return clampView(v.start + (isFinite(d) ? d : 0), v.end - v.start, total);
+  }
+
   root.IPortalAudio = {
     GAIN_MIN_DB: GAIN_MIN_DB, GAIN_MAX_DB: GAIN_MAX_DB, GAIN_STEP_DB: GAIN_STEP_DB,
     SET_LEVEL_SECONDS: SET_LEVEL_SECONDS, SET_LEVEL_TARGET_DBFS: SET_LEVEL_TARGET_DBFS,
@@ -227,5 +329,10 @@
     trim: trim, applyGain: applyGain, normalize: normalize, punchIn: punchIn, concat: concat,
     collapseSilentChannel: collapseSilentChannel, encodeWav: encodeWav, peaksForRange: peaksForRange,
     fromAudioBuffer: fromAudioBuffer, toAudioBuffer: toAudioBuffer, UndoStack: UndoStack,
+    VU_DEFAULT_MIN_DB: VU_DEFAULT_MIN_DB, VU_YELLOW_DBFS: VU_YELLOW_DBFS, VU_RED_DBFS: VU_RED_DBFS,
+    PEAK_HOLD_MS: PEAK_HOLD_MS, PEAK_FALLOFF_DB_PER_S: PEAK_FALLOFF_DB_PER_S,
+    vuMinDb: vuMinDb, levelDbfs: levelDbfs, vuPercent: vuPercent, vuThresholds: vuThresholds,
+    measureLevels: measureLevels, PeakHold: PeakHold,
+    MIN_VIEW_SECONDS: MIN_VIEW_SECONDS, clampView: clampView, zoomView: zoomView, panView: panView,
   };
 })(typeof window !== "undefined" ? window : this);

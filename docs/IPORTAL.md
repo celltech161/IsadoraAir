@@ -88,8 +88,40 @@ take of one exact test type — docs/PRODUCED_CONTENT.md).
 * **Input** — microphone selection (labels appear after permission), level
   meter, gain −15…+15 dB in 0.5 dB steps, **Set Level** (6 s listen, peaks to
   −6 dBFS, below −40 dBFS = "no signal", gain unchanged).
+* **Input meter (r0114)** — the console's calibrated VU scale, not a
+  percentage: the station's `AudioPipeline.vu_meter_min_db` (−40 dBFS by
+  default; read-only by the workstation view, never created) at the left, 0
+  dBFS at the right, green below −20 dBFS (0 VU), yellow −20…−6 dBFS, red
+  above −6 dBFS — at 50 % and 85 % on the default scale, recomputed for any
+  other minimum. The bar is the **RMS** level of each 50 ms analyser block
+  after the gain; the thin marker is the **peak**, held 300 ms and then falling
+  20 dB/s like the console's engine meter (GStreamer `level` decay). It is
+  labelled as such (RMS bar, peak marker, dBFS). Set Level still measures
+  instantaneous peaks exactly as before; the meter only displays. When the
+  microphone is released or lost the meter settles to "no input" instead of
+  freezing its last reading.
 * **Recording** — record, pause/resume, stop, visible elapsed time, a hard
   maximum duration (10 min for VoiceTrack); the take is kept at the limit.
+* **Preview transport (r0114)** — one **Preview / Pause / Resume** button and
+  **Stop**. Pause keeps the playhead and Resume continues from it; **Stop and
+  a natural end** (of the clip or of the selected range, which is never
+  passed) return the playhead to exactly 0 and keep the selection. Clicking
+  the waveform during preview seeks. Internally ending preview before
+  recording, punch-in, an edit, an import, a load or a discard keeps the
+  playhead (punch-in records at it). Each preview source carries a
+  generation: a superseded source's end can never stop or reset newer
+  playback, and only one source is ever audible.
+* **Waveform navigation (r0114)** — wheel over the waveform zooms around the
+  cursor; a sideways trackpad swipe, or Shift + wheel, scrolls; Ctrl + wheel
+  (trackpad pinch) zooms. On touch: tap places the playhead, one-finger drag
+  selects, two-finger pinch zooms around the midpoint and two-finger drag
+  scrolls; a second finger turns a would-be selection into navigation (the
+  earlier selection is kept) and a cancelled gesture leaves nothing stuck.
+  Vertical page scrolling stays native (`touch-action: pan-y`), and the wheel
+  is left to the page outside the waveform or when the view cannot move.
+  Views never leave the clip or show less than 50 ms (or the whole clip, when
+  it is shorter); navigation changes only the view — selection and playhead
+  stay in absolute clip seconds, and no gesture edits audio.
 * **Editing** (browser-local) — waveform, zoom, drag selection, playhead,
   keep/delete trim, peak normalize (to 0.95, an explicit operation), gain,
   bounded undo (5 steps / 400 MB), punch-in at the playhead, import, WAV export.

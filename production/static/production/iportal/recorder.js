@@ -172,13 +172,28 @@
     return p;
   };
 
+  /* The display meter (r0114): RMS and peak of one analyser block, measured
+   * after the user gain, like the samples being captured. Read-only. */
+  Recorder.prototype.currentLevels = function () {
+    if (!this.analyser) return { peak: 0, rms: 0 };
+    var buf = new Float32Array(this.analyser.fftSize);
+    this.analyser.getFloatTimeDomainData(buf);
+    return A.measureLevels(buf);
+  };
+
   Recorder.prototype._startMeter = function () {
     var self = this;
     this._stopMeter();
-    this._meterTimer = root.setInterval(function () { self.onLevel(self.currentPeak()); }, 50);
+    this._meterTimer = root.setInterval(function () { self.onLevel(self.currentLevels()); }, 50);
   };
+  /* When the meter stops (release, device loss) it says so: onLevel(null)
+   * means "no live input", never a frozen last reading. */
   Recorder.prototype._stopMeter = function () {
-    if (this._meterTimer) { root.clearInterval(this._meterTimer); this._meterTimer = null; }
+    if (this._meterTimer) {
+      root.clearInterval(this._meterTimer);
+      this._meterTimer = null;
+      this.onLevel(null);
+    }
   };
 
   /* Set Level: listen for SET_LEVEL_SECONDS, then move the gain so peaks land

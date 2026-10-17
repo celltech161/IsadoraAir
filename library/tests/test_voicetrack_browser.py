@@ -23,7 +23,7 @@ from production.models import ProductionMedia
 from production.services import retention
 from production.services import layout
 from production.tests.support import IsolatedMediaRootMixin, ffmpeg_available
-from production.tests.test_recorder_browser import _tone, in_browser, sync_playwright
+from production.tests.test_recorder_browser import _tone, exercise_shared_editor, in_browser, sync_playwright
 
 User = get_user_model()
 
@@ -196,6 +196,20 @@ class VoiceTrackStudioBrowserTests(IsolatedMediaRootMixin, StaticLiveServerTestC
         row = VoiceTrack.objects.get(track=self.track, position="intro")
         self.assertEqual((row.media_id, vtm.revision_of(row)), (media.pk, revision))
         self.assertEqual(errors, [])
+
+    @in_browser
+    def test_the_shared_editor_refinements_behave_the_same_in_the_studio(self):
+        """r0114: the VoiceTrack studio gets the same meter, transport and
+        navigation; nothing is saved and no VoiceTrack is bound."""
+        context = self.browser.new_context()
+        context.add_cookies([{"name": "sessionid", "value": self.session_cookie, "url": self.live_server_url}])
+        page = context.new_page()
+        page.errors, page.requests = [], []
+        page.on("pageerror", lambda exc: page.errors.append(str(exc)))
+        page.on("request", lambda req: page.requests.append(req.url))
+        self.studio(page)
+        exercise_shared_editor(self, page)
+        self.assertFalse(VoiceTrack.objects.filter(track=self.track).exists())
 
     @in_browser
     def test_with_nothing_on_air_the_editor_is_simply_empty(self):

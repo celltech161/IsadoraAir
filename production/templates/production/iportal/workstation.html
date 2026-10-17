@@ -29,11 +29,29 @@
   .ip-btn.rec { background: #dc2626; color: #fff; border-color: transparent; }
   .ip-btn.danger { color: #f88; }
   .ip-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
-  .ip-meter { height: 10px; background: #111; border-radius: 4px; overflow: hidden; flex: 1; min-width: 120px; }
-  .ip-meter > div { height: 100%; width: 0; background: linear-gradient(90deg, #16a34a 0 70%, #eab308 70% 90%, #dc2626 90%); }
+  /* Input meter (r0114): the console's VU scale. Full-width colour scale (green
+     to -20 dBFS, yellow to -6 dBFS, red to 0 dBFS; the stops are set from the
+     station's minimum by workstation.js), a right-side mask revealing the RMS
+     level, and a peak-hold marker. */
+  .ip-meter-wrap { flex: 1; min-width: 160px; }
+  .ip-meter { position: relative; height: 10px; border-radius: 3px; overflow: hidden;
+    border: 1px solid var(--border-subtle, #333);
+    background: linear-gradient(to right, #22c55e 0%, #22c55e var(--ip-vu-yellow, 50%),
+      #eab308 var(--ip-vu-yellow, 50%), #eab308 var(--ip-vu-red, 85%), #ef4444 var(--ip-vu-red, 85%), #ef4444 100%); }
+  .ip-meter-mask { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: var(--bg-darker, #111);
+    transition: width 60ms linear; }
+  .ip-meter-peak { position: absolute; top: -1px; bottom: -1px; left: 0; width: 2px; background: var(--text-main, #eee);
+    transition: left 80ms linear; pointer-events: none; }
+  .ip-meter-scale { position: relative; height: 0.7rem; }
+  .ip-meter-scale .ip-tick { position: absolute; top: 0; transform: translateX(-50%); font-size: 0.6rem; line-height: 1;
+    color: var(--text-muted); white-space: nowrap; }
+  .ip-meter-scale .ip-tick.emph { color: var(--text-main, #eee); font-weight: 600; }
+  .ip-meter-scale .ip-tick.first { transform: translateX(0); }
+  .ip-meter-scale .ip-tick.last { transform: translateX(-100%); }
   .ip-timer { font-variant-numeric: tabular-nums; font-size: 1.1rem; min-width: 7ch; }
   .ip-timer.recording { color: #f87171; }
-  #ipWave { width: 100%; height: 160px; background: #0b0d10; border-radius: 6px; cursor: crosshair; display: block; }
+  #ipWave { width: 100%; height: 160px; background: #0b0d10; border-radius: 6px; cursor: crosshair; display: block;
+    touch-action: pan-y; user-select: none; -webkit-user-select: none; }
   .ip-small { font-size: 0.75rem; color: var(--text-muted); }
   label.ip-inline { display: inline-flex; gap: 0.3rem; align-items: center; font-size: 0.8rem; }
 </style>
@@ -81,7 +99,17 @@
         <span id="ipGainLabel" class="ip-small">0.0 dB</span>
         <button type="button" class="ip-btn" id="ipSetLevel" disabled>Set Level</button>
       </div>
-      <div class="ip-row"><div class="ip-meter"><div id="ipMeter"></div></div></div>
+      <div class="ip-row">
+        <div class="ip-meter-wrap">
+          <div class="ip-meter" id="ipMeter" role="meter" aria-label="Input level, RMS (dBFS)"
+               aria-valuemin="-40" aria-valuemax="0" aria-valuenow="-40">
+            <div class="ip-meter-mask" id="ipMeterMask"></div>
+            <div class="ip-meter-peak" id="ipMeterPeak" hidden></div>
+          </div>
+          <div class="ip-meter-scale" id="ipMeterScale" aria-hidden="true"></div>
+          <div class="ip-small">Input level in dBFS — bar: RMS, marker: peak (0 VU = −20 dBFS)</div>
+        </div>
+      </div>
       <div class="ip-row">
         <button type="button" class="ip-btn rec" id="ipRecord" disabled>&#9679; Record</button>
         <button type="button" class="ip-btn" id="ipPause" disabled>Pause</button>
@@ -117,9 +145,11 @@
     </div>
     <canvas id="ipWave" width="1060" height="160" aria-label="Waveform"></canvas>
     <div class="ip-row ip-small"><span id="ipSelection">No audio yet.</span></div>
+    <div class="ip-row ip-small" id="ipWaveHint">Click or tap to place the playhead · drag to select ·
+      wheel or pinch to zoom · Shift+wheel, sideways swipe or two-finger drag to scroll</div>
     <div class="ip-row">
-      <button type="button" class="ip-btn" id="ipPlay" disabled>&#9654; Preview</button>
-      <button type="button" class="ip-btn" id="ipPlayStop" disabled>Stop</button>
+      <button type="button" class="ip-btn" id="ipPlay" data-transport="stopped" aria-label="Play preview" disabled>&#9654; Preview</button>
+      <button type="button" class="ip-btn" id="ipPlayStop" aria-label="Stop preview" disabled>&#9632; Stop</button>
       <button type="button" class="ip-btn" id="ipZoomIn" disabled>Zoom +</button>
       <button type="button" class="ip-btn" id="ipZoomOut" disabled>Zoom &minus;</button>
       <button type="button" class="ip-btn" id="ipZoomFit" disabled>Fit</button>
