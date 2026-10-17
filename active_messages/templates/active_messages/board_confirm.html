@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ verb }} message — Operator board — IsadoraAir{% endblock %}
+{% block extra_css %}{% include "active_messages/_board_style.html" %}{% endblock %}
+{% block content %}
+<div class="amb amb-confirm" id="amConfirm" data-action="{{ action }}">
+  <h1>{{ verb }} “{{ message.title|default:message.content_type.name }}”?</h1>
+  <dl class="amb-facts">
+    <dt>Producer</dt><dd>{{ message.producer_username|default:message.producer_key }}</dd>
+    <dt>Type</dt><dd>{{ message.content_type.name }} <span class="amb-muted">({{ message.content_type.key }})</span> · {{ message.get_kind_display }}</dd>
+    <dt>State</dt><dd>{{ message.get_state_display }}{% if message.activated_at %} since {{ message.activated_at|date:"Y-m-d H:i T" }}{% endif %}</dd>
+    <dt>ID</dt><dd class="amb-id">{{ message.pk }}</dd>
+  </dl>
+  <p class="amb-note">{{ explain }} Only this exact message changes{% if action == "clear" %} — never a newer replacement{% endif %}.</p>
+  <form method="post" action="{{ post_url }}">{% csrf_token %}
+    <input type="hidden" name="return" value="{{ return_query }}">
+    <label for="ambReason" class="amb-muted">Reason (optional, kept in its history)</label>
+    <input type="text" id="ambReason" name="reason" maxlength="{{ reason_limit }}" placeholder="{{ default_reason }}">
+    <div class="amb-actions">
+      <button type="submit" class="amb-btn danger" id="ambConfirm">{{ verb }} this message</button>
+      <a class="amb-btn" href="{{ cancel_url }}">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

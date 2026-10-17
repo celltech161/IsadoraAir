@@ -28,7 +28,7 @@
 <div class="am-wrap" id="activeMessagesWorkspace">
   <div class="am-row" style="justify-content: space-between;">
     <h1 style="font-size:1.3rem; margin:0;">My Messages</h1>
-    <a href="/iportal/" class="am-muted">&larr; iPortal</a>
+    <span class="am-muted">{% if control %}<a href="{% url 'active_messages:board' %}" id="amBoardLink">Operator board</a> · {% endif %}<a href="/iportal/">&larr; iPortal</a></span>
   </div>
   <p class="am-muted">
     Your urgent and public-address messages. Record audio for a draft, then publish it. Saving audio never

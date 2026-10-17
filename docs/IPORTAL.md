@@ -45,6 +45,11 @@ The adapter supplies:
   403; raise `SubjectNotFound` to not disclose the subject). Default: allow;
 * `show_in_hub(user)` (2.22D3B) — whether the `/iportal/` hub lists the tool
   (presentation only). Default: `authorize(user, "open")`;
+* `hub_links(user)` (2.22D3D) — further `(label, url)` pages of the SAME tool
+  the hub lists under its one entry (so a subsystem never gets several
+  top-level entries); presentation only, each page authorizes itself.
+  Default: none. `active-message` lists "My messages" and "Operator board"
+  for control;
 * `media_policy(subject)` — the domain's `MediaPolicy` bounds;
 * `media_airing_prohibited(subject)` (r0113) — whether every take made for this
   exact resolved subject is NO-AIR media; `api_take` stamps it on the new
@@ -75,6 +80,20 @@ docs/ACTIVE_MESSAGES.md, "Producer workspace"); and since 2.22D3C, produced
 content (`produced-content`: one exact regular SpokenItem, whose save is the
 explicit "Submit for processing", or the signed-in user's own TEST / NO AIR
 take of one exact test type — docs/PRODUCED_CONTENT.md).
+
+## Page density (2.22D3D onward)
+
+iPortal management pages share one visual philosophy, first applied by the
+Active Messages operator board (docs/ACTIVE_MESSAGES.md, "Operator board"):
+high information density, low clutter, minimal scrolling, mobile first
+(360–430 CSS px without horizontal page scrolling). A compact status strip,
+then the list at once; compact rows that expand in place (native
+`<details>`) rather than full-height cards; progressive disclosure for
+detail, history and less common actions; one obvious primary action per
+expanded row; confirmations on their own page (one at a time, Back works);
+strong colour only for real attention (urgent, on air, failures); theme CSS
+variables only, so station light and dark palettes both work; no
+framework, no fixed bars, no hover-only controls.
 
 ## The browser workstation
 

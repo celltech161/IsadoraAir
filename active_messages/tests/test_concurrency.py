@@ -182,3 +182,34 @@ class ReplayTokenRaceTests(Sessions):
         self.assertIsNone(second["error"])
         self.assertEqual(first["result"].pk, second["result"].pk)
         self.assertEqual(ActiveBroadcastExecution.objects.count(), 1)
+
+
+class ReviewedPublicationRaceTests(Sessions):
+    """D3D: an operator publishes exactly the draft revision they reviewed."""
+
+    def test_a_save_waiting_on_a_reviewed_publication_cannot_change_the_published_audio(self):
+        draft = self.prepared(self.producer)
+        reviewed = ActiveBroadcastMessage.objects.get(pk=draft.pk).message_media_id
+        revision = services.message_revision(draft)
+        newer = media(self.producer)
+        first, second = self.race(
+            lambda: services.activate_message(draft, actor=self.admin, expected_revision=revision),
+            lambda: services.bind_message_media(draft, newer, actor=self.producer),
+            "active_messages.services._suppress_stale")
+        self.assertIsNone(first["error"])
+        self.assertIsInstance(second["error"], services.InvalidTransition)
+        stored = ActiveBroadcastMessage.objects.get(pk=draft.pk)
+        self.assertEqual((stored.state, stored.message_media_id), ("active", reviewed))
+
+    def test_a_reviewed_publication_waiting_on_a_save_is_refused(self):
+        draft = self.prepared(self.producer)
+        revision = services.message_revision(draft)
+        newer = media(self.producer)
+        first, second = self.race(
+            lambda: services.bind_message_media(draft, newer, actor=self.producer),
+            lambda: services.activate_message(draft, actor=self.admin, expected_revision=revision),
+            "active_messages.services._lock_media")
+        self.assertIsNone(first["error"])
+        self.assertIsInstance(second["error"], services.RevisionConflict)
+        stored = ActiveBroadcastMessage.objects.get(pk=draft.pk)
+        self.assertEqual((stored.state, stored.message_media_id), ("prepared", newer.pk))

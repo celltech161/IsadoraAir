@@ -143,6 +143,12 @@ class RecordingAdapter:
         choice, never authorization. Default: whoever may open it."""
         return self.authorize(user, "open")
 
+    def hub_links(self, user) -> tuple:
+        """Further ``(label, url)`` pages of the same tool the hub lists under
+        its entry for ``user`` (D3D) -- presentation only; each page authorizes
+        itself. Default: none."""
+        return ()
+
     # -- the subject ---------------------------------------------------------
     def resolve(self, params) -> object:
         """Resolve the subject from request parameters (a QueryDict or dict).

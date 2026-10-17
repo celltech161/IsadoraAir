@@ -160,7 +160,9 @@ def _maybe_sweep_abandoned():
 @require_GET
 def workspace_index(request):
     """The iPortal workspace hub: the media tools this user may use."""
-    tools = [adapter for adapter in registry.all_adapters() if adapter.show_in_hub(request.user)]
+    tools = [{"label": adapter.label, "description": adapter.description, "entry_url": adapter.entry_url,
+              "links": [{"label": label, "url": url} for label, url in adapter.hub_links(request.user)]}
+             for adapter in registry.all_adapters() if adapter.show_in_hub(request.user)]
     return render(request, "production/iportal/index.html", {"tools": tools})
 
 

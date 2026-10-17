@@ -534,11 +534,20 @@ def bind_message_media(message, media, *, actor, expected_revision=None) -> Acti
     return row
 
 
-def set_message_expiry(message, expires_at, *, actor, now=None) -> ActiveBroadcastMessage:
+UNCHECKED = object()
+
+
+def set_message_expiry(message, expires_at, *, actor, now=None,
+                       expected_expires_at=UNCHECKED) -> ActiveBroadcastMessage:
     """Set or remove a message's expiry. PREPARED: its producer or a
     control-capable operator. ACTIVE: control only (the composition does not
     change until the expiry sweep actually expires it). To end a message now,
-    clear it."""
+    clear it.
+
+    ``expected_expires_at`` (D3D: the expiry the operator's page showed, None
+    for none): act only if the message still has exactly that expiry, checked
+    under its row lock -- a stale form never overwrites a newer change
+    (InvalidTransition ``expiry_changed``)."""
     now = _now(now)
     expires_at = _aware_future(expires_at, now, "expires_at")
     if not can(actor, CONTROL):
@@ -554,6 +563,9 @@ def set_message_expiry(message, expires_at, *, actor, now=None) -> ActiveBroadca
             _require_assignment(actor, _message_type(row))
         else:
             raise InvalidTransition(f"a {row.state} message is final", code="terminal")
+        if expected_expires_at is not UNCHECKED and row.expires_at != expected_expires_at:
+            raise InvalidTransition("the message's expiry changed since this page was loaded",
+                                    code="expiry_changed")
         if row.expires_at == expires_at:
             return row
         previous = row.expires_at
@@ -582,13 +594,18 @@ def _require_activation(actor, row, control: bool) -> None:
                            code="self_publish_disabled")
 
 
-def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
+def activate_message(message, *, actor, now=None, expected_revision=None) -> ActiveBroadcastMessage:
     """PREPARED -> ACTIVE. CONTROL, or the message's own assigned producer when
     its exact type allows producer self-publish. Atomically supersedes the
     same producer's ACTIVE message of the same EXACT content type (never
     another type, even of the same kind). The new message is due
     immediately. Its replay interval is the type's override, else the policy
-    default. Idempotent: an already-ACTIVE message is returned unchanged."""
+    default. Idempotent: an already-ACTIVE message is returned unchanged.
+
+    ``expected_revision`` (D3D: the ``message_revision`` the reviewing
+    operator's page showed): activate only that exact draft -- compared under
+    the message row lock, so audio saved after the review is never published
+    unreviewed (RevisionConflict; nothing changes)."""
     control = can(actor, CONTROL)
     if not control:
         _require(actor, PRODUCE)
@@ -609,6 +626,10 @@ def activate_message(message, *, actor, now=None) -> ActiveBroadcastMessage:
             return row
         if row.state != M.PREPARED:
             raise InvalidTransition(f"a {row.state} message cannot be activated", code="terminal")
+        if expected_revision is not None:
+            current = message_revision(row)
+            if str(expected_revision) != current:
+                raise RevisionConflict("the draft changed since it was reviewed", current_revision=current)
         content_type = _message_type(row)
         interval = content_type.replay_interval_seconds or policy.default_replay_interval_seconds
         if row.message_media_id is None:

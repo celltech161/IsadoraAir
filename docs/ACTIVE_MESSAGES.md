@@ -36,7 +36,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D3A** | native produced-content authority: `ProducedContentType` (regular / public address / urgent / test) and producer assignments; active messages keyed by the exact content type; producer self-publish and recall | **no** — authority and configuration only |
 | **D3B** | the producer workspace: "My Messages" (`/iportal/messages/`) and the shared iPortal recorder on one exact message (adapter `active-message`); Save audio ≠ Publish; producer recall/discard | **no** — gate still closed |
 | D3C | regular produced content through a managed Phase-C spoken backend, TEST / NO AIR, "My Content" (docs/PRODUCED_CONTENT.md) -- no active-message change | gate still closed |
-| D3D+ | operator board, Replay Now UI, monitoring | gate still closed |
+| **D3D** | the operator board (`/iportal/messages/board/`): review and publish across producers, clear, decline, expiry, Replay Now (unavailable while the gate is closed), airing and event visibility | **no** — gate still closed; Replay Now refuses before the service |
+| D3E | monitoring, retention, failure recovery, worker packaging | gate still closed |
 
 ## Authority
 
@@ -126,7 +127,10 @@ through a private compare-and-write store with read-back.
 
 CLEARED and EXPIRED are final. Activate and clear are idempotent (a repeated
 POST returns the row unchanged). Clear acts on the exact UUID: clearing an old,
-already-superseded row can never touch its replacement. An ACTIVE message's
+already-superseded row can never touch its replacement. (D3D) `activate_message`
+takes an optional `expected_revision` and `set_message_expiry` an optional
+`expected_expires_at`, compared under the message row lock: a stale page
+changes nothing. An ACTIVE message's
 media never changes — editing means preparing a new message and activating it.
 
 Media binding: valid, present, not a bed, measured duration within the
@@ -241,6 +245,7 @@ approval — PREPARED is the review state; there is no other approval
 lifecycle). Every POST is CSRF-protected and authorized again by the
 services; another producer's message is a 404. `expected_state` makes a
 stale "discard" unable to recall a message that was activated meanwhile.
+A control user's My Messages page links to the operator board.
 
 **The recorder subject is one exact message UUID** (`active_messages/iportal.py`):
 never a producer/kind pair, "the current message", a type name, a path or a
@@ -274,6 +279,86 @@ While native airing is unavailable (every installation until Phase G), the
 page and the recorder say so: "Native Active Message airing is not enabled on
 this installation." The workflow itself still works (prepare, save, publish,
 recall) and dispatches nothing to the engine.
+
+## Operator board (D3D)
+
+**Operator board** — `/iportal/messages/board/`, for `active_message.control`
+only (staff/superuser through `authorize()`'s bypass); everyone else gets 403
+on every board URL, and GroupAccess still gates the `/iportal/` prefix. The
+hub keeps ONE Active Messages entry and lists "My messages · Operator board"
+under it for control (`RecordingAdapter.hub_links`); a control user's My
+Messages page links to it too. Producers keep My Messages.
+
+**Layout** (the iPortal density philosophy, docs/IPORTAL.md "Page density"):
+
+* a one-line status strip: active urgent and public-address counts, drafts
+  with audio to review, the current or last airing (its real state; **ON AIR**
+  only for a STARTED airing), the native-airing gate, an over-limit alert when
+  the active set breaks a policy limit, and **Replay now**;
+* filters (Current — review first, then the active set; Active — in
+  composition order; Review — every PREPARED draft, those with audio first;
+  History — cleared/expired, newest first) and a search (title, producer,
+  type name or key, exact UUID); 25 rows a page, so history is never loaded
+  unbounded;
+* one compact row per message: class (URG/PA), title, exact type, producer,
+  time, audio length or problem, expiry/next due, state. On a phone that is
+  two lines (a third only for an expiry); from 900 px it is one line of
+  columns. A row expands in place (native `<details>`): browser-local audio
+  preview, facts (class, type and key, producer, state — "not airing (native
+  airing closed)" for an ACTIVE message while the gate is closed —,
+  publishing rule, expiry, what a publication would replace, UUID), the
+  actions, an expiry editor and the latest five events. "History" opens the
+  message's page (up to 200 events and the airings it was part of); each
+  airing has a page with its reason, state, failure code, timestamps
+  (accepted and claimed are labelled "not air"; only STARTED is air
+  evidence), components in airing order, digest and events;
+* a bounded refresh (every 20 s while visible, at most 90 times) updates the
+  strip's counts and offers "Reload" when anything changed; it never
+  re-renders rows, so expanded rows, focus, filters and typed input stay.
+
+| Action | How | Service |
+| --- | --- | --- |
+| Publish / Publish replacement | POST on the exact UUID with the draft's revision as shown | `activate_message(expected_revision=…)` |
+| Decline (a PREPARED draft) | confirmation page naming message and producer, optional reason, POST | `clear_message(expected_state=prepared)` |
+| Clear (an ACTIVE message) | likewise | `clear_message(expected_state=active)` |
+| Set / change / remove expiry | POST with the station-local time and the expiry as shown | `set_message_expiry(expected_expires_at=…)` |
+| Replay now | POST with the request token issued with the page | `request_manual_replay(request_token=…)` |
+| Record / edit a draft | the shared recorder on `?message=<uuid>&from=board` (its Back returns to the board, for control) | the D3B adapter, unchanged |
+
+Every POST is CSRF-protected, carries the operator's filter/search/page
+(re-validated against a whitelist; the redirect path is fixed) and is decided
+by the services under their locks; displayed state is never authority. Board
+reads take no lock (in particular not `snapshot_active_composition`'s policy
+lock, which the engine's bounded admission also takes); the over-limit alert
+is advisory.
+
+**Stale pages.** A draft re-saved after the operator's review fails
+publication (`RevisionConflict`, under the message row lock): unreviewed
+audio is never published. A clear or decline acts on the exact UUID with its
+expected state: a stale clear of a superseded message reports "already
+cleared" and never touches the replacement; a stale decline of a message
+published meanwhile is refused. A stale expiry form (someone changed the
+expiry since) is refused (`expiry_changed`). A repeated publication or clear
+is reported, not repeated. The page's script sends each form once; the
+services are idempotent regardless.
+
+**Expiry** is entered in station time (the page names the zone); a local
+time the station clock skips or repeats at a DST change is refused, never
+guessed. The board distinguishes an approaching expiry (within an hour), an
+expiry that has passed while the message is still ACTIVE ("not yet expired by
+the sweep" — EXPIRED is set only by `expire_due_messages`), and EXPIRED.
+
+**Replay Now while the gate is closed** (every installation until Phase G):
+the button is disabled and names why, and the server refuses the POST BEFORE
+calling `request_manual_replay` — no dormant execution is ever created as if
+it were a live replay. With the gate open (tests patch it; Phase G's cutover
+opens it), the token issued with the page makes a double click or Back +
+resubmit resolve to the same airing ("already requested"); an unfinished
+airing absorbs a new request ("absorbed"); refusals (nothing active, limits,
+an earlier composition still with the engine, another operator's token) are
+reported and create nothing; a new airing is reported as not on air until
+the engine starts it. The board never opens the gate and never sends an
+engine command.
 
 ## Generation and lock order
 
@@ -775,3 +860,21 @@ and untouched.
   unchanged.
 * No engine, renderer, GStreamer or service change; `NATIVE_AIRING_AVAILABLE`
   stays False.
+
+## Release notes for D3D
+
+* No migration, no new table, field, capability or setting.
+* New control-only pages under `/iportal/messages/board/` (inside the existing
+  `/iportal/` GroupAccess prefix); templates are self-contained (no new static
+  files).
+* `activate_message(expected_revision=...)` and
+  `set_message_expiry(expected_expires_at=...)` are optional; existing callers
+  are unchanged.
+* The recorder contract gains `hub_links(user)` (default none); the hub lists
+  it under the tool's one entry. The active-message adapter's Back link
+  returns to the board when opened from it by control.
+* No engine, renderer, worker, GStreamer, OGRemote, Weather/AMBER or service
+  change; `NATIVE_AIRING_AVAILABLE` stays False and Replay Now is refused
+  before the service while the gate is closed.
+* Not in D3D (D3E): monitoring, retention, failure recovery and worker
+  packaging.

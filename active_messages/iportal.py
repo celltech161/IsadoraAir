@@ -121,6 +121,12 @@ class ActiveMessageAdapter(RecordingAdapter):
         return services.can(user, services.PRODUCE) and authority.assigned_types(user).filter(
             delivery_mode__in=ACTIVE_MESSAGE_MODES).exists()
 
+    def hub_links(self, user):
+        # One hub entry for the whole subsystem: control also gets the board.
+        if getattr(user, "is_authenticated", False) and services.can(user, services.CONTROL):
+            return (("My messages", "/iportal/messages/"), ("Operator board", "/iportal/messages/board/"))
+        return ()
+
     def authorize_subject(self, user, subject, operation):
         verdict = access(user, subject.message)
         if not verdict.visible:
@@ -233,7 +239,10 @@ class ActiveMessageAdapter(RecordingAdapter):
             purpose=purpose, allowed_operations=tuple(operations),
             max_duration_seconds=float(policy.max_message_seconds), max_bytes=PLATFORM_MAX_BYTES,
             revision=services.message_revision(message), current=current, display=tuple(display),
-            return_url=reverse("active_messages:my-messages"),
+            # Opened from the operator board (D3D): Back returns there -- for control only.
+            return_url=reverse("active_messages:board"
+                               if request.GET.get("from") == "board" and services.can(request.user, services.CONTROL)
+                               else "active_messages:my-messages"),
             blocked_reason="" if verdict.writable else verdict.reason,
             air_label=air_label, terms=terms,
         )

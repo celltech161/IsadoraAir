@@ -1,0 +1,66 @@
+{% with m=row.message %}
+<div class="amb-wide">
+  {% if row.preview_url %}
+  <audio controls preload="none" src="{{ row.preview_url }}" aria-label="Preview {{ m.title|default:m.content_type.name }}"></audio>
+  <div class="amb-note">Preview plays in this browser only; it never reaches the station output.</div>
+  {% endif %}
+  {% if not row.audio.ok %}<div class="amb-note warn" data-audio-problem="{{ row.audio.code }}">{{ row.audio.label }}</div>{% endif %}
+</div>
+<dl class="amb-facts">
+  <dt>Class</dt><dd>{{ m.get_kind_display }}</dd>
+  <dt>Type</dt><dd>{{ m.content_type.name }} <span class="amb-muted">({{ m.content_type.key }})</span>{% if row.problem %} — <strong>{{ row.problem }}</strong>{% endif %}</dd>
+  <dt>Producer</dt><dd>{{ m.producer_username|default:m.producer_key }}</dd>
+  <dt>State</dt><dd>{{ m.get_state_display }}{% if row.on_air %} — <strong>on air now</strong>{% elif m.state == "active" %} — {% if gate_open %}not on air now{% else %}not airing (native airing closed){% endif %}{% endif %}</dd>
+  <dt>Created</dt><dd>{{ m.created_at|date:"Y-m-d H:i T" }}</dd>
+  {% if m.activated_at %}<dt>Published</dt><dd>{{ m.activated_at|date:"Y-m-d H:i T" }}{% if m.activated_by_username %} by {{ m.activated_by_username }}{% endif %}</dd>{% endif %}
+  {% if m.state == "active" %}
+  <dt>Replay</dt><dd>every {{ m.replay_interval_seconds }} s (frozen at publication){% if row.next_due %}; next due {{ row.next_due|date:"H:i T" }}{% endif %}</dd>
+  {% elif m.state == "prepared" %}
+  <dt>Publishing</dt><dd>{% if row.needs_operator %}needs an operator (no producer self-publish){% else %}its producer may also publish it{% endif %}</dd>
+  {% endif %}
+  <dt>Expiry</dt><dd data-expiry>{{ row.expiry.label }}</dd>
+  {% if row.replaces %}<dt>Replaces</dt><dd>publishing clears “{{ row.replaces.title|default:row.replaces.content_type.name }}” (same producer and type)</dd>{% endif %}
+  {% if m.terminal_at %}<dt>Ended</dt><dd>{{ m.terminal_at|date:"Y-m-d H:i T" }}{% if m.terminal_by_username %} by {{ m.terminal_by_username }}{% endif %}{% if m.terminal_reason %} — {{ m.terminal_reason }}{% endif %}</dd>{% endif %}
+  {% if m.superseded_by_id %}<dt>Replaced by</dt><dd><a href="{% url 'active_messages:board-message' m.superseded_by_id %}">{{ m.superseded_by_id|stringformat:"s"|slice:":8" }}</a></dd>{% endif %}
+  <dt>ID</dt><dd class="amb-id">{{ m.pk }}</dd>
+</dl>
+<div>
+  <div class="amb-actions">
+    {% if m.state == "prepared" %}
+      {% if row.publishable %}
+      <form method="post" action="{% url 'active_messages:board-publish' m.pk %}">{% csrf_token %}
+        <input type="hidden" name="revision" value="{{ row.revision }}">
+        <input type="hidden" name="return" value="{{ return_query }}">
+        <button type="submit" class="amb-btn primary" data-action="publish">{% if row.replaces %}Publish replacement{% else %}Publish{% endif %}</button>
+      </form>
+      {% else %}
+      <span class="amb-note warn" data-blocked>Cannot publish: {{ row.blocked }}</span>
+      {% endif %}
+      <a class="amb-btn danger" data-action="decline" href="{% url 'active_messages:board-decline' m.pk %}{% if return_query %}?{{ return_query }}{% endif %}">Decline…</a>
+      <a class="amb-btn" href="{{ row.recorder_url }}">Recorder</a>
+    {% elif m.state == "active" %}
+      <a class="amb-btn danger" data-action="clear" href="{% url 'active_messages:board-clear' m.pk %}{% if return_query %}?{{ return_query }}{% endif %}">Clear…</a>
+      <a class="amb-btn" href="{{ row.recorder_url }}">Recorder</a>
+    {% endif %}
+    {% if not detail %}<a class="amb-btn" href="{{ row.detail_url }}{% if return_query %}?{{ return_query }}{% endif %}">History</a>{% endif %}
+  </div>
+  {% if m.state == "prepared" or m.state == "active" %}
+  <details class="amb-sub">
+    <summary>Set expiry ({{ station_tz }})</summary>
+    <form method="post" action="{% url 'active_messages:board-expiry' m.pk %}">{% csrf_token %}
+      <input type="hidden" name="return" value="{{ return_query }}">
+      <input type="hidden" name="expected" value="{% if m.expires_at %}{{ m.expires_at.isoformat }}{% endif %}">
+      <label class="amb-sr" for="exp-{{ m.pk }}">Expiry for {{ m.title|default:m.content_type.name }} (station time, {{ station_tz }})</label>
+      <input type="datetime-local" id="exp-{{ m.pk }}" name="expires_at" value="{{ row.expiry.local_input|default:'' }}" required>
+      <button type="submit" class="amb-btn">Set</button>
+      {% if m.expires_at %}<button type="submit" class="amb-btn" name="remove" value="1" formnovalidate>Remove expiry</button>{% endif %}
+    </form>
+  </details>
+  {% endif %}
+</div>
+{% if not detail and row.events %}
+<ul class="amb-events amb-wide" aria-label="Recent history">
+  {% for item in row.events %}<li><time datetime="{{ item.event.created_at.isoformat }}">{{ item.event.created_at|date:"M j H:i" }}</time> <b>{{ item.label }}</b> · {{ item.actor }}{% for key, value in item.facts %}{% if key == "reason" %} — {{ value }}{% endif %}{% endfor %}</li>{% endfor %}
+</ul>
+{% endif %}
+{% endwith %}

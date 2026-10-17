@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Airing {{ execution.pk|stringformat:"s"|slice:":8" }} — Operator board — IsadoraAir{% endblock %}
+{% block extra_css %}{% include "active_messages/_board_style.html" %}{% endblock %}
+{% block content %}
+<div class="amb" id="amAiring" data-execution="{{ execution.pk }}" data-execution-state="{{ execution.state }}">
+  <header class="amb-head">
+    <h1>Airing {{ execution.pk|stringformat:"s"|slice:":8" }} · {% if airing.on_air %}● On air{% else %}{{ execution.get_state_display }}{% endif %}</h1>
+    <nav aria-label="Back"><a href="{{ back_url }}">‹ Operator board</a></nav>
+  </header>
+  <p class="amb-note">{% if execution.started_at %}Air evidence: the engine's first real program buffer at {{ execution.started_at|date:"H:i:s T" }}.{% else %}No air evidence: this airing has not been on air{% if execution.state == "accepted" or execution.state == "claimed" %} (accepted or claimed is not air){% endif %}.{% endif %}{% if not gate_open %} Native airing is closed.{% endif %}</p>
+  <dl class="amb-facts">
+    <dt>Why</dt><dd>{{ execution.get_reason_display }}{% if execution.requested_by_username %} — {{ execution.requested_by_username }}{% endif %}</dd>
+    <dt>State</dt><dd>{{ execution.get_state_display }}{% if execution.failure_code %} — <strong>{{ execution.failure_code }}</strong>{% if execution.failure_detail %}: {{ execution.failure_detail }}{% endif %}{% endif %}</dd>
+    <dt>Created</dt><dd>{{ execution.created_at|date:"Y-m-d H:i:s T" }} (due {{ execution.due_at|date:"H:i:s" }})</dd>
+    {% if execution.ready_at %}<dt>Ready</dt><dd>{{ execution.ready_at|date:"H:i:s T" }}</dd>{% endif %}
+    {% if execution.accepted_at %}<dt>Accepted</dt><dd>{{ execution.accepted_at|date:"H:i:s T" }} (queued — not air)</dd>{% endif %}
+    {% if execution.claimed_at %}<dt>Claimed</dt><dd>{{ execution.claimed_at|date:"H:i:s T" }} (deck opening — not air)</dd>{% endif %}
+    {% if execution.started_at %}<dt>Started</dt><dd>{{ execution.started_at|date:"H:i:s T" }}</dd>{% endif %}
+    {% if execution.ended_at %}<dt>Ended</dt><dd>{{ execution.ended_at|date:"H:i:s T" }}{% if execution.confirmed_duration_seconds %} ({{ execution.confirmed_duration_seconds }} s){% endif %}</dd>{% endif %}
+    {% if execution.terminal_at %}<dt>Final</dt><dd>{{ execution.terminal_at|date:"Y-m-d H:i:s T" }}</dd>{% endif %}
+    <dt>Attempts</dt><dd>{{ execution.attempt_count }}</dd>
+    <dt>Generation</dt><dd>{{ execution.policy_generation }}</dd>
+    <dt>Length</dt><dd>{{ accounted_seconds|default:"—" }} s accounted{% if stinger %} (stinger {{ stinger.key }}){% elif stinger_unavailable %} (stinger unavailable: {{ stinger_unavailable }}){% endif %}</dd>
+    <dt>Digest</dt><dd class="amb-id">{{ execution.composition_digest }}</dd>
+    <dt>ID</dt><dd class="amb-id">{{ execution.pk }}</dd>
+    {% if execution.mix_media_id %}<dt>Aggregate</dt><dd class="amb-id">{{ execution.mix_media_id }}</dd>{% endif %}
+  </dl>
+
+  <details class="amb-panel" open>
+    <summary>Messages in this airing <span class="amb-muted">· {{ components|length }}, in airing order</span></summary>
+    <div><table class="amb-table">
+      <thead><tr><th>#</th><th>Message</th><th>Class</th><th class="wide">Type</th><th>Producer</th><th>Length</th></tr></thead>
+      <tbody>{% for c in components %}<tr><td>{{ forloop.counter }}</td><td><a href="{{ c.url }}">{{ c.title|default:c.message|truncatechars:40 }}</a></td>
+        <td>{% if c.kind == "urgent" %}Urgent{% else %}PA{% endif %}</td><td class="wide">{{ c.content_type_key|default:"—" }}</td>
+        <td>{{ c.producer_username }}</td><td>{{ c.duration_seconds }} s</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </details>
+
+  <details class="amb-panel">
+    <summary>Events <span class="amb-muted">· {{ events|length }}{% if events_capped %}+ (latest shown){% endif %}</span></summary>
+    <div><ul class="amb-events">
+      {% for item in events %}<li data-event="{{ item.event.event }}"><time datetime="{{ item.event.created_at.isoformat }}">{{ item.event.created_at|date:"Y-m-d H:i:s T" }}</time> <b>{{ item.label }}</b> · {{ item.actor }}{% if item.event.to_state %} → {{ item.event.to_state }}{% endif %}{% if item.facts %}<div class="facts">{% for key, value in item.facts %}{{ key }}: {{ value }}{% if not forloop.last %} · {% endif %}{% endfor %}</div>{% endif %}</li>
+      {% empty %}<li>No events.</li>{% endfor %}
+    </ul></div>
+  </details>
+</div>
+{% endblock %}

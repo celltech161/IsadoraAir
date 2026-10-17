@@ -13,6 +13,7 @@
     <li style="margin:0.75rem 0; padding:0.75rem; border:1px solid var(--border,#333); border-radius:8px;">
       <a href="{{ tool.entry_url }}" style="font-weight:600; color:var(--accent);">{{ tool.label }}</a>
       <div style="color:var(--text-muted); font-size:0.85rem;">{{ tool.description }}</div>
+      {% if tool.links %}<div style="font-size:0.85rem; margin-top:0.25rem;">{% for link in tool.links %}<a href="{{ link.url }}" style="color:var(--accent);">{{ link.label }}</a>{% if not forloop.last %} · {% endif %}{% endfor %}</div>{% endif %}
     </li>
     {% endfor %}
   </ul>
