@@ -37,7 +37,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D3B** | the producer workspace: "My Messages" (`/iportal/messages/`) and the shared iPortal recorder on one exact message (adapter `active-message`); Save audio ≠ Publish; producer recall/discard | **no** — gate still closed |
 | D3C | regular produced content through a managed Phase-C spoken backend, TEST / NO AIR, "My Content" (docs/PRODUCED_CONTENT.md) -- no active-message change | gate still closed |
 | **D3D** | the operator board (`/iportal/messages/board/`): review and publish across producers, clear, decline, expiry, Replay Now (unavailable while the gate is closed), airing and event visibility | **no** — gate still closed; Replay Now refuses before the service |
-| D3E | monitoring, retention, failure recovery, worker packaging | gate still closed |
+| D3E-A | worker lifecycle and recovery hardening: expiry while a composition is blocked, one loop cadence, signals and connections, the worker heartbeat / readiness contract | **no** — gate still closed |
+| D3E-B+ | managed worker unit + Monitoring (B), retention (C), long-session board polling (D) | gate still closed |
 
 ## Authority
 
@@ -821,6 +822,127 @@ classified the same way). Nothing was special-cased.
 Tests open it only with an explicit patch. Production cutover (Phase G) needs
 that code change; D2B does not make it. Legacy OGRemote stays authoritative
 and untouched.
+
+## Worker lifecycle and readiness (D3E-A)
+
+**Expiry while a composition is blocked.** A permanently failed composition
+(`input_unavailable`, `provenance_mismatch`, `rendition_invalid`,
+`aggregate_too_long`, `render_failed`) is never re-rendered at the same
+generation -- but it must never hold back the expiry that changes it. Until
+D3E-A the worker decided "blocked" BEFORE calling
+`materialize_due_execution`, so the expiry sweep inside it never ran while
+blocked (an expired message stayed ACTIVE). Now the decision is made INSIDE
+`materialize_due_execution(blocking_codes=...)`, under the policy lock and
+after its expiry sweep and stale suppression: the occurrence it would create
+is built, and only if the newest execution FAILED with a blocking code at the
+current generation for exactly that digest is none created
+(`CompositionBlocked`, raised after the sweep commits). An expiry makes a new
+generation, so the changed set is assessed afresh in the same pass. One
+transaction instead of two (the worker no longer calls
+`snapshot_active_composition`, which took the policy lock and hashed the
+stinger every blocked pass). Callers without `blocking_codes` are unchanged.
+
+**One loop cadence.** `worker.run_forever` is the management command's loop
+and the only definition of when to wait: after every pass that made no
+progress -- idle (a READY aggregate behind the closed gate reports
+`idle`/`gated`), busy, blocked, backoff, retry, error and every `playout`
+result (publication backoff/retry, in flight, accepted, claimed, started:
+their recovery is time-based and evidence-driven, never "as fast as
+possible"; the engine-held step takes the policy lock) -- it waits
+`POLL_SECONDS` (5 s). Progress (ready, reused, failed, superseded) continues
+at once, at most `MAX_PROGRESS_PASSES` (10) passes in a row. A freshly READY
+aggregate is still published and dispatched in the same pass (gate
+permitting). Until D3E-A the command's own list omitted `playout`: once
+native playout became reachable it would have polled the database -- and the
+policy lock -- without pause.
+
+**Signals and connections.** SIGTERM/SIGINT are honoured between passes and
+within a wait (0.5 s slices), never by abandoning a pass mid-way (a render in
+progress finishes or is abandoned only by process death, which the existing
+reuse/retry recovery covers). A database failure closes the connection (the
+session advisory lock dies with it), is reported as `error` and waits; any
+other exception ends the process for its supervisor to restart. A clean stop
+closes the connection. `--once` runs one pass and closes the connection.
+
+### Heartbeat and readiness contract (for D3E-B)
+
+The established IsadoraAir pattern (aircheck's state file, Liquidsoap's,
+Monitoring's self-health): the worker process writes one small fixed-shape
+JSON file, atomically and best-effort, at
+`settings.ACTIVE_MESSAGE_WORKER_STATE_PATH` (default
+`/run/isadoraair/active_message_worker.json`); readers only read it
+(`active_messages.heartbeat`). No database row or migration: the state is per
+process, and a database heartbeat would write every 5 s into the database the
+engine's admission path locks.
+
+| Written | When |
+| --- | --- |
+| `phase: starting`, `recent_starts` | at start-up (restarts within 15 min are counted from the previous file) |
+| `phase: rendering`, `render_deadline` | just before each render (its own bounded timeout + 120 s): a long render is not a stale worker |
+| `phase: polling`, result / code / execution, `repeats`, `last_progress_at`, `consecutive_errors` | after every loop cycle |
+| `phase: stopped` | on a clean stop |
+
+`heartbeat.assess(state, now=, gate_open=)` (pure) and
+`heartbeat.readiness()` (reads the file and the gate with SELECTs only; it
+never creates the policy singleton, renders, expires or materializes):
+
+| Condition | Status | Meaning |
+| --- | --- | --- |
+| `idle` | ok | polling, nothing due |
+| `ready_waiting_for_gate` | ok | a READY aggregate behind the CLOSED gate -- expected until Phase G |
+| `working`, `rendering`, `retry_backoff`, `playout_in_flight`, `busy` | ok | progress, a render within its deadline, backing off, with publication/engine, a skipped pass |
+| `blocked` | warning | the current composition failed permanently (its SystemEvent names the cause) |
+| `lock_held_elsewhere` | warning | 12 consecutive `busy` passes (~1 min): another holder of the worker lock |
+| `database_errors` | warning | a pass failed on the database; the connection was closed |
+| `malfunction` | critical | 3 consecutive database failures |
+| `render_overdue` | critical | a render past its deadline |
+| `stale` | critical | no record for 60 s while polling |
+| `crash_looping` | critical | 3 starts within 15 minutes |
+| `stopped` | critical | a clean stop (a managed unit should be running) |
+| `no_heartbeat` | unknown | no readable file |
+
+`detail.native_airing` is `closed`/`open` and never degrades the status.
+
+**D3E-B dependencies** (not done here): a managed `isadoraair-active-message-worker`
+unit (a signed protected-policy change) with `RuntimeDirectory=isadoraair`
+and `RuntimeDirectoryPreserve=yes` (or an equivalent writable state path) so
+the heartbeat survives restarts; `Restart=on-failure`; a `TimeoutStopSec`
+that tolerates finishing a pass (killing mid-render is safe -- the next pass
+reuses or re-renders -- but should be the exception); the unit's ordering
+after PostgreSQL and `isadoraair-render`; a Monitoring probe built on
+`heartbeat.readiness()` combined with systemd's ActiveState/NRestarts (as
+`monitoring/services/self_health.py` does); and dashboard presentation.
+
+### Crash and interruption boundaries (audited in D3E-A)
+
+| Boundary | Behaviour | Evidence |
+| --- | --- | --- |
+| crash before due materialization commits | nothing is created; the next pass creates it | `CrashBoundaryTests` (new) |
+| crash after creation, before rendering | the same PENDING_RENDER execution is rendered next pass | `CrashBoundaryTests` (new) |
+| crash during rendering / after the rendition, before binding | reuse of the proven rendition, else a fresh render | `test_a_crash_between_render_and_bind_is_recovered_by_reuse` (existing) |
+| crash after READY | never re-rendered; waits behind the closed gate | `CrashBoundaryTests` (new) |
+| renderer unavailable / unvalidated rendition | `render_retry`, exponential backoff, attention after 3 | existing binding tests |
+| frozen stinger pin unusable; crash before reconciliation | exactly one reconciliation, on the next pass | `test_reconciliation_is_idempotent_and_survives_a_crash_before_it` (existing) |
+| retryable publication failure | same READY execution, backoff, nothing else materialized | `test_playout_publication` (existing) |
+| advisory-lock contention | `busy`, nothing touched | `CrashBoundaryTests`, `test_two_workers_render_one_execution_once` |
+| SIGTERM idle / working | stops within a wait slice / after the pass | `LoopCadenceTests`, `CommandLoopTests` (new) |
+| expiry while blocked | expired under the lock, one event, one generation | `BlockedExpiryTests`, `BlockedExpiryRaceTests` (new; previously broken) |
+
+No engine-side playback authority or air-evidence rule changed. An uncertain
+air state is never converted into a completed airing or a retry.
+
+### Phase G requirement: OGRemote and native coexistence (recorded, not implemented)
+
+Producers will migrate to native iPortal gradually. **OGRemote must remain
+available and operating for producers not yet migrated after native airing is
+introduced, until the station explicitly authorizes its retirement.** Before
+simultaneous broadcast delivery is allowed, Phase G must define: exact
+producer and message ownership (which authority owns each producer, and how
+ownership moves); legacy aggregate membership; duplicate prevention (the same
+message never airing from both); insertion scheduling between the two
+aggregates and Weather/AMBER; and rollback behaviour. The global
+native-airing gate alone cannot prove safe mixed-authority operation. No
+authority switch or OGRemote teardown belongs before Phase G.
 
 ## Release notes for D1
 

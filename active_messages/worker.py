@@ -9,9 +9,12 @@ One pass (``run_once``):
 2. obtain the one current occurrence from D1 authority
    (``services.materialize_due_execution``: expiry first, stale airings
    suppressed, the unfinished execution coalesced, else a due one created) --
-   unless the CURRENT composition already failed permanently at this
-   generation (``blocked``: re-rendering identical inputs cannot succeed; an
-   operator change -- clear, replacement, a limit -- makes a new generation);
+   unless the due occurrence is exactly the composition that already failed
+   permanently at this generation (``blocked``: re-rendering identical inputs
+   cannot succeed; an operator change -- clear, replacement, a limit -- or an
+   expiry makes a new generation). D3E-A: that decision is made INSIDE the
+   service's transaction, after its expiry sweep, so a blocked composition
+   never holds back the expiry that changes it;
 3. if it is PENDING_RENDER: honour its retry backoff, then REUSE a rendition
    proven to be exactly its frozen aggregate, or RENDER one (no database lock
    is held while the render service works), then BIND it
@@ -56,14 +59,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 
-from django.db import connection
+from django.db import Error as DatabaseFailure
+from django.db import close_old_connections, connection
 from django.utils import timezone
 
 from production.services.render import client
 from production.services.render.engine import RenderError
 
-from . import playout, rendering, services
-from .models import UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessageEvent, ExecutionState
+from . import heartbeat, playout, rendering, services
+from .models import ActiveBroadcastExecution, ActiveBroadcastMessageEvent, ExecutionState
 
 # (namespace, key) of the worker's session advisory lock. "AMSG" as an int32.
 LOCK_NAMESPACE = 0x414D5347
@@ -85,13 +89,28 @@ _PERMANENT = {
     "rendition_invalid": "rendition_invalid",
 }
 POLL_SECONDS = 5.0
+# Loop cadence (D3E-A) -- the ONE definition, used by run_forever and so by
+# the management command. Only a pass that made progress may be followed at
+# once (there may be more work now); every other result waits POLL_SECONDS:
+# idle (incl. a READY aggregate behind the closed gate), busy, blocked,
+# backoff, retry, playout (an execution past rendering is with publication or
+# the engine -- its retries and recovery are time-based, never "as fast as
+# possible") and error. Even progress waits after MAX_PROGRESS_PASSES in a row.
+PROGRESS_RESULTS = heartbeat.PROGRESS_RESULTS
+MAX_PROGRESS_PASSES = 10
+PAUSE_SLICE_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
 class Outcome:
-    result: str                 # busy | idle | blocked | backoff | ready | reused | retry | failed | superseded | playout
+    # busy | idle | blocked | backoff | ready | reused | retry | failed | superseded | playout | error
+    result: str
     execution: str = ""
     code: str = ""
+
+
+def waits_after(outcome) -> bool:
+    return outcome.result not in PROGRESS_RESULTS
 
 
 @contextmanager
@@ -113,20 +132,6 @@ def _attention(code, execution_id, detail="", *, level="error"):
                detail={"execution": str(execution_id), "code": code,
                        "detail": services._bounded_detail(detail)},
                dedupe_key=f"active_messages|render|{code}")
-
-
-def _blocked() -> str:
-    """The code of a permanent failure of the CURRENT composition at the
-    CURRENT generation (re-rendering it cannot succeed), or ""."""
-    if ActiveBroadcastExecution.objects.filter(state__in=UNFINISHED_EXECUTION_STATES).exists():
-        return ""
-    last = ActiveBroadcastExecution.objects.order_by("-created_at", "-id").first()
-    if last is None or last.state != ExecutionState.FAILED or last.failure_code not in BLOCKING_CODES:
-        return ""
-    current = services.snapshot_active_composition()
-    if last.policy_generation == current["generation"] and last.composition_digest == current["digest"]:
-        return last.failure_code
-    return ""
 
 
 def _backoff_remaining(execution, now) -> float:
@@ -157,8 +162,11 @@ def _reconcile(failed):
 
 
 def _occurrence(now):
+    """The current occurrence; CompositionBlocked when it would be exactly the
+    permanently failed composition (decided after the expiry sweep, under the
+    policy lock)."""
     try:
-        return services.materialize_due_execution(now=now)
+        return services.materialize_due_execution(now=now, blocking_codes=BLOCKING_CODES)
     except services.CompositionIneligible:
         return None                     # already failed closed with operator attention (D1)
 
@@ -204,6 +212,9 @@ def process(execution, *, now=None, render_fn=rendering.render) -> Outcome:
     reusable = rendering.find_reusable(execution.composition_snapshot)
     if reusable is not None:
         return _bind(execution, reusable, "reused")
+    recorder = heartbeat.current()
+    if recorder is not None:                               # a render may last until its own deadline
+        recorder.rendering(execution.pk, rendering.timeout_seconds(execution.composition_snapshot))
     try:
         result = render_fn(execution)                       # no database lock held
     except RenderError as exc:
@@ -230,7 +241,10 @@ def run_once(*, now=None, render_fn=rendering.render) -> Outcome:
             return Outcome("playout", code=step)        # one execution past rendering is still in flight
         outcome = _render_pass(now, render_fn)
         if outcome.result in ("ready", "reused"):
-            playout.advance(now=now)                    # publish + dispatch at once (gate permitting)
+            step = playout.advance(now=now)             # publish + dispatch at once (gate permitting)
+        if outcome.result == "idle" and step == "gated":
+            # A READY aggregate waiting behind the closed native-airing gate: expected, not a failure.
+            outcome = Outcome("idle", outcome.execution, "gated")
         return outcome
 
 
@@ -253,10 +267,10 @@ def _render_pass(now, render_fn) -> Outcome:
         successor = _reconcile(orphan)
         if successor is not None and successor.state == ExecutionState.PENDING_RENDER:
             return process(successor, now=now, render_fn=render_fn)
-    blocked = _blocked()
-    if blocked:
-        return Outcome("blocked", code=blocked)
-    execution = _occurrence(now)
+    try:
+        execution = _occurrence(now)
+    except services.CompositionBlocked as exc:
+        return Outcome("blocked", code=exc.code)
     if execution is None or execution.state != ExecutionState.PENDING_RENDER:
         return Outcome("idle", "" if execution is None else str(execution.pk))
     outcome = process(execution, now=now, render_fn=render_fn)
@@ -270,8 +284,45 @@ def _render_pass(now, render_fn) -> Outcome:
     return outcome
 
 
-def run_forever(*, poll_seconds=POLL_SECONDS, stop=lambda: False, sleep=time.sleep) -> None:
+def _pause(seconds, stop, sleep) -> None:
+    """Wait ``seconds`` in short slices, returning as soon as ``stop()``."""
+    remaining = float(seconds)
+    while remaining > 0 and not stop():
+        step = min(PAUSE_SLICE_SECONDS, remaining)
+        sleep(step)
+        remaining -= step
+
+
+def run_forever(*, poll_seconds=POLL_SECONDS, stop=lambda: False, sleep=None, run=None, recorder=None,
+                report=None, refresh=None, close=None) -> None:
+    """The worker loop (the management command's). Waits after every pass that
+    made no progress (``waits_after``), and after MAX_PROGRESS_PASSES passes
+    of progress in a row; ``stop()`` is honoured between passes and within a
+    wait. A database failure closes the connection (a session advisory lock
+    dies with it) and waits; any other exception ends the process (its
+    supervisor restarts it -- the heartbeat counts such restarts). A clean
+    stop records "stopped" and closes the connection."""
+    sleep = sleep or (lambda seconds: time.sleep(seconds))
+    run = run or run_once
+    refresh = refresh or close_old_connections
+    close = close or (lambda: connection.close())
+    progressed = 0
     while not stop():
-        outcome = run_once()
-        if outcome.result in ("idle", "busy", "blocked", "backoff", "retry", "playout"):
-            sleep(poll_seconds)
+        try:
+            outcome = run()
+        except DatabaseFailure as exc:
+            close()
+            outcome = Outcome("error", code=type(exc).__name__)
+        if recorder is not None:
+            recorder.cycle(outcome)
+        if report is not None:
+            report(outcome)
+        if not waits_after(outcome) and progressed < MAX_PROGRESS_PASSES:
+            progressed += 1
+            continue
+        progressed = 0
+        _pause(poll_seconds, stop, sleep)
+        refresh()
+    if recorder is not None:
+        recorder.stopped()
+    close()

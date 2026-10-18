@@ -130,6 +130,17 @@ class CompositionIneligible(LimitExceeded):
         self.detail = detail
 
 
+class CompositionBlocked(ActiveMessageError):
+    """The occurrence that is due is exactly the composition whose newest
+    execution FAILED permanently at this generation: identical inputs cannot
+    render, so none is created (D3E-A). ``code`` is that failure code. Any
+    expiry done in the same pass still commits."""
+
+    def __init__(self, failure_code: str):
+        super().__init__(f"the current composition failed permanently ({failure_code}); an operator change "
+                         f"(clear, replacement, limit) makes a new one", code=failure_code)
+
+
 class NothingActive(ActiveMessageError):
     code = "nothing_active"
 
@@ -793,15 +804,21 @@ def _warn_stinger(code, key):
     transaction.on_commit(emit)
 
 
-def _create_execution(policy, messages, stinger, *, reason, due_at, now, event, actor_kind, user=None,
-                      request_token=None):
+def _built(messages, stinger):
+    """(snapshot, digest) of the aggregate ``messages`` would make now."""
     stinger_pin, unavailable, stinger_seconds = stinger
     try:
         snapshot = composition.build(messages, stinger_pin=stinger_pin, stinger_unavailable=unavailable,
                                      stinger_seconds=stinger_seconds)
     except composition.CompositionError as exc:
         raise LimitExceeded(str(exc), code=exc.code) from None
-    digest = composition.digest(snapshot)
+    return snapshot, composition.digest(snapshot)
+
+
+def _create_execution(policy, messages, stinger, *, reason, due_at, now, event, actor_kind, user=None,
+                      request_token=None, built=None):
+    unavailable = stinger[1]
+    snapshot, digest = built or _built(messages, stinger)
     execution = _store.insert(
         ActiveBroadcastExecution, id=uuid.uuid4(), reason=reason, state=X.PENDING_RENDER, open_slot=1,
         policy_generation=policy.generation, composition_digest=digest, composition_snapshot=snapshot,
@@ -816,7 +833,21 @@ def _create_execution(policy, messages, stinger, *, reason, due_at, now, event, 
     return execution
 
 
-def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
+def _blocking_failure(policy, digest, blocking_codes) -> str:
+    """The failure code when the NEWEST execution failed permanently
+    (``blocking_codes``) at this generation for exactly this composition, else
+    "" -- read under the caller's policy lock (the newest-first index)."""
+    if not blocking_codes:
+        return ""
+    last = (ActiveBroadcastExecution.objects.order_by("-created_at", "-id")
+            .values("state", "failure_code", "policy_generation", "composition_digest").first())
+    if (last is not None and last["state"] == X.FAILED and last["failure_code"] in blocking_codes
+            and last["policy_generation"] == policy.generation and last["composition_digest"] == digest):
+        return last["failure_code"]
+    return ""
+
+
+def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER, blocking_codes=frozenset()):
     """Create the one due airing if the active set is due, else return the
     unfinished one (coalesced), else None. Expiry runs first, in the same
     transaction: an expired message is never in a new airing.
@@ -826,9 +857,18 @@ def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
 
     An active set that breaks a policy limit is NOT aired: CompositionIneligible
     is raised (after the expiry/suppression work commits) and an operator
-    alert is raised."""
+    alert is raised.
+
+    ``blocking_codes`` (D3E-A, the worker's permanent render failures): when
+    the occurrence that would be created is exactly the composition whose
+    newest execution FAILED with one of them at this generation, none is
+    created and CompositionBlocked is raised -- AFTER the expiry and
+    suppression work commits. So a permanently failed composition blocks only
+    itself: an expiry still happens, makes a new generation, and the changed
+    set is assessed afresh in the same pass."""
     now = _now(now)
     refusal = None
+    blocked = ""
     with transaction.atomic():
         policy = _lock_policy()
         policy, _expired = _expire_locked(policy, now, actor_kind=actor_kind)
@@ -846,8 +886,14 @@ def materialize_due_execution(*, now=None, actor_kind=ActorKind.WORKER):
         except CompositionIneligible as exc:
             refusal = exc
         else:
-            return _create_execution(policy, messages, stinger, reason=ExecutionReason.SCHEDULED, due_at=min(due),
-                                     now=now, event="execution_materialized", actor_kind=actor_kind)
+            built = _built(messages, stinger)
+            blocked = _blocking_failure(policy, built[1], blocking_codes)
+            if not blocked:
+                return _create_execution(policy, messages, stinger, reason=ExecutionReason.SCHEDULED,
+                                         due_at=min(due), now=now, event="execution_materialized",
+                                         actor_kind=actor_kind, built=built)
+    if blocked:
+        raise CompositionBlocked(blocked)
     _alert_ineligible(refusal)
     raise refusal
 

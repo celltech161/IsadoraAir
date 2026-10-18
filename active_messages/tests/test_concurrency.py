@@ -263,3 +263,35 @@ class ReplayOutcomeRaceTests(Sessions):
         execution = ActiveBroadcastExecution.objects.get()
         self.assertIn(f"new airing {str(execution.pk)[:8]}", first["result"])
         self.assertIn(f"absorbed by the airing already in progress: {str(execution.pk)[:8]}", second["result"])
+
+
+class BlockedExpiryRaceTests(Sessions):
+    """D3E-A: two workers reach a permanently blocked composition just as one
+    of its messages expires -- one sweep, one generation step, one new
+    occurrence for the changed set, and no duplicate event."""
+
+    def test_two_workers_expire_once_and_share_the_new_occurrence(self):
+        from active_messages import worker
+        from active_messages.models import ActiveBroadcastMessageEvent
+        from production.services.render.engine import RenderError
+        now = timezone.now()
+        keep = self.active(kind="urgent", now=now)
+        going = self.active(now=now)
+        services.set_message_expiry(going, now + timedelta(seconds=60), actor=self.admin, now=now)
+        failed = worker.run_once(now=now, render_fn=mock.Mock(side_effect=RenderError("render_failed", "x")))
+        self.assertEqual(failed.result, "failed")
+        self.assertEqual(worker.run_once(now=now, render_fn=mock.Mock()).result, "blocked")
+        generation = services.current_policy().generation
+        later = now + timedelta(minutes=2)
+
+        def materialize():
+            return services.materialize_due_execution(now=later, blocking_codes=worker.BLOCKING_CODES)
+        first, second = self.race(materialize, materialize, "active_messages.services._expire_locked")
+        self.assertIsNone(first["error"])
+        self.assertIsNone(second["error"])
+        self.assertEqual(first["result"].pk, second["result"].pk)                 # coalesced
+        self.assertEqual([c["message"] for c in first["result"].composition_snapshot["components"]], [str(keep.pk)])
+        self.assertEqual(ActiveBroadcastMessage.objects.get(pk=going.pk).state, "expired")
+        self.assertEqual(ActiveBroadcastMessageEvent.objects.filter(event="expired").count(), 1)
+        self.assertEqual(services.current_policy().generation, generation + 1)
+        self.assertEqual(ActiveBroadcastExecution.objects.filter(state="pending_render").count(), 1)
