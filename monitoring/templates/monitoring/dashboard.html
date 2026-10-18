@@ -591,14 +591,44 @@ const SELF_HEALTH_CAPTIONS = {
   status_missing: "Running · no status",
   status_malformed: "Running · bad status",
   observer_error: "Unknown",
+  // D3E-B -- the active-message worker (probes._active_message_worker_readiness).
+  starting: "Starting",
+  service_failed: "Failed",
+  identity_unavailable: "Unknown",
+  no_heartbeat: "No heartbeat",
+  heartbeat_not_current: "Heartbeat not current",
+  stale: "Heartbeat stale",
+  malformed: "Bad heartbeat",
+  stopped: "Stopped",
+  crash_looping: "Crash loop",
+  render_overdue: "Render overdue",
+  malfunction: "Database failing",
+  database_errors: "Database errors",
+  blocked: "Blocked",
+  lock_held_elsewhere: "Lock held elsewhere",
+  history_unverified: "Restart history unknown",
 };
+
+// D3E-B -- one short line for the active-message worker: what it is doing,
+// its last outcome / code, the execution, and the native-airing gate. Only
+// cards whose detail carries native_airing (that worker) get it.
+function workerLine(d) {
+  if (d.native_airing == null) return "";
+  const parts = [];
+  if (d.phase) parts.push(d.phase === "rendering" ? "Rendering" : d.phase === "starting" ? "First pass" : "Polling");
+  if (d.outcome) parts.push(`last ${d.outcome}${d.code ? ` (${d.code})` : ""}`);
+  if (d.execution) parts.push(`exec ${String(d.execution).slice(0, 8)}`);
+  parts.push(`native airing ${d.native_airing}`);
+  if (Number.isInteger(d.n_restarts) && d.n_restarts > 0) parts.push(`${d.n_restarts} auto-restarts`);
+  return `<div class="mon-card-detail">${escapeHtmlAttr(parts.join(" · "))}</div>`;
+}
 
 function renderSystemdBody(check) {
   const uptimeSeconds = check.detail && check.detail.uptime_seconds;
   const uptimeHours = uptimeSeconds != null ? (uptimeSeconds / 3600).toFixed(2) : null;
   const reason = check.detail && check.detail.reason;
   const caption = check.status === "ok" ? (check.detail && check.detail.at_capacity ? "Running · busy" : "Running")
-    : check.status === "unknown" ? "Unknown"
+    : check.status === "unknown" ? (reason === "starting" ? "Starting" : "Unknown")
     : (reason && SELF_HEALTH_CAPTIONS[reason]) || "Stopped";
   const heartbeatAge = check.detail && check.detail.heartbeat_age_seconds;
   const heartbeatLine = (reason && heartbeatAge != null)
@@ -619,6 +649,7 @@ function renderSystemdBody(check) {
     </div>
     ${heartbeatLine}
     ${limitsLine}
+    ${workerLine(d)}
     <div class="mon-uptime-row">
       <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
       ${restartable ? `<button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>` : ""}

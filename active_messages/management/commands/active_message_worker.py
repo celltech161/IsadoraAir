@@ -7,8 +7,9 @@ Renders happen in isadoraair-render; this process materializes the one due
 occurrence, asks for its exact aggregate, ingests and binds it
 (PENDING_RENDER -> READY). With the native-airing gate closed (every station
 until Phase G) it never publishes, never sends an engine command and nothing
-airs. D2A ships no systemd unit for it: deploying it is a D3E-B release
-decision (a new managed unit is a signed protected-policy change).
+airs. D3E-B: deploy/isadoraair-active-message-worker.service runs the loop
+(start gate: active_message_worker_ready); installing it is a signed
+protected-policy change carried by a release, never a manual install.
 
 D3E-A: the loop is ``worker.run_forever`` -- its ONE cadence rule (wait after
 every pass that made no progress, playout included), SIGTERM/SIGINT honoured

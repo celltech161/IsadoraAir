@@ -42,7 +42,7 @@ def probe_systemd(check):
     try:
         result = subprocess.run(
             ["systemctl", "show", check.systemd_unit,
-             "--property=ActiveState,SubState,ActiveEnterTimestamp,NRestarts"],
+             "--property=ActiveState,SubState,ActiveEnterTimestamp,NRestarts,MainPID,ExecMainStartTimestamp"],
             capture_output=True, text=True, timeout=5, check=False,
             env=_UTC_ENV,
         )
@@ -59,14 +59,9 @@ def probe_systemd(check):
     sub_state = props.get("SubState", "")
     detail = {"active_state": active_state, "sub_state": sub_state}
 
-    since_raw = props.get("ActiveEnterTimestamp", "")
-    if since_raw:
-        try:
-            entered = datetime.strptime(since_raw, "%a %Y-%m-%d %H:%M:%S %Z")
-            entered = entered.replace(tzinfo=timezone.utc)
-            detail["uptime_seconds"] = max(0, time.time() - entered.timestamp())
-        except ValueError:
-            pass
+    entered = _systemd_epoch(props.get("ActiveEnterTimestamp", ""))
+    if entered is not None:
+        detail["uptime_seconds"] = max(0, time.time() - entered)
 
     readiness = APPLICATION_READINESS.get(check.systemd_unit)
     if readiness is not None:
@@ -74,6 +69,16 @@ def probe_systemd(check):
     if active_state != "active":
         return "critical", detail
     return "ok", detail
+
+
+def _systemd_epoch(raw):
+    """A `systemctl show` timestamp (UTC, see _UTC_ENV) as epoch seconds, or None."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%a %Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
 
 
 # r0108 -- first-party units whose systemd state alone does not prove they can
@@ -173,7 +178,73 @@ def _render_readiness(check, props, detail):
     return ("warning" if readiness["reason"] in render_health.DEGRADED_REASONS else "critical"), detail
 
 
-APPLICATION_READINESS = {VALIDATION_UNIT: _validation_readiness, RENDER_UNIT: _render_readiness}
+ACTIVE_MESSAGE_WORKER_UNIT = "isadoraair-active-message-worker.service"
+
+
+def _active_message_worker_readiness(check, props, detail):
+    """isadoraair-active-message-worker (D3E-B): systemd state, automatic-
+    restart evidence and the worker's D3E-A heartbeat -- read through
+    active_messages.supervision.observe, which accepts the heartbeat only once
+    it is proven to come from the running process (MainPID and
+    ExecMainStartTimestamp; a file left by an earlier process never counts)
+    and otherwise reports exactly active_messages.heartbeat's own verdict.
+
+    critical -- not active (failed, stopped, between automatic restarts), or
+                active with a stale / malformed / future-dated / not-current
+                heartbeat, none after the start-up grace, a render past its
+                deadline, a crash loop, repeated database failures, a
+                recorded stop;
+    warning  -- blocked composition, the worker lock held elsewhere, database
+                errors, unverifiable restart history, or an automatic restart
+                since the previous poll;
+    unknown  -- starting (start gate running, or no current heartbeat yet
+                within the grace), MainPID unavailable, observer error;
+    ok       -- running with a fresh current heartbeat: idle, a READY
+                aggregate waiting behind the CLOSED native-airing gate (the
+                expected state until Phase G), rendering within its deadline,
+                retry backoff, in-flight playout, working.
+    Read-only (a file read; the gate by SELECT at most). The Restart button
+    is withheld: this unit is not in the protected operator-restart
+    allowlist, and Monitoring never restarts it."""
+    detail["restart_via_dashboard"] = False
+    try:
+        restarts = int(props.get("NRestarts", ""))
+    except ValueError:
+        restarts = None
+    detail["n_restarts"] = restarts
+    previous = _last_restarts.get(check.id)
+    _last_restarts[check.id] = restarts
+    active_state, sub_state = detail["active_state"], detail["sub_state"]
+    if active_state != "active":
+        if active_state == "activating" and sub_state != "auto-restart":
+            detail["reason"] = "starting"                 # the start gate decides; never ok meanwhile
+            return "unknown", detail
+        detail["reason"] = ("restarting" if active_state == "activating" or sub_state == "auto-restart"
+                            else "service_failed" if active_state == "failed" else "service_inactive")
+        return "critical", detail
+    try:
+        main_pid = int(props.get("MainPID", ""))
+    except ValueError:
+        main_pid = None
+    try:
+        from active_messages import supervision
+        observed = supervision.observe(main_pid=main_pid,
+                                       process_started_at=_systemd_epoch(props.get("ExecMainStartTimestamp", "")),
+                                       now=time.time())
+    except Exception as exc:  # noqa: BLE001 -- an observer bug is "unknown", never a crash
+        detail["reason"] = "observer_error"
+        detail["error"] = type(exc).__name__              # never the message: no paths or database text
+        return "unknown", detail
+    detail.update(observed["detail"])
+    status, reason = observed["status"], observed["condition"]
+    if status == "ok" and restarts is not None and previous is not None and restarts > previous:
+        status, reason = "warning", "restarted"           # recovered from a crash; crash loops are the heartbeat's
+    detail["reason"] = reason
+    return status, detail
+
+
+APPLICATION_READINESS = {VALIDATION_UNIT: _validation_readiness, RENDER_UNIT: _render_readiness,
+                         ACTIVE_MESSAGE_WORKER_UNIT: _active_message_worker_readiness}
 
 
 def probe_disk(check):

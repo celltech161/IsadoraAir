@@ -1,0 +1,73 @@
+[Unit]
+Description=IsadoraAir active-message render worker (renders and binds; never airs while native airing is closed)
+Documentation=file://@@ISA_ROOT@@/docs/ACTIVE_MESSAGES.md
+After=network.target postgresql.service isadoraair-render.service isadoraair-validation.service
+# Renders run in isadoraair-render and renditions are validated by
+# isadoraair-validation. Wants=, not Requires=: without either, a render
+# attempt fails retryably (bounded backoff, operator attention) and the
+# worker stays alive -- a renderer outage is retryable work, not a reason to
+# stop this unit.
+Wants=isadoraair-render.service isadoraair-validation.service
+
+[Service]
+# Materializes the one due active-message occurrence, asks isadoraair-render
+# for its exact aggregate and binds it (PENDING_RENDER -> READY). With the
+# native-airing gate closed (active_messages.services.NATIVE_AIRING_AVAILABLE
+# is False -- every station until Phase G) it never publishes, never sends an
+# engine command and nothing airs. OGRemote stays authoritative.
+Type=simple
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+EnvironmentFile=@@ISA_ROOT@@/.env
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py active_message_worker
+# Start-up gate (D3E-B): a start job -- Update Center's `enable --now`
+# included -- completes only once THIS process (its $MAINPID and start time;
+# a heartbeat left by an earlier process never counts) has written a valid
+# heartbeat to /run/isadoraair/active_message_worker.json and finished its
+# first pass (or begun a render). Idle, blocked and gated-READY passes all
+# count: this proves the process and its loop, not domain progress, and it
+# never needs the database, a render or an active message. Read-only.
+ExecStartPost=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py active_message_worker_ready --pid ${MAINPID} --timeout 45
+TimeoutStartSec=90
+# The heartbeat directory is the SHARED /run/isadoraair from
+# isadoraair-tmpfiles.conf (0755, the station account; recreated at boot).
+# No RuntimeDirectory=: a unit-owned one would conflict with the shared
+# directory and would delete the heartbeat (and its crash-loop history) on
+# every stop.
+Restart=on-failure
+# 10 s after the first failure, growing to at most 2 minutes for a unit that
+# keeps failing; never a tight loop, never a permanent give-up.
+RestartSec=10
+RestartSteps=4
+RestartMaxDelaySec=120
+# SIGTERM stops the loop between passes and within a wait (at most one
+# 0.5 s slice) and records a clean stop. A render in progress is not waited
+# for: after 30 s systemd kills the process, and the next start renders the
+# same PENDING_RENDER execution again (D3E-A crash boundary) -- an Update
+# Center stop or restart is never held up by a long render.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# No capability, no privilege change, no real-time scheduling. File-system
+# protections are deliberately not used: the worker writes rendered media
+# beneath the application's media root and the heartbeat in the shared
+# runtime directory; PostgreSQL may be TCP or a Unix socket (AF_NETLINK only
+# for the resolver's interface query).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
