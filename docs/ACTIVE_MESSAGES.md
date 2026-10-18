@@ -38,7 +38,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | D3C | regular produced content through a managed Phase-C spoken backend, TEST / NO AIR, "My Content" (docs/PRODUCED_CONTENT.md) -- no active-message change | gate still closed |
 | **D3D** | the operator board (`/iportal/messages/board/`): review and publish across producers, clear, decline, expiry, Replay Now (unavailable while the gate is closed), airing and event visibility | **no** — gate still closed; Replay Now refuses before the service |
 | D3E-A | worker lifecycle and recovery hardening: expiry while a composition is blocked, one loop cadence, signals and connections, the worker heartbeat / readiness contract | **no** — gate still closed |
-| D3E-B+ | managed worker unit + Monitoring (B), retention (C), long-session board polling (D) | gate still closed |
+| D3E-B | the managed worker unit `isadoraair-active-message-worker.service` (start gate, bounded restart/stop), Monitoring of it, the next protected generation's signed-policy entry (unsigned source only; deployed by r0116) | **no** — gate still closed |
+| D3E-C+ | retention (C), long-session board polling (D) | gate still closed |
 
 ## Authority
 
@@ -955,18 +956,8 @@ to 30 seconds (default 5); zero, negative, non-finite or larger values are
 refused, so a waiting worker always records well within the 60 s staleness
 bound. A stop during the wait takes effect within 0.5 s.
 
-**D3E-B dependencies** (not done here): a managed `isadoraair-active-message-worker`
-unit (a signed protected-policy change) running as the station user (as
-Monitoring does, so the 0600 file is readable by it) and writing in the
-EXISTING `/run/isadoraair` (tmpfiles.d `d /run/isadoraair 0755 <station user>`,
-shared by several services) -- not a unit-owned `RuntimeDirectory`, which
-would conflict with that shared directory; the document then survives worker
-restarts (restart history) and is cleared at boot. Also `Restart=on-failure`;
-a `TimeoutStopSec` that tolerates finishing a pass (killing mid-render is safe
--- the next pass reuses or re-renders -- but should be the exception);
-ordering after PostgreSQL and `isadoraair-render`; a Monitoring probe built on
-`heartbeat.readiness()` with systemd's ActiveState/NRestarts (as
-`monitoring/services/self_health.py` does); dashboard presentation.
+**D3E-B** packages this contract as a managed unit and a Monitoring check --
+see "Managed worker unit and Monitoring (D3E-B)" below.
 
 ### Crash and interruption boundaries (audited in D3E-A)
 
@@ -998,6 +989,212 @@ message never airing from both); insertion scheduling between the two
 aggregates and Weather/AMBER; and rollback behaviour. The global
 native-airing gate alone cannot prove safe mixed-authority operation. No
 authority switch or OGRemote teardown belongs before Phase G.
+
+## Managed worker unit and Monitoring (D3E-B)
+
+### The unit
+
+`deploy/isadoraair-active-message-worker.service` runs
+`manage.py active_message_worker` (the D3E-A loop) as the station account
+(`@@ISA_USER@@`, never root) from the application root with the station
+`.env`. With the native-airing gate closed it materializes the one due
+occurrence, has `isadoraair-render` render the exact aggregate and binds it
+(PENDING_RENDER → READY) -- and stops there: no publication, no UrgentPA
+Track, no engine command, no LogItem/PlayEvent, no ACCEPTED/CLAIMED/STARTED.
+OGRemote remains the authority for remote producers; the unit does not name,
+order against or touch OGRemote, the engine, Weather/AMBER or the encoders.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `After=` | network, `postgresql`, `isadoraair-render`, `isadoraair-validation` | start after its dependencies when they are present |
+| `Wants=` | `isadoraair-render`, `isadoraair-validation` | weak: a renderer outage is retryable work (`render_retry`, backoff, attention after 3), never a reason for the worker to stop. No `Requires=`/`BindsTo=` |
+| Start gate | `ExecStartPost=manage.py active_message_worker_ready --pid ${MAINPID} --timeout 45`, `TimeoutStartSec=90` | below |
+| `Restart=` | `on-failure`, `RestartSec=10` growing (`RestartSteps=4`) to at most `RestartMaxDelaySec=120` | a crash or failed start is retried forever, never in a tight loop; a clean exit (SIGTERM) is not restarted |
+| Stop | `KillSignal=SIGTERM`, `TimeoutStopSec=30` | below |
+| Hardening | `NoNewPrivileges`, empty `CapabilityBoundingSet`/`AmbientCapabilities`, `PrivateTmp`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`, `RestrictRealtime`, `RestrictSUIDSGID`, `RestrictNamespaces`, `LockPersonality`, kernel module/log/tunable, clock and hostname protection, `SystemCallArchitectures=native` | no capability, privilege change or real-time scheduling. No file-system confinement (`ProtectSystem`/`ProtectHome`): the worker writes rendered media under the application's media root and its heartbeat in `/run/isadoraair`; PostgreSQL may be TCP or a Unix socket; the renderer is a Unix socket |
+| Runtime directory | none (`RuntimeDirectory=` deliberately absent) | below |
+
+`systemd-analyze security` rates the rendered unit 3.9 ("OK"; the spoken
+worker's unit is 8.7).
+
+### Heartbeat file: `/run/isadoraair/active_message_worker.json`
+
+The directory is the SHARED one from `deploy/isadoraair-tmpfiles.conf`
+(`d /run/isadoraair 0755 <station user> <station user> -`): created at boot by
+`systemd-tmpfiles`, used by the engine, Monitoring, Liquidsoap, aircheck and
+others. The unit does not own it (no `RuntimeDirectory=`, which would conflict
+with the shared directory and delete the heartbeat -- and its restart history
+-- on every stop) and never changes its ownership. The worker writes the file
+`0600` (atomic replace, D3E-A); Monitoring runs as the same station account,
+so it -- and nobody else -- can read it. The file survives worker restarts
+and is cleared at boot.
+
+### Start-up: process readiness, not domain progress
+
+A start job (including Update Center's `enable --now`) completes only when
+the gate (`active_messages.supervision.startup_failure`, read-only: the file
+and the process table, never the database) sees, within 45 s:
+
+* a heartbeat that validates under the D3E-A contract,
+* written by THIS process: its `pid` equals `$MAINPID` and its `started_at`
+  is not earlier than that process's start (less 2 s for whole-second
+  clocks) -- a file left by an earlier process, even a healthy-looking one,
+  never counts (a different pid, or, on pid reuse, a start before the new
+  process existed),
+* not a recorded stop, not future-dated, and
+* the first pass finished (`cycle ≥ 1`) or a render begun (`rendering`).
+
+Any first-pass outcome counts: idle (nothing active), `blocked`, a READY
+aggregate waiting behind the closed gate, a retryable render failure, even a
+database error (the process is up; Monitoring then warns). The gate never
+needs a render to complete, an active message or the database. It fails --
+and the start job with it -- if the process exits (immediately), cannot write
+its heartbeat (missing/unwritable directory) or never completes a pass; the
+unit then retries per `Restart=on-failure`.
+
+### Stop and forced termination
+
+SIGTERM ends the loop between passes or within one 0.5 s wait slice and
+records a clean stop (`phase: stopped`, exit 0, not restarted). A render in
+progress is not interrupted by SIGTERM; systemd kills the process after
+`TimeoutStopSec=30` so an Update Center stop/restart is never held up by a
+long render. The killed process leaves no clean-stop record; the next start
+records `previous: unclean` and renders the same PENDING_RENDER execution
+again (D3E-A crash boundary: reuse of a proven rendition, else a fresh
+render). Three such unclean ends within 15 minutes read as a crash loop --
+expected only if the unit is repeatedly stopped mid-render. An abnormal exit
+(crash, OOM, SIGKILL) is restarted after the restart delay.
+
+### Monitoring
+
+An ordinary **Systemd Service** check of exactly
+`isadoraair-active-message-worker.service`
+(`monitoring/services/probes.py`, `_active_message_worker_readiness`): one
+`systemctl show` (ActiveState, SubState, NRestarts, MainPID,
+ExecMainStartTimestamp) plus `active_messages.supervision.observe`, which
+reads the heartbeat with D3E-A's own decoder and verdict and accepts it only
+when it belongs to the running process (MainPID and ExecMainStartTimestamp, as
+the start gate does). Read-only: a file read and, only if native airing could
+ever be open, one SELECT of the gate; no policy row, execution, render,
+expiry or engine command. An observer failure is `unknown`
+(`observer_error`, exception type only), never a Monitoring crash.
+
+| Condition | Monitoring | reason |
+| --- | --- | --- |
+| active, fresh current heartbeat, idle | ok | `idle` |
+| READY waiting behind the closed native-airing gate | ok | `ready_waiting_for_gate` |
+| render in progress within its deadline | ok | `rendering` |
+| retry backoff; playout in flight; progress | ok | `retry_backoff` / `playout_in_flight` / `working` |
+| worker lock held elsewhere (12 busy passes) | warning | `lock_held_elsewhere` |
+| composition permanently blocked | warning | `blocked` |
+| database failure (1–2 in a row) | warning | `database_errors` |
+| 3 database failures in a row | critical | `malfunction` |
+| unverifiable previous restart history | warning | `history_unverified` |
+| automatic restart since the previous poll (heartbeat otherwise ok) | warning | `restarted` |
+| stale, malformed or future-dated heartbeat | critical | `stale` / `malformed` (`problem` says how) |
+| render past its deadline | critical | `render_overdue` |
+| ≥ 3 unclean starts within 15 minutes | critical | `crash_looping` |
+| failed / stopped / between automatic restarts | critical | `service_failed` / `service_inactive` / `restarting` |
+| active but the heartbeat records a stop | critical | `stopped` |
+| start gate running; or no current heartbeat within 90 s of the process start | unknown | `starting` |
+| no heartbeat after that grace | critical | `no_heartbeat` |
+| a heartbeat from another process after the grace | critical | `heartbeat_not_current` |
+| systemd reports no MainPID | unknown | `identity_unavailable` |
+
+A long-waiting ACCEPTED/CLAIMED airing is never itself a failure, and the
+closed gate never degrades the status (`native_airing: closed` is shown). The
+existing debounce (`consecutive_failures_required`, default 2), transition
+events and notifications apply unchanged. The card shows the state, uptime,
+the last heartbeat's age, phase, last outcome and code, the execution (first
+8 characters), the gate and the automatic-restart count -- no path, pid
+history or raw document. **No Restart button**: the unit is not in the
+protected operator-restart allowlist, and Monitoring never restarts it.
+
+The check is configuration, not schema: after installation, run (as the
+station account) `manage.py provision_active_message_worker_check` -- it
+creates the check ("Active Message Worker", enabled, default debounce) only if
+no systemd check of the unit exists, never edits or renames one, and supports
+`--dry-run`. Adding the same row in Django admin is equivalent. No migration
+(a `RunPython` seed would make the release's migrations manual for the
+protected updater).
+
+### Expected healthy dormant state
+
+Active (running), card **ok** with `idle` -- or `ready_waiting_for_gate` once
+a message has been published and rendered -- and `native airing closed`;
+the heartbeat refreshes at least every 5 s while idle; no automatic restarts;
+no executions beyond READY.
+
+### Protected deployment (r0116) -- authorization, not a manual install
+
+The worker becomes a managed unit only through the signed protected policy:
+D3E-B adds exactly `isadoraair-active-message-worker.service: ENABLE_NOW` to
+`deploy/updater_runtime/protected-policy.json` -- the policy SOURCE of the
+next generation (15), unsigned. No protected-runtime Python authority changes
+(not in `MANAGED_UNIT_POLICIES`, `CORE_SERVICES`, `RESTART_ORDER` or the
+restart allowlist). The generation-14 runtime refuses the unit outright
+(install allowlist, `UNKNOWN_MANAGED_UNIT` for an ordinary plan); only a
+release that carries a verified generation-15 candidate whose signed policy
+names it, and whose manifest declares it, can install it
+(`verify_new_units_authorized_by_candidate_policy`). Proved in
+`updatecenter/tests/test_active_message_worker_policy.py`.
+
+The r0116 packaging (not D3E-B) must:
+
+1. build the generation-15 descriptor from the reviewed runtime tree
+   (`deploy/updater_bootstrap/tools/protected_runtime_release.py`,
+   `build_descriptor`, runtime version and protocols unchanged), whose only
+   change from generation 14 is the policy file;
+2. sign the primary-release statement offline with the real signer and verify
+   it against the trusted public key; commit the manifest, descriptor and
+   attestation atomically in the release-introduction commit (the r0109
+   pattern), and validate with `updatecenter.protected_release_validator`;
+3. declare the unit in **`systemd_units_new_required`** (not `_optional`:
+   optional units are report-only and never installed by the updater, which
+   would leave a manual install -- exactly what the signed path exists to
+   prevent), with `isadoraair-monitoring` (new probe) and
+   `isadoraair-gunicorn` (dashboard) in `services_requiring_restart`;
+4. after installation: `provision_active_message_worker_check`, the card
+   `ok`, the heartbeat current, the gate still closed, and a fresh Runtime
+   Recovery payload for generation 15 (as for every generation change).
+
+The updater then installs the template, reloads once, `enable --now`s it --
+the start job completes only through the start gate -- and verifies it
+active. **Failure:** a failed start fails the job (`SAFE_EXECUTION_FAILURE`,
+manual) before any declared restart; it never touches another unit. There is
+no automatic rollback (docs/UPDATE_CENTER.md): generation 14 stays the
+last-known-good slot, the schema and checkout are the release's, and the unit
+stays installed and enabled, retrying with backoff -- harmless with the gate
+closed. Fix forward with a corrected signed release; never by hand-installing
+or editing units, policy or trust configuration. Nothing in the rollout can
+open native airing (`NATIVE_AIRING_AVAILABLE` is a source constant, False,
+not configuration; the unit sets no environment) or stop OGRemote (no
+OGRemote unit is in the updater's authority).
+
+### Troubleshooting (safe while native airing is closed)
+
+* **Stale heartbeat** (`stale`, or `heartbeat_not_current`): check
+  `systemctl status isadoraair-active-message-worker` and its journal; a
+  process wedged in a database call or a render past its deadline shows here.
+  A restart through the normal administrative path (`systemctl restart`, not
+  a dashboard button) is safe: the next start resumes the same execution.
+* **Service failed / restarting**: the journal names the cause (settings,
+  database, import error). A start-gate failure prints
+  `not started after 45s: <reason>` -- `missing` / `unreadable` (heartbeat
+  could not be written), `first_pass_pending` (the first pass did not
+  finish), `previous_process`.
+* **Missing runtime directory** (`/run/isadoraair` absent or not the station
+  account's): it is provisioned at boot by the station's tmpfiles entry;
+  `sudo systemd-tmpfiles --create` (the station's existing tmpfiles
+  configuration) recreates it. Do not create a different directory or change
+  the unit.
+* **Render failures**: `retry_backoff` is normal while `isadoraair-render`
+  is down (check its own card); a permanent failure leaves the composition
+  `blocked` (warning) with a SystemEvent naming the cause -- change the
+  message set on the board (clear, expire, replace audio).
+* Safe actions: board operations, starting/stopping/restarting the worker.
+  Never edit the heartbeat file, the protected policy, the trust
+  configuration or installed unit files, and never bypass Update Center.
 
 ## Release notes for D1
 
@@ -1097,3 +1294,19 @@ authority switch or OGRemote teardown belongs before Phase G.
   before the service while the gate is closed.
 * Not in D3D (D3E): monitoring, retention, failure recovery and worker
   packaging.
+
+## Release notes for D3E-B
+
+* New unit template `deploy/isadoraair-active-message-worker.service` and its
+  start gate `manage.py active_message_worker_ready`; not installed until a
+  release declares it with the signed generation-15 policy (r0116).
+* Protected policy source: one new entry
+  (`isadoraair-active-message-worker.service: ENABLE_NOW`), unsigned; the
+  protected-runtime descriptor still describes generation 14.
+* Monitoring: the Systemd Service probe also reads `MainPID` and
+  `ExecMainStartTimestamp` (every unit; other units' results are unchanged)
+  and recognizes the worker unit; dashboard captions and one detail line;
+  `manage.py provision_active_message_worker_check`.
+* No migration, model, setting, capability or URL; no engine, renderer,
+  OGRemote, Weather/AMBER or GStreamer change; `NATIVE_AIRING_AVAILABLE`
+  stays False.
