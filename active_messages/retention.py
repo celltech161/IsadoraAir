@@ -432,11 +432,13 @@ def retire_publication(execution_id, *, operator, apply=False) -> Outcome:
     """Retire ONE named execution's publication: its library file, waveform
     and Track. Never selects anything by itself, never by age.
 
-    Durable first: under policy -> execution -> Track locks, re-assess; then,
-    in ONE transaction, append ``publication_retired`` (the publication's
+    Durable first: under the policy -> execution locks, re-assess; then, in
+    ONE transaction, append ``publication_retired`` (the publication's
     identity, Track id snapshot, SHA-256, relpath) and delete the Track
-    through the library's own deletion (LogItem/PlayEvent/publication Track
-    references become NULL; their snapshots stay). Only after that commits are
+    through the vetted Collector -- the library's own order (LogItem /
+    PlayEvent / publication Track references become NULL, their snapshots
+    stay; then the Track), so a concurrent library deletion serializes with
+    it instead of deadlocking. Only after that commits are
     the bytes removed. A crash before the commit changes nothing; after it,
     ``finish_retirements`` removes what remains. The publication, its
     insertions, the execution and every event are untouched; a retired
