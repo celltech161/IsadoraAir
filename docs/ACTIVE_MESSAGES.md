@@ -1074,7 +1074,8 @@ An ordinary **Systemd Service** check of exactly
 ExecMainStartTimestamp) plus `active_messages.supervision.observe`, which
 reads the heartbeat with D3E-A's own decoder and verdict and accepts it only
 when it belongs to the running process (MainPID and ExecMainStartTimestamp, as
-the start gate does). Read-only: a file read and, only if native airing could
+the start gate does). Identity fails closed: PID equality alone never counts
+(PIDs are reused), so without a usable start time the card is never `ok`. Read-only: a file read and, only if native airing could
 ever be open, one SELECT of the gate; no policy row, execution, render,
 expiry or engine command. An observer failure is `unknown`
 (`observer_error`, exception type only), never a Monitoring crash.
@@ -1099,7 +1100,7 @@ expiry or engine command. An observer failure is `unknown`
 | start gate running; or no current heartbeat within 90 s of the process start | unknown | `starting` |
 | no heartbeat after that grace | critical | `no_heartbeat` |
 | a heartbeat from another process after the grace | critical | `heartbeat_not_current` |
-| systemd reports no MainPID | unknown | `identity_unavailable` |
+| no MainPID, or no usable process start (`ExecMainStartTimestamp` missing, empty or unparseable): the writer cannot be proven | unknown | `identity_unavailable` |
 
 A long-waiting ACCEPTED/CLAIMED airing is never itself a failure, and the
 closed gate never degrades the status (`native_airing: closed` is shown). The

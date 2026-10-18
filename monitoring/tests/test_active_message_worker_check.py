@@ -372,3 +372,90 @@ class DashboardTemplateTests(SimpleTestCase):
             self.assertRegex(template, rf"\n  {reason}: \"")
         self.assertIn("${workerLine(d)}", template)
         self.assertIn("escapeHtmlAttr(parts.join(", template)
+
+
+def systemctl_raw(*, start_line, active="active", sub="running", pid=PID, restarts="0"):
+    """``systemctl show`` output with an exact ExecMainStartTimestamp line (or none)."""
+    lines = [f"ActiveState={active}", f"SubState={sub}", f"ActiveEnterTimestamp={stamp(time.time() - 590)}",
+             f"NRestarts={restarts}", f"MainPID={pid}"]
+    if start_line is not None:
+        lines.append(start_line)
+    return subprocess.CompletedProcess(["systemctl"], 0, stdout="\n".join(lines) + "\n", stderr="")
+
+
+class ProcessIdentityTests(Heartbeat, SimpleTestCase):
+    """D3E-B correction B1: without a verified process start, a heartbeat is
+    never current -- PID equality alone proves nothing (PIDs are reused)."""
+
+    UNVERIFIABLE = {"missing": None, "empty": "ExecMainStartTimestamp=",
+                    "malformed": "ExecMainStartTimestamp=yesterday-ish",
+                    "n/a": "ExecMainStartTimestamp=n/a"}
+
+    def setUp(self):
+        super().setUp()
+        self.check = MonitorCheck(id=954, name="Active Message Worker", kind="systemd", systemd_unit=UNIT)
+
+    def probe(self, unit_state):
+        with mock.patch.object(probes.subprocess, "run", return_value=unit_state):
+            status, detail = probes.probe_systemd(self.check)
+        self.assertLessEqual(set(detail), SHOWN)
+        return status, detail
+
+    def test_a_reused_pid_with_a_stale_healthy_heartbeat_is_never_current_without_a_start_time(self):
+        earlier = time.time() - 3600                    # the previous process, same pid number, healthy-looking
+        self.beat(started=earlier, recent_starts=[earlier])
+        for label, line in self.UNVERIFIABLE.items():
+            with self.subTest(label):
+                status, detail = self.probe(systemctl_raw(start_line=line))
+                self.assertEqual((status, detail["reason"]), ("unknown", "identity_unavailable"))
+                self.assertNotIn("phase", detail)       # nothing reported from an unproven document
+        # the known contradictory start is a confirmed mismatch (never weaker than unknown)
+        now = time.time()
+        status, detail = self.probe(systemctl_raw(start_line=f"ExecMainStartTimestamp={stamp(now - 600)}"))
+        self.assertEqual((status, detail["reason"]), ("critical", "heartbeat_not_current"))
+        status, detail = self.probe(systemctl_raw(start_line=f"ExecMainStartTimestamp={stamp(now - 10)}"))
+        self.assertEqual((status, detail["reason"]), ("unknown", "starting"))
+
+    def test_the_current_process_without_a_start_time_is_still_unverified(self):
+        self.beat()                                     # truly current, but systemd gives no start time
+        for label, line in self.UNVERIFIABLE.items():
+            with self.subTest(label):
+                status, detail = self.probe(systemctl_raw(start_line=line))
+                self.assertEqual((status, detail["reason"]), ("unknown", "identity_unavailable"))
+        self.path.unlink()                              # and with no heartbeat at all
+        self.assertEqual(self.probe(systemctl_raw(start_line=None))[0], "unknown")
+
+    def test_a_valid_start_time_keeps_its_two_second_precision_tolerance(self):
+        now = time.time()
+        start = float(int(now - 100))                   # what systemd prints: whole seconds
+        for offset, current in ((0.0, True), (-1.5, True), (-2.0, True), (-2.5, False), (-30, False)):
+            with self.subTest(offset=offset):
+                self.beat(started=start + offset, recent_starts=[start + offset])
+                status, detail = self.probe(systemctl_raw(start_line=f"ExecMainStartTimestamp={stamp(start)}"))
+                if current:
+                    self.assertEqual((status, detail["reason"]), ("ok", "idle"))
+                else:                                   # 100 s after the start: past the grace, a mismatch
+                    self.assertEqual((status, detail["reason"]), ("critical", "heartbeat_not_current"))
+
+    def test_legitimate_current_states_are_unchanged(self):
+        start = time.time() - 600
+        line = f"ExecMainStartTimestamp={stamp(start)}"
+        for changes, expected in (({}, ("ok", "idle")),
+                                  ({"result": "idle", "code": "gated", "execution": EXECUTION},
+                                   ("ok", "ready_waiting_for_gate")),
+                                  ({"result": "blocked", "code": "render_failed"}, ("warning", "blocked")),
+                                  ({"age": 120}, ("critical", "stale"))):
+            with self.subTest(changes=changes):
+                self.beat(started=start + 1, recent_starts=[start + 1], **changes)
+                status, detail = self.probe(systemctl_raw(start_line=line))
+                self.assertEqual((status, detail["reason"]), expected)
+
+    def test_the_identity_rule_itself_fails_closed(self):
+        beat = heartbeat.validate(document())
+        for started in (None, float("nan"), float("inf"), "1760000000", True, 0, -5):
+            with self.subTest(started=started):
+                self.assertFalse(supervision.belongs(beat, pid=PID, process_started_at=started))
+        self.assertTrue(supervision.belongs(beat, pid=PID, process_started_at=beat.started_at + 2.0))
+        self.assertFalse(supervision.belongs(beat, pid=PID, process_started_at=beat.started_at + 2.01))
+        found = supervision.observe(main_pid=PID, process_started_at=None, now=time.time(), path=self.path)
+        self.assertEqual((found["status"], found["condition"]), ("unknown", "identity_unavailable"))

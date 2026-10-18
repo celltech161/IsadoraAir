@@ -141,7 +141,8 @@ class StartGateTests(Scratch, SimpleTestCase):
         beat = heartbeat.validate(document())
         for pid in (None, 0, -1, "1", True):
             self.assertFalse(supervision.belongs(beat, pid=pid, process_started_at=None))
-        self.assertTrue(supervision.belongs(beat, pid=os.getpid(), process_started_at=None))
+        self.assertFalse(supervision.belongs(beat, pid=os.getpid(), process_started_at=None))   # B1: fails closed
+        self.assertTrue(supervision.belongs(beat, pid=os.getpid(), process_started_at=own_start()))
         self.assertFalse(supervision.belongs(beat, pid=os.getpid(), process_started_at=float("nan")))
 
 

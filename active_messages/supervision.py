@@ -52,14 +52,20 @@ MAX_STARTUP_TIMEOUT_SECONDS = 120.0
 LIVE_PHASES = frozenset({"starting", "polling", "rendering"})
 
 
+def start_time_known(process_started_at) -> bool:
+    """Is ``process_started_at`` a usable process start (finite epoch seconds)?"""
+    return (type(process_started_at) in (int, float) and math.isfinite(process_started_at)
+            and heartbeat.MIN_TIMESTAMP <= process_started_at <= heartbeat.MAX_TIMESTAMP)
+
+
 def belongs(beat: heartbeat.Heartbeat, *, pid, process_started_at) -> bool:
     """Was ``beat`` written by the process ``pid`` that started at
-    ``process_started_at`` (epoch seconds; None = unknown, pid alone)?"""
+    ``process_started_at`` (epoch seconds)? Fails closed: PID equality alone
+    is never enough -- PIDs are reused -- so an unknown or invalid start time
+    is never a match."""
     if type(pid) is not int or pid <= 0 or beat.pid != pid:
         return False
-    if process_started_at is None:
-        return True
-    if type(process_started_at) not in (int, float) or not math.isfinite(process_started_at):
+    if not start_time_known(process_started_at):
         return False
     return beat.started_at >= process_started_at - START_SLACK_SECONDS
 
@@ -103,25 +109,27 @@ def observe(*, main_pid, process_started_at, now, path=None) -> dict:
       process start, else "no_heartbeat" (critical);
     * a valid heartbeat from another process -- "starting" (unknown) within
       the grace, else "heartbeat_not_current" (critical);
-    * no usable MainPID -- "identity_unavailable" (unknown);
+    * no usable MainPID, or no usable start time (ExecMainStartTimestamp
+      missing, empty or unparseable) -- "identity_unavailable" (unknown):
+      nothing proves which process wrote the file, so it is never reported
+      as current health (and never guessed from the file itself);
     * otherwise exactly heartbeat.assess's status and condition (malformed,
       future-dated, stale, crash loop, render overdue... included)."""
     document, unreadable = heartbeat.read_state(Path(path) if path is not None else heartbeat.state_path())
     verdict = heartbeat.assess(document, now=now, gate_open=heartbeat.gate_open_read_only(),
                                unreadable=unreadable or None)
     detail = {"native_airing": verdict["detail"]["native_airing"]}
-    age = None if process_started_at is None else now - process_started_at
-    starting = age is not None and age < STARTUP_GRACE_SECONDS
+    starting = start_time_known(process_started_at) and now - process_started_at < STARTUP_GRACE_SECONDS
 
     def found(status, condition, **extra):
         return {"status": status, "condition": condition, "detail": {**detail, **extra}}
 
+    if verdict["condition"] == "malformed":               # broken whoever wrote it
+        return found("critical", "malformed", problem=str(verdict["detail"].get("reason", ""))[:64])
+    if type(main_pid) is not int or main_pid <= 0 or not start_time_known(process_started_at):
+        return found("unknown", "identity_unavailable")
     if verdict["condition"] == "no_heartbeat":
         return found("unknown", "starting") if starting else found("critical", "no_heartbeat")
-    if verdict["condition"] == "malformed":
-        return found("critical", "malformed", problem=str(verdict["detail"].get("reason", ""))[:64])
-    if type(main_pid) is not int or main_pid <= 0:
-        return found("unknown", "identity_unavailable")
     beat = heartbeat.validate(document)                  # assess accepted it: valid
     if not belongs(beat, pid=main_pid, process_started_at=process_started_at):
         return found("unknown", "starting") if starting else found("critical", "heartbeat_not_current")
