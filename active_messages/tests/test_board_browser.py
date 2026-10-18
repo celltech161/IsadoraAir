@@ -477,3 +477,59 @@ class OnAirRefreshBrowserTests(OperatorBoardBrowserTests):
         self.assertEqual(airing_page.text_content(f"[data-execution-label='{execution.pk}']"), "Completed")
         message_page.context.close()
         airing_page.context.close()
+
+    @in_browser
+    def test_an_older_success_never_overrides_a_newer_failure(self):
+        """Review 2, finding 1: request 1 (stale STARTED data) is held, request 2
+        fails, then request 1 arrives -- it must be ignored, the page must stay
+        marked out of date, and only request 3's newer success may clear that."""
+        message = self.live(self.producer, self.notice, "On air when request 1 was answered")
+        execution, token = self.start()
+        page = self.open(width=390, height=844)
+        self.assertEqual(self.on_air(page), {str(message.pk)})
+        held, seen = [], []
+
+        def handle(route):
+            seen.append(route.request.url)
+            if len(seen) == 1:
+                held.append((route, route.fetch()))            # request 1: answered NOW (STARTED), delivered later
+            elif len(seen) == 2:
+                route.abort()                                   # request 2: fails
+            else:
+                route.continue_()                               # request 3: the real, current status
+        page.route("**/iportal/messages/board/status/", handle)
+
+        page.evaluate("void window.ambBoardStatus.poll()")       # request 1 outstanding
+        for _ in range(50):
+            if held:
+                break
+            page.wait_for_timeout(50)
+        self.assertEqual(len(held), 1)
+        self.assertIn('"execution": "%s"' % execution.pk, held[0][1].text().replace('":"', '": "'))
+        services.record_air_completed(execution, attempt_token=token, ended_at=timezone.now(),
+                                      confirmed_duration_seconds=Decimal("30.000"))
+
+        self.refresh(page)                                      # request 2 fails while request 1 is outstanding
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(page.locator("#ambStale").is_hidden())
+        self.assertEqual(page.get_attribute("#amBoard", "data-status-stale"), "1")
+        self.assertEqual(page.eval_on_selector(f"#m-{message.pk} span.amb-state.onair",
+                                               "el => getComputedStyle(el).opacity"), "0.55")   # visibly uncertain
+        self.assertEqual(page.eval_on_selector("#ambAiring", "el => getComputedStyle(el).opacity"), "0.55")
+
+        route, stale = held[0]
+        route.fulfill(response=stale)                           # the older success finally arrives
+        page.wait_for_timeout(300)
+        self.assertFalse(page.locator("#ambStale").is_hidden())                     # still out of date
+        self.assertEqual(page.get_attribute("#amBoard", "data-status-stale"), "1")
+        self.assertEqual(page.eval_on_selector("#ambAiring", "el => getComputedStyle(el).opacity"), "0.55")
+
+        self.refresh(page)                                      # request 3: newer authority
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(page.locator("#ambStale").is_hidden())
+        self.assertIsNone(page.get_attribute("#amBoard", "data-status-stale"))
+        self.assertEqual(self.on_air(page), set())
+        self.assertEqual(self.chip(page), ("Last: Completed", []))
+        self.assertEqual(page.text_content(f"[data-execution-label='{execution.pk}']"), "Completed")
+        self.assertEqual(page.errors, [])
+        page.context.close()

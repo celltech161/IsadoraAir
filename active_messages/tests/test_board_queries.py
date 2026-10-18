@@ -89,6 +89,30 @@ class HistoryAtScaleTests(Domain, TestCase):
             cursor.execute(f"EXPLAIN ({options}FORMAT TEXT) {sql}", params)
             return "\n".join(row[0] for row in cursor.fetchall())
 
+    def nodes(self, sql, params=()) -> list:
+        """Every node of the structured plan (EXPLAIN FORMAT JSON), depth first:
+        nested Plans, including subplans, InitPlans and CTEs."""
+        with connection.cursor() as cursor:
+            cursor.execute(f"EXPLAIN (FORMAT JSON) {sql}", params)
+            document = cursor.fetchone()[0]
+        document = json.loads(document) if isinstance(document, str) else document
+        found, pending = [], [document[0]["Plan"]]
+        while pending:
+            node = pending.pop()
+            found.append(node)
+            pending.extend(node.get("Plans", []))
+        return found
+
+    @staticmethod
+    def seq_scanned(nodes) -> set:
+        """The EXACT relations read by a sequential scan (never a name prefix:
+        ...activebroadcastmessage is not ...activebroadcastmessageevent)."""
+        return {node.get("Relation Name") for node in nodes if node["Node Type"] == "Seq Scan"}
+
+    @staticmethod
+    def indexes_used(nodes) -> set:
+        return {node["Index Name"] for node in nodes if "Index Name" in node}
+
     def query_plan(self, queryset, name, **kwargs) -> str:
         sql, params = queryset.query.sql_with_params()
         return self.record(name, sql, params, **kwargs)
@@ -100,10 +124,10 @@ class HistoryAtScaleTests(Domain, TestCase):
             with open(Path(directory) / "explain.txt", "a") as out:
                 out.write(f"=== {name}\n{sql % tuple(repr(p) for p in params) if params else sql}\n"
                           f"{self.plan(sql, params, analyze=True)}\n\n")
+        nodes = self.nodes(sql, params)
         if uses:
-            self.assertIn(uses, text, f"{name}:\n{text}")
-        for table in TABLES:
-            self.assertNotIn(f"Seq Scan on {table}", text, f"{name}:\n{text}")
+            self.assertIn(uses, self.indexes_used(nodes), f"{name}:\n{text}")
+        self.assertFalse(self.seq_scanned(nodes) & set(TABLES), f"{name}:\n{text}")
         return text
 
     def ordered(self):
@@ -191,8 +215,34 @@ class HistoryAtScaleTests(Domain, TestCase):
         for name, queryset in before.items():
             sql, params = queryset.query.sql_with_params()
             text = self.plan(sql, params)
+            nodes = self.nodes(sql, params)
             if os.environ.get("AMB_EXPLAIN"):
                 with open(Path(os.environ["AMB_EXPLAIN"]) / "explain.txt", "a") as out:
                     out.write(f"=== {name}\n{self.plan(sql, params, analyze=True)}\n\n")
             if name != "BEFORE: unfinished airing":           # (state, created_at) serves that one already
-                self.assertIn("Seq Scan on active_messages_activebroadcastexecution", text, f"{name}:\n{text}")
+                self.assertIn("active_messages_activebroadcastexecution", self.seq_scanned(nodes), f"{name}:\n{text}")
+
+    def test_the_scan_check_names_exact_relations(self):
+        """Review 2, finding 2: a sequential scan of the (small) event table is
+        not a scan of the message table, whose name merely prefixes it."""
+        event_table = "active_messages_activebroadcastmessageevent"
+        message_table = "active_messages_activebroadcastmessage"
+        self.assertTrue(event_table.startswith(message_table))                  # why a substring check failed
+        synthetic = [{"Node Type": "Limit"}, {"Node Type": "Seq Scan", "Relation Name": event_table},
+                     {"Node Type": "Index Scan", "Relation Name": message_table, "Index Name": "active_message_due"}]
+        self.assertEqual(self.seq_scanned(synthetic), {event_table})
+        self.assertFalse(self.seq_scanned(synthetic) & set(TABLES))
+        self.assertEqual(self.seq_scanned(synthetic + [{"Node Type": "Seq Scan", "Relation Name": message_table}])
+                         & set(TABLES), {message_table})
+        # And on real plans: an event-table scan nested under a CTE is found by its exact name, and is allowed.
+        nodes = self.nodes(f"WITH recent AS MATERIALIZED (SELECT id FROM {event_table} WHERE detail ? 'reason') "
+                           f"SELECT count(*) FROM recent")
+        self.assertIn(event_table, self.seq_scanned(nodes))
+        self.assertNotIn(message_table, self.seq_scanned(nodes))
+        self.record("event-table scan beside the message table (allowed)",
+                    f"SELECT count(*) FROM {event_table} WHERE detail ? 'reason'")
+        with connection.cursor() as cursor:
+            cursor.execute("SET LOCAL enable_indexscan = off")
+            cursor.execute("SET LOCAL enable_bitmapscan = off")
+        forced = self.nodes(f"SELECT id FROM {message_table} WHERE state = 'active'")
+        self.assertIn(message_table, self.seq_scanned(forced))                    # the real thing is still caught

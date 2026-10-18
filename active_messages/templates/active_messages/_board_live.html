@@ -15,13 +15,15 @@
 
   // Live status: every ON AIR indication on the page follows the server's one
   // interpretation (the STARTED airing and the messages frozen in ITS
-  // composition), on each successful refresh. Only the newest response is
-  // ever applied; a failed or abandoned refresh changes nothing but says the
-  // page may be out of date. Rows are never re-rendered: expanded rows, focus,
-  // filters and typed input stay as they are.
+  // composition), on each successful refresh. A response -- success or
+  // failure -- may change the page only while its request is still the newest
+  // one sent: once a newer request exists (even one that failed, was aborted or
+  // timed out), an older answer is ignored. So a failed newest request leaves
+  // the page marked stale, and only a later, newer success clears that. Rows
+  // are never re-rendered: expanded rows, focus, filters and typed input stay.
   var url = root.dataset.statusUrl, version = root.dataset.version;
   var EVERY = 20000, LIMIT = 90, TIMEOUT = 10000;
-  var polls = 0, sent = 0, applied = 0, lastPoll = Date.now();
+  var polls = 0, sent = 0, lastPoll = Date.now();
   var stale = document.getElementById("ambStale"), changed = document.getElementById("ambChanged");
   document.querySelectorAll("[data-reload]").forEach(function (link) {
     link.href = window.location.pathname + window.location.search;
@@ -72,6 +74,7 @@
   function poll() {
     if (++polls > LIMIT) {
       window.clearInterval(timer);
+      ++sent;                                          // a request still in flight can no longer clear this
       markStale("Auto-refresh paused");
       return Promise.resolve();
     }
@@ -86,12 +89,10 @@
         return response.json();
       })
       .then(function (status) {
-        if (mine <= applied) return;                   // an older response arriving late: never applied
-        applied = mine;
-        apply(status);
+        if (mine === sent) apply(status);              // superseded by a newer request: never applied
       })
       .catch(function () {
-        if (mine > applied) markStale("Live status could not be refreshed");
+        if (mine === sent) markStale("Live status could not be refreshed");
       })
       .then(function () { window.clearTimeout(timeout); });
   }
