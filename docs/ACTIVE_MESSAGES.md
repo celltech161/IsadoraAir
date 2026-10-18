@@ -887,8 +887,13 @@ only before the first cycle), `code` (`[A-Za-z0-9_]{0,64}`), `execution` (""
 or a UUID), `repeats` (1..cycle after the first cycle), `consecutive_errors`
 (equal to `repeats` when the result is `error`, else 0), `last_progress_at`
 (null or within the process's life), `render_deadline` (present exactly while
-`rendering`, after `checked_at`, at most 3750 s later). Booleans are never
-accepted as numbers; NaN/Infinity are refused. The strict decoder
+`rendering`, after `checked_at`, at most 3750 s later). Relations, from the
+writer's own state rules: unless `previous` is `unclean`, `recent_starts` is
+exactly `[started_at]`; `polling` needs `cycle >= 1`; `starting` has
+`checked_at == started_at`; before the first completed cycle there is no
+result, code, counter or `last_progress_at`, and an `execution` only while
+`rendering` (a render during the first pass). Booleans are never accepted as
+numbers; NaN/Infinity are refused. The strict decoder
 (`heartbeat.validate`) returns a fully validated value or a stable reason; a
 document that breaks any rule is `malformed` (critical) -- never partially
 interpreted, never an exception, never `ok` -- and so is one stamped more than

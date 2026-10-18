@@ -26,6 +26,12 @@ MAX_DOCUMENT_BYTES):
 | last_progress_at | null or a timestamp in [started_at, checked_at] |
 | render_deadline | a timestamp exactly when phase is "rendering" (after checked_at, at most RENDER_DEADLINE_MAX_SECONDS later), else null |
 
+Relations (the writer's own state rules): unless ``previous`` is "unclean",
+``recent_starts`` is exactly [started_at]; "polling" needs cycle >= 1;
+"starting" has checked_at == started_at; before the first completed cycle
+(cycle 0) there is no result, code, counter or last_progress_at, and an
+execution only while "rendering" (a render during the first pass).
+
 "starting" means cycle 0 with no result yet. A document that breaks ANY rule
 is "malformed" (critical) -- it is never partially interpreted -- and a
 missing or unreadable one is "no_heartbeat" (unknown). Neither can ever be
@@ -241,6 +247,21 @@ def validate(doc) -> Heartbeat:
             raise Malformed("bad_render_deadline")
     elif deadline is not None:
         raise Malformed("deadline_outside_rendering")
+    # Relations the writer guarantees (Recorder): only an unclean end carries
+    # earlier starts; a document records "polling" only after completing a
+    # cycle; "starting" is written once, at the start; before the first cycle
+    # completes there is no progress, and an execution only while rendering.
+    if previous != "unclean" and len(starts) != 1:
+        raise Malformed("history_without_unclean_restart")
+    if phase == "polling" and cycle == 0:
+        raise Malformed("polling_before_first_cycle")
+    if phase == "starting" and checked_at != started_at:
+        raise Malformed("starting_after_its_start")
+    if cycle == 0:
+        if progress is not None:
+            raise Malformed("progress_before_first_cycle")
+        if execution and phase != "rendering":
+            raise Malformed("execution_before_first_cycle")
     return Heartbeat(pid=pid, started_at=started_at, checked_at=checked_at, recent_starts=starts,
                      previous=previous, phase=phase, cycle=cycle, result=result, code=code, execution=execution,
                      repeats=repeats, consecutive_errors=errors, last_progress_at=progress, render_deadline=deadline)

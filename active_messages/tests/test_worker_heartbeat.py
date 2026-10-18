@@ -464,3 +464,116 @@ class IdleSecondsTests(SimpleTestCase):
         worker.run_forever(poll_seconds=30.0, stop=lambda: bool(stopped), sleep=sleep,
                            run=lambda: worker.Outcome("idle"), refresh=mock.Mock(), close=mock.Mock())
         self.assertEqual(slept, [worker.PAUSE_SLICE_SECONDS])
+
+
+class RelationalContractTests(Workspace):
+    """Review 2: individually valid fields in combinations the writer never
+    produces are malformed -- not crash history, not a healthy cycle."""
+
+    def capture(self):
+        """Record every document the REAL writer publishes."""
+        import copy
+        written, original = [], heartbeat._write
+
+        def keep(path, data):
+            written.append(copy.deepcopy(data))
+            return original(path, data)
+        patcher = mock.patch.object(heartbeat, "_write", side_effect=keep)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return written
+
+    def writer_documents(self):
+        """Every phase the writer produces: a fresh start, a render during the
+        first pass, the first cycle, retry/backoff, an error, playout, a later
+        render, stops (before and after a cycle), clean, unclean, trimmed and
+        malformed-prior restarts."""
+        written = self.capture()
+        recorder = self.recorder()                                        # previous: none
+        self.clock[0] += 1
+        recorder.rendering(EXECUTION, 600)                                # render during the first pass
+        self.clock[0] += 30
+        for outcome in (worker.Outcome("ready", EXECUTION), worker.Outcome("retry", EXECUTION, "render_unavailable"),
+                        worker.Outcome("backoff", EXECUTION), worker.Outcome("error", code="OperationalError"),
+                        worker.Outcome("playout", code="accepted"), worker.Outcome("idle", EXECUTION, "gated")):
+            self.clock[0] += 5
+            recorder.cycle(outcome)
+        recorder.rendering(EXECUTION, 60)                                 # a later render
+        self.clock[0] += 5
+        recorder.cycle(worker.Outcome("reused", EXECUTION))
+        recorder.stopped()                                                # a clean stop after cycles
+        self.clock[0] += 5
+        self.recorder().stopped()                                         # previous: clean; stop at cycle 0
+        for _ in range(3):                                                # unclean restarts
+            self.clock[0] += 10
+            self.recorder()
+        self.clock[0] += heartbeat.CRASH_WINDOW_SECONDS + 1               # an unclean restart after the window
+        self.recorder()
+        self.path.write_text("{garbage")                                  # previous: malformed
+        self.clock[0] += 1
+        self.recorder().cycle(worker.Outcome("idle"))
+        return written
+
+    def test_restart_history_contradictions_are_malformed(self):
+        for previous in ("none", "clean", "malformed"):
+            with self.subTest(previous):
+                state = document(previous=previous, recent_starts=[T0 - 20, T0 - 10, T0])
+                verdict = assess(state)
+                self.assertEqual((verdict["status"], verdict["condition"]), ("critical", "malformed"), verdict)
+                self.assertNotEqual(verdict["condition"], "crash_looping")
+                self.assertEqual(assess(document(previous=previous, recent_starts=[T0]))["status"],
+                                 "warning" if previous == "malformed" else "ok")
+        self.assertEqual(assess(document(previous="unclean", recent_starts=[T0 - 20, T0 - 10, T0]))["condition"],
+                         "crash_looping")                                 # the one value that may carry history
+
+    def test_polling_without_a_completed_cycle_is_malformed(self):
+        for label, state in {
+            "empty result": document(phase="polling", cycle=0, result="", repeats=0),
+            "plausible result": document(phase="polling", cycle=0, result="idle", repeats=1),
+        }.items():
+            with self.subTest(label):
+                verdict = assess(state)
+                self.assertEqual((verdict["status"], verdict["condition"]), ("critical", "malformed"), verdict)
+
+    def test_other_initial_state_contradictions_are_malformed(self):
+        starting = dict(phase="starting", cycle=0, result="", repeats=0, checked_at=T0)
+        for label, state in {
+            "starting recorded after its start": document(**dict(starting, checked_at=T0 + 1)),
+            "starting with an execution": document(**dict(starting, execution=EXECUTION)),
+            "progress before any cycle": document(**dict(starting, last_progress_at=T0)),
+            "stopped before any cycle with an execution": document(phase="stopped", cycle=0, result="", repeats=0,
+                                                                     execution=EXECUTION),
+        }.items():
+            with self.subTest(label):
+                self.assertEqual(assess(state)["condition"], "malformed")
+
+    def test_every_writer_document_is_valid_and_its_contradictions_are_not(self):
+        documents = self.writer_documents()
+        phases = {(d["phase"], d["cycle"] == 0, d["previous"]) for d in documents}
+        for expected in (("starting", True, "none"), ("rendering", True, "none"), ("polling", False, "none"),
+                         ("stopped", False, "none"), ("stopped", True, "clean"), ("starting", True, "unclean"),
+                         ("starting", True, "malformed"), ("polling", False, "malformed")):
+            self.assertIn(expected, phases)
+        self.assertIn(3, {len(d["recent_starts"]) for d in documents})              # a real unclean sequence
+        self.assertIn(("unclean", 1), {(d["previous"], len(d["recent_starts"])) for d in documents})   # trimmed
+        for index, state in enumerate(documents):
+            with self.subTest(index=index, phase=state["phase"], cycle=state["cycle"]):
+                heartbeat.validate(state)                                    # every genuine document passes
+                verdict = assess(state, now=state["checked_at"])
+                self.assertNotEqual(verdict["condition"], "malformed")
+                mutations = {}
+                if len(state["recent_starts"]) > 1:
+                    for previous in ("none", "clean", "malformed"):
+                        mutations[f"previous={previous}"] = dict(state, previous=previous)
+                if state["cycle"] == 0:
+                    mutations["phase=polling"] = dict(state, phase="polling")
+                    if state["phase"] != "rendering":
+                        mutations["execution"] = dict(state, execution=EXECUTION)
+                    mutations["last_progress_at"] = dict(state, last_progress_at=state["started_at"])
+                if state["phase"] == "starting":
+                    mutations["checked_at moved"] = dict(state, checked_at=state["checked_at"] + 1)
+                for label, mutated in mutations.items():
+                    with self.subTest(mutation=label):
+                        with self.assertRaises(heartbeat.Malformed):
+                            heartbeat.validate(mutated)
+                        self.assertEqual(assess(mutated, now=state["checked_at"])["condition"], "malformed")
