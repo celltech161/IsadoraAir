@@ -95,7 +95,9 @@ POLL_SECONDS = 5.0
 # idle (incl. a READY aggregate behind the closed gate), busy, blocked,
 # backoff, retry, playout (an execution past rendering is with publication or
 # the engine -- its retries and recovery are time-based, never "as fast as
-# possible") and error. Even progress waits after MAX_PROGRESS_PASSES in a row.
+# possible") and error. Progress continues at once for at most
+# MAX_PROGRESS_PASSES passes in a row; the pass after which that many have run
+# back-to-back is followed by a wait like any other.
 PROGRESS_RESULTS = heartbeat.PROGRESS_RESULTS
 MAX_PROGRESS_PASSES = 10
 PAUSE_SLICE_SECONDS = 0.5
@@ -317,9 +319,9 @@ def run_forever(*, poll_seconds=POLL_SECONDS, stop=lambda: False, sleep=None, ru
             recorder.cycle(outcome)
         if report is not None:
             report(outcome)
-        if not waits_after(outcome) and progressed < MAX_PROGRESS_PASSES:
-            progressed += 1
-            continue
+        progressed = progressed + 1 if not waits_after(outcome) else 0
+        if progressed and progressed < MAX_PROGRESS_PASSES:
+            continue                                   # passes 1..MAX-1 of a progress run: at once
         progressed = 0
         _pause(poll_seconds, stop, sleep)
         refresh()

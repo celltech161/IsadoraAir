@@ -15,6 +15,8 @@ every pass that made no progress, playout included), SIGTERM/SIGINT honoured
 between passes and within a wait, database failures close the connection --
 and the loop writes the worker heartbeat (active_messages.heartbeat).
 """
+import argparse
+import math
 import signal
 
 from django.core.management.base import BaseCommand
@@ -22,14 +24,32 @@ from django.db import connection
 
 from active_messages import heartbeat, worker
 
+# The wait after a pass that made no progress. At most MAX_IDLE_SECONDS, so a
+# waiting worker always records its heartbeat well within
+# heartbeat.STALE_AFTER_SECONDS; at least 1 s (never a busy loop).
+MIN_IDLE_SECONDS = 1.0
+MAX_IDLE_SECONDS = 30.0
+
+
+def idle_seconds(value) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if not math.isfinite(seconds) or not MIN_IDLE_SECONDS <= seconds <= MAX_IDLE_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be from {MIN_IDLE_SECONDS:g} to {MAX_IDLE_SECONDS:g} seconds (got {value})")
+    return seconds
+
 
 class Command(BaseCommand):
     help = "Render due active-message aggregates through isadoraair-render and bind them (no airing)."
 
     def add_arguments(self, parser):
         parser.add_argument("--once", action="store_true", help="Run one pass, then exit.")
-        parser.add_argument("--idle-seconds", type=float, default=worker.POLL_SECONDS,
-                            help="Wait after a pass that made no progress (loop mode; at least 1 s).")
+        parser.add_argument("--idle-seconds", type=idle_seconds, default=worker.POLL_SECONDS,
+                            help=f"Wait after a pass that made no progress (loop mode; "
+                                 f"{MIN_IDLE_SECONDS:g}..{MAX_IDLE_SECONDS:g} s, default {worker.POLL_SECONDS:g}).")
 
     def report(self, outcome):
         self.stdout.write(" ".join(part for part in (outcome.result, outcome.execution, outcome.code) if part))
@@ -44,6 +64,6 @@ class Command(BaseCommand):
         stopping = []
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, lambda *_: stopping.append(True))
-        worker.run_forever(poll_seconds=max(1.0, options["idle_seconds"]), stop=lambda: bool(stopping),
+        worker.run_forever(poll_seconds=options["idle_seconds"], stop=lambda: bool(stopping),
                            recorder=heartbeat.Recorder(), report=self.report)
         return None

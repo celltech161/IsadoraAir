@@ -6,7 +6,7 @@
   but bounded, signals stop the loop promptly, database errors close the
   connection and wait;
 * A3 -- the crash / interruption boundaries recover as their contracts say;
-* A4 -- the worker heartbeat / readiness contract (read-only assessment);
+* A4 -- the worker heartbeat / readiness contract: test_worker_heartbeat;
 * A5 -- with native airing closed nothing is published or dispatched.
 
 Render functions are injected (exact rendition rows from d2a_support): no
@@ -177,10 +177,22 @@ class LoopCadenceTests(TestCase):
     def test_progress_continues_at_once_but_is_bounded(self):
         for result in ("ready", "reused", "failed", "superseded"):
             self.assertFalse(worker.waits_after(worker.Outcome(result)))
-        slept = self.drive([("ready", "")] * (worker.MAX_PROGRESS_PASSES + 1) + [("idle", "")])
-        # One wait only: after the bound is reached (the final idle pass is followed by the stop).
-        self.assertEqual(sum(slept), 5.0)
-        self.assertEqual(self.drive([("ready", "")] * worker.MAX_PROGRESS_PASSES + [("idle", "")]), [])
+        # Exactly MAX_PROGRESS_PASSES progress passes run back-to-back, then a wait.
+        slept = self.drive([("ready", "")] * worker.MAX_PROGRESS_PASSES + [("idle", "")])
+        self.assertEqual(sum(slept), 5.0)                      # after the 10th (the idle pass is followed by stop)
+        self.assertEqual(self.drive([("ready", "")] * (worker.MAX_PROGRESS_PASSES - 1) + [("idle", "")]), [])
+        passes, waits_after_pass = [], []
+
+        def run():
+            passes.append(True)
+            return worker.Outcome("ready")
+
+        def sleep(seconds):
+            waits_after_pass.append(len(passes))
+        stop = lambda: len(set(waits_after_pass)) >= 3  # noqa: E731
+        worker.run_forever(stop=stop, sleep=sleep, run=run, refresh=mock.Mock(), close=mock.Mock())
+        self.assertEqual(sorted(set(waits_after_pass)),
+                         [worker.MAX_PROGRESS_PASSES * n for n in (1, 2, 3)])   # every 10th pass, never the 11th
 
     def test_a_stop_during_a_wait_returns_within_one_slice(self):
         stopped, slept = [], []
@@ -309,137 +321,6 @@ class CrashBoundaryTests(Domain, TestCase):
             lock.return_value.__enter__.return_value = False
             self.assertEqual(worker.run_once(render_fn=mock.Mock()).result, "busy")
         self.assertFalse(X.objects.exists())
-
-
-class HeartbeatTests(TestCase):
-    """A4: the readiness contract (active_messages.heartbeat)."""
-
-    def setUp(self):
-        import tempfile
-        from pathlib import Path
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / "worker.json"
-        self.clock = [1_000_000.0]
-
-    def recorder(self):
-        from active_messages import heartbeat
-        return heartbeat.Recorder(self.path, clock=lambda: self.clock[0], pid=4242)
-
-    def assess(self, state, *, at=None, gate_open=False):
-        from active_messages import heartbeat
-        return heartbeat.assess(state, now=self.clock[0] if at is None else at, gate_open=gate_open)
-
-    def read(self):
-        import json
-        return json.loads(self.path.read_text())
-
-    def test_each_condition(self):
-        from active_messages import heartbeat
-        recorder = self.recorder()
-        cases = [
-            (worker.Outcome("idle"), "ok", "idle"),
-            (worker.Outcome("idle", "e", "gated"), "ok", "ready_waiting_for_gate"),
-            (worker.Outcome("ready", "e"), "ok", "working"),
-            (worker.Outcome("retry", "e", "render_unavailable"), "ok", "retry_backoff"),
-            (worker.Outcome("backoff", "e"), "ok", "retry_backoff"),
-            (worker.Outcome("playout", code="accepted"), "ok", "playout_in_flight"),
-            (worker.Outcome("blocked", code="render_failed"), "warning", "blocked"),
-            (worker.Outcome("busy"), "ok", "busy"),
-        ]
-        for outcome, status, condition in cases:
-            with self.subTest(condition):
-                recorder.cycle(outcome)
-                verdict = self.assess(self.read())
-                self.assertEqual((verdict["status"], verdict["condition"]), (status, condition))
-                self.assertEqual(verdict["detail"]["native_airing"], "closed")   # informational only
-        for _ in range(heartbeat.BUSY_WARNING_REPEATS):
-            recorder.cycle(worker.Outcome("busy"))
-        self.assertEqual(self.assess(self.read())["condition"], "lock_held_elsewhere")
-        recorder.cycle(worker.Outcome("error", code="OperationalError"))
-        self.assertEqual(self.assess(self.read())["condition"], "database_errors")
-        for _ in range(heartbeat.ERROR_CRITICAL_REPEATS):
-            recorder.cycle(worker.Outcome("error", code="OperationalError"))
-        self.assertEqual(self.assess(self.read())["status"], "critical")
-        recorder.cycle(worker.Outcome("idle"))
-        self.assertEqual(self.assess(self.read())["condition"], "idle")          # errors reset on success
-        self.assertEqual(self.assess(self.read(), gate_open=True)["detail"]["native_airing"], "open")
-
-    def test_staleness_and_a_long_render_use_the_right_clock(self):
-        from active_messages import heartbeat
-        recorder = self.recorder()
-        recorder.cycle(worker.Outcome("idle"))
-        self.assertEqual(self.assess(self.read(), at=self.clock[0] + heartbeat.STALE_AFTER_SECONDS)["condition"],
-                         "idle")
-        self.assertEqual(self.assess(self.read(), at=self.clock[0] + heartbeat.STALE_AFTER_SECONDS + 1)
-                         ["condition"], "stale")
-        recorder.rendering("e", timeout_seconds=1800)
-        long_after = self.clock[0] + 1800                         # far past STALE_AFTER: still rendering
-        self.assertEqual(self.assess(self.read(), at=long_after)["condition"], "rendering")
-        overdue = self.clock[0] + 1800 + heartbeat.RENDER_GRACE_SECONDS + 1
-        self.assertEqual(self.assess(self.read(), at=overdue)["condition"], "render_overdue")
-
-    def test_restarts_within_the_window_are_crash_looping_and_a_clean_stop_is_reported(self):
-        from active_messages import heartbeat
-        for _ in range(heartbeat.CRASH_LOOP_STARTS - 1):
-            self.recorder()
-            self.clock[0] += 60
-        self.assertEqual(self.assess(self.read())["condition"], "idle")          # "starting": no pass yet
-        self.recorder()
-        self.assertEqual(self.assess(self.read())["condition"], "crash_looping")
-        self.clock[0] += heartbeat.CRASH_WINDOW_SECONDS + 1
-        recorder = self.recorder()                                              # a start long after: reset
-        self.assertEqual(self.read()["recent_starts"], 1)
-        recorder.stopped()
-        self.assertEqual(self.assess(self.read())["condition"], "stopped")
-        self.assertIsNone(heartbeat.current())
-
-    def test_unreadable_or_missing_state_is_unknown_and_write_failures_never_raise(self):
-        from pathlib import Path
-
-        from active_messages import heartbeat
-        self.assertEqual(self.assess(None)["condition"], "no_heartbeat")
-        self.path.write_text("{not json")
-        self.assertEqual(heartbeat.readiness(path=self.path)["condition"], "no_heartbeat")
-        heartbeat.Recorder(Path("/nonexistent/dir/worker.json"), clock=lambda: 1.0).cycle(worker.Outcome("idle"))
-
-    def test_readiness_only_reads(self):
-        from django.db import connection
-        from django.test.utils import CaptureQueriesContext
-
-        from active_messages import heartbeat
-        from active_messages.models import ActiveBroadcastPolicy
-        self.recorder().cycle(worker.Outcome("idle"))
-        with mock.patch.object(services, "NATIVE_AIRING_AVAILABLE", True), \
-                CaptureQueriesContext(connection) as queries:
-            verdict = heartbeat.readiness(path=self.path, now=self.clock[0])
-        self.assertEqual(verdict["condition"], "idle")
-        self.assertTrue(all(query["sql"].lstrip().upper().startswith("SELECT") for query in queries))
-        self.assertFalse(ActiveBroadcastPolicy.objects.exists())                # the singleton was not created
-
-
-class HeartbeatRenderTests(Domain, TestCase):
-    def test_a_real_render_records_its_deadline_first(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        from active_messages import heartbeat
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        path = Path(directory.name) / "worker.json"
-        self.active(kind="urgent", seconds="10.000000")
-        recorder = heartbeat.Recorder(path, clock=lambda: 1_000_000.0)
-        self.addCleanup(recorder.stopped)
-        seen = []
-
-        def render(execution):
-            seen.append(json.loads(path.read_text()))
-            return renders_ready(execution)
-        self.assertIs(heartbeat.current(), recorder)
-        self.assertEqual(worker.run_once(render_fn=render).result, "ready")
-        self.assertEqual(seen[0]["phase"], "rendering")
-        self.assertGreater(seen[0]["render_deadline"], 1_000_000.0 + heartbeat.RENDER_GRACE_SECONDS)
 
 
 class ClosedGateTests(Domain, TestCase):

@@ -850,7 +850,8 @@ result (publication backoff/retry, in flight, accepted, claimed, started:
 their recovery is time-based and evidence-driven, never "as fast as
 possible"; the engine-held step takes the policy lock) -- it waits
 `POLL_SECONDS` (5 s). Progress (ready, reused, failed, superseded) continues
-at once, at most `MAX_PROGRESS_PASSES` (10) passes in a row. A freshly READY
+at once for at most `MAX_PROGRESS_PASSES` (10) passes back to back; the
+10th is followed by a wait. A freshly READY
 aggregate is still published and dispatched in the same pass (gate
 permitting). Until D3E-A the command's own list omitted `playout`: once
 native playout became reachable it would have polled the database -- and the
@@ -868,18 +869,57 @@ closes the connection. `--once` runs one pass and closes the connection.
 
 The established IsadoraAir pattern (aircheck's state file, Liquidsoap's,
 Monitoring's self-health): the worker process writes one small fixed-shape
-JSON file, atomically and best-effort, at
+JSON document, atomically and best-effort, at
 `settings.ACTIVE_MESSAGE_WORKER_STATE_PATH` (default
 `/run/isadoraair/active_message_worker.json`); readers only read it
 (`active_messages.heartbeat`). No database row or migration: the state is per
-process, and a database heartbeat would write every 5 s into the database the
-engine's admission path locks.
+process, and a database heartbeat would write every cycle into the database
+the engine's admission path locks.
+
+**Document (schema 2).** Every key required, no other key, at most 4096
+bytes: `schema` (2), `pid`, `started_at`, `checked_at` (finite epoch seconds
+in 2000..2100, `started_at <= checked_at`), `recent_starts` (1..8 such
+timestamps, nondecreasing, the last equal to `started_at`, none older than the
+crash window before it), `previous` (`none`, `clean`, `unclean`,
+`malformed`: how the previous process ended), `phase` (`starting`,
+`polling`, `rendering`, `stopped`), `cycle`, `result` (a worker outcome; ""
+only before the first cycle), `code` (`[A-Za-z0-9_]{0,64}`), `execution` (""
+or a UUID), `repeats` (1..cycle after the first cycle), `consecutive_errors`
+(equal to `repeats` when the result is `error`, else 0), `last_progress_at`
+(null or within the process's life), `render_deadline` (present exactly while
+`rendering`, after `checked_at`, at most 3750 s later). Booleans are never
+accepted as numbers; NaN/Infinity are refused. The strict decoder
+(`heartbeat.validate`) returns a fully validated value or a stable reason; a
+document that breaks any rule is `malformed` (critical) -- never partially
+interpreted, never an exception, never `ok` -- and so is one stamped more than
+30 s in the future. A missing or unreadable file is `no_heartbeat` (unknown).
+
+**File safety.** Reader: `O_NOFOLLOW | O_NONBLOCK`, `fstat` (regular files
+only), a 4096-byte cap before parsing; a symlink, directory, FIFO or
+oversized file is `malformed`, never followed or waited on. Writer: a random
+temporary name created exclusively by `tempfile.mkstemp`
+(`O_CREAT|O_EXCL`: a pre-planted file or symlink at any name is never opened),
+verified regular, mode 0600, written and fsync'ed through its descriptor, then
+`os.replace`d over the heartbeat path in the same directory (a symlink there is
+replaced, never written through); removed on any failure; the writer never
+publishes a document its own decoder would reject. A concurrent reader sees
+the old or the new complete document.
+
+**Restart accounting.** A start appends to `recent_starts` only after an
+UNCLEAN end (the previous document is valid and not `stopped`); a recorded
+clean stop, a missing history and a malformed history each start a fresh
+sequence (`previous` records which; a malformed one is reported as
+`history_unverified` for the window). Previous starts more than 900 s before
+the new start are dropped (at most 8 kept). The assessment counts the starts
+within 900 s of the OBSERVATION time, inclusive at exactly 900 s: three or
+more is `crash_looping`. So operator stop/start cycles never count, and starts
+at 0, 850 and 1700 are two in the window at 1700.
 
 | Written | When |
 | --- | --- |
-| `phase: starting`, `recent_starts` | at start-up (restarts within 15 min are counted from the previous file) |
+| `phase: starting` | at start-up |
 | `phase: rendering`, `render_deadline` | just before each render (its own bounded timeout + 120 s): a long render is not a stale worker |
-| `phase: polling`, result / code / execution, `repeats`, `last_progress_at`, `consecutive_errors` | after every loop cycle |
+| `phase: polling`, the outcome, `repeats`, `last_progress_at`, `consecutive_errors` | after every loop cycle |
 | `phase: stopped` | on a clean stop |
 
 `heartbeat.assess(state, now=, gate_open=)` (pure) and
@@ -891,27 +931,37 @@ never creates the policy singleton, renders, expires or materializes):
 | `idle` | ok | polling, nothing due |
 | `ready_waiting_for_gate` | ok | a READY aggregate behind the CLOSED gate -- expected until Phase G |
 | `working`, `rendering`, `retry_backoff`, `playout_in_flight`, `busy` | ok | progress, a render within its deadline, backing off, with publication/engine, a skipped pass |
+| `history_unverified` | warning | the previous document was malformed (for 900 s after the start) |
 | `blocked` | warning | the current composition failed permanently (its SystemEvent names the cause) |
-| `lock_held_elsewhere` | warning | 12 consecutive `busy` passes (~1 min): another holder of the worker lock |
+| `lock_held_elsewhere` | warning | 12 consecutive `busy` passes: another holder of the worker lock |
 | `database_errors` | warning | a pass failed on the database; the connection was closed |
 | `malfunction` | critical | 3 consecutive database failures |
 | `render_overdue` | critical | a render past its deadline |
-| `stale` | critical | no record for 60 s while polling |
-| `crash_looping` | critical | 3 starts within 15 minutes |
+| `stale` | critical | no record for 60 s while not rendering |
+| `crash_looping` | critical | 3 unclean starts within 900 s of the observation |
 | `stopped` | critical | a clean stop (a managed unit should be running) |
+| `malformed` | critical | the document breaks the contract (`detail.reason`) |
 | `no_heartbeat` | unknown | no readable file |
 
 `detail.native_airing` is `closed`/`open` and never degrades the status.
 
+**`--idle-seconds`** (the wait after a pass that made no progress) accepts 1
+to 30 seconds (default 5); zero, negative, non-finite or larger values are
+refused, so a waiting worker always records well within the 60 s staleness
+bound. A stop during the wait takes effect within 0.5 s.
+
 **D3E-B dependencies** (not done here): a managed `isadoraair-active-message-worker`
-unit (a signed protected-policy change) with `RuntimeDirectory=isadoraair`
-and `RuntimeDirectoryPreserve=yes` (or an equivalent writable state path) so
-the heartbeat survives restarts; `Restart=on-failure`; a `TimeoutStopSec`
-that tolerates finishing a pass (killing mid-render is safe -- the next pass
-reuses or re-renders -- but should be the exception); the unit's ordering
-after PostgreSQL and `isadoraair-render`; a Monitoring probe built on
-`heartbeat.readiness()` combined with systemd's ActiveState/NRestarts (as
-`monitoring/services/self_health.py` does); and dashboard presentation.
+unit (a signed protected-policy change) running as the station user (as
+Monitoring does, so the 0600 file is readable by it) and writing in the
+EXISTING `/run/isadoraair` (tmpfiles.d `d /run/isadoraair 0755 <station user>`,
+shared by several services) -- not a unit-owned `RuntimeDirectory`, which
+would conflict with that shared directory; the document then survives worker
+restarts (restart history) and is cleared at boot. Also `Restart=on-failure`;
+a `TimeoutStopSec` that tolerates finishing a pass (killing mid-render is safe
+-- the next pass reuses or re-renders -- but should be the exception);
+ordering after PostgreSQL and `isadoraair-render`; a Monitoring probe built on
+`heartbeat.readiness()` with systemd's ActiveState/NRestarts (as
+`monitoring/services/self_health.py` does); dashboard presentation.
 
 ### Crash and interruption boundaries (audited in D3E-A)
 
