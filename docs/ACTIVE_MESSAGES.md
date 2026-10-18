@@ -39,7 +39,8 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | **D3D** | the operator board (`/iportal/messages/board/`): review and publish across producers, clear, decline, expiry, Replay Now (unavailable while the gate is closed), airing and event visibility | **no** — gate still closed; Replay Now refuses before the service |
 | D3E-A | worker lifecycle and recovery hardening: expiry while a composition is blocked, one loop cadence, signals and connections, the worker heartbeat / readiness contract | **no** — gate still closed |
 | D3E-B | the managed worker unit `isadoraair-active-message-worker.service` (start gate, bounded restart/stop), Monitoring of it, the next protected generation's signed-policy entry (unsigned source only; deployed by r0116) | **no** — gate still closed |
-| D3E-C+ | retention (C), long-session board polling (D) | gate still closed |
+| D3E-C | retention and reconciliation: a read-only reconciler, one eligibility authority, safe cleanup of provably unreferenced leftovers, explicit operator-driven publication retirement (`manage.py active_message_retention`) | **no** — gate still closed; nothing selected by age |
+| D3E-D | long-session board polling / diagnostics | gate still closed |
 
 ## Authority
 
@@ -1286,6 +1287,186 @@ OGRemote unit is in the updater's authority).
   Never edit the heartbeat file, the protected policy, the trust
   configuration or installed unit files, and never bypass Update Center.
 
+## Retention and reconciliation (D3E-C)
+
+`active_messages/retention.py` is the ONE authority on what may be reclaimed
+(and the only code that reclaims it); `active_messages/reconcile.py` is the
+read-only reconciler; `manage.py active_message_retention` is the operator
+interface. Retention reclaims **storage** (bytes on disk). It never deletes
+or rewrites **history** (database rows).
+
+### Ownership and reference matrix
+
+| Artifact | Owner / references | D3E-C |
+| --- | --- | --- |
+| Producer message audio (`ProductionMedia`) | `ActiveBroadcastMessage.message_media` (PROTECT); frozen snapshots by identity | **retained** (messages are never deleted) |
+| Reference / stinger audio | `ReferenceAudio` registry (PROTECT, current and retired) | **retained** (the registry's) |
+| Bound aggregate (`mix_media`) | `ActiveBroadcastExecution.mix_media`, `ActiveBroadcastPublication.media` (PROTECT) | **retained** as history; reported (`terminal_mix_retained`) |
+| Unbound aggregate (rendered, never bound) | nothing (crash between render and bind; composition moved on) | **reclaimable**: bytes purged via Production's `purge_media` (row, hash, provenance kept), past the grace |
+| Aggregate of a FAILED / SUPPRESSED / INTERRUPTED execution | the execution (bound) | **retained** like any bound aggregate |
+| Published file `UrgentPA/am-<hex>.flac` | `ActiveBroadcastPublication` + its Track | **retirable** by explicit operator action only |
+| Library Track + waveform of a publication | the library (deleted through its own Collector) | removed **with** retirement only |
+| Interrupted-publication leftovers (`.am-publish-*` scratch, `.am-<hex>.flac.publish.lock`, placed file with no publication row) | nobody (crash) | **reclaimable** by the sweep, past the grace, never while a publish holds its lock, never a READY execution's placed file |
+| Publication / insertion correlation rows | the domain (append-only, never deleted) | **retained** forever |
+| LogItems, PlayEvents, segments, execution events | library / domain history | **retained** (library retention is the library's) |
+
+Nonnegotiable: frozen snapshots, execution identity / generation / digest /
+state history, append-only events, publication and insertion rows with their
+Track / LogItem id snapshots, actual-air evidence and confirmed durations,
+and media provenance and hashes are never removed or rewritten. A missing
+Track never means "never aired"; ACCEPTED or CLAIMED never means "aired"; a
+PlayEvent stays authoritative after its Track or LogItem is pruned.
+
+### Eligibility (`retention.assess_*`)
+
+* **Execution** (necessary, never sufficient): terminal (COMPLETED, FAILED,
+  SUPPRESSED, INTERRUPTED) with no open slot. PENDING_RENDER, READY,
+  ACCEPTED, CLAIMED and STARTED are refused (`execution_<state>`) however old.
+* **Publication retirement** additionally needs: not already retired; the
+  Track (if it still exists) provably the publication's -- id snapshot,
+  reserved path and candidate name (`track_not_publication` otherwise);
+  no unresolved deck claim (`deck_claim_unresolved`) or open air evidence
+  (`air_evidence_open`) on any LogItem naming the Track or any insertion's
+  LogItem; deleting the Track would neither be refused (`track_protected`:
+  playlist, rotation slot) nor cascade into anything (`track_has_dependents`:
+  voice tracks, ...); the reserved namespace is a real directory under a real
+  library root (`library_unavailable`, `namespace_not_a_directory`, ...); the
+  published file is not a symlink or other non-regular entry. An unclaimed,
+  unplayed LogItem is not a consumer: deck-open authority refuses every
+  native LogItem that is not the current attempt of a live execution.
+* **Aggregate purge**: an `active_message_mix` rendition, present, referenced
+  by nothing (Production's own reference discovery), older than the grace;
+  `purge_media` re-checks every reference under the media row lock.
+
+Never authorized by: age alone, a missing Track, a terminal state alone, or a
+path supplied by anyone.
+
+### Retirement lifecycle
+
+Published and available (live execution: dispatchable) -> historical (terminal
+execution: never dispatched again; deck-open authority refuses it) ->
+**retired** (operator action) -- distinct from "missing unexpectedly"
+(integrity damage) and "pruned through the library" (expected).
+
+`retire_publication` (one named execution):
+
+1. outside any lock: assess (dry run stops here: `eligible` with the bytes it
+   *would* reclaim);
+2. one transaction, locks policy -> execution (the established order; the
+   Track is not row-locked first): re-assess; append `publication_retired`
+   (publication id, Track id snapshot, SHA-256, relpath, what was present) as
+   the operator; delete the Track through the vetted `Collector` -- referrers
+   SET_NULL (their snapshots stay), then the Track, the library's own order
+   (a concurrent library deletion serializes with it; a dependent created
+   meanwhile fails the deferred foreign key and rolls the retirement back);
+3. after commit: remove the file and the waveform under the publication
+   destination lock.
+
+A retired publication is never redispatched (its execution is terminal) and
+is never reported as `publication_unavailable` damage. No migration: the
+append-only event is the durable marker (as `reconciled` is for stinger
+reconciliation).
+
+### Crash recovery
+
+| Interrupted | State afterwards | Recovery |
+| --- | --- | --- |
+| before cleanup / during assessment | unchanged | none needed |
+| after eligibility, before the commit (incl. a failing Track deletion) | rolled back: no event, Track and file intact | retry |
+| after the commit, before / during file removal | retired; file and/or waveform remain (harmless; nothing claims availability) | reconciler `retired_bytes_remaining` (in_flight); `--sweep --apply` (`finish_retirements`) removes them |
+| after removal, before the report | retired; bytes gone | a retry reports `already_retired`, 0 bytes |
+| waveform removal fails (permission) | retired; file gone, waveform remains; outcome `failed` | `--sweep --apply` |
+| a Track reappears for a retired publication | refused (`retired_track_present`), attention | operator review |
+
+Bytes are removed only after the durable state commits; a publication never
+claims bytes that are gone.
+
+### Reconciliation (`manage.py active_message_retention [--deep]`)
+
+Read-only: no message, execution, publication, Track, media or retention
+state, file, policy generation (the policy singleton is never created),
+retry counter or engine command changes; repeated runs give equal findings.
+Bounded (`--limit` rows per class; namespace scan capped; truncation
+reported). The metadata check stats files; only `--deep` hashes (never on the
+engine's path).
+
+| Code | Severity | Category |
+| --- | --- | --- |
+| `mix_media_bytes_inconsistent` | critical (live) / warning (terminal) | integrity_damage |
+| `mix_provenance_inconsistent` | critical / warning | integrity_damage |
+| `mix_media_purged_but_referenced`, `purged_media_still_referenced` | critical | integrity_damage |
+| `pending_input_unavailable`, `active_message_media_unavailable` | critical | integrity_damage |
+| `terminal_mix_retained` | info | retained |
+| `aggregate_unbound` | info | candidate_retirement (eligible / blocked:too_recent / referenced) |
+| `publication_digest_inconsistent`, `publication_track_snapshot_mismatch` | critical | integrity_damage |
+| `publication_track_missing` (live) | critical | integrity_damage |
+| `publication_file_missing`, `publication_track_path_mismatch`, `publication_file_digest_mismatch` (deep), `publication_file_not_regular` | critical (live) / warning (terminal) | integrity_damage |
+| `publication_waveform_missing` | warning | integrity_damage (display only) |
+| `publication_pruned` | info | expected_pruning (Track and file removed through the library) |
+| `publication_file_without_track` | info | candidate_retirement |
+| `publication_retained` | info | candidate_retirement (with eligibility / blocking reasons) |
+| `retired_bytes_remaining` | info | in_flight (sweep finishes) |
+| `retired_track_present` | warning | integrity_damage |
+| `insertion_log_item_pruned` | info | expected_pruning |
+| `current_insertion_log_item_missing` | warning | in_flight (the worker recovers) |
+| `insertion_publication_mismatch`, `insertion_association_unexpected` | critical | integrity_damage |
+| `namespace_orphan_file`, `publication_scratch_leftover`, `publication_lock_leftover` | warning / info | candidate_orphan |
+| `namespace_file_awaiting_adoption` | info | in_flight (READY: publish adopts it) |
+| `namespace_entry_unexpected`, `library_unavailable`, `namespace_not_a_directory` | warning / critical | unknown |
+
+Monitoring: the report run raises ONE deduplicated SystemEvent per
+integrity / unknown code with warning or critical severity
+(`active_messages|retention|<code>`, a count and five sample identities);
+expected pruning, in-flight work, candidates, retained history and the
+closed native-airing gate never alert (`--no-attention` suppresses all).
+No Monitoring worker or timer runs it; D3E-D can read the same structured
+`Report` for the board.
+
+### Operator commands
+
+    manage.py active_message_retention                       # report (read-only)
+    manage.py active_message_retention --deep                # report + hashes
+    manage.py active_message_retention --sweep               # dry run of the safe sweep
+    manage.py active_message_retention --sweep --apply       # reclaim leftovers (grace >= 1 h; default 24 h)
+    manage.py active_message_retention --sweep --apply --include-production   # + Production's own sweeps
+    manage.py active_message_retention --retire <execution UUID> ...           # dry run: eligibility per execution
+    manage.py active_message_retention --retire <UUID> ... --apply --operator <username>
+
+Defaults: read-only; destructive only with `--apply`; no timer, no
+background cleanup, no age-based expiry of publications and no default
+retention duration; at most 50 executions per `--retire`; never a path. Dry
+runs report "reclaimable (not reclaimed)"; `--apply` reports bytes actually
+removed. Exit 1 for a storage or database failure or any failed removal
+(nothing is reported as reclaimed for it).
+
+### Troubleshooting
+
+* `retired_bytes_remaining` / a `failed` retirement: fix the cause (e.g. the
+  library mount or permissions), then `--sweep --apply`.
+* `library_unavailable` / `namespace_not_a_directory`: the library mount is
+  absent or the reserved directory was replaced (e.g. by a symlink); nothing
+  is removed until it is a real directory again.
+* `publication_track_missing` on a live execution: the worker fails it
+  (`publication_unavailable`); a terminal one with the Track gone is expected
+  pruning.
+* Blocked retirement: the reasons name the fix -- remove the Track from the
+  playlist / rotation, wait for the deck's evidence to become terminal, or
+  leave it retained.
+* Safe while native airing is closed: every report and dry run; `--sweep
+  --apply`; retiring terminal executions. Never edit or delete publication,
+  insertion or event rows, never hand-delete files in `UrgentPA/am-*`.
+
+### What D3E-C deliberately does not reclaim (Phase G dependencies)
+
+Bound aggregates stay as long as their executions reference them (forever:
+executions are history). With the gate closed this is bounded (one unfinished
+execution; identical compositions reuse one rendition). Before Phase G airs
+an aggregate every cadence, the station needs an explicit, separately
+authorized aggregate-retention design (e.g. which terminal executions' bytes
+may go while their rows stay) -- not age-based deletion, and not by removing
+a foreign key. Likewise there is no automatic publication retirement policy:
+any future one must be designed, authorized and qualified as such.
+
 ## Release notes for D1
 
 * `active_messages.0001_initial` — CreateModel ×4 (additive, automatic).
@@ -1410,3 +1591,16 @@ OGRemote unit is in the updater's authority).
 * No model, setting, capability or URL; no engine, renderer,
   OGRemote, Weather/AMBER or GStreamer change; `NATIVE_AIRING_AVAILABLE`
   stays False.
+
+## Release notes for D3E-C
+
+* New `active_messages/retention.py` (eligibility authority, retirement,
+  safe sweeps) and `active_messages/reconcile.py` (read-only reconciler,
+  deduplicated Monitoring attention); new `manage.py active_message_retention`.
+* No migration, model, setting, capability, URL or timer. The retirement
+  marker is the append-only `publication_retired` event.
+* Nothing is reclaimed without `--apply`; nothing is selected by age;
+  publication retirement is explicit, per execution, by an authorized
+  operator.
+* No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
+  change; `NATIVE_AIRING_AVAILABLE` stays False.
