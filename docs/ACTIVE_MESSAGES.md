@@ -1111,13 +1111,27 @@ the last heartbeat's age, phase, last outcome and code, the execution (first
 history or raw document. **No Restart button**: the unit is not in the
 protected operator-restart allowlist, and Monitoring never restarts it.
 
-The check is configuration, not schema: after installation, run (as the
-station account) `manage.py provision_active_message_worker_check` -- it
-creates the check ("Active Message Worker", enabled, default debounce) only if
-no systemd check of the unit exists, never edits or renames one, and supports
-`--dry-run`. Adding the same row in Django admin is equivalent. No migration
-(a `RunPython` seed would make the release's migrations manual for the
-protected updater).
+The check is configuration, not schema, provisioned unattended by migration
+**`monitoring.0014_provision_active_message_worker_check`** (one `RunPython`,
+no schema change, reverse a no-op):
+
+* an existing systemd check of the exact unit -- any name, enabled or not,
+  customized -- is left exactly as it is; re-running never duplicates it;
+* otherwise one check is created: "Active Message Worker", enabled, default
+  debounce/notifications, shown, sorted after the other systemd checks;
+* if that name belongs to an unrelated check, that row is never touched; the
+  check is created under the unit name instead, and if that is also taken,
+  nothing is created (add it by hand);
+* it touches no service, unit or Active Messages row.
+
+The executor applies migrations before unit reconciliation and restarts, so
+the check exists before the worker starts and before Monitoring restarts. In
+the seconds between the migration and the unit's `enable --now` the running
+Monitoring may see the unit absent; the default two-poll debounce absorbs a
+short gap, and if the job stops before activating the unit, the critical card
+is the truthful signal (the release did not finish).
+`manage.py provision_active_message_worker_check` (idempotent, `--dry-run`)
+and Django admin remain repair paths.
 
 ### Expected healthy dormant state
 
@@ -1189,9 +1203,35 @@ The r0116 packaging (not D3E-B) must:
    prevent), with `isadoraair-monitoring` (new probe) and
    `isadoraair-gunicorn` (dashboard, manifest validator, planner) -- never
    the worker itself (bridge rule) -- in `services_requiring_restart`;
-4. after installation: `provision_active_message_worker_check`, the card
-   `ok`, the heartbeat current, the gate still closed, and a fresh Runtime
-   Recovery payload for generation 15 (as for every generation change).
+4. declare `monitoring.0014_provision_active_message_worker_check` in
+   `migrations_required` (`migration_compatibility: "additive"`). Its one
+   `RunPython` is classified **manual** by Update Center (never added to the
+   automatic allowlist), so the release needs its trusted migration-
+   authorization companion -- authored only AFTER the release-introducing
+   commit exists (the r0111 / r0115 procedure):
+   1. finalize and commit the r0116 release-introducing commit (manifest,
+      descriptor, attestation); record its full SHA `R` and
+      `sha256(deploy/releases/r0116.json at R)` `M`;
+   2. confirm the migration bytes at `R` are the reviewed ones
+      (`sha256(monitoring/migrations/0014_provision_active_message_worker_check.py at R)`)
+      and that the real classifier (`updatecenter_probe`) reports exactly one
+      manual operation: index 0, `RunPython`;
+   3. write `deploy/migration_authorizations/r0116.json` -- schema 1,
+      `release_id` r0116, `target_commit` R, `manifest_sha256` M, and exactly
+      one `authorized_manual_operations` entry (that ref, that file SHA-256,
+      `operation_index` 0, `RunPython`, `manual`), `json.dumps(..., indent=2)`
+      plus a newline;
+   4. commit it alone, as a single-parent child of R that changes only that
+      file (metadata-only); never amend R, never modify the companion later;
+   5. validate with both validators (the protected runtime and
+      `updatecenter.migration_authorization`) at the new tip, and publish
+      both commits together. No real values exist before step 1 -- none are
+      invented in D3E-B (`test_active_message_worker_migration` proves the
+      contract with synthetic commits);
+5. after installation: the "Active Message Worker" card present (from the
+   migration) and `ok`, the heartbeat current, the gate still closed, and a
+   fresh Runtime Recovery payload for generation 15 (as for every generation
+   change).
 
 The updater then installs the template, reloads once, `enable --now`s it --
 the start job completes only through the start gate -- and verifies it
@@ -1346,7 +1386,10 @@ OGRemote unit is in the updater's authority).
 * Monitoring: the Systemd Service probe also reads `MainPID` and
   `ExecMainStartTimestamp` (every unit; other units' results are unchanged)
   and recognizes the worker unit; dashboard captions and one detail line;
-  `manage.py provision_active_message_worker_check`.
-* No migration, model, setting, capability or URL; no engine, renderer,
+  `manage.py provision_active_message_worker_check` (repair tool).
+* **Migration `monitoring.0014_provision_active_message_worker_check`**: one
+  `RunPython` (manual for Update Center; needs the r0116 companion), no
+  schema change, reverse a no-op.
+* No model, setting, capability or URL; no engine, renderer,
   OGRemote, Weather/AMBER or GStreamer change; `NATIVE_AIRING_AVAILABLE`
   stays False.

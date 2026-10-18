@@ -111,6 +111,10 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
         "monitoring.0012_alter_monitorcheck_kind",
         "monitoring.0013_backup_recovery_assurance_check",
     )
+    # Monitoring migrations introduced by releases after r0060 (see the test).
+    later_release_refs = (
+        "monitoring.0014_provision_active_message_worker_check",
+    )
 
     def test_r0012_probe_accepts_and_applies_r0011_from_supported_baselines(self):
         executor = MigrationExecutor(connection)
@@ -126,9 +130,24 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
             # Represent the schema still installed at r0010. The corrected
             # probe is imported from this staged post-r0011/r0012 source.
             executor.migrate(r0010_targets)
-            target_payload = _strict_probe(
+            current_tree_payload = _strict_probe(
                 json.dumps(build_probe_payload()).encode("utf-8"), review_context=False,
             )
+            # D3E-B (r0116 and later) adds monitoring migrations AFTER r0060
+            # that r0060's own target tree never contained -- among them the
+            # first deliberately MANUAL one (a RunPython, authorized by its
+            # release's companion). They are pinned here explicitly, and the
+            # historical r0060 transition below is judged on exactly the plan
+            # its own tree would have produced: the current plan restricted to
+            # r0060's pending refs (nothing in that tree depends on the later
+            # leaves).
+            later = [item for item in current_tree_payload["plan"]
+                     if item["ref"] not in self.pending_migration_refs]
+            self.assertEqual([item["ref"] for item in later], list(self.later_release_refs))
+            self.assertEqual([(op["operation"], op["classification"]) for item in later
+                              for op in item["operations"]], [("RunPython", "manual")])
+            target_payload = dict(current_tree_payload, plan=[
+                item for item in current_tree_payload["plan"] if item["ref"] in self.pending_migration_refs])
             migration = next(
                 item
                 for item in target_payload["plan"]

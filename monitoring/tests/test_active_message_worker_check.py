@@ -272,8 +272,12 @@ class MonitorCycleTests(Heartbeat, TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         MonitorCheck.objects.all().update(enabled=False)
-        self.check = MonitorCheck.objects.create(name="Active Message Worker", kind="systemd", systemd_unit=UNIT,
-                                                 consecutive_failures_required=2, sort_order=1)
+        # the check monitoring.0014 provisioned (correction B3), as an operator would see it
+        self.check = MonitorCheck.objects.get(kind="systemd", systemd_unit=UNIT)
+        self.assertEqual(self.check.name, "Active Message Worker")
+        MonitorCheck.objects.filter(pk=self.check.pk).update(enabled=True, sort_order=1)
+        self.check.refresh_from_db()
+        self.assertEqual(self.check.consecutive_failures_required, 2)
         self.other = MonitorCheck.objects.create(name="Disk", kind="disk", disk_path="/", critical_threshold=101,
                                                  sort_order=2)
         self.manager = monitor_module.MonitorManager()

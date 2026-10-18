@@ -14,11 +14,12 @@ precedent for the render/spoken units -- and replaces nothing:
 * otherwise one row is created: DEFAULT_NAME, enabled, the default debounce;
 * a different row already holding DEFAULT_NAME is refused, never renamed.
 
-Run it after the unit is installed and verified active (a check of a unit
-that does not exist yet reports it stopped). No migration: provisioning is a
-deliberate post-install step, so it never makes a release's migrations
-"manual" for the protected updater (RunPython is outside its automatic
-allowlist).
+Unattended installation does not need it: migration
+monitoring.0014_provision_active_message_worker_check provisions the same
+check (falling back to the unit name, or creating nothing, when the default
+name is held by an unrelated check). This command stays an optional,
+idempotent repair tool -- e.g. after an operator deleted the check, or to add
+it under the default name once a colliding row is renamed.
 """
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
