@@ -1,6 +1,10 @@
 {
   "managed_units": [
     {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-active-message-worker.service"
+    },
+    {
       "policy": "INSTALL_ONLY",
       "unit": "isadoraair-aircheck-buffer.service"
     },
