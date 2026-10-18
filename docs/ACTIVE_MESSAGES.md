@@ -1115,13 +1115,25 @@ The check is configuration, not schema, provisioned unattended by migration
 **`monitoring.0014_provision_active_message_worker_check`** (one `RunPython`,
 no schema change, reverse a no-op):
 
-* an existing systemd check of the exact unit -- any name, enabled or not,
-  customized -- is left exactly as it is; re-running never duplicates it;
-* otherwise one check is created: "Active Message Worker", enabled, default
-  debounce/notifications, shown, sorted after the other systemd checks;
-* if that name belongs to an unrelated check, that row is never touched; the
-  check is created under the unit name instead, and if that is also taken,
-  nothing is created (add it by hand);
+* the worker's check is identified ONLY by kind `systemd` + the exact unit
+  `isadoraair-active-message-worker.service` -- never by its name. If one
+  exists (any name, enabled or not, customized) every field is left exactly
+  as it is; re-running never duplicates it;
+* otherwise exactly one check is created -- enabled, default
+  debounce/notifications, shown, sorted after the other systemd checks --
+  under the first free name of a fixed, bounded series: "Active Message
+  Worker", then the unit name `isadoraair-active-message-worker.service`, then
+  "Active Message Worker (2)" ... "Active Message Worker (100)" (all within
+  the 100-character name limit). A row holding one of those names is never
+  touched, renamed or adopted;
+* an absent check is therefore either created or the migration FAILS: if all
+  101 names are taken by other checks it raises `CandidateNamesExhausted`
+  (rolled back, not recorded as applied), naming the fix -- rename one of
+  those checks or add a Systemd Service check for the unit under any free name
+  in Django admin -- after which the update is retried. A database error
+  (e.g. a concurrent name collision) is never swallowed either;
+* reverse is a no-op (a check an operator may have customized is never
+  deleted);
 * it touches no service, unit or Active Messages row.
 
 The executor applies migrations before unit reconciliation and restarts, so
@@ -1212,10 +1224,13 @@ The r0116 packaging (not D3E-B) must:
    1. finalize and commit the r0116 release-introducing commit (manifest,
       descriptor, attestation); record its full SHA `R` and
       `sha256(deploy/releases/r0116.json at R)` `M`;
-   2. confirm the migration bytes at `R` are the reviewed ones
-      (`sha256(monitoring/migrations/0014_provision_active_message_worker_check.py at R)`)
-      and that the real classifier (`updatecenter_probe`) reports exactly one
-      manual operation: index 0, `RunPython`;
+   2. confirm the migration bytes at `R` are the reviewed ones --
+      `sha256(monitoring/migrations/0014_provision_active_message_worker_check.py at R)`
+      must be `e87ae5de003d01c857884821106b0d7a618d15e926ec84820fcf072e4a245566`
+      (the collision-safe version; the superseded `5d10a044…` bytes must
+      never be authorized) -- and that the real classifier
+      (`updatecenter_probe`) reports exactly one manual operation: index 0,
+      `RunPython`;
    3. write `deploy/migration_authorizations/r0116.json` -- schema 1,
       `release_id` r0116, `target_commit` R, `manifest_sha256` M, and exactly
       one `authorized_manual_operations` entry (that ref, that file SHA-256,
@@ -1388,8 +1403,10 @@ OGRemote unit is in the updater's authority).
   and recognizes the worker unit; dashboard captions and one detail line;
   `manage.py provision_active_message_worker_check` (repair tool).
 * **Migration `monitoring.0014_provision_active_message_worker_check`**: one
-  `RunPython` (manual for Update Center; needs the r0116 companion), no
-  schema change, reverse a no-op.
+  `RunPython` (manual for Update Center; needs the r0116 companion bound to
+  SHA-256 `e87ae5de…a245566`), no schema change, reverse a no-op. It creates
+  the worker's check under the first free name of a bounded series, or fails
+  explicitly -- an unattended install never succeeds without the check.
 * No model, setting, capability or URL; no engine, renderer,
   OGRemote, Weather/AMBER or GStreamer change; `NATIVE_AIRING_AVAILABLE`
   stays False.

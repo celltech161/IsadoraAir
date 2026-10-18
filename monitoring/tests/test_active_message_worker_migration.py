@@ -31,11 +31,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.loader import MigrationLoader
 from django.test import SimpleTestCase, TestCase
 
 from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastPolicy
 from monitoring.models import MonitorCheck
+from monitoring.services import probes
 from updatecenter import migration_authorization as django_side
 from updatecenter.management.commands import updatecenter_probe as probe
 from updatecenter.tests.phase_b_helpers import RUNTIME_ROOT, git, manifest  # noqa: F401
@@ -54,6 +56,11 @@ PATH = f"monitoring/migrations/{NAME}.py"
 UNIT = "isadoraair-active-message-worker.service"
 MIGRATION_BYTES = (PROJECT_ROOT / PATH).read_bytes()
 MIGRATION_SHA256 = hashlib.sha256(MIGRATION_BYTES).hexdigest()
+# The reviewed bytes (collision-safe naming correction). The b37dfc7 bytes,
+# which could succeed without creating the check, must never be authorized.
+REVIEWED_SHA256 = "e87ae5de003d01c857884821106b0d7a618d15e926ec84820fcf072e4a245566"
+SUPERSEDED_SHA256 = "5d10a04420897537cf48716ff2908d8f4438d54e3f8e29d0b26971ea71829018"
+PREVIOUS = ("monitoring", "0013_backup_recovery_assurance_check")
 COMPANION = "deploy/migration_authorizations/r0003.json"
 module = importlib.import_module(f"monitoring.migrations.{NAME}")
 
@@ -70,8 +77,25 @@ def worker_checks():
     return MonitorCheck.objects.filter(kind="systemd", systemd_unit=UNIT)
 
 
-def snapshot():
-    return sorted(MonitorCheck.objects.values_list(*[f.attname for f in MonitorCheck._meta.concrete_fields]))
+def snapshot(queryset=None):
+    queryset = MonitorCheck.objects.all() if queryset is None else queryset
+    return sorted(queryset.values_list(*[f.attname for f in MonitorCheck._meta.concrete_fields]))
+
+
+def occupy(*names):
+    """Unrelated (disk) checks holding ``names``."""
+    MonitorCheck.objects.bulk_create([
+        MonitorCheck(name=name, kind="disk", disk_path=f"/occupied/{index}", critical_threshold=90)
+        for index, name in enumerate(names)])
+
+
+def migrate_monitoring(target):
+    """The REAL migration through Django's executor (inside this test's transaction)."""
+    MigrationExecutor(connection).migrate([("monitoring", target)])
+
+
+def applied(name):
+    return ("monitoring", name) in MigrationExecutor(connection).loader.applied_migrations
 
 
 class ProvisioningTests(TestCase):
@@ -103,19 +127,113 @@ class ProvisioningTests(TestCase):
         self.assertEqual(snapshot(), before)                     # byte-for-byte: disabled stays disabled
         self.assertFalse(worker_checks().get().enabled)
 
-    def test_name_collisions_never_touch_an_unrelated_row(self):
+    def test_the_reviewed_bytes(self):
+        self.assertEqual(MIGRATION_SHA256, REVIEWED_SHA256)
+        self.assertNotEqual(MIGRATION_SHA256, SUPERSEDED_SHA256)
+        self.assertEqual(module.CANDIDATE_NAMES[:4], ("Active Message Worker", UNIT, "Active Message Worker (2)",
+                                                      "Active Message Worker (3)"))
+        self.assertEqual(len(module.CANDIDATE_NAMES), 101)
+        self.assertEqual(len(set(module.CANDIDATE_NAMES)), 101)
+        self.assertLessEqual(max(map(len, module.CANDIDATE_NAMES)), MonitorCheck._meta.get_field("name").max_length)
+
+    def test_the_preferred_name_when_free(self):
         worker_checks().delete()
-        unrelated = MonitorCheck.objects.create(name="Active Message Worker", kind="disk", disk_path="/",
-                                                critical_threshold=90)
         provision()
-        self.assertEqual(list(worker_checks().values_list("name", flat=True)), [UNIT])     # the fallback name
-        self.assertEqual(MonitorCheck.objects.get(pk=unrelated.pk).kind, "disk")
+        self.assertEqual(worker_checks().get().name, "Active Message Worker")
+
+    def test_the_unit_name_when_the_preferred_name_is_held(self):
         worker_checks().delete()
+        occupy("Active Message Worker")
+        provision()
+        self.assertEqual(worker_checks().get().name, UNIT)
+
+    def test_both_preferred_names_occupied_still_creates_the_check(self):
+        """The reviewed defect: no worker check, "Active Message Worker" and the
+        unit-name fallback both held by unrelated checks -- the migration must
+        not succeed without creating the worker's check."""
+        worker_checks().delete()
+        MonitorCheck.objects.create(name="Active Message Worker", kind="disk", disk_path="/", critical_threshold=90)
         MonitorCheck.objects.create(name=UNIT, kind="disk", disk_path="/tmp", critical_threshold=90)
+        provision()
+        self.assertEqual(list(worker_checks().values_list("name", "enabled")), [("Active Message Worker (2)", True)])
+
+    def test_the_next_unused_numbered_name(self):
+        worker_checks().delete()
+        occupy("Active Message Worker", UNIT, "Active Message Worker (2)", "Active Message Worker (3)",
+               "Active Message Worker (5)")
+        provision()
+        self.assertEqual(worker_checks().get().name, "Active Message Worker (4)")
+
+    def test_unrelated_rows_keep_their_names_settings_and_identities(self):
+        worker_checks().delete()
+        occupy("Active Message Worker", UNIT, "Active Message Worker (2)")
+        MonitorCheck.objects.filter(name="Active Message Worker").update(enabled=False, sort_order=9)
+        MonitorCheck.objects.create(name="Engine (renamed)", kind="systemd", systemd_unit="isadoraair-engine.service")
+        unrelated = MonitorCheck.objects.exclude(kind="systemd", systemd_unit=UNIT)
+        before = snapshot(unrelated)
+        provision()
+        self.assertEqual(snapshot(MonitorCheck.objects.exclude(kind="systemd", systemd_unit=UNIT)), before)
+        self.assertEqual(worker_checks().count(), 1)
+
+    def test_exhausted_candidate_names_fail_explicitly_and_create_nothing(self):
+        worker_checks().delete()
+        occupy(*module.CANDIDATE_NAMES)
         before = snapshot()
-        provision()                                              # both names held: nothing is created or changed
+        with self.assertRaises(module.CandidateNamesExhausted) as raised:
+            provision()
+        message = str(raised.exception)
+        for needle in (UNIT, "Active Message Worker", "(100)", "Rename one of those checks", "Django admin",
+                       "retry the update"):
+            self.assertIn(needle, message)
         self.assertEqual(snapshot(), before)
         self.assertFalse(worker_checks().exists())
+
+    def test_through_the_real_migration_executor(self):
+        """Unapply/apply monitoring.0014 with Django's executor: collisions, a
+        numbered name, idempotency, the no-op reverse."""
+        self.assertTrue(applied(NAME))
+        migrate_monitoring(PREVIOUS[1])                          # reverse: a no-op, never a delete
+        self.assertFalse(applied(NAME))
+        self.assertEqual(worker_checks().count(), 1)
+        worker_checks().delete()
+        occupy("Active Message Worker", UNIT)
+        migrate_monitoring(NAME)
+        self.assertTrue(applied(NAME))
+        self.assertEqual(list(worker_checks().values_list("name", flat=True)), ["Active Message Worker (2)"])
+        before = snapshot()
+        migrate_monitoring(PREVIOUS[1])
+        migrate_monitoring(NAME)                                 # re-applied: no duplicate, nothing changed
+        self.assertEqual(snapshot(), before)
+
+    def test_exhaustion_fails_the_real_migration_and_rolls_back(self):
+        migrate_monitoring(PREVIOUS[1])
+        worker_checks().delete()
+        occupy(*module.CANDIDATE_NAMES)
+        before = snapshot()
+        with self.assertRaises(module.CandidateNamesExhausted):
+            migrate_monitoring(NAME)
+        self.assertFalse(applied(NAME))                          # never recorded as applied
+        self.assertEqual(snapshot(), before)
+        MonitorCheck.objects.filter(name="Active Message Worker (100)").delete()     # the operator frees a name
+        migrate_monitoring(NAME)                                 # the retried update provisions it
+        self.assertEqual(worker_checks().get().name, "Active Message Worker (100)")
+
+    def test_the_new_check_is_what_the_monitoring_poller_runs(self):
+        worker_checks().delete()
+        occupy("Active Message Worker", UNIT)
+        provision()
+        polled = list(MonitorCheck.objects.filter(enabled=True).order_by("sort_order"))   # MonitorManager._run_cycle
+        [check] = [item for item in polled if item.systemd_unit == UNIT]
+        self.assertIs(probes.PROBE_DISPATCH[check.kind], probes.probe_systemd)
+        self.assertIs(probes.APPLICATION_READINESS[check.systemd_unit], probes._active_message_worker_readiness)
+
+    def test_no_schema_change(self):
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        before = loader.project_state(PREVIOUS).models[("monitoring", "monitorcheck")]
+        after = loader.project_state(("monitoring", NAME)).models[("monitoring", "monitorcheck")]
+        self.assertEqual({name: field.deconstruct() for name, field in before.fields.items()},
+                         {name: field.deconstruct() for name, field in after.fields.items()})
+        self.assertEqual((before.options, before.bases), (after.options, after.bases))
 
     def test_reverse_never_deletes_operator_state(self):
         migration = MigrationLoader(None, ignore_no_migrations=True).disk_migrations[("monitoring", NAME)]
@@ -283,6 +401,12 @@ class CompanionContractTests(SimpleTestCase):
         runtime, _django = release.verdicts()
         self.assertEqual(runtime[0], "ok")                       # valid for ITS bytes...
         self.assertFalse(central_authorization_covers({"r0003": runtime[1]}, **exact_station_plan()))  # ...not ours
+
+    def test_the_superseded_bytes_hash_does_not_authorize_the_corrected_migration(self):
+        release = self.release()
+        release.add_companion(release.record(migration_file_sha256=SUPERSEDED_SHA256))
+        runtime, django = release.verdicts()
+        self.assertEqual((runtime[0], django[0]), ("rejected", "rejected"))
 
     def test_a_missing_companion_authorizes_nothing(self):
         runtime, django = self.release().verdicts()

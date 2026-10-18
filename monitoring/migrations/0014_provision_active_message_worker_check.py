@@ -11,12 +11,14 @@
 # * Otherwise exactly one is created: enabled, the model's default debounce and
 #   notification settings, shown as a card, sorted after the existing systemd
 #   checks.
-# * Name collision (the name is unique): if DEFAULT_NAME belongs to an
-#   unrelated check, that row is never touched or renamed; the check is created
-#   under the deterministic FALLBACK_NAME (the unit name itself). Only if that
-#   is ALSO held by an unrelated row is nothing created --
-#   `manage.py provision_active_message_worker_check` (or Django admin) then
-#   adds it under a name the operator chooses.
+# * Names (MonitorCheck.name is unique): the check is created under the first
+#   free name of a fixed, bounded series -- DEFAULT_NAME, then FALLBACK_NAME
+#   (the unit name), then "DEFAULT_NAME (2)" ... "DEFAULT_NAME (MAX_SUFFIX)".
+#   A row already holding a name is never touched, renamed or adopted: only
+#   kind + systemd_unit identify the worker's check.
+# * If every candidate is taken the migration FAILS (CandidateNamesExhausted,
+#   rolling back): it never succeeds without the check. Nothing swallows a
+#   database error either -- a concurrent unique-name collision also fails it.
 # * Re-running it can never create a second check for the unit.
 # * Reverse is a no-op: a check an operator may have customized since is never
 #   deleted by a migration.
@@ -32,7 +34,19 @@ from django.db import migrations
 UNIT = "isadoraair-active-message-worker.service"
 DEFAULT_NAME = "Active Message Worker"
 FALLBACK_NAME = UNIT
+MAX_SUFFIX = 100                    # "Active Message Worker (2)" .. "(100)": 101 candidates in all
+MAX_NAME_LENGTH = 100               # MonitorCheck.name max_length
 MAX_SORT_ORDER = 32767
+CANDIDATE_NAMES = (DEFAULT_NAME, FALLBACK_NAME,
+                   *(f"{DEFAULT_NAME} ({number})" for number in range(2, MAX_SUFFIX + 1)))
+
+
+class CandidateNamesExhausted(RuntimeError):
+    pass
+
+
+if any(len(candidate) > MAX_NAME_LENGTH for candidate in CANDIDATE_NAMES):
+    raise RuntimeError("a candidate Monitoring check name exceeds MonitorCheck.name's length")
 
 
 def provision_active_message_worker_check(apps, schema_editor):
@@ -40,10 +54,14 @@ def provision_active_message_worker_check(apps, schema_editor):
     checks = MonitorCheck.objects.using(schema_editor.connection.alias)
     if checks.filter(kind="systemd", systemd_unit=UNIT).exists():
         return
-    taken = set(checks.filter(name__in=(DEFAULT_NAME, FALLBACK_NAME)).values_list("name", flat=True))
-    name = next((candidate for candidate in (DEFAULT_NAME, FALLBACK_NAME) if candidate not in taken), None)
+    taken = set(checks.filter(name__in=CANDIDATE_NAMES).values_list("name", flat=True))
+    name = next((candidate for candidate in CANDIDATE_NAMES if candidate not in taken), None)
     if name is None:
-        return
+        raise CandidateNamesExhausted(
+            f"cannot provision the Monitoring check for {UNIT}: every candidate name "
+            f"({DEFAULT_NAME!r}, {FALLBACK_NAME!r}, {DEFAULT_NAME!r} (2)..({MAX_SUFFIX})) is used by another "
+            f"check. Rename one of those checks, or add a Systemd Service check for {UNIT} under any free name "
+            f"in Django admin (Monitoring > Monitor Checks), then retry the update.")
     highest = max(checks.filter(kind="systemd").values_list("sort_order", flat=True), default=0)
     checks.create(
         name=name, kind="systemd", systemd_unit=UNIT, enabled=True,
