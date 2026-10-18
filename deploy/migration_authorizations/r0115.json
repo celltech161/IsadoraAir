@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0115",
+  "target_commit": "fd3ac805e774f6039636f3f8178f5770ea038572",
+  "manifest_sha256": "347a4288b09f89a501596c2667f3d510cdf88da8b8ba6af3de1da4ecd69d7688",
+  "authorized_manual_operations": [
+    {
+      "ref": "active_messages.0005_execution_history_indexes",
+      "migration_file_sha256": "2faa6b4aac94f7aaaa2dfede9c64cb1987a8153d9b737275c3e2ed8219d7af8e",
+      "operation_index": 0,
+      "operation": "AddIndex",
+      "classification": "manual"
+    },
+    {
+      "ref": "active_messages.0005_execution_history_indexes",
+      "migration_file_sha256": "2faa6b4aac94f7aaaa2dfede9c64cb1987a8153d9b737275c3e2ed8219d7af8e",
+      "operation_index": 1,
+      "operation": "AddIndex",
+      "classification": "manual"
+    }
+  ]
+}
