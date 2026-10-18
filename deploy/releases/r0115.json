@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0115",
+  "previous_release_id": "r0114",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal D3D: the Active Messages operator board (/iportal/messages/board/, active_message.control only): review and publish across producers, clear, decline, expiry, live ON AIR truth from the frozen airing, indexed and paginated airing history; Replay Now is unavailable while native airing stays closed (OGRemote remains authoritative). One migration, two AddIndex under the trusted companion; Gunicorn restart only; no static, package, unit or runtime change.",
+  "migrations_required": [
+    "active_messages.0005_execution_history_indexes"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
