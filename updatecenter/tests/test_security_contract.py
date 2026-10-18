@@ -133,7 +133,7 @@ class ManifestFieldContractTests(SimpleTestCase):
             m.CORE_RESTARTABLE_SERVICES,
             {"isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",
              "isadoraair-monitoring", "isadoraair-spoken-render-worker",
-             "isadoraair-rbds"},
+             "isadoraair-active-message-worker", "isadoraair-rbds"},
         )
 
 

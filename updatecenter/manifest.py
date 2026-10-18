@@ -128,6 +128,7 @@ CORE_RESTARTABLE_SERVICES = frozenset({
     "isadoraair-gunicorn",
     "isadoraair-engine",
     "isadoraair-spoken-render-worker",
+    "isadoraair-active-message-worker",
     "isadoraair-encoders",
     "isadoraair-monitoring",
     "isadoraair-rbds",

@@ -46,11 +46,13 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\.(?:service|timer)$")
 PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*$")
 CORE_SERVICES = frozenset({
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-encoders",
-    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-rbds",
+    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-active-message-worker",
+    "isadoraair-rbds",
 })
 RESTART_ORDER = (
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
-    "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds",
+    "isadoraair-spoken-render-worker", "isadoraair-active-message-worker", "isadoraair-encoders",
+    "isadoraair-rbds",
 )
 
 

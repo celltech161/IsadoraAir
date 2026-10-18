@@ -72,6 +72,21 @@ REVIEWED_RELEASE_PY_EDITS = (
 )
 # The signed r0112 descriptor's recorded digest of release.py (generation 14).
 R0112_RELEASE_PY_SHA256 = "034ba10f0de4f16e6e5b66ef94ff1e998fcd15eb057f91361736f567afc4ab6c"
+# Runtime 13 (D3E-B; for generation 15, not yet signed): explicit restart
+# authority and order for isadoraair-active-message-worker, applied on top of the
+# exact signed generation-14 bytes above.
+RUNTIME_13_RELEASE_PY_EDITS = (
+    (b'    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-rbds",\n'
+     b'})\n',
+     b'    "isadoraair-monitoring", "isadoraair-spoken-render-worker", "isadoraair-active-message-worker",\n'
+     b'    "isadoraair-rbds",\n'
+     b'})\n'),
+    (b'    "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds",\n'
+     b')\n',
+     b'    "isadoraair-spoken-render-worker", "isadoraair-active-message-worker", "isadoraair-encoders",\n'
+     b'    "isadoraair-rbds",\n'
+     b')\n'),
+)
 
 
 def expected_release_py(baseline: bytes, edits=REVIEWED_RELEASE_PY_EDITS) -> bytes:
@@ -425,8 +440,9 @@ class InitiatingPlannerFingerprintTests(SimpleTestCase):
             ["git", "-C", str(PROJECT_ROOT), "show", f"{R0104_BASELINE}:deploy/updater_runtime/isadoraair_updater/release.py"],
             check=True, capture_output=True,
         ).stdout
-        expected = expected_release_py(baseline)
-        self.assertEqual(hashlib.sha256(expected).hexdigest(), R0112_RELEASE_PY_SHA256)    # = the signed bytes
+        generation_14 = expected_release_py(baseline)
+        self.assertEqual(hashlib.sha256(generation_14).hexdigest(), R0112_RELEASE_PY_SHA256)  # = the signed bytes
+        expected = expected_release_py(generation_14, RUNTIME_13_RELEASE_PY_EDITS)
         self.assertEqual(runtime_source, expected,
                          "trusted-chain/fingerprint code must stay byte-identical to r0104 plus the reviewed edits")
         from isadoraair_updater import release

@@ -73,11 +73,12 @@ class TrustedReleaseTests(SimpleTestCase):
         self.assertEqual(
             RESTART_ORDER,
             ("isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
-             "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds"),
+             "isadoraair-spoken-render-worker", "isadoraair-active-message-worker", "isadoraair-encoders",
+             "isadoraair-rbds"),
         )
 
-    def test_runtime_12_keeps_all_protocols_unchanged(self):
-        self.assertEqual(RUNTIME_VERSION, 12)
+    def test_runtime_13_keeps_all_protocols_unchanged(self):
+        self.assertEqual(RUNTIME_VERSION, 13)
         self.assertEqual(MANIFEST_PROTOCOL_VERSION, 5)
         self.assertEqual(PROTOCOL_VERSION, 4)
         self.assertEqual(SUPPORTED_WIRE_PROTOCOLS, (3, 4))

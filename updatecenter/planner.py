@@ -37,11 +37,14 @@ from .execution_contract import (
 # derived from these units' own declared `After=` dependencies
 # (deploy/isadoraair-engine.service and isadoraair-monitoring.service
 # both declare `After=...isadoraair-gunicorn.service`) -- gunicorn
-# first, then the web-dependent core, then the independent spoken worker,
-# with encoders/rbds last since nothing else declares an After= on them.
+# first, then the web-dependent core, then the independent application
+# workers (spoken, then active messages: each After= only PostgreSQL, the
+# renderer and the validator, and nothing declares an After= on either), with
+# encoders/rbds last since nothing else declares an After= on them.
 RESTART_ORDER = (
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
-    "isadoraair-spoken-render-worker", "isadoraair-encoders", "isadoraair-rbds",
+    "isadoraair-spoken-render-worker", "isadoraair-active-message-worker", "isadoraair-encoders",
+    "isadoraair-rbds",
 )
 
 

@@ -377,7 +377,7 @@ class ManifestProtocolBumpTests(SimpleTestCase):
         # constant, and bumping it broke every existing daemon-socket
         # client's request shape).
         self.assertEqual(PROTOCOL_VERSION, 4)
-        self.assertEqual(RUNTIME_VERSION, 12)
+        self.assertEqual(RUNTIME_VERSION, 13)
 
     def test_old_updater_protocol_rejects_a_release_requiring_the_new_one(self):
         """Simulates an updater still running protocol-3 code (as it

@@ -109,7 +109,16 @@ HANDOFF_WIRE_PROTOCOL = SUPPORTED_WIRE_PROTOCOLS[0]
 # 11 -> 12 (r0112): explicit restart authority/order for the already-managed
 # isadoraair-spoken-render-worker. No release-manifest schema, daemon wire
 # protocol, bootstrap protocol, or managed-unit activation semantics changed.
-RUNTIME_VERSION = 12
+#
+# 12 -> 13 (D3E-B; first carried by r0116 with generation 15): explicit
+# restart authority/order for isadoraair-active-message-worker, which the
+# generation-15 signed policy first names ENABLE_NOW (installed and started by
+# that release's unit reconciliation; never restarted by it). A runtime-12
+# worker refuses the name while parsing the chain, before its handoff, so the
+# release delivering runtime 13 must not itself declare that restart (the r0112
+# precedent). No release-manifest schema, daemon wire protocol, bootstrap
+# protocol, or managed-unit activation semantics changed.
+RUNTIME_VERSION = 13
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared

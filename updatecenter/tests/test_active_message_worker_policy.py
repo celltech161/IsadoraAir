@@ -7,17 +7,19 @@ ENABLE_NOW``, to deploy/updater_runtime/protected-policy.json -- the policy
 SOURCE of the next generation. It is UNSIGNED PREPARATION: the
 generation-15 descriptor, the release manifest and the primary-release
 attestation are produced by the r0116 release packaging with the real
-signing workflow, never here. No protected-runtime Python authority changes:
-the compiled fallback map, core services and restart order do not name the
-worker.
+signing workflow, never here. The only other runtime change is runtime 13's
+release-driven restart authority (CORE_SERVICES / RESTART_ORDER, correction
+B2, test_active_message_worker_restart), which -- as r0112's did -- also seeds
+the compiled fallback map; that map is never consulted while a signed policy
+is active.
 
 Proved against the real updater code (isadoraair_updater, protected_bootstrap)
 with test keys and temporary repositories -- nothing is installed:
 
 * the policy source: generation 14 (as r0115 runs it) plus exactly the one
   entry; canonical; every entry has a template;
-* refusal without authority: the active generation-14 policy and the
-  compiled fallback both refuse to install the unit; an ordinary plan naming
+* refusal without authority: the active generation-14 policy refuses to
+  install the unit; an ordinary plan naming
   it is blocked UNKNOWN_MANAGED_UNIT; a candidate that does not authorize it,
   or a manifest that does not declare it, is refused;
 * the candidate path: a candidate bundle built from THIS runtime tree and
@@ -47,7 +49,7 @@ from django.test import SimpleTestCase
 from .phase_b_helpers import RUNTIME_ROOT, config_dict, create_release_repository
 
 from deploy.updater_bootstrap.tools.protected_runtime_release import build_descriptor, build_statement, sign_statement
-from isadoraair_updater import HANDOFF_WIRE_PROTOCOL
+from isadoraair_updater import HANDOFF_WIRE_PROTOCOL, RUNTIME_VERSION
 from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.process import CommandRunner, ProcessResult
 from isadoraair_updater.release import (
@@ -123,18 +125,22 @@ class PolicySourceTests(SimpleTestCase):
         self.assertFalse((PROJECT_ROOT / "deploy" / "releases" / "r0116.json").exists())
         self.assertFalse(list((PROJECT_ROOT / "deploy" / "updater_attestations").glob("r0116*")))
 
-    def test_no_protected_runtime_python_authority_changes(self):
+    def test_the_protected_runtime_changes_are_exactly_policy_and_restart_authority(self):
+        """Generation 15's runtime differs from generation 14's by the policy entry
+        and runtime 13's restart authority (release.py CORE_SERVICES /
+        RESTART_ORDER, __init__.py RUNTIME_VERSION) -- see
+        test_active_message_worker_restart."""
         tracked = _git("ls-files", "deploy/updater_runtime").decode().split()
-        changed = [path for path in tracked
-                   if (PROJECT_ROOT / path).read_bytes() != _git("show", f"{R0115}:{path}")]
-        self.assertEqual(changed, [POLICY_PATH])
+        changed = sorted(path for path in tracked
+                         if (PROJECT_ROOT / path).read_bytes() != _git("show", f"{R0115}:{path}"))
+        self.assertEqual(changed, ["deploy/updater_runtime/isadoraair_updater/__init__.py",
+                                   "deploy/updater_runtime/isadoraair_updater/release.py", POLICY_PATH])
         service = WORKER.removesuffix(".service")
-        self.assertNotIn(WORKER, MANAGED_UNIT_POLICIES)
-        self.assertNotIn(service, CORE_SERVICES)
-        self.assertNotIn(service, RESTART_ORDER)
-        self.assertNotIn(service, manifest_mod.CORE_RESTARTABLE_SERVICES)
-        self.assertNotIn(service, (PROJECT_ROOT / "updatecenter" / "planner.py").read_text())
-        self.assertIsNotNone(planner)
+        self.assertIs(MANAGED_UNIT_POLICIES[WORKER], UnitActivationPolicy.ENABLE_NOW)
+        self.assertIn(service, CORE_SERVICES)
+        self.assertIn(service, RESTART_ORDER)
+        self.assertEqual(manifest_mod.CORE_RESTARTABLE_SERVICES, CORE_SERVICES)
+        self.assertEqual(planner.RESTART_ORDER, RESTART_ORDER)
 
     def test_wildcards_paths_templates_and_unknown_policies_are_refused(self):
         for unit in ("isadoraair-active-message-*.service", "../isadoraair-active-message-worker.service",
@@ -165,23 +171,24 @@ class Station(SimpleTestCase):
 
 
 class RefusalWithoutAuthorityTests(Station):
-    def test_the_active_generation_14_policy_and_the_compiled_fallback_refuse_it(self):
-        for policy in (GENERATION_14, None):
-            with self.subTest(policy="generation 14" if policy else "compiled fallback"):
-                runner = FakeSystemRunner()
-                self.assertNotIn(WORKER, resolve_known_managed_units(active_policy=policy))
-                self.assertIsNone(resolve_unit_policy(WORKER, signed_policy=policy))
-                with self.assertRaisesRegex(SystemdError, "outside the installed updater allowlist"):
-                    self.manager(runner, policy).reconcile(self.source, plan(systemd_units_new_required=(WORKER,)))
-                self.assertEqual(runner.calls, [])                               # nothing ran
-                self.assertFalse((self.config.systemd_unit_root / WORKER).exists())   # nothing installed
+    def test_the_active_generation_14_policy_refuses_it(self):
+        """The active signed policy decides membership. Runtime 13's compiled
+        fallback names the worker (CORE_SERVICES seeds it, the r0112 precedent),
+        but that map is consulted only with NO active signed policy -- never on a
+        Phase-D station, whose generation-14 policy refuses the unit outright."""
+        runner = FakeSystemRunner()
+        self.assertNotIn(WORKER, resolve_known_managed_units(active_policy=GENERATION_14))
+        with self.assertRaisesRegex(SystemdError, "outside the installed updater allowlist"):
+            self.manager(runner, GENERATION_14).reconcile(self.source, plan(systemd_units_new_required=(WORKER,)))
+        self.assertEqual(runner.calls, [])                                       # nothing ran
+        self.assertFalse((self.config.systemd_unit_root / WORKER).exists())       # nothing installed
+        self.assertIn(WORKER, resolve_known_managed_units(active_policy=None))    # D0/legacy fallback only
 
     def test_an_ordinary_plan_naming_it_is_blocked(self):
         ordinary = plan(systemd_units_new_required=(WORKER,))
         self.assertIsNone(ordinary.protected_runtime)
         known = resolve_known_managed_units(active_policy=GENERATION_14)
         self.assertIn("UNKNOWN_MANAGED_UNIT", manual_blockers(ordinary, known_units=known))
-        self.assertIn("UNKNOWN_MANAGED_UNIT", manual_blockers(ordinary))
         # declared optional it is never installed, so it is reported only
         self.assertNotIn("UNKNOWN_MANAGED_UNIT",
                          manual_blockers(plan(systemd_units_new_optional=(WORKER,)), known_units=known))
@@ -232,7 +239,8 @@ class CandidateVerificationTests(SimpleTestCase):
         self.attestations.mkdir()
 
     def stage(self, *, generation=15, key=None, sign=True):
-        descriptor = build_descriptor(runtime_root=self.bundle, generation=generation, runtime_version=12,
+        descriptor = build_descriptor(runtime_root=self.bundle, generation=generation,
+                                      runtime_version=RUNTIME_VERSION,
                                       manifest_protocol_version=5, supported_wire_protocols=(3, 4))
         if sign:
             statement = build_statement(descriptor_bytes=descriptor, release_id="r0116", previous_release_id="r0115",
@@ -358,10 +366,12 @@ class ActivationTests(Station):
         self.assertTrue(resolve_known_managed_units(active_policy=GENERATION_14)
                         < resolve_known_managed_units(active_policy=CANDIDATE))
 
-    def test_the_updater_never_restarts_it(self):
+    def test_release_driven_restart_only_never_an_operator_restart(self):
+        """Runtime 13 (correction B2): a trusted plan may restart it
+        (test_active_message_worker_restart); the operator/Monitoring path may not."""
         manager = self.manager(FakeSystemRunner(), CANDIDATE)
-        with self.assertRaises(SystemdError):
-            manager.restart_declared(("isadoraair-active-message-worker",))
+        self.assertEqual(manager.restart_declared(("isadoraair-active-message-worker",)),
+                         ["isadoraair-active-message-worker"])
         self.assertNotIn(WORKER, self.config.operator_restart_units)
         with self.assertRaisesRegex(SystemdError, "operator restart allowlist"):
             manager.restart_operator_service(WORKER)

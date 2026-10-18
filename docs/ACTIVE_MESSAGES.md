@@ -1131,21 +1131,54 @@ no executions beyond READY.
 The worker becomes a managed unit only through the signed protected policy:
 D3E-B adds exactly `isadoraair-active-message-worker.service: ENABLE_NOW` to
 `deploy/updater_runtime/protected-policy.json` -- the policy SOURCE of the
-next generation (15), unsigned. No protected-runtime Python authority changes
-(not in `MANAGED_UNIT_POLICIES`, `CORE_SERVICES`, `RESTART_ORDER` or the
-restart allowlist). The generation-14 runtime refuses the unit outright
-(install allowlist, `UNKNOWN_MANAGED_UNIT` for an ordinary plan); only a
+next generation (15), unsigned. The generation-14 runtime refuses the unit
+outright (its signed policy decides membership: install allowlist,
+`UNKNOWN_MANAGED_UNIT` for an ordinary plan, restart allowlist); only a
 release that carries a verified generation-15 candidate whose signed policy
 names it, and whose manifest declares it, can install it
 (`verify_new_units_authorized_by_candidate_policy`). Proved in
 `updatecenter/tests/test_active_message_worker_policy.py`.
 
+**Runtime 13 -- release-driven restart authority** (the r0112 spoken-worker
+precedent; `test_active_message_worker_restart.py`). Generation 15 also
+carries protected runtime 13, which adds the exact basename
+`isadoraair-active-message-worker` to the protected `CORE_SERVICES` and to the
+Django manifest's `CORE_RESTARTABLE_SERVICES`, and to both identical
+`RESTART_ORDER` tables:
+
+    gunicorn, engine, monitoring, spoken-render-worker,
+    active-message-worker, encoders, rbds
+
+(the two application workers each depend only on PostgreSQL, the renderer
+and the validator, and nothing depends on them; every other service keeps its
+relative order). A LATER release that changes worker code declares
+`isadoraair-active-message-worker` in `services_requiring_restart`; the
+updater restarts exactly it (through its start gate) and nothing else. An
+undeclared restart never happens; a changed unit template without a
+declaration is installed and reloaded, not restarted (the existing rule);
+unknown names, `.service` suffixes, wildcards and out-of-order lists are
+refused. No release-manifest schema, daemon wire or bootstrap protocol
+changed. As with r0112, `CORE_SERVICES` also seeds the compiled fallback map
+(`MANAGED_UNIT_POLICIES`, the generation-1 document) with the worker
+`ENABLE_NOW` -- the same value as the generation-15 policy source; that map
+is consulted only with NO active signed policy, never on a Phase-D station.
+This is release-driven authority only: the worker is NOT in the
+root-configured operator-restart allowlist, and the Monitoring card keeps no
+Restart button.
+
+**Bridge rule:** a runtime-12 worker parses every manifest in the chain before
+its handoff and refuses the new name, so r0116 (which delivers runtime 13)
+must NOT declare the worker restart -- nor does it need to: `enable --now`
+starts the newly installed unit on r0116 code, once. Only releases after
+r0116 may declare it.
+
 The r0116 packaging (not D3E-B) must:
 
 1. build the generation-15 descriptor from the reviewed runtime tree
    (`deploy/updater_bootstrap/tools/protected_runtime_release.py`,
-   `build_descriptor`, runtime version and protocols unchanged), whose only
-   change from generation 14 is the policy file;
+   `build_descriptor`, runtime version 13, manifest protocol 5, wire 3/4),
+   whose changes from generation 14 are exactly the policy entry and the
+   runtime-13 restart authority (`release.py`, `__init__.py`);
 2. sign the primary-release statement offline with the real signer and verify
    it against the trusted public key; commit the manifest, descriptor and
    attestation atomically in the release-introduction commit (the r0109
@@ -1154,7 +1187,8 @@ The r0116 packaging (not D3E-B) must:
    optional units are report-only and never installed by the updater, which
    would leave a manual install -- exactly what the signed path exists to
    prevent), with `isadoraair-monitoring` (new probe) and
-   `isadoraair-gunicorn` (dashboard) in `services_requiring_restart`;
+   `isadoraair-gunicorn` (dashboard, manifest validator, planner) -- never
+   the worker itself (bridge rule) -- in `services_requiring_restart`;
 4. after installation: `provision_active_message_worker_check`, the card
    `ok`, the heartbeat current, the gate still closed, and a fresh Runtime
    Recovery payload for generation 15 (as for every generation change).
@@ -1304,6 +1338,11 @@ OGRemote unit is in the updater's authority).
 * Protected policy source: one new entry
   (`isadoraair-active-message-worker.service: ENABLE_NOW`), unsigned; the
   protected-runtime descriptor still describes generation 14.
+* Protected runtime 13: release-driven restart authority and order for
+  `isadoraair-active-message-worker` (Django manifest/planner in lockstep);
+  not an operator-restart permission.
+* Monitoring identity fails closed: no usable process start time is
+  `identity_unavailable`, never `ok`.
 * Monitoring: the Systemd Service probe also reads `MainPID` and
   `ExecMainStartTimestamp` (every unit; other units' results are unchanged)
   and recognizes the worker unit; dashboard captions and one detail line;

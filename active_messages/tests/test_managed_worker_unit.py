@@ -48,6 +48,8 @@ for signum in (signal.SIGTERM, signal.SIGINT):            # exactly the manageme
 import django
 django.setup()
 from active_messages import heartbeat, worker
+version_file = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "version")
+version = open(version_file).read().strip() if os.path.exists(version_file) else ""   # "the code", read at start
 time.sleep(delay)                                          # a slow start-up before the first record
 recorder = heartbeat.Recorder(path)
 
@@ -57,7 +59,7 @@ def run():
         recorder.rendering(uuid.uuid4(), 3600)
         while True:
             time.sleep(3600)
-    return worker.Outcome("idle")
+    return worker.Outcome("idle", code=version)
 
 
 worker.run_forever(poll_seconds=1, stop=lambda: bool(stopping), run=run, recorder=recorder,
@@ -104,6 +106,14 @@ class TransientWorkerUnit:
                                  "--property=ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp"],
                                 capture_output=True, text=True, timeout=10, env={**os.environ, "TZ": "UTC"}).stdout
         return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+    def install_code(self, version: str):
+        (self.script.parent / "version").write_text(version)
+
+    def restart(self) -> float:
+        started = time.monotonic()
+        subprocess.run(["systemctl", "--user", "restart", self.unit], check=True, capture_output=True, timeout=120)
+        return time.monotonic() - started
 
     def stop(self) -> float:
         started = time.monotonic()
@@ -208,6 +218,25 @@ class ManagedWorkerUnitTests(SimpleTestCase):
         self.assertEqual((found["status"], found["condition"]), ("ok", "idle"))
         stale = unit.observe(props, main_pid=old_pid)                      # the old identity is not current
         self.assertNotEqual(stale["status"], "ok")
+
+    def test_an_authorized_restart_runs_the_new_code(self):
+        """What a release-declared restart (correction B2) does to the installed
+        unit: the stop is clean, the start gate passes again for the NEW process,
+        and the new process runs the code present at its start."""
+        unit = TransientWorkerUnit(self, self.path)
+        unit.install_code("v1")
+        self.assertEqual(unit.start()[0], 0)
+        old_pid = int(unit.show()["MainPID"])
+        self.assertEqual((self.stored().pid, self.stored().code), (old_pid, "v1"))
+        unit.install_code("v2")                                            # the release advanced the checkout
+        self.assertLess(unit.restart(), 30)                                # restart job: through the start gate
+        props = unit.show()
+        self.assertEqual((props["ActiveState"], props["NRestarts"]), ("active", "0"))   # not a crash restart
+        beat = self.stored()
+        self.assertNotEqual(beat.pid, old_pid)
+        self.assertEqual((beat.pid, beat.code, beat.previous), (int(props["MainPID"]), "v2", "clean"))
+        found = unit.observe(props)
+        self.assertEqual((found["status"], found["condition"]), ("ok", "idle"))
 
     def test_a_worker_that_cannot_write_its_heartbeat_fails_its_start(self):
         readonly = self.dir / "readonly"
