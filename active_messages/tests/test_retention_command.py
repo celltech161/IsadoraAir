@@ -97,12 +97,13 @@ class CommandContractTests(Domain, TestCase):
         damage.add("insertion", "y", "insertion_log_item_pruned", "info", "expected_pruning", "pruned")
         with mock.patch.object(reconcile, "reconcile", return_value=damage), \
                 mock.patch("monitoring.models.emit_event") as emitted:
-            run()
+            run()                                                # the default never records attention
+            emitted.assert_not_called()
+            run("--attention")
             self.assertEqual([call.kwargs["dedupe_key"] for call in emitted.call_args_list],
                              ["active_messages|retention|publication_file_missing"])
-            emitted.reset_mock()
-            run("--no-attention")
-            emitted.assert_not_called()
+        with self.assertRaises(CommandError):
+            run("--attention", "--sweep")
 
 
 @unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
@@ -118,6 +119,6 @@ class CommandRetirementTests(Lifecycle, TestCase):
         self.assertIn("reclaimed", done)
         self.assertFalse(self.file(publication).exists())
         self.assertTrue(retention.is_retired(execution.pk))
-        report = run("--no-attention")
+        report = run()
         self.assertNotIn("[critical]", report)
         self.assertNotIn("[warning]", report)

@@ -1,7 +1,8 @@
 """Reconcile active-message publication artifacts; reclaim only what is provably safe (iPortal D3E-C).
 
-    manage.py active_message_retention                     # read-only report (metadata)
+    manage.py active_message_retention                     # read-only report (metadata; writes nothing)
     manage.py active_message_retention --deep              # ... and re-hash bytes (slow)
+    manage.py active_message_retention --attention         # ... and raise Monitoring attention (writes events)
     manage.py active_message_retention --sweep [--apply]   # unreferenced leftovers (dry-run without --apply)
     manage.py active_message_retention --retire <execution UUID> ... [--apply]
 
@@ -58,12 +59,15 @@ class Command(BaseCommand):
                             help=f"Rows per artifact class (1..{retention.MAX_LIMIT}; default {retention.DEFAULT_LIMIT}).")
         parser.add_argument("--include-production", action="store_true",
                             help="Sweep: also run Production's own reconcile sweeps (parts, orphan media, work).")
-        parser.add_argument("--no-attention", action="store_true",
-                            help="Report mode: do not raise Monitoring events for integrity findings.")
+        parser.add_argument("--attention", action="store_true",
+                            help="Report mode: ALSO record deduplicated Monitoring SystemEvents for integrity "
+                                 "findings (persistent operator attention). Without it the report writes nothing.")
 
     def handle(self, *args, **options):
         if options["apply"] and not (options["sweep"] or options["retire"]):
             raise CommandError("--apply needs --sweep or --retire")
+        if options["attention"] and (options["sweep"] or options["retire"]):
+            raise CommandError("--attention belongs to the report mode")
         if not 1 <= options["limit"] <= retention.MAX_LIMIT:
             raise CommandError(f"--limit must be from 1 to {retention.MAX_LIMIT}")
         grace = timedelta(hours=options["grace_hours"])
@@ -93,10 +97,11 @@ class Command(BaseCommand):
             self.stdout.write(style(f"  [{finding.severity}] {finding.code} {finding.artifact} {finding.identity}: "
                                     f"{finding.evidence} ({finding.category}; {finding.eligibility})"
                                     + (f" -> {finding.action}" if finding.action else "")))
-        if not options["no_attention"]:
+        if options["attention"]:
             emitted = reconcile.attention(report)
-            if emitted:
-                self.stdout.write(f"Monitoring attention raised for {emitted} condition code(s).")
+            self.stdout.write(f"Monitoring attention recorded for {emitted} condition code(s).")
+        else:
+            self.stdout.write("(diagnostic output only; pass --attention to record Monitoring attention)")
 
     # -- sweep ------------------------------------------------------------------------------
     def sweep(self, options, grace):
