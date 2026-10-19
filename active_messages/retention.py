@@ -28,7 +28,7 @@ What can be reclaimed (each only with ``apply=True``; dry-run otherwise):
    placed file (publish reuses it), never inside the grace period, always
    under the destination lock publish itself takes.
 3. Retired publications' remaining bytes (crash recovery of 4).
-4. Publication retirement -- ONLY for executions an operator names
+4. Publication retirement -- ONLY for executions a maintenance run names
    explicitly; never by age. See ``retire_publication``.
 
 Everything else is retained deliberately: a bound aggregate (``mix_media``,
@@ -429,7 +429,10 @@ def _remove_publication_bytes(publication_relpath: str, track_id_snapshot: int):
     return removed, problems
 
 
-def retire_publication(execution_id, *, operator, apply=False) -> Outcome:
+MAINTENANCE_VIA = "maintenance_command"
+
+
+def retire_publication(execution_id, *, apply=False) -> Outcome:
     """Retire ONE named execution's publication: its library file, waveform
     and Track. Never selects anything by itself, never by age.
 
@@ -444,15 +447,21 @@ def retire_publication(execution_id, *, operator, apply=False) -> Outcome:
     ``finish_retirements`` removes what remains. The publication, its
     insertions, the execution and every event are untouched; a retired
     publication is never redispatched (its execution is terminal) and is
-    never reported as unexpected damage."""
+    never reported as unexpected damage.
+
+    Authority: this is a TRUSTED MAINTENANCE operation of the station's
+    operating-system boundary (whoever can run it holds the application's
+    database credentials and could change those rows directly), not a
+    Django-user action. No caller-supplied identity is accepted or recorded:
+    the event is ActorKind.SYSTEM with no user, and ``detail.via`` records
+    that the maintenance command initiated it. An individual human is never
+    attributed (the station account is shared)."""
     from library.models import Track
     identity = str(execution_id)
     try:
         execution_uuid = uuid.UUID(identity)
     except ValueError:
         return Outcome("publication", identity[:40], "refused", ("unknown_execution",))
-    if apply:
-        services._require(operator, services.CONTROL)
     publication = ActiveBroadcastPublication.objects.filter(execution_id=execution_uuid).first()
     if publication is None:
         return Outcome("publication", identity, "refused", ("no_publication",))
@@ -487,8 +496,9 @@ def retire_publication(execution_id, *, operator, apply=False) -> Outcome:
                     return Outcome("publication", identity, "refused", tuple(reasons))
             file_present = file_state(namespace_dir() / native_name(publication.library_relpath))[0] == "regular"
             services._event(RETIRED_EVENT, generation=services.current_policy().generation,
-                            actor_kind=ActorKind.USER, user=operator, execution=row,
-                            detail={"publication": str(publication.pk),
+                            actor_kind=ActorKind.SYSTEM, execution=row,
+                            detail={"via": MAINTENANCE_VIA,
+                                    "publication": str(publication.pk),
                                     "track": publication.track_id_snapshot,
                                     "library_relpath": publication.library_relpath,
                                     "sha256": publication.sha256,

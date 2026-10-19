@@ -51,21 +51,19 @@ class CommandContractTests(Domain, TestCase):
         self.assertIn("DRY RUN", run("--sweep"))
         self.assertIn("reclaimable (not reclaimed)", run("--sweep"))
         self.assertIn("DRY RUN", run("--retire", str(uuid.uuid4())))
-        with self.assertRaisesRegex(CommandError, "needs --operator"):
-            run("--retire", str(uuid.uuid4()), "--apply")
-        with self.assertRaisesRegex(CommandError, "no such active operator"):
-            run("--retire", str(uuid.uuid4()), "--apply", "--operator", "nobody-here")
+        self.assertIn("no_publication", run("--retire", str(uuid.uuid4()), "--apply"))
 
-    def test_an_operator_without_the_control_capability_is_refused(self):
-        with self.assertRaisesRegex(CommandError, "not permitted"):
-            run("--retire", str(uuid.uuid4()), "--apply", "--operator", self.producer.username)
+    def test_no_identity_can_be_asserted(self):
+        """Review 2: the command takes no username at all (any --operator is an error)."""
+        for name in ("nobody-here", self.producer.username, self.admin.username):
+            with self.subTest(name=name), self.assertRaises(CommandError):
+                run("--retire", str(uuid.uuid4()), "--apply", "--operator", name)
 
     def test_a_path_is_never_accepted(self):
         victim = os.path.join(self.root.name, "UrgentPA", "precious.flac")
         with open(victim, "wb") as handle:
             handle.write(b"keep me")
-        output = run("--retire", victim, os.path.join("UrgentPA", "precious.flac"), "--apply",
-                     "--operator", self.admin.username)
+        output = run("--retire", victim, os.path.join("UrgentPA", "precious.flac"), "--apply")
         self.assertIn("refused", output)
         self.assertIn("unknown_execution", output)
         with open(victim, "rb") as handle:
@@ -115,7 +113,7 @@ class CommandRetirementTests(Lifecycle, TestCase):
         self.assertIn("eligible 1", dry)
         self.assertTrue(self.file(publication).is_file())
         with self.captureOnCommitCallbacks(execute=True):
-            done = run("--retire", str(execution.pk), "--apply", "--operator", self.admin.username)
+            done = run("--retire", str(execution.pk), "--apply")
         self.assertIn("retired 1", done)
         self.assertIn("reclaimed", done)
         self.assertFalse(self.file(publication).exists())

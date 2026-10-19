@@ -51,7 +51,7 @@ class CleanupRaceTests(Lifecycle, TransactionTestCase):
     serialized_rollback = True
 
     def retire_now(self, execution):
-        return lambda: retention.retire_publication(execution.pk, operator=self.admin, apply=True)
+        return lambda: retention.retire_publication(execution.pk, apply=True)
 
     def test_two_concurrent_retirements_retire_once(self):
         execution, publication, _item = self.completed()

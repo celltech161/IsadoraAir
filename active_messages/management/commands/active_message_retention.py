@@ -3,26 +3,31 @@
     manage.py active_message_retention                     # read-only report (metadata)
     manage.py active_message_retention --deep              # ... and re-hash bytes (slow)
     manage.py active_message_retention --sweep [--apply]   # unreferenced leftovers (dry-run without --apply)
-    manage.py active_message_retention --retire <execution UUID> ... --operator <username> [--apply]
+    manage.py active_message_retention --retire <execution UUID> ... [--apply]
 
 Nothing is removed without --apply, and nothing is ever selected by age
 alone: the sweep removes only provably unreferenced artifacts past a grace
 period (interrupted-publication leftovers in the reserved namespace, unbound
 aggregate bytes, the remaining bytes of retired publications -- and, with
 --include-production, Production's own sweeps); --retire acts only on
-executions named here, by an operator who holds the Active Messages control
-capability. No path is ever accepted. There is no timer behind this command.
+executions named here. No path is ever accepted. There is no timer behind
+this command.
+
+Authority: a TRUSTED MAINTENANCE operation. Whoever can run it already holds
+the application's database credentials (the station account's .env) and
+could change these rows directly, so the command asserts no Django identity:
+it takes no username, and a retirement is recorded as the system (detail.via
+"maintenance_command"), never as a person.
 
 Exit status: 0 when every requested action succeeded (findings alone are not
 failures); 1 for an operational failure (database, storage, a failed removal).
 """
 from datetime import timedelta
 
-from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
 from django.db import DatabaseError
 
-from active_messages import reconcile, retention, services
+from active_messages import reconcile, retention
 from production.services import reconcile as production_reconcile
 
 MAX_RETIRE = 50
@@ -46,8 +51,6 @@ class Command(BaseCommand):
         mode.add_argument("--retire", nargs="+", metavar="EXECUTION_UUID",
                           help=f"Retire these executions' publications (at most {MAX_RETIRE}; dry-run unless --apply).")
         parser.add_argument("--apply", action="store_true", help="Actually reclaim what is reported as eligible.")
-        parser.add_argument("--operator", help="Username accountable for --retire --apply (needs the Active "
-                                               "Messages control capability).")
         parser.add_argument("--deep", action="store_true", help="Report mode: also re-hash bytes (slow).")
         parser.add_argument("--grace-hours", type=_grace_hours, default=retention.DEFAULT_GRACE.total_seconds() / 3600,
                             help="Sweep: only touch leftovers idle at least this long (minimum 1; default 24).")
@@ -74,8 +77,6 @@ class Command(BaseCommand):
             raise CommandError(f"storage unavailable: {exc.code}") from None
         except DatabaseError as exc:
             raise CommandError(f"database unavailable: {type(exc).__name__}") from None
-        except services.NotPermitted as exc:
-            raise CommandError(f"not permitted: {exc.code}") from None
 
     # -- report -----------------------------------------------------------------------------
     def report(self, options, grace):
@@ -126,18 +127,11 @@ class Command(BaseCommand):
         identities = options["retire"]
         if len(identities) > MAX_RETIRE:
             raise CommandError(f"at most {MAX_RETIRE} executions per run")
-        operator = None
-        if options["apply"]:
-            if not options["operator"]:
-                raise CommandError("--retire --apply needs --operator <username>")
-            operator = get_user_model().objects.filter(username=options["operator"], is_active=True).first()
-            if operator is None:
-                raise CommandError("no such active operator")
-        else:
-            self.stdout.write(self.style.WARNING("DRY RUN -- pass --apply (and --operator) to retire."))
+        if not options["apply"]:
+            self.stdout.write(self.style.WARNING("DRY RUN -- pass --apply to retire (a trusted maintenance action)."))
         report = retention.CleanupReport(apply=options["apply"])
         for identity in identities:
-            report.add(retention.retire_publication(identity, operator=operator, apply=options["apply"]))
+            report.add(retention.retire_publication(identity, apply=options["apply"]))
         self._summary("publication retirement", report)
         if report.failures:
             raise CommandError(f"{len(report.failures)} retirement(s) left bytes behind; run --sweep --apply")

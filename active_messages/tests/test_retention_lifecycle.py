@@ -53,8 +53,10 @@ class RetirementTests(Lifecycle, TestCase):
         [added] = sorted(set(after_events) - set(before_events))
         self.assertIn('"event": "publication_retired"', added)
         [event] = ActiveBroadcastMessageEvent.objects.filter(execution=execution, event=retention.RETIRED_EVENT)
-        self.assertEqual((event.actor_username, event.detail["track"], event.detail["sha256"]),
-                         ("admin", publication.track_id_snapshot, publication.sha256))
+        self.assertEqual((event.actor_kind, event.actor_id, event.actor_username, event.detail["via"]),
+                         ("system", None, "", "maintenance_command"))      # never a person (review 2)
+        self.assertEqual((event.detail["track"], event.detail["sha256"]),
+                         (publication.track_id_snapshot, publication.sha256))
         stored = self.stored(execution)
         self.assertEqual((stored.state, stored.confirmed_duration_seconds), ("completed", execution.confirmed_duration_seconds))
         self.assertEqual(PlayEvent.objects.get(pk=play_event.pk).track_title, "Urgent PA")
@@ -121,12 +123,12 @@ class RetirementTests(Lifecycle, TestCase):
         self.assertEqual(self.retire(execution).reasons, ("track_not_publication",))
         self.assertTrue(self.tracks(publication).exists())
 
-    def test_retirement_needs_an_authorized_operator(self):
+    def test_retirement_accepts_no_asserted_identity(self):
+        """Review 2: no user (privileged or not) can be handed in as authority."""
         execution, publication, _item = self.completed()
-        with self.assertRaises(services.NotPermitted):
-            retention.retire_publication(execution.pk, operator=self.producer, apply=True)
-        with self.assertRaises(services.NotPermitted):
-            retention.retire_publication(execution.pk, operator=None, apply=True)
+        for user in (self.producer, self.admin, None):
+            with self.subTest(user=user), self.assertRaises(TypeError):
+                retention.retire_publication(execution.pk, operator=user, apply=True)
         self.assertTrue(self.file(publication).is_file())
         self.assertFalse(retention.is_retired(execution.pk))
 

@@ -130,12 +130,9 @@ class Lifecycle(Playout):
                     found[str(path)] = (info.st_size, info.st_mtime_ns)
         return found
 
-    def operator(self):
-        return self.admin
-
-    def retire(self, execution, *, apply=True, operator=None):
+    def retire(self, execution, *, apply=True):
         with self.captureOnCommitCallbacks(execute=True) if hasattr(self, "captureOnCommitCallbacks") else _null():
-            return retention.retire_publication(execution.pk, operator=operator or self.admin, apply=apply)
+            return retention.retire_publication(execution.pk, apply=apply)
 
     def tracks(self, publication):
         return Track.objects.filter(pk=publication.track_id_snapshot)
