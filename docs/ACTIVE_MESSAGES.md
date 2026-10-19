@@ -1392,17 +1392,70 @@ different inodes at the same time. The sidecar is opened without following a
 symlink and must be a single-link regular file; after locking, the pathname
 must still name the locked inode -- otherwise the operation fails closed.
 
-**Track ownership of a reserved path.** `active_messages.track_guard`
-(registered through `library.register_track_write_guard`, as spoken's
-projection guard is) refuses creating a Track at `UrgentPA/am-<hex>.flac`, or
-re-pointing one there, on every ORM path (save / create / update_or_create,
-bulk_create, update, bulk_update; aliases resolved by real directory) unless
-the writer holds that destination's lock. Publish holds it, and its Track
-registration is `atomic(durable=True)`, so it commits before the lock is
-released. Cleanup decides "no Track owns this path" and removes under the
-same lock: a registration and a removal of the same path are serialized, and
-the bytes are never removed while any Track owns them. Edits of an existing
-Track's other columns are unaffected.
+**Track ownership of the files cleanup removes.** A Track refers to files
+through TWO fields: `filepath` (its audio) and `waveform_path` (its
+waveform). Cleanup never removes a file -- in its original place or held in
+the quarantine below -- that any Track refers to through either field.
+
+*Cleanup-time check* (`retention.track_references`, the one predicate every
+removal path uses: retired audio, crash recovery, orphans, waveforms,
+quarantine recovery, retirement assessment and the reconciler). Every Track
+row is read through the base manager (nothing hidden), in bounded batches by
+primary key; for each non-empty `filepath` and `waveform_path`:
+
+* it refers to the OBJECT when `stat` of the stored path -- following every
+  directory and file symlink, `.` and `..` -- reaches the object's very
+  device and inode (a hard link is the same inode);
+* it refers to the NAME when its fully resolved path is the file's home
+  name (the reserved destination, or `WAVEFORMS_DIR/<id>.json`), whatever is
+  there now;
+* a path that resolves to nothing refers to no object (only its resolved
+  name is compared); identical contents, an identical basename elsewhere or a
+  directory-name substring are never ownership;
+* a path that cannot be resolved (permission denied, a symlink loop, an
+  invalid path) makes ownership UNKNOWN: `ownership_unverifiable`; a database
+  error is `ownership_unavailable`. Unknown is never "no owner": nothing is
+  removed, a quarantined object stays pending.
+
+Answers: a reference to the name (or to the object at its name) refuses
+(`path_owned_by_track` / `waveform_owned_by_track`; an object already held in
+quarantine is put back under that name, never over an occupant); a reference
+to an object held in quarantine keeps it exactly where it is
+(`quarantine_owned_by_track`, pending -- moving it would break that Track).
+For a waveform, a Track whose id is the waveform's name also owns it.
+
+*Write guard* (`active_messages.track_guard`, registered through
+`library.register_track_write_guard` as spoken's projection guard is). On
+every supported ORM path -- save / create / update_or_create, bulk_create,
+QuerySet.update and bulk_update -- and for BOTH fields, a NEW reference is
+judged by where it resolves (directory and file symlinks, `.`, `..`):
+
+* into a cleanup quarantine: refused, always (nothing legitimately refers to
+  a quarantined object);
+* to a reserved `UrgentPA/am-<hex>.flac`: only while the writer holds that
+  destination's lock. Publish holds it, and its Track registration is
+  `atomic(durable=True)`, so it commits before the lock is released;
+* to a publication's waveform name `WAVEFORMS_DIR/<snapshot>.json` by a
+  Track that is not that id: only under that publication's destination lock.
+  A Track writing its own `<id>.json` (every analysis) is untouched.
+
+Unchanged values, other columns and paths elsewhere are untouched; the
+library schema is unchanged.
+
+*Why a concurrent writer cannot claim an object between the last check and
+its deletion.* Cleanup holds the destination lock from before its final
+ownership scan until after the verified deletion. In that interval a new
+reference resolving into the quarantine is refused unconditionally (there is
+no lock to race), and a new reference to the object's former name needs the
+very lock cleanup holds, so it waits and finds the object gone (a writer that
+held the lock first committed before releasing it, and cleanup's scan sees
+it). Both orders are tested across PostgreSQL sessions. The guard does not
+replace the scan: references written through Django's base QuerySet, raw SQL,
+legacy rows, or a symlink created after the write are found by the scan and
+keep the object; only a privileged writer that changes the filesystem or
+database outside the application between the final scan and the deletion
+(e.g. creates a symlink to the payload and a row through raw SQL in that
+instant) is outside what an application lock can control.
 
 ### Identity-preserving removal (quarantine)
 
@@ -1420,9 +1473,9 @@ only moves the window: Linux cannot unlink a descriptor.
 **Semantics** (`active_messages/quarantine.py`). Nothing D3E-C reclaims is
 ever deleted through a shared name. Under the destination lock:
 
-1. the caller re-establishes its authority (eligibility, retirement, Track
-   ownership of the path at any id or alias, no Track referencing the
-   quarantine);
+1. the caller re-establishes its authority (eligibility, retirement, and no
+   Track referring to the name or to the object -- either field, any id, any
+   alias: see "Track ownership" above);
 2. the file is opened through the verified directory descriptor
    (`O_NOFOLLOW`) and proven to be a single-link regular file of the expected
    size and SHA-256;
@@ -1439,15 +1492,19 @@ ever deleted through a shared name. Under the destination lock:
    never replacing, an existing destination; both directories are fsync'd;
 6. the MOVED object is verified: it must be the manifest's inode, single
    link, the recorded and expected size and SHA-256;
-7. the authority is asked again; only then is `payload` removed from the
+7. the authority -- including the full Track reference scan for the moved
+   inode -- is asked again; only then is `payload` removed from the
    private directory, and the removal is PROVEN by the verified descriptor's
    link count dropping to zero. Only that proven length is counted;
 8. the manifest and operation directory are removed (fsync'd).
 
 `payload` and `intent.json` carry no audio extension, so a library scan
-(`import_songs`) never imports quarantined bytes; a Track explicitly pointed
-into the quarantine keeps the payload where it is
-(`quarantine_owned_by_track`). The persistent lock sidecars are never touched.
+(`import_songs`) never imports quarantined bytes, and the write guard refuses
+any Track reference into a quarantine. A pre-existing reference (through
+either field, by any alias) keeps the payload where it is
+(`quarantine_owned_by_track`); a non-regular object found as `payload` is
+never moved or deleted (`quarantine_recovery_required`). The persistent lock
+sidecars are never touched.
 
 **A replacement moves instead.** If another object took the name between
 steps 2 and 5, THAT object is what moved. It is never deleted and never
@@ -1573,6 +1630,9 @@ engine's path).
 | `quarantine_identity_mismatch` | warning | integrity_damage (not the verified file; the sweep puts it back) |
 | `quarantine_restore_blocked` | warning | integrity_damage (manual recovery; never deleted) |
 | `quarantine_recovery_required`, `quarantine_entry_unexpected`, `quarantine_not_private` | warning | unknown (manual recovery; never deleted) |
+| `quarantine_owned_by_track` | warning | integrity_damage (a Track refers to the held object; counted as manual bytes; never deleted while it does) |
+| `quarantine_name_owned_by_track` | info | in_flight (a Track refers to the held object's former name; the sweep puts it back) |
+| `ownership_unverifiable` | warning | unknown (a Track path cannot be resolved; nothing is removed) |
 
 The report prints `quarantined bytes: quarantine_reclaimable N,
 quarantine_manual M` when anything is held: bytes a sweep may reclaim after
@@ -1629,6 +1689,17 @@ removed. Exit 1 for a storage or database failure or any failed removal
   puts it back. If blocked: compare the occupant of the name with the payload,
   move the occupant aside yourself, run `--sweep --apply` (it puts the payload
   back), then decide. Never delete a payload by hand without that comparison.
+* `quarantine_owned_by_track` (a sweep reports `failed: quarantine_pending,
+  quarantine_owned_by_track`, 0 bytes): a Track's `filepath` or
+  `waveform_path` refers to the held object, directly or through an alias.
+  Nothing is deleted and the Track is not changed. Decide in the library
+  whether that Track should keep the file; if not, correct or remove its
+  reference there (a separate, authorized library action), then run
+  `--sweep --apply`: the object is re-proven and removed, and its bytes are
+  counted once. Repeated sweeps while the reference remains change nothing.
+* `ownership_unverifiable`: some Track's path cannot be resolved (permission
+  denied, symlink loop). Fix or correct that path; until then no cleanup
+  proceeds (an unresolvable path could be an alias of the file).
 * `quarantine_recovery_required` / `quarantine_entry_unexpected`: an object
   whose identity cannot be proven; it is never deleted automatically. Inspect
   it; nothing else is affected.
@@ -1804,5 +1875,12 @@ any future one must be designed, authorized and qualified as such.
   a replacement is put back without overwriting, or kept for manual recovery.
   Interrupted operations are settled by `--sweep --apply`
   (`retention.recover_quarantine`) and reported read-only (`quarantine_*`).
+* Quarantine ownership correction: Track ownership covers BOTH `filepath` and
+  `waveform_path`, matched by the object's device/inode (any alias) and by
+  resolved name, through one bounded scan of every Track; unresolvable paths
+  and database errors refuse. The Track write guard refuses any new reference
+  resolving into a quarantine and requires the destination lock for claims of
+  a reserved file or of another Track's publication waveform name, on every
+  ORM path. No migration; no library schema change.
 * No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
   change; `NATIVE_AIRING_AVAILABLE` stays False.

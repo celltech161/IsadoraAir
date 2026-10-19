@@ -407,23 +407,109 @@ def canonical_destination(relpath) -> Path:
     return playout._library_root() / playout.CATEGORY_CODE / native_name(relpath)
 
 
-def _path_owners(destination: Path) -> list:
-    """Ids of EVERY Track whose filepath names ``destination`` -- whatever its
-    id (not only the publication's own Track or its snapshot) and through any
-    alias of the directory. Base manager: no Track is hidden."""
-    from library.models import Track
+OWNERSHIP_BATCH = 2000
 
-    from .track_guard import reserved_destination
-    candidates = Track._base_manager.filter(filepath__endswith="/" + destination.name).values_list("pk", "filepath")
-    return sorted(pk for pk, filepath in candidates if reserved_destination(filepath) == destination)
+
+class OwnershipUnverifiable(Exception):
+    """A Track reference could not be resolved (permission, symlink loop,
+    invalid path): ownership is UNKNOWN -- never "no owner"."""
+
+    def __init__(self, track_id, field):
+        super().__init__(f"Track {track_id} {field} cannot be resolved")
+        self.track_id, self.field = track_id, field
+
+
+def _reference_kind(value: str, identity, names) -> str:
+    """How one stored path refers to the object: "object" when it resolves
+    (through every directory or file symlink, ``.`` and ``..``) to the very
+    inode ``identity`` (device, inode); "name" when its resolved path is one
+    of ``names`` (whatever is, or is not, there now); "" otherwise. A path that
+    resolves to nothing is not a reference to the object; one that cannot be
+    resolved raises (OSError / ValueError)."""
+    try:
+        info = os.stat(value)
+    except (FileNotFoundError, NotADirectoryError):
+        info = None
+    if info is not None and identity is not None and (info.st_dev, info.st_ino) == tuple(identity):
+        return "object"
+    return "name" if os.path.realpath(value) in names else ""
+
+
+def track_references(location: Path, identity=None) -> list:
+    """EVERY Track reference to ``location`` or to the object ``identity``
+    (device, inode) wherever it now lives: (track id, field, kind) for each of
+    ``filepath`` and ``waveform_path``, any id, any alias (directory or file
+    symlink, ``.``/``..``, a hard link is the same inode). Contents never
+    count: an identical copy is another object. The whole Track table is
+    read through the base manager (nothing hidden) in bounded batches.
+    Raises DatabaseError, or OwnershipUnverifiable for a path that cannot be
+    resolved -- an incomplete scan is never "no owner"."""
+    from library.models import Track
+    names = {os.path.realpath(location)}
+    found, last = [], None
+    while True:
+        rows = Track._base_manager.order_by("pk")
+        if last is not None:
+            rows = rows.filter(pk__gt=last)
+        batch = list(rows.values_list("pk", "filepath", "waveform_path")[:OWNERSHIP_BATCH])
+        for pk, *values in batch:
+            for field, value in zip(("filepath", "waveform_path"), values):
+                if not value:
+                    continue
+                try:
+                    kind = _reference_kind(value, identity, names)
+                except (OSError, ValueError):
+                    raise OwnershipUnverifiable(pk, field) from None
+                if kind:
+                    found.append((pk, field, kind))
+        if len(batch) < OWNERSHIP_BATCH:
+            return found
+        last = batch[-1][0]
+
+
+def _identity(path: Path):
+    """(device, inode) of the regular file at ``path`` (never followed), or None."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino) if stat.S_ISREG(info.st_mode) else None
+
+
+def _path_owners(destination: Path, identity=None) -> list:
+    """``track_references`` of ``destination`` and (by default) the file now
+    at it. Raises like ``track_references``."""
+    return track_references(destination, identity if identity is not None else _identity(destination))
 
 
 def _owners(destination: Path):
-    """``_path_owners`` or None when ownership cannot be established."""
+    """Ids of every Track referring to ``destination`` or to the file at it
+    (either field, any id, any alias), or None when that cannot be
+    established."""
     try:
-        return _path_owners(destination)
-    except DatabaseError:
+        return sorted({pk for pk, _field, _kind in _path_owners(destination)})
+    except (DatabaseError, OwnershipUnverifiable):
         return None
+
+
+def _ownership_problem(location: Path, identity, held: bool, owned: str) -> str:
+    """The cleanup's ownership answer for the object ``identity`` whose home
+    is ``location``: "" (no Track refers to either), ``owned`` (a Track
+    refers to its name / to it at its name), ``quarantine_owned_by_track`` (a
+    Track refers to the object itself while it is held in quarantine: it is
+    kept where it is), or ``ownership_unavailable`` / ``ownership_unverifiable``
+    (unknown: never permission)."""
+    try:
+        references = _path_owners(location, identity)
+    except DatabaseError:
+        return "ownership_unavailable"
+    except OwnershipUnverifiable:
+        return "ownership_unverifiable"
+    if not references:
+        return ""
+    if held and any(kind == "object" for _pk, _field, kind in references):
+        return "quarantine_owned_by_track"
+    return owned
 
 
 def _open_namespace(destination: Path | None = None) -> int:
@@ -480,21 +566,11 @@ def _reclaim(opener, name, *, expected, authorize, prefix="file_"):
     return removed, [prefix + (problem[5:] if problem.startswith("file_") else problem) for problem in problems]
 
 
-def _quarantine_owned() -> str:
-    """No Track may own a quarantined object (``payload`` is never imported;
-    an explicit registration of one keeps it where it is)."""
-    from library.models import Track
-    try:
-        owned = Track._base_manager.filter(filepath__contains=f"/{quarantine.ROOT}/").exists()
-    except DatabaseError:
-        return "ownership_unavailable"
-    return "quarantine_owned_by_track" if owned else ""
-
-
 def _retired_authority(publication, destination):
     """Authority to remove a RETIRED publication's file: still retired, its
-    Track gone, and NO Track owning the path (any id, any alias)."""
-    def authorize() -> str:
+    Track gone, and NO Track referring to the path or to the file (either
+    field, any id, any alias)."""
+    def authorize(identity=None, held=False) -> str:
         try:
             if not is_retired(publication.execution_id):
                 return "not_retired"
@@ -502,35 +578,25 @@ def _retired_authority(publication, destination):
                 return "retired_track_present"
         except DatabaseError:
             return "ownership_unavailable"
-        owners = _owners(destination)
-        if owners is None:
-            return "ownership_unavailable"
-        return "path_owned_by_track" if owners else _quarantine_owned()
+        return _ownership_problem(destination, identity, held, "path_owned_by_track")
     return authorize
 
 
 def _waveform_authority(publication, wave: Path):
-    def authorize() -> str:
+    """Authority to remove a retired publication's waveform: no Track has its
+    id (the waveform naming convention) and no Track refers to it, by either
+    field, any alias."""
+    def authorize(identity=None, held=False) -> str:
+        from library.models import Track
         try:
             if not is_retired(publication.execution_id):
                 return "not_retired"
+            if Track._base_manager.filter(pk=publication.track_id_snapshot).exists():
+                return "waveform_owned_by_track"
         except DatabaseError:
             return "ownership_unavailable"
-        return _waveform_problem(wave, publication.track_id_snapshot) or _quarantine_owned()
+        return _ownership_problem(wave, identity, held, "waveform_owned_by_track")
     return authorize
-
-
-def _waveform_problem(wave: Path, track_id_snapshot) -> str:
-    """"" when the waveform may go: no Track has that id (its name) or
-    records that waveform path."""
-    from library.models import Track
-    try:
-        if (Track._base_manager.filter(pk=track_id_snapshot).exists()
-                or Track._base_manager.filter(waveform_path=str(wave)).exists()):
-            return "waveform_owned_by_track"
-    except DatabaseError:
-        return "ownership_unavailable"
-    return ""
 
 
 def _waveform_name(publication) -> str:
@@ -881,18 +947,15 @@ def _orphan_identity(execution_id):
 def _orphan_authority(name, execution_id, destination):
     """Authority to remove an interrupted publication's placed file: no
     publication records it, its execution can never adopt it, no Track owns
-    the path."""
-    def authorize() -> str:
+    the path or the file."""
+    def authorize(identity=None, held=False) -> str:
         try:
             if (ActiveBroadcastPublication.objects.filter(library_relpath=f"{playout.CATEGORY_CODE}/{name}").exists()
                     or not _unadoptable(execution_id)):
                 return "in_flight_publication"
         except DatabaseError:
             return "ownership_unavailable"
-        owners = _owners(destination)
-        if owners is None:
-            return "ownership_unavailable"
-        return "path_owned_by_track" if owners else _quarantine_owned()
+        return _ownership_problem(destination, identity, held, "path_owned_by_track")
     return authorize
 
 

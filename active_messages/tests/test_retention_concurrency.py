@@ -6,6 +6,7 @@ the established locks (policy -> execution -> Track; the media row lock;
 the publication destination flock) or refuses -- never both outcomes, never
 a deadlock, never lost history.
 """
+import os
 import threading
 import time
 import unittest
@@ -284,11 +285,11 @@ class OwnershipRaceTests(Lifecycle, TransactionTestCase):
         execution, publication, path = self.interrupted()
         decided, register_waiting = threading.Event(), threading.Event()
         self.flock_signals("register", register_waiting)
-        real_owners = retention._owners
+        real_owners = retention._path_owners
         timeline = []
 
-        def owners(destination):
-            found = real_owners(destination)
+        def owners(destination, identity=None):
+            found = real_owners(destination, identity)
             if threading.current_thread().name == "cleanup" and playout.holds_destination_lock(destination):
                 decided.set()                                # the authoritative check, under the lock
                 assert register_waiting.wait(20)            # the registration now waits on our lock
@@ -306,7 +307,7 @@ class OwnershipRaceTests(Lifecycle, TransactionTestCase):
             timeline.append(("cleaned", path.exists()))
             return [(o.action, o.reasons) for o in outcomes]
 
-        with mock.patch.object(retention, "_owners", side_effect=owners):
+        with mock.patch.object(retention, "_path_owners", side_effect=owners):
             results, errors = self.run_named(("register", register), ("cleanup", cleanup))
         self.assertEqual(errors, {})
         self.assertEqual(results["cleanup"], [("removed", ())])  # decided and removed while no Track owned it
@@ -431,3 +432,131 @@ class QuarantineRaceTests(Lifecycle, TransactionTestCase):
         self.assertEqual([(o.action, o.bytes_reclaimed) for o in outcomes], [("restored", 0)])
         self.assertEqual(path.read_bytes(), b"unrelated replacement")   # put back, never deleted
         self.assertEqual(aside.read_bytes()[:4], b"fLaC")               # the verified original untouched
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class QuarantineClaimRaceTests(Lifecycle, TransactionTestCase):
+    """The final ownership check -> verified deletion interval, across
+    PostgreSQL sessions: a supported Track writer racing recovery either
+    commits its claim first (and recovery keeps / puts back the object) or is
+    refused (and recovery deletes) -- never a committed reference to a deleted
+    object. Barriers, not sleeps."""
+
+    serialized_rollback = True
+    interrupted = OwnershipRaceTests.interrupted
+    run_named = OwnershipRaceTests.run_named
+    flock_signals = OwnershipRaceTests.flock_signals
+
+    def held(self, publication, nth):
+        """Crash the cleanup right after the ``nth`` move (1: audio, 2: waveform)."""
+        from unittest import mock
+
+        from active_messages import quarantine
+        seen = []
+
+        def checkpoint(stage):
+            if stage == "after_move":
+                seen.append(stage)
+                if len(seen) == nth:
+                    raise SystemExit("killed after the move")
+        with mock.patch.object(quarantine, "_checkpoint", side_effect=checkpoint):
+            try:
+                retention.finish_retirements(apply=True)
+            except SystemExit:
+                pass
+        directory = self.library_root / "UrgentPA" if nth == 1 else self.waveforms
+        root = directory / quarantine.ROOT
+        (operation,) = os.listdir(root)
+        return root / operation / quarantine.PAYLOAD
+
+    def pause_cleanup_at(self, stage, reached, release):
+        from unittest import mock
+
+        from active_messages import quarantine
+
+        def checkpoint(current):
+            if current == stage and threading.current_thread().name == "cleanup":
+                reached.set()
+                assert release.wait(20)
+        patcher = mock.patch.object(quarantine, "_checkpoint", side_effect=checkpoint)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_cleanup_wins_every_claim_is_refused(self):
+        from library.models import TrackWriteRefused
+        execution, publication, path = self.interrupted()
+        payload = self.held(publication, 1)
+        size = payload.stat().st_size
+        alias = self.library_root.parent / "alias.flac"
+        alias.symlink_to(payload)
+        song = self.song("Ordinary")
+        authorized, release, writer_waiting = threading.Event(), threading.Event(), threading.Event()
+        self.pause_cleanup_at("authorized", authorized, release)
+        self.flock_signals("writer", writer_waiting)
+        refused = []
+
+        def writer():
+            assert authorized.wait(20)                    # recovery's LAST ownership check said "unowned"
+            claims = {
+                "create waveform_path": lambda: Track.objects.create(
+                    title="w", artist=self.song_artist, filepath=str(self.library_root / "w.wav"),
+                    filename="w.wav", waveform_path=str(payload)),
+                "update waveform_path alias": lambda: Track.objects.filter(pk=song.pk).update(
+                    waveform_path=str(alias)),
+                "create filepath": lambda: Track.objects.create(
+                    title="f", artist=self.song_artist, filepath=str(payload), filename="payload"),
+                "register the former name": lambda: Track.objects.create(
+                    title="n", artist=self.song_artist, filepath=str(path), filename=path.name),
+            }
+            for label, claim in claims.items():
+                try:
+                    with transaction.atomic():
+                        claim()
+                except TrackWriteRefused:
+                    refused.append(label)
+            release.set()
+            with playout._destination_lock(path):         # a coordinated claim waits for the cleanup
+                return os.path.exists(payload)
+
+        results, errors = self.run_named(
+            ("cleanup", lambda: [(o.action, o.bytes_reclaimed) for o in
+                                 retention.recover_quarantine(apply=True).outcomes]),
+            ("writer", writer))
+        self.assertEqual(errors, {})
+        self.assertEqual(sorted(refused), sorted(["create waveform_path", "update waveform_path alias",
+                                                  "create filepath", "register the former name"]))
+        self.assertTrue(writer_waiting.is_set())
+        self.assertEqual(results["cleanup"], [("removed", size)])
+        self.assertFalse(results["writer"])               # by the time it held the lock the object was gone
+        self.assertFalse(payload.exists())
+        self.assertEqual(retention.track_references(path, None), [])
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, song.waveform_path)
+
+    def test_a_waveform_claim_that_commits_first_keeps_the_waveform(self):
+        execution, publication, path = self.interrupted()
+        payload = self.held(publication, 2)
+        wave = self.wave(publication)
+        data = payload.read_bytes()
+        song = self.song("Ordinary")
+        locked, cleanup_waiting = threading.Event(), threading.Event()
+        self.flock_signals("cleanup", cleanup_waiting)
+
+        def writer():
+            with playout._destination_lock(path):
+                locked.set()
+                assert cleanup_waiting.wait(20)            # recovery has begun and waits for the lock
+                with transaction.atomic(durable=True):     # committed before the lock is released
+                    Track.objects.filter(pk=song.pk).update(waveform_path=str(wave))
+
+        def cleanup():
+            assert locked.wait(20)
+            return [(o.action, o.reasons, o.bytes_reclaimed) for o in
+                    retention.recover_quarantine(apply=True).outcomes]
+
+        results, errors = self.run_named(("writer", writer), ("cleanup", cleanup))
+        self.assertEqual(errors, {})
+        ((action, reasons, removed),) = results["cleanup"]
+        self.assertEqual((action, removed), ("restored", 0))
+        self.assertIn("waveform_owned_by_track", reasons)
+        self.assertEqual(wave.read_bytes(), data)            # the Track's waveform is where it says
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, str(wave))

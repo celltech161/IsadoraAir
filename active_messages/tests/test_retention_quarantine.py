@@ -11,6 +11,7 @@ first destructive operation on the publication pathname (whatever that
 operation is), so the test fails on the vulnerable candidate.
 """
 import os
+import stat
 import unittest
 from unittest import mock
 
@@ -276,3 +277,320 @@ class QuarantineLifecycleTests(Lifecycle, TestCase):
         self.assertEqual([(o.action, o.reasons) for o in outcomes],
                          [("failed", ("quarantine_pending", "quarantine_owned_by_track"))])
         self.assertTrue(payload.is_file())
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class QuarantineOwnershipRegressionTests(Lifecycle, TestCase):
+    """Independent review: a legitimate Track whose ``waveform_path`` refers to
+    a quarantined payload (its ``filepath`` unrelated) must keep it."""
+
+    pending = QuarantineLifecycleTests.pending
+    interrupted_retirement = FinalSyscallSubstitutionTests.interrupted_retirement
+
+    def payload(self, directory=None):
+        root = (directory or self.library_root / "UrgentPA") / quarantine.ROOT
+        (operation,) = os.listdir(root)
+        return root / operation / quarantine.PAYLOAD
+
+    def referencing_track(self, **fields):
+        """Through the ordinary ORM when the guard allows it; otherwise as a
+        pre-existing (legacy) row the guard never saw."""
+        from django.db import models
+
+        from library.models import Track, TrackWriteRefused
+        self._unrelated = getattr(self, "_unrelated", 0) + 1
+        audio = self.library_root / "Unrelated" / f"unrelated-{self._unrelated}.wav"
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(b"RIFF unrelated audio")
+        values = dict(title="Unrelated", artist=self.song_artist, filepath=str(audio), filename=audio.name)
+        values.update(fields)
+        try:
+            return Track.objects.create(**values), "orm"
+        except TrackWriteRefused:
+            (track,) = models.QuerySet(Track).bulk_create([Track(**values)])
+            return track, "legacy"
+
+    def snapshot(self, track):
+        from library.models import Track
+        return Track._base_manager.filter(pk=track.pk).values("pk", "filepath", "waveform_path").get()
+
+    def test_a_waveform_path_reference_to_the_payload_keeps_it(self):
+        execution, publication = self.pending()
+        payload = self.payload()
+        data = payload.read_bytes()
+        track, _how = self.referencing_track(waveform_path=str(payload))
+        row = self.snapshot(track)
+        report = retention.recover_quarantine(apply=True)
+        outcomes = [(o.action, o.reasons, o.bytes_reclaimed) for o in report.outcomes]
+        self.assertTrue(payload.is_file(), f"the referenced payload was deleted: {outcomes}")
+        self.assertEqual(payload.read_bytes(), data)
+        self.assertEqual(report.bytes_reclaimed, 0)
+        ((action, reasons, _bytes),) = outcomes
+        self.assertEqual(action, "failed")
+        self.assertIn("quarantine_owned_by_track", reasons)
+        self.assertEqual(self.snapshot(track), row)                      # the Track is untouched
+        self.assertTrue(retention.is_retired(execution.pk))
+
+    # -- helpers ------------------------------------------------------------------------------------------
+    def legacy_track(self, **fields):
+        """A pre-existing reference the write guard never saw (Django's base QuerySet)."""
+        from django.db import models
+
+        from library.models import Track
+        self._legacy = getattr(self, "_legacy", 0) + 1
+        values = dict(title=f"Legacy {self._legacy}", artist=self.song_artist,
+                      filepath=str(self.library_root / "Legacy" / f"legacy-{self._legacy}.wav"),
+                      filename=f"legacy-{self._legacy}.wav")
+        values.update(fields)
+        (track,) = models.QuerySet(Track).bulk_create([Track(**values)])
+        return track
+
+    def pending_waveform(self):
+        """A retirement whose WAVEFORM cleanup died right after moving it aside (the audio went)."""
+        execution, publication = self.interrupted_retirement()
+        seen = []
+
+        def checkpoint(stage):
+            if stage == "after_move":
+                seen.append(stage)
+                if len(seen) == 2:
+                    raise SystemExit("killed during the waveform's quarantine")
+        with mock.patch.object(quarantine, "_checkpoint", side_effect=checkpoint), self.assertRaises(SystemExit):
+            retention.finish_retirements(apply=True)
+        return execution, publication, self.payload(self.waveforms)
+
+    def assert_kept(self, payload, *tracks, reason="quarantine_owned_by_track"):
+        data = payload.read_bytes()
+        rows = [self.snapshot(track) for track in tracks]
+        for _attempt in range(2):                                        # repeated recovery is harmless
+            report = retention.recover_quarantine(apply=True)
+            self.assertEqual([(o.action, o.reasons, o.bytes_reclaimed) for o in report.outcomes],
+                             [("failed", ("quarantine_pending", reason), 0)])
+            self.assertEqual(payload.read_bytes(), data)
+        self.assertEqual([self.snapshot(track) for track in tracks], rows)
+
+    def assert_removed(self, payload):
+        size = payload.stat().st_size
+        report = retention.recover_quarantine(apply=True)
+        self.assertEqual([(o.action, o.bytes_reclaimed) for o in report.outcomes], [("removed", size)])
+        self.assertFalse(payload.exists())
+        self.assertEqual(retention.recover_quarantine(apply=True).outcomes, [])
+
+    # -- existing ownership: every reference keeps the payload ----------------------------------------
+    def assert_ownership_case(self, fields):
+        execution, publication = self.pending()
+        payload = self.payload()
+        track = self.legacy_track(**fields(payload))
+        self.assertNotEqual(track.pk, publication.track_id_snapshot)       # any Track id, not the snapshot
+        self.assert_kept(payload, track)
+        from library.models import Track
+        Track.objects.get(pk=track.pk).delete()                           # an ordinary library deletion ...
+        self.assert_removed(payload)                                       # ... then it is reclaimed, once
+
+    def test_ownership_through_filepath(self):
+        self.assert_ownership_case(lambda p: dict(filepath=str(p)))
+
+    def test_ownership_through_waveform_path_with_an_unrelated_filepath(self):
+        self.assert_ownership_case(lambda p: dict(waveform_path=str(p)))
+
+    def test_ownership_through_both_fields(self):
+        self.assert_ownership_case(lambda p: dict(filepath=str(p), waveform_path=str(p)))
+
+    def test_ownership_through_a_file_symlink_waveform_path(self):
+        self.assert_ownership_case(lambda p: dict(waveform_path=str(self.link_to(p))))
+
+    def test_ownership_through_a_path_with_dot_and_dot_dot(self):
+        self.assert_ownership_case(lambda p: dict(waveform_path=f"{p.parent}/../{p.parent.name}/./{p.name}"))
+
+    def test_ownership_through_a_symlinked_parent_directory(self):
+        alias_dir = self.library_root.parent / "alias-of-urgentpa"
+        alias_dir.symlink_to(self.library_root / "UrgentPA")
+        self.assert_ownership_case(
+            lambda p: dict(waveform_path=str(alias_dir / quarantine.ROOT / p.parent.name / p.name)))
+
+    def link_to(self, target):
+        self._links = getattr(self, "_links", 0) + 1
+        link = self.library_root.parent / f"link-{self._links}.json"
+        link.symlink_to(target)
+        return link
+
+    def test_a_quarantined_waveform_referenced_by_a_track_is_kept(self):
+        execution, publication, payload = self.pending_waveform()
+        for fields in (dict(waveform_path=str(payload)), dict(waveform_path=str(self.link_to(payload)))):
+            with self.subTest(fields=list(fields)):
+                track = self.legacy_track(**fields)
+                self.assert_kept(payload, track)
+                from library.models import Track
+                Track.objects.filter(pk=track.pk).update(waveform_path="")   # the reference is cleared
+        self.assert_removed(payload)
+
+    def test_a_track_referring_to_the_former_waveform_name_gets_it_back(self):
+        execution, publication, payload = self.pending_waveform()
+        wave = self.wave(publication)
+        data = payload.read_bytes()
+        self.legacy_track(waveform_path=str(wave))
+        (outcome,) = retention.recover_quarantine(apply=True).outcomes
+        self.assertEqual((outcome.action, outcome.bytes_reclaimed), ("restored", 0))
+        self.assertEqual(wave.read_bytes(), data)
+
+    # -- non-ownership: no false owner by name, content or neighbourhood --------------------------------
+    def test_unrelated_references_are_not_ownership(self):
+        execution, publication = self.pending()
+        payload = self.payload()
+        same_name = self.library_root / "Elsewhere" / quarantine.PAYLOAD
+        same_name.parent.mkdir()
+        same_name.write_bytes(payload.read_bytes())                      # same basename AND same contents
+        native_twin = self.library_root / "Elsewhere" / self.file(publication).name
+        native_twin.write_bytes(payload.read_bytes())
+        own_wave = self.waveforms / "999999.json"
+        own_wave.write_bytes(b"{}")
+        from library.models import Track
+        for label, fields in {"empty waveform": dict(waveform_path=""),
+                              "ordinary waveform": dict(waveform_path=str(own_wave)),
+                              "same basename and contents": dict(waveform_path=str(same_name)),
+                              "same native name elsewhere": dict(filepath=str(native_twin))}.items():
+            self.referencing_track(**fields)                              # the ordinary ORM allows these
+        self.song("An unrelated song")
+        self.assert_removed(payload)
+        self.assertTrue(same_name.is_file() and native_twin.is_file() and own_wave.is_file())
+        self.assertGreaterEqual(Track._base_manager.count(), 5)
+
+    # -- fail closed ----------------------------------------------------------------------------------
+    def test_unresolvable_track_paths_keep_the_payload(self):
+        execution, publication = self.pending()
+        payload = self.payload()
+        loop = self.library_root.parent / "loop.json"
+        loop.symlink_to(loop)
+        locked = self.library_root.parent / "locked"
+        locked.mkdir()
+        (locked / "x.json").write_bytes(b"{}")
+        for label, value in {"symlink loop": str(loop), "permission denied": str(locked / "x.json")}.items():
+            with self.subTest(label):
+                track = self.legacy_track(waveform_path=value)
+                locked.chmod(0o000)
+                try:
+                    if os.access(locked, os.R_OK | os.X_OK) and label == "permission denied":
+                        self.skipTest("privileges ignore directory permissions")
+                    self.assert_kept(payload, track, reason="ownership_unverifiable")
+                finally:
+                    locked.chmod(0o755)
+                from library.models import Track
+                Track._base_manager.filter(pk=track.pk).delete()
+        self.assert_removed(payload)
+
+    def test_a_database_failure_while_scanning_references_keeps_the_payload(self):
+        execution, publication = self.pending()
+        payload = self.payload()
+        with mock.patch.object(retention, "track_references", side_effect=DatabaseError("connection lost")):
+            self.assert_kept(payload, reason="ownership_unavailable")
+        self.assert_removed(payload)
+
+    def test_inconsistent_intent_metadata_never_permits_deletion(self):
+        import json
+        execution, publication = self.pending()
+        payload = self.payload()
+        manifest = payload.with_name(quarantine.MANIFEST)
+        record = json.loads(manifest.read_text())
+        data = payload.read_bytes()
+        for label, change in {"another inode": dict(ino=record["ino"] + 1), "another name": dict(name="am-x.flac")}.items():
+            with self.subTest(label):
+                manifest.write_text(json.dumps({**record, **change}))
+                outcomes = [(o.action, o.bytes_reclaimed) for o in retention.recover_quarantine(apply=True).outcomes]
+                self.assertNotIn("removed", [action for action, _bytes in outcomes])
+                restored = self.file(publication)
+                if restored.exists():                                     # a mismatch is put back, never deleted
+                    self.assertEqual(restored.read_bytes(), data)
+                    return
+                self.assertEqual(payload.read_bytes(), data)
+
+    def test_an_unexpected_object_as_payload_is_kept(self):
+        execution, publication = self.pending()
+        payload = self.payload()
+        payload.rename(self.library_root.parent / "moved-away")
+        os.mkfifo(payload)
+        (outcome,) = retention.recover_quarantine(apply=True).outcomes
+        self.assertEqual((outcome.action, outcome.reasons, outcome.bytes_reclaimed),
+                         ("failed", ("quarantine_recovery_required",), 0))
+        self.assertTrue(stat.S_ISFIFO(os.lstat(payload).st_mode))          # kept, never moved or deleted
+        self.assertFalse(self.file(publication).exists())
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class QuarantineClaimGuardTests(Lifecycle, TestCase):
+    """No supported Track writer can create a new reference into a quarantine,
+    by either field, on any ORM path, through any alias; claims of a
+    publication's waveform name by another Track need its destination lock."""
+
+    pending = QuarantineLifecycleTests.pending
+    interrupted_retirement = FinalSyscallSubstitutionTests.interrupted_retirement
+    payload = QuarantineOwnershipRegressionTests.payload
+
+    def test_every_orm_path_refuses_a_claim_into_the_quarantine(self):
+        from library.models import Track, TrackWriteRefused
+        execution, publication = self.pending()
+        payload = self.payload()
+        alias = self.library_root.parent / "alias.json"
+        alias.symlink_to(payload)
+        song = self.song("Ordinary")
+        for field in ("filepath", "waveform_path"):
+            for value in (str(payload), str(alias), f"{payload.parent}/../{payload.parent.name}/{payload.name}"):
+                values = dict(title="Claim", artist=self.song_artist, filepath=str(self.library_root / "c.wav"),
+                              filename="c.wav")
+                values[field] = value
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(TrackWriteRefused):
+                        Track.objects.create(**values)
+                    with self.assertRaises(TrackWriteRefused):
+                        Track.objects.update_or_create(title="Claim", defaults=values)
+                    with self.assertRaises(TrackWriteRefused):
+                        Track.objects.bulk_create([Track(**values)])
+                    with self.assertRaises(TrackWriteRefused):
+                        Track.objects.filter(pk=song.pk).update(**{field: value})
+                    claimed = Track.objects.get(pk=song.pk)
+                    setattr(claimed, field, value)
+                    with self.assertRaises(TrackWriteRefused):
+                        claimed.save()
+                    with self.assertRaises(TrackWriteRefused):
+                        Track.objects.bulk_update([claimed], [field])
+        self.assertFalse(Track._base_manager.filter(waveform_path__contains=quarantine.ROOT).exists())
+        self.assertTrue(payload.is_file())
+
+    def test_ordinary_waveforms_are_untouched(self):
+        from library.models import Track
+        song = self.song("Ordinary")
+        own = self.waveforms / f"{song.pk}.json"
+        Track.objects.filter(pk=song.pk).update(waveform_path=str(own))   # every analysis does this
+        song.refresh_from_db()
+        song.waveform_path = str(self.waveforms / "elsewhere.json")
+        song.save()
+        song.title = "Edited"
+        song.save()
+        self.assertEqual(Track.objects.get(pk=song.pk).title, "Edited")
+
+    def test_claiming_a_publication_waveform_name_needs_its_lock(self):
+        from library.models import Track, TrackWriteRefused
+        execution, publication, _item = self.completed()
+        wave = str(self.wave(publication))
+        song = self.song("Another Track")
+        with self.assertRaises(TrackWriteRefused):
+            Track.objects.filter(pk=song.pk).update(waveform_path=wave)
+        with self.assertRaises(TrackWriteRefused):
+            Track.objects.create(title="x", artist=self.song_artist, filepath=str(self.library_root / "x.wav"),
+                                 filename="x.wav", waveform_path=wave)
+        # the publication's own Track re-analysed: its own name, untouched
+        Track.objects.filter(pk=publication.track_id_snapshot).update(waveform_path=wave)
+        with playout._destination_lock(self.file(publication)):
+            Track.objects.filter(pk=song.pk).update(waveform_path=wave)
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, wave)
+
+    def test_an_existing_reference_is_not_a_new_claim(self):
+        from django.db import models
+
+        from library.models import Track
+        execution, publication = self.pending()
+        (track,) = models.QuerySet(Track).bulk_create([Track(
+            title="Legacy", artist=self.song_artist, filepath=str(self.library_root / "legacy.wav"),
+            filename="legacy.wav", waveform_path=str(self.payload()))])
+        track.title = "Renamed"
+        track.save()                                                       # other columns stay editable
+        self.assertEqual(Track.objects.get(pk=track.pk).title, "Renamed")

@@ -76,7 +76,8 @@ OPERATION = re.compile(r"(?P<name>am-[0-9a-f]{32}\.flac|[0-9]{1,19}\.json)\.(?P<
 # Authority answers that keep a verified payload pending where it is (retry
 # later): the authority is unknown right now, or something references the
 # quarantined object itself. Every other refusal puts the object back.
-KEEP_AUTHORITY = frozenset({"ownership_unavailable", "authority_unavailable", "quarantine_owned_by_track"})
+KEEP_AUTHORITY = frozenset({"ownership_unavailable", "ownership_unverifiable", "authority_unavailable",
+                            "quarantine_owned_by_track"})
 # Read-only classifications a sweep settles by itself (delete after re-proof,
 # put back, or clear); every other one needs an operator.
 SETTLEABLE = frozenset({"quarantine_pending", "quarantine_identity_mismatch", "quarantine_operation_leftover"})
@@ -118,6 +119,7 @@ class Held:
     code: str                   # quarantine_pending | quarantine_identity_mismatch | quarantine_restore_blocked |
     size: int = 0               # quarantine_recovery_required | quarantine_operation_leftover |
                                 # quarantine_entry_unexpected
+    identity: tuple | None = None   # the payload's (device, inode), when there is one
 
 
 # -- seams and primitives ------------------------------------------------------------------------------
@@ -308,12 +310,11 @@ def _identity_problem(fd: int, info, expected: Expected) -> str:
 
 def remove(dir_fd: int, name: str, *, expected: Expected, authorize) -> tuple[int, str]:
     """(bytes proven removed, problem) for the entry ``name`` of the verified
-    directory ``dir_fd``. The caller holds the destination lock; ``authorize()``
-    returns "" or a refusal code and is asked before the move and again before
-    the deletion. problem "" with 0 bytes: nothing was there."""
-    problem = authorize()
-    if problem:
-        return 0, problem
+    directory ``dir_fd``. The caller holds the destination lock;
+    ``authorize(identity, held)`` -- identity the object's (device, inode),
+    held whether it is in quarantine -- returns "" or a refusal code and is
+    asked before the move and again, last, before the deletion. problem ""
+    with 0 bytes: nothing was there."""
     try:
         fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -322,7 +323,7 @@ def remove(dir_fd: int, name: str, *, expected: Expected, authorize) -> tuple[in
         return 0, "file_not_regular" if exc.errno == errno.ELOOP else f"file_{type(exc).__name__}"
     try:
         info = os.fstat(fd)
-        problem = _identity_problem(fd, info, expected)
+        problem = authorize((info.st_dev, info.st_ino), False) or _identity_problem(fd, info, expected)
         if problem:
             return 0, problem
         _checkpoint("before_quarantine")
@@ -414,17 +415,23 @@ def _settle(dir_fd, root_fd, operation, name, record, expected, authorize) -> Se
             return Settled(operation, "kept", problem="quarantine_recovery_required")
         try:
             moved = os.fstat(payload_fd)
-            if record is None:                            # nothing proves what this is: keep it
+            if record is None or not stat.S_ISREG(moved.st_mode):
+                # nothing proves what this is (or it is no file we ever move): keep it
                 return Settled(operation, "kept", problem="quarantine_recovery_required")
             reason = _moved_problem(payload_fd, moved, record, expected)
             if reason:
                 return _restore(dir_fd, root_fd, operation, op_fd, name, reason)
             _checkpoint("verified")
-            problem = authorize()
+            problem = authorize((moved.st_dev, moved.st_ino), True)
             if problem in KEEP_AUTHORITY:
                 return Settled(operation, "kept", problem="quarantine_pending", detail=problem)
             if problem:
                 return _restore(dir_fd, root_fd, operation, op_fd, name, problem)
+            # The last ownership answer is final: no supported writer can create a
+            # reference to this object before the unlink below (the Track write
+            # guard refuses any claim resolving into a quarantine, and claims of
+            # its former name need the destination lock this process holds).
+            _checkpoint("authorized")
             os.unlink(PAYLOAD, dir_fd=op_fd)
             if os.fstat(payload_fd).st_nlink != 0:        # not the verified object that went: claim nothing
                 return Settled(operation, "kept", problem="quarantine_substituted")
@@ -572,7 +579,7 @@ def _inspect_one(dir_fd, root_fd, operation, device) -> Held:
             return Held(operation, name, "quarantine_recovery_required", size)
         if ((moved.st_dev, moved.st_ino) == (record["dev"], record["ino"]) and moved.st_nlink == 1
                 and moved.st_size == record["size"]):
-            return Held(operation, name, "quarantine_pending", size)
+            return Held(operation, name, "quarantine_pending", size, (moved.st_dev, moved.st_ino))
         try:
             os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             return Held(operation, name, "quarantine_restore_blocked", size)

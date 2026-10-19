@@ -473,6 +473,22 @@ QUARANTINE_FINDINGS = {
                                    "manual recovery: compare both files; nothing is deleted automatically"),
     "quarantine_recovery_required": ("warning", "unknown", "{size} bytes whose identity cannot be proven",
                                      "blocked:manual_recovery", "manual recovery; never deleted automatically"),
+    "quarantine_owned_by_track": ("warning", "integrity_damage",
+                                  "{size} verified bytes held in quarantine are referred to by a Track "
+                                  "(filepath or waveform_path); never deleted while it does",
+                                  "blocked:quarantine_owned_by_track",
+                                  "operator review: change or remove that Track reference through the library, "
+                                  "then sweep --apply"),
+    "quarantine_name_owned_by_track": ("info", "in_flight",
+                                       "{size} verified bytes held in quarantine; a Track now refers to their "
+                                       "former name", "blocked:name_owned_by_track",
+                                       "sweep --apply puts them back under that name (never over an occupant)"),
+    "ownership_unavailable": ("warning", "unknown", "{size} bytes held; Track references cannot be read",
+                              "blocked:ownership_unavailable", "retry; nothing is removed meanwhile"),
+    "ownership_unverifiable": ("warning", "unknown",
+                               "{size} bytes held; a Track path cannot be resolved (permission, symlink loop)",
+                               "blocked:ownership_unverifiable",
+                               "fix or correct that Track path; nothing is removed meanwhile"),
 }
 
 
@@ -511,9 +527,24 @@ def _check_quarantine(report, *, limit):
                            "unexpected object in the cleanup quarantine (never followed or removed)",
                            action="operator review")
                 continue
-            severity, category, evidence, eligibility, action = QUARANTINE_FINDINGS[item.code]
-            report.add("quarantine", f"{kind}/{item.operation}", item.code, severity, category,
+            code = item.code
+            if code == "quarantine_pending":
+                owned = _quarantine_ownership(kind, item)
+                if owned:
+                    report.bytes["quarantine_reclaimable"] -= item.size
+                    report.bytes["quarantine_manual"] += item.size
+                    code = owned
+            severity, category, evidence, eligibility, action = QUARANTINE_FINDINGS[code]
+            report.add("quarantine", f"{kind}/{item.operation}", code, severity, category,
                        evidence.format(size=item.size), eligibility=eligibility, action=action)
+
+
+def _quarantine_ownership(kind, item) -> str:
+    """Read-only: "" when no Track refers to a pending payload or its former
+    name; otherwise the code that keeps it (the sweep would keep it too)."""
+    directory = retention.namespace_dir() if kind == "namespace" else retention.waveforms_dir()
+    problem = retention._ownership_problem(directory / item.name, item.identity, True, "quarantine_name_owned_by_track")
+    return problem
 
 
 # -- entry points ----------------------------------------------------------------------------------------

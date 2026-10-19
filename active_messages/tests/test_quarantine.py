@@ -37,7 +37,7 @@ def open_dir(path) -> int:
     return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
 
 
-def reclaim(directory: Path, name=NAME, *, data=CONTENT, authorize=lambda: "", want=None):
+def reclaim(directory: Path, name=NAME, *, data=CONTENT, authorize=lambda *_: "", want=None):
     """One cleanup exactly as retention runs it: under the destination lock,
     through a directory descriptor."""
     with playout._destination_lock(directory / name):
@@ -285,13 +285,13 @@ class IdentityTests(FixtureMixin, SimpleTestCase):
 
     def test_authority_withdrawn_after_the_move_puts_the_file_back(self):
         answers = iter(["", "path_owned_by_track"])
-        self.assertEqual(reclaim(self.dir, authorize=lambda: next(answers)), (0, ["path_owned_by_track"]))
+        self.assertEqual(reclaim(self.dir, authorize=lambda *_: next(answers)), (0, ["path_owned_by_track"]))
         self.assertEqual(os.lstat(self.path).st_ino, self.inode)
         self.assert_clean_quarantine()
 
     def test_authority_unknown_after_the_move_keeps_it_pending_then_finishes(self):
         answers = iter(["", "ownership_unavailable"])
-        self.assertEqual(reclaim(self.dir, authorize=lambda: next(answers)), (0, ["quarantine_pending"]))
+        self.assertEqual(reclaim(self.dir, authorize=lambda *_: next(answers)), (0, ["quarantine_pending"]))
         self.assertFalse(self.path.exists())
         self.assertEqual(held(self.dir), [(NAME, "quarantine_pending", len(CONTENT))])
         self.assertEqual(reclaim(self.dir), (len(CONTENT), []))          # re-proven, removed, counted once
@@ -299,7 +299,7 @@ class IdentityTests(FixtureMixin, SimpleTestCase):
 
     def test_inspection_changes_nothing(self):
         answers = iter(["", "ownership_unavailable"])
-        reclaim(self.dir, authorize=lambda: next(answers))
+        reclaim(self.dir, authorize=lambda *_: next(answers))
 
         def snapshot():
             return sorted((str(p), os.lstat(p).st_ino, os.lstat(p).st_mtime_ns) for p in self.dir.rglob("*"))
@@ -334,7 +334,7 @@ def _child(directory, stop_at, reached, substitute, recover_only):
     if recover_only:
         with playout._destination_lock(path):
             fd = open_dir(directory)
-            quarantine.recover(fd, NAME, expected=expected(), authorize=lambda: "")
+            quarantine.recover(fd, NAME, expected=expected(), authorize=lambda *_: "")
     else:
         reclaim(Path(directory))
     os._exit(0)
@@ -356,7 +356,7 @@ class CrashRecoveryTests(FixtureMixin, SimpleTestCase):
             fd = open_dir(self.dir)
             try:
                 return [(s.state, s.bytes_removed, s.problem, s.detail)
-                        for s in quarantine.recover(fd, NAME, **{"expected": expected(), "authorize": lambda: "",
+                        for s in quarantine.recover(fd, NAME, **{"expected": expected(), "authorize": lambda *_: "",
                                                                  **kwargs})]
             finally:
                 os.close(fd)
@@ -430,7 +430,7 @@ class CrashRecoveryTests(FixtureMixin, SimpleTestCase):
         self.assertEqual(held(self.dir), [(NAME, "quarantine_recovery_required", len(CONTENT))])
         # 3. content authority unavailable: pending, kept
         manifest.unlink()
-        self.assertEqual(self.recover(expected=None, authorize=lambda: "ownership_unavailable")[0][:3],
+        self.assertEqual(self.recover(expected=None, authorize=lambda *_: "ownership_unavailable")[0][:3],
                          ("kept", 0, "quarantine_recovery_required"))
         self.assertTrue(payload.is_file())
 
@@ -438,7 +438,7 @@ class CrashRecoveryTests(FixtureMixin, SimpleTestCase):
         self.kill_at("after_move")
         (operation,) = operations(self.dir)
         os.utime(self.dir / quarantine.ROOT / operation / quarantine.PAYLOAD, (0, 0))
-        self.assertEqual(self.recover(expected=None, authorize=lambda: "ownership_unavailable"),
+        self.assertEqual(self.recover(expected=None, authorize=lambda *_: "ownership_unavailable"),
                          [("kept", 0, "quarantine_pending", "ownership_unavailable")])
 
 
