@@ -186,8 +186,9 @@ class RetirementTests(Lifecycle, TestCase):
             with self.assertRaises(SystemExit):
                 self.retire(execution)
         artist = Track.objects.first().artist if Track.objects.exists() else self.song_artist
-        Track.objects.create(id=publication.track_id_snapshot, title="again", artist=artist,
-                             filepath=str(self.file(publication)), filename="x.flac")
+        with playout._destination_lock(self.file(publication)):   # a legitimate (lock-holding) registration
+            Track.objects.create(id=publication.track_id_snapshot, title="again", artist=artist,
+                                 filepath=str(self.file(publication)), filename="x.flac")
         self.assertEqual([o.reasons for o in retention.finish_retirements(apply=True).outcomes],
                          [("retired_track_present",)])
         self.assertEqual(self.retire(execution).reasons, ("retired_track_present",))
@@ -235,7 +236,8 @@ class RetirementTests(Lifecycle, TestCase):
                 path.write_bytes(data)
                 if wave is not None:
                     self.wave(publication).write_bytes(wave)
-                Track.objects.filter(pk=publication.track_id_snapshot).update(filepath=str(path))
+                with playout._destination_lock(path):            # re-pointing to a reserved path needs the lock
+                    Track.objects.filter(pk=publication.track_id_snapshot).update(filepath=str(path))
         self.assertEqual(codes(reconcile.reconcile(deep=True), "integrity_damage"), [])
         self.assertEqual(path.read_bytes(), data)
 
@@ -288,15 +290,46 @@ class RetirementTests(Lifecycle, TestCase):
         self.assertGreaterEqual(report.healthy["publication_lock"], 1)   # a retained synchronization artifact
         dry = retention.sweep_publication_namespace(now=later)
         self.assertEqual(sorted(o.artifact for o in dry.outcomes if o.action == "eligible"),
-                         ["namespace_file", "publication_scratch"])
+                         ["publication_scratch"])                     # the identity-less orphan never is
         self.assertTrue(orphan.exists())                              # dry run
         lock_inode = os.lstat(lock).st_ino
         done = retention.sweep_publication_namespace(apply=True, now=later)
-        self.assertEqual(done.count("removed"), 2)
-        self.assertFalse(orphan.exists() or scratch.exists())
+        self.assertEqual(done.count("removed"), 1)                    # the scratch directory
+        self.assertFalse(scratch.exists())
+        self.assertTrue(orphan.exists())                              # a name alone proves nothing (review 3)
+        self.assertIn(("namespace_file", ("identity_unverifiable",)),
+                      [(o.artifact, o.reasons) for o in done.outcomes])
         self.assertEqual(os.lstat(lock).st_ino, lock_inode)           # the lock sidecar persists, same inode
         self.assertEqual(legacy.read_bytes(), b"legacy")              # never ours, never touched
         self.assertEqual(self.file(publication).read_bytes(), published)   # a valid publication is never touched
+
+    def test_an_orphan_with_its_executions_exact_aggregate_is_removed(self):
+        """An interrupted publication whose execution was then superseded: the
+        placed file is exactly that execution's aggregate and no Track owns it."""
+        from datetime import timedelta
+        from django.utils import timezone
+        from production.services import media_io
+        execution = self.ready_execution()
+        message = execution.composition_snapshot["components"][0]["message"]
+        placed = self.library_root / playout.relpath_for(execution.pk)
+        placed.parent.mkdir(parents=True, exist_ok=True)
+        opened = media_io.open_media(execution.mix_media)
+        try:
+            placed.write_bytes(opened.file.read())
+        finally:
+            opened.close()
+        services.clear_message(message, actor=self.admin)        # the composition moves on: SUPPRESSED
+        self.assertEqual(self.stored(execution).state, "suppressed")
+        later = timezone.now() + timedelta(hours=25)
+        done = retention.sweep_publication_namespace(apply=True, now=later)
+        self.assertEqual([(o.action, o.bytes_reclaimed) for o in done.outcomes if o.artifact == "namespace_file"],
+                         [("removed", execution.mix_media.byte_size)])
+        self.assertFalse(placed.exists())
+        placed.write_bytes(b"not the aggregate")                  # other bytes at that name are never removed
+        refused = retention.sweep_publication_namespace(apply=True, now=later)
+        self.assertEqual([o.reasons for o in refused.outcomes if o.artifact == "namespace_file"],
+                         [("file_identity_mismatch",)])
+        self.assertTrue(placed.exists())
 
     def test_a_ready_executions_placed_file_awaits_adoption(self):
         execution = self.ready_execution()

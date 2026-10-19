@@ -46,6 +46,7 @@ claiming bytes that are gone.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -55,7 +56,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -355,6 +356,11 @@ def assess_publication_retirement(publication, *, execution=None, track=None) ->
             reasons.append("track_not_publication")
         else:
             reasons.extend(_track_dependency_reasons(track))
+    owners = _owners(canonical_destination(publication.library_relpath))
+    if owners is None:
+        reasons.append("ownership_unavailable")
+    elif set(owners) - ({track.pk} if track is not None and track.pk == publication.track_id_snapshot else set()):
+        reasons.append("path_owned_by_track")              # another Track owns the publication's path
     log_items = ActiveBroadcastInsertion.objects.filter(publication=publication).values_list(
         "log_item_id_snapshot", flat=True)
     reasons.extend(_air_evidence_reasons(publication.track_id_snapshot if track is not None else None,
@@ -389,41 +395,150 @@ def assess_aggregate_purge(media, *, now=None, grace=None) -> Assessment:
 
 # -- publication retirement -----------------------------------------------------------------------------
 
-def _remove_publication_bytes(publication_relpath: str, track_id_snapshot: int):
-    """Remove a RETIRED publication's file and waveform, under the
-    destination lock publish takes. Returns (bytes_removed, problems).
-    Missing files are already done; a symlink or other non-regular entry is
-    never followed or removed (reported)."""
+def canonical_destination(relpath) -> Path:
+    """The publication's canonical absolute path -- the same one publish
+    places, the Track records and the destination lock is keyed by."""
+    return playout._library_root() / playout.CATEGORY_CODE / native_name(relpath)
+
+
+def _path_owners(destination: Path) -> list:
+    """Ids of EVERY Track whose filepath names ``destination`` -- whatever its
+    id (not only the publication's own Track or its snapshot) and through any
+    alias of the directory. Base manager: no Track is hidden."""
+    from library.models import Track
+
+    from .track_guard import reserved_destination
+    candidates = Track._base_manager.filter(filepath__endswith="/" + destination.name).values_list("pk", "filepath")
+    return sorted(pk for pk, filepath in candidates if reserved_destination(filepath) == destination)
+
+
+def _owners(destination: Path):
+    """``_path_owners`` or None when ownership cannot be established."""
+    try:
+        return _path_owners(destination)
+    except DatabaseError:
+        return None
+
+
+def _digest_fd(fd) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verified_unlink(destination: Path, *, expected_sha256: str, expected_size: int):
+    """(bytes_removed, problem): remove ``destination`` ONLY if, with the
+    caller holding its destination lock (so no Track can be registered there
+    meanwhile -- active_messages.track_guard):
+
+    * the namespace is the real directory under the library root (opened
+      O_NOFOLLOW; its descriptor is the one the removal goes through);
+    * no Track owns the path (``_path_owners``; unknowable -> refuse);
+    * the entry is a regular file (never a symlink), of exactly the expected
+      size and SHA-256 (hashed through the opened descriptor);
+    * the pathname still names that very inode at the moment of removal.
+    Anything else refuses and keeps the bytes. problem is "" on success or
+    when the file is already gone."""
+    import errno
+    try:
+        real_namespace = namespace_dir()
+    except RetentionUnavailable as exc:
+        return 0, exc.code
+    directory = destination.parent
+    if os.path.realpath(real_namespace) != os.path.realpath(directory):
+        return 0, "namespace_substituted"
+    try:
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return 0, "namespace_unavailable"
+    try:
+        held, named = os.fstat(dirfd), os.lstat(directory)
+        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            return 0, "namespace_substituted"
+        owners = _owners(destination)
+        if owners is None:
+            return 0, "ownership_unavailable"
+        if owners:
+            return 0, "path_owned_by_track"
+        try:
+            fd = os.open(destination.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+        except FileNotFoundError:
+            return 0, ""
+        except OSError as exc:
+            return 0, "file_not_regular" if exc.errno == errno.ELOOP else f"file_{type(exc).__name__}"
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return 0, "file_not_regular"
+            if info.st_size != expected_size or _digest_fd(fd) != expected_sha256:
+                return 0, "file_identity_mismatch"
+            current = os.stat(destination.name, dir_fd=dirfd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                return 0, "file_replaced"
+            os.unlink(destination.name, dir_fd=dirfd)
+            return info.st_size, ""
+        except FileNotFoundError:
+            return 0, "file_replaced"
+        except OSError as exc:
+            return 0, f"file_{type(exc).__name__}"
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dirfd)
+
+
+def _waveform_problem(wave: Path, track_id_snapshot) -> str:
+    """"" when the waveform may go: no Track has that id (its name) or
+    records that waveform path."""
+    from library.models import Track
+    try:
+        if (Track._base_manager.filter(pk=track_id_snapshot).exists()
+                or Track._base_manager.filter(waveform_path=str(wave)).exists()):
+            return "waveform_owned_by_track"
+    except DatabaseError:
+        return "ownership_unavailable"
+    return ""
+
+
+def _remove_publication_bytes(publication):
+    """Remove a RETIRED publication's file and waveform. Returns
+    (bytes_removed, problems). The file goes only through
+    ``_verified_unlink`` under the destination lock (never while ANY Track
+    owns the path, never a file that is not exactly the publication's); a
+    missing file is already done; anything uncertain keeps the bytes."""
     problems, removed = [], 0
     try:
-        dest = namespace_dir() / native_name(publication_relpath)
+        destination = canonical_destination(publication.library_relpath)
+        size = ProductionMedia.objects.filter(pk=publication.media_id).values_list("byte_size", flat=True).first()
     except RetentionUnavailable as exc:
         return 0, [exc.code]
+    except DatabaseError:
+        return 0, ["ownership_unavailable"]
     try:
-        with playout._destination_lock(dest):
-            state, size = file_state(dest)
-            if state == "regular":
-                try:
-                    os.unlink(dest)
-                    removed += size
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    problems.append(f"file_{type(exc).__name__}")
-            elif state != "missing":
-                problems.append(f"file_{state}")
+        with playout._destination_lock(destination):
+            gone, problem = _verified_unlink(destination, expected_sha256=publication.sha256,
+                                             expected_size=size if size is not None else -1)
+        removed += gone
+        if problem:
+            problems.append(problem)
     except OSError as exc:                       # the destination lock itself (namespace not writable)
         problems.append(f"file_{type(exc).__name__}")
-    wave = waveforms_dir() / f"{int(track_id_snapshot)}.json"
-    state, size = file_state(wave)
+    wave = waveforms_dir() / f"{int(publication.track_id_snapshot)}.json"
+    state, wave_size = file_state(wave)
     if state == "regular":
-        try:
-            os.unlink(wave)
-            removed += size
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            problems.append(f"waveform_{type(exc).__name__}")
+        problem = _waveform_problem(wave, publication.track_id_snapshot)
+        if problem:
+            problems.append(problem)
+        else:
+            try:
+                os.unlink(wave)
+                removed += wave_size
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                problems.append(f"waveform_{type(exc).__name__}")
     elif state != "missing":
         problems.append(f"waveform_{state}")
     return removed, problems
@@ -479,6 +594,11 @@ def retire_publication(execution_id, *, apply=False) -> Outcome:
         if is_retired(row.pk):
             if _track_present(publication):
                 return Outcome("publication", identity, "refused", ("retired_track_present",))
+            owners = _owners(canonical_destination(publication.library_relpath))
+            if owners is None:
+                return Outcome("publication", identity, "failed", ("ownership_unavailable",))
+            if owners:
+                return Outcome("publication", identity, "refused", ("path_owned_by_track",))
             retired_now = False
         else:
             # The Track is NOT row-locked first: the library deletes a Track by
@@ -507,7 +627,7 @@ def retire_publication(execution_id, *, apply=False) -> Outcome:
             if collector is not None:
                 collector.delete()                   # SET_NULL referrers, then the Track (signals included)
             retired_now = True
-    removed, problems = _remove_publication_bytes(publication.library_relpath, publication.track_id_snapshot)
+    removed, problems = _remove_publication_bytes(publication)
     if problems:
         return Outcome("publication", identity, "failed", tuple(problems), bytes_reclaimed=removed)
     return Outcome("publication", identity, "retired" if retired_now else "already_retired",
@@ -543,11 +663,18 @@ def finish_retirements(*, apply=False, limit=None) -> CleanupReport:
         if _track_present(publication):
             report.add(Outcome("retired_publication", identity, "refused", ("retired_track_present",)))
             continue
+        owners = _owners(canonical_destination(publication.library_relpath))
+        if owners is None:
+            report.add(Outcome("retired_publication", identity, "failed", ("ownership_unavailable",)))
+            continue
+        if owners:
+            report.add(Outcome("retired_publication", identity, "refused", ("path_owned_by_track",)))
+            continue
         size = sum(s for _p, s in remaining)
         if not apply:
             report.add(Outcome("retired_publication", identity, "eligible", bytes_reclaimable=size))
             continue
-        removed, problems = _remove_publication_bytes(publication.library_relpath, publication.track_id_snapshot)
+        removed, problems = _remove_publication_bytes(publication)
         report.add(Outcome("retired_publication", identity, "failed" if problems else "removed", tuple(problems),
                            bytes_reclaimed=removed))
     return report
@@ -610,6 +737,9 @@ def sweep_publication_namespace(*, apply=False, grace=None, now=None, limit=None
             if not _unadoptable(execution_id):
                 report.add(Outcome("namespace_file", name, "kept", ("in_flight_publication",)))
                 continue
+            if _orphan_identity(execution_id) is None:
+                report.add(Outcome("namespace_file", name, "refused", ("identity_unverifiable",)))
+                continue
             age = _age_seconds(path, now)
             if age is None or age < grace.total_seconds():
                 report.add(Outcome("namespace_file", name, "kept", ("too_recent",)))
@@ -617,7 +747,7 @@ def sweep_publication_namespace(*, apply=False, grace=None, now=None, limit=None
             if not apply:
                 report.add(Outcome("namespace_file", name, "eligible", bytes_reclaimable=size))
                 continue
-            report.add(_remove_orphan(path, name, execution_id))
+            report.add(_remove_orphan(name, execution_id))
         elif name.startswith(SCRATCH_PREFIX):
             handled += 1
             try:
@@ -683,21 +813,39 @@ def _publish_in_progress(directory, names) -> bool:
     return False
 
 
-def _remove_orphan(path, name, execution_id) -> Outcome:
+def _orphan_identity(execution_id):
+    """(sha256, size) the placed file of ``execution_id`` must have -- its
+    exact aggregate -- or None when no such identity exists (then the file
+    is never removed: a name alone proves nothing)."""
+    row = (ActiveBroadcastExecution.objects.filter(pk=execution_id, mix_media__isnull=False)
+           .values_list("mix_media__sha256", "mix_media__byte_size").first())
+    return row
+
+
+def _remove_orphan(name, execution_id) -> Outcome:
     """Under the destination lock publish takes, re-check that no publication
-    owns the file and its execution still cannot adopt it, then remove it."""
+    owns the file and its execution still cannot adopt it, then remove it only
+    through ``_verified_unlink`` (no Track owns the path; exactly the
+    execution's aggregate bytes; the same inode)."""
     try:
-        with playout._destination_lock(path):
+        destination = playout._library_root() / playout.CATEGORY_CODE / name
+        with playout._destination_lock(destination):
             if (ActiveBroadcastPublication.objects.filter(library_relpath=f"{playout.CATEGORY_CODE}/{name}")
                     .exists() or not _unadoptable(execution_id)):
                 return Outcome("namespace_file", name, "kept", ("in_flight_publication",))
-            state, size = file_state(path)
-            if state != "regular":
-                return Outcome("namespace_file", name, "refused", (f"entry_{state}",))
-            os.unlink(path)
-            return Outcome("namespace_file", name, "removed", bytes_reclaimed=size)
-    except OSError as exc:
+            identity = _orphan_identity(execution_id)
+            if identity is None:
+                return Outcome("namespace_file", name, "refused", ("identity_unverifiable",))
+            removed, problem = _verified_unlink(destination, expected_sha256=identity[0], expected_size=identity[1])
+    except (OSError, DatabaseError) as exc:
         return Outcome("namespace_file", name, "failed", (type(exc).__name__,))
+    if problem:
+        return Outcome("namespace_file", name, "refused" if problem in _REFUSALS else "failed", (problem,))
+    return Outcome("namespace_file", name, "removed", bytes_reclaimed=removed)
+
+
+_REFUSALS = frozenset({"path_owned_by_track", "file_identity_mismatch", "file_replaced", "file_not_regular",
+                       "namespace_substituted"})
 
 
 # -- unbound aggregate bytes -------------------------------------------------------------------------------

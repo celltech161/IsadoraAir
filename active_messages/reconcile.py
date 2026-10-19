@@ -265,9 +265,19 @@ def _check_publications(report, *, deep, limit):
         track = tracks.get(row.track_id)
         if row.execution_id in retired:
             wave_state = retention.file_state(waves / f"{row.track_id_snapshot}.json")[0]
+            owners = retention._owners(retention.canonical_destination(row.library_relpath))
             if track is not None or Track.objects.filter(pk=row.track_id_snapshot).exists():
                 report.add("publication", row.execution_id, "retired_track_present", "warning", "integrity_damage",
                            "a retired publication's Track exists again", action="operator review")
+            elif owners:
+                report.add("publication", row.execution_id, "retired_path_owned_by_track", "warning",
+                           "integrity_damage", f"Track {owners[0]} now owns the retired publication's path; "
+                           "its bytes are never removed", eligibility="blocked:path_owned_by_track",
+                           action="operator review: keep that Track or move it before any cleanup")
+            elif owners is None:
+                report.add("publication", row.execution_id, "ownership_unavailable", "warning", "unknown",
+                           "Track ownership of the retired path could not be established",
+                           action="retry; nothing is removed meanwhile")
             elif file_state != "missing" or wave_state != "missing":
                 report.add("publication", row.execution_id, "retired_bytes_remaining", "info", "in_flight",
                            "retired publication still has its file or waveform on disk", eligibility="eligible",
@@ -288,6 +298,10 @@ def _check_publications(report, *, deep, limit):
                 report.add("publication", row.execution_id, "publication_pruned", "info", "expected_pruning",
                            f"Track {row.track_id_snapshot} and its file were removed through the library; "
                            "the publication record is kept")
+            elif retention._owners(retention.canonical_destination(row.library_relpath)):
+                report.add("publication", row.execution_id, "publication_path_adopted", "warning",
+                           "integrity_damage", f"another Track owns {name}; its bytes are never removed",
+                           eligibility="blocked:path_owned_by_track", action="operator review")
             else:
                 assessment = retention.assess_publication_retirement(row, execution=execution, track=None)
                 report.add("publication", row.execution_id, "publication_file_without_track", "info",

@@ -13,3 +13,10 @@ class ActiveMessagesConfig(AppConfig):
 
         from .iportal import ADAPTER as active_message_recorder_adapter
         recorder_registry.register(active_message_recorder_adapter)
+        # D3E-C review 3: a Track may own a reserved native publication path
+        # only under that path's publication destination lock.
+        from library.models import register_track_write_guard
+
+        from . import track_guard
+        register_track_write_guard(track_guard.check_track_save, track_guard.check_track_update,
+                                   track_guard.check_track_bulk_update)

@@ -364,7 +364,10 @@ def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublicat
                     os.chmod(staged, 0o644)
                     os.link(staged, dest)                 # atomic and never overwrites
                     placed = True
-                with transaction.atomic():
+                # durable: the Track registration COMMITS before the destination
+                # lock is released, so a cleanup that takes the lock next sees
+                # the Track owning this path (active_messages.track_guard).
+                with transaction.atomic(durable=True):
                     track, _created = sync_track_file(str(dest), ready2air=False, wave_dir=wave_scratch)
                     scratch_wave = wave_scratch / f"{track.id}.json"
                     if not scratch_wave.is_file():

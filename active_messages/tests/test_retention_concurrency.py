@@ -193,3 +193,155 @@ class SweepPublicationRaceTests(Lifecycle, TransactionTestCase):
         publication = ActiveBroadcastPublication.objects.get(execution=execution)
         self.assertEqual(playout._file_sha256(placed), publication.sha256)
         self.assertNotIn("removed", [action for action, _r in results["sweep"]])
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class OwnershipRaceTests(Lifecycle, TransactionTestCase):
+    """Review 3, across PostgreSQL sessions (one connection per thread): a
+    Track registering at a retired publication's path and the cleanup that
+    removes that path serialize on the destination lock; the bytes are never
+    removed while any Track owns them."""
+
+    serialized_rollback = True
+
+    def interrupted(self):
+        from unittest import mock
+        execution, publication, _item = self.completed()
+        with mock.patch.object(retention, "_remove_publication_bytes", side_effect=SystemExit("killed")):
+            try:
+                retention.retire_publication(execution.pk, apply=True)
+            except SystemExit:
+                pass
+        self.assertTrue(retention.is_retired(execution.pk))
+        return execution, publication, self.library_root / publication.library_relpath
+
+    def new_track(self, path):
+        return Track.objects.create(title="Adopted", artist=self.song_artist, filepath=str(path),
+                                    filename=path.name)
+
+    def flock_signals(self, thread_name, event):
+        """Patch fcntl.flock so ``thread_name`` signals ``event`` just before it
+        waits for an exclusive lock (deterministic ordering, no sleeps)."""
+        import fcntl
+        from unittest import mock
+        real = fcntl.flock
+
+        def flock(fd, operation):
+            if (threading.current_thread().name == thread_name and operation & fcntl.LOCK_EX
+                    and not operation & fcntl.LOCK_NB):
+                event.set()
+            return real(fd, operation)
+
+        patcher = mock.patch.object(fcntl, "flock", side_effect=flock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_named(self, *named, timeout=60):
+        results, errors = {}, {}
+
+        def wrap(name, target):
+            try:
+                results[name] = target()
+            except BaseException as exc:             # noqa: BLE001
+                errors[name] = exc
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=wrap, args=(name, target), name=name) for name, target in named]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout)
+            assert not thread.is_alive(), "deadlock"
+        return results, errors
+
+    def test_a_registration_holding_the_lock_beats_a_cleanup_past_its_precheck(self):
+        execution, publication, path = self.interrupted()
+        data = path.read_bytes()
+        locked, cleanup_waiting = threading.Event(), threading.Event()
+        self.flock_signals("cleanup", cleanup_waiting)
+
+        def register():
+            with playout._destination_lock(path):
+                locked.set()
+                assert cleanup_waiting.wait(20)              # the cleanup passed its pre-check and now waits
+                with transaction.atomic(durable=True):
+                    return self.new_track(path).pk           # committed before the lock is released
+
+        def cleanup():
+            assert locked.wait(20)
+            return [(o.action, o.reasons) for o in retention.finish_retirements(apply=True).outcomes]
+
+        results, errors = self.run_named(("register", register), ("cleanup", cleanup))
+        self.assertEqual(errors, {})
+        self.assertEqual(results["cleanup"], [("failed", ("path_owned_by_track",))])   # decided under the lock
+        self.assertEqual(path.read_bytes(), data)                                      # the new Track's audio
+        self.assertTrue(Track.objects.filter(pk=results["register"], filepath=str(path)).exists())
+        self.assertNotEqual(results["register"], publication.track_id_snapshot)
+
+    def test_a_cleanup_holding_the_lock_beats_a_registration(self):
+        from unittest import mock
+        execution, publication, path = self.interrupted()
+        decided, register_waiting = threading.Event(), threading.Event()
+        self.flock_signals("register", register_waiting)
+        real_owners = retention._owners
+        timeline = []
+
+        def owners(destination):
+            found = real_owners(destination)
+            if threading.current_thread().name == "cleanup" and playout.holds_destination_lock(destination):
+                decided.set()                                # the authoritative check, under the lock
+                assert register_waiting.wait(20)            # the registration now waits on our lock
+            return found
+
+        def register():
+            assert decided.wait(20)
+            with playout._destination_lock(path):
+                timeline.append(("registered", path.exists()))
+                with transaction.atomic(durable=True):
+                    return self.new_track(path).pk
+
+        def cleanup():
+            outcomes = retention.finish_retirements(apply=True).outcomes
+            timeline.append(("cleaned", path.exists()))
+            return [(o.action, o.reasons) for o in outcomes]
+
+        with mock.patch.object(retention, "_owners", side_effect=owners):
+            results, errors = self.run_named(("register", register), ("cleanup", cleanup))
+        self.assertEqual(errors, {})
+        self.assertEqual(results["cleanup"], [("removed", ())])  # decided and removed while no Track owned it
+        # the registration obtained the lock only after the removal: no bytes were left for it to own
+        self.assertEqual(sorted(timeline), [("cleaned", False), ("registered", False)])
+
+    def test_two_concurrent_cleanups_remove_once(self):
+        execution, publication, path = self.interrupted()
+        expected = path.stat().st_size + self.wave(publication).stat().st_size
+        results, errors = self.run_named(
+            ("a", lambda: retention.finish_retirements(apply=True).bytes_reclaimed),
+            ("b", lambda: retention.finish_retirements(apply=True).bytes_reclaimed))
+        self.assertEqual(errors, {})
+        self.assertFalse(path.exists())
+        self.assertEqual(results["a"] + results["b"], expected)       # every byte removed (and counted) once
+        self.assertFalse(self.wave(publication).exists())
+        self.assertEqual(retention.finish_retirements(apply=True).outcomes, [])
+
+    def test_an_uncoordinated_library_sync_racing_cleanup_never_owns_the_path(self):
+        from library.management.commands.sync_track_file import sync_track_file
+        from library.models import TrackWriteRefused
+        execution, publication, path = self.interrupted()
+
+        def sync():
+            try:
+                sync_track_file(str(path), ready2air=False)
+            except TrackWriteRefused:
+                return "refused"
+            except Exception as exc:                        # noqa: BLE001 -- file already gone, etc.
+                return type(exc).__name__
+            return "registered"
+
+        results, errors = self.run_named(("sync", sync),
+                                         ("cleanup", lambda: retention.finish_retirements(apply=True).outcomes))
+        self.assertEqual(errors, {})
+        self.assertNotEqual(results["sync"], "registered")
+        self.assertFalse(Track.objects.filter(filepath=str(path)).exists())
+        self.assertFalse(path.exists())
