@@ -282,14 +282,17 @@ class RetirementTests(Lifecycle, TestCase):
         later = timezone.now() + timedelta(hours=25)              # the grace counts from mtime AND ctime
         report = reconcile.reconcile(now=later)
         self.assertEqual(sorted(f.code for f in report.findings if f.category == "candidate_orphan"),
-                         ["namespace_orphan_file", "publication_lock_leftover", "publication_scratch_leftover"])
+                         ["namespace_orphan_file", "publication_scratch_leftover"])
+        self.assertGreaterEqual(report.healthy["publication_lock"], 1)   # a retained synchronization artifact
         dry = retention.sweep_publication_namespace(now=later)
         self.assertEqual(sorted(o.artifact for o in dry.outcomes if o.action == "eligible"),
-                         ["namespace_file", "publication_lock", "publication_scratch"])
+                         ["namespace_file", "publication_scratch"])
         self.assertTrue(orphan.exists())                              # dry run
+        lock_inode = os.lstat(lock).st_ino
         done = retention.sweep_publication_namespace(apply=True, now=later)
-        self.assertEqual(done.count("removed"), 3)
-        self.assertFalse(orphan.exists() or scratch.exists() or lock.exists())
+        self.assertEqual(done.count("removed"), 2)
+        self.assertFalse(orphan.exists() or scratch.exists())
+        self.assertEqual(os.lstat(lock).st_ino, lock_inode)           # the lock sidecar persists, same inode
         self.assertEqual(legacy.read_bytes(), b"legacy")              # never ours, never touched
         self.assertEqual(self.file(publication).read_bytes(), published)   # a valid publication is never touched
 

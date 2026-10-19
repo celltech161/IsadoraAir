@@ -426,12 +426,14 @@ def _check_namespace(report, *, now, grace, limit):
                        eligibility="eligible" if old else "blocked:too_recent",
                        action="sweep --apply removes it after the grace period")
         else:
-            age = retention._age_seconds(path, now)
-            old = age is not None and age >= sweep.total_seconds()
-            report.add("publication_lock", name, "publication_lock_leftover", "info", "candidate_orphan",
-                       "destination-lock sidecar left by an interrupted publication",
-                       eligibility="eligible" if old else "blocked:too_recent",
-                       action="sweep --apply removes it when unlocked")
+            # A persistent destination-lock sidecar: a retained synchronization
+            # artifact, never a cleanup candidate (playout._destination_lock).
+            if retention.file_state(path)[0] == "regular":
+                report.healthy["publication_lock"] += 1
+            else:
+                report.add("publication_lock", name, "namespace_entry_unexpected", "warning", "unknown",
+                           f"{name} is not a regular file; publication of that execution refuses it",
+                           action="operator review; never followed or removed")
 
 
 # -- entry points ----------------------------------------------------------------------------------------

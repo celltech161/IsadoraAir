@@ -21,9 +21,10 @@ What can be reclaimed (each only with ``apply=True``; dry-run otherwise):
    same moment either sees the purge (``rendition_unavailable``: it simply
    renders again) or wins and the purge refuses.
 2. Interrupted-publication leftovers in the reserved ``UrgentPA`` namespace:
-   ``.am-publish-*`` scratch directories, ``.am-<hex>.flac.publish.lock``
-   sidecars, and placed ``am-<hex>.flac`` files with no publication row whose
-   execution can no longer adopt them (not READY). Never a READY execution's
+   ``.am-publish-*`` scratch directories and placed ``am-<hex>.flac`` files
+   with no publication row whose execution can no longer adopt them (not
+   READY). The ``.am-<hex>.flac.publish.lock`` sidecars are NOT leftovers:
+   they are persistent synchronization artifacts and are never removed. Never a READY execution's
    placed file (publish reuses it), never inside the grace period, always
    under the destination lock publish itself takes.
 3. Retired publications' remaining bytes (crash recovery of 4).
@@ -560,11 +561,11 @@ def sweep_publication_namespace(*, apply=False, grace=None, now=None, limit=None
       not READY, older than the grace: removed under the destination lock
       after re-checking both (a READY execution's file is kept: publish adopts
       it);
-    * ``.am-publish-*`` scratch directories older than the grace;
-    * ``.am-<hex>.flac.publish.lock`` sidecars older than the grace, for an
-      execution that cannot publish, removed only while their flock is held.
-    Symlinks and other non-regular entries are reported, never followed."""
-    import fcntl
+    * ``.am-publish-*`` scratch directories older than the grace, never while
+      any publish holds its destination lock.
+    ``.am-<hex>.flac.publish.lock`` sidecars are never removed (persistent
+    locks; a non-regular one is reported). Symlinks and other non-regular
+    entries are reported, never followed."""
     report, grace, now, limit = CleanupReport(apply=apply), _grace(grace), now or timezone.now(), _limit(limit)
     try:
         directory = namespace_dir()
@@ -635,35 +636,13 @@ def sweep_publication_namespace(*, apply=False, grace=None, now=None, limit=None
             except OSError as exc:
                 report.add(Outcome("publication_scratch", name[:64], "failed", (type(exc).__name__,)))
         elif name.startswith(".am-") and name.endswith(".flac.publish.lock") and NATIVE_NAME.fullmatch(name[1:-13]):
-            handled += 1
+            # A destination-lock sidecar is a PERSISTENT synchronization artifact
+            # (see playout._destination_lock): never removed, whatever its age --
+            # a waiter may hold it open. Only an unexpected object is reported.
             state, _size = file_state(path)
             if state != "regular":
+                handled += 1
                 report.add(Outcome("publication_lock", name, "refused", (f"entry_{state}",)))
-                continue
-            age = _age_seconds(path, now)
-            if age is None or age < grace.total_seconds() or not _unadoptable(execution_id_for(name[1:-13])):
-                report.add(Outcome("publication_lock", name, "kept", ("in_use_or_recent",)))
-                continue
-            if not apply:
-                report.add(Outcome("publication_lock", name, "eligible"))
-                continue
-            try:
-                fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
-            except OSError as exc:
-                report.add(Outcome("publication_lock", name, "failed", (type(exc).__name__,)))
-                continue
-            try:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
-                    report.add(Outcome("publication_lock", name, "kept", ("in_use_or_recent",)))
-                    continue
-                os.unlink(path)
-                report.add(Outcome("publication_lock", name, "removed"))
-            except OSError as exc:
-                report.add(Outcome("publication_lock", name, "failed", (type(exc).__name__,)))
-            finally:
-                os.close(fd)
     return report
 
 

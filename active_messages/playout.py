@@ -78,7 +78,9 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import tempfile
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -180,24 +182,68 @@ def _event(name, row, *, actor_kind, detail=None, from_state="", to_state=""):
 
 # -- publication ---------------------------------------------------------------------------
 
+_held_locks = threading.local()
+
+
+def lock_sidecar(dest: Path) -> Path:
+    return dest.parent / f".{dest.name}.publish.lock"
+
+
+def _open_lock_sidecar(lock_path: Path) -> int:
+    """The persistent sidecar, opened without following a symlink and proven
+    to be a single-link regular file (a symlink, directory, FIFO, device or
+    hard link is never accepted as the lock: OSError)."""
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(fd)
+        raise OSError(f"unexpected publication lock sidecar {lock_path.name}")
+    return fd
+
+
+def holds_destination_lock(dest: Path) -> bool:
+    """Does THIS thread hold the destination lock of ``dest``?"""
+    return str(lock_sidecar(dest)) in getattr(_held_locks, "paths", {})
+
+
 @contextmanager
 def _destination_lock(dest: Path):
-    """Cross-process exclusive lock keyed by the destination (an flock on a
-    hidden sidecar, released by the kernel on exit or crash)."""
-    lock_path = dest.parent / f".{dest.name}.publish.lock"
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o644)
+    """Cross-process exclusive lock keyed by the destination: an flock on the
+    PERSISTENT hidden sidecar ``.<name>.publish.lock`` (released by the kernel
+    on exit or crash). The sidecar is NEVER unlinked -- not on release, not by
+    any cleanup: a process that already opened it and waits must lock the very
+    inode every later process opens, or two "exclusive" holders could coexist
+    on different inodes. After locking, the pathname must still name the
+    locked inode (else OSError: something replaced it -- fail closed).
+    Reentrant within one thread (``holds_destination_lock``)."""
+    lock_path = lock_sidecar(dest)
+    key = str(lock_path)
+    held = getattr(_held_locks, "paths", None)
+    if held is None:
+        held = _held_locks.paths = {}
+    if key in held:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    fd = _open_lock_sidecar(lock_path)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        locked, current = os.fstat(fd), os.lstat(lock_path)
+        if (locked.st_dev, locked.st_ino) != (current.st_dev, current.st_ino) or not stat.S_ISREG(current.st_mode):
+            raise OSError(f"publication lock sidecar {lock_path.name} was replaced")
+        held[key] = 1
+        try:
+            yield
+        finally:
+            del held[key]
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-            try:
-                os.unlink(lock_path)
-            except OSError:
-                pass
 
 
 def _file_sha256(path: Path) -> str:
