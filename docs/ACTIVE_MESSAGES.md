@@ -1304,9 +1304,10 @@ or rewrites **history** (database rows).
 | Bound aggregate (`mix_media`) | `ActiveBroadcastExecution.mix_media`, `ActiveBroadcastPublication.media` (PROTECT) | **retained** as history; reported (`terminal_mix_retained`) |
 | Unbound aggregate (rendered, never bound) | nothing (crash between render and bind; composition moved on) | **reclaimable**: bytes purged via Production's `purge_media` (row, hash, provenance kept), past the grace |
 | Aggregate of a FAILED / SUPPRESSED / INTERRUPTED execution | the execution (bound) | **retained** like any bound aggregate |
-| Published file `UrgentPA/am-<hex>.flac` | `ActiveBroadcastPublication` + its Track | **retirable** by explicit operator action only |
+| Published file `UrgentPA/am-<hex>.flac` | `ActiveBroadcastPublication` + its Track | **retirable** by an explicit maintenance action only; never while ANY Track owns the path |
 | Library Track + waveform of a publication | the library (deleted through its own Collector) | removed **with** retirement only |
-| Interrupted-publication leftovers (`.am-publish-*` scratch, `.am-<hex>.flac.publish.lock`, placed file with no publication row) | nobody (crash) | **reclaimable** by the sweep, past the grace, never while a publish holds its lock, never a READY execution's placed file |
+| Interrupted-publication leftovers (`.am-publish-*` scratch; a placed file with no publication row) | nobody (crash) | **reclaimable** by the sweep, past the grace; scratch never while a publish holds its lock; a placed file only when it is exactly its (non-READY) execution's aggregate and no Track owns the path |
+| Destination-lock sidecar `.am-<hex>.flac.publish.lock` | the publication lock (every placement, retirement, cleanup) | **retained forever** (a persistent synchronization artifact: a small empty file per destination) |
 | Publication / insertion correlation rows | the domain (append-only, never deleted) | **retained** forever |
 | LogItems, PlayEvents, segments, execution events | library / domain history | **retained** (library retention is the library's) |
 
@@ -1355,12 +1356,51 @@ execution: never dispatched again; deck-open authority refuses it) ->
 2. one transaction, locks policy -> execution (the established order; the
    Track is not row-locked first): re-assess; append `publication_retired`
    (publication id, Track id snapshot, SHA-256, relpath, what was present) as
-   the operator; delete the Track through the vetted `Collector` -- referrers
+   the SYSTEM maintenance actor (`detail.via: maintenance_command`); delete
+   the Track through the vetted `Collector` -- referrers
    SET_NULL (their snapshots stay), then the Track, the library's own order
    (a concurrent library deletion serializes with it; a dependent created
    meanwhile fails the deferred foreign key and rolls the retirement back);
-3. after commit: remove the file and the waveform under the publication
-   destination lock.
+3. after commit, under the publication destination lock: remove the file
+   only if no Track of ANY id owns its path (aliases included), it is a
+   regular file of exactly the publication's size and SHA-256 (hashed through
+   the opened descriptor, via a verified directory descriptor), and the
+   pathname still names that inode; the waveform only if no Track has that id
+   or records that waveform. Anything uncertain refuses and keeps the bytes
+   (`path_owned_by_track`, `file_identity_mismatch`, `file_replaced`,
+   `ownership_unavailable`, ...).
+
+**Authority.** Retirement through the command is a TRUSTED MAINTENANCE
+operation of the station's operating-system boundary: whoever can run
+`manage.py` holds the application's database credentials (the station
+account's `.env`) and could change these rows directly. It is not an
+authenticated per-user action -- the command accepts no username (there is no
+`--operator`), records no person (the station account is shared), and records
+the event as `ActorKind.SYSTEM` with `detail.via: "maintenance_command"`. An
+authenticated per-user retirement (verified session, CSRF, the
+`active_message.control` capability) does not exist in D3E-C.
+
+**The destination lock.** `playout._destination_lock` is an `flock` on the
+sidecar `.am-<hex>.flac.publish.lock`, which is PERSISTENT: it is never
+unlinked -- not on release, not by any sweep, whatever its age. A process
+that has already opened the sidecar and waits for it must lock the very
+inode every later process opens; unlinking it (as the original helper and the
+first D3E-C sweep did) let a waiter and a newcomer hold "exclusive" locks on
+different inodes at the same time. The sidecar is opened without following a
+symlink and must be a single-link regular file; after locking, the pathname
+must still name the locked inode -- otherwise the operation fails closed.
+
+**Track ownership of a reserved path.** `active_messages.track_guard`
+(registered through `library.register_track_write_guard`, as spoken's
+projection guard is) refuses creating a Track at `UrgentPA/am-<hex>.flac`, or
+re-pointing one there, on every ORM path (save / create / update_or_create,
+bulk_create, update, bulk_update; aliases resolved by real directory) unless
+the writer holds that destination's lock. Publish holds it, and its Track
+registration is `atomic(durable=True)`, so it commits before the lock is
+released. Cleanup decides "no Track owns this path" and removes under the
+same lock: a registration and a removal of the same path are serialized, and
+the bytes are never removed while any Track owns them. Edits of an existing
+Track's other columns are unaffected.
 
 A retired publication is never redispatched (its execution is terminal) and
 is never reported as `publication_unavailable` damage. No migration: the
@@ -1375,6 +1415,9 @@ reconciliation).
 | after eligibility, before the commit (incl. a failing Track deletion) | rolled back: no event, Track and file intact | retry |
 | after the commit, before / during file removal | retired; file and/or waveform remain (harmless; nothing claims availability) | reconciler `retired_bytes_remaining` (in_flight); `--sweep --apply` (`finish_retirements`) removes them |
 | after removal, before the report | retired; bytes gone | a retry reports `already_retired`, 0 bytes |
+| another Track was registered at the path meanwhile (any id) | refused (`path_owned_by_track`); its audio kept | operator review |
+| the file is not the publication's / was replaced between checks | refused (`file_identity_mismatch` / `file_replaced`); kept | operator review |
+| ownership lookup failed (database) | `failed` (`ownership_unavailable`); kept | retry |
 | waveform removal fails (permission) | retired; file gone, waveform remains; outcome `failed` | `--sweep --apply` |
 | a Track reappears for a retired publication | refused (`retired_track_present`), attention | operator review |
 
@@ -1407,30 +1450,39 @@ engine's path).
 | `publication_retained` | info | candidate_retirement (with eligibility / blocking reasons) |
 | `retired_bytes_remaining` | info | in_flight (sweep finishes) |
 | `retired_track_present` | warning | integrity_damage |
+| `retired_path_owned_by_track`, `publication_path_adopted` | warning | integrity_damage (another Track owns the path; never removed) |
+| `ownership_unavailable` | warning | unknown |
 | `insertion_log_item_pruned` | info | expected_pruning |
 | `current_insertion_log_item_missing` | warning | in_flight (the worker recovers) |
 | `insertion_publication_mismatch`, `insertion_association_unexpected` | critical | integrity_damage |
-| `namespace_orphan_file`, `publication_scratch_leftover`, `publication_lock_leftover` | warning / info | candidate_orphan |
+| `namespace_orphan_file`, `publication_scratch_leftover` | warning / info | candidate_orphan (an orphan without a provable identity is refused: `identity_unverifiable`) |
 | `namespace_file_awaiting_adoption` | info | in_flight (READY: publish adopts it) |
 | `namespace_entry_unexpected`, `library_unavailable`, `namespace_not_a_directory` | warning / critical | unknown |
 
-Monitoring: the report run raises ONE deduplicated SystemEvent per
-integrity / unknown code with warning or critical severity
+Destination-lock sidecars are counted as retained synchronization artifacts
+(`healthy.publication_lock`), never candidates; a non-regular one is
+`namespace_entry_unexpected`.
+
+Monitoring attention is an explicit opt-in: the default report (and every
+dry run) writes NOTHING -- no SystemEvent, no domain, Track, media or
+retention row, no file. Only `--attention` records ONE deduplicated
+SystemEvent per integrity / unknown code with warning or critical severity
 (`active_messages|retention|<code>`, a count and five sample identities);
 expected pruning, in-flight work, candidates, retained history and the
-closed native-airing gate never alert (`--no-attention` suppresses all).
+closed native-airing gate never alert.
 No Monitoring worker or timer runs it; D3E-D can read the same structured
 `Report` for the board.
 
 ### Operator commands
 
-    manage.py active_message_retention                       # report (read-only)
+    manage.py active_message_retention                       # report (read-only; writes nothing)
     manage.py active_message_retention --deep                # report + hashes
+    manage.py active_message_retention --attention           # report + record Monitoring attention
     manage.py active_message_retention --sweep               # dry run of the safe sweep
     manage.py active_message_retention --sweep --apply       # reclaim leftovers (grace >= 1 h; default 24 h)
     manage.py active_message_retention --sweep --apply --include-production   # + Production's own sweeps
     manage.py active_message_retention --retire <execution UUID> ...           # dry run: eligibility per execution
-    manage.py active_message_retention --retire <UUID> ... --apply --operator <username>
+    manage.py active_message_retention --retire <UUID> ... --apply             # trusted maintenance action
 
 Defaults: read-only; destructive only with `--apply`; no timer, no
 background cleanup, no age-based expiry of publications and no default
@@ -1600,7 +1652,12 @@ any future one must be designed, authorized and qualified as such.
 * No migration, model, setting, capability, URL or timer. The retirement
   marker is the append-only `publication_retired` event.
 * Nothing is reclaimed without `--apply`; nothing is selected by age;
-  publication retirement is explicit, per execution, by an authorized
-  operator.
+  publication retirement is explicit, per execution, a trusted maintenance
+  action recorded as the system (no asserted operator identity).
+* Review corrections: the publication destination-lock sidecar is persistent
+  (never unlinked); a Track may own a reserved path only under its
+  destination lock (`active_messages.track_guard`), and cleanup never removes
+  bytes any Track owns or that are not exactly the publication's; the default
+  report writes nothing (`--attention` opts in).
 * No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
   change; `NATIVE_AIRING_AVAILABLE` stays False.
