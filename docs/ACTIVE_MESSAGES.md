@@ -1362,13 +1362,15 @@ execution: never dispatched again; deck-open authority refuses it) ->
    (a concurrent library deletion serializes with it; a dependent created
    meanwhile fails the deferred foreign key and rolls the retirement back);
 3. after commit, under the publication destination lock: remove the file
-   only if no Track of ANY id owns its path (aliases included), it is a
-   regular file of exactly the publication's size and SHA-256 (hashed through
-   the opened descriptor, via a verified directory descriptor), and the
-   pathname still names that inode; the waveform only if no Track has that id
-   or records that waveform. Anything uncertain refuses and keeps the bytes
-   (`path_owned_by_track`, `file_identity_mismatch`, `file_replaced`,
-   `ownership_unavailable`, ...).
+   only if no Track of ANY id owns its path (aliases included) and it is a
+   single-link regular file of exactly the publication's size and SHA-256
+   (hashed through the opened descriptor, via a verified directory
+   descriptor); the waveform only if no Track has that id or records that
+   waveform. Both are removed ONLY through the identity-preserving quarantine
+   below -- never by unlinking the shared pathname. Anything uncertain
+   refuses and keeps the bytes (`path_owned_by_track`,
+   `file_identity_mismatch`, `file_hard_linked`,
+   `quarantine_identity_mismatch`, `ownership_unavailable`, ...).
 
 **Authority.** Retirement through the command is a TRUSTED MAINTENANCE
 operation of the station's operating-system boundary: whoever can run
@@ -1402,6 +1404,104 @@ same lock: a registration and a removal of the same path are serialized, and
 the bytes are never removed while any Track owns them. Edits of an existing
 Track's other columns are unaffected.
 
+### Identity-preserving removal (quarantine)
+
+**Why "verify the pathname, then unlink it" is unsafe.** `unlink(name)`
+removes whatever object the NAME denotes at the instant of the call. The
+first D3E-C cleanup verified an opened descriptor (contents, size, inode),
+re-checked with `stat` that the name still denoted that inode, and then called
+`unlink(name)` -- a separate system call. A file renamed onto the name between
+the two was the one deleted, and the verified file's length was reported as
+reclaimed while the verified file survived elsewhere (independently
+reproduced; preserved as
+`test_retention_quarantine.FinalSyscallSubstitutionTests`). Another check
+only moves the window: Linux cannot unlink a descriptor.
+
+**Semantics** (`active_messages/quarantine.py`). Nothing D3E-C reclaims is
+ever deleted through a shared name. Under the destination lock:
+
+1. the caller re-establishes its authority (eligibility, retirement, Track
+   ownership of the path at any id or alias, no Track referencing the
+   quarantine);
+2. the file is opened through the verified directory descriptor
+   (`O_NOFOLLOW`) and proven to be a single-link regular file of the expected
+   size and SHA-256;
+3. a private operation directory `.am-quarantine/<name>.<128-bit random
+   token>` is created with an exclusive `mkdir` (never an existing one) in the
+   application's quarantine -- inside the same directory as the file (the
+   reserved namespace, or `WAVEFORMS_DIR` for waveforms), so it is the same
+   filesystem; mode 0700, owned by the station account, never a symlink
+   (each is re-verified by descriptor);
+4. an intent manifest (`intent.json`: device, inode, size, SHA-256) is
+   written and fsync'd, then the directory;
+5. the name is moved into the operation as `payload` with
+   `renameat2(RENAME_NOREPLACE)` -- atomic on one filesystem, and refusing,
+   never replacing, an existing destination; both directories are fsync'd;
+6. the MOVED object is verified: it must be the manifest's inode, single
+   link, the recorded and expected size and SHA-256;
+7. the authority is asked again; only then is `payload` removed from the
+   private directory, and the removal is PROVEN by the verified descriptor's
+   link count dropping to zero. Only that proven length is counted;
+8. the manifest and operation directory are removed (fsync'd).
+
+`payload` and `intent.json` carry no audio extension, so a library scan
+(`import_songs`) never imports quarantined bytes; a Track explicitly pointed
+into the quarantine keeps the payload where it is
+(`quarantine_owned_by_track`). The persistent lock sidecars are never touched.
+
+**A replacement moves instead.** If another object took the name between
+steps 2 and 5, THAT object is what moved. It is never deleted and never
+counted: it is put back under its name with `RENAME_NOREPLACE` -- which can
+only succeed while the name is free, so a newer occupant is never overwritten
+-- and the cleanup reports `quarantine_identity_mismatch` (refused/failed, 0
+bytes). If the name is occupied again, the object stays in quarantine and the
+cleanup reports `quarantine_restore_blocked` for manual recovery; nothing new
+is started for that name until it is resolved. The same applies when the
+moved object is the right inode but was hard-linked (`file_hard_linked`) or
+rewritten meanwhile, and when the authority withdraws after the move (e.g.
+`path_owned_by_track`: the file goes back to the Track that now owns the
+path). Availability exposure: a replacement is absent from its name only for
+the instants between the move and the put-back (no hashing happens in
+between when the inode differs).
+
+**What is retained for manual intervention.** A payload whose identity cannot
+be proven (manifest missing or invalid: `quarantine_recovery_required`), a
+mismatched object whose name is occupied (`quarantine_restore_blocked`), a
+payload a Track references, and anything unexpected in the quarantine
+(`quarantine_entry_unexpected`, `quarantine_not_private`) are never deleted
+automatically, whatever their age.
+
+**Accounting.** Reported bytes are lengths whose removal was proven (link
+count zero, single link before), counted by the run that proved them -- never
+again by a retry or by recovery of an operation that already finished. A
+hard-linked file is never removed (removing one name frees nothing). The
+report distinguishes `quarantined bytes: quarantine_reclaimable` (verified,
+awaiting deletion: a sweep removes them after re-proof) from
+`quarantine_manual` (held for an operator).
+
+**Supported filesystem and trust assumptions.** The namespace and its
+quarantine are on one local POSIX filesystem supporting `renameat2(...,
+RENAME_NOREPLACE)` (ext4, xfs, btrfs, tmpfs); where it is unsupported the
+cleanup refuses before moving anything (`quarantine_unsupported`). The
+destination lock coordinates every SUPPORTED writer of these names (publish,
+the Track write guard, retention, recovery); it does not and cannot stop a
+hostile process running as the station account, which could delete the files
+directly. The private directory is never written by a supported writer; any
+interference inside it is detected by the zero-link proof
+(`quarantine_substituted`: nothing is claimed) rather than prevented.
+
+### Deletion paths (audited in the final D3E-C correction)
+
+| Path | Classification | Basis |
+| --- | --- | --- |
+| Retired publication audio (`retire_publication`, `finish_retirements`) | corrected: quarantine | identity re-proven on the moved inode; no shared-name unlink |
+| Interrupted-publication orphan (`sweep_publication_namespace`) | corrected: quarantine | the execution's exact aggregate, re-proven on the moved inode |
+| Retired publication waveform | corrected: quarantine (in `WAVEFORMS_DIR`) | the observed inode is the identity (derived data, no content authority); no Track has that id or path |
+| Quarantine payload / manifest / operation directory | protected | unlinked only inside the exclusive 0700 directory, under the lock; payload removal proven by zero link count |
+| Publication scratch `.am-publish-*` (`shutil.rmtree`) | protected by existing invariant | names are exclusive random `mkdtemp` names never reused; only their creating publish (holding its lock) writes inside; removed only past the grace with no publish lock held; `rmtree` walks by descriptor and never follows symlinks; no supported writer renames anything onto such a name |
+| Destination-lock sidecars | never deleted | persistent synchronization artifacts |
+| Unbound aggregate bytes (`purge_media`) | Production's accepted path, unchanged | content-addressed storage key of a row marked PURGED under its row lock; D3E-C only calls it |
+
 A retired publication is never redispatched (its execution is terminal) and
 is never reported as `publication_unavailable` damage. No migration: the
 append-only event is the durable marker (as `reconciled` is for stinger
@@ -1415,8 +1515,18 @@ reconciliation).
 | after eligibility, before the commit (incl. a failing Track deletion) | rolled back: no event, Track and file intact | retry |
 | after the commit, before / during file removal | retired; file and/or waveform remain (harmless; nothing claims availability) | reconciler `retired_bytes_remaining` (in_flight); `--sweep --apply` (`finish_retirements`) removes them |
 | after removal, before the report | retired; bytes gone | a retry reports `already_retired`, 0 bytes |
+| quarantine: before the operation directory exists | unchanged | the next run starts afresh |
+| quarantine: operation created, before / immediately before the move | file still at its name; an operation holding only a manifest | `quarantine_operation_leftover`; the sweep clears it (`abandoned_before_move`), then removes the file normally |
+| quarantine: after the move / after verification, before deletion | file held as `payload`; the name is empty | `quarantine_pending` + `retired_bytes_remaining`; `--sweep --apply` re-proves identity (manifest inode, database SHA-256 and size) and authority from scratch, then removes and counts it once |
+| quarantine: after deletion, before reporting | bytes gone; an operation holding only a manifest | cleared (`concluded`), 0 bytes (never counted twice) |
+| quarantine: while putting back a mismatched object | the object held; its name empty | `quarantine_identity_mismatch`; the sweep puts it back (no-replace) |
+| quarantine: put-back finds the name occupied | the object held | `quarantine_restore_blocked`; manual recovery, then `--sweep --apply` retries |
+| quarantine: a recovery sweep is itself interrupted | one of the states above | the next sweep settles it the same way |
+| quarantine: payload identity unprovable (manifest lost) | held | `quarantine_recovery_required`; never deleted automatically |
 | another Track was registered at the path meanwhile (any id) | refused (`path_owned_by_track`); its audio kept | operator review |
-| the file is not the publication's / was replaced between checks | refused (`file_identity_mismatch` / `file_replaced`); kept | operator review |
+| the file is not the publication's | refused (`file_identity_mismatch`); kept | operator review |
+| the name was substituted before the move | the replacement is put back (`quarantine_identity_mismatch`), never deleted or counted | operator review |
+| the file is hard-linked | refused (`file_hard_linked`); kept, 0 bytes | operator review |
 | ownership lookup failed (database) | `failed` (`ownership_unavailable`); kept | retry |
 | waveform removal fails (permission) | retired; file gone, waveform remains; outcome `failed` | `--sweep --apply` |
 | a Track reappears for a retired publication | refused (`retired_track_present`), attention | operator review |
@@ -1458,6 +1568,15 @@ engine's path).
 | `namespace_orphan_file`, `publication_scratch_leftover` | warning / info | candidate_orphan (an orphan without a provable identity is refused: `identity_unverifiable`) |
 | `namespace_file_awaiting_adoption` | info | in_flight (READY: publish adopts it) |
 | `namespace_entry_unexpected`, `library_unavailable`, `namespace_not_a_directory` | warning / critical | unknown |
+| `quarantine_pending` | info | in_flight (verified bytes held for deletion; the sweep re-proves and removes) |
+| `quarantine_operation_leftover` | info | in_flight (holds nothing; the sweep clears it) |
+| `quarantine_identity_mismatch` | warning | integrity_damage (not the verified file; the sweep puts it back) |
+| `quarantine_restore_blocked` | warning | integrity_damage (manual recovery; never deleted) |
+| `quarantine_recovery_required`, `quarantine_entry_unexpected`, `quarantine_not_private` | warning | unknown (manual recovery; never deleted) |
+
+The report prints `quarantined bytes: quarantine_reclaimable N,
+quarantine_manual M` when anything is held: bytes a sweep may reclaim after
+re-proof versus bytes that need an operator.
 
 Destination-lock sidecars are counted as retained synchronization artifacts
 (`healthy.publication_lock`), never candidates; a non-regular one is
@@ -1484,6 +1603,11 @@ No Monitoring worker or timer runs it; D3E-D can read the same structured
     manage.py active_message_retention --retire <execution UUID> ...           # dry run: eligibility per execution
     manage.py active_message_retention --retire <UUID> ... --apply             # trusted maintenance action
 
+`--sweep` first settles interrupted quarantine operations ("interrupted
+cleanups (quarantine)": `removed` after re-proof, `restored`, `cleared`, or
+`failed` when an operator is needed), then the namespace, retired-publication
+and aggregate sweeps.
+
 Defaults: read-only; destructive only with `--apply`; no timer, no
 background cleanup, no age-based expiry of publications and no default
 retention duration; at most 50 executions per `--retire`; never a path. Dry
@@ -1495,6 +1619,19 @@ removed. Exit 1 for a storage or database failure or any failed removal
 
 * `retired_bytes_remaining` / a `failed` retirement: fix the cause (e.g. the
   library mount or permissions), then `--sweep --apply`.
+* `quarantine_pending`: a cleanup was interrupted after moving verified bytes
+  aside; `--sweep --apply` re-proves and removes them (or puts them back if
+  authority changed).
+* `quarantine_identity_mismatch` / `quarantine_restore_blocked`: something
+  replaced a publication file while it was being removed. The replacement is
+  in `UrgentPA/.am-quarantine/<name>.<token>/payload` (or under
+  `WAVEFORMS_DIR/.am-quarantine/`). If its name is free, `--sweep --apply`
+  puts it back. If blocked: compare the occupant of the name with the payload,
+  move the occupant aside yourself, run `--sweep --apply` (it puts the payload
+  back), then decide. Never delete a payload by hand without that comparison.
+* `quarantine_recovery_required` / `quarantine_entry_unexpected`: an object
+  whose identity cannot be proven; it is never deleted automatically. Inspect
+  it; nothing else is affected.
 * `library_unavailable` / `namespace_not_a_directory`: the library mount is
   absent or the reserved directory was replaced (e.g. by a symlink); nothing
   is removed until it is a real directory again.
@@ -1506,7 +1643,8 @@ removed. Exit 1 for a storage or database failure or any failed removal
   leave it retained.
 * Safe while native airing is closed: every report and dry run; `--sweep
   --apply`; retiring terminal executions. Never edit or delete publication,
-  insertion or event rows, never hand-delete files in `UrgentPA/am-*`.
+  insertion or event rows, never hand-delete files in `UrgentPA/am-*` or
+  in a `.am-quarantine`.
 
 ### What D3E-C deliberately does not reclaim (Phase G dependencies)
 
@@ -1659,5 +1797,12 @@ any future one must be designed, authorized and qualified as such.
   destination lock (`active_messages.track_guard`), and cleanup never removes
   bytes any Track owns or that are not exactly the publication's; the default
   report writes nothing (`--attention` opts in).
+* Final correction: nothing is deleted through a shared pathname any more.
+  Every removal (publication audio, orphan, waveform) moves the name into a
+  private quarantine with `renameat2(RENAME_NOREPLACE)`, proves the MOVED
+  inode is the verified one, and only then removes it (zero-link proof);
+  a replacement is put back without overwriting, or kept for manual recovery.
+  Interrupted operations are settled by `--sweep --apply`
+  (`retention.recover_quarantine`) and reported read-only (`quarantine_*`).
 * No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
   change; `NATIVE_AIRING_AVAILABLE` stays False.

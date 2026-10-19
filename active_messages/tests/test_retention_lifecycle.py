@@ -165,20 +165,38 @@ class RetirementTests(Lifecycle, TestCase):
 
     def test_a_failed_waveform_removal_is_retried(self):
         execution, publication, _item = self.completed()
+        self.waveforms.chmod(0o555)                              # the waveform cannot be moved aside
+        self.addCleanup(self.waveforms.chmod, 0o755)
+        if os.access(self.waveforms, os.W_OK):
+            self.skipTest("privileges ignore directory permissions")
+        outcome = self.retire(execution)
+        self.assertEqual((outcome.action, outcome.reasons), ("failed", ("waveform_quarantine_PermissionError",)))
+        self.assertEqual(outcome.bytes_reclaimed, publication.media.byte_size)   # only the audio really went
+        self.assertFalse(self.file(publication).exists())
+        self.assertTrue(self.wave(publication).is_file())
+        self.waveforms.chmod(0o755)
+        self.assertEqual([o.action for o in retention.finish_retirements(apply=True).outcomes], ["removed"])
+        self.assertFalse(self.wave(publication).exists())
+
+    def test_a_failure_after_proven_removal_still_counts_the_bytes(self):
+        from active_messages import quarantine
+        execution, publication, _item = self.completed()
+        size = publication.media.byte_size + self.wave(publication).stat().st_size
         real_unlink = os.unlink
 
         def unlink(path, *args, **kwargs):
-            if str(path).endswith(".json"):
+            if path == quarantine.MANIFEST:
                 raise PermissionError("denied")
             return real_unlink(path, *args, **kwargs)
 
-        with mock.patch.object(retention.os, "unlink", side_effect=unlink):
+        with mock.patch("os.unlink", side_effect=unlink):
             outcome = self.retire(execution)
-        self.assertEqual((outcome.action, outcome.reasons), ("failed", ("waveform_PermissionError",)))
+        self.assertEqual(outcome.action, "failed")
+        self.assertEqual(set(outcome.reasons), {"quarantine_operation_leftover", "waveform_quarantine_operation_leftover"})
+        self.assertEqual(outcome.bytes_reclaimed, size)          # proven removed: counted, once
         self.assertFalse(self.file(publication).exists())
-        self.assertTrue(self.wave(publication).is_file())
-        self.assertEqual([o.action for o in retention.finish_retirements(apply=True).outcomes], ["removed"])
-        self.assertFalse(self.wave(publication).exists())
+        self.assertEqual([(o.action, o.bytes_reclaimed) for o in retention.recover_quarantine(apply=True).outcomes],
+                         [("cleared", 0), ("cleared", 0)])       # the leftovers hold nothing; never recounted
 
     def test_a_retired_publication_whose_track_reappears_is_refused(self):
         execution, publication, _item = self.completed()
@@ -383,7 +401,8 @@ class RetirementTests(Lifecycle, TestCase):
             self.skipTest("privileges ignore directory permissions")
         wave_bytes = self.wave(publication).stat().st_size
         outcome = self.retire(execution)
-        self.assertEqual((outcome.action, outcome.reasons), ("failed", ("file_PermissionError",)))
+        # the namespace cannot hold the quarantine: nothing is moved, nothing claimed for the audio
+        self.assertEqual((outcome.action, outcome.reasons), ("failed", ("quarantine_PermissionError",)))
         self.assertEqual(outcome.bytes_reclaimed, wave_bytes)          # only what really went (the waveform)
         self.assertTrue(self.file(publication).is_file())
         self.assertTrue(retention.is_retired(execution.pk))

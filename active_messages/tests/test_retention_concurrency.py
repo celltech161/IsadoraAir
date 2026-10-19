@@ -15,7 +15,7 @@ from django.db import connection, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
-from active_messages import playout, retention, services, worker
+from active_messages import playout, reconcile, retention, services, worker
 from active_messages.models import ActiveBroadcastMessageEvent, ActiveBroadcastPublication
 from library.models import Track
 from production.errors import PurgeRefused
@@ -345,3 +345,89 @@ class OwnershipRaceTests(Lifecycle, TransactionTestCase):
         self.assertNotEqual(results["sync"], "registered")
         self.assertFalse(Track.objects.filter(filepath=str(path)).exists())
         self.assertFalse(path.exists())
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class QuarantineRaceTests(Lifecycle, TransactionTestCase):
+    """The identity-preserving quarantine across PostgreSQL sessions: a
+    library sync while cleanup holds the verified file aside, and a cleanup
+    blocked by a conflicting occupant that is retried once it is resolved."""
+
+    serialized_rollback = True
+    interrupted = OwnershipRaceTests.interrupted
+    run_named = OwnershipRaceTests.run_named
+
+    def pause(self, stage, thread_name, reached, release):
+        from unittest import mock
+
+        from active_messages import quarantine
+
+        def checkpoint(current):
+            if current == stage and threading.current_thread().name == thread_name:
+                reached.set()
+                assert release.wait(20)
+        patcher = mock.patch.object(quarantine, "_checkpoint", side_effect=checkpoint)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_library_sync_while_the_file_is_held_in_quarantine(self):
+        from library.management.commands.sync_track_file import sync_track_file
+        from library.models import TrackWriteRefused
+        execution, publication, path = self.interrupted()
+        size = path.stat().st_size + self.wave(publication).stat().st_size
+        held, release = threading.Event(), threading.Event()
+        self.pause("verified", "cleanup", held, release)
+
+        def sync():
+            assert held.wait(20)                         # the verified file is in quarantine; the name is empty
+            try:
+                sync_track_file(str(path), ready2air=False)
+                return "registered"
+            except TrackWriteRefused:
+                return "refused"
+            except Exception as exc:                     # noqa: BLE001 -- nothing at the name
+                return type(exc).__name__
+            finally:
+                release.set()
+
+        results, errors = self.run_named(
+            ("cleanup", lambda: [(o.action, o.bytes_reclaimed) for o in
+                                 retention.finish_retirements(apply=True).outcomes]),
+            ("sync", sync))
+        self.assertEqual(errors, {})
+        self.assertNotEqual(results["sync"], "registered")
+        self.assertEqual(results["cleanup"], [("removed", size)])
+        self.assertFalse(Track._base_manager.filter(filepath__contains=".am-quarantine").exists())
+        self.assertFalse(Track._base_manager.filter(filepath=str(path)).exists())
+        self.assertFalse(path.exists())
+
+    def test_a_blocked_cleanup_is_retried_after_the_conflict_is_resolved(self):
+        from unittest import mock
+
+        from active_messages import quarantine
+        execution, publication, path = self.interrupted()
+        aside = path.with_name("verified-original.aside")
+        newest = b"an occupant that arrived during the restore"
+        real_move = quarantine._rename_noreplace
+        steps = []
+
+        def move(src_dirfd, src, dst_dirfd, dst):
+            if src == path.name and not steps:
+                steps.append("substituted")
+                path.rename(aside)
+                path.write_bytes(b"unrelated replacement")
+            elif src == quarantine.PAYLOAD and steps == ["substituted"]:
+                steps.append("occupied")
+                path.write_bytes(newest)
+            return real_move(src_dirfd, src, dst_dirfd, dst)
+
+        with mock.patch.object(quarantine, "_rename_noreplace", side_effect=move):
+            (blocked,) = retention.finish_retirements(apply=True).outcomes
+        self.assertEqual((blocked.action, blocked.reasons[0]), ("failed", "quarantine_restore_blocked"))
+        self.assertEqual(path.read_bytes(), newest)
+        self.assertIn("quarantine_restore_blocked", [f.code for f in reconcile.reconcile().findings])
+        path.rename(path.with_name("operator-kept.flac"))       # the operator resolves the conflict
+        outcomes = retention.recover_quarantine(apply=True).outcomes
+        self.assertEqual([(o.action, o.bytes_reclaimed) for o in outcomes], [("restored", 0)])
+        self.assertEqual(path.read_bytes(), b"unrelated replacement")   # put back, never deleted
+        self.assertEqual(aside.read_bytes()[:4], b"fLaC")               # the verified original untouched

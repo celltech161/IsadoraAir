@@ -14,7 +14,7 @@ from django.db import DatabaseError, connection, models, transaction
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 
-from active_messages import playout, reconcile, retention
+from active_messages import playout, quarantine, reconcile, retention
 from active_messages.models import ActiveBroadcastMessageEvent, ActorKind
 from library.models import Track, TrackWriteRefused
 from production.tests.support import ffmpeg_available
@@ -117,7 +117,8 @@ class TrackOwnershipTests(Lifecycle, TestCase):
     def test_a_file_replaced_between_verification_and_removal_is_kept(self):
         execution, publication = self.interrupted_retirement()
         path = self.file(publication)
-        real = retention._digest_fd
+        wave_size = self.wave(publication).stat().st_size
+        real = quarantine.digest_fd
 
         def swap_after_hashing(fd):
             digest = real(fd)
@@ -125,10 +126,14 @@ class TrackOwnershipTests(Lifecycle, TestCase):
             path.write_bytes(b"substituted")
             return digest
 
-        with mock.patch.object(retention, "_digest_fd", side_effect=swap_after_hashing):
+        with mock.patch.object(quarantine, "digest_fd", side_effect=swap_after_hashing):
             outcomes = retention.finish_retirements(apply=True).outcomes
-        self.assertEqual([o.reasons for o in outcomes], [("file_replaced",)])
+        # the replacement is what moved into quarantine: never deleted, put back under its name; only
+        # the (unowned) waveform's bytes were reclaimed
+        self.assertEqual([(o.reasons, o.bytes_reclaimed) for o in outcomes],
+                         [(("quarantine_identity_mismatch",), wave_size)])
         self.assertEqual(path.read_bytes(), b"substituted")
+        self.assertTrue(path.with_name("moved-away.flac").is_file())
 
     def test_a_database_failure_during_removal_keeps_the_bytes(self):
         execution, publication = self.interrupted_retirement()

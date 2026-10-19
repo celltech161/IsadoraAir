@@ -9,8 +9,9 @@
 Nothing is removed without --apply, and nothing is ever selected by age
 alone: the sweep removes only provably unreferenced artifacts past a grace
 period (interrupted-publication leftovers in the reserved namespace, unbound
-aggregate bytes, the remaining bytes of retired publications -- and, with
---include-production, Production's own sweeps); --retire acts only on
+aggregate bytes, the remaining bytes of retired publications, interrupted
+quarantine operations -- and, with --include-production, Production's own
+sweeps); --retire acts only on
 executions named here. No path is ever accepted. There is no timer behind
 this command.
 
@@ -89,6 +90,8 @@ class Command(BaseCommand):
         self.stdout.write("inspected: " + self._counts(report.inspected))
         self.stdout.write("healthy:   " + self._counts(report.healthy))
         self.stdout.write("findings by category: " + self._counts(report.by("category")))
+        if report.bytes:
+            self.stdout.write("quarantined bytes: " + self._counts(report.bytes))
         if report.truncated:
             self.stdout.write(self.style.WARNING("truncated (raise --limit): " + ", ".join(sorted(report.truncated))))
         for finding in sorted(report.findings, key=lambda item: (-("info", "warning", "critical").index(item.severity),
@@ -107,7 +110,8 @@ class Command(BaseCommand):
     def sweep(self, options, grace):
         apply, limit = options["apply"], options["limit"]
         self.stdout.write("" if apply else self.style.WARNING("DRY RUN -- pass --apply to reclaim anything."))
-        reports = [("interrupted publications", retention.sweep_publication_namespace(apply=apply, grace=grace,
+        reports = [("interrupted cleanups (quarantine)", retention.recover_quarantine(apply=apply, limit=limit)),
+                   ("interrupted publications", retention.sweep_publication_namespace(apply=apply, grace=grace,
                                                                                       limit=limit)),
                    ("retired publication bytes", retention.finish_retirements(apply=apply, limit=limit)),
                    ("unbound aggregate bytes", retention.purge_unbound_aggregates(apply=apply, grace=grace,
@@ -148,7 +152,8 @@ class Command(BaseCommand):
 
     def _summary(self, label, report):
         counts = {action: report.count(action) for action in
-                  ("retired", "purged", "removed", "eligible", "already_retired", "kept", "refused", "failed")}
+                  ("retired", "purged", "removed", "restored", "cleared", "eligible", "already_retired", "kept",
+                   "refused", "failed")}
         self.stdout.write(f"{label}: " + ", ".join(f"{key} {value}" for key, value in counts.items() if value)
                           + (f"; reclaimed {report.bytes_reclaimed} bytes" if report.apply
                              else f"; reclaimable (not reclaimed) {report.bytes_reclaimable} bytes"))

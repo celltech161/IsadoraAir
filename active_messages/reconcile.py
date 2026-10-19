@@ -80,6 +80,7 @@ class Report:
     inspected: Counter = field(default_factory=Counter)
     healthy: Counter = field(default_factory=Counter)
     truncated: list = field(default_factory=list)
+    bytes: Counter = field(default_factory=Counter)      # quarantine: reclaimable vs held for manual recovery
 
     def add(self, artifact, identity, code, severity, category, evidence, eligibility="not_applicable", action=""):
         assert severity in SEVERITIES and category in CATEGORIES
@@ -92,7 +93,7 @@ class Report:
     def signature(self):
         """Order-independent content (idempotency comparisons)."""
         return (sorted(item.as_dict().items() for item in self.findings), sorted(self.inspected.items()),
-                sorted(self.healthy.items()), sorted(self.truncated))
+                sorted(self.healthy.items()), sorted(self.truncated), sorted(self.bytes.items()))
 
 
 def _bytes_problem(media, *, deep) -> str:
@@ -282,6 +283,10 @@ def _check_publications(report, *, deep, limit):
                 report.add("publication", row.execution_id, "retired_bytes_remaining", "info", "in_flight",
                            "retired publication still has its file or waveform on disk", eligibility="eligible",
                            action="sweep --apply finishes the retirement")
+            elif retention.held_in_quarantine(row):
+                report.add("publication", row.execution_id, "retired_bytes_remaining", "info", "in_flight",
+                           "retired publication's physical cleanup was interrupted (quarantine operation held)",
+                           eligibility="see quarantine findings", action="sweep --apply settles it")
             else:
                 report.healthy["publication_retired"] += 1
             continue
@@ -450,6 +455,67 @@ def _check_namespace(report, *, now, grace, limit):
                            action="operator review; never followed or removed")
 
 
+# -- interrupted quarantine operations -------------------------------------------------------------------
+
+QUARANTINE_FINDINGS = {
+    # code: (severity, category, evidence, eligibility, action)
+    "quarantine_pending": ("info", "in_flight", "{size} bytes proven to be the verified file, held for deletion",
+                           "eligible", "sweep --apply re-proves identity and authority, then removes them"),
+    "quarantine_operation_leftover": ("info", "in_flight", "an interrupted cleanup operation holding nothing",
+                                      "eligible", "sweep --apply clears it"),
+    "quarantine_identity_mismatch": ("warning", "integrity_damage",
+                                     "{size} bytes that are NOT the verified file were moved aside; their name is "
+                                     "free", "blocked:not_the_verified_file",
+                                     "sweep --apply puts them back under their name (never over an occupant)"),
+    "quarantine_restore_blocked": ("warning", "integrity_damage",
+                                   "{size} bytes that are NOT the verified file cannot be put back: their name is "
+                                   "occupied", "blocked:manual_recovery",
+                                   "manual recovery: compare both files; nothing is deleted automatically"),
+    "quarantine_recovery_required": ("warning", "unknown", "{size} bytes whose identity cannot be proven",
+                                     "blocked:manual_recovery", "manual recovery; never deleted automatically"),
+}
+
+
+def _check_quarantine(report, *, limit):
+    """The quarantines of the reserved namespace and WAVEFORMS_DIR, read-only
+    (metadata only). Distinguishes bytes a sweep may reclaim from bytes held
+    for manual recovery."""
+    import os
+
+    from . import quarantine
+    for kind, opener in (("namespace", retention._open_namespace), ("waveforms", retention._open_waveforms)):
+        try:
+            dir_fd = opener()
+        except quarantine.Refused as exc:
+            if exc.code != "namespace_missing" and kind == "waveforms":
+                report.add("quarantine", kind, exc.code, "warning", "unknown", f"{kind} directory unavailable",
+                           action="check the mount; nothing is removed while it is unavailable")
+            continue
+        if dir_fd is None:
+            continue
+        try:
+            held = quarantine.inspect(dir_fd)
+        finally:
+            os.close(dir_fd)
+        if len(held) > limit:
+            report.truncated.append(f"quarantine_{kind}")
+            held = held[:limit]
+        for item in held:
+            report.inspected["quarantine_operation"] += 1
+            if item.code == "quarantine_pending":
+                report.bytes["quarantine_reclaimable"] += item.size
+            elif item.code != "quarantine_operation_leftover":
+                report.bytes["quarantine_manual"] += item.size
+            if item.code not in QUARANTINE_FINDINGS:
+                report.add("quarantine", f"{kind}/{item.operation}", item.code, "warning", "unknown",
+                           "unexpected object in the cleanup quarantine (never followed or removed)",
+                           action="operator review")
+                continue
+            severity, category, evidence, eligibility, action = QUARANTINE_FINDINGS[item.code]
+            report.add("quarantine", f"{kind}/{item.operation}", item.code, severity, category,
+                       evidence.format(size=item.size), eligibility=eligibility, action=action)
+
+
 # -- entry points ----------------------------------------------------------------------------------------
 
 def reconcile(*, deep=False, limit=None, now=None, grace=None) -> Report:
@@ -463,6 +529,7 @@ def reconcile(*, deep=False, limit=None, now=None, grace=None) -> Report:
     _check_publications(report, deep=deep, limit=limit)
     _check_insertions(report, limit=limit)
     _check_namespace(report, now=now, grace=grace, limit=limit)
+    _check_quarantine(report, limit=limit)
     return report
 
 

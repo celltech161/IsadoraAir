@@ -30,6 +30,13 @@ What can be reclaimed (each only with ``apply=True``; dry-run otherwise):
 3. Retired publications' remaining bytes (crash recovery of 4).
 4. Publication retirement -- ONLY for executions a maintenance run names
    explicitly; never by age. See ``retire_publication``.
+5. Interrupted quarantine operations (``recover_quarantine``).
+
+Every file removal (1 aside, which is Production's) goes through
+``active_messages.quarantine``: the name is moved into a private operation
+directory, the MOVED inode is proven to be the verified one, and only then is
+it removed -- never ``unlink`` of a shared pathname, which would remove
+whatever was renamed onto it after the last check.
 
 Everything else is retained deliberately: a bound aggregate (``mix_media``,
 ``ActiveBroadcastPublication.media``) and message media are PROTECT-referenced
@@ -46,7 +53,6 @@ claiming bytes that are gone.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import stat
@@ -65,7 +71,7 @@ from production.models import ProductionMedia
 from production.services import reconcile as production_reconcile
 from production.services import retention as production_retention
 
-from . import playout, rendering, services
+from . import playout, quarantine, rendering, services
 from .models import (
     TERMINAL_EXECUTION_STATES, UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastInsertion,
     ActiveBroadcastMessageEvent, ActiveBroadcastPublication, ActorKind, ExecutionState,
@@ -420,73 +426,98 @@ def _owners(destination: Path):
         return None
 
 
-def _digest_fd(fd) -> str:
-    digest = hashlib.sha256()
-    os.lseek(fd, 0, os.SEEK_SET)
-    while chunk := os.read(fd, 1024 * 1024):
-        digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _verified_unlink(destination: Path, *, expected_sha256: str, expected_size: int):
-    """(bytes_removed, problem): remove ``destination`` ONLY if, with the
-    caller holding its destination lock (so no Track can be registered there
-    meanwhile -- active_messages.track_guard):
-
-    * the namespace is the real directory under the library root (opened
-      O_NOFOLLOW; its descriptor is the one the removal goes through);
-    * no Track owns the path (``_path_owners``; unknowable -> refuse);
-    * the entry is a regular file (never a symlink), of exactly the expected
-      size and SHA-256 (hashed through the opened descriptor);
-    * the pathname still names that very inode at the moment of removal.
-    Anything else refuses and keeps the bytes. problem is "" on success or
-    when the file is already gone."""
-    import errno
+def _open_namespace(destination: Path | None = None) -> int:
+    """A descriptor of the reserved namespace -- the real directory under the
+    library root, opened O_NOFOLLOW and proven to be the object its name
+    denotes; every cleanup of the namespace goes through it.
+    quarantine.Refused otherwise."""
     try:
         real_namespace = namespace_dir()
     except RetentionUnavailable as exc:
-        return 0, exc.code
-    directory = destination.parent
+        raise quarantine.Refused(exc.code) from None
+    directory = real_namespace if destination is None else destination.parent
     if os.path.realpath(real_namespace) != os.path.realpath(directory):
-        return 0, "namespace_substituted"
+        raise quarantine.Refused("namespace_substituted")
     try:
-        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
-        return 0, "namespace_unavailable"
+        raise quarantine.Refused("namespace_unavailable") from None
+    held, named = os.fstat(fd), os.lstat(directory)
+    if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+        os.close(fd)
+        raise quarantine.Refused("namespace_substituted")
+    return fd
+
+
+def _open_waveforms() -> int | None:
+    """A descriptor of WAVEFORMS_DIR (the configured path, as the library
+    resolves it), or None when it does not exist (nothing to clean)."""
     try:
-        held, named = os.fstat(dirfd), os.lstat(directory)
-        if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
-            return 0, "namespace_substituted"
+        return os.open(waveforms_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise quarantine.Refused("waveforms_unavailable") from None
+
+
+def _reclaim(opener, name, *, expected, authorize, prefix="file_"):
+    """quarantine.reclaim of ``name`` in the directory ``opener()`` gives
+    (the caller holds the destination lock). (bytes proven removed, problems)."""
+    try:
+        dir_fd = opener()
+    except quarantine.Refused as exc:
+        return 0, [exc.code]
+    if dir_fd is None:
+        return 0, []
+    try:
+        removed, problems = quarantine.reclaim(dir_fd, name, expected=expected, authorize=authorize)
+    except OSError as exc:
+        removed, problems = 0, [f"file_{type(exc).__name__}"]
+    finally:
+        os.close(dir_fd)
+    if prefix == "file_":
+        return removed, problems
+    return removed, [prefix + (problem[5:] if problem.startswith("file_") else problem) for problem in problems]
+
+
+def _quarantine_owned() -> str:
+    """No Track may own a quarantined object (``payload`` is never imported;
+    an explicit registration of one keeps it where it is)."""
+    from library.models import Track
+    try:
+        owned = Track._base_manager.filter(filepath__contains=f"/{quarantine.ROOT}/").exists()
+    except DatabaseError:
+        return "ownership_unavailable"
+    return "quarantine_owned_by_track" if owned else ""
+
+
+def _retired_authority(publication, destination):
+    """Authority to remove a RETIRED publication's file: still retired, its
+    Track gone, and NO Track owning the path (any id, any alias)."""
+    def authorize() -> str:
+        try:
+            if not is_retired(publication.execution_id):
+                return "not_retired"
+            if _track_present(publication):
+                return "retired_track_present"
+        except DatabaseError:
+            return "ownership_unavailable"
         owners = _owners(destination)
         if owners is None:
-            return 0, "ownership_unavailable"
-        if owners:
-            return 0, "path_owned_by_track"
+            return "ownership_unavailable"
+        return "path_owned_by_track" if owners else _quarantine_owned()
+    return authorize
+
+
+def _waveform_authority(publication, wave: Path):
+    def authorize() -> str:
         try:
-            fd = os.open(destination.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
-        except FileNotFoundError:
-            return 0, ""
-        except OSError as exc:
-            return 0, "file_not_regular" if exc.errno == errno.ELOOP else f"file_{type(exc).__name__}"
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return 0, "file_not_regular"
-            if info.st_size != expected_size or _digest_fd(fd) != expected_sha256:
-                return 0, "file_identity_mismatch"
-            current = os.stat(destination.name, dir_fd=dirfd, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
-                return 0, "file_replaced"
-            os.unlink(destination.name, dir_fd=dirfd)
-            return info.st_size, ""
-        except FileNotFoundError:
-            return 0, "file_replaced"
-        except OSError as exc:
-            return 0, f"file_{type(exc).__name__}"
-        finally:
-            os.close(fd)
-    finally:
-        os.close(dirfd)
+            if not is_retired(publication.execution_id):
+                return "not_retired"
+        except DatabaseError:
+            return "ownership_unavailable"
+        return _waveform_problem(wave, publication.track_id_snapshot) or _quarantine_owned()
+    return authorize
 
 
 def _waveform_problem(wave: Path, track_id_snapshot) -> str:
@@ -502,13 +533,18 @@ def _waveform_problem(wave: Path, track_id_snapshot) -> str:
     return ""
 
 
+def _waveform_name(publication) -> str:
+    return f"{int(publication.track_id_snapshot)}.json"
+
+
 def _remove_publication_bytes(publication):
     """Remove a RETIRED publication's file and waveform. Returns
-    (bytes_removed, problems). The file goes only through
-    ``_verified_unlink`` under the destination lock (never while ANY Track
-    owns the path, never a file that is not exactly the publication's); a
-    missing file is already done; anything uncertain keeps the bytes."""
-    problems, removed = [], 0
+    (bytes proven removed, problems). Both go only through the
+    identity-preserving quarantine (active_messages.quarantine) under the
+    publication's destination lock: the file only while no Track owns the
+    path and only if it is exactly the publication's bytes; the waveform only
+    while no Track owns it. Interrupted earlier attempts are settled first.
+    A missing file is already done; anything uncertain keeps the bytes."""
     try:
         destination = canonical_destination(publication.library_relpath)
         size = ProductionMedia.objects.filter(pk=publication.media_id).values_list("byte_size", flat=True).first()
@@ -516,32 +552,42 @@ def _remove_publication_bytes(publication):
         return 0, [exc.code]
     except DatabaseError:
         return 0, ["ownership_unavailable"]
+    expected = quarantine.Expected(publication.sha256, size if size is not None else -1)
+    wave = waveforms_dir() / _waveform_name(publication)
     try:
         with playout._destination_lock(destination):
-            gone, problem = _verified_unlink(destination, expected_sha256=publication.sha256,
-                                             expected_size=size if size is not None else -1)
-        removed += gone
-        if problem:
-            problems.append(problem)
+            removed, problems = _reclaim(lambda: _open_namespace(destination), destination.name, expected=expected,
+                                         authorize=_retired_authority(publication, destination))
+            wave_removed, wave_problems = _reclaim(_open_waveforms, wave.name, expected=quarantine.Expected(),
+                                                   authorize=_waveform_authority(publication, wave),
+                                                   prefix="waveform_")
     except OSError as exc:                       # the destination lock itself (namespace not writable)
-        problems.append(f"file_{type(exc).__name__}")
-    wave = waveforms_dir() / f"{int(publication.track_id_snapshot)}.json"
-    state, wave_size = file_state(wave)
-    if state == "regular":
-        problem = _waveform_problem(wave, publication.track_id_snapshot)
-        if problem:
-            problems.append(problem)
-        else:
-            try:
-                os.unlink(wave)
-                removed += wave_size
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                problems.append(f"waveform_{type(exc).__name__}")
-    elif state != "missing":
-        problems.append(f"waveform_{state}")
-    return removed, problems
+        return 0, [f"file_{type(exc).__name__}"]
+    return removed + wave_removed, problems + wave_problems
+
+
+def held_in_quarantine(publication) -> list:
+    """Read-only: quarantine operations of this publication's file and
+    waveform (quarantine.Held), never raising."""
+    held = []
+    try:
+        name = native_name(publication.library_relpath)
+    except RetentionUnavailable:
+        return held
+    for opener, entry in ((_open_namespace, name), (_open_waveforms, _waveform_name(publication))):
+        try:
+            dir_fd = opener()
+        except quarantine.Refused:
+            continue
+        if dir_fd is None:
+            continue
+        try:
+            held.extend(quarantine.inspect(dir_fd, entry))
+        except OSError:
+            continue
+        finally:
+            os.close(dir_fd)
+    return held
 
 
 MAINTENANCE_VIA = "maintenance_command"
@@ -643,8 +689,11 @@ def _track_present(publication) -> bool:
 
 def finish_retirements(*, apply=False, limit=None) -> CleanupReport:
     """Crash recovery: remove the remaining file / waveform of RETIRED
-    publications (idempotent). A retired publication whose Track exists again
-    is refused (inconsistent; operator attention)."""
+    publications, and settle their interrupted quarantine operations
+    (idempotent; bytes are counted only by the run that proves their
+    removal). A retired publication whose Track exists again, or whose path
+    another Track owns, is refused (operator attention) -- with --apply an
+    interrupted operation is still settled, which puts the object back."""
     report, limit = CleanupReport(apply=apply), _limit(limit)
     retired = (ActiveBroadcastMessageEvent.objects.filter(event=RETIRED_EVENT)
                .values_list("execution_id", flat=True).order_by("id"))
@@ -656,22 +705,29 @@ def finish_retirements(*, apply=False, limit=None) -> CleanupReport:
         except RetentionUnavailable as exc:
             report.add(Outcome("retired_publication", identity, "failed", (exc.code,)))
             continue
-        wave = waveforms_dir() / f"{publication.track_id_snapshot}.json"
+        wave = waveforms_dir() / _waveform_name(publication)
         remaining = [(p, s) for p, s in (file_state(dest), file_state(wave)) if p != "missing"]
-        if not remaining:
+        held = held_in_quarantine(publication)
+        if not remaining and not held:
             continue
+        refusal = None
         if _track_present(publication):
-            report.add(Outcome("retired_publication", identity, "refused", ("retired_track_present",)))
+            refusal = ("refused", ("retired_track_present",))
+        else:
+            owners = _owners(canonical_destination(publication.library_relpath))
+            if owners is None:
+                refusal = ("failed", ("ownership_unavailable",))
+            elif owners:
+                refusal = ("refused", ("path_owned_by_track",))
+        if refusal is not None and not (apply and held):
+            report.add(Outcome("retired_publication", identity, *refusal))
             continue
-        owners = _owners(canonical_destination(publication.library_relpath))
-        if owners is None:
-            report.add(Outcome("retired_publication", identity, "failed", ("ownership_unavailable",)))
-            continue
-        if owners:
-            report.add(Outcome("retired_publication", identity, "refused", ("path_owned_by_track",)))
-            continue
-        size = sum(s for _p, s in remaining)
         if not apply:
+            manual = tuple(sorted({item.code for item in held} - quarantine.SETTLEABLE))
+            if manual:
+                report.add(Outcome("retired_publication", identity, "refused", manual))
+                continue
+            size = sum(s for _p, s in remaining) + sum(item.size for item in held if item.code == "quarantine_pending")
             report.add(Outcome("retired_publication", identity, "eligible", bytes_reclaimable=size))
             continue
         removed, problems = _remove_publication_bytes(publication)
@@ -822,11 +878,29 @@ def _orphan_identity(execution_id):
     return row
 
 
+def _orphan_authority(name, execution_id, destination):
+    """Authority to remove an interrupted publication's placed file: no
+    publication records it, its execution can never adopt it, no Track owns
+    the path."""
+    def authorize() -> str:
+        try:
+            if (ActiveBroadcastPublication.objects.filter(library_relpath=f"{playout.CATEGORY_CODE}/{name}").exists()
+                    or not _unadoptable(execution_id)):
+                return "in_flight_publication"
+        except DatabaseError:
+            return "ownership_unavailable"
+        owners = _owners(destination)
+        if owners is None:
+            return "ownership_unavailable"
+        return "path_owned_by_track" if owners else _quarantine_owned()
+    return authorize
+
+
 def _remove_orphan(name, execution_id) -> Outcome:
     """Under the destination lock publish takes, re-check that no publication
     owns the file and its execution still cannot adopt it, then remove it only
-    through ``_verified_unlink`` (no Track owns the path; exactly the
-    execution's aggregate bytes; the same inode)."""
+    through the identity-preserving quarantine (no Track owns the path;
+    exactly the execution's aggregate bytes; the very object verified)."""
     try:
         destination = playout._library_root() / playout.CATEGORY_CODE / name
         with playout._destination_lock(destination):
@@ -836,16 +910,120 @@ def _remove_orphan(name, execution_id) -> Outcome:
             identity = _orphan_identity(execution_id)
             if identity is None:
                 return Outcome("namespace_file", name, "refused", ("identity_unverifiable",))
-            removed, problem = _verified_unlink(destination, expected_sha256=identity[0], expected_size=identity[1])
+            removed, problems = _reclaim(lambda: _open_namespace(destination), name,
+                                         expected=quarantine.Expected(*identity),
+                                         authorize=_orphan_authority(name, execution_id, destination))
     except (OSError, DatabaseError) as exc:
         return Outcome("namespace_file", name, "failed", (type(exc).__name__,))
-    if problem:
-        return Outcome("namespace_file", name, "refused" if problem in _REFUSALS else "failed", (problem,))
+    if problems:
+        refused = all(problem in _REFUSALS for problem in problems)
+        return Outcome("namespace_file", name, "refused" if refused else "failed", tuple(problems),
+                       bytes_reclaimed=removed)
     return Outcome("namespace_file", name, "removed", bytes_reclaimed=removed)
 
 
-_REFUSALS = frozenset({"path_owned_by_track", "file_identity_mismatch", "file_replaced", "file_not_regular",
-                       "namespace_substituted"})
+_REFUSALS = frozenset({"path_owned_by_track", "file_identity_mismatch", "file_not_regular", "file_hard_linked",
+                       "namespace_substituted", "in_flight_publication", "quarantine_identity_mismatch"})
+
+
+# -- interrupted quarantine operations ---------------------------------------------------------------------
+
+def _authority_for(directory_kind, name):
+    """(destination lock path, expected identity or None, authorize) for a
+    quarantine operation of ``name`` -- re-derived from the database, never
+    from the operation itself. None when nothing in the database explains
+    the operation (then it is never touched)."""
+    if directory_kind == "namespace":
+        relpath = f"{playout.CATEGORY_CODE}/{name}"
+        destination = canonical_destination(relpath)
+        publication = ActiveBroadcastPublication.objects.filter(library_relpath=relpath).first()
+        if publication is not None:
+            size = (ProductionMedia.objects.filter(pk=publication.media_id)
+                    .values_list("byte_size", flat=True).first())
+            retired = is_retired(publication.execution_id)
+            expected = quarantine.Expected(publication.sha256, size) if retired and size is not None else None
+            return destination, expected, _retired_authority(publication, destination)
+        execution_id = execution_id_for(name)
+        identity = _orphan_identity(execution_id)
+        expected = quarantine.Expected(*identity) if identity is not None else None
+        return destination, expected, _orphan_authority(name, execution_id, destination)
+    publication = (ActiveBroadcastPublication.objects.filter(track_id_snapshot=int(name[:-5]))
+                   .order_by("published_at", "id").first())
+    if publication is None:
+        return None
+    wave = waveforms_dir() / name
+    return (canonical_destination(publication.library_relpath), quarantine.Expected(),
+            _waveform_authority(publication, wave))
+
+
+_SETTLED_ACTIONS = {"deleted": "removed", "restored": "restored", "cleared": "cleared", "kept": "failed"}
+
+
+def recover_quarantine(*, apply=False, limit=None) -> CleanupReport:
+    """Settle every interrupted quarantine operation (namespace and
+    WAVEFORMS_DIR), each under its publication's destination lock, after
+    re-deriving identity and authority from the database: a payload proven to
+    be the verified object is deleted (and only then counted); anything else
+    is put back without overwriting an occupant, or kept for manual recovery.
+    Never by age. Dry-run reports the read-only classification."""
+    report, limit = CleanupReport(apply=apply), _limit(limit)
+    for kind, opener in (("namespace", _open_namespace), ("waveforms", _open_waveforms)):
+        try:
+            dir_fd = opener()
+        except quarantine.Refused as exc:
+            if exc.code != "namespace_missing":
+                report.add(Outcome("quarantine", kind, "failed", (exc.code,)))
+            continue
+        if dir_fd is None:
+            continue
+        try:
+            held = quarantine.inspect(dir_fd)
+        finally:
+            os.close(dir_fd)
+        names = sorted({item.name for item in held if item.name})[:limit]
+        for item in held:
+            if not item.name:
+                report.add(Outcome("quarantine", f"{kind}/{item.operation}"[:64], "refused", (item.code,)))
+        for name in names:
+            entries = [item for item in held if item.name == name]
+            if not apply:
+                for item in entries:
+                    settleable = item.code in quarantine.SETTLEABLE
+                    report.add(Outcome("quarantine", item.operation[:64], "eligible" if settleable else "refused",
+                                       (item.code,), bytes_reclaimable=item.size
+                                       if item.code == "quarantine_pending" else 0))
+                continue
+            for outcome in _recover_name(kind, opener, name):
+                report.add(outcome)
+    return report
+
+
+def _recover_name(kind, opener, name) -> list:
+    try:
+        authority = _authority_for(kind, name)
+    except DatabaseError:
+        return [Outcome("quarantine", name, "failed", ("ownership_unavailable",))]
+    except RetentionUnavailable as exc:
+        return [Outcome("quarantine", name, "failed", (exc.code,))]
+    if authority is None:
+        return [Outcome("quarantine", name, "refused", ("quarantine_recovery_required",))]
+    destination, expected, authorize = authority
+    try:
+        with playout._destination_lock(destination):
+            dir_fd = opener()
+            if dir_fd is None:
+                return []
+            try:
+                settled = quarantine.recover(dir_fd, name, expected=expected, authorize=authorize)
+            finally:
+                os.close(dir_fd)
+    except quarantine.Refused as exc:
+        return [Outcome("quarantine", name, "failed", (exc.code,))]
+    except OSError as exc:
+        return [Outcome("quarantine", name, "failed", (f"file_{type(exc).__name__}",))]
+    return [Outcome("quarantine", item.operation[:64], _SETTLED_ACTIONS[item.state],
+                    tuple(code for code in (item.problem, item.detail) if code), bytes_reclaimed=item.bytes_removed)
+            for item in settled]
 
 
 # -- unbound aggregate bytes -------------------------------------------------------------------------------
