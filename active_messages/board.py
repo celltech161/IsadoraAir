@@ -50,7 +50,7 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 from production.models import ProductionMedia, ReferenceAudio
 from production.recorder.views import url_name
 
-from . import services
+from . import diagnostics, heartbeat, services
 from .iportal import ADAPTER_KEY, NATIVE_AIRING_CLOSED, native_airing_open
 from .models import (
     TERMINAL_MESSAGE_STATES, UNFINISHED_EXECUTION_STATES, ActiveBroadcastExecution, ActiveBroadcastMessage,
@@ -81,9 +81,15 @@ EVENT_LABELS = {
     "reconciles": "Reconciles an airing", "reconciled": "Reconciled", "suppressed": "Suppressed",
     "mix_bound": "Aggregate ready", "render_retry": "Render retry", "failed": "Failed",
     "publication_retry": "Publication retry",
+    "published": "Published to the library", "publication_retired": "Publication retired (maintenance)",
+    "dispatched": "Sent to the engine", "accepted": "Accepted by the engine (not air)",
+    "claimed": "Deck opening (not air)", "air_started": "On air", "air_completed": "Aired to the end",
+    "air_interrupted": "Air interrupted", "not_aired": "Not aired", "claimed_not_aired": "Claimed, never aired",
+    "playout_failed": "Playout failed", "render_failed": "Render failed", "execution_suppressed": "Suppressed",
 }
 DETAIL_KEYS = ("reason", "expires_at", "previous", "supersedes", "superseded_by", "content_type", "duration_seconds",
-               "code", "detail", "state", "outcome", "producer_recall", "self_published")
+               "code", "detail", "state", "outcome", "producer_recall", "self_published", "via", "file_present",
+               "track_present")
 
 
 # -- access and view state ----------------------------------------------------------------------
@@ -418,6 +424,16 @@ def _status(policy) -> dict:
     }
 
 
+WORKER_CHIP_CLASS = {"ok": "ok", "warning": "review", "critical": "alert"}
+
+
+def _worker_chip(worker) -> dict:
+    """The strip's worker indicator: Monitoring's last validated verdict, or
+    why there is none -- never an inference from a file or a PID."""
+    return {"state": worker["state"], "label": worker["label"],
+            "class": WORKER_CHIP_CLASS.get(worker["state"], "off")}
+
+
 def _airing_text(airing) -> str:
     if airing is None:
         return "No airings yet"
@@ -456,6 +472,7 @@ def board(request):
         "page_urls": {"previous": _board_url({**state, "page": page.number - 1}) if page.has_previous() else "",
                       "next": _board_url({**state, "page": page.number + 1}) if page.has_next() else ""},
         "station_tz": timezone.localtime(now).strftime("%Z"),
+        "worker": _worker_chip(diagnostics.worker_health()),
     })
 
 
@@ -473,6 +490,7 @@ def board_status(request):
         "latest": None if latest is None else {"execution": str(latest.pk), "state": latest.state,
                                                "label": latest.get_state_display()},
         "over": status["load"]["over"], "version": status["version"],
+        "worker": _worker_chip(diagnostics.worker_health()),
     }, headers={"Cache-Control": "no-store"})
 
 
@@ -541,12 +559,46 @@ def airing_detail(request, execution_id):
               ActiveBroadcastMessageEvent.objects.filter(execution=execution).order_by("-id")[:DETAIL_EVENTS]]
     return render(request, "active_messages/board_airing.html", {
         "airing": _airing(execution), "execution": execution, "components": components,
+        "evidence": diagnostics.publication_evidence(execution),
         "stinger": snapshot.get("stinger"), "stinger_unavailable": snapshot.get("stinger_unavailable"),
         "accounted_seconds": snapshot.get("accounted_seconds"), "events": events,
         "events_capped": len(events) >= DETAIL_EVENTS, "back_url": _board_url(state),
         "gate_open": native_airing_open(), "gate_message": NATIVE_AIRING_CLOSED,
         "status_version": _status(services.current_policy())["version"],
     })
+
+
+# -- diagnostics (D3E-D; read-only) ------------------------------------------------------------
+
+@require_GET
+def board_diagnostics(request):
+    """Reconciliation and worker diagnostics. The inspection runs only when
+    the operator asks for it (``?inspect=1``): no cached or background result
+    is ever shown as current, and a plain visit says no inspection has run.
+    Read-only: no row, file or Monitoring event is ever written."""
+    _require_control(request.user)
+    inspection = diagnostics.inspect() if request.GET.get("inspect") == "1" else None
+    response = render(request, "active_messages/board_diagnostics.html", {
+        "inspection": inspection, "worker": diagnostics.worker_health(),
+        "classes": [{"key": key, "label": label, "meaning": meaning}
+                    for key, (label, meaning) in diagnostics.CLASSES.items()],
+        "gate_open": heartbeat.gate_open_read_only(), "gate_message": NATIVE_AIRING_CLOSED,
+        "back_url": _board_url(_state(request.GET)), "limit": diagnostics.DIAGNOSTIC_LIMIT,
+        "max_findings": diagnostics.MAX_FINDINGS,
+        "inspect_url": reverse("active_messages:board-diagnostics") + "?inspect=1",
+    })
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+@require_GET
+def board_diagnostics_data(request):
+    """The same bounded inspection as structured JSON (every GET inspects
+    afresh; nothing is cached). Read-only."""
+    _require_control(request.user)
+    return JsonResponse({"inspection": diagnostics.inspect(), "worker": diagnostics.worker_health(),
+                         "native_airing": "open" if heartbeat.gate_open_read_only() else "closed"},
+                        headers={"Cache-Control": "no-store"})
 
 
 # -- actions (POST; each one exact UUID) --------------------------------------------------------

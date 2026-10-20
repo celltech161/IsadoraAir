@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics — Operator board — IsadoraAir{% endblock %}
+{% block extra_css %}{% include "active_messages/_board_style.html" %}{% endblock %}
+{% block content %}
+<div class="amb" id="amDiagnostics">
+  <header class="amb-head">
+    <h1>Diagnostics</h1>
+    <nav aria-label="Back"><a href="{{ back_url }}">‹ Operator board</a></nav>
+  </header>
+  <p class="amb-note">Read-only. This page never retires, deletes, moves, restores or repairs anything, and never records Monitoring attention. Maintenance stays with the trusted <code>manage.py active_message_retention</code> command.{% if not gate_open %} Native airing is closed.{% endif %}</p>
+
+  <section class="amb-panel amb-diag-worker" id="ambWorkerHealth" data-worker-state="{{ worker.state }}" aria-labelledby="ambWorkerTitle">
+    <div>
+      <h2 id="ambWorkerTitle" class="amb-h2">Active message worker</h2>
+      <p><span class="amb-chip {% if worker.state == 'ok' %}ok{% elif worker.state == 'critical' %}alert{% elif worker.state == 'warning' %}review{% else %}off{% endif %}" data-worker-label>{{ worker.label }}</span></p>
+      {% if worker.state == "not_configured" %}<p class="amb-note">Monitoring has no check for <code>{{ worker.unit }}</code>, so nothing validates the worker. The check is provisioned by the additive migration <code>monitoring.0014</code> when r0116 is installed.</p>
+      {% elif worker.state == "disabled" %}<p class="amb-note">The Monitoring check “{{ worker.check }}” is disabled: the worker is not validated.</p>
+      {% elif worker.state == "monitoring_unavailable" %}<p class="amb-note">Monitoring's status could not be read. Worker health is unknown — it is never inferred from the heartbeat file or a process ID here.</p>
+      {% elif worker.state == "not_observed" %}<p class="amb-note">Monitoring has not observed the check “{{ worker.check }}” yet.</p>
+      {% else %}
+      <dl class="amb-facts">
+        {% if worker.state == "stale" %}<dt>Freshness</dt><dd><strong>Monitoring's last poll is {{ worker.observed_age_seconds }} s old</strong> — the verdict below is only the last known one ({{ worker.status }}).</dd>
+        {% else %}<dt>Observed</dt><dd>{{ worker.observed_age_seconds }} s ago by Monitoring</dd>{% endif %}
+        <dt>Process identity</dt><dd>{% if worker.identity == "verified" %}Verified (heartbeat bound to the running process){% elif worker.identity == "mismatch" %}Not current — the heartbeat belongs to another process{% else %}Unknown{% endif %}</dd>
+        <dt>Heartbeat</dt><dd>{{ worker.heartbeat|capfirst }}{% if worker.detail.heartbeat_age_seconds is not None %} ({{ worker.detail.heartbeat_age_seconds }} s old){% endif %}</dd>
+        {% if worker.reason %}<dt>Condition</dt><dd><code>{{ worker.reason }}</code></dd>{% endif %}
+        {% if worker.detail.phase %}<dt>Phase</dt><dd>{{ worker.detail.phase }}{% if worker.detail.outcome %} · last outcome {{ worker.detail.outcome }}{% endif %}</dd>{% endif %}
+        {% if worker.detail.n_restarts is not None %}<dt>Restarts</dt><dd>{{ worker.detail.n_restarts }} automatic{% if worker.recovery %} — <strong>recovering or crash history</strong>{% endif %}</dd>{% elif worker.recovery %}<dt>Recovery</dt><dd><strong>Recovering or crash history</strong></dd>{% endif %}
+      </dl>
+      {% endif %}
+      <p class="amb-note">Healthy worker does not mean anything is on air. <a href="{{ worker.monitoring_url }}">Monitoring ›</a> (no restart control here)</p>
+    </div>
+  </section>
+
+  <section class="amb-panel" id="ambInspection" data-inspection-state="{% if inspection %}{{ inspection.state }}{% else %}not_inspected{% endif %}" aria-labelledby="ambInspectionTitle">
+    <div>
+      <h2 id="ambInspectionTitle" class="amb-h2">Reconciliation</h2>
+      {% if not inspection %}
+      <p class="amb-note warn" data-empty="not_inspected">No inspection has been performed in this view. The absence of findings here says nothing about health.</p>
+      <p><a class="amb-btn primary" href="{{ inspect_url }}" id="ambInspect">Inspect now</a> <span class="amb-muted">Bounded to {{ limit }} rows per class, metadata only (no hashing). Read-only.</span></p>
+      {% elif inspection.state == "unavailable" %}
+      <p class="amb-note warn" data-empty="unavailable">The inspection could not run ({{ inspection.reason }}) at {{ inspection.generated_at }}. Nothing is known — this is not a healthy result.</p>
+      <p><a class="amb-btn" href="{{ inspect_url }}">Inspect again</a></p>
+      {% else %}
+      <p class="amb-note"><strong>Inspected</strong> <time datetime="{{ inspection.generated_at }}">{{ inspection.generated_at }}</time> in {{ inspection.duration_ms }} ms · bounded to {{ inspection.limit }} rows per class · metadata only. This describes that moment, not now. <a href="{{ inspect_url }}">Inspect again</a></p>
+      {% if inspection.state == "incomplete" %}<p class="amb-note warn" data-incomplete>Incomplete:{% if inspection.truncated %} limit reached for {{ inspection.truncated|join:", " }} (older rows were not inspected; the CLI inspects more){% endif %}{% if inspection.truncated and inspection.unverifiable %};{% endif %}{% if inspection.unverifiable %} {{ inspection.unverifiable }} item{{ inspection.unverifiable|pluralize }} could not be verified{% endif %}. The counts cover only what was inspected.</p>{% endif %}
+      <ul class="amb-diag-summary" aria-label="Summary">
+        <li class="{% if inspection.summary.integrity_damage %}alert{% endif %}"><b data-summary="integrity_damage">{{ inspection.summary.integrity_damage }}</b> integrity damage</li>
+        <li class="{% if inspection.summary.attention %}review{% endif %}"><b data-summary="attention">{{ inspection.summary.attention }}</b> need manual attention</li>
+        <li><b data-summary="candidates">{{ inspection.summary.candidates }}</b> cleanup / recovery candidates</li>
+        <li><b>{{ inspection.summary.by_severity.critical }}</b> critical · <b>{{ inspection.summary.by_severity.warning }}</b> warning · <b>{{ inspection.summary.by_severity.info }}</b> info</li>
+        {% if inspection.summary.bytes.quarantine_reclaimable or inspection.summary.bytes.quarantine_manual %}<li>Quarantine: {{ inspection.summary.bytes.quarantine_reclaimable }} bytes reclaimable after re-proof · {{ inspection.summary.bytes.quarantine_manual }} bytes held for manual recovery</li>{% endif %}
+      </ul>
+      <table class="amb-table amb-diag-classes">
+        <thead><tr><th>Class</th><th>Findings</th><th class="wide">Meaning</th></tr></thead>
+        <tbody>{% for item in classes %}<tr data-class="{{ item.key }}"><td>{{ item.label }}</td><td data-class-count>{% for key, count in inspection.summary.by_class.items %}{% if key == item.key %}{{ count }}{% endif %}{% endfor %}</td><td class="wide">{{ item.meaning }}</td></tr>{% endfor %}</tbody>
+      </table>
+      {% if inspection.findings %}
+      <h3 class="amb-h3">Findings <span class="amb-muted">· {{ inspection.summary.findings }}{% if inspection.findings_truncated %} (first {{ max_findings }} shown){% endif %}</span></h3>
+      <ul class="amb-findings">
+        {% for item in inspection.findings %}
+        <li data-code="{{ item.code }}" data-class="{{ item.class }}" data-severity="{{ item.severity }}">
+          <span class="amb-sev {{ item.severity }}">{{ item.severity|upper }}</span> <b>{{ item.title }}</b> <code>{{ item.code }}</code> <span class="amb-muted">· {{ item.class_label }}</span>
+          <div class="amb-note">{{ item.evidence }}{% if item.link %} — <a href="{{ item.link.url }}">{{ item.link.label }} ›</a>{% else %} <span class="amb-id">{{ item.identity|truncatechars:48 }}</span>{% endif %}</div>
+          <div class="amb-note">{{ item.interpretation }}{% if item.action %} Suggested: {{ item.action }}.{% endif %}</div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% elif inspection.state == "complete" %}
+      <p class="amb-note" data-empty="healthy">The completed inspection found nothing to report{% if inspection.summary.healthy %} ({% for key, count in inspection.summary.healthy.items %}{{ count }} {{ key }}{% if not forloop.last %}, {% endif %}{% endfor %} healthy){% endif %}.</p>
+      {% else %}
+      <p class="amb-note" data-empty="incomplete_no_findings">No findings within the inspected bound — not proof of health beyond it.</p>
+      {% endif %}
+      {% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}

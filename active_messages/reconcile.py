@@ -36,6 +36,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from django.db import DatabaseError
 from django.utils import timezone
 
 from production.errors import MediaInconsistent, MediaPurged
@@ -81,6 +82,8 @@ class Report:
     healthy: Counter = field(default_factory=Counter)
     truncated: list = field(default_factory=list)
     bytes: Counter = field(default_factory=Counter)      # quarantine: reclaimable vs held for manual recovery
+    generated_at: object = None                          # when this inspection ran (never reused as "current")
+    limit: int = 0
 
     def add(self, artifact, identity, code, severity, category, evidence, eligibility="not_applicable", action=""):
         assert severity in SEVERITIES and category in CATEGORIES
@@ -227,13 +230,14 @@ def _check_unbound_aggregates(report, *, now, grace, limit):
 
 # -- publications and insertions ---------------------------------------------------------------------------
 
-def _check_publications(report, *, deep, limit):
+def _check_publications(report, *, deep, limit, rows=None):
     from library.models import Track
-    rows = list(ActiveBroadcastPublication.objects.select_related("execution", "media")
-                .order_by("-published_at", "-id")[:limit + 1])
-    if len(rows) > limit:
-        report.truncated.append("publications")
-        rows = rows[:limit]
+    if rows is None:
+        rows = list(ActiveBroadcastPublication.objects.select_related("execution", "media")
+                    .order_by("-published_at", "-id")[:limit + 1])
+        if len(rows) > limit:
+            report.truncated.append("publications")
+            rows = rows[:limit]
     retired = retention.retired_execution_ids(row.execution_id for row in rows)
     tracks = {track.pk: track for track in Track.objects.filter(pk__in=[row.track_id for row in rows if row.track_id])}
     try:
@@ -245,6 +249,9 @@ def _check_publications(report, *, deep, limit):
                        "the reserved library namespace is unavailable; publications cannot be checked",
                        action="check the library mount; nothing is removed while it is unavailable")
     waves = retention.waveforms_dir()
+    owners_of = _owners_index([retention.canonical_destination(row.library_relpath) for row in rows
+                               if row.track_id is None or row.execution_id in retired
+                               or row.execution.state not in UNFINISHED_EXECUTION_STATES]) if directory else {}
     for row in rows:
         report.inspected["publication"] += 1
         execution, live = row.execution, row.execution.state in UNFINISHED_EXECUTION_STATES
@@ -266,7 +273,7 @@ def _check_publications(report, *, deep, limit):
         track = tracks.get(row.track_id)
         if row.execution_id in retired:
             wave_state = retention.file_state(waves / f"{row.track_id_snapshot}.json")[0]
-            owners = retention._owners(retention.canonical_destination(row.library_relpath))
+            owners = owners_of.get(str(retention.canonical_destination(row.library_relpath)))
             if track is not None or Track.objects.filter(pk=row.track_id_snapshot).exists():
                 report.add("publication", row.execution_id, "retired_track_present", "warning", "integrity_damage",
                            "a retired publication's Track exists again", action="operator review")
@@ -303,12 +310,14 @@ def _check_publications(report, *, deep, limit):
                 report.add("publication", row.execution_id, "publication_pruned", "info", "expected_pruning",
                            f"Track {row.track_id_snapshot} and its file were removed through the library; "
                            "the publication record is kept")
-            elif retention._owners(retention.canonical_destination(row.library_relpath)):
+            elif owners_of.get(str(retention.canonical_destination(row.library_relpath))):
                 report.add("publication", row.execution_id, "publication_path_adopted", "warning",
                            "integrity_damage", f"another Track owns {name}; its bytes are never removed",
                            eligibility="blocked:path_owned_by_track", action="operator review")
             else:
-                assessment = retention.assess_publication_retirement(row, execution=execution, track=None)
+                assessment = retention.assess_publication_retirement(
+                    row, execution=execution, track=None,
+                    owners=owners_of.get(str(retention.canonical_destination(row.library_relpath))))
                 report.add("publication", row.execution_id, "publication_file_without_track", "info",
                            "candidate_retirement", f"Track {row.track_id_snapshot} was deleted; its file remains",
                            eligibility=_eligibility(assessment), action="retire --apply this execution")
@@ -341,10 +350,27 @@ def _check_publications(report, *, deep, limit):
             continue
         report.healthy["publication"] += 1
         if not live:
-            assessment = retention.assess_publication_retirement(row, execution=execution, track=track)
+            assessment = retention.assess_publication_retirement(
+                row, execution=execution, track=track,
+                owners=owners_of.get(str(retention.canonical_destination(row.library_relpath))))
             report.add("publication", row.execution_id, "publication_retained", "info", "candidate_retirement",
                        f"{execution.state} execution's published file and Track {track.pk} remain",
                        eligibility=_eligibility(assessment), action="retire --apply after review")
+
+
+def _owners_index(destinations) -> dict:
+    """{str(destination): sorted Track ids referring to it} for every
+    destination at once -- ONE bounded scan of the Track table instead of one
+    per publication (retention.references_by_location: the same ownership
+    rules as cleanup's). Every value is None when ownership cannot be
+    established (database error, an unresolvable Track path)."""
+    destinations = list(dict.fromkeys(str(destination) for destination in destinations))
+    try:
+        found = retention.references_by_location(destinations)
+    except (DatabaseError, retention.OwnershipUnverifiable):
+        return {destination: None for destination in destinations}
+    return {destination: sorted({pk for pk, _field, _kind in references})
+            for destination, references in found.items()}
 
 
 def _eligibility(assessment) -> str:
@@ -552,7 +578,7 @@ def _quarantine_ownership(kind, item) -> str:
 def reconcile(*, deep=False, limit=None, now=None, grace=None) -> Report:
     """The whole read-only report (see the module docstring)."""
     limit, grace, now = retention._limit(limit), retention._grace(grace), now or timezone.now()
-    report = Report(deep=deep)
+    report = Report(deep=deep, generated_at=now, limit=limit)
     _check_executions(report, deep=deep, limit=limit)
     _check_inputs(report, deep=deep)
     _check_purged_references(report, limit=limit)
@@ -561,6 +587,18 @@ def reconcile(*, deep=False, limit=None, now=None, grace=None) -> Report:
     _check_insertions(report, limit=limit)
     _check_namespace(report, now=now, grace=grace, limit=limit)
     _check_quarantine(report, limit=limit)
+    return report
+
+
+def inspect_publication(publication, *, now=None) -> Report:
+    """The same publication rules as ``reconcile`` for ONE publication (the
+    operator board's airing detail), plus its held quarantine operations.
+    Read-only, metadata only; nothing else is inspected."""
+    report = Report(deep=False, generated_at=now or timezone.now(), limit=1)
+    row = (ActiveBroadcastPublication.objects.select_related("execution", "media")
+           .filter(pk=publication.pk).first())
+    if row is not None:
+        _check_publications(report, deep=False, limit=1, rows=[row])
     return report
 
 

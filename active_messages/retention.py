@@ -332,7 +332,10 @@ def _track_dependency_reasons(track) -> list:
     return _track_collector(track)[0]
 
 
-def assess_publication_retirement(publication, *, execution=None, track=None) -> Assessment:
+_UNSCANNED = object()
+
+
+def assess_publication_retirement(publication, *, execution=None, track=None, owners=_UNSCANNED) -> Assessment:
     """May this publication's library file, waveform and Track be retired?
     Read-only. Never by age; every reason is positive evidence:
 
@@ -343,7 +346,11 @@ def assess_publication_retirement(publication, *, execution=None, track=None) ->
     * no deck claim, play or air evidence on it is unresolved;
     * deleting the Track would neither be refused (playlist / rotation) nor
       cascade into anything (voice tracks, other dependents);
-    * the reserved namespace is available and unsubstituted."""
+    * the reserved namespace is available and unsubstituted.
+
+    ``owners`` -- the ids ``_owners`` would return for the publication's
+    path (None: unknown), when a caller has already scanned them in a shared
+    pass (``references_by_location``); scanned here otherwise."""
     from library.models import Track
     row = execution or ActiveBroadcastExecution.objects.get(pk=publication.execution_id)
     if is_retired(row.pk):
@@ -362,7 +369,8 @@ def assess_publication_retirement(publication, *, execution=None, track=None) ->
             reasons.append("track_not_publication")
         else:
             reasons.extend(_track_dependency_reasons(track))
-    owners = _owners(canonical_destination(publication.library_relpath))
+    if owners is _UNSCANNED:
+        owners = _owners(canonical_destination(publication.library_relpath))
     if owners is None:
         reasons.append("ownership_unavailable")
     elif set(owners) - ({track.pk} if track is not None and track.pk == publication.track_id_snapshot else set()):
@@ -462,6 +470,57 @@ def track_references(location: Path, identity=None) -> list:
                     raise OwnershipUnverifiable(pk, field) from None
                 if kind:
                     found.append((pk, field, kind))
+        if len(batch) < OWNERSHIP_BATCH:
+            return found
+        last = batch[-1][0]
+
+
+def references_by_location(locations) -> dict:
+    """``track_references`` for SEVERAL locations in ONE bounded scan of the
+    Track table (the read-only reconciler's inspections; cleanup decisions
+    always use ``track_references`` itself, under the destination lock): the
+    same rules -- each location's own regular file is its identity, a
+    reference is to that object (device, inode) or to the resolved name -- so
+    the result for each location is exactly what ``track_references(location,
+    _identity(location))`` would return. Raises DatabaseError or
+    OwnershipUnverifiable like it (then nothing is known for any location)."""
+    from library.models import Track
+    locations = [Path(location) for location in locations]
+    found = {str(location): [] for location in locations}
+    if not locations:
+        return found
+    by_name, by_object = {}, {}
+    for location in locations:
+        by_name.setdefault(os.path.realpath(location), []).append(str(location))
+        identity = _identity(location)
+        if identity is not None:
+            by_object.setdefault(identity, []).append(str(location))
+    last = None
+    while True:
+        rows = Track._base_manager.order_by("pk")
+        if last is not None:
+            rows = rows.filter(pk__gt=last)
+        batch = list(rows.values_list("pk", "filepath", "waveform_path")[:OWNERSHIP_BATCH])
+        for pk, *values in batch:
+            for field, value in zip(("filepath", "waveform_path"), values):
+                if not value:
+                    continue
+                try:
+                    try:
+                        info = os.stat(value)
+                    except (FileNotFoundError, NotADirectoryError):
+                        info = None
+                    resolved = os.path.realpath(value)
+                except (OSError, ValueError):
+                    raise OwnershipUnverifiable(pk, field) from None
+                matched = set()
+                if info is not None:
+                    for location in by_object.get((info.st_dev, info.st_ino), ()):
+                        found[location].append((pk, field, "object"))
+                        matched.add(location)
+                for location in by_name.get(resolved, ()):
+                    if location not in matched:
+                        found[location].append((pk, field, "name"))
         if len(batch) < OWNERSHIP_BATCH:
             return found
         last = batch[-1][0]
