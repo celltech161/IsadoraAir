@@ -296,14 +296,27 @@ FRESH_REASONS = frozenset({"idle", "busy", "retry_backoff", "playout_in_flight",
                            "rendering", "blocked", "lock_held_elsewhere", "database_errors", "malfunction",
                            "history_unverified", "restarted"})
 BOUND_REASONS = FRESH_REASONS | {"stale", "stopped", "crash_looping", "render_overdue"}
-# assess's order: "stopped" exactly for the stopped phase; a rendering heartbeat
-# is never judged stale, only overdue, and may still be a crash loop.
-RENDER_PHASE_REASONS = frozenset({"rendering", "render_overdue", "crash_looping", "history_unverified", "restarted"})
+# assess's "ok" conditions: an ok verdict may still be lifted to
+# "history_unverified" (assess, a malformed predecessor) or "restarted" (the
+# probe, NRestarts rose since its last poll).
+OK_REASONS = frozenset({"idle", "busy", "retry_backoff", "playout_in_flight", "working", "ready_waiting_for_gate",
+                        "rendering"})
+LIFTED_REASONS = frozenset({"history_unverified", "restarted"})
+# assess's reading of the last cycle's result on a fresh, non-rendering
+# heartbeat, in its own order. Where two are listed, counters Monitoring does
+# not serialize decide (repeats: busy vs lock_held_elsewhere, database_errors
+# vs malfunction) -- either is the producer's. "idle" is ready_waiting_for_gate
+# exactly with code "gated"; "" (no cycle completed yet) is idle.
+OUTCOME_REASONS = {"error": frozenset({"database_errors", "malfunction"}), "blocked": frozenset({"blocked"}),
+                   "busy": frozenset({"busy", "lock_held_elsewhere"}), "backoff": frozenset({"retry_backoff"}),
+                   "retry": frozenset({"retry_backoff"}), "playout": frozenset({"playout_in_flight"}),
+                   **{result: frozenset({"working"}) for result in heartbeat.PROGRESS_RESULTS}}
+# What observe adds only for a bound heartbeat (supervision._SHOWN).
+HEARTBEAT_EVIDENCE = ("phase", "outcome", "code", "execution", "heartbeat_age_seconds")
 # Raw verdicts the poller never debounces (only warning/critical are held at
 # the last stable status), so the written status must be exactly this one.
 UNDEBOUNCED_STATUS = {"starting": "unknown", "observer_error": "unknown", "identity_unavailable": "unknown",
-                      **{reason: "ok" for reason in ("idle", "busy", "retry_backoff", "playout_in_flight",
-                                                     "working", "ready_waiting_for_gate", "rendering")}}
+                      **{reason: "ok" for reason in OK_REASONS}}
 RECOVERY_CONDITIONS = frozenset({"crash_looping", "restarted", "history_unverified", "restarting"})
 WORKER_LABELS = {
     "not_configured": "Worker check not provisioned",
@@ -451,6 +464,9 @@ def _worker_evidence(entry):
                     else "service_failed" if active_state == "failed" else "service_inactive")
         if reason != expected:
             raise _invalid("detail.reason")
+        _no_heartbeat_evidence(detail)                    # the probe returns before observe runs
+        if "native_airing" in detail:
+            raise _invalid("detail.native_airing/reason")
         return status, reason, "unknown", "unknown"
     if reason not in UNBOUND_REASONS | BOUND_REASONS:
         raise _invalid("detail.reason")
@@ -459,31 +475,99 @@ def _worker_evidence(entry):
     if reason not in BOUND_REASONS:
         if reason == "malformed" and type(detail.get("problem")) is not str:
             raise _invalid("detail.problem")
+        if reason == "observer_error" and type(detail.get("error")) is not str:
+            raise _invalid("detail.error")
+        _no_heartbeat_evidence(detail)
         return status, reason, ("mismatch" if reason == "heartbeat_not_current" else "unknown"), {
             "no_heartbeat": "missing", "heartbeat_not_current": "not_current", "malformed": "malformed",
         }.get(reason, "unknown")
-    # A bound heartbeat: every field assess reported on it must be there, typed
-    # and consistent with the reason -- the evidence is never synthesized.
-    phase, outcome = detail.get("phase"), detail.get("outcome")
-    if phase not in heartbeat.PHASES or (phase == "stopped") != (reason == "stopped") \
-            or phase == "rendering" and reason not in RENDER_PHASE_REASONS \
-            or reason in ("rendering", "render_overdue") and phase != "rendering":
-        raise _invalid("detail.phase")
-    if outcome not in heartbeat.RESULTS:
-        raise _invalid("detail.outcome")
-    for field in ("code", "execution"):
-        if type(detail.get(field)) is not str:
-            raise _invalid(f"detail.{field}")
-    age = detail.get("heartbeat_age_seconds")
-    if not _number(age) or age < -heartbeat.MAX_FUTURE_SKEW_SECONDS:
-        raise _invalid("detail.heartbeat_age_seconds")
-    if phase != "rendering" and reason in FRESH_REASONS and age > heartbeat.STALE_AFTER_SECONDS \
-            or reason == "stale" and age < heartbeat.STALE_AFTER_SECONDS:
-        raise _invalid("detail.heartbeat_age_seconds")   # "current" and stale at once
+    _bound_heartbeat(reason, detail)
+    if reason == "restarted" and not (type(detail["n_restarts"]) is int and detail["n_restarts"] >= 1):
+        raise _invalid("detail.n_restarts/reason")       # the probe saw NRestarts rise
     if status == "unknown":
         return status, reason, "unknown", "unknown"
     return status, reason, "verified", ("current" if reason in FRESH_REASONS
                                         else "stale" if reason == "stale" else "unknown")
+
+
+def _no_heartbeat_evidence(detail):
+    """Unit state and unbound verdicts carry no heartbeat reading: one here is
+    not the producer's (and must not be read as evidence about the process)."""
+    for key in HEARTBEAT_EVIDENCE:
+        if key in detail:
+            raise _invalid(f"detail.{key}/reason")
+
+
+def assessed_reasons(phase, outcome=None, code=None, age=None) -> frozenset:
+    """Every reason the producer can write for a bound heartbeat showing these
+    fields: heartbeat.assess in its own order (stopped; crash loop; rendering
+    -- never stale, only overdue; stale; the outcome table), then the lifted
+    history_unverified / restarted for an ok verdict. ``age`` is the probe's
+    rounded heartbeat age; None (outcome, age) means any."""
+    if phase == "stopped":
+        return frozenset({"stopped"})
+    found = {"crash_looping"}
+    if phase == "rendering":
+        if age is None or age >= 0:                        # past its deadline, which is after checked_at
+            found.add("render_overdue")
+        if age is None or age <= heartbeat.RENDER_DEADLINE_MAX_SECONDS:    # within its deadline
+            found |= {"rendering", "restarted"}
+            if age is None or age <= heartbeat.CRASH_WINDOW_SECONDS:      # history_unverified's window
+                found.add("history_unverified")
+        return frozenset(found)
+    # round(age, 1): above STALE_AFTER_SECONDS rounds to >= it, at most it to <= it.
+    if age is None or age >= heartbeat.STALE_AFTER_SECONDS:
+        found.add("stale")
+    if age is None or age <= heartbeat.STALE_AFTER_SECONDS:
+        read = (frozenset().union(*OUTCOME_REASONS.values(), {"ready_waiting_for_gate", "idle"}) if outcome is None
+                else OUTCOME_REASONS.get(outcome)
+                or frozenset({"ready_waiting_for_gate" if outcome == "idle" and code == "gated" else "idle"}))
+        found |= read | (LIFTED_REASONS if read & OK_REASONS else set())
+    return frozenset(found)
+
+
+def _bound_heartbeat(reason, detail):
+    """A bound heartbeat's evidence, validated as the one observation the
+    producer wrote: each field in its serialized format (heartbeat.validate's
+    own rules), the writer's state relations that survive serialization (no
+    cycle, counter, history or deadline is serialized), and the reason being
+    one heartbeat.assess could derive from exactly these fields."""
+    phase, outcome, code, execution, age = (detail.get(key) for key in HEARTBEAT_EVIDENCE)
+    if phase not in heartbeat.PHASES:
+        raise _invalid("detail.phase")
+    if outcome != "" and outcome not in heartbeat.RESULTS:
+        raise _invalid("detail.outcome")
+    if type(code) is not str or not heartbeat._CODE.fullmatch(code):
+        raise _invalid("detail.code")
+    if type(execution) is not str:
+        raise _invalid("detail.execution")
+    if execution:
+        try:
+            canonical = str(uuid.UUID(execution)) == execution
+        except ValueError:
+            canonical = False
+        if not canonical:                                  # never normalized into evidence
+            raise _invalid("detail.execution")
+    if not _number(age) or age < -heartbeat.MAX_FUTURE_SKEW_SECONDS:
+        raise _invalid("detail.heartbeat_age_seconds")
+    # The writer: no outcome only before the first completed cycle -- then no
+    # code, never "polling", and an execution only for a render in that pass;
+    # "starting" only then; a render always names its execution.
+    if outcome == "":
+        if code:
+            raise _invalid("detail.code/outcome")
+        if phase == "polling":
+            raise _invalid("detail.outcome/phase")
+        if execution and phase != "rendering":
+            raise _invalid("detail.execution/phase")
+    elif phase == "starting":
+        raise _invalid("detail.outcome/phase")
+    if phase == "rendering" and not execution:
+        raise _invalid("detail.execution/phase")
+    if reason not in assessed_reasons(phase, outcome, code, age):    # blame the first relation it breaks
+        raise _invalid("detail.reason/phase" if reason not in assessed_reasons(phase)
+                       else "detail.reason/outcome" if reason not in assessed_reasons(phase, outcome, code)
+                       else "detail.reason/heartbeat_age_seconds")
 
 
 def worker_health(*, now=None, state_path=None) -> dict:

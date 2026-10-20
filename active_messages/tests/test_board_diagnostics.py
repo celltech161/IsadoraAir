@@ -431,6 +431,14 @@ class MonitoringStateFixture(Fixtures):
                   "restart_via_dashboard": False, "n_restarts": 0, "native_airing": "closed", "phase": "polling",
                   "outcome": "idle", "code": "", "execution": "", "heartbeat_age_seconds": 3.1, "reason": "idle",
                   **detail}
+        # As the producer writes other states: a heartbeat reading only for a bound
+        # verdict, native_airing only once observe ran (an active unit).
+        if detail["reason"] not in diagnostics.BOUND_REASONS:
+            detail = {key: value for key, value in detail.items() if key not in diagnostics.HEARTBEAT_EVIDENCE}
+        if detail["active_state"] != "active":
+            detail.pop("native_airing", None)
+        if detail["reason"] == "observer_error":
+            detail.setdefault("error", "RuntimeError")
         return {"id": self.check.pk, "name": self.check.name, "kind": "systemd", "status": status, "detail": detail}
 
     def publish(self, status="ok", *, age=2.0, **detail):
@@ -687,7 +695,7 @@ class MonitoringStateSafetyTests(MonitoringStateFixture, Domain, TestCase):
         self.raw(json.dumps({"timestamp": time.time() - 2, "checks": []}))
         self.assertEqual(self.health()["state"], "not_observed")
         for status, reason, expected, identity, extra in (
-                ("warning", "restarted", "warning", "verified", {}),         # Monitoring bound the heartbeat first
+                ("warning", "restarted", "warning", "verified", {"n_restarts": 3}),  # bound the heartbeat first
                 ("critical", "crash_looping", "critical", "verified", {}),
                 ("critical", "stale", "critical", "verified", {"heartbeat_age_seconds": 75.0}),
                 ("unknown", "identity_unavailable", "unknown", "unknown", {}),
@@ -807,6 +815,54 @@ class NestedSchemaReproductionTests(MonitoringStateFixture, Domain, TestCase):
         self.assert_incomplete("detail.reason")
 
 
+P1A_CASES = (
+    # (label, detail changes, the relationship or field to blame)
+    ("A: idle with an error outcome", {"reason": "idle", "outcome": "error", "code": "OperationalError"},
+     "detail.reason/outcome"),
+    ("B: busy with an idle outcome", {"reason": "busy", "outcome": "idle"}, "detail.reason/outcome"),
+    ("C: gated without the gated code", {"reason": "ready_waiting_for_gate", "outcome": "idle", "code": ""},
+     "detail.reason/outcome"),
+    ("D: execution not a UUID", {"execution": "not-a-uuid"}, "detail.execution"),
+    ("E: code outside the producer alphabet", {"code": "bad code!"}, "detail.code"),
+)
+
+
+class ProducerConsistencyReproductionTests(MonitoringStateFixture, Domain, TestCase):
+    """Producer-contract review P1-A, kept verbatim: five complete entries
+    whose heartbeat evidence the producer can never write. On 574e0f0 each
+    read as ok / verified / current."""
+
+    def test_review_p1a_impossible_heartbeat_evidence_fails_closed(self):
+        for label, changes, field in P1A_CASES:
+            with self.subTest(label):
+                self.publish("ok", **changes)
+                worker = self.health()
+                self.assertEqual((worker["state"], worker["identity"], worker["heartbeat"]),
+                                 ("monitoring_unavailable", "unknown", "unknown"), worker)
+                self.assertEqual((worker["problem"], worker["field"]), ("entry_invalid", field), worker)
+                self.assertEqual(worker["label"], "Monitoring status unavailable — worker check data is incomplete")
+
+    def test_review_p1a_case_a_on_every_board_surface(self):
+        client = self.operator()
+        warm(client)
+        client.get(BOARD)                                                  # the policy singleton's first visit
+        self.publish("ok", reason="idle", outcome="error", code="OperationalError")
+        with CaptureQueriesContext(connection) as queries:
+            board, status, page, data = (client.get(url) for url in (BOARD, BOARD + "status/", DIAG, DATA))
+        self.assertEqual(writes(queries), [])
+        for response in (board, status, page, data):
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(b"Traceback", response.content)
+        self.assertNotContains(board, "Worker OK")
+        self.assertContains(board, 'data-worker-state="monitoring_unavailable"')
+        self.assertEqual(status.json()["worker"]["state"], "monitoring_unavailable")
+        self.assertNotIn("Verified", content(page))
+        self.assertEqual({key: data.json()["worker"][key] for key in ("state", "problem", "field", "identity",
+                                                                       "heartbeat")},
+                         {"state": "monitoring_unavailable", "problem": "entry_invalid",
+                          "field": "detail.reason/outcome", "identity": "unknown", "heartbeat": "unknown"})
+
+
 class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
     """Every worker condition as the accepted D3E-B producer really writes it
     (probes.probe_systemd over a disposable heartbeat, serialized by the
@@ -869,6 +925,16 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
             ("render overdue", {"phase": "rendering", "execution": EXECUTION, "started": now - 4000, "age": 3700,
                                 "render_deadline": now - 10}, rendering, "critical", "render_overdue", "verified",
              "unknown"),
+            ("first-cycle render", {"phase": "rendering", "execution": EXECUTION, "cycle": 0, "result": "",
+                                    "repeats": 0, "started": now - 30, "age": 25, "render_deadline": now + 600},
+             systemctl(started=now - 30), "ok", "rendering", "verified", "current"),
+            ("first-cycle render overdue", {"phase": "rendering", "execution": EXECUTION, "cycle": 0, "result": "",
+                                            "repeats": 0, "started": now - 900, "age": 890,
+                                            "render_deadline": now - 10},
+             systemctl(started=now - 900), "critical", "render_overdue", "verified", "unknown"),
+            ("render failed", {"result": "failed", "repeats": 1, "execution": EXECUTION,
+                               "last_progress_at": now - 3}, None, "ok", "working", "verified", "current"),
+            ("busy", {"result": "busy", "repeats": 1}, None, "ok", "busy", "verified", "current"),
             ("retry", {"result": "retry", "repeats": 1, "execution": EXECUTION}, None, "ok", "retry_backoff",
              "verified", "current"),
             ("playout", {"result": "playout", "repeats": 1}, None, "ok", "playout_in_flight", "verified", "current"),
@@ -922,6 +988,31 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
                     self.beat(**beat)
                 self.assertEqual(self.produce(unit_state), (status, reason))      # the producer's own verdict
                 self.assert_read(label, status, reason, identity, heartbeat_state)
+
+    def test_review_p1b_first_cycle_render_from_the_real_recorder(self):
+        """Producer-contract review P1-B, kept verbatim: the real Recorder's
+        first-cycle render (cycle 0: no outcome yet, the execution already
+        set), observed by the real probe and written by the real poller, is a
+        healthy current render -- 574e0f0 refused it (detail.outcome)."""
+        from monitoring.tests.test_active_message_worker_check import EXECUTION, PID, systemctl
+        started = time.time() - 20
+        with mock.patch.object(heartbeat, "_current", None):
+            recorder = heartbeat.Recorder(self.beat_path, clock=lambda: started, pid=PID)
+            recorder.clock = lambda: started + 5
+            recorder.rendering(EXECUTION, 600)
+        beat = json.loads(self.beat_path.read_text())
+        self.assertEqual((beat["cycle"], beat["phase"], beat["result"], beat["code"], beat["execution"]),
+                         (0, "rendering", "", "", EXECUTION))
+        self.assertEqual(self.produce(systemctl(started=started)), ("ok", "rendering"))
+        written = json.loads(self.state.read_text())["checks"][0]["detail"]
+        self.assertEqual({key: written[key] for key in ("reason", "phase", "outcome", "code", "execution")},
+                         {"reason": "rendering", "phase": "rendering", "outcome": "", "code": "",
+                          "execution": EXECUTION})
+        worker = self.health()
+        self.assertEqual((worker["state"], worker["reason"], worker["identity"], worker["heartbeat"],
+                          worker["problem"], worker["label"]),
+                         ("ok", "rendering", "verified", "current", "", "Worker OK — rendering"),
+                         (worker, written))
 
     def test_restart_observer_error_and_unrunnable_systemctl(self):
         from monitoring.tests.test_active_message_worker_check import systemctl
@@ -978,6 +1069,9 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
             self.assertEqual((confirmed["state"], confirmed["heartbeat"]), ("critical", "stale"))
 
 
+EXECUTION = "0f8fad5b-d9cb-469f-a165-70867728950e"
+
+
 ENTRY_FIELD_CASES = (
     # (label, changes to the idle producer entry: a callable over a deep copy, expected field)
     ("detail missing", lambda e: e.pop("detail"), "detail"),
@@ -1019,11 +1113,14 @@ ENTRY_FIELD_CASES = (
     ("phase missing", lambda e: e["detail"].pop("phase"), "detail.phase"),
     ("phase unknown", lambda e: e["detail"].update(phase="dancing"), "detail.phase"),
     ("phase integer", lambda e: e["detail"].update(phase=1), "detail.phase"),
-    ("idle while rendering", lambda e: e["detail"].update(phase="rendering"), "detail.phase"),
-    ("idle while stopped", lambda e: e["detail"].update(phase="stopped"), "detail.phase"),
-    ("rendering while polling", lambda e: e["detail"].update(reason="rendering"), "detail.phase"),
+    ("idle while rendering", lambda e: e["detail"].update(phase="rendering", execution=EXECUTION),
+     "detail.reason/phase"),
+    ("rendering without its execution", lambda e: e["detail"].update(phase="rendering", reason="rendering"),
+     "detail.execution/phase"),
+    ("idle while stopped", lambda e: e["detail"].update(phase="stopped"), "detail.reason/phase"),
+    ("rendering while polling", lambda e: e["detail"].update(reason="rendering"), "detail.reason/phase"),
     ("stopped while polling", lambda e: e.update(status="critical") or e["detail"].update(reason="stopped"),
-     "detail.phase"),
+     "detail.reason/phase"),
     ("outcome missing", lambda e: e["detail"].pop("outcome"), "detail.outcome"),
     ("outcome unknown", lambda e: e["detail"].update(outcome="great"), "detail.outcome"),
     ("outcome null", lambda e: e["detail"].update(outcome=None), "detail.outcome"),
@@ -1043,9 +1140,10 @@ ENTRY_FIELD_CASES = (
      "detail.heartbeat_age_seconds"),
     ("heartbeat from the future", lambda e: e["detail"].update(heartbeat_age_seconds=-31.0),
      "detail.heartbeat_age_seconds"),
-    ("idle yet stale", lambda e: e["detail"].update(heartbeat_age_seconds=61.0), "detail.heartbeat_age_seconds"),
+    ("idle yet stale", lambda e: e["detail"].update(heartbeat_age_seconds=61.0),
+     "detail.reason/heartbeat_age_seconds"),
     ("stale yet fresh", lambda e: e.update(status="critical") or e["detail"].update(reason="stale"),
-     "detail.heartbeat_age_seconds"),
+     "detail.reason/heartbeat_age_seconds"),
     ("idle reported as warning", lambda e: e.update(status="warning"), "status"),
     ("unproven identity reported ok", lambda e: e["detail"].update(reason="identity_unavailable"), "status"),
     ("starting reported ok", lambda e: e["detail"].update(reason="starting"), "status"),
@@ -1136,6 +1234,166 @@ class NestedSchemaValidationTests(MonitoringStateFixture, Domain, TestCase):
                          ("stale", "ok", "unknown", "unknown"))
 
 
+class HeartbeatEvidenceContractTests(MonitoringStateFixture, Domain, TestCase):
+    """Producer-contract review P1-A/P1-B: a bound heartbeat's evidence is one
+    observation the producer wrote, not independently plausible fields."""
+
+    NOW = 1_800_000_000.0
+
+    def producer_grid(self):
+        """Every valid heartbeat (heartbeat.validate) over a grid of visible and
+        hidden fields, classified by the producer's own heartbeat.assess and
+        shown as supervision.observe shows it (its _SHOWN), with the probe's
+        "restarted" lift of an ok verdict."""
+        import itertools
+        from active_messages import supervision
+        now = self.NOW
+        for phase, cycle, result, code, execution, repeats, history, age, overdue in itertools.product(
+                sorted(heartbeat.PHASES), (0, 20), [""] + sorted(heartbeat.RESULTS), ("", "gated", "OperationalError"),
+                ("", EXECUTION), (0, 1, 3, 12), ("none", "malformed", "crash"), (3.0, 75.0, 600.0), (False, True)):
+            started = now - age - (0 if phase == "starting" else 10)
+            starts = [started - 120, started - 60, started] if history == "crash" else [started]
+            doc = {"schema": heartbeat.SCHEMA, "pid": 4242, "started_at": started, "checked_at": now - age,
+                   "recent_starts": starts, "previous": "unclean" if history == "crash" else history,
+                   "phase": phase, "cycle": cycle, "result": result, "code": code, "execution": execution,
+                   "repeats": repeats, "consecutive_errors": repeats if result == "error" else 0,
+                   "last_progress_at": None,
+                   "render_deadline": (now - 1 if overdue else now + 600) if phase == "rendering" else None}
+            try:
+                heartbeat.validate(doc)
+            except heartbeat.Malformed:
+                continue
+            verdict = heartbeat.assess(doc, now=now, gate_open=False)
+            self.assertNotIn(verdict["condition"], ("malformed", "no_heartbeat"), doc)
+            shown = {name: verdict["detail"][key] for key, name in supervision._SHOWN if key in verdict["detail"]}
+            detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": age + 10,
+                      "restart_via_dashboard": False, "n_restarts": 0, **shown, "reason": verdict["condition"]}
+            yield verdict["status"], detail
+            if verdict["status"] == "ok":
+                yield "warning", {**detail, "reason": "restarted", "n_restarts": 1}
+
+    @staticmethod
+    def visible(detail):
+        return tuple(detail[key] for key in ("phase", "outcome", "code", "heartbeat_age_seconds"))
+
+    def test_every_producer_heartbeat_is_read_with_its_meaning(self):
+        seen = 0
+        for status, detail in self.producer_grid():
+            evidence = diagnostics._worker_evidence({"status": status, "detail": detail})
+            self.assertEqual(evidence[:3], (status, detail["reason"], "verified"), detail)
+            self.assertEqual(evidence[3], "current" if detail["reason"] in diagnostics.FRESH_REASONS
+                             else "stale" if detail["reason"] == "stale" else "unknown", detail)
+            seen += 1
+        self.assertGreater(seen, 500)
+
+    def test_the_reader_accepts_exactly_the_reasons_the_producer_writes(self):
+        """Contract drift: for every combination of serialized fields, the
+        reasons the reader accepts are exactly those heartbeat.assess (and the
+        probe's lift) produced -- a new or changed producer condition fails
+        here until the reader's table is reviewed."""
+        produced, details = {}, {}
+        for _status, detail in self.producer_grid():
+            produced.setdefault(self.visible(detail), set()).add(detail["reason"])
+            details.setdefault(self.visible(detail), detail)
+        self.assertGreater(len(produced), 50)
+        for key, reasons in produced.items():
+            with self.subTest(key=key):
+                self.assertEqual(diagnostics.assessed_reasons(*key), reasons)
+                for reason in sorted(diagnostics.BOUND_REASONS - reasons):    # every other bound reason: refused
+                    entry = {"status": diagnostics.UNDEBOUNCED_STATUS.get(reason, "critical"),
+                             "detail": {**details[key], "reason": reason, "n_restarts": 1}}
+                    with self.assertRaises(diagnostics.UntrustedState) as refused:
+                        diagnostics._worker_evidence(entry)
+                    self.assertEqual(refused.exception.code, "entry_invalid")
+                    self.assertTrue(refused.exception.field.startswith("detail.reason/"), refused.exception.field)
+
+    def read(self, status="ok", **detail):
+        self.publish(status, **detail)
+        return self.health()
+
+    def assert_refused(self, worker, field):
+        self.assertEqual((worker["state"], worker["problem"], worker["field"], worker["identity"], worker["heartbeat"]),
+                         ("monitoring_unavailable", "entry_invalid", field, "unknown", "unknown"), worker)
+        self.assertNotIn("Worker OK", worker["label"])
+
+    def test_heartbeat_code_is_the_producers_whole_string_alphabet(self):
+        for code in ("", "OperationalError", "render_failed", "A" * 64, "0_9"):
+            with self.subTest(accepted=code):
+                worker = self.read(code=code)
+                self.assertEqual((worker["state"], worker["heartbeat"], worker["problem"]), ("ok", "current", ""))
+        for code in ("A" * 65, "bad code!", " leading", "trailing ", "with-hyphen", "dot.ted", "new\nline",
+                     "Error\n", "tab\t", "ünïcode", "٣", "ǅ", None, 5, True, [], {}):
+            with self.subTest(refused=code):
+                self.assert_refused(self.read(code=code), "detail.code")
+
+    def test_execution_is_empty_or_the_producers_canonical_uuid(self):
+        for execution in ("", EXECUTION):
+            with self.subTest(accepted=execution):
+                self.assertEqual(self.read(execution=execution)["state"], "ok")
+        for execution in (EXECUTION.upper(), "{" + EXECUTION + "}", "urn:uuid:" + EXECUTION,
+                          EXECUTION.replace("-", ""), EXECUTION[:-1], EXECUTION + " ", " " + EXECUTION,
+                          "not-a-uuid", "0", None, 5, True, {"id": EXECUTION}, [EXECUTION]):
+            with self.subTest(refused=execution):
+                self.assert_refused(self.read(execution=execution), "detail.execution")
+
+    def test_first_cycle_render_and_its_lookalikes(self):
+        first = {"reason": "rendering", "phase": "rendering", "outcome": "", "code": "", "execution": EXECUTION,
+                 "heartbeat_age_seconds": 15.0}
+        worker = self.read("ok", **first)
+        self.assertEqual((worker["state"], worker["reason"], worker["identity"], worker["heartbeat"], worker["label"]),
+                         ("ok", "rendering", "verified", "current", "Worker OK — rendering"))
+        later = self.read("ok", **{**first, "outcome": "idle", "code": "gated"})    # a later cycle's render
+        self.assertEqual((later["state"], later["heartbeat"]), ("ok", "current"))
+        overdue = self.read("critical", **{**first, "reason": "render_overdue"})
+        self.assertEqual((overdue["state"], overdue["identity"], overdue["heartbeat"]),
+                         ("critical", "verified", "unknown"))
+        for label, status, changes, field in (
+                ("no outcome while polling", "ok", {"reason": "idle", "phase": "polling", "execution": ""},
+                 "detail.outcome/phase"),
+                ("no outcome yet a code", "ok", {"code": "OperationalError"}, "detail.code/outcome"),
+                ("no outcome, rendering nothing", "ok", {"execution": ""}, "detail.execution/phase"),
+                ("no outcome, a malformed execution", "ok", {"execution": "not-a-uuid"}, "detail.execution"),
+                ("no outcome, idle while rendering", "ok", {"reason": "idle"}, "detail.reason/phase"),
+                ("no outcome, gated while rendering", "ok", {"reason": "ready_waiting_for_gate"},
+                 "detail.reason/phase"),
+                ("no outcome, stale while rendering", "critical", {"reason": "stale"}, "detail.reason/phase"),
+                ("starting with an execution", "ok", {"reason": "idle", "phase": "starting"},
+                 "detail.execution/phase"),
+                ("starting after an outcome", "ok", {"reason": "idle", "phase": "starting", "outcome": "idle",
+                                                     "execution": ""}, "detail.outcome/phase"),
+                ("stopped mid first render", "critical", {"reason": "stopped", "phase": "stopped"},
+                 "detail.execution/phase"),
+                ("rendering past any deadline", "ok", {"heartbeat_age_seconds": 3751.0},
+                 "detail.reason/heartbeat_age_seconds"),
+                ("render reported unknown", "unknown", {}, "status"),
+                ("an unknown outcome", "ok", {"outcome": "great"}, "detail.outcome"),
+                ("outcome null", "ok", {"outcome": None}, "detail.outcome")):
+            with self.subTest(label):
+                self.assert_refused(self.read(status, **{**first, **changes}), field)
+        # a render reading under an identity Monitoring could not prove: never the producer's
+        entry = self.entry("ok", **first)
+        entry.update(status="unknown")
+        entry["detail"]["reason"] = "identity_unavailable"
+        self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+        self.assert_refused(self.health(), "detail.phase/reason")
+
+    def test_unbound_and_unit_states_carry_no_heartbeat_reading(self):
+        for reason, status, changes in (("heartbeat_not_current", "critical", {}),
+                                        ("no_heartbeat", "critical", {}), ("identity_unavailable", "unknown", {}),
+                                        ("service_failed", "critical", {"active_state": "failed",
+                                                                        "sub_state": "failed"})):
+            for key in diagnostics.HEARTBEAT_EVIDENCE:
+                with self.subTest(reason=reason, key=key):
+                    entry = self.entry(status, reason=reason, **changes)
+                    entry["detail"][key] = self.entry()["detail"][key]
+                    self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+                    self.assert_refused(self.health(), f"detail.{key}/reason")
+        entry = self.entry("critical", reason="service_failed", active_state="failed", sub_state="failed")
+        entry["detail"]["native_airing"] = "closed"                    # observe never ran for an inactive unit
+        self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+        self.assert_refused(self.health(), "detail.native_airing/reason")
+
+
 class WorkerEndpointMatrixTests(MonitoringStateFixture, Domain, TestCase):
     """All four board surfaces, for incomplete, valid and untrusted worker
     state: no crash, no false health, the precise reason, no traceback or
@@ -1176,6 +1434,12 @@ class WorkerEndpointMatrixTests(MonitoringStateFixture, Domain, TestCase):
             ("missing heartbeat age", without("detail", "heartbeat_age_seconds"), "monitoring_unavailable",
              "entry_invalid", "detail.heartbeat_age_seconds", "off", "unknown", "unknown"),
             ("valid healthy", publish("ok"), "ok", "", "", "ok", "verified", "current"),
+            ("first-cycle render", publish("ok", reason="rendering", phase="rendering", outcome="",
+                                           execution=EXECUTION), "ok", "", "", "ok", "verified", "current"),
+            ("impossible evidence", publish("ok", reason="busy", outcome="idle"), "monitoring_unavailable",
+             "entry_invalid", "detail.reason/outcome", "off", "unknown", "unknown"),
+            ("malformed execution", publish("ok", execution="not-a-uuid"), "monitoring_unavailable",
+             "entry_invalid", "detail.execution", "off", "unknown", "unknown"),
             ("valid warning", publish("warning", reason="blocked", outcome="blocked"), "warning", "", "", "review",
              "verified", "current"),
             ("valid critical", publish("critical", reason="service_failed", **inactive), "critical", "", "",

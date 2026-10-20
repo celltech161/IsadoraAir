@@ -1911,17 +1911,73 @@ or heartbeat evidence is ever synthesized.
 | unit not active | `active_state`, `sub_state`, `n_restarts`, `reason` (+ `uptime_seconds`, `restart_via_dashboard`) | all four; `reason` must be the one the producer derives from `active_state`/`sub_state` (`starting`, `restarting`, `service_failed`, `service_inactive`) |
 | active, observer raised | as above, `reason: observer_error` (+ `error`) | the four; status `unknown` |
 | active, heartbeat not bound to the process | + `native_airing`; `reason` `identity_unavailable` / `starting` / `no_heartbeat` / `heartbeat_not_current` / `malformed` (+ `problem`) | + `native_airing` (`open`/`closed`); `problem` (text) for `malformed` |
-| active, heartbeat bound (`supervision.belongs`) | + `phase`, `outcome`, `code`, `execution`, `heartbeat_age_seconds`; `reason` = `heartbeat.assess`'s condition, or `restarted` | all of them, typed (`phase` ∈ heartbeat PHASES, `outcome` ∈ RESULTS, `code`/`execution` text, a finite age no further ahead than assess's 30 s skew) |
+| active, heartbeat bound (`supervision.belongs`) | + `phase`, `outcome`, `code`, `execution`, `heartbeat_age_seconds`; `reason` = `heartbeat.assess`'s condition, or `restarted` | all of them, as one consistent observation (below) |
 
 Optional display metadata (`uptime_seconds`, `restart_via_dashboard`,
-`error`, `problem` text) never decides anything. Contradictions the producer
-cannot write are refused too: a reason the poller never debounces under
-another status (an `ok` condition not written `ok`; `starting`,
-`identity_unavailable`, `observer_error` not written `unknown`), a reason that
-disagrees with the unit state, `stopped` without the stopped phase, a render
-condition outside the rendering phase (or an idle one inside it), a fresh
-condition with a heartbeat older than assess's staleness bound, or `stale`
-with a younger one.
+`problem` text) never decides anything. A reason the poller never debounces
+must be written under its own status (an `ok` condition `ok`; `starting`,
+`identity_unavailable`, `observer_error` `unknown`); a unit-state reason must
+be the one `active_state`/`sub_state` give; unit-state and unbound verdicts
+carry no heartbeat reading (`phase`, `outcome`, `code`, `execution`, age) --
+the probe returns before `observe` reads one -- and an inactive unit no
+`native_airing`; `restarted` needs `n_restarts` >= 1 (the probe saw it rise).
+
+**A bound heartbeat is one observation, validated as the producer wrote it.**
+Monitoring serializes only `phase`, `outcome` (the heartbeat's `result`),
+`code`, `execution` and the rounded age -- not `cycle`, `repeats`,
+`previous`, `recent_starts` or `render_deadline` -- so the board enforces
+exactly the producer's rules those fields can show:
+
+* formats (`heartbeat.validate`): `code` is the whole string
+  `[A-Za-z0-9_]{0,64}` (the producer's own pattern, full match); `execution`
+  is `""` or a UUID in exactly the producer's canonical form
+  (`str(uuid.UUID(x)) == x`: lowercase, hyphenated -- braces, `urn:`, no
+  hyphens, upper case or padding are refused, never normalized); `phase` one
+  of starting/polling/rendering/stopped; `outcome` one of the results or `""`;
+* the writer's state (`Recorder`): `outcome` is `""` only before the first
+  completed cycle -- then `code` is `""`, the phase is never `polling`, and an
+  `execution` appears only for a render begun in that first pass; `starting`
+  has no outcome; `rendering` always names its execution;
+* the classification (`heartbeat.assess`, in its order): `stopped` exactly for
+  the stopped phase; a crash loop in any other phase; in the rendering phase
+  `rendering` (age within the longest deadline), `render_overdue`, or an ok
+  render lifted to `history_unverified` / `restarted` -- never stale or an
+  idle reading; otherwise `stale` exactly beyond the 60 s bound (both at the
+  rounded 60.0), and below it the reason the outcome gives:
+
+  | outcome | reason |
+  |---|---|
+  | `error` | `database_errors` or `malfunction` (the unserialized error count decides) |
+  | `blocked` | `blocked` |
+  | `busy` | `busy` or `lock_held_elsewhere` (the unserialized repeat count decides) |
+  | `backoff`, `retry` | `retry_backoff` |
+  | `playout` | `playout_in_flight` |
+  | `ready`, `reused`, `failed`, `superseded` | `working` |
+  | `idle` with code `gated` | `ready_waiting_for_gate` |
+  | `idle` (other codes), `""` | `idle` |
+
+  plus `history_unverified` / `restarted` for any ok reading.
+
+`diagnostics.assessed_reasons(phase, outcome, code, age)` is that mapping. A
+test classifies a grid of every valid heartbeat document with the producer's
+own `validate`/`assess` and requires the reader to accept exactly the reasons
+the producer produced for each combination of serialized fields, and to
+refuse every other: a new or changed producer condition fails that test, and
+reads as unavailable on the board, until this table is reviewed. Anything
+else -- `idle` with an `error` outcome, `busy` with `idle`, `gated` without
+the gated code, a malformed code or execution -- is `entry_invalid` naming
+the relation (`detail.reason/outcome`, `detail.reason/phase`,
+`detail.reason/heartbeat_age_seconds`, `detail.code/outcome`,
+`detail.outcome/phase`, `detail.execution/phase`) or the field.
+
+**A first-cycle render is legitimate, not incomplete.** The worker records a
+render before its first loop cycle completes (`Recorder.rendering` at cycle
+0), and the unit's start gate accepts it; the producer then writes `phase
+rendering`, `outcome ""`, `code ""` and the render's canonical execution.
+That is a healthy current render ("Worker OK — rendering", identity verified)
+while within its deadline -- the empty outcome is accepted only with that
+phase, no code and an execution, never for an incomplete entry (a missing
+`outcome` key) or in any other phase.
 
 What a valid entry establishes:
 
@@ -2201,6 +2257,11 @@ restore, a version change, stale ON AIR and the worker chip.
   missing or wrong); an incomplete entry is "unavailable", never ok, verified
   or current, and a heartbeat is "current" only for conditions that passed
   the heartbeat's staleness bound.
+* Producer-contract consistency: a bound heartbeat must be one observation
+  the producer could write (code/execution formats, the writer's first-cycle
+  rules, `heartbeat.assess`'s reason for exactly these fields, checked
+  against the producer over a grid of every valid document); a first-cycle
+  render with no outcome yet is a healthy current render.
 * Reconciler: one shared Track-ownership scan per inspection
   (`retention.references_by_location`); `Report.generated_at`;
   `reconcile.inspect_publication`. Cleanup authorities unchanged.

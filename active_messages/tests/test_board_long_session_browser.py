@@ -323,11 +323,11 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
             or MonitorCheck.objects.create(kind="systemd", systemd_unit=diagnostics.WORKER_UNIT, name="Worker")
         MonitorCheck.objects.filter(pk=check.pk).update(enabled=True)
 
-        def observe(*, drop=None, checks=None):
+        def observe(*, drop=None, checks=None, **changes):
             detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": 597.0,
                       "restart_via_dashboard": False, "n_restarts": 0, "native_airing": "closed",
                       "phase": "polling", "outcome": "idle", "code": "", "execution": "",
-                      "heartbeat_age_seconds": 3.1, "reason": "idle"}
+                      "heartbeat_age_seconds": 3.1, "reason": "idle", **changes}
             if drop:
                 del detail[drop]
             entry = {"id": check.pk, "name": check.name, "kind": "systemd", "status": "ok", "detail": detail}
@@ -340,8 +340,14 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
         self.advance(page, EVERY)
         self.assertEqual((page.get_attribute("#ambWorker", "data-worker-state"),
                           page.text_content("#ambWorker").strip()), ("ok", "Worker OK — idle"))
+        observe(reason="rendering", phase="rendering", outcome="",           # the producer's first-cycle render
+                execution="0f8fad5b-d9cb-469f-a165-70867728950e")
+        self.advance(page, EVERY)
+        self.assertEqual((page.get_attribute("#ambWorker", "data-worker-state"),
+                          page.text_content("#ambWorker").strip()), ("ok", "Worker OK — rendering"))
         for label, kwargs in (("missing reason", {"drop": "reason"}), ("missing active_state",
                                                                          {"drop": "active_state"}),
+                              ("impossible evidence", {"reason": "busy", "outcome": "idle"}),
                               ("checks not a list", {"checks": 1})):
             with self.subTest(label):
                 observe(**kwargs)
@@ -351,7 +357,7 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
                 self.assertTrue(text.startswith("Monitoring status unavailable"), text)
                 self.assertNotIn("Worker OK", text)
                 self.assertNotIn("ok", page.get_attribute("#ambWorker", "class").split())
-                if "drop" in kwargs:
+                if "checks" not in kwargs:
                     self.assertEqual(text, "Monitoring status unavailable — worker check data is incomplete")
                 self.assertFalse(self.stale(page))                           # unavailable worker != stale page
                 self.assertEqual(self.state(page)["failures"], 0)            # an ordinary 200 answer
@@ -359,7 +365,7 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
         self.advance(page, EVERY)
         self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "ok")
         state = self.state(page)
-        self.assertEqual((state["sent"], state["failures"], state["stopped"], state["scheduled"]), (5, 0, False, True))
-        self.assertEqual(len(self.hits), 5)                                  # one request per refresh
+        self.assertEqual((state["sent"], state["failures"], state["stopped"], state["scheduled"]), (7, 0, False, True))
+        self.assertEqual(len(self.hits), 7)                                  # one request per refresh
         self.assertEqual(page.errors, [])
         self.close(page)
