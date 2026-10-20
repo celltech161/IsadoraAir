@@ -19,7 +19,7 @@ from django.test import Client, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
-from active_messages import diagnostics, playout, quarantine, reconcile, retention, services
+from active_messages import diagnostics, heartbeat, playout, quarantine, reconcile, retention, services
 from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastInsertion, ActiveBroadcastMessageEvent
 from library.models import Track
 from production.tests.support import ffmpeg_available
@@ -426,8 +426,10 @@ class MonitoringStateFixture(Fixtures):
         self.addCleanup(patcher.stop)
 
     def entry(self, status="ok", **detail):
-        detail = {"active_state": "active", "sub_state": "running", "reason": "idle", "phase": "polling",
-                  "outcome": "idle", "heartbeat_age_seconds": 3.1, "native_airing": "closed", "n_restarts": 0,
+        # Exactly what the D3E-B probe writes for an idle worker (its keys in its own order).
+        detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": 597.0,
+                  "restart_via_dashboard": False, "n_restarts": 0, "native_airing": "closed", "phase": "polling",
+                  "outcome": "idle", "code": "", "execution": "", "heartbeat_age_seconds": 3.1, "reason": "idle",
                   **detail}
         return {"id": self.check.pk, "name": self.check.name, "kind": "systemd", "status": status, "detail": detail}
 
@@ -684,14 +686,14 @@ class MonitoringStateSafetyTests(MonitoringStateFixture, Domain, TestCase):
     def test_valid_documents_keep_their_specific_states(self):
         self.raw(json.dumps({"timestamp": time.time() - 2, "checks": []}))
         self.assertEqual(self.health()["state"], "not_observed")
-        for status, reason, expected, identity in (
-                ("warning", "restarted", "warning", "verified"),            # Monitoring bound the heartbeat first
-                ("critical", "crash_looping", "critical", "verified"),
-                ("critical", "stale", "critical", "verified"),
-                ("unknown", "identity_unavailable", "unknown", "unknown"),
-                ("critical", "heartbeat_not_current", "critical", "mismatch")):
+        for status, reason, expected, identity, extra in (
+                ("warning", "restarted", "warning", "verified", {}),         # Monitoring bound the heartbeat first
+                ("critical", "crash_looping", "critical", "verified", {}),
+                ("critical", "stale", "critical", "verified", {"heartbeat_age_seconds": 75.0}),
+                ("unknown", "identity_unavailable", "unknown", "unknown", {}),
+                ("critical", "heartbeat_not_current", "critical", "mismatch", {})):
             with self.subTest(status=status, reason=reason):
-                self.publish(status, reason=reason)
+                self.publish(status, reason=reason, **extra)
                 worker = self.health()
                 self.assertEqual((worker["state"], worker["identity"]), (expected, identity))
                 self.assertNotEqual(worker["state"], "ok")
@@ -755,6 +757,509 @@ class ReproductionRecordTests(MonitoringStateFixture, Domain, TestCase):
         with mock.patch.object(diagnostics, "inspect", wraps=diagnostics.inspect) as ran:
             self.operator().get(DATA)
         self.assertEqual(ran.call_count, 0)
+
+
+class NestedSchemaReproductionTests(MonitoringStateFixture, Domain, TestCase):
+    """Final review P1, kept verbatim: a valid document (timestamp, check id,
+    status ok) whose worker entry lacks one nested field. On 6cc77bd each read
+    as a healthy worker -- the parser supplied {} / "" for the missing field."""
+
+    def assert_incomplete(self, field):
+        worker = self.health()
+        self.assertEqual((worker["state"], worker["identity"], worker["heartbeat"]),
+                         ("monitoring_unavailable", "unknown", "unknown"), worker)
+        self.assertEqual((worker["problem"], worker.get("field")), ("entry_invalid", field), worker)
+        self.assertEqual(worker["label"], "Monitoring status unavailable — worker check data is incomplete", worker)
+        client = self.operator()
+        board, status, page, data = (client.get(url) for url in (BOARD, BOARD + "status/", DIAG, DATA))
+        for response in (board, status, page, data):
+            self.assertEqual(response.status_code, 200)
+        self.assertNotContains(board, "Worker OK")
+        self.assertContains(board, 'data-worker-state="monitoring_unavailable"')
+        self.assertEqual((status.json()["worker"]["state"], status.json()["worker"]["class"]),
+                         ("monitoring_unavailable", "off"))
+        self.assertNotIn("Worker OK", content(page))
+        self.assertNotIn("Verified", content(page))
+        self.assertEqual({key: data.json()["worker"][key] for key in ("state", "problem", "identity", "heartbeat")},
+                         {"state": "monitoring_unavailable", "problem": "entry_invalid", "identity": "unknown",
+                          "heartbeat": "unknown"})
+        self.assertIsNone(data.json()["inspection"])                       # no inspection was asked for
+
+    def publish_without(self, *path):
+        entry = self.entry()
+        holder = entry
+        for key in path[:-1]:
+            holder = holder[key]
+        del holder[path[-1]]
+        self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+
+    def test_review_case_a_missing_detail(self):
+        self.publish_without("detail")
+        self.assert_incomplete("detail")
+
+    def test_review_case_b_missing_active_state(self):
+        self.publish_without("detail", "active_state")
+        self.assert_incomplete("detail.active_state")
+
+    def test_review_case_c_missing_reason(self):
+        entry = {**self.entry(), "detail": {"active_state": "active", "sub_state": "running"}}
+        self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+        self.assert_incomplete("detail.reason")
+
+
+class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
+    """Every worker condition as the accepted D3E-B producer really writes it
+    (probes.probe_systemd over a disposable heartbeat, serialized by the
+    poller's own _build_result/_write_state) is read with its exact meaning:
+    the board's validation is the producer's contract, not a guess at it."""
+
+    def setUp(self):
+        super().setUp()
+        from django.test import override_settings
+        from monitoring.services import probes
+        holder = tempfile.TemporaryDirectory(prefix="am-heartbeat-")
+        self.addCleanup(holder.cleanup)
+        self.beat_path = Path(holder.name) / "active_message_worker.json"
+        override = override_settings(ACTIVE_MESSAGE_WORKER_STATE_PATH=str(self.beat_path))
+        override.enable()
+        self.addCleanup(override.disable)
+        probes._last_restarts.clear()
+        self.addCleanup(probes._last_restarts.clear)
+
+    def beat(self, **changes):
+        from monitoring.tests.test_active_message_worker_check import document
+        self.beat_path.write_text(json.dumps(document(**changes)))
+
+    def produce(self, unit_state=None, *, run=None, observe=None):
+        """One real probe of the worker check, written exactly as the poller writes it."""
+        from types import SimpleNamespace
+        from monitoring.services import monitor as monitor_module, probes
+        from monitoring.tests.test_active_message_worker_check import systemctl
+        patches = [mock.patch.object(probes.subprocess, "run", **(run or {"return_value": unit_state or systemctl()}))]
+        if observe is not None:
+            from active_messages import supervision
+            patches.append(mock.patch.object(supervision, "observe", side_effect=observe))
+        for patcher in patches:
+            patcher.start()
+        try:
+            status, detail = probes.probe_systemd(self.check)
+        except Exception as exc:                          # what the poller writes when a probe raises
+            status, detail = "unknown", {"error": str(exc)}
+        finally:
+            for patcher in patches:
+                patcher.stop()
+        poller = SimpleNamespace(_since={}, _cooldowns={}, _runtime_commit=None)
+        with mock.patch.object(monitor_module, "STATE_PATH", self.state):
+            monitor_module.MonitorManager._write_state(
+                poller, [monitor_module.MonitorManager._build_result(poller, self.check, status, detail)])
+        return status, detail.get("reason", "")
+
+    def scenarios(self):
+        from monitoring.tests.test_active_message_worker_check import EXECUTION, PID, systemctl
+        now = time.time()
+        starts = [now - 120, now - 60, now - 10]
+        rendering = systemctl(started=now - 4005)
+        return [
+            # (label, heartbeat changes or None for no file, unit state, expected status, reason, identity, heartbeat)
+            ("idle", {}, None, "ok", "idle", "verified", "current"),
+            ("gated", {"result": "idle", "code": "gated", "execution": EXECUTION}, None,
+             "ok", "ready_waiting_for_gate", "verified", "current"),
+            ("rendering", {"phase": "rendering", "execution": EXECUTION, "started": now - 4000, "age": 1800,
+                           "render_deadline": now + 600}, rendering, "ok", "rendering", "verified", "current"),
+            ("render overdue", {"phase": "rendering", "execution": EXECUTION, "started": now - 4000, "age": 3700,
+                                "render_deadline": now - 10}, rendering, "critical", "render_overdue", "verified",
+             "unknown"),
+            ("retry", {"result": "retry", "repeats": 1, "execution": EXECUTION}, None, "ok", "retry_backoff",
+             "verified", "current"),
+            ("playout", {"result": "playout", "repeats": 1}, None, "ok", "playout_in_flight", "verified", "current"),
+            ("working", {"result": "ready", "repeats": 1, "execution": EXECUTION, "last_progress_at": now - 3}, None,
+             "ok", "working", "verified", "current"),
+            ("blocked", {"result": "blocked", "code": "render_failed", "repeats": 5}, None, "warning", "blocked",
+             "verified", "current"),
+            ("lock held", {"result": "busy", "repeats": heartbeat.BUSY_WARNING_REPEATS}, None, "warning",
+             "lock_held_elsewhere", "verified", "current"),
+            ("db errors", {"result": "error", "code": "OperationalError", "repeats": 1, "consecutive_errors": 1},
+             None, "warning", "database_errors", "verified", "current"),
+            ("malfunction", {"result": "error", "code": "OperationalError", "repeats": heartbeat.ERROR_CRITICAL_REPEATS,
+                             "consecutive_errors": heartbeat.ERROR_CRITICAL_REPEATS}, None, "critical", "malfunction",
+             "verified", "current"),
+            ("stale", {"age": heartbeat.STALE_AFTER_SECONDS + 5}, None, "critical", "stale", "verified", "stale"),
+            ("future heartbeat", {"age": -600}, None, "critical", "malformed", "unknown", "malformed"),
+            ("stopped", {"phase": "stopped"}, None, "critical", "stopped", "verified", "unknown"),
+            ("crash loop", {"started": starts[-1], "recent_starts": starts, "previous": "unclean", "cycle": 1,
+                            "repeats": 1}, systemctl(restarts="2", started=starts[-1]), "critical", "crash_looping",
+             "verified", "unknown"),
+            ("history unverified", {"started": now - 30, "recent_starts": [now - 30], "previous": "malformed",
+                                    "cycle": 2, "repeats": 2}, systemctl(started=now - 30), "warning",
+             "history_unverified", "verified", "current"),
+            ("starting, no heartbeat yet", None, systemctl(started=now - 10), "unknown", "starting", "unknown",
+             "unknown"),
+            ("no heartbeat", None, None, "critical", "no_heartbeat", "unknown", "missing"),
+            ("previous process", {"pid": PID - 1}, None, "critical", "heartbeat_not_current", "mismatch",
+             "not_current"),
+            ("no MainPID", {}, systemctl(pid=0), "unknown", "identity_unavailable", "unknown", "unknown"),
+            ("failed", {}, systemctl("failed", "failed"), "critical", "service_failed", "unknown", "unknown"),
+            ("inactive", {}, systemctl("inactive", "dead"), "critical", "service_inactive", "unknown", "unknown"),
+            ("deactivating", {}, systemctl("deactivating", "stop-sigterm"), "critical", "service_inactive",
+             "unknown", "unknown"),
+            ("auto-restart", {}, systemctl("activating", "auto-restart"), "critical", "restarting", "unknown",
+             "unknown"),
+            ("start gate", {}, systemctl("activating", "start-post"), "unknown", "starting", "unknown", "unknown"),
+        ]
+
+    def assert_read(self, label, status, reason, identity, heartbeat_state):
+        worker = self.health()
+        self.assertEqual((worker["state"], worker["reason"], worker["identity"], worker["heartbeat"], worker["problem"]),
+                         (status, reason, identity, heartbeat_state, ""), (label, worker))
+
+    def test_every_producer_condition_keeps_its_meaning(self):
+        for label, beat, unit_state, status, reason, identity, heartbeat_state in self.scenarios():
+            with self.subTest(label):
+                from monitoring.services import probes
+                probes._last_restarts.clear()
+                self.beat_path.unlink(missing_ok=True)
+                if beat is not None:
+                    self.beat(**beat)
+                self.assertEqual(self.produce(unit_state), (status, reason))      # the producer's own verdict
+                self.assert_read(label, status, reason, identity, heartbeat_state)
+
+    def test_restart_observer_error_and_unrunnable_systemctl(self):
+        from monitoring.tests.test_active_message_worker_check import systemctl
+        self.beat()
+        self.produce(systemctl(restarts="2"))
+        self.assertEqual(self.produce(systemctl(restarts="3")), ("warning", "restarted"))
+        self.assert_read("restarted", "warning", "restarted", "verified", "current")
+        self.assertEqual(self.produce(observe=RuntimeError("bug")), ("unknown", "observer_error"))
+        self.assert_read("observer error", "unknown", "observer_error", "unknown", "unknown")
+        self.assertEqual(self.produce(run={"side_effect": FileNotFoundError("systemctl")}), ("unknown", ""))
+        self.assert_read("no systemctl", "unknown", "", "unknown", "unknown")
+        with mock.patch("monitoring.services.probes._active_message_worker_readiness",
+                        side_effect=RuntimeError("probe bug")), \
+                mock.patch.dict("monitoring.services.probes.APPLICATION_READINESS", clear=False) as table:
+            from monitoring.services import probes
+            table[diagnostics.WORKER_UNIT] = probes._active_message_worker_readiness
+            self.assertEqual(self.produce(), ("unknown", ""))                    # the poller's own containment
+        self.assert_read("probe raised", "unknown", "", "unknown", "unknown")
+
+    def test_the_debounce_window_never_reads_as_a_current_heartbeat(self):
+        """The poller holds a first bad verdict at the last stable status (the
+        check needs 2 consecutive failures): the written status is "ok" while
+        the detail already says stale. The board shows Monitoring's verdict but
+        never calls that heartbeat current."""
+        from monitoring.models import MonitorCheck
+        from monitoring.services import monitor as monitor_module, probes
+        from monitoring.tests.test_active_message_worker_check import systemctl
+        MonitorCheck.objects.exclude(pk=self.check.pk).update(enabled=False)
+        MonitorCheck.objects.filter(pk=self.check.pk).update(enabled=True, consecutive_failures_required=2)
+        listener = self.state.with_name("listeners.json")
+        with mock.patch.object(monitor_module, "STATE_PATH", self.state), \
+                mock.patch.object(monitor_module, "LISTENER_STATE_PATH", listener):
+            manager = monitor_module.MonitorManager()
+
+            def cycle():
+                with mock.patch.object(monitor_module, "STATE_PATH", self.state), \
+                        mock.patch.object(monitor_module, "LISTENER_STATE_PATH", listener), \
+                        mock.patch.object(manager, "_poll_shoutcast_listeners"), \
+                        mock.patch.object(monitor_module, "close_old_connections"), \
+                        mock.patch.object(monitor_module, "create_transmitter_driver", return_value=None), \
+                        mock.patch.object(probes.subprocess, "run", return_value=systemctl()), \
+                        mock.patch.object(monitor_module, "maybe_notify"):
+                    manager._run_cycle()
+                return self.health()
+
+            self.beat()
+            self.assertEqual({key: cycle()[key] for key in HEALTHY}, HEALTHY)
+            self.beat(age=heartbeat.STALE_AFTER_SECONDS + 5)
+            held = cycle()                                                 # one bad poll: held at "ok"
+            self.assertEqual((held["state"], held["reason"], held["identity"], held["heartbeat"]),
+                             ("ok", "stale", "verified", "stale"))
+            self.assertEqual(held["label"], "Worker OK — stale")
+            confirmed = cycle()
+            self.assertEqual((confirmed["state"], confirmed["heartbeat"]), ("critical", "stale"))
+
+
+ENTRY_FIELD_CASES = (
+    # (label, changes to the idle producer entry: a callable over a deep copy, expected field)
+    ("detail missing", lambda e: e.pop("detail"), "detail"),
+    ("detail null", lambda e: e.update(detail=None), "detail"),
+    ("detail a list", lambda e: e.update(detail=[{"active_state": "active"}]), "detail"),
+    ("detail a string", lambda e: e.update(detail="active"), "detail"),
+    ("detail empty", lambda e: e.update(detail={}), "detail.active_state"),
+    ("status missing", lambda e: e.pop("status"), "status"),
+    ("active_state missing", lambda e: e["detail"].pop("active_state"), "detail.active_state"),
+    ("active_state null", lambda e: e["detail"].update(active_state=None), "detail.active_state"),
+    ("active_state integer", lambda e: e["detail"].update(active_state=1), "detail.active_state"),
+    ("active_state boolean", lambda e: e["detail"].update(active_state=True), "detail.active_state"),
+    ("active_state object", lambda e: e["detail"].update(active_state={"v": "active"}), "detail.active_state"),
+    ("active_state list", lambda e: e["detail"].update(active_state=["active"]), "detail.active_state"),
+    ("active_state empty with idle", lambda e: e["detail"].update(active_state=""), "detail.reason"),
+    ("inactive yet idle", lambda e: e["detail"].update(active_state="inactive", sub_state="dead"), "detail.reason"),
+    ("sub_state missing", lambda e: e["detail"].pop("sub_state"), "detail.sub_state"),
+    ("sub_state null", lambda e: e["detail"].update(sub_state=None), "detail.sub_state"),
+    ("sub_state integer", lambda e: e["detail"].update(sub_state=0), "detail.sub_state"),
+    ("sub_state boolean", lambda e: e["detail"].update(sub_state=False), "detail.sub_state"),
+    ("sub_state list", lambda e: e["detail"].update(sub_state=["running"]), "detail.sub_state"),
+    ("reason missing", lambda e: e["detail"].pop("reason"), "detail.reason"),
+    ("reason null", lambda e: e["detail"].update(reason=None), "detail.reason"),
+    ("reason empty", lambda e: e["detail"].update(reason=""), "detail.reason"),
+    ("reason integer", lambda e: e["detail"].update(reason=1), "detail.reason"),
+    ("reason boolean", lambda e: e["detail"].update(reason=True), "detail.reason"),
+    ("reason object", lambda e: e["detail"].update(reason={"code": "idle"}), "detail.reason"),
+    ("reason list", lambda e: e["detail"].update(reason=["idle"]), "detail.reason"),
+    ("reason unknown", lambda e: e["detail"].update(reason="excellent"), "detail.reason"),
+    ("service reason while active", lambda e: e["detail"].update(reason="service_failed"), "detail.reason"),
+    ("n_restarts missing", lambda e: e["detail"].pop("n_restarts"), "detail.n_restarts"),
+    ("n_restarts text", lambda e: e["detail"].update(n_restarts="0"), "detail.n_restarts"),
+    ("n_restarts boolean", lambda e: e["detail"].update(n_restarts=False), "detail.n_restarts"),
+    ("n_restarts negative", lambda e: e["detail"].update(n_restarts=-1), "detail.n_restarts"),
+    ("n_restarts float", lambda e: e["detail"].update(n_restarts=1.5), "detail.n_restarts"),
+    ("native_airing missing", lambda e: e["detail"].pop("native_airing"), "detail.native_airing"),
+    ("native_airing unknown", lambda e: e["detail"].update(native_airing="maybe"), "detail.native_airing"),
+    ("native_airing boolean", lambda e: e["detail"].update(native_airing=False), "detail.native_airing"),
+    ("phase missing", lambda e: e["detail"].pop("phase"), "detail.phase"),
+    ("phase unknown", lambda e: e["detail"].update(phase="dancing"), "detail.phase"),
+    ("phase integer", lambda e: e["detail"].update(phase=1), "detail.phase"),
+    ("idle while rendering", lambda e: e["detail"].update(phase="rendering"), "detail.phase"),
+    ("idle while stopped", lambda e: e["detail"].update(phase="stopped"), "detail.phase"),
+    ("rendering while polling", lambda e: e["detail"].update(reason="rendering"), "detail.phase"),
+    ("stopped while polling", lambda e: e.update(status="critical") or e["detail"].update(reason="stopped"),
+     "detail.phase"),
+    ("outcome missing", lambda e: e["detail"].pop("outcome"), "detail.outcome"),
+    ("outcome unknown", lambda e: e["detail"].update(outcome="great"), "detail.outcome"),
+    ("outcome null", lambda e: e["detail"].update(outcome=None), "detail.outcome"),
+    ("code missing", lambda e: e["detail"].pop("code"), "detail.code"),
+    ("code null", lambda e: e["detail"].update(code=None), "detail.code"),
+    ("code integer", lambda e: e["detail"].update(code=5), "detail.code"),
+    ("execution missing", lambda e: e["detail"].pop("execution"), "detail.execution"),
+    ("execution object", lambda e: e["detail"].update(execution={"id": 1}), "detail.execution"),
+    ("heartbeat age missing", lambda e: e["detail"].pop("heartbeat_age_seconds"), "detail.heartbeat_age_seconds"),
+    ("heartbeat age null", lambda e: e["detail"].update(heartbeat_age_seconds=None), "detail.heartbeat_age_seconds"),
+    ("heartbeat age text", lambda e: e["detail"].update(heartbeat_age_seconds="3"), "detail.heartbeat_age_seconds"),
+    ("heartbeat age boolean", lambda e: e["detail"].update(heartbeat_age_seconds=True),
+     "detail.heartbeat_age_seconds"),
+    ("heartbeat age NaN", lambda e: e["detail"].update(heartbeat_age_seconds=float("nan")),
+     "detail.heartbeat_age_seconds"),
+    ("heartbeat age infinite", lambda e: e["detail"].update(heartbeat_age_seconds=float("inf")),
+     "detail.heartbeat_age_seconds"),
+    ("heartbeat from the future", lambda e: e["detail"].update(heartbeat_age_seconds=-31.0),
+     "detail.heartbeat_age_seconds"),
+    ("idle yet stale", lambda e: e["detail"].update(heartbeat_age_seconds=61.0), "detail.heartbeat_age_seconds"),
+    ("stale yet fresh", lambda e: e.update(status="critical") or e["detail"].update(reason="stale"),
+     "detail.heartbeat_age_seconds"),
+    ("idle reported as warning", lambda e: e.update(status="warning"), "status"),
+    ("unproven identity reported ok", lambda e: e["detail"].update(reason="identity_unavailable"), "status"),
+    ("starting reported ok", lambda e: e["detail"].update(reason="starting"), "status"),
+    ("malformed without its problem", lambda e: e.update(status="critical") or e["detail"].update(reason="malformed"),
+     "detail.problem"),
+    ("failed unit without a reason", lambda e: e.update(status="critical") or (
+        e["detail"].update(active_state="failed", sub_state="failed"), e["detail"].pop("reason")), "detail.reason"),
+    ("failed unit called restarting", lambda e: e.update(status="critical") or e["detail"].update(
+        active_state="failed", sub_state="failed", reason="restarting"), "detail.reason"),
+    ("auto-restart called failed", lambda e: e.update(status="critical") or e["detail"].update(
+        active_state="activating", sub_state="auto-restart", reason="service_failed"), "detail.reason"),
+    ("no unit state, status ok", lambda e: e.update(detail={"error": "systemctl"}), "detail.active_state"),
+    ("no unit state, error not text", lambda e: e.update(status="unknown", detail={"error": 5}),
+     "detail.active_state"),
+    ("no unit state yet a reason", lambda e: e.update(status="unknown", detail={"error": "x", "reason": "idle"}),
+     "detail.active_state"),
+)
+
+
+class NestedSchemaValidationTests(MonitoringStateFixture, Domain, TestCase):
+    """One field at a time, every nested field the board's verdict depends on:
+    missing, null, mistyped, unknown or contradicting the producer's contract
+    is "monitoring_unavailable" / entry_invalid naming that field -- found by
+    validation (never by the catch-all), and never ok, verified or current."""
+
+    def test_every_incomplete_or_contradictory_entry_fails_closed_naming_its_field(self):
+        import copy
+        for label, change, field in ENTRY_FIELD_CASES:
+            with self.subTest(label):
+                entry = copy.deepcopy(self.entry())
+                change(entry)
+                self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+                with mock.patch.object(diagnostics, "_unavailable", wraps=diagnostics._unavailable) as unavailable:
+                    worker = self.health()
+                self.assertEqual((worker["state"], worker["problem"], worker["field"]),
+                                 ("monitoring_unavailable", "entry_invalid", field), worker)
+                self.assertEqual((worker["identity"], worker["heartbeat"], worker["observed_age_seconds"]),
+                                 ("unknown", "unknown", None))
+                self.assertEqual(worker["label"],
+                                 "Monitoring status unavailable — worker check data is incomplete")
+                self.assertEqual(unavailable.call_args.args[1:], ("entry_invalid", field))  # not observer_error
+
+    def test_valid_nonhealthy_states_are_not_malformed(self):
+        """Known non-running states with exactly the producer's fields."""
+        common = {"uptime_seconds": 1.0, "restart_via_dashboard": False, "n_restarts": 4}
+        for status, detail, expected in (
+                ("critical", {"active_state": "failed", "sub_state": "failed", "reason": "service_failed"},
+                 ("critical", "unknown", "unknown")),
+                ("critical", {"active_state": "inactive", "sub_state": "dead", "reason": "service_inactive"},
+                 ("critical", "unknown", "unknown")),
+                ("critical", {"active_state": "activating", "sub_state": "auto-restart", "reason": "restarting"},
+                 ("critical", "unknown", "unknown")),
+                ("unknown", {"active_state": "activating", "sub_state": "start-pre", "reason": "starting"},
+                 ("unknown", "unknown", "unknown")),
+                ("unknown", {"active_state": "active", "sub_state": "running", "reason": "identity_unavailable",
+                             "native_airing": "closed"}, ("unknown", "unknown", "unknown")),
+                ("critical", {"active_state": "active", "sub_state": "running", "reason": "malformed",
+                              "problem": "bad_pid", "native_airing": "closed"}, ("critical", "unknown", "malformed")),
+                ("unknown", {"error": "[Errno 2] No such file or directory: 'systemctl'"},
+                 ("unknown", "unknown", "unknown"))):
+            with self.subTest(reason=detail.get("reason", "no unit state")):
+                entry = {**self.entry(status), "detail": {**common, **detail} if "active_state" in detail else detail}
+                self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+                worker = self.health()
+                self.assertEqual((worker["state"], worker["identity"], worker["heartbeat"]), expected, worker)
+                self.assertEqual(worker["problem"], "")
+
+    def test_a_held_verdict_for_an_unbound_or_failed_worker_is_never_verified(self):
+        """Within the poller's debounce a critical detail can sit under any
+        last stable status -- even "ok"; identity and heartbeat still come
+        only from the detail's own evidence."""
+        for reason, changes, identity, heartbeat_state in (
+                ("no_heartbeat", {}, "unknown", "missing"),
+                ("heartbeat_not_current", {}, "mismatch", "not_current"),
+                ("service_failed", {"active_state": "failed", "sub_state": "failed"}, "unknown", "unknown"),
+                ("stale", {"heartbeat_age_seconds": 75.0}, "verified", "stale"),
+                ("crash_looping", {}, "verified", "unknown")):
+            with self.subTest(reason):
+                self.publish("ok", reason=reason, **changes)
+                worker = self.health()
+                self.assertEqual((worker["state"], worker["reason"], worker["identity"], worker["heartbeat"]),
+                                 ("ok", reason, identity, heartbeat_state))
+
+    def test_a_stale_observation_claims_nothing_current(self):
+        self.publish(age=120)
+        worker = self.health()
+        self.assertEqual((worker["state"], worker["status"], worker["identity"], worker["heartbeat"]),
+                         ("stale", "ok", "unknown", "unknown"))
+
+
+class WorkerEndpointMatrixTests(MonitoringStateFixture, Domain, TestCase):
+    """All four board surfaces, for incomplete, valid and untrusted worker
+    state: no crash, no false health, the precise reason, no traceback or
+    path, no write, no Monitoring event, no inspection, no engine action."""
+
+    def scenarios(self):
+        def without(*path, status="ok", **detail):
+            def write():
+                entry = self.entry(status, **detail)
+                holder = entry
+                for key in path[:-1]:
+                    holder = holder[key]
+                del holder[path[-1]]
+                self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": [entry]}))
+            return write
+
+        def publish(status, **detail):
+            return lambda: self.publish(status, **detail)
+
+        def raw(text):
+            return lambda: self.state.write_text(text)
+
+        inactive = {"active_state": "failed", "sub_state": "failed"}
+        return [
+            # (label, write, state, problem, field, chip class, identity, heartbeat)
+            ("missing detail", without("detail"), "monitoring_unavailable", "entry_invalid", "detail", "off",
+             "unknown", "unknown"),
+            ("missing active_state", without("detail", "active_state"), "monitoring_unavailable", "entry_invalid",
+             "detail.active_state", "off", "unknown", "unknown"),
+            ("missing sub_state", without("detail", "sub_state"), "monitoring_unavailable", "entry_invalid",
+             "detail.sub_state", "off", "unknown", "unknown"),
+            ("active/running without reason", without("detail", "reason"), "monitoring_unavailable",
+             "entry_invalid", "detail.reason", "off", "unknown", "unknown"),
+            ("failed unit without reason", without("detail", "reason", status="critical", **inactive),
+             "monitoring_unavailable", "entry_invalid", "detail.reason", "off", "unknown", "unknown"),
+            ("missing restart count", without("detail", "n_restarts"), "monitoring_unavailable", "entry_invalid",
+             "detail.n_restarts", "off", "unknown", "unknown"),
+            ("missing heartbeat age", without("detail", "heartbeat_age_seconds"), "monitoring_unavailable",
+             "entry_invalid", "detail.heartbeat_age_seconds", "off", "unknown", "unknown"),
+            ("valid healthy", publish("ok"), "ok", "", "", "ok", "verified", "current"),
+            ("valid warning", publish("warning", reason="blocked", outcome="blocked"), "warning", "", "", "review",
+             "verified", "current"),
+            ("valid critical", publish("critical", reason="service_failed", **inactive), "critical", "", "",
+             "alert", "unknown", "unknown"),
+            ("malformed document", raw(json.dumps({"timestamp": time.time() - 2, "checks": 1})),
+             "monitoring_unavailable", "checks_invalid", "", "off", "unknown", "unknown"),
+            ("future document", lambda: self.state.write_text(json.dumps(
+                {"timestamp": time.time() + 100, "checks": [self.entry()]})),
+             "monitoring_unavailable", "timestamp_in_future", "", "off", "unknown", "unknown"),
+        ]
+
+    def operator_client(self):
+        """The main board creates the policy singleton on its first visit to a
+        fresh database (services.current_policy) -- not a worker-health write."""
+        client = self.operator()
+        warm(client)
+        client.get(BOARD)
+        return client
+
+    def surfaces(self, client):
+        from monitoring.models import SystemEvent
+        events = (SystemEvent.objects.count(), ActiveBroadcastMessageEvent.objects.count())
+        forbidden = [mock.patch.object(diagnostics, "inspect", side_effect=AssertionError("inspect")),
+                     mock.patch.object(reconcile, "reconcile", side_effect=AssertionError("reconcile")),
+                     mock.patch.object(reconcile, "attention", side_effect=AssertionError("attention")),
+                     mock.patch.object(playout, "dispatch", side_effect=AssertionError("dispatch")),
+                     mock.patch("subprocess.run", side_effect=AssertionError("subprocess")),
+                     mock.patch("subprocess.Popen", side_effect=AssertionError("subprocess"))]
+        for patcher in forbidden:
+            patcher.start()
+        try:
+            with CaptureQueriesContext(connection) as queries:
+                responses = [client.get(url) for url in (BOARD, BOARD + "status/", DIAG, DATA)]
+        finally:
+            for patcher in forbidden:
+                patcher.stop()
+        self.assertEqual(writes(queries), [])
+        self.assertEqual((SystemEvent.objects.count(), ActiveBroadcastMessageEvent.objects.count()), events)
+        for response in responses:
+            self.assertEqual(response.status_code, 200)
+            for leak in (b"Traceback", b"TypeError", b"KeyError", b"AttributeError", str(self.state).encode(),
+                         b"/run/isadoraair"):
+                self.assertNotIn(leak, response.content)
+        return responses
+
+    def test_every_surface_for_every_worker_state(self):
+        client = self.operator_client()
+        for label, write, state, problem, field, chip, identity, heartbeat_state in self.scenarios():
+            with self.subTest(label):
+                write()
+                board, status, page, data = self.surfaces(client)
+                self.assertContains(board, f'data-worker-state="{state}"')
+                self.assertEqual((status.json()["worker"]["state"], status.json()["worker"]["class"]), (state, chip))
+                worker = data.json()["worker"]
+                self.assertEqual((worker["state"], worker["problem"], worker["field"], worker["identity"],
+                                  worker["heartbeat"]), (state, problem, field, identity, heartbeat_state))
+                self.assertEqual((data.json()["inspection"], data.json()["status"]), (None, "not_inspected"))
+                self.assertContains(page, f'data-worker-state="{state}"')
+                if state == "monitoring_unavailable":
+                    self.assertNotContains(board, "Worker OK")
+                    self.assertNotIn("Worker OK", status.json()["worker"]["label"])
+                    self.assertNotIn("Verified", content(page))
+                    self.assertIn(f'data-worker-problem="{problem}"', content(page))
+                    if problem == "entry_invalid":
+                        self.assertContains(board, "worker check data is incomplete")
+                elif state == "ok":
+                    self.assertContains(board, "Worker OK")
+                    self.assertIn("Verified", content(page))
+
+    def test_disabled_and_unprovisioned_on_every_surface(self):
+        client = self.operator_client()
+        self.publish()
+        for state, change in (("disabled", lambda: self.check.__class__.objects.filter(pk=self.check.pk)
+                                         .update(enabled=False)),
+                              ("not_configured", lambda: self.check.__class__.objects.filter(pk=self.check.pk)
+                                              .delete())):
+            with self.subTest(state):
+                change()
+                board, status, page, data = self.surfaces(client)
+                self.assertContains(board, f'data-worker-state="{state}"')
+                self.assertEqual((status.json()["worker"]["state"], status.json()["worker"]["class"]), (state, "off"))
+                self.assertEqual((data.json()["worker"]["state"], data.json()["worker"]["identity"]),
+                                 (state, "unknown"))
+                self.assertContains(page, f'data-worker-state="{state}"')
 
 
 class InspectionOptInTests(Fixtures, Domain, TestCase):

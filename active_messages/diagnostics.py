@@ -277,9 +277,33 @@ MONITORING_STATE_MAX_BYTES = 4 * 1024 * 1024
 # path (monitoring.views.STATE_PATH). The test suite points it at a disposable
 # location so no test ever reads a station's live Monitoring state.
 MONITORING_STATE_PATH = None
-# Conditions under which supervision.observe never bound the heartbeat to the running process.
-IDENTITY_UNPROVEN = frozenset({"identity_unavailable", "heartbeat_not_current", "starting", "no_heartbeat",
-                               "malformed", "observer_error", "service_inactive", "service_failed", "restarting"})
+# The worker check's serialized contract, as its one producer writes it
+# (monitoring.services.probes.probe_systemd -> _active_message_worker_readiness
+# -> active_messages.supervision.observe -> heartbeat.assess, serialized by
+# monitoring.services.monitor._build_result). Every reason is listed with what
+# it proves; a reason outside these tables is not trusted.
+#
+# Unit not active: the reason is a function of active_state/sub_state alone
+# ("starting", "restarting", "service_failed", "service_inactive").
+# Unit active, heartbeat NOT bound to the running process (identity unproven).
+UNBOUND_REASONS = frozenset({"observer_error", "identity_unavailable", "starting", "no_heartbeat",
+                             "heartbeat_not_current", "malformed"})
+# Unit active, heartbeat bound to the running process (supervision.belongs:
+# MainPID and ExecMainStartTimestamp) -- heartbeat.assess's verdict on it.
+# FRESH passed assess's staleness bound (a render within its deadline is
+# assess's own exception); the others say nothing current about it.
+FRESH_REASONS = frozenset({"idle", "busy", "retry_backoff", "playout_in_flight", "working", "ready_waiting_for_gate",
+                           "rendering", "blocked", "lock_held_elsewhere", "database_errors", "malfunction",
+                           "history_unverified", "restarted"})
+BOUND_REASONS = FRESH_REASONS | {"stale", "stopped", "crash_looping", "render_overdue"}
+# assess's order: "stopped" exactly for the stopped phase; a rendering heartbeat
+# is never judged stale, only overdue, and may still be a crash loop.
+RENDER_PHASE_REASONS = frozenset({"rendering", "render_overdue", "crash_looping", "history_unverified", "restarted"})
+# Raw verdicts the poller never debounces (only warning/critical are held at
+# the last stable status), so the written status must be exactly this one.
+UNDEBOUNCED_STATUS = {"starting": "unknown", "observer_error": "unknown", "identity_unavailable": "unknown",
+                      **{reason: "ok" for reason in ("idle", "busy", "retry_backoff", "playout_in_flight",
+                                                     "working", "ready_waiting_for_gate", "rendering")}}
 RECOVERY_CONDITIONS = frozenset({"crash_looping", "restarted", "history_unverified", "restarting"})
 WORKER_LABELS = {
     "not_configured": "Worker check not provisioned",
@@ -326,17 +350,21 @@ PROBLEMS = {
     "timestamp_invalid": "its observation time is not a valid epoch timestamp",
     "timestamp_in_future": "its observation time is in the future, so it cannot describe the present",
     "checks_invalid": "its list of check results is malformed",
-    "entry_invalid": "the worker's check result is malformed",
+    "entry_invalid": "the worker's check result is incomplete or malformed",
     "observer_error": "its state could not be interpreted",
 }
 
 
-class UntrustedState(ValueError):
-    """The Monitoring document cannot be trusted; ``code`` says why."""
+PROBLEM_LABELS = {"entry_invalid": "worker check data is incomplete"}
 
-    def __init__(self, code):
+
+class UntrustedState(ValueError):
+    """The Monitoring document cannot be trusted; ``code`` says why and
+    ``field`` (when one is to blame) which part of the worker's entry."""
+
+    def __init__(self, code, field=""):
         super().__init__(code)
-        self.code = code
+        self.code, self.field = code, field
 
 
 def _observation_age(document, now) -> float:
@@ -372,14 +400,90 @@ def _worker_entry(document, check_id):
         seen.add(item["id"])
         if item["id"] == check_id:
             found = item
-    if found is None:
-        return None
-    detail = found.get("detail", {})
-    if found.get("status") not in MONITORING_STATUSES or type(detail) is not dict \
-            or not isinstance(detail.get("reason", ""), (str, type(None))) \
-            or not isinstance(detail.get("active_state", ""), (str, type(None))):
-        raise UntrustedState("entry_invalid")
     return found
+
+
+def _invalid(field):
+    return UntrustedState("entry_invalid", field)
+
+
+def _number(value) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _worker_evidence(entry):
+    """(status, reason, identity, heartbeat) from one worker entry validated
+    against the producer's contract for the state it reports, or
+    UntrustedState("entry_invalid", field). Nothing is defaulted: a missing,
+    mistyped, unknown or contradictory field can only make the entry
+    untrusted -- never idle, running, verified or current."""
+    status = entry.get("status")
+    if status not in MONITORING_STATUSES:
+        raise _invalid("status")
+    if "detail" not in entry:
+        raise _invalid("detail")
+    detail = entry["detail"]
+    if type(detail) is not dict:
+        raise _invalid("detail")
+    if "active_state" not in detail:
+        # systemctl itself could not be run, or the probe raised: the poller
+        # writes {"error": ...} as "unknown" -- no unit state, no verdict.
+        if "reason" in detail or status != "unknown" or type(detail.get("error")) is not str:
+            raise _invalid("detail.active_state")
+        return status, "", "unknown", "unknown"
+    active_state = detail["active_state"]
+    if type(active_state) is not str:
+        raise _invalid("detail.active_state")
+    if type(detail.get("sub_state")) is not str:
+        raise _invalid("detail.sub_state")
+    sub_state = detail["sub_state"]
+    reason = detail.get("reason")
+    if type(reason) is not str or not reason:
+        raise _invalid("detail.reason")
+    if "n_restarts" not in detail or not (detail["n_restarts"] is None or type(detail["n_restarts"]) is int
+                                          and detail["n_restarts"] >= 0):
+        raise _invalid("detail.n_restarts")
+    if UNDEBOUNCED_STATUS.get(reason, status) != status:
+        raise _invalid("status")                          # e.g. "ok" over an identity it could not prove
+    if active_state != "active":
+        expected = ("starting" if active_state == "activating" and sub_state != "auto-restart"
+                    else "restarting" if active_state == "activating" or sub_state == "auto-restart"
+                    else "service_failed" if active_state == "failed" else "service_inactive")
+        if reason != expected:
+            raise _invalid("detail.reason")
+        return status, reason, "unknown", "unknown"
+    if reason not in UNBOUND_REASONS | BOUND_REASONS:
+        raise _invalid("detail.reason")
+    if reason != "observer_error" and detail.get("native_airing") not in ("open", "closed"):
+        raise _invalid("detail.native_airing")
+    if reason not in BOUND_REASONS:
+        if reason == "malformed" and type(detail.get("problem")) is not str:
+            raise _invalid("detail.problem")
+        return status, reason, ("mismatch" if reason == "heartbeat_not_current" else "unknown"), {
+            "no_heartbeat": "missing", "heartbeat_not_current": "not_current", "malformed": "malformed",
+        }.get(reason, "unknown")
+    # A bound heartbeat: every field assess reported on it must be there, typed
+    # and consistent with the reason -- the evidence is never synthesized.
+    phase, outcome = detail.get("phase"), detail.get("outcome")
+    if phase not in heartbeat.PHASES or (phase == "stopped") != (reason == "stopped") \
+            or phase == "rendering" and reason not in RENDER_PHASE_REASONS \
+            or reason in ("rendering", "render_overdue") and phase != "rendering":
+        raise _invalid("detail.phase")
+    if outcome not in heartbeat.RESULTS:
+        raise _invalid("detail.outcome")
+    for field in ("code", "execution"):
+        if type(detail.get(field)) is not str:
+            raise _invalid(f"detail.{field}")
+    age = detail.get("heartbeat_age_seconds")
+    if not _number(age) or age < -heartbeat.MAX_FUTURE_SKEW_SECONDS:
+        raise _invalid("detail.heartbeat_age_seconds")
+    if phase != "rendering" and reason in FRESH_REASONS and age > heartbeat.STALE_AFTER_SECONDS \
+            or reason == "stale" and age < heartbeat.STALE_AFTER_SECONDS:
+        raise _invalid("detail.heartbeat_age_seconds")   # "current" and stale at once
+    if status == "unknown":
+        return status, reason, "unknown", "unknown"
+    return status, reason, "verified", ("current" if reason in FRESH_REASONS
+                                        else "stale" if reason == "stale" else "unknown")
 
 
 def worker_health(*, now=None, state_path=None) -> dict:
@@ -387,23 +491,26 @@ def worker_health(*, now=None, state_path=None) -> dict:
 
     state: "not_configured" (no Monitoring check of the unit), "disabled",
     "monitoring_unavailable" (no trustworthy state: unreadable, malformed,
-    or an observation time that is missing, invalid or in the future --
-    ``problem`` says which), "stale" (Monitoring's last poll is older than its
+    or an observation time that is missing, invalid or in the future, or a
+    worker entry that is incomplete or contradicts the producer's contract --
+    ``problem`` says which, ``field`` which part of the entry), "stale" (Monitoring's last poll is older than its
     own staleness bound: the verdict shown is only the last known one),
     "not_observed" (the poller has no result for the check yet), or the
     verdict's status ("ok", "warning", "critical", "unknown"). Never raises:
     an unforeseen fault is "monitoring_unavailable" too, never health."""
     base = {"monitoring_url": "/monitoring/", "unit": WORKER_UNIT, "identity": "unknown", "heartbeat": "unknown",
-            "recovery": False, "reason": "", "problem": "", "observed_age_seconds": None, "detail": {}}
+            "recovery": False, "reason": "", "problem": "", "field": "", "observed_age_seconds": None, "detail": {}}
     try:
         return _worker_health(base, now=time.time() if now is None else now, state_path=state_path)
     except Exception:                                 # noqa: BLE001 -- fail closed, never a crash or "ok"
         return _unavailable(base, "observer_error")
 
 
-def _unavailable(base, problem, **extra):
-    return {**base, **extra, "state": "monitoring_unavailable", "problem": problem,
-            "label": WORKER_LABELS["monitoring_unavailable"], "explanation": PROBLEMS[problem]}
+def _unavailable(base, problem, field="", **extra):
+    label = WORKER_LABELS["monitoring_unavailable"]
+    return {**base, **extra, "state": "monitoring_unavailable", "problem": problem, "field": field,
+            "label": label + (f" — {PROBLEM_LABELS[problem]}" if problem in PROBLEM_LABELS else ""),
+            "explanation": PROBLEMS[problem]}
 
 
 def _worker_health(base, *, now, state_path) -> dict:
@@ -424,27 +531,22 @@ def _worker_health(base, *, now, state_path) -> dict:
     try:
         age = _observation_age(document, now)
         entry = _worker_entry(document, check["id"])
+        if entry is not None:
+            status, reason, identity, heartbeat_state = _worker_evidence(entry)
     except UntrustedState as exc:
-        return _unavailable(base, exc.code, check=check["name"])
+        return _unavailable(base, exc.code, exc.field, check=check["name"])
     age = round(age, 1)
     if entry is None:
         return {**base, "state": "not_observed", "label": WORKER_LABELS["not_observed"], "check": check["name"],
                 "observed_age_seconds": age}
-    status = entry["status"]
-    detail = entry.get("detail", {})
-    reason = str(detail.get("reason") or "")[:64]
-    active = detail.get("active_state") == "active"
-    identity = ("mismatch" if reason == "heartbeat_not_current"
-                else "verified" if active and reason not in IDENTITY_UNPROVEN and status != "unknown"
-                else "unknown")
-    heartbeat_state = ("current" if identity == "verified" else "missing" if reason == "no_heartbeat"
-                       else "not_current" if reason == "heartbeat_not_current" else "malformed"
-                       if reason == "malformed" else "unknown")
+    detail = entry["detail"]
     shown = {key: detail[key] for key in ("phase", "outcome", "code", "heartbeat_age_seconds", "native_airing",
                                           "n_restarts", "active_state", "sub_state")
              if key in detail and isinstance(detail[key], (str, int, float, bool, type(None)))
              and not (isinstance(detail[key], float) and not math.isfinite(detail[key]))}
     stale = age > STATE_STALE_SECONDS
+    if stale:                                             # the last known verdict proves nothing current
+        identity, heartbeat_state = "unknown", "unknown"
     return {**base, "state": "stale" if stale else status, "status": status,
             "label": (WORKER_LABELS["stale"] if stale else WORKER_LABELS[status]) + (f" — {reason}" if reason else ""),
             "reason": reason, "identity": identity, "heartbeat": heartbeat_state,

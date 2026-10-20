@@ -1888,21 +1888,74 @@ healthy -- with a `problem` and a plain explanation (no traceback, no path):
 * `checks_invalid` -- `checks` missing or not a list, or any entry that is not
   an object with an integer `id`, or a duplicated id (a garbled list must not
   read as "not yet observed"); an empty list is valid: "not observed";
-* `entry_invalid` -- the worker's entry has an unknown status or a non-object
-  detail.
+* `entry_invalid` -- the worker's entry is incomplete, mistyped or contradicts
+  the producer's contract (below); `field` names the part to blame
+  (`status`, `detail`, `detail.reason`, ...) and the chip reads "Monitoring
+  status unavailable — worker check data is incomplete".
 
 Any unforeseen fault is also "unavailable" (`observer_error`), never a 500 and
-never health. So the board, the status poll, the diagnostics page and its
+never health.
+
+**The worker entry's schema is its producer's.** The worker check has one
+producer: `probes.probe_systemd` → `_active_message_worker_readiness` →
+`supervision.observe` → `heartbeat.assess`, serialized by the poller's
+`_build_result` (`{"id", "name", "kind", "status", "detail", ...}`). The board
+validates exactly that contract, state by state, and defaults nothing that a
+verdict depends on: a missing `detail` is not `{}`, a missing `active_state`
+is not "idle", a missing `reason` is not a healthy condition, and no identity
+or heartbeat evidence is ever synthesized.
+
+| Producer path | `detail` the producer writes | Required by the board |
+|---|---|---|
+| systemctl could not run, or the probe raised | `{"error": "..."}`, status `unknown` | `error` (text), status `unknown`, no `reason` |
+| unit not active | `active_state`, `sub_state`, `n_restarts`, `reason` (+ `uptime_seconds`, `restart_via_dashboard`) | all four; `reason` must be the one the producer derives from `active_state`/`sub_state` (`starting`, `restarting`, `service_failed`, `service_inactive`) |
+| active, observer raised | as above, `reason: observer_error` (+ `error`) | the four; status `unknown` |
+| active, heartbeat not bound to the process | + `native_airing`; `reason` `identity_unavailable` / `starting` / `no_heartbeat` / `heartbeat_not_current` / `malformed` (+ `problem`) | + `native_airing` (`open`/`closed`); `problem` (text) for `malformed` |
+| active, heartbeat bound (`supervision.belongs`) | + `phase`, `outcome`, `code`, `execution`, `heartbeat_age_seconds`; `reason` = `heartbeat.assess`'s condition, or `restarted` | all of them, typed (`phase` ∈ heartbeat PHASES, `outcome` ∈ RESULTS, `code`/`execution` text, a finite age no further ahead than assess's 30 s skew) |
+
+Optional display metadata (`uptime_seconds`, `restart_via_dashboard`,
+`error`, `problem` text) never decides anything. Contradictions the producer
+cannot write are refused too: a reason the poller never debounces under
+another status (an `ok` condition not written `ok`; `starting`,
+`identity_unavailable`, `observer_error` not written `unknown`), a reason that
+disagrees with the unit state, `stopped` without the stopped phase, a render
+condition outside the rendering phase (or an idle one inside it), a fresh
+condition with a heartbeat older than assess's staleness bound, or `stale`
+with a younger one.
+
+What a valid entry establishes:
+
+* **Process identity verified** -- only a bound-heartbeat condition (the
+  verdict came past `supervision.belongs`), never under status `unknown`;
+  **not current** for `heartbeat_not_current`; otherwise **unknown**.
+* **Heartbeat current** -- only for conditions that passed assess's staleness
+  bound (idle, busy, retry, playout, working, gated, blocked, lock held,
+  database errors, malfunction, unverified history, restarted) and a render
+  within its deadline. `stale` is **stale**; `stopped`, `crash_looping` and
+  `render_overdue` are **unknown** (assess decided them before or without
+  freshness); `no_heartbeat` is missing, `malformed` malformed.
+* A **stale** Monitoring observation (older than 30 s) proves nothing current:
+  identity and heartbeat are unknown; the last verdict is shown as such.
+* The poller holds a first warning/critical result at the last stable status
+  (the worker check needs 2 consecutive failures), so for one poll the status
+  can read "ok" while the detail already says e.g. `stale` or
+  `service_failed`. The board shows Monitoring's own verdict with that
+  condition ("Worker OK — stale") and derives identity and heartbeat only
+  from the detail -- never current or verified beyond what it proves.
+
+**Unavailable is not unhealthy.** An untrusted or incomplete entry says
+nothing about the worker: it is never shown as stopped, failed or critical,
+and never as healthy -- the worker's state is unknown until the next
+trustworthy observation. A genuinely failed, stopped or crash-looping worker
+is a valid entry and keeps its real classification. Disabled, unprovisioned
+and not-yet-observed checks are their own states and need no worker detail.
+Timestamp validation and the explicit `?inspect=1` opt-in are unchanged. So the board, the status poll, the diagnostics page and its
 JSON keep answering, and the rest of the status keeps updating; the next
 trustworthy document restores the specific state. The existing staleness
 bound is unchanged ("out of date" past 30 s).
 
-Process identity: **verified** only for an active unit whose verdict came
-past `supervision.belongs`; **not current** (`heartbeat_not_current`);
-otherwise **unknown** (`identity_unavailable`, starting, no heartbeat,
-malformed, observer error, inactive). Crash loops, automatic restarts and
-unverified history are flagged as recovery. A healthy worker never means
-anything is on air.
+Crash loops, automatic restarts, unverified history and restarting are
+flagged as recovery. A healthy worker never means anything is on air.
 
 ### Historical evidence on an airing
 
@@ -2143,6 +2196,11 @@ restore, a version change, stale ON AIR and the worker chip.
   "Monitoring status unavailable", never a current healthy verdict and never
   an exception; the JSON diagnostics route inspects only on the same explicit
   `?inspect=1` as the page (`board.inspection_requested`).
+* Nested-schema correction: the worker entry is validated against its
+  producer's serialized contract, state by state (`field` names what is
+  missing or wrong); an incomplete entry is "unavailable", never ok, verified
+  or current, and a heartbeat is "current" only for conditions that passed
+  the heartbeat's staleness bound.
 * Reconciler: one shared Track-ownership scan per inspection
   (`retention.references_by_location`); `Report.generated_at`;
   `reconcile.inspect_publication`. Cleanup authorities unchanged.

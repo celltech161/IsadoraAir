@@ -70,6 +70,8 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
             route.fulfill(status=403, content_type="text/html", body="<h1>403 Forbidden</h1>")
         elif self.mode == "login_page":
             route.fulfill(status=200, content_type="text/html", body="<form>Sign in</form>")
+        elif self.mode == "live":                                      # the real status view answers
+            route.continue_()
         else:                                                          # "hold": answered later (or never)
             self.held.append(route)
 
@@ -296,4 +298,68 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
         state = self.state(page)
         self.assertEqual((state["sent"], state["failures"], state["stopped"]), (3, 0, False))
         self.assertEqual(len(self.hits), 3)                                  # one request per refresh
+        self.close(page)
+
+    @in_browser
+    def test_an_incomplete_worker_entry_from_the_real_status_view(self):
+        """Nested-schema correction, end to end: the real status view reads a
+        disposable Monitoring document; an incomplete worker entry turns the
+        chip unavailable (never Worker OK) as an ordinary 200 answer, a
+        malformed document likewise, and a valid observation restores it."""
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest import mock
+
+        from active_messages import diagnostics
+        from monitoring.models import MonitorCheck
+        holder = tempfile.TemporaryDirectory(prefix="am-monitoring-")
+        self.addCleanup(holder.cleanup)
+        state_file = Path(holder.name) / "monitoring_state.json"
+        patcher = mock.patch.object(diagnostics, "MONITORING_STATE_PATH", state_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        check = MonitorCheck.objects.filter(kind="systemd", systemd_unit=diagnostics.WORKER_UNIT).first() \
+            or MonitorCheck.objects.create(kind="systemd", systemd_unit=diagnostics.WORKER_UNIT, name="Worker")
+        MonitorCheck.objects.filter(pk=check.pk).update(enabled=True)
+
+        def observe(*, drop=None, checks=None):
+            detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": 597.0,
+                      "restart_via_dashboard": False, "n_restarts": 0, "native_airing": "closed",
+                      "phase": "polling", "outcome": "idle", "code": "", "execution": "",
+                      "heartbeat_age_seconds": 3.1, "reason": "idle"}
+            if drop:
+                del detail[drop]
+            entry = {"id": check.pk, "name": check.name, "kind": "systemd", "status": "ok", "detail": detail}
+            state_file.write_text(json.dumps({"timestamp": time.time() - 2,
+                                              "checks": [entry] if checks is None else checks}))
+
+        observe()
+        page = self.clocked()
+        self.mode = "live"
+        self.advance(page, EVERY)
+        self.assertEqual((page.get_attribute("#ambWorker", "data-worker-state"),
+                          page.text_content("#ambWorker").strip()), ("ok", "Worker OK — idle"))
+        for label, kwargs in (("missing reason", {"drop": "reason"}), ("missing active_state",
+                                                                         {"drop": "active_state"}),
+                              ("checks not a list", {"checks": 1})):
+            with self.subTest(label):
+                observe(**kwargs)
+                self.advance(page, EVERY)
+                self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "monitoring_unavailable")
+                text = page.text_content("#ambWorker").strip()
+                self.assertTrue(text.startswith("Monitoring status unavailable"), text)
+                self.assertNotIn("Worker OK", text)
+                self.assertNotIn("ok", page.get_attribute("#ambWorker", "class").split())
+                if "drop" in kwargs:
+                    self.assertEqual(text, "Monitoring status unavailable — worker check data is incomplete")
+                self.assertFalse(self.stale(page))                           # unavailable worker != stale page
+                self.assertEqual(self.state(page)["failures"], 0)            # an ordinary 200 answer
+        observe()
+        self.advance(page, EVERY)
+        self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "ok")
+        state = self.state(page)
+        self.assertEqual((state["sent"], state["failures"], state["stopped"], state["scheduled"]), (5, 0, False, True))
+        self.assertEqual(len(self.hits), 5)                                  # one request per refresh
+        self.assertEqual(page.errors, [])
         self.close(page)
