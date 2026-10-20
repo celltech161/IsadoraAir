@@ -40,7 +40,7 @@ Weather and AMBER alerts are **not** active messages. Their `WxAlert` →
 | D3E-A | worker lifecycle and recovery hardening: expiry while a composition is blocked, one loop cadence, signals and connections, the worker heartbeat / readiness contract | **no** — gate still closed |
 | D3E-B | the managed worker unit `isadoraair-active-message-worker.service` (start gate, bounded restart/stop), Monitoring of it, the next protected generation's signed-policy entry (unsigned source only; deployed by r0116) | **no** — gate still closed |
 | D3E-C | retention and reconciliation: a read-only reconciler, one eligibility authority, safe cleanup of provably unreferenced leftovers, explicit operator-driven publication retirement (`manage.py active_message_retention`) | **no** — gate still closed; nothing selected by age |
-| D3E-D | long-session board polling / diagnostics | gate still closed |
+| D3E-D | read-only board diagnostics (reconciliation, worker health as Monitoring validated it, publication / retirement / air evidence), long-session status refresh, the r0116 readiness checklist (docs/releases/r0116_readiness.md) | **no** — gate still closed; nothing on the board changes state |
 
 ## Authority
 
@@ -1772,6 +1772,157 @@ may go while their rows stay) -- not age-based deletion, and not by removing
 a foreign key. Likewise there is no automatic publication retirement policy:
 any future one must be designed, authorized and qualified as such.
 
+## Operator diagnostics and long sessions (D3E-D)
+
+D3E-D adds read-only diagnostics to the existing Operator Board and makes its
+live status reliable for a whole operator shift. Nothing here is deployed by
+D3E-D itself: it ships with the integrated r0116 release
+(docs/releases/r0116_readiness.md). The native-airing gate stays closed.
+
+### Board diagnostics (`/iportal/messages/board/diagnostics/`)
+
+CONTROL only (the board's `_require_control`; staff/superuser through the
+established compatibility bypass); GET only (POST/PUT/DELETE: 405); every
+response `Cache-Control: no-store`. The page has no form and no button that
+changes anything: it never retires a publication, deletes media or a Track,
+purges ProductionMedia, restores or removes a quarantine payload, runs
+`--apply`, records Monitoring attention, or alters a retry or recovery state.
+Maintenance stays with the trusted `manage.py active_message_retention`
+command.
+
+* **Inspection on request, never cached.** A plain visit says "No inspection
+  has been performed" -- the absence of findings is never shown as health.
+  "Inspect now" (`?inspect=1`) runs D3E-C's reconciler once
+  (`active_messages.diagnostics.inspect` → `reconcile.reconcile`), bounded to
+  `DIAGNOSTIC_LIMIT` (100) rows per class and metadata only (`deep=False`:
+  no SHA-256 pass from the web; `--deep` stays a CLI diagnostic). No request
+  parameter changes the bound or the depth. The result states when it was
+  generated and that it describes that moment, not now; there is no
+  background scheduler and no stored result.
+* **States.** `complete` (every class fit the bound and nothing was
+  unverifiable), `incomplete` (a class hit the bound -- named -- or something
+  could not be verified; the counts cover only what was inspected), and
+  `unavailable` (the inspection itself failed: database or storage; nothing
+  is known, which is never a healthy result -- only the error class is shown).
+* **Summary.** Counts by severity, category and operator class; integrity
+  damage; cleanup / recovery candidates; items needing manual attention;
+  quarantine bytes reclaimable after re-proof versus held for manual
+  recovery.
+* **Findings** (at most `MAX_FINDINGS`, 200, listed; counts cover all): the
+  severity, D3E-C's condition code, a plain-language title, the reconciler's
+  own evidence and suggested action, the class's interpretation, and a link
+  to the existing airing or message page when the identity names one that
+  exists (execution, publication, placed file, insertion attempt, quarantine
+  operation). No server path or exception text is shown; all text is escaped.
+* `/iportal/messages/board/diagnostics/data/` -- the same bounded inspection
+  as JSON (`inspection`, `worker`, `native_airing`); every GET inspects
+  afresh.
+
+**Condition classes** (`diagnostics.classify`: D3E-C's codes first, then its
+categories -- no definition of its own):
+
+| Class | From | Operator response |
+| --- | --- | --- |
+| Integrity damage | category `integrity_damage` (incl. `quarantine_identity_mismatch`) | stored evidence contradicts the records; nothing changes automatically; review with the maintainer before any maintenance |
+| Manual recovery required | `quarantine_restore_blocked`, `quarantine_recovery_required`, `quarantine_owned_by_track`, `quarantine_entry_unexpected`, `quarantine_not_private` | never deleted or moved automatically; follow the quarantine troubleshooting above |
+| Unknown / unverifiable | category `unknown` (`library_unavailable`, `ownership_unavailable`, `ownership_unverifiable`, ...) | nothing is removed while unknown; fix the cause and inspect again |
+| Quarantine pending | `quarantine_pending`, `quarantine_name_owned_by_track`, `quarantine_operation_leftover` | an interrupted cleanup; `--sweep --apply` re-proves and finishes it |
+| Work in progress | category `in_flight` | the worker or a retry settles it |
+| Cleanup candidate | category `candidate_orphan` | a sweep may reclaim it after the grace period |
+| Retirement candidate | category `candidate_retirement` | only an explicit `--retire` maintenance command, never automatic |
+| Expected historical pruning | category `expected_pruning` | the library's own retention; snapshots keep the history |
+| Healthy / retained | category `retained` | deliberately kept history |
+
+**Resource bounds.** The reconciler's per-class limits apply. Its Track
+ownership checks for all inspected publications now run as ONE bounded scan
+of the Track table (`retention.references_by_location`, the same rules as
+cleanup's per-location `track_references`, proven equal in
+`test_board_diagnostics`) instead of one full scan per publication. Cleanup
+decisions are unchanged: they still use `track_references` under the
+destination lock. Routine status polling never inspects.
+
+### Worker health on the board
+
+The strip's worker chip and the diagnostics page show the managed worker as
+Monitoring LAST VALIDATED it -- D3E-B's probe binds D3E-A's heartbeat to
+systemd's MainPID and ExecMainStartTimestamp (`supervision.observe`) -- read
+from Monitoring's own state file. The board never reads the heartbeat file as
+health, never infers a process from a PID, never calls systemctl, and offers
+no restart control (Monitoring keeps no Restart button for this unit either;
+the runtime-13 restart authority stays release-driven).
+
+| Shown | Meaning |
+| --- | --- |
+| Worker check not provisioned | no Monitoring check of the unit (before r0116's `monitoring.0014`) |
+| Worker check disabled | the check exists but is off: not validated |
+| Monitoring status unavailable | no readable Monitoring state: unknown |
+| Not yet observed by Monitoring | the poller has no result for the check yet |
+| Monitoring status out of date | Monitoring's last poll is older than its own 30 s bound: the verdict is only the last known one |
+| Worker OK / warning / critical / unknown — *condition* | Monitoring's verdict and condition |
+
+Process identity: **verified** only for an active unit whose verdict came
+past `supervision.belongs`; **not current** (`heartbeat_not_current`);
+otherwise **unknown** (`identity_unavailable`, starting, no heartbeat,
+malformed, observer error, inactive). Crash loops, automatic restarts and
+unverified history are flagged as recovery. A healthy worker never means
+anything is on air.
+
+### Historical evidence on an airing
+
+The airing detail page adds "Publication and air evidence", classified with
+`reconcile.inspect_publication` (the reconciler's publication rules for one
+publication): never published · present · **retired by maintenance**
+(the `publication_retired` event: time, `ActorKind.SYSTEM`, `via:
+maintenance_command` -- an intentional retirement, never shown as a failure)
+· retired with cleanup pending · retired, needs review · pruned through the
+library · cleanup quarantine pending · missing or damaged · unknown. The
+publication id, file name, SHA-256 and Track id snapshot, the insertion
+attempts (token, LogItem id snapshot, whether that item was pruned), and the
+deck's PlayEvents (times, played duration, evidence state, whether the Track
+was since removed) are shown as recorded -- retirement of the Track or the
+file hides or rewrites none of them -- and "confirmed air evidence" versus
+"never aired" follows only the execution's STARTED evidence. Bounded: at most
+`EVIDENCE_LIMIT` (50) insertions and play events; the page's query count does
+not grow with history.
+
+Navigation: findings link to airings and messages; the airing evidence links
+to diagnostics. The existing message and airing history (keyset pagination,
+deterministic order, bounded queries) needed no other change.
+
+### Long-session status refresh
+
+The strip, the ON AIR badges and the airing labels refresh from
+`board/status/` (read-only; now also the worker chip):
+
+* every 20 s while the tab is visible, with **no cutoff** (the D3D helper
+  stopped after 90 refreshes, about 30 minutes);
+* **at most one request outstanding**: the next refresh is scheduled only
+  after the previous one settled; a forced refresh (tab shown again, a page
+  restored from the back-forward cache) aborts the outstanding one; only the
+  newest request's answer is ever applied;
+* a failure or a 10 s timeout marks the page stale ("on-air indications may
+  be out of date"); retries back off (40 s, 80 s, ... at most 5 min) and the
+  first success restores the 20 s pace and clears the warning; no success
+  for 60 s (a throttled or suspended tab) also marks it stale;
+* a hidden tab sends nothing; showing it refreshes at once when the last
+  answer is 20 s old or more; a back-forward restore re-enables its forms and
+  re-checks at once, marked stale until answered;
+* an expired session (401/403, a redirect to sign-in, anything that is not
+  the JSON status) stops refreshing and says so -- it is never retried in a
+  loop;
+* **a stale page never asserts ON AIR as current**: ON AIR badges, the
+  airing chip and on-air labels are dimmed and marked "(last known)"; ON AIR
+  still means only STARTED with the engine's air evidence (ACTIVE, ACCEPTED
+  and CLAIMED never are) and nothing is inferred from a healthy worker;
+* rows are never re-rendered: expanded rows, focus, typed input, filters and
+  the page stay; a changed board version shows "This page has changed" with a
+  reload link to the same view (filter, search, page).
+
+Deterministic browser tests with Playwright's fake clock
+(`test_board_long_session_browser`) cover 120 refreshes, timeouts and
+back-off, a 30-minute outage, session expiry, a hidden tab, a back-forward
+restore, a version change, stale ON AIR and the worker chip.
+
 ## Release notes for D1
 
 * `active_messages.0001_initial` — CreateModel ×4 (additive, automatic).
@@ -1935,3 +2086,24 @@ any future one must be designed, authorized and qualified as such.
   holder re-validates that the file exists before referring to it.
 * No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
   change; `NATIVE_AIRING_AVAILABLE` stays False.
+
+## Release notes for D3E-D
+
+* Operator Board diagnostics (`/iportal/messages/board/diagnostics/`, and
+  `.../diagnostics/data/` as JSON): D3E-C's reconciliation on explicit
+  request, bounded (100 rows per class, metadata only), classified for an
+  operator, never cached and never shown as health when it did not run;
+  worker health exactly as Monitoring last validated it; read-only and
+  CONTROL only. No destructive endpoint, no maintenance from the web.
+* Airing detail: publication, retirement (`publication_retired`, SYSTEM via
+  maintenance_command), insertion and play evidence, durable after
+  retirement.
+* Live status: no 90-refresh cutoff, one outstanding request, back-off, a
+  stale view never asserts ON AIR, hidden-tab / back-forward / session-expiry
+  handling, the worker chip.
+* Reconciler: one shared Track-ownership scan per inspection
+  (`retention.references_by_location`); `Report.generated_at`;
+  `reconcile.inspect_publication`. Cleanup authorities unchanged.
+* No migration, model, setting, capability, timer or scheduler;
+  `NATIVE_AIRING_AVAILABLE` stays False; no engine, renderer, publication,
+  OGRemote, Weather/AMBER or GStreamer change.
