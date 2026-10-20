@@ -1939,7 +1939,8 @@ exactly the producer's rules those fields can show:
   `execution` appears only for a render begun in that first pass; `starting`
   has no outcome; `rendering` always names its execution;
 * the classification (`heartbeat.assess`, in its order): `stopped` exactly for
-  the stopped phase; a crash loop in any other phase; in the rendering phase
+  the stopped phase; a crash loop in any other phase, within the crash
+  window (below); in the rendering phase
   `rendering` (age within the longest deadline), `render_overdue`, or an ok
   render lifted to `history_unverified` / `restarted` -- never stale or an
   idle reading; otherwise `stale` exactly beyond the 60 s bound (both at the
@@ -1957,6 +1958,33 @@ exactly the producer's rules those fields can show:
   | `idle` (other codes), `""` | `idle` |
 
   plus `history_unverified` / `restarted` for any ok reading.
+
+**Time bounds on the serialized age.** Monitoring writes the heartbeat age as
+`round(now - checked_at, 1)`. Every bound below is the producer's own constant
+and comparison, read through that rounding: a true age just above a bound and
+one at or just below it can both serialize to the bound itself, so the
+rounded bound value stays possible either way, and one tenth beyond it is
+excluded.
+
+| bound (heartbeat.py) | producer comparison | serialized age: possible / excluded |
+|---|---|---|
+| crash window, `CRASH_WINDOW_SECONDS` = 900 | a start counts only if `0 <= now - start <= 900`; every start is at or before `started_at` <= `checked_at` | `crash_looping` up to 900.0; from 900.1 never |
+| unverified history, same window | `0 <= now - started_at <= 900` | rendering: up to 900.0; `starting` (where `started_at == checked_at`): not below 0 |
+| staleness, `STALE_AFTER_SECONDS` = 60 | stale when `now - checked_at > 60` (not while rendering) | fresh readings up to 60.0, `stale` from 60.0 |
+| render deadline, `RENDER_DEADLINE_MAX_SECONDS` = 3750 | `checked_at < deadline <= checked_at + 3750`; rendering while `now <= deadline` | `rendering` up to 3750.0; `render_overdue` from 0.0 |
+| future skew, `MAX_FUTURE_SKEW_SECONDS` = 30 | `checked_at > now + 30` is malformed (never bound) | down to -30.0; -30.1 refused |
+
+So a crash loop reported with a heartbeat older than the window -- 900.1 s,
+901 s, an hour -- is evidence the producer cannot write: no recorded start can
+be inside the window when the record itself is outside it. It is
+`entry_invalid` (`detail.reason/heartbeat_age_seconds`), identity and
+heartbeat unknown -- never a verified crash-looping process, and not a stopped
+or failed worker either. A crash loop at up to 900.0 s keeps its meaning
+(critical, identity verified, heartbeat unknown). The producer grid includes
+true ages on both sides of each bound and requires the reader to accept
+exactly the producer's reasons at every serialized age. Monitoring's own
+observation bound (its document is stale when `time.time() - timestamp > 30`)
+is applied with the same strict comparison on the unrounded age.
 
 `diagnostics.assessed_reasons(phase, outcome, code, age)` is that mapping. A
 test classifies a grid of every valid heartbeat document with the producer's
@@ -2262,6 +2290,10 @@ restore, a version change, stale ON AIR and the worker chip.
   rules, `heartbeat.assess`'s reason for exactly these fields, checked
   against the producer over a grid of every valid document); a first-cycle
   render with no outcome yet is a healthy current render.
+* Crash window: `crash_looping` only at a serialized heartbeat age within the
+  producer's 900 s crash window (900.0 possible, 900.1 and above never), and
+  `history_unverified` never for a `starting` record from the future; the
+  producer grid now spans every time bound on both sides.
 * Reconciler: one shared Track-ownership scan per inspection
   (`retention.references_by_location`); `Report.generated_at`;
   `reconcile.inspect_publication`. Cleanup authorities unchanged.

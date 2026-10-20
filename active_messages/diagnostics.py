@@ -506,7 +506,12 @@ def assessed_reasons(phase, outcome=None, code=None, age=None) -> frozenset:
     rounded heartbeat age; None (outcome, age) means any."""
     if phase == "stopped":
         return frozenset({"stopped"})
-    found = {"crash_looping"}
+    # assess counts a start only if 0 <= now - start <= CRASH_WINDOW_SECONDS, and
+    # every recorded start is at or before checked_at (started_at <= checked_at,
+    # recent_starts ends with started_at): once the heartbeat itself is older than
+    # the window no start can count. round(age, 1) above the window is > 900.0;
+    # 900.0 itself may be a true age just inside it.
+    found = {"crash_looping"} if age is None or age <= heartbeat.CRASH_WINDOW_SECONDS else set()
     if phase == "rendering":
         if age is None or age >= 0:                        # past its deadline, which is after checked_at
             found.add("render_overdue")
@@ -522,7 +527,12 @@ def assessed_reasons(phase, outcome=None, code=None, age=None) -> frozenset:
         read = (frozenset().union(*OUTCOME_REASONS.values(), {"ready_waiting_for_gate", "idle"}) if outcome is None
                 else OUTCOME_REASONS.get(outcome)
                 or frozenset({"ready_waiting_for_gate" if outcome == "idle" and code == "gated" else "idle"}))
-        found |= read | (LIFTED_REASONS if read & OK_REASONS else set())
+        lifted = LIFTED_REASONS if read & OK_REASONS else frozenset()
+        if phase == "starting" and age is not None and age < 0:
+            # history_unverified needs 0 <= now - started_at, and "starting" has
+            # started_at == checked_at: a record from the future cannot have it.
+            lifted -= {"history_unverified"}
+        found |= read | lifted
     return frozenset(found)
 
 

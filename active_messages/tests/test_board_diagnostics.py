@@ -5,6 +5,7 @@ it, and one airing's publication / retirement / air evidence.
 Real publications (d3ec_support.Lifecycle: real render, publish, admission,
 deck evidence); no state is written raw except where a test needs a condition
 the services never produce, and then it says so."""
+import functools
 import json
 import os
 import tempfile
@@ -30,6 +31,7 @@ from .support import Domain
 BOARD = "/iportal/messages/board/"
 DIAG = BOARD + "diagnostics/"
 DATA = DIAG + "data/"
+EXECUTION = "0f8fad5b-d9cb-469f-a165-70867728950e"            # a canonical execution id
 
 
 def content(response) -> str:
@@ -863,6 +865,138 @@ class ProducerConsistencyReproductionTests(MonitoringStateFixture, Domain, TestC
                           "field": "detail.reason/outcome", "identity": "unknown", "heartbeat": "unknown"})
 
 
+CRASH_LOOP_PHASES = {
+    # A crash loop's bound heartbeat as the producer writes it in each phase it can occur in.
+    "starting": {"phase": "starting", "outcome": "", "code": "", "execution": ""},
+    "polling": {"phase": "polling", "outcome": "idle", "code": "", "execution": ""},
+    "rendering": {"phase": "rendering", "outcome": "", "code": "", "execution": EXECUTION},
+}
+
+
+class CrashWindowReproductionTests(MonitoringStateFixture, Domain, TestCase):
+    """Crash-window review P1, kept verbatim: heartbeat.assess counts a start
+    only within CRASH_WINDOW_SECONDS (900) of the observation, and every
+    recorded start is at or before checked_at -- so a serialized heartbeat
+    age above 900.0 rules a crash loop out. On deefa27 such an entry read as
+    critical / crash_looping with VERIFIED identity."""
+
+    def crash_loop(self, age, phase="polling"):
+        self.publish("critical", reason="crash_looping", heartbeat_age_seconds=age, **CRASH_LOOP_PHASES[phase])
+        return self.health()
+
+    def test_review_over_age_crash_loops_fail_closed(self):
+        for phase in CRASH_LOOP_PHASES:
+            for age in (900.1, 901.0, 1800.0, 3600.0):
+                with self.subTest(phase=phase, age=age):
+                    worker = self.crash_loop(age, phase)
+                    self.assertEqual((worker["state"], worker["identity"], worker["heartbeat"]),
+                                     ("monitoring_unavailable", "unknown", "unknown"), worker)
+                    self.assertEqual((worker["problem"], worker["field"]),
+                                     ("entry_invalid", "detail.reason/heartbeat_age_seconds"), worker)
+                    self.assertNotIn("Worker", worker["label"].split(" — ")[0])
+
+    def test_within_the_window_a_crash_loop_keeps_its_meaning(self):
+        for phase in CRASH_LOOP_PHASES:
+            for age in (0.0, 3.1, 59.9, 60.0, 60.1, 600.0, 899.9, 900.0):
+                with self.subTest(phase=phase, age=age):
+                    worker = self.crash_loop(age, phase)
+                    self.assertEqual((worker["state"], worker["reason"], worker["identity"], worker["heartbeat"],
+                                      worker["problem"], worker["recovery"]),
+                                     ("critical", "crash_looping", "verified", "unknown", "", True), worker)
+
+    def test_the_other_time_bounds_below_at_and_above(self):
+        """heartbeat.assess's other comparisons on the serialized (rounded) age:
+        stale is "> STALE_AFTER_SECONDS" (60.0 either way), a render within its
+        deadline needs age <= RENDER_DEADLINE_MAX_SECONDS, a record more than
+        MAX_FUTURE_SKEW_SECONDS ahead is malformed (never bound)."""
+        stale_or_fresh = {59.9: {"idle"}, 60.0: {"idle", "stale"}, 60.1: {"stale"}}
+        for age, accepted in stale_or_fresh.items():
+            for reason in ("idle", "stale"):
+                with self.subTest(age=age, reason=reason):
+                    self.publish("ok" if reason == "idle" else "critical", reason=reason, heartbeat_age_seconds=age)
+                    worker = self.health()
+                    if reason in accepted:
+                        self.assertEqual((worker["reason"], worker["identity"], worker["heartbeat"]),
+                                         (reason, "verified", "current" if reason == "idle" else "stale"))
+                    else:
+                        self.assertEqual((worker["state"], worker["field"], worker["identity"]),
+                                         ("monitoring_unavailable", "detail.reason/heartbeat_age_seconds", "unknown"))
+        starting = {"phase": "starting", "outcome": "", "code": "", "execution": ""}
+        for age, state in ((0.0, "warning"), (-3.0, "monitoring_unavailable")):
+            with self.subTest(starting_history_age=age):                # needs 0 <= now - started_at
+                self.publish("warning", reason="history_unverified", heartbeat_age_seconds=age, **starting)
+                worker = self.health()
+                self.assertEqual(worker["state"], state, worker)
+                if state != "warning":
+                    self.assertEqual(worker["field"], "detail.reason/heartbeat_age_seconds")
+        self.publish("warning", reason="history_unverified", heartbeat_age_seconds=-3.0)   # polling: earlier start
+        self.assertEqual(self.health()["state"], "warning")
+        render = {"phase": "rendering", "outcome": "", "code": "", "execution": EXECUTION}
+        for age, state in ((3749.9, "ok"), (3750.0, "ok"), (3750.1, "monitoring_unavailable")):
+            with self.subTest(render_age=age):
+                self.publish("ok", reason="rendering", heartbeat_age_seconds=age, **render)
+                self.assertEqual(self.health()["state"], state)
+        for age, state in ((-29.9, "ok"), (-30.0, "ok"), (-30.1, "monitoring_unavailable")):
+            with self.subTest(future_age=age):
+                self.publish("ok", heartbeat_age_seconds=age)
+                worker = self.health()
+                self.assertEqual(worker["state"], state)
+                if state != "ok":
+                    self.assertEqual(worker["field"], "detail.heartbeat_age_seconds")
+
+    def test_monitorings_own_observation_bound(self):
+        """Monitoring's views call its document stale when time.time() -
+        timestamp > STATE_STALE_SECONDS (30); the board uses the same strict
+        comparison on the unrounded age."""
+        now = time.time()
+        for age, state in ((29.9, "ok"), (30.0, "ok"), (30.1, "stale")):
+            with self.subTest(age=age):
+                self.state.write_text(json.dumps({"timestamp": now - age, "checks": [self.entry()]}))
+                worker = diagnostics.worker_health(now=now)
+                self.assertEqual(worker["state"], state)
+                self.assertEqual(worker["heartbeat"], "current" if state == "ok" else "unknown")
+
+    def test_review_age_901_on_every_board_surface(self):
+        client = self.operator()
+        warm(client)
+        client.get(BOARD)                                                  # the policy singleton's first visit
+        self.crash_loop(901.0)
+        with CaptureQueriesContext(connection) as queries:
+            board, status, page, data = (client.get(url) for url in (BOARD, BOARD + "status/", DIAG, DATA))
+        self.assertEqual(writes(queries), [])
+        for response in (board, status, page, data):
+            self.assertEqual(response.status_code, 200)
+            for leak in (b"Traceback", str(self.state).encode(), b"/run/isadoraair"):
+                self.assertNotIn(leak, response.content)
+        self.assertContains(board, 'data-worker-state="monitoring_unavailable"')
+        self.assertNotContains(board, "Worker OK")
+        self.assertNotContains(board, "Worker critical")
+        self.assertEqual((status.json()["worker"]["state"], status.json()["worker"]["class"]),
+                         ("monitoring_unavailable", "off"))
+        self.assertIn('data-worker-problem="entry_invalid"', content(page))
+        self.assertNotIn("Verified", content(page))
+        self.assertNotIn("Current", content(page))
+        self.assertEqual({key: data.json()["worker"][key] for key in ("state", "problem", "field", "identity",
+                                                                       "heartbeat")},
+                         {"state": "monitoring_unavailable", "problem": "entry_invalid",
+                          "field": "detail.reason/heartbeat_age_seconds", "identity": "unknown",
+                          "heartbeat": "unknown"})
+        self.assertEqual(data.json()["inspection"], None)
+
+    def test_a_crash_loop_within_the_window_on_every_board_surface(self):
+        client = self.operator()
+        warm(client)
+        client.get(BOARD)
+        self.crash_loop(899.9)
+        board, status, page, data = (client.get(url) for url in (BOARD, BOARD + "status/", DIAG, DATA))
+        self.assertContains(board, 'data-worker-state="critical"')
+        self.assertEqual((status.json()["worker"]["state"], status.json()["worker"]["class"]), ("critical", "alert"))
+        self.assertIn("Verified", content(page))                           # the producer bound it to the process
+        self.assertEqual({key: data.json()["worker"][key] for key in ("state", "reason", "identity", "heartbeat")},
+                         {"state": "critical", "reason": "crash_looping", "identity": "verified",
+                          "heartbeat": "unknown"})
+
+
 class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
     """Every worker condition as the accepted D3E-B producer really writes it
     (probes.probe_systemd over a disposable heartbeat, serialized by the
@@ -955,6 +1089,9 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
             ("crash loop", {"started": starts[-1], "recent_starts": starts, "previous": "unclean", "cycle": 1,
                             "repeats": 1}, systemctl(restarts="2", started=starts[-1]), "critical", "crash_looping",
              "verified", "unknown"),
+            ("crash loop near the window", {"started": now - 890, "recent_starts": [now - 895, now - 892, now - 890],
+                                            "previous": "unclean", "cycle": 1, "repeats": 1, "age": 880},
+             systemctl(restarts="2", started=now - 890), "critical", "crash_looping", "verified", "unknown"),
             ("history unverified", {"started": now - 30, "recent_starts": [now - 30], "previous": "malformed",
                                     "cycle": 2, "repeats": 2}, systemctl(started=now - 30), "warning",
              "history_unverified", "verified", "current"),
@@ -1067,9 +1204,6 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
             self.assertEqual(held["label"], "Worker OK — stale")
             confirmed = cycle()
             self.assertEqual((confirmed["state"], confirmed["heartbeat"]), ("critical", "stale"))
-
-
-EXECUTION = "0f8fad5b-d9cb-469f-a165-70867728950e"
 
 
 ENTRY_FIELD_CASES = (
@@ -1234,43 +1368,75 @@ class NestedSchemaValidationTests(MonitoringStateFixture, Domain, TestCase):
                          ("stale", "ok", "unknown", "unknown"))
 
 
-class HeartbeatEvidenceContractTests(MonitoringStateFixture, Domain, TestCase):
-    """Producer-contract review P1-A/P1-B: a bound heartbeat's evidence is one
-    observation the producer wrote, not independently plausible fields."""
+# True heartbeat ages (now - checked_at) for the producer grid: each producer
+# boundary below, at and above it -- including true ages on either side that
+# serialize to the same rounded value (round(age, 1)), so the grid itself shows
+# which readings are ambiguous at 60.0 (STALE_AFTER_SECONDS), 900.0
+# (CRASH_WINDOW_SECONDS) and 3750.0 (RENDER_DEADLINE_MAX_SECONDS); negative ages
+# down to assess's MAX_FUTURE_SKEW_SECONDS (a record up to 30 s ahead of the clock).
+GRID_AGES = (-30.04, -30.0, -29.96, -3.0, 0.0, 0.04, 3.0, 59.9, 59.96, 60.0, 60.04, 60.1, 75.0, 599.9, 600.0, 899.9, 899.96, 900.0, 900.04,
+             900.1, 901.0, 1800.0, 3600.0, 3749.9, 3749.96, 3750.0, 3750.04, 3750.1, 7200.0)
 
-    NOW = 1_800_000_000.0
 
-    def producer_grid(self):
-        """Every valid heartbeat (heartbeat.validate) over a grid of visible and
-        hidden fields, classified by the producer's own heartbeat.assess and
-        shown as supervision.observe shows it (its _SHOWN), with the probe's
-        "restarted" lift of an ok verdict."""
-        import itertools
-        from active_messages import supervision
-        now = self.NOW
-        for phase, cycle, result, code, execution, repeats, history, age, overdue in itertools.product(
-                sorted(heartbeat.PHASES), (0, 20), [""] + sorted(heartbeat.RESULTS), ("", "gated", "OperationalError"),
-                ("", EXECUTION), (0, 1, 3, 12), ("none", "malformed", "crash"), (3.0, 75.0, 600.0), (False, True)):
-            started = now - age - (0 if phase == "starting" else 10)
-            starts = [started - 120, started - 60, started] if history == "crash" else [started]
-            doc = {"schema": heartbeat.SCHEMA, "pid": 4242, "started_at": started, "checked_at": now - age,
-                   "recent_starts": starts, "previous": "unclean" if history == "crash" else history,
-                   "phase": phase, "cycle": cycle, "result": result, "code": code, "execution": execution,
-                   "repeats": repeats, "consecutive_errors": repeats if result == "error" else 0,
-                   "last_progress_at": None,
-                   "render_deadline": (now - 1 if overdue else now + 600) if phase == "rendering" else None}
+@functools.lru_cache(maxsize=1)
+def producer_grid():
+    """Every valid heartbeat (heartbeat.validate) over a grid of visible and
+    hidden fields -- phase, cycle, result, code, repeats, start history, the
+    gap between the process start and the record, the render deadline and the
+    true age -- classified by the producer's own heartbeat.assess and shown as
+    supervision.observe shows it (its _SHOWN), with the probe's "restarted"
+    lift of an ok verdict. Built from the writer's own shapes: a first cycle
+    has no result/code/counters, only a render names an execution."""
+    import itertools
+    from active_messages import supervision
+    now = 1_800_000_000.0
+    found = []
+    for phase, cycle, age, gap, history in itertools.product(
+            sorted(heartbeat.PHASES), (0, 20), GRID_AGES, (0.0, 10.0, 600.0), ("none", "malformed", "crash", "spread")):
+        if phase == "starting" and (cycle or gap):         # "starting": cycle 0, checked_at == started_at
+            continue
+        checked = now - age
+        started = checked - gap
+        starts = ([started - 0.02, started - 0.01, started] if history == "crash"      # unclean starts, close
+                  else [started - 300, started - 200, started - 100, started] if history == "spread"   # or apart
+                  else [started])
+        results = [("", "", 0)] if cycle == 0 else [
+            (result, code, repeats) for result in sorted(heartbeat.RESULTS)
+            for code in ("", "gated", "OperationalError") for repeats in (1, 3, 12)]
+        deadlines = [None] if phase != "rendering" else \
+            [checked + heartbeat.RENDER_DEADLINE_MAX_SECONDS] + ([checked + age / 2] if age > 0 else [])
+        for (result, code, repeats), deadline in itertools.product(results, deadlines):
+            doc = {"schema": heartbeat.SCHEMA, "pid": 4242, "started_at": started, "checked_at": checked,
+                   "recent_starts": starts, "previous": "unclean" if history in ("crash", "spread") else history,
+                   "phase": phase, "cycle": cycle, "result": result, "code": code,
+                   "execution": EXECUTION if phase == "rendering" else "", "repeats": repeats,
+                   "consecutive_errors": repeats if result == "error" else 0, "last_progress_at": None,
+                   "render_deadline": deadline}
             try:
                 heartbeat.validate(doc)
             except heartbeat.Malformed:
                 continue
             verdict = heartbeat.assess(doc, now=now, gate_open=False)
-            self.assertNotIn(verdict["condition"], ("malformed", "no_heartbeat"), doc)
+            if verdict["condition"] == "malformed":            # beyond the future skew: unbound, never bound
+                assert age < -heartbeat.MAX_FUTURE_SKEW_SECONDS, doc
+                continue
+            assert verdict["condition"] != "no_heartbeat", doc
             shown = {name: verdict["detail"][key] for key, name in supervision._SHOWN if key in verdict["detail"]}
-            detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": age + 10,
+            assert shown["heartbeat_age_seconds"] == round(age, 1), (shown, age)
+            detail = {"active_state": "active", "sub_state": "running", "uptime_seconds": age + gap,
                       "restart_via_dashboard": False, "n_restarts": 0, **shown, "reason": verdict["condition"]}
-            yield verdict["status"], detail
+            found.append((verdict["status"], detail))
             if verdict["status"] == "ok":
-                yield "warning", {**detail, "reason": "restarted", "n_restarts": 1}
+                found.append(("warning", {**detail, "reason": "restarted", "n_restarts": 1}))
+    return tuple(found)
+
+
+class HeartbeatEvidenceContractTests(MonitoringStateFixture, Domain, TestCase):
+    """Producer-contract review P1-A/P1-B: a bound heartbeat's evidence is one
+    observation the producer wrote, not independently plausible fields."""
+
+    def producer_grid(self):
+        return producer_grid()
 
     @staticmethod
     def visible(detail):
@@ -1296,6 +1462,9 @@ class HeartbeatEvidenceContractTests(MonitoringStateFixture, Domain, TestCase):
             produced.setdefault(self.visible(detail), set()).add(detail["reason"])
             details.setdefault(self.visible(detail), detail)
         self.assertGreater(len(produced), 50)
+        crash = {key[3] for key, reasons in produced.items() if "crash_looping" in reasons}
+        self.assertEqual(max(crash), heartbeat.CRASH_WINDOW_SECONDS)       # 900.0 possible, 900.1 never
+        self.assertTrue({900.1, 901.0, 3600.0}.issubset({key[3] for key in produced}))
         for key, reasons in produced.items():
             with self.subTest(key=key):
                 self.assertEqual(diagnostics.assessed_reasons(*key), reasons)
