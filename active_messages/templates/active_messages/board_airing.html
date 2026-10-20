@@ -27,6 +27,35 @@
     {% if execution.mix_media_id %}<dt>Aggregate</dt><dd class="amb-id">{{ execution.mix_media_id }}</dd>{% endif %}
   </dl>
 
+  <section class="amb-panel" id="ambEvidence" data-publication-state="{{ evidence.state }}" aria-labelledby="ambEvidenceTitle">
+    <div>
+      <h2 id="ambEvidenceTitle" class="amb-h2">Publication and air evidence</h2>
+      <p class="amb-note"><strong data-publication-label>{{ evidence.label }}</strong>{% if evidence.aired %} · this airing has confirmed air evidence{% else %} · this airing never aired{% endif %}.</p>
+      {% if evidence.publication %}{% with p=evidence.publication %}
+      <dl class="amb-facts">
+        <dt>Publication</dt><dd class="amb-id">{{ p.id }}</dd>
+        <dt>File</dt><dd class="amb-id">{{ p.name }}</dd>
+        <dt>SHA-256</dt><dd class="amb-id">{{ p.sha256 }}</dd>
+        <dt>Track</dt><dd>#{{ p.track_id_snapshot }} (snapshot){% if p.track_present %} — present{% else %} — no longer in the library{% endif %}</dd>
+        <dt>Published</dt><dd>{{ p.published_at|date:"Y-m-d H:i:s T" }}</dd>
+        {% if evidence.retirement %}<dt>Retired</dt><dd data-retired>{{ evidence.retirement.at|date:"Y-m-d H:i:s T" }} by {{ evidence.retirement.actor }}{% if evidence.retirement.via %} (via {{ evidence.retirement.via }}){% endif %} — intentional retirement, not a failure; its history below is unchanged.</dd>{% endif %}
+      </dl>
+      {% endwith %}{% endif %}
+      {% if evidence.findings %}<ul class="amb-findings">{% for item in evidence.findings %}<li data-code="{{ item.code }}" data-class="{{ item.class }}"><span class="amb-sev {{ item.severity }}">{{ item.severity|upper }}</span> <b>{{ item.title }}</b> <code>{{ item.code }}</code><div class="amb-note">{{ item.evidence }} {{ item.interpretation }}</div></li>{% endfor %}</ul>
+      <p class="amb-note"><a href="{% url 'active_messages:board-diagnostics' %}">Diagnostics ›</a></p>{% endif %}
+      <table class="amb-table" aria-label="Insertions">
+        <thead><tr><th>Insertion</th><th>Playlist item</th><th class="wide">Engine</th><th>Inserted</th></tr></thead>
+        <tbody>{% for row in evidence.insertions %}<tr><td class="amb-id">{{ row.attempt_token|slice:":8" }}</td><td>#{{ row.log_item_id_snapshot }}{% if not row.log_item_present %} (pruned){% endif %}</td><td class="wide">{{ row.engine_instance }}</td><td>{{ row.inserted_at|date:"H:i:s" }}</td></tr>
+        {% empty %}<tr><td colspan="4">No insertion was recorded.</td></tr>{% endfor %}</tbody>
+      </table>
+      <table class="amb-table" aria-label="Play evidence">
+        <thead><tr><th>Played</th><th>Ended</th><th>Duration</th><th class="wide">Evidence</th></tr></thead>
+        <tbody>{% for row in evidence.plays %}<tr><td>{{ row.started_at|date:"H:i:s" }}</td><td>{{ row.ended_at|date:"H:i:s"|default:"—" }}</td><td>{% if row.duration_played_seconds is not None %}{{ row.duration_played_seconds|floatformat:1 }} s{% else %}—{% endif %}</td><td class="wide">{{ row.evidence_state }}{% if not row.track_present %} (Track since removed){% endif %}</td></tr>
+        {% empty %}<tr><td colspan="4">No play evidence.</td></tr>{% endfor %}</tbody>
+      </table>
+    </div>
+  </section>
+
   <details class="amb-panel" open>
     <summary>Messages in this airing <span class="amb-muted">· {{ components|length }}, in airing order</span></summary>
     <div><table class="amb-table">

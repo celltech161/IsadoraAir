@@ -14,6 +14,8 @@
     <a class="amb-chip{% if status.review %} review{% endif %}" href="?filter=review" title="Prepared messages with audio, awaiting review"><b data-count="review">{{ status.review }}</b> to review</a>
     <a class="amb-chip{% if chip.class %} {{ chip.class }}{% endif %}" id="ambAiring" href="#ambAirings" title="Current or most recent airing"><span data-text="airing">{{ chip.text }}</span></a>
     <span class="amb-chip {% if status.gate_open %}ok{% else %}off{% endif %}" id="ambGate" data-gate="{{ status.gate_open|yesno:'open,closed' }}">{% if status.gate_open %}Native airing open{% else %}Native airing closed<span class="amb-sr" id="ambGateText">: {{ gate_message }} Active messages do not air.</span>{% endif %}</span>
+    <a class="amb-chip {{ worker.class }}" id="ambWorker" href="{% url 'active_messages:board-diagnostics' %}" data-worker-state="{{ worker.state }}" title="The active message worker, as Monitoring last validated it"><span data-text="worker">{{ worker.label }}</span></a>
+    <a class="amb-chip" id="ambDiagnosticsLink" href="{% url 'active_messages:board-diagnostics' %}" title="Read-only reconciliation and worker diagnostics">Diagnostics</a>
     {% if status.load.over %}<span class="amb-chip alert" data-status="over" title="The active set breaks a policy limit and is not aired">Over limit: {{ status.load.over|join:"; " }}</span>{% endif %}
     <form method="post" action="{% url 'active_messages:board-replay' %}" class="amb-replay">{% csrf_token %}
       <input type="hidden" name="request_token" value="{{ replay_token }}">
