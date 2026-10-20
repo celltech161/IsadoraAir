@@ -13,18 +13,34 @@
     form.querySelectorAll("button").forEach(function (button) { button.setAttribute("aria-disabled", "true"); });
   }, true);
 
-  // Live status: every ON AIR indication on the page follows the server's one
-  // interpretation (the STARTED airing and the messages frozen in ITS
-  // composition), on each successful refresh. A response -- success or
-  // failure -- may change the page only while its request is still the newest
-  // one sent: once a newer request exists (even one that failed, was aborted or
-  // timed out), an older answer is ignored. So a failed newest request leaves
-  // the page marked stale, and only a later, newer success clears that. Rows
-  // are never re-rendered: expanded rows, focus, filters and typed input stay.
+  // Live status for a whole operator shift (D3E-D). Every ON AIR indication on
+  // the page follows the server's one interpretation (the STARTED airing and
+  // the messages frozen in ITS composition), on each successful refresh.
+  //
+  // * At most ONE request is outstanding: the next refresh is scheduled only
+  //   after the previous one settled, and a forced refresh (tab shown again,
+  //   page restored from the back-forward cache, the test hook) first aborts the
+  //   outstanding one. A response -- success or failure -- may change the page
+  //   only while its request is still the newest one sent, so an older answer
+  //   is never applied and a failed newest request leaves the page stale until a
+  //   later, newer success clears that.
+  // * There is no polling cutoff: refreshes continue every EVERY ms while the tab
+  //   is visible; after failures the delay doubles up to MAX_BACKOFF (a station
+  //   outage is not hammered), and the first success restores the normal pace.
+  // * Staleness is also a matter of age: no success for STALE_AFTER ms (a hidden,
+  //   throttled or suspended tab) marks the page stale until a fresh answer.
+  // * A hidden tab sends nothing; showing it refreshes at once if the last answer
+  //   is older than EVERY.
+  // * An expired session (401/403, a redirect to sign-in, or anything that is not
+  //   the JSON status) stops refreshing and says so -- never retried in a loop.
+  // * Rows are never re-rendered: expanded rows, focus, filters, typed input and
+  //   the page position stay. A changed board version only offers a reload.
   var url = root.dataset.statusUrl, version = root.dataset.version;
-  var EVERY = 20000, LIMIT = 90, TIMEOUT = 10000;
-  var polls = 0, sent = 0, lastPoll = Date.now();
+  var EVERY = 20000, TIMEOUT = 10000, MAX_BACKOFF = 300000, STALE_AFTER = 3 * EVERY;
+  var sent = 0, inflight = null, timer = null, failures = 0, stopped = false;
+  var lastSuccess = Date.now(), applied = 0;
   var stale = document.getElementById("ambStale"), changed = document.getElementById("ambChanged");
+  var expired = document.getElementById("ambExpired");
   document.querySelectorAll("[data-reload]").forEach(function (link) {
     link.href = window.location.pathname + window.location.search;
   });
@@ -39,9 +55,12 @@
     stale.querySelector("[data-stale-reason]").textContent = reason;
     stale.hidden = false;
   }
-  function apply(status) {
+  function clearStale() {
     delete root.dataset.statusStale;
     if (stale) stale.hidden = true;
+  }
+  function apply(status) {
+    clearStale();
     text('[data-count="urgent"]', status.urgent);
     text('[data-count="public_address"]', status.public_address);
     text('[data-count="review"]', status.review);
@@ -50,6 +69,13 @@
       chip.classList.remove("onair", "alert");
       if (status.chip["class"]) chip.classList.add(status.chip["class"]);
       text('[data-text="airing"]', status.chip.text);
+    }
+    var worker = document.getElementById("ambWorker");
+    if (worker && status.worker) {
+      worker.classList.remove("ok", "review", "alert", "off");
+      worker.classList.add(status.worker["class"]);
+      worker.dataset.workerState = status.worker.state;
+      text('[data-text="worker"]', status.worker.label);
     }
     var live = {};
     status.on_air.messages.forEach(function (id) { live[id] = true; });
@@ -70,35 +96,76 @@
       }
     });
     if (changed && status.version !== version) changed.hidden = false;
+    applied += 1;
+  }
+  function delay() {
+    return failures ? Math.min(EVERY * Math.pow(2, failures), MAX_BACKOFF) : EVERY;
+  }
+  function schedule(ms) {
+    window.clearTimeout(timer);
+    timer = stopped ? null : window.setTimeout(tick, ms);
+  }
+  function tick() {
+    timer = null;
+    if (Date.now() - lastSuccess > STALE_AFTER) markStale("Live status is out of date");
+    if (document.hidden) return;                       // resumed by visibilitychange
+    poll();
+  }
+  function expire() {
+    stopped = true;
+    window.clearTimeout(timer);
+    timer = null;
+    markStale("Live status stopped");
+    if (expired) expired.hidden = false;
   }
   function poll() {
-    if (++polls > LIMIT) {
-      window.clearInterval(timer);
-      ++sent;                                          // a request still in flight can no longer clear this
-      markStale("Auto-refresh paused");
-      return Promise.resolve();
-    }
+    if (stopped) return Promise.resolve();
+    if (inflight) inflight.abort();                    // never two outstanding requests
     var mine = ++sent;
-    lastPoll = Date.now();
     var abort = window.AbortController ? new AbortController() : null;
+    inflight = abort;
+    window.clearTimeout(timer);
+    timer = null;
     var timeout = window.setTimeout(function () { if (abort) abort.abort(); }, TIMEOUT);
     return fetch(url, {credentials: "same-origin", cache: "no-store", headers: {"Accept": "application/json"},
                        signal: abort ? abort.signal : undefined})
       .then(function (response) {
+        var type = response.headers.get("Content-Type") || "";
+        if (response.status === 401 || response.status === 403 || response.redirected
+            || (response.ok && type.indexOf("application/json") !== 0)) {
+          var ended = new Error("session");
+          ended.session = true;
+          throw ended;
+        }
         if (!response.ok) throw new Error("status " + response.status);
         return response.json();
       })
       .then(function (status) {
-        if (mine === sent) apply(status);              // superseded by a newer request: never applied
+        if (mine !== sent) return;                     // superseded by a newer request: never applied
+        failures = 0;
+        lastSuccess = Date.now();
+        apply(status);
       })
-      .catch(function () {
-        if (mine === sent) markStale("Live status could not be refreshed");
+      .catch(function (error) {
+        if (mine !== sent) return;
+        if (error && error.session) { expire(); return; }
+        failures += 1;
+        markStale(failures > 1 ? "Live status could not be refreshed (retrying less often)"
+                               : "Live status could not be refreshed");
       })
-      .then(function () { window.clearTimeout(timeout); });
+      .then(function () {
+        window.clearTimeout(timeout);
+        if (mine !== sent) return;
+        inflight = null;
+        if (!stopped && !document.hidden) schedule(delay());
+      });
   }
-  var timer = window.setInterval(function () { if (!document.hidden) poll(); }, EVERY);
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && Date.now() - lastPoll > EVERY) poll();
+    if (document.hidden || stopped) return;
+    if (Date.now() - lastSuccess > STALE_AFTER) markStale("Live status is out of date");
+    if (inflight) return;                              // its completion schedules the next refresh
+    if (Date.now() - lastSuccess >= EVERY || failures) poll();
+    else schedule(EVERY - (Date.now() - lastSuccess));
   });
   window.addEventListener("pageshow", function (event) {
     if (!event.persisted) return;
@@ -106,8 +173,17 @@
       delete form.dataset.sent;
       form.querySelectorAll("button").forEach(function (button) { button.removeAttribute("aria-disabled"); });
     });
-    poll();                                            // a page restored from the cache is re-checked at once
+    if (stopped) return;
+    markStale("Restored page: checking live status");  // what the cache restored is old by definition
+    poll();
   });
-  window.ambBoardStatus = {poll: poll};
+  schedule(EVERY);
+  window.ambBoardStatus = {
+    poll: poll,
+    state: function () {
+      return {sent: sent, failures: failures, stopped: stopped, inflight: Boolean(inflight), scheduled: Boolean(timer),
+              applied: applied, stale: root.dataset.statusStale === "1", delay: delay()};
+    }
+  };
 })();
 </script>
