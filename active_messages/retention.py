@@ -563,7 +563,8 @@ def _reclaim(opener, name, *, expected, authorize, prefix="file_"):
         os.close(dir_fd)
     if prefix == "file_":
         return removed, problems
-    return removed, [prefix + (problem[5:] if problem.startswith("file_") else problem) for problem in problems]
+    return removed, [problem if problem.startswith(prefix) else prefix + (problem[5:] if problem.startswith("file_")
+                                                                          else problem) for problem in problems]
 
 
 def _retired_authority(publication, destination):

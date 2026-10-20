@@ -296,11 +296,15 @@ class OwnershipRaceTests(Lifecycle, TransactionTestCase):
             return found
 
         def register():
+            from library.models import TrackWriteRefused
             assert decided.wait(20)
             with playout._destination_lock(path):
                 timeline.append(("registered", path.exists()))
-                with transaction.atomic(durable=True):
-                    return self.new_track(path).pk
+                try:
+                    with transaction.atomic(durable=True):
+                        return self.new_track(path).pk
+                except TrackWriteRefused:
+                    return "refused"                     # re-validated under the lock: the file is gone
 
         def cleanup():
             outcomes = retention.finish_retirements(apply=True).outcomes
@@ -311,8 +315,10 @@ class OwnershipRaceTests(Lifecycle, TransactionTestCase):
             results, errors = self.run_named(("register", register), ("cleanup", cleanup))
         self.assertEqual(errors, {})
         self.assertEqual(results["cleanup"], [("removed", ())])  # decided and removed while no Track owned it
-        # the registration obtained the lock only after the removal: no bytes were left for it to own
+        # the registration obtained the lock only after the removal and refers to nothing
         self.assertEqual(sorted(timeline), [("cleaned", False), ("registered", False)])
+        self.assertEqual(results["register"], "refused")
+        self.assertFalse(Track._base_manager.filter(filepath=str(path)).exists())
 
     def test_two_concurrent_cleanups_remove_once(self):
         execution, publication, path = self.interrupted()
@@ -532,11 +538,46 @@ class QuarantineClaimRaceTests(Lifecycle, TransactionTestCase):
         self.assertEqual(retention.track_references(path, None), [])
         self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, song.waveform_path)
 
-    def test_a_waveform_claim_that_commits_first_keeps_the_waveform(self):
+    def test_a_waiting_waveform_claim_revalidates_after_the_cleanup(self):
+        """The claimer waits for the lock the cleanup holds; once it gets it,
+        the waveform is gone, and the claim is refused -- no reference to a
+        deleted object is ever committed."""
         execution, publication, path = self.interrupted()
         payload = self.held(publication, 2)
+        size = payload.stat().st_size
         wave = self.wave(publication)
-        data = payload.read_bytes()
+        song = self.song("Ordinary")
+        authorized, writer_waiting = threading.Event(), threading.Event()
+        self.flock_signals("writer", writer_waiting)
+        self.pause_cleanup_at("authorized", authorized, writer_waiting)
+
+        def writer():
+            from library.models import TrackWriteRefused
+            assert authorized.wait(20)
+            with playout._destination_lock(path):          # waits for the cleanup
+                try:
+                    with transaction.atomic(durable=True):
+                        Track.objects.filter(pk=song.pk).update(waveform_path=str(wave))
+                    return "committed"
+                except TrackWriteRefused:
+                    return "refused"
+
+        results, errors = self.run_named(
+            ("cleanup", lambda: [(o.action, o.bytes_reclaimed) for o in
+                                 retention.recover_quarantine(apply=True).outcomes]),
+            ("writer", writer))
+        self.assertEqual(errors, {})
+        self.assertEqual(results, {"cleanup": [("removed", size)], "writer": "refused"})
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, song.waveform_path)
+        self.assertEqual(retention.track_references(wave, None), [])
+
+    def test_a_claim_that_commits_first_wins_and_cleanup_refuses(self):
+        """A legitimate claim of the waveform (present at its name) under the
+        lock commits before the cleanup gets the lock; the cleanup then sees
+        it and refuses -- the waveform survives, 0 of its bytes are counted."""
+        execution, publication, path = self.interrupted()
+        wave = self.wave(publication)
+        data, audio = wave.read_bytes(), path.stat().st_size
         song = self.song("Ordinary")
         locked, cleanup_waiting = threading.Event(), threading.Event()
         self.flock_signals("cleanup", cleanup_waiting)
@@ -544,19 +585,99 @@ class QuarantineClaimRaceTests(Lifecycle, TransactionTestCase):
         def writer():
             with playout._destination_lock(path):
                 locked.set()
-                assert cleanup_waiting.wait(20)            # recovery has begun and waits for the lock
+                assert cleanup_waiting.wait(20)            # the cleanup has begun and waits for the lock
                 with transaction.atomic(durable=True):     # committed before the lock is released
                     Track.objects.filter(pk=song.pk).update(waveform_path=str(wave))
 
         def cleanup():
             assert locked.wait(20)
             return [(o.action, o.reasons, o.bytes_reclaimed) for o in
-                    retention.recover_quarantine(apply=True).outcomes]
+                    retention.finish_retirements(apply=True).outcomes]
 
         results, errors = self.run_named(("writer", writer), ("cleanup", cleanup))
         self.assertEqual(errors, {})
-        ((action, reasons, removed),) = results["cleanup"]
-        self.assertEqual((action, removed), ("restored", 0))
-        self.assertIn("waveform_owned_by_track", reasons)
-        self.assertEqual(wave.read_bytes(), data)            # the Track's waveform is where it says
+        self.assertEqual(results["cleanup"], [("failed", ("waveform_owned_by_track",), audio)])
+        self.assertEqual(wave.read_bytes(), data)            # the claimed waveform is untouched
         self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, str(wave))
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class GuardBypassRaceTests(Lifecycle, TransactionTestCase):
+    """Independent review (P1-A, P1-B): two supported ORM writes that
+    committed a reference to a protected file while cleanup sat at its real
+    ``authorized`` checkpoint (final ownership check done, lock held), after
+    which cleanup deleted the file. Each case records the evidence and must
+    end with the writer refused (or waiting and then refused) and no durable
+    reference to a deleted object."""
+
+    serialized_rollback = True
+    interrupted = OwnershipRaceTests.interrupted
+    run_named = OwnershipRaceTests.run_named
+    held = QuarantineClaimRaceTests.held
+
+    def race(self, payload, lock_path, claim, *, reference):
+        """Cleanup pauses at ``authorized``; ``claim`` runs in another session."""
+        from unittest import mock
+
+        from active_messages import quarantine
+        from library.models import TrackWriteRefused
+        authorized, release = threading.Event(), threading.Event()
+        evidence = {"size": payload.stat().st_size}
+
+        def checkpoint(stage):
+            if stage == "authorized" and threading.current_thread().name == "cleanup":
+                evidence["cleanup_holds_lock"] = playout.holds_destination_lock(lock_path)
+                authorized.set()
+                assert release.wait(20)
+
+        def writer():
+            assert authorized.wait(20)                    # the final ownership check is complete
+            try:
+                with transaction.atomic():
+                    claim()
+                evidence["write"] = "committed"
+            except TrackWriteRefused as exc:
+                evidence["write"] = f"refused: {exc}"[:90]
+            finally:
+                release.set()
+
+        def cleanup():
+            return [(o.action, o.bytes_reclaimed) for o in retention.recover_quarantine(apply=True).outcomes]
+
+        with mock.patch.object(quarantine, "_checkpoint", side_effect=checkpoint):
+            results, errors = self.run_named(("cleanup", cleanup), ("writer", writer))
+        self.assertEqual(errors, {})
+        evidence["cleanup"] = results["cleanup"]
+        evidence["payload_deleted"] = not payload.exists()
+        evidence["references"] = list(Track._base_manager.filter(**reference).values_list("pk", "filepath",
+                                                                                          "waveform_path"))
+        return evidence
+
+    def assert_cleanup_won(self, evidence):
+        message = repr(evidence)
+        self.assertTrue(evidence["cleanup_holds_lock"], message)
+        self.assertTrue(evidence["write"].startswith("refused"), message)   # nothing committed
+        self.assertEqual(evidence["cleanup"], [("removed", evidence["size"])], message)
+        self.assertTrue(evidence["payload_deleted"], message)
+        self.assertEqual(evidence["references"], [], message)              # no dangling Track reference
+
+    def test_p1a_an_expression_valued_update_cannot_bypass_the_lock(self):
+        from django.db.models import Value
+        execution, publication, path = self.interrupted()
+        payload = self.held(publication, 1)
+        song = self.song("Ordinary")
+        evidence = self.race(payload, path, lambda: Track.objects.filter(pk=song.pk).update(
+            waveform_path=Value(str(payload))), reference={"waveform_path": str(payload)})
+        self.assert_cleanup_won(evidence)
+
+    def test_p1b_recreating_the_historical_track_id_cannot_bypass_the_lock(self):
+        execution, publication, path = self.interrupted()
+        payload = self.held(publication, 2)                # the retired publication's waveform, held
+        wave = self.wave(publication)
+        snapshot = publication.track_id_snapshot
+        self.assertFalse(Track._base_manager.filter(pk=snapshot).exists())
+        evidence = self.race(payload, path, lambda: Track.objects.create(
+            id=snapshot, title="Recreated", artist=self.song_artist,
+            filepath=str(self.library_root / "recreated.wav"), filename="recreated.wav",
+            waveform_path=str(wave)), reference={"pk": snapshot})
+        self.assert_cleanup_won(evidence)

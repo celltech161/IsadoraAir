@@ -15,7 +15,7 @@ import stat
 import unittest
 from unittest import mock
 
-from django.db import DatabaseError
+from django.db import DatabaseError, transaction
 from django.test import TestCase
 
 from active_messages import playout, reconcile, retention
@@ -181,12 +181,16 @@ class QuarantineLifecycleTests(Lifecycle, TestCase):
         self.assertEqual(retention.finish_retirements(apply=True).outcomes, [])
 
     def test_a_track_registered_while_the_file_is_held_gets_its_file_back(self):
-        from library.models import Track
+        from django.db import models
+
+        from library.models import Track, TrackWriteRefused
         execution, publication = self.pending()
         path = self.file(publication)
-        with playout._destination_lock(path):
-            track = Track.objects.create(title="Adopted", artist=self.song_artist, filepath=str(path),
-                                         filename=path.name)
+        with playout._destination_lock(path), self.assertRaises(TrackWriteRefused):
+            Track.objects.create(title="Adopted", artist=self.song_artist, filepath=str(path), filename=path.name)
+        # a reference that exists anyway (written outside the guard) still gets its file back
+        (track,) = models.QuerySet(Track).bulk_create([Track(title="Adopted", artist=self.song_artist,
+                                                             filepath=str(path), filename=path.name)])
         outcomes = retention.recover_quarantine(apply=True).outcomes
         self.assertEqual([(o.action, o.reasons, o.bytes_reclaimed) for o in outcomes],
                          [("restored", ("path_owned_by_track", "path_owned_by_track"), 0)])
@@ -592,5 +596,185 @@ class QuarantineClaimGuardTests(Lifecycle, TestCase):
             title="Legacy", artist=self.song_artist, filepath=str(self.library_root / "legacy.wav"),
             filename="legacy.wav", waveform_path=str(self.payload()))])
         track.title = "Renamed"
-        track.save()                                                       # other columns stay editable
+        track.save(update_fields=["title"])                                # other columns stay editable
         self.assertEqual(Track.objects.get(pk=track.pk).title, "Renamed")
+        from library.models import TrackWriteRefused
+        track.title = "Again"
+        with self.assertRaises(TrackWriteRefused):
+            track.save()                                                   # re-writing the reference is a claim
+        self.assertEqual(Track.objects.get(pk=track.pk).title, "Renamed")
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg not available")
+class GuardAuthorizationTests(Lifecycle, TestCase):
+    """Final guard correction: protected path fields accept only literals;
+    a historical Track id authorizes nothing; lock holders re-validate."""
+
+    interrupted_retirement = FinalSyscallSubstitutionTests.interrupted_retirement
+    pending = QuarantineLifecycleTests.pending
+    payload = QuarantineOwnershipRegressionTests.payload
+
+    def values(self, **fields):
+        self._n = getattr(self, "_n", 0) + 1
+        values = dict(title=f"T{self._n}", artist=self.song_artist,
+                      filepath=str(self.library_root / f"t-{self._n}.wav"), filename=f"t-{self._n}.wav")
+        values.update(fields)
+        return values
+
+    def refused(self, operation):
+        from library.models import TrackWriteRefused
+        with self.assertRaises(TrackWriteRefused):
+            with transaction.atomic():
+                operation()
+
+    def expressions(self, target):
+        from django.db.models import CharField, F, OuterRef, Subquery, Value, When, Case
+        from django.db.models.expressions import RawSQL
+        from django.db.models.functions import Cast, Coalesce, Concat
+        from library.models import Track
+        return {
+            "F(waveform_path)": F("waveform_path"),
+            "F(filepath)": F("filepath"),
+            "Case/When": Case(When(pk__gt=0, then=Value(target)), default=Value(""), output_field=CharField()),
+            "Concat": Concat(Value(os.path.dirname(target) + "/"), Value(os.path.basename(target)),
+                             output_field=CharField()),
+            "Cast": Cast(Value(target), output_field=CharField()),
+            "Coalesce": Coalesce(Value(None, output_field=CharField()), Value(target)),
+            "combined": Concat(F("waveform_path"), Value(""), output_field=CharField()),
+            "Subquery": Subquery(Track._base_manager.filter(pk=OuterRef("pk")).values("waveform_path")[:1]),
+            "RawSQL": RawSQL("%s", (target,)),
+            "nested Value": Value(Value(target)),
+        }
+
+    # -- 1-3. expressions --------------------------------------------------------------------------------
+    def test_value_wrapping_a_protected_path_is_judged_like_the_string(self):
+        from django.db.models import Value
+        from library.models import Track
+        execution, publication = self.pending()
+        payload, song = self.payload(), self.song("Ordinary")
+        for field in ("filepath", "waveform_path"):
+            with self.subTest(field):
+                self.refused(lambda: Track.objects.filter(pk=song.pk).update(**{field: Value(str(payload))}))
+                self.refused(lambda: Track.objects.create(**self.values(**{field: Value(str(payload))})))
+        Track.objects.filter(pk=song.pk).update(waveform_path=Value(str(self.waveforms / "elsewhere.json")))
+
+    def test_every_other_expression_on_a_path_field_is_refused(self):
+        from library.models import Track
+        execution, publication = self.pending()
+        song = self.song("Ordinary")
+        before = Track.objects.filter(pk=song.pk).values("filepath", "waveform_path").get()
+        for target in (str(self.payload()), str(self.waveforms / "ordinary.json")):   # protected or not
+            for label, expression in self.expressions(target).items():
+                for field in ("filepath", "waveform_path"):
+                    with self.subTest(label=label, field=field, protected=".am-quarantine" in target):
+                        self.refused(lambda: Track.objects.filter(pk=song.pk).update(**{field: expression}))
+                        claimed = Track.objects.get(pk=song.pk)
+                        setattr(claimed, field, expression)
+                        self.refused(claimed.save)
+                        self.refused(lambda: Track.objects.bulk_update([claimed], [field]))
+        self.assertEqual(Track.objects.filter(pk=song.pk).values("filepath", "waveform_path").get(), before)
+
+    def test_expressions_on_other_columns_still_work(self):
+        from django.db.models import F, Value
+        from django.db.models.functions import Concat
+        from library.models import Track
+        song = self.song("Ordinary")
+        Track.objects.filter(pk=song.pk).update(duration_seconds=F("duration_seconds") + 1,
+                                                title=Concat(F("title"), Value(" (edit)")))
+        self.assertEqual(Track.objects.get(pk=song.pk).title, "Ordinary (edit)")
+        Track.objects.filter(pk=song.pk).update(waveform_path="", title="Plain")      # empty: nothing claimed
+        Track.objects.filter(pk=song.pk).update(waveform_path=None) if Track._meta.get_field(
+            "waveform_path").null else None
+
+    # -- 4-5. historical ids and other ids -------------------------------------------------------------
+    def test_the_historical_track_id_authorizes_nothing(self):
+        from django.db import models
+
+        from library.models import Track
+        execution, publication = self.interrupted_retirement()
+        snapshot, wave, audio = publication.track_id_snapshot, self.wave(publication), self.file(publication)
+        alias = self.library_root.parent / "alias.json"
+        alias.symlink_to(wave)
+        song = self.song("Ordinary")
+        for label, value in {"waveform": str(wave), "alias": str(alias),
+                             "dot-dot": f"{wave.parent}/../{wave.parent.name}/{wave.name}"}.items():
+            with self.subTest(label):
+                self.refused(lambda: Track.objects.create(**self.values(id=snapshot, waveform_path=value)))
+                self.refused(lambda: Track.objects.create(**self.values(waveform_path=value)))     # another id
+                self.refused(lambda: Track.objects.bulk_create([Track(**self.values(id=snapshot,
+                                                                                    waveform_path=value))]))
+                self.refused(lambda: Track.objects.update_or_create(id=snapshot, defaults=self.values(
+                    waveform_path=value)))
+                self.refused(lambda: Track.objects.bulk_create(
+                    [Track(**self.values(filepath=song.filepath, waveform_path=value))],
+                    update_conflicts=True, unique_fields=["filepath"], update_fields=["waveform_path"]))
+                self.refused(lambda: Track.objects.filter(pk=song.pk).update(waveform_path=value))
+                reassigned = Track.objects.get(pk=song.pk)
+                reassigned.waveform_path = value
+                self.refused(reassigned.save)
+                self.refused(lambda: Track.objects.bulk_update([reassigned], ["waveform_path"]))
+        self.refused(lambda: Track.objects.create(**self.values(id=snapshot, filepath=str(audio))))
+        self.assertFalse(Track._base_manager.filter(pk=snapshot).exists())
+        self.assertTrue(wave.is_file() and audio.is_file())
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, song.waveform_path)
+        # a pre-existing (out-of-contract) recreation is still found by the cleanup
+        models.QuerySet(Track).bulk_create([Track(**self.values(id=snapshot, waveform_path=str(wave)))])
+        (outcome,) = retention.finish_retirements(apply=True).outcomes
+        self.assertEqual(outcome.action, "refused")
+        self.assertTrue(wave.is_file())
+
+    def test_a_quarantined_original_name_cannot_be_claimed_even_under_the_lock(self):
+        from library.models import Track
+        execution, publication = self.pending()
+        path = self.file(publication)                                     # its payload is in quarantine
+        with playout._destination_lock(path):
+            self.refused(lambda: Track.objects.create(**self.values(filepath=str(path))))
+            self.refused(lambda: Track.objects.create(**self.values(waveform_path=str(self.payload()))))
+        self.assertTrue(self.payload().is_file())
+
+    # -- 6. permitted writes ----------------------------------------------------------------------------
+    def test_a_literal_write_under_the_lock_with_the_file_present_is_permitted(self):
+        from library.models import Track
+        execution, publication = self.interrupted_retirement()
+        with playout._destination_lock(self.file(publication)):
+            with transaction.atomic():
+                track = Track.objects.create(**self.values(waveform_path=str(self.wave(publication))))
+        self.assertEqual(Track.objects.get(pk=track.pk).waveform_path, str(self.wave(publication)))
+
+    def test_the_live_publications_own_track_keeps_working(self):
+        from library.models import Track
+        execution, publication, _item = self.completed()
+        own = Track.objects.get(pk=publication.track_id)
+        wave = str(self.wave(publication))
+        Track.objects.filter(id=own.pk).update(waveform_path=wave, cue_in_seconds=0.1)   # re-analysis
+        own.refresh_from_db()
+        own.title = "Edited"
+        own.save()                                                         # a full save of its own row
+        Track.objects.bulk_update([own], ["waveform_path", "filepath"])
+        self.assertEqual(Track.objects.get(pk=own.pk).title, "Edited")
+        # but a bulk filter that may reach other rows is a claim
+        self.refused(lambda: Track.objects.filter(title="Edited").update(waveform_path=wave))
+
+    def test_a_stale_instance_cannot_recreate_a_retired_track(self):
+        from django.db import DatabaseError
+
+        from library.models import Track, TrackWriteRefused
+        execution, publication, _item = self.completed()
+        stale = Track.objects.get(pk=publication.track_id)
+        self.retire(execution)
+        self.assertFalse(Track._base_manager.filter(pk=stale.pk).exists())
+        with self.assertRaises((TrackWriteRefused, DatabaseError)):
+            with transaction.atomic():
+                stale.save()
+        self.assertFalse(Track._base_manager.filter(pk=stale.pk).exists())
+
+    def test_ordinary_library_tracks_are_untouched(self):
+        from library.models import Track
+        song = self.song("Ordinary")
+        own = str(self.waveforms / f"{song.pk}.json")
+        Track.objects.filter(id=song.pk).update(waveform_path=own)          # analysis
+        created = Track.objects.create(**self.values(waveform_path=str(self.waveforms / "x.json")))
+        created.category = song.category
+        created.save()                                                      # recategorization
+        Track.objects.bulk_update([created], ["waveform_path"])
+        self.assertEqual(Track.objects.get(pk=song.pk).waveform_path, own)

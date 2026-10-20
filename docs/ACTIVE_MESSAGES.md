@@ -1425,37 +1425,81 @@ to an object held in quarantine keeps it exactly where it is
 For a waveform, a Track whose id is the waveform's name also owns it.
 
 *Write guard* (`active_messages.track_guard`, registered through
-`library.register_track_write_guard` as spoken's projection guard is). On
-every supported ORM path -- save / create / update_or_create, bulk_create,
-QuerySet.update and bulk_update -- and for BOTH fields, a NEW reference is
-judged by where it resolves (directory and file symlinks, `.`, `..`):
+`library.register_track_write_guard` as spoken's projection guard is). It
+judges every write of EITHER field on every supported ORM path: save,
+create, update_or_create, bulk_create (including the
+`update_conflicts=True` upsert), QuerySet.update and bulk_update.
 
-* into a cleanup quarantine: refused, always (nothing legitimately refers to
-  a quarantined object);
-* to a reserved `UrgentPA/am-<hex>.flac`: only while the writer holds that
-  destination's lock. Publish holds it, and its Track registration is
-  `atomic(durable=True)`, so it commits before the lock is released;
-* to a publication's waveform name `WAVEFORMS_DIR/<snapshot>.json` by a
-  Track that is not that id: only under that publication's destination lock.
-  A Track writing its own `<id>.json` (every analysis) is untouched.
+1. *Literal values only.* A path field may be written as a literal: a string
+   (or path object), or `Value("...")`, which is judged exactly as that
+   string. Any other ORM expression assigned to `filepath` or
+   `waveform_path` -- `F(...)`, `Case`/`When`, `Concat`, `Cast`, `Coalesce`,
+   combinations, `Subquery`, `RawSQL`, a `Value` wrapping an expression -- is
+   REFUSED: the database computes it when the statement runs, so its target
+   cannot be authorized beforehand (the guard never evaluates an expression
+   against guessed or in-memory values, and never pre-queries a value the
+   statement might then compute differently). The one recognized shape is the
+   statement Django's own bulk_update issues -- `Case(When(pk=<int>,
+   then=<literal>), ...)`, cast to the field's type on PostgreSQL -- whose
+   every literal lands only on the row with that primary key, and is judged
+   per row. Expressions on all other columns are unaffected. (Independently
+   reproduced bypass: `update(waveform_path=Value(payload))` committed while
+   cleanup sat at its final checkpoint, then cleanup deleted the payload --
+   `GuardBypassRaceTests.test_p1a_*`.)
+2. *Where it resolves* (directory and file symlinks, `.`, `..`):
+   * into a cleanup quarantine: refused, always (nothing legitimately refers
+     to a quarantined object; no lock to race);
+   * to a reserved `UrgentPA/am-<hex>.flac`, or to a publication's waveform
+     name `WAVEFORMS_DIR/<track_id_snapshot>.json`: permitted only while the
+     writing thread holds that publication's destination lock, and only if
+     the file is present NOW -- re-validated under the lock, so a writer that
+     waited for a cleanup never commits a reference to what it removed. The
+     holder must commit before releasing the lock (publish registers its
+     Track in `atomic(durable=True)` inside it);
+   * the single lock-free exception: an UPDATE of the live publication's own
+     Track -- the row the publication's foreign key still points to (the key
+     of a retired or library-pruned publication is NULL) -- writing that
+     publication's own file name (re-analysis, an edit saved in full). Such a
+     write cannot create a row: `Track.save` is forced to be an update (the
+     guard returns `library.models.UPDATE_ONLY`), bulk_update only updates,
+     and a QuerySet.update qualifies only when it filters on exactly that
+     primary key. A Track id merely EQUAL to `track_id_snapshot` authorizes
+     nothing: the snapshot is historical evidence, and a Track recreated with
+     it (`create(id=snapshot, ...)`, `update_or_create`, bulk_create, an
+     upsert, or a stale instance whose row was deleted) is refused without
+     the lock (independently reproduced bypass:
+     `GuardBypassRaceTests.test_p1b_*`).
 
-Unchanged values, other columns and paths elsewhere are untouched; the
-library schema is unchanged.
+A refused write raises `library.models.TrackWriteRefused` before anything is
+written (the Track row, the file, publication and execution history and air
+evidence are unchanged). Paths elsewhere, empty values and other columns are
+untouched; ordinary library imports, analysis, recategorization, spoken /
+Weather / Aircheck publication and CD ripping never write a protected name.
+The library schema is unchanged.
 
 *Why a concurrent writer cannot claim an object between the last check and
 its deletion.* Cleanup holds the destination lock from before its final
-ownership scan until after the verified deletion. In that interval a new
-reference resolving into the quarantine is refused unconditionally (there is
-no lock to race), and a new reference to the object's former name needs the
-very lock cleanup holds, so it waits and finds the object gone (a writer that
-held the lock first committed before releasing it, and cleanup's scan sees
-it). Both orders are tested across PostgreSQL sessions. The guard does not
-replace the scan: references written through Django's base QuerySet, raw SQL,
-legacy rows, or a symlink created after the write are found by the scan and
-keep the object; only a privileged writer that changes the filesystem or
-database outside the application between the final scan and the deletion
-(e.g. creates a symlink to the payload and a row through raw SQL in that
-instant) is outside what an application lock can control.
+ownership scan (the `authorized` checkpoint) until after the verified
+deletion. In that interval a reference resolving into the quarantine, or any
+expression, is refused unconditionally; a reference to the object's former
+name needs the very lock cleanup holds, so the writer waits and, once it has
+the lock, finds the file gone and is refused; an update of the live
+publication's own Track cannot exist for a retired publication (its key is
+NULL). A writer that held the lock first committed before releasing it, and
+cleanup's scan sees its reference and refuses. All orders are tested across
+PostgreSQL sessions with barriers (`GuardBypassRaceTests`,
+`QuarantineClaimRaceTests`). Lock order is unchanged: a writer takes the
+destination lock before opening its transaction and commits before releasing
+it; cleanup holds no database row locks while it holds the destination lock.
+
+*Existing references and the trust boundary.* The guard does not replace the
+scan: references written through Django's base QuerySet, raw SQL, legacy
+rows, or a symlink created after the write are found by the scan and keep
+the object. Those bypasses are not reachable from station workflows; they
+belong to privileged writers of the station account, which Django's
+application hooks do not govern. Only such a writer, changing the filesystem
+or the database outside the application in the instant between the final
+scan and the deletion, is outside what an application lock can control.
 
 ### Identity-preserving removal (quarantine)
 
@@ -1882,5 +1926,12 @@ any future one must be designed, authorized and qualified as such.
   resolving into a quarantine and requires the destination lock for claims of
   a reserved file or of another Track's publication waveform name, on every
   ORM path. No migration; no library schema change.
+* Final guard authorization correction: protected path fields accept only
+  literal values (`Value("...")` is judged as its string; every other ORM
+  expression is refused); a Track id equal to a publication's
+  `track_id_snapshot` authorizes nothing -- only the live publication's own
+  Track (its foreign key) may update its own file names without the lock, as
+  an update that cannot re-insert a row (`library.models.UPDATE_ONLY`); a lock
+  holder re-validates that the file exists before referring to it.
 * No engine, renderer, publication, OGRemote, Weather/AMBER or GStreamer
   change; `NATIVE_AIRING_AVAILABLE` stays False.

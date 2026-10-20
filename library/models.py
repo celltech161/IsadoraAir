@@ -280,6 +280,11 @@ class Holiday(models.Model):
 # library itself never calls into those apps directly.
 TRACK_WRITE_GUARDS = []
 
+# A save guard may return UPDATE_ONLY: it admits the write only as an UPDATE
+# of the existing row. Track.save then forces an update, so a stale instance
+# whose row was deleted fails instead of silently re-inserting it.
+UPDATE_ONLY = "update_only"
+
 
 class TrackWriteRefused(Exception):
     """A registered guard refused a Track write (e.g. a projection-owned
@@ -478,14 +483,19 @@ class Track(models.Model):
     def __str__(self):
         return f"{self.artist} - {self.title}"
 
-    def check_write_guards(self, update_fields=None) -> None:
+    def check_write_guards(self, update_fields=None) -> bool:
         """Raise TrackWriteRefused if a registered guard refuses saving this
-        instance as it is now (views call it BEFORE side effects)."""
+        instance as it is now (views call it BEFORE side effects). True when
+        a guard admitted it only as an update of the existing row."""
+        update_only = False
         for save, _update, _bulk in TRACK_WRITE_GUARDS:
-            save(self, update_fields)
+            if save(self, update_fields) == UPDATE_ONLY:
+                update_only = True
+        return update_only
 
     def save(self, *args, **kwargs):
-        self.check_write_guards(kwargs.get("update_fields"))
+        if self.check_write_guards(kwargs.get("update_fields")):
+            kwargs["force_update"] = True
         super().save(*args, **kwargs)
 
 
