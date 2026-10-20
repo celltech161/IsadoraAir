@@ -68,7 +68,7 @@ class Fixtures:
         return client
 
     def inspected(self, client=None):
-        response = (client or self.operator()).get(DATA)
+        response = (client or self.operator()).get(DATA + "?inspect=1")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Cache-Control"], "no-store")
         return response.json()["inspection"]
@@ -335,6 +335,7 @@ class ReadOnlyContractTests(Fixtures, Lifecycle, TestCase):
             for _ in range(3):                                           # repeated requests are harmless
                 self.assertEqual(client.get(DIAG + "?inspect=1").status_code, 200)
                 self.assertEqual(client.get(DATA).status_code, 200)
+                self.assertEqual(client.get(DATA + "?inspect=1").status_code, 200)
                 self.assertEqual(client.get(DIAG).status_code, 200)
                 self.assertEqual(client.get(BOARD + "status/").status_code, 200)
                 self.assertEqual(client.get(f"{BOARD}airings/{execution.pk}/").status_code, 200)
@@ -408,7 +409,9 @@ class AuthorizationTests(Fixtures, Domain, TestCase):
 
 # -- worker health (Monitoring's validated verdict) ---------------------------------------------------------
 
-class WorkerHealthTests(Fixtures, Domain, TestCase):
+class MonitoringStateFixture(Fixtures):
+    """A disposable Monitoring state file and the worker's Monitoring check."""
+
     def setUp(self):
         super().setUp()
         from monitoring.models import MonitorCheck
@@ -422,16 +425,20 @@ class WorkerHealthTests(Fixtures, Domain, TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def publish(self, status="ok", *, age=2.0, **detail):
+    def entry(self, status="ok", **detail):
         detail = {"active_state": "active", "sub_state": "running", "reason": "idle", "phase": "polling",
                   "outcome": "idle", "heartbeat_age_seconds": 3.1, "native_airing": "closed", "n_restarts": 0,
                   **detail}
-        self.state.write_text(json.dumps({"timestamp": time.time() - age, "checks": [
-            {"id": self.check.pk, "name": self.check.name, "kind": "systemd", "status": status, "detail": detail}]}))
+        return {"id": self.check.pk, "name": self.check.name, "kind": "systemd", "status": status, "detail": detail}
+
+    def publish(self, status="ok", *, age=2.0, **detail):
+        self.state.write_text(json.dumps({"timestamp": time.time() - age, "checks": [self.entry(status, **detail)]}))
 
     def health(self):
         return diagnostics.worker_health()
 
+
+class WorkerHealthTests(MonitoringStateFixture, Domain, TestCase):
     def test_ok_with_a_verified_current_heartbeat(self):
         self.publish()
         worker = self.health()
@@ -574,3 +581,239 @@ class HistoricalEvidenceTests(Fixtures, Lifecycle, TestCase):
             self.detail(execution)
         self.assertEqual(len(later), len(first))
         self.assertEqual(writes(first) + writes(later), [])
+
+
+# -- corrective pass: untrusted Monitoring state and explicit inspection ----------------------------------
+
+HEALTHY = {"state": "ok", "identity": "verified", "heartbeat": "current"}
+
+
+class MonitoringStateSafetyTests(MonitoringStateFixture, Domain, TestCase):
+    """Independent review P1: a future-dated or malformed Monitoring document
+    must never yield a current healthy verdict, nor crash a board request."""
+
+    def assert_untrusted(self, worker, problem=None):
+        self.assertEqual(worker["state"], "monitoring_unavailable", worker)
+        self.assertEqual((worker["identity"], worker["heartbeat"]), ("unknown", "unknown"))
+        self.assertIsNone(worker["observed_age_seconds"])
+        if problem:
+            self.assertEqual(worker["problem"], problem)
+
+    def raw(self, text):
+        self.state.write_text(text)
+
+    def document(self, **root):
+        self.raw(json.dumps({"timestamp": time.time() - 2, "checks": [self.entry()], **root}))
+
+    def test_a_fresh_and_an_exactly_current_observation_are_healthy(self):
+        self.publish(age=2.0)
+        worker = self.health()
+        self.assertEqual({key: worker[key] for key in HEALTHY}, HEALTHY)
+        now = time.time()
+        self.raw(json.dumps({"timestamp": now, "checks": [self.entry()]}))
+        worker = diagnostics.worker_health(now=now)
+        self.assertEqual({key: worker[key] for key in HEALTHY}, HEALTHY)
+        self.assertEqual(worker["observed_age_seconds"], 0.0)
+
+    def test_a_future_observation_is_never_current_health(self):
+        for ahead in (100, 0.5, 0.001):
+            with self.subTest(ahead=ahead):
+                now = time.time()
+                self.raw(json.dumps({"timestamp": now + ahead, "checks": [self.entry()]}))
+                self.assert_untrusted(diagnostics.worker_health(now=now), "timestamp_in_future")
+
+    def test_a_stale_observation_is_only_the_last_known_verdict(self):
+        self.publish(age=120)
+        worker = self.health()
+        self.assertEqual((worker["state"], worker["status"]), ("stale", "ok"))
+        self.assertNotEqual(worker["state"], "ok")
+
+    def test_untrusted_timestamps_fail_closed(self):
+        cases = {
+            "missing": "{\"checks\": []}",
+            "null": '{"timestamp": null, "checks": []}',
+            "iso string": '{"timestamp": "2026-10-20T03:00:00+00:00", "checks": []}',
+            "naive string": '{"timestamp": "2026-10-20 03:00:00", "checks": []}',
+            "numeric string": '{"timestamp": "1760000000", "checks": []}',
+            "boolean": '{"timestamp": true, "checks": []}',
+            "object": '{"timestamp": {"t": 1}, "checks": []}',
+            "zero": '{"timestamp": 0, "checks": []}',
+            "negative": '{"timestamp": -5, "checks": []}',
+            "NaN": '{"timestamp": NaN, "checks": []}',
+            "Infinity": '{"timestamp": Infinity, "checks": []}',
+            "-Infinity": '{"timestamp": -Infinity, "checks": []}',
+            "beyond 2100": '{"timestamp": 4102444801, "checks": []}',
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.raw(text.replace("[]", json.dumps([self.entry()])))
+                expected = "timestamp_missing" if label in ("missing", "null") else "timestamp_invalid"
+                self.assert_untrusted(self.health(), expected)          # rejected by validation, not by a crash
+
+    def test_malformed_checks_never_raise_or_look_healthy(self):
+        problem = {"an unknown status": "entry_invalid", "detail not an object": "entry_invalid",
+                   "root is a list": "unreadable", "root is a number": "unreadable",
+                   "partially written": "unreadable", "corrupt": "unreadable"}
+        cases = {
+            "checks: 1": '{"timestamp": TS, "checks": 1}',
+            "checks: null": '{"timestamp": TS, "checks": null}',
+            "checks: {}": '{"timestamp": TS, "checks": {}}',
+            "checks: text": '{"timestamp": TS, "checks": "text"}',
+            "missing checks": '{"timestamp": TS}',
+            "a number in the list": '{"timestamp": TS, "checks": [1, ENTRY]}',
+            "null in the list": '{"timestamp": TS, "checks": [null, ENTRY]}',
+            "an unexpected object": '{"timestamp": TS, "checks": [{"unexpected": true}, ENTRY]}',
+            "a boolean id": '{"timestamp": TS, "checks": [{"id": true, "status": "ok"}, ENTRY]}',
+            "a duplicate entry": '{"timestamp": TS, "checks": [ENTRY, ENTRY]}',
+            "an unknown status": '{"timestamp": TS, "checks": [BOGUS]}',
+            "detail not an object": '{"timestamp": TS, "checks": [BADDETAIL]}',
+            "root is a list": '[ENTRY]',
+            "root is a number": '7',
+            "partially written": '{"timestamp": TS, "checks": [ENTRY',
+            "corrupt": '{not json',
+        }
+        entry = json.dumps(self.entry())
+        bogus = json.dumps({**self.entry(), "status": "excellent"})
+        bad_detail = json.dumps({**self.entry(), "detail": ["active"]})
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.raw(text.replace("TS", str(time.time() - 2)).replace("ENTRY", entry)
+                         .replace("BOGUS", bogus).replace("BADDETAIL", bad_detail))
+                self.assert_untrusted(self.health(), problem.get(label, "checks_invalid"))
+
+    def test_valid_documents_keep_their_specific_states(self):
+        self.raw(json.dumps({"timestamp": time.time() - 2, "checks": []}))
+        self.assertEqual(self.health()["state"], "not_observed")
+        for status, reason, expected, identity in (
+                ("warning", "restarted", "warning", "verified"),            # Monitoring bound the heartbeat first
+                ("critical", "crash_looping", "critical", "verified"),
+                ("critical", "stale", "critical", "verified"),
+                ("unknown", "identity_unavailable", "unknown", "unknown"),
+                ("critical", "heartbeat_not_current", "critical", "mismatch")):
+            with self.subTest(status=status, reason=reason):
+                self.publish(status, reason=reason)
+                worker = self.health()
+                self.assertEqual((worker["state"], worker["identity"]), (expected, identity))
+                self.assertNotEqual(worker["state"], "ok")
+        self.check.enabled = False
+        self.check.save()
+        self.assertEqual(self.health()["state"], "disabled")
+        self.check.delete()
+        self.assertEqual(self.health()["state"], "not_configured")
+
+    def test_every_board_surface_fails_closed_without_an_exception(self):
+        client = self.operator()
+        warm(client)
+        future = json.dumps({"timestamp": time.time() + 100, "checks": [self.entry()]})
+        malformed = {"future": future, "checks: 1": json.dumps({"timestamp": time.time() - 2, "checks": 1}),
+                     "root list": "[1]", "partial": '{"timestamp": 1, "checks": ['}
+        for label, text in malformed.items():
+            with self.subTest(label):
+                self.publish()                                             # a healthy verdict first ...
+                self.assertEqual(client.get(BOARD + "status/").json()["worker"]["state"], "ok")
+                self.raw(text)                                             # ... then the untrusted document
+                with CaptureQueriesContext(connection) as queries:
+                    board = client.get(BOARD)
+                    status = client.get(BOARD + "status/")
+                    page = client.get(DIAG)
+                    data = client.get(DATA)
+                for response in (board, status, page, data):
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotIn(b"Traceback", response.content)
+                    self.assertNotIn(b"TypeError", response.content)
+                self.assertContains(board, 'data-worker-state="monitoring_unavailable"')
+                self.assertNotContains(board, ">Worker OK<")
+                self.assertEqual(status.json()["worker"]["state"], "monitoring_unavailable")
+                self.assertEqual(status.json()["worker"]["class"], "off")
+                self.assertEqual(data.json()["worker"]["state"], "monitoring_unavailable")
+                self.assertNotEqual(data.json()["worker"]["identity"], "verified")
+                self.assertContains(page, 'data-worker-state="monitoring_unavailable"')
+                self.assertNotIn("Verified", content(page))
+                self.assertEqual(writes(queries), [])
+
+
+class ReproductionRecordTests(MonitoringStateFixture, Domain, TestCase):
+    """The independent review's exact reproductions, kept verbatim."""
+
+    def test_review_case_a_future_by_100_seconds(self):
+        now = time.time()
+        self.state.write_text(json.dumps({"timestamp": now + 100, "checks": [self.entry()]}))
+        worker = diagnostics.worker_health(now=now)
+        self.assertNotEqual(worker["state"], "ok", worker)
+        self.assertNotEqual(worker["identity"], "verified", worker)
+        self.assertNotEqual(worker["heartbeat"], "current", worker)
+        self.assertIsNone(worker["observed_age_seconds"], worker)
+
+    def test_review_case_b_checks_is_an_integer(self):
+        self.state.write_text(json.dumps({"timestamp": time.time() - 2, "checks": 1}))
+        client = self.operator()
+        for url in (BOARD, BOARD + "status/", DIAG, DATA):
+            with self.subTest(url=url):
+                self.assertEqual(client.get(url).status_code, 200)
+
+    def test_review_p2_plain_json_get_does_not_inspect(self):
+        with mock.patch.object(diagnostics, "inspect", wraps=diagnostics.inspect) as ran:
+            self.operator().get(DATA)
+        self.assertEqual(ran.call_count, 0)
+
+
+class InspectionOptInTests(Fixtures, Domain, TestCase):
+    """Independent review P2: neither diagnostics route inspects unless an
+    authorized CONTROL user asks with exactly ``inspect=1``."""
+
+    def forbid(self):
+        patchers = [mock.patch.object(diagnostics, "inspect", side_effect=AssertionError("inspected")),
+                    mock.patch.object(reconcile, "reconcile", side_effect=AssertionError("reconciled")),
+                    mock.patch.object(retention, "references_by_location",
+                                      side_effect=AssertionError("ownership scan"))]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_plain_json_request_does_not_inspect(self):
+        self.forbid()
+        response = self.operator().get(DATA)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        body = response.json()
+        self.assertIsNone(body["inspection"])
+        self.assertEqual(body["status"], "not_inspected")
+        self.assertIn("worker", body)
+
+    def test_a_plain_html_request_does_not_inspect(self):
+        self.forbid()
+        response = self.operator().get(DIAG)
+        self.assertContains(response, 'data-inspection-state="not_inspected"')
+
+    def test_only_exactly_inspect_1_inspects(self):
+        client = self.operator()
+        for query in ("", "?inspect=0", "?inspect=false", "?inspect=true", "?inspect=", "?inspect=yes",
+                      "?inspect=1&inspect=0", "?inspect=0&inspect=1", "?inspect=1&inspect=1", "?inspect= 1",
+                      "?foo=bar", "?Inspect=1"):
+            for url in (DIAG, DATA):
+                with self.subTest(url=url + query), \
+                        mock.patch.object(diagnostics, "inspect", side_effect=AssertionError("inspected")):
+                    self.assertEqual(client.get(url + query).status_code, 200)
+        for url in (DIAG + "?inspect=1", DATA + "?inspect=1", DATA + "?inspect=1&foo=bar"):
+            with self.subTest(url=url), mock.patch.object(diagnostics, "inspect", wraps=diagnostics.inspect) as ran:
+                response = client.get(url)
+                self.assertEqual(ran.call_count, 1)
+                self.assertEqual(response["Cache-Control"], "no-store")
+        body = client.get(DATA + "?inspect=1").json()
+        self.assertEqual((body["status"], body["inspection"]["state"]), ("complete", "complete"))
+
+    def test_unauthorized_requests_never_inspect(self):
+        producer = Client()
+        producer.force_login(self.producer)
+        self.forbid()
+        for client in (Client(), producer):
+            for url in (DIAG + "?inspect=1", DATA + "?inspect=1"):
+                with self.subTest(url=url):
+                    self.assertIn(client.get(url).status_code, (302, 403))
+
+    def test_status_polling_never_inspects(self):
+        self.forbid()
+        client = self.operator()
+        for _ in range(3):
+            self.assertEqual(client.get(BOARD + "status/").status_code, 200)
+            self.assertEqual(client.get(BOARD + "status/?inspect=1").status_code, 200)

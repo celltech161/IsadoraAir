@@ -15,7 +15,7 @@
       <p><span class="amb-chip {% if worker.state == 'ok' %}ok{% elif worker.state == 'critical' %}alert{% elif worker.state == 'warning' %}review{% else %}off{% endif %}" data-worker-label>{{ worker.label }}</span></p>
       {% if worker.state == "not_configured" %}<p class="amb-note">Monitoring has no check for <code>{{ worker.unit }}</code>, so nothing validates the worker. The check is provisioned by the additive migration <code>monitoring.0014</code> when r0116 is installed.</p>
       {% elif worker.state == "disabled" %}<p class="amb-note">The Monitoring check “{{ worker.check }}” is disabled: the worker is not validated.</p>
-      {% elif worker.state == "monitoring_unavailable" %}<p class="amb-note">Monitoring's status could not be read. Worker health is unknown — it is never inferred from the heartbeat file or a process ID here.</p>
+      {% elif worker.state == "monitoring_unavailable" %}<p class="amb-note" data-worker-problem="{{ worker.problem }}">Monitoring's status cannot be trusted: {{ worker.explanation|default:"it could not be read" }}. Worker health is unknown — not healthy — and it is never inferred from the heartbeat file or a process ID here.</p>
       {% elif worker.state == "not_observed" %}<p class="amb-note">Monitoring has not observed the check “{{ worker.check }}” yet.</p>
       {% else %}
       <dl class="amb-facts">

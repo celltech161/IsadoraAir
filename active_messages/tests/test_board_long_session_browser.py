@@ -273,3 +273,27 @@ class LongSessionBrowserTests(test_board_browser.OperatorBoardBrowserTests):
         self.assertIn("alert", page.get_attribute("#ambWorker", "class"))
         self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "critical")
         self.close(page)
+
+    @in_browser
+    def test_an_untrusted_monitoring_state_is_shown_as_unavailable_and_recovers(self):
+        """Corrective pass: an untrusted Monitoring document now arrives as a
+        normal status answer (worker "monitoring_unavailable"), never a 500 --
+        so the rest of the status keeps updating and the page is not stale."""
+        page = self.clocked()
+        self.advance(page, EVERY)
+        self.assertIn("ok", page.get_attribute("#ambWorker", "class"))
+        self.overrides = {"worker": {"state": "monitoring_unavailable", "label": "Monitoring status unavailable",
+                                     "class": "off"}, "urgent": 3}
+        self.advance(page, EVERY)
+        self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "monitoring_unavailable")
+        self.assertEqual(page.text_content("#ambWorker").strip(), "Monitoring status unavailable")
+        self.assertNotIn("ok", page.get_attribute("#ambWorker", "class").split())
+        self.assertEqual(page.text_content('[data-count="urgent"]'), "3")    # the rest still updates
+        self.assertFalse(self.stale(page))
+        self.overrides = {}
+        self.advance(page, EVERY)
+        self.assertEqual(page.get_attribute("#ambWorker", "data-worker-state"), "ok")
+        state = self.state(page)
+        self.assertEqual((state["sent"], state["failures"], state["stopped"]), (3, 0, False))
+        self.assertEqual(len(self.hits), 3)                                  # one request per refresh
+        self.close(page)

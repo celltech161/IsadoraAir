@@ -570,6 +570,13 @@ def airing_detail(request, execution_id):
 
 # -- diagnostics (D3E-D; read-only) ------------------------------------------------------------
 
+def inspection_requested(params) -> bool:
+    """THE opt-in rule for both diagnostics routes: exactly one ``inspect``
+    parameter whose value is exactly "1". Missing, other, empty, duplicated
+    or contradictory values never inspect."""
+    return params.getlist("inspect") == ["1"]
+
+
 @require_GET
 def board_diagnostics(request):
     """Reconciliation and worker diagnostics. The inspection runs only when
@@ -577,7 +584,7 @@ def board_diagnostics(request):
     is ever shown as current, and a plain visit says no inspection has run.
     Read-only: no row, file or Monitoring event is ever written."""
     _require_control(request.user)
-    inspection = diagnostics.inspect() if request.GET.get("inspect") == "1" else None
+    inspection = diagnostics.inspect() if inspection_requested(request.GET) else None
     response = render(request, "active_messages/board_diagnostics.html", {
         "inspection": inspection, "worker": diagnostics.worker_health(),
         "classes": [{"key": key, "label": label, "meaning": meaning}
@@ -593,10 +600,15 @@ def board_diagnostics(request):
 
 @require_GET
 def board_diagnostics_data(request):
-    """The same bounded inspection as structured JSON (every GET inspects
-    afresh; nothing is cached). Read-only."""
+    """The diagnostics as structured JSON. Like the page, it inspects only on
+    an explicit ``?inspect=1`` (then afresh, nothing cached); otherwise
+    ``inspection`` is null and ``status`` "not_inspected" -- never a healthy
+    result. Read-only."""
     _require_control(request.user)
-    return JsonResponse({"inspection": diagnostics.inspect(), "worker": diagnostics.worker_health(),
+    inspection = diagnostics.inspect() if inspection_requested(request.GET) else None
+    return JsonResponse({"inspection": inspection,
+                         "status": "not_inspected" if inspection is None else inspection["state"],
+                         "worker": diagnostics.worker_health(),
                          "native_airing": "open" if heartbeat.gate_open_read_only() else "closed"},
                         headers={"Cache-Control": "no-store"})
 

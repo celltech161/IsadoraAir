@@ -1814,9 +1814,19 @@ command.
   to the existing airing or message page when the identity names one that
   exists (execution, publication, placed file, insertion attempt, quarantine
   operation). No server path or exception text is shown; all text is escaped.
-* `/iportal/messages/board/diagnostics/data/` -- the same bounded inspection
-  as JSON (`inspection`, `worker`, `native_airing`); every GET inspects
-  afresh.
+* `/iportal/messages/board/diagnostics/data/` -- the same as JSON
+  (`inspection`, `status`, `worker`, `native_airing`). It follows the SAME
+  opt-in as the page: without it, `inspection` is null and `status`
+  "not_inspected" (never a healthy result); with it, `status` is the
+  inspection's `complete` / `incomplete` / `unavailable`, inspected afresh.
+* **Explicit opt-in, one rule for both routes** (`board.inspection_requested`):
+  exactly one `inspect` parameter whose value is exactly `1`. A missing,
+  empty, `0`, `false`, `true` or any other value, a duplicated or
+  contradictory parameter (`inspect=1&inspect=0`), or unrelated parameters
+  never inspect -- no reconciliation, no Track ownership scan, no stat of the
+  library. Authorization is checked first: an anonymous user, a producer or
+  an expired session gets nothing, even with `inspect=1`. The status poll
+  never inspects.
 
 **Condition classes** (`diagnostics.classify`: D3E-C's codes first, then its
 categories -- no definition of its own):
@@ -1859,6 +1869,33 @@ the runtime-13 restart authority stays release-driven).
 | Not yet observed by Monitoring | the poller has no result for the check yet |
 | Monitoring status out of date | Monitoring's last poll is older than its own 30 s bound: the verdict is only the last known one |
 | Worker OK / warning / critical / unknown — *condition* | Monitoring's verdict and condition |
+
+**Untrusted Monitoring state fails closed.** The document is validated where
+it enters the read model (`diagnostics.worker_health`), before any verdict is
+read, and the result is "Monitoring status unavailable" -- unknown, never
+healthy -- with a `problem` and a plain explanation (no traceback, no path):
+
+* `unreadable` -- missing, unreadable, a symlink, over the size cap, not
+  JSON, partially written, or a root that is not an object;
+* `timestamp_missing` / `timestamp_invalid` -- Monitoring writes `timestamp`
+  as `time.time()`, finite epoch seconds (UTC by definition): anything else
+  (null, a string -- ISO, naive or numeric --, a boolean, an object, NaN,
+  ±Infinity, or outside the heartbeat contract's 2000..2100 window) is
+  refused, never converted;
+* `timestamp_in_future` -- an observation newer than now cannot describe the
+  present: it is refused, never clamped to age 0 (a negative age is never
+  shown, and a serialized "ok" from the future is not current health);
+* `checks_invalid` -- `checks` missing or not a list, or any entry that is not
+  an object with an integer `id`, or a duplicated id (a garbled list must not
+  read as "not yet observed"); an empty list is valid: "not observed";
+* `entry_invalid` -- the worker's entry has an unknown status or a non-object
+  detail.
+
+Any unforeseen fault is also "unavailable" (`observer_error`), never a 500 and
+never health. So the board, the status poll, the diagnostics page and its
+JSON keep answering, and the rest of the status keeps updating; the next
+trustworthy document restores the specific state. The existing staleness
+bound is unchanged ("out of date" past 30 s).
 
 Process identity: **verified** only for an active unit whose verdict came
 past `supervision.belongs`; **not current** (`heartbeat_not_current`);
@@ -2101,6 +2138,11 @@ restore, a version change, stale ON AIR and the worker chip.
 * Live status: no 90-refresh cutoff, one outstanding request, back-off, a
   stale view never asserts ON AIR, hidden-tab / back-forward / session-expiry
   handling, the worker chip.
+* Corrective pass: an untrusted Monitoring document (future-dated, invalid
+  or missing timestamp, malformed `checks` or entry, unreadable) is
+  "Monitoring status unavailable", never a current healthy verdict and never
+  an exception; the JSON diagnostics route inspects only on the same explicit
+  `?inspect=1` as the page (`board.inspection_requested`).
 * Reconciler: one shared Track-ownership scan per inspection
   (`retention.references_by_location`); `Report.generated_at`;
   `reconcile.inspect_publication`. Cleanup authorities unchanged.

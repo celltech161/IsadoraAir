@@ -27,6 +27,7 @@ maintenance command is run, and nothing reaches the playback engine.
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import time
@@ -37,7 +38,7 @@ from django.db import DatabaseError
 from django.urls import reverse
 from django.utils import timezone
 
-from . import reconcile, retention
+from . import heartbeat, reconcile, retention
 from .models import (
     ActiveBroadcastExecution, ActiveBroadcastInsertion, ActiveBroadcastMessage, ActiveBroadcastMessageEvent,
     ActiveBroadcastPublication,
@@ -314,56 +315,139 @@ def _monitoring_state(path):
     return document if isinstance(document, dict) else None
 
 
+MONITORING_STATUSES = ("ok", "warning", "critical", "unknown")
+# Monitoring writes ``timestamp`` as ``time.time()``: finite epoch seconds
+# (UTC by definition -- no local-time or naive interpretation exists). The
+# same plausibility window as the heartbeat contract.
+TIMESTAMP_MIN, TIMESTAMP_MAX = heartbeat.MIN_TIMESTAMP, heartbeat.MAX_TIMESTAMP
+PROBLEMS = {
+    "unreadable": "its state file is missing, unreadable or not a JSON object",
+    "timestamp_missing": "its state has no observation time",
+    "timestamp_invalid": "its observation time is not a valid epoch timestamp",
+    "timestamp_in_future": "its observation time is in the future, so it cannot describe the present",
+    "checks_invalid": "its list of check results is malformed",
+    "entry_invalid": "the worker's check result is malformed",
+    "observer_error": "its state could not be interpreted",
+}
+
+
+class UntrustedState(ValueError):
+    """The Monitoring document cannot be trusted; ``code`` says why."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _observation_age(document, now) -> float:
+    """Seconds since Monitoring's observation, or UntrustedState. A future
+    observation is refused, never clamped: it cannot describe the present."""
+    if "timestamp" not in document or document["timestamp"] is None:
+        raise UntrustedState("timestamp_missing")
+    timestamp = document["timestamp"]
+    if type(timestamp) not in (int, float) or not math.isfinite(timestamp) \
+            or not TIMESTAMP_MIN <= timestamp <= TIMESTAMP_MAX:
+        raise UntrustedState("timestamp_invalid")
+    if type(now) not in (int, float) or not math.isfinite(now):
+        raise UntrustedState("observer_error")
+    age = now - timestamp
+    if age < 0:
+        raise UntrustedState("timestamp_in_future")
+    return age
+
+
+def _worker_entry(document, check_id):
+    """The worker's result from a validated ``checks`` list (None: the poller
+    has not observed it yet), or UntrustedState. Every entry must be what the
+    poller writes -- an object with an integer id -- and ids must be unique;
+    anything else makes the whole list untrusted (a lost or garbled entry
+    must not read as "not observed")."""
+    checks = document.get("checks")
+    if type(checks) is not list:
+        raise UntrustedState("checks_invalid")
+    found, seen = None, set()
+    for item in checks:
+        if type(item) is not dict or type(item.get("id")) is not int or item["id"] in seen:
+            raise UntrustedState("checks_invalid")
+        seen.add(item["id"])
+        if item["id"] == check_id:
+            found = item
+    if found is None:
+        return None
+    detail = found.get("detail", {})
+    if found.get("status") not in MONITORING_STATUSES or type(detail) is not dict \
+            or not isinstance(detail.get("reason", ""), (str, type(None))) \
+            or not isinstance(detail.get("active_state", ""), (str, type(None))):
+        raise UntrustedState("entry_invalid")
+    return found
+
+
 def worker_health(*, now=None, state_path=None) -> dict:
     """The worker as Monitoring last validated it -- never re-derived here.
 
     state: "not_configured" (no Monitoring check of the unit), "disabled",
-    "monitoring_unavailable" (no readable state), "stale" (Monitoring's last
-    poll is older than its own staleness bound: the verdict shown is only the
-    last known one), "not_observed" (the poller has no result for the check
-    yet), or the verdict's status ("ok", "warning", "critical", "unknown")."""
+    "monitoring_unavailable" (no trustworthy state: unreadable, malformed,
+    or an observation time that is missing, invalid or in the future --
+    ``problem`` says which), "stale" (Monitoring's last poll is older than its
+    own staleness bound: the verdict shown is only the last known one),
+    "not_observed" (the poller has no result for the check yet), or the
+    verdict's status ("ok", "warning", "critical", "unknown"). Never raises:
+    an unforeseen fault is "monitoring_unavailable" too, never health."""
+    base = {"monitoring_url": "/monitoring/", "unit": WORKER_UNIT, "identity": "unknown", "heartbeat": "unknown",
+            "recovery": False, "reason": "", "problem": "", "observed_age_seconds": None, "detail": {}}
+    try:
+        return _worker_health(base, now=time.time() if now is None else now, state_path=state_path)
+    except Exception:                                 # noqa: BLE001 -- fail closed, never a crash or "ok"
+        return _unavailable(base, "observer_error")
+
+
+def _unavailable(base, problem, **extra):
+    return {**base, **extra, "state": "monitoring_unavailable", "problem": problem,
+            "label": WORKER_LABELS["monitoring_unavailable"], "explanation": PROBLEMS[problem]}
+
+
+def _worker_health(base, *, now, state_path) -> dict:
     from monitoring.models import MonitorCheck
     from monitoring.views import STATE_PATH, STATE_STALE_SECONDS
-    now = time.time() if now is None else now
-    base = {"monitoring_url": "/monitoring/", "unit": WORKER_UNIT, "identity": "unknown", "heartbeat": "unknown",
-            "recovery": False, "reason": "", "observed_age_seconds": None, "detail": {}}
     try:
         check = (MonitorCheck.objects.filter(kind="systemd", systemd_unit=WORKER_UNIT)
                  .order_by("id").values("id", "name", "enabled").first())
     except DatabaseError:
-        return {**base, "state": "monitoring_unavailable", "label": WORKER_LABELS["monitoring_unavailable"]}
+        return _unavailable(base, "observer_error")
     if check is None:
         return {**base, "state": "not_configured", "label": WORKER_LABELS["not_configured"]}
     if not check["enabled"]:
         return {**base, "state": "disabled", "label": WORKER_LABELS["disabled"], "check": check["name"]}
     document = _monitoring_state(state_path or MONITORING_STATE_PATH or STATE_PATH)
     if document is None:
-        return {**base, "state": "monitoring_unavailable", "label": WORKER_LABELS["monitoring_unavailable"],
-                "check": check["name"]}
-    timestamp = document.get("timestamp")
-    age = round(now - timestamp, 1) if type(timestamp) in (int, float) and timestamp > 0 else None
-    entry = next((item for item in document.get("checks") or [] if isinstance(item, dict)
-                  and item.get("id") == check["id"]), None)
+        return _unavailable(base, "unreadable", check=check["name"])
+    try:
+        age = _observation_age(document, now)
+        entry = _worker_entry(document, check["id"])
+    except UntrustedState as exc:
+        return _unavailable(base, exc.code, check=check["name"])
+    age = round(age, 1)
     if entry is None:
         return {**base, "state": "not_observed", "label": WORKER_LABELS["not_observed"], "check": check["name"],
                 "observed_age_seconds": age}
-    status = entry.get("status") if entry.get("status") in ("ok", "warning", "critical", "unknown") else "unknown"
-    detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+    status = entry["status"]
+    detail = entry.get("detail", {})
     reason = str(detail.get("reason") or "")[:64]
     active = detail.get("active_state") == "active"
     identity = ("mismatch" if reason == "heartbeat_not_current"
                 else "verified" if active and reason not in IDENTITY_UNPROVEN and status != "unknown"
                 else "unknown")
-    heartbeat = ("current" if identity == "verified" else "missing" if reason == "no_heartbeat"
-                 else "not_current" if reason == "heartbeat_not_current" else "malformed" if reason == "malformed"
-                 else "unknown")
+    heartbeat_state = ("current" if identity == "verified" else "missing" if reason == "no_heartbeat"
+                       else "not_current" if reason == "heartbeat_not_current" else "malformed"
+                       if reason == "malformed" else "unknown")
     shown = {key: detail[key] for key in ("phase", "outcome", "code", "heartbeat_age_seconds", "native_airing",
                                           "n_restarts", "active_state", "sub_state")
-             if key in detail and isinstance(detail[key], (str, int, float, bool, type(None)))}
-    stale = age is None or age > STATE_STALE_SECONDS
+             if key in detail and isinstance(detail[key], (str, int, float, bool, type(None)))
+             and not (isinstance(detail[key], float) and not math.isfinite(detail[key]))}
+    stale = age > STATE_STALE_SECONDS
     return {**base, "state": "stale" if stale else status, "status": status,
             "label": (WORKER_LABELS["stale"] if stale else WORKER_LABELS[status]) + (f" — {reason}" if reason else ""),
-            "reason": reason, "identity": identity, "heartbeat": heartbeat,
+            "reason": reason, "identity": identity, "heartbeat": heartbeat_state,
             "recovery": reason in RECOVERY_CONDITIONS, "check": check["name"], "observed_age_seconds": age,
             "detail": shown}
 
