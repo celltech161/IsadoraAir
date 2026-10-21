@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -6,6 +7,7 @@ import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
 
+from django.contrib.auth import get_user_model
 from django.http import FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound
 from django.shortcuts import render
 from django.urls import reverse
@@ -2820,15 +2822,76 @@ def api_engine_manual_mode(request):
     return JsonResponse({"ok": True})
 
 
+ENGINE_STATE_PATH = Path("/run/isadoraair/engine_state.json")
+REMOTE_DJ_OWNER_NAME_MAX = 64
+# Who may see WHO holds the Remote DJ connection: anyone who may connect as,
+# or gate, the Remote DJ (staff/superuser via authorize()'s own bypass).
+REMOTE_DJ_IDENTITY_CAPABILITIES = ("remote_dj.connect", "remote_dj.mic_gate")
+
+
+def _can_view_remote_dj_identity(user):
+    from authz.evaluator import SCHEDULE_POLICY_IGNORE
+
+    for slug in REMOTE_DJ_IDENTITY_CAPABILITIES:
+        try:
+            if authorize(user, slug, schedule_policy=SCHEDULE_POLICY_IGNORE):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _public_remote_dj_owner(raw_owner, viewer):
+    """Roadmap 2.23 Phase 1B -- the display-safe view of the engine's active
+    Remote DJ owner (engine.PlaybackEngine._remote_dj_owner_state).
+
+    Never returns the raw user id or attempt id. ``browser_key`` is a one-way
+    digest of the owning connection attempt, so the owning browser (which
+    alone holds its attempt id) can recognise its own connection while an
+    observer learns nothing usable. ``identity`` is "unavailable" when the
+    owner cannot be established (no user id, or the account no longer
+    exists) -- the page then shows a generic connected state rather than
+    inventing a name.
+    """
+    if not isinstance(raw_owner, dict):
+        return None
+    attempt_id = raw_owner.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return None
+    if not _can_view_remote_dj_identity(viewer):
+        return None
+    owner = None
+    user_id = raw_owner.get("user_id")
+    if isinstance(user_id, int) and user_id > 0:
+        owner = get_user_model().objects.filter(pk=user_id).first()
+    display_name = None
+    if owner is not None:
+        display_name = (owner.get_full_name().strip() or owner.get_username())[:REMOTE_DJ_OWNER_NAME_MAX]
+    return {
+        "identity": "known" if display_name else "unavailable",
+        "display_name": display_name,
+        "is_current_user": owner is not None and owner.pk == viewer.pk,
+        "browser_key": hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32],
+    }
+
+
 @require_http_methods(["GET"])
 def api_engine_status(request):
-    state_path = Path("/run/isadoraair/engine_state.json")
+    state_path = ENGINE_STATE_PATH
     if not state_path.is_file():
         return JsonResponse({"transport": "OFFLINE", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": []})
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
-        if time_mod.time() - data.get("timestamp", 0) > 10:
+        stale = time_mod.time() - data.get("timestamp", 0) > 10
+        if stale:
             data["transport"] = "STALE"
+        # The raw owner block never leaves the server. A stale state file
+        # can't prove the session is still active, so no identity then.
+        raw_owner = data.pop("remote_dj_owner", None)
+        data["remote_dj_owner"] = (
+            None if stale or not data.get("remote_dj_connected")
+            else _public_remote_dj_owner(raw_owner, request.user)
+        )
         return JsonResponse(data)
     except Exception:
         return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": []})

@@ -391,3 +391,55 @@ class ConsoleTemplateContractTests(SimpleTestCase):
                 body = self._function(fn)
                 self.assertNotIn("setInterval(", body)
                 self.assertNotIn("fetch(", body)
+
+
+class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
+    """Roadmap 2.23 Phase 1B -- deterministic source contracts."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.template = TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def _function(self, name):
+        start = self.template.index(f"function {name}(")
+        return self.template[start:self.template.index("\n}", start) + 2]
+
+    def test_ownership_is_this_browsers_attempt_key_never_user_identity(self):
+        presentation = self._function("rdjOwnerPresentation")
+        self.assertIn("owner.browser_key === rdjBrowserKey", presentation)
+        # is_current_user only labels an observer "(you)"; it never makes a
+        # page the owner (that requires a live peer connection AND the key).
+        self.assertNotIn("is_current_user &&", presentation.split("if (weAreConnected) {")[1].split("}")[0])
+        self.assertIn("const weAreConnected = !!rdjPc;", self._function("renderRemoteDjConnect"))
+
+    def test_no_raw_identifier_is_read_from_the_owner_block(self):
+        for raw in ("remote_dj_owner.user_id", "remote_dj_owner.attempt_id", "owner.user_id", "owner.attempt_id"):
+            with self.subTest(raw=raw):
+                self.assertNotIn(raw, self.template)
+
+    def test_browser_key_is_derived_locally_and_dropped_on_disconnect(self):
+        self.assertIn("window.crypto.subtle.digest('SHA-256'", self._function("rdjDeriveBrowserKey"))
+        self.assertIn("rdjBrowserKey = null;", self._function("rdjDisconnect"))
+
+    def test_identity_renders_only_from_the_newest_status_response(self):
+        poll = self._function("poll")
+        self.assertIn("const seq = ++statusPollSeq;", poll)
+        guarded = poll[poll.index("if (seq > latestRemoteDjStatusSeq) {"):]
+        guarded = guarded[:guarded.index("}")]
+        self.assertIn("renderRemoteDjConnect(data);", guarded)
+        self.assertIn("renderRemoteDjGate(data);", guarded)
+        self.assertEqual(poll.count("renderRemoteDjConnect(data);"), 1)
+
+    def test_identity_is_withheld_while_status_is_stale(self):
+        self.assertIn("renderRemoteDjConnect(window.__rdjLastEngineState || {});",
+                      self._function("renderConnectionStale"))
+        render = self._function("renderRemoteDjConnect")
+        stale = render[render.index("if (connectionStale && (weAreConnected || someoneElseConnected)) {"):]
+        self.assertIn("'Status unavailable'", stale[:stale.index("return;")])
+        self.assertLess(render.index("if (connectionStale &&"), render.index("rdjOwnerPresentation(data"))
+
+    def test_no_new_polling_loop_or_endpoint(self):
+        self.assertEqual(self.template.count("setInterval(poll, 1000);"), 1)
+        self.assertNotIn("/api/remote-dj/owner", self.template)
+        self.assertNotIn("/api/engine/remote-dj-owner", self.template)

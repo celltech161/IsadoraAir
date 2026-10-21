@@ -10203,6 +10203,23 @@ class PlaybackEngine:
             return None
         return session.quality.snapshot(attempt_status=attempt.status, now=time.monotonic())
 
+    def _remote_dj_owner_state(self):
+        """Roadmap 2.23 Phase 1B -- who owns the ACTIVE Remote DJ session.
+
+        `user_id` is the signed-token user the signaling server re-authorized
+        at admission (and _remote_dj_authorization_tick keeps re-checking);
+        `attempt_id` identifies the owning browser's connection attempt.
+        Active session only -- never derived from _remote_dj_last_attempt, so
+        an ended session can never be reported as owned. Written to
+        engine_state.json for library.views.api_engine_status, which turns it
+        into a display block for authorized viewers and never passes these
+        raw values through."""
+        session = getattr(self, "remote_dj_session", None)
+        attempt = getattr(session, "connection_attempt", None) if session is not None else None
+        if session is None or attempt is None:
+            return None
+        return {"user_id": session.user_id, "attempt_id": attempt.attempt_id}
+
     def _remote_dj_record_browser_milestone(
         self, attempt_id, milestone, elapsed_ms
     ):
@@ -14758,6 +14775,10 @@ class PlaybackEngine:
                 # "reconnecting" whenever B1/B1.1 says so). Purely
                 # observational: see remote_dj_quality.py.
                 "remote_dj_quality": self._remote_dj_quality_state(),
+                # Roadmap 2.23 Phase 1B -- RAW owner identity for the status
+                # view only (see _remote_dj_owner_state); stripped from every
+                # /api/engine/status/ response.
+                "remote_dj_owner": self._remote_dj_owner_state(),
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
                 # progress-bar reconciliation regardless of what

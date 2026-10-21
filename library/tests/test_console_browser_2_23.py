@@ -18,6 +18,7 @@ Isolation -- nothing here can touch playout:
 Screenshots go to $CONSOLE_2_23_SCREENSHOT_DIR when set (evidence runs),
 otherwise to a throwaway temp directory.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -752,8 +753,10 @@ class _ConsoleBrowserBase:
         }""", button)
 
     def poll_now(self, page, **state):
+        """Run one status poll; ``state`` is either engine_state() overrides
+        or (when it has "decks") a complete fixture state."""
         if state:
-            self.state = engine_state(**state)
+            self.state = state if "decks" in state else engine_state(**state)
         page.evaluate("async () => { await poll(); }")
 
     def test_network_rejection_clears_pending_and_reports_an_unconfirmed_outcome(self):
@@ -964,6 +967,206 @@ class _ConsoleBrowserBase:
             "() => { const c = document.getElementById('npWaveform-A');"
             " return c.width === Math.round(c.getBoundingClientRect().width); }")
         self.shot(page, "full-mobile-light-theme")
+
+    # -- Roadmap 2.23 Phase 1B: Remote DJ connection identity ---------------
+    # The browser receives /api/engine/status/ from fixtures here, shaped as
+    # library.views.api_engine_status returns it (test_remote_dj_identity_2_23
+    # covers the view itself). No WebRTC connection is ever made: "this
+    # browser owns it" is simulated by giving the page a stand-in peer
+    # connection and its own attempt id, exactly the two things it holds.
+    OWNER_ATTEMPT = "owner-attempt-0123456789ab"
+
+    @staticmethod
+    def browser_key(attempt_id):
+        return hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+
+    def owner(self, name="Jane Smith", *, current=False, attempt=None, identity="known"):
+        return {"identity": identity, "display_name": name if identity == "known" else None,
+                "is_current_user": current,
+                "browser_key": self.browser_key(attempt or "someone-elses-attempt-xyz")}
+
+    def connected(self, owner, **overrides):
+        state = dict(remote_dj_connected=True, remote_dj_owner=owner,
+                     remote_dj_quality={"overall": "good"})
+        state.update(overrides)
+        return engine_state(**state)
+
+    def connect_ui(self, page):
+        return page.evaluate("""() => {
+          const b = document.getElementById('remoteDjConnectBtn');
+          const action = document.getElementById('remoteDjConnectAction');
+          const r = b.getBoundingClientRect();
+          return {action: action.textContent, status: document.getElementById('remoteDjConnectStatus').textContent,
+                  aria: b.getAttribute('aria-label'), title: b.title, disabled: b.disabled,
+                  width: r.width, height: r.height, top: r.top,
+                  actionClipped: action.scrollWidth > action.clientWidth};
+        }""")
+
+    def become_owner_browser(self, page, attempt):
+        page.evaluate("""async (attempt) => {
+          rdjPc = { close() {}, iceConnectionState: 'connected' };
+          rdjAttemptId = attempt;
+          rdjBrowserKey = await rdjDeriveBrowserKey(attempt);
+        }""", attempt)
+
+    def test_observer_sees_who_is_connected(self):
+        self.state = self.connected(self.owner("Jane Smith"))
+        page = self.open_console(self.superuser)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Jane Smith", "Other browser · Good", True))
+        self.assertEqual(ui["aria"], "Remote DJ connected — Jane Smith (in another browser) — link quality Good")
+        self.assertIn("Only that browser can disconnect it", ui["title"])
+        self.assertEqual(page.evaluate(
+            "() => getComputedStyle(document.getElementById('remoteDjConnectBtn')).opacity"), "0.75")
+        self.shot(page, "rdj-identity-observer")
+
+    def test_same_account_in_another_browser_is_an_observer(self):
+        self.state = self.connected(self.owner("Jane Smith", current=True))
+        page = self.open_console(self.superuser)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]),
+                         ("Jane Smith (you)", "Other browser · Good", True))
+        self.assertIn("your account, in another browser", ui["aria"])
+        self.shot(page, "rdj-identity-same-account-other-browser")
+
+    def test_owning_browser_is_recognised_by_its_own_attempt_key(self):
+        self.state = self.connected(self.owner("Jane Smith", current=True, attempt=self.OWNER_ATTEMPT))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.OWNER_ATTEMPT)
+        self.poll_now(page)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Disconnect", "You · Good", False))
+        self.assertIn("you are connected in this browser as Jane Smith", ui["aria"])
+        self.shot(page, "rdj-identity-owner-browser")
+        # A page holding a peer connection whose key does NOT match is not
+        # told "You": matching user identity is never proof of ownership.
+        self.become_owner_browser(page, "a-different-attempt-000000")
+        self.poll_now(page)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Disconnect", "Good"))
+        self.assertNotIn("you are connected", ui["aria"])
+
+    def test_owner_disconnect_is_local_and_unchanged(self):
+        self.state = self.connected(self.owner(attempt=self.OWNER_ATTEMPT))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.OWNER_ATTEMPT)
+        self.poll_now(page)
+        page.locator("#remoteDjConnectBtn").click()
+        # rdjAttemptId is kept for diagnostics, as in r0116; ownership is gone.
+        self.assertEqual(page.evaluate("() => [rdjPc, rdjBrowserKey]"), [None, None])
+        ui = self.connect_ui(page)
+        self.assertNotIn("You", ui["status"])
+        self.assertEqual(self.posts, [])   # Disconnect is local WebRTC teardown, no engine command
+
+    def test_unknown_or_withheld_identity_stays_generic(self):
+        for name, owner, status in (("unavailable", self.owner(identity="unavailable"), "Other browser · Good"),
+                                    ("withheld", None, "Good")):
+            with self.subTest(owner=name):
+                self.state = self.connected(owner)
+                page = self.open_console(self.superuser)
+                ui = self.connect_ui(page)
+                self.assertEqual((ui["action"], ui["status"]), ("Remote in use", status))
+                self.assertNotIn("Jane", ui["aria"] + ui["title"])
+
+    def test_disconnected_shows_no_identity(self):
+        self.state = engine_state(remote_dj_connected=False, remote_dj_owner=None)
+        page = self.open_console(self.superuser)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["title"]), ("Connect", "Offline", ""))
+
+    def test_owner_changes_and_expiry_leave_no_stale_name(self):
+        self.state = self.connected(self.owner("Jane Smith"))
+        page = self.open_console(self.superuser)
+        self.assertEqual(self.connect_ui(page)["action"], "Jane Smith")
+        # A's connection degrades: engine reconnect grace.
+        self.poll_now(page, **{**self.connected(self.owner("Jane Smith"), remote_dj_reconnecting=True)})
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Jane Smith", "Reconnecting…"))
+        self.shot(page, "rdj-identity-reconnecting")
+        # The server expires the abandoned session.
+        self.poll_now(page, remote_dj_connected=False, remote_dj_owner=None)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Connect", "Offline"))
+        self.assertNotIn("Jane", ui["aria"] + ui["title"])
+        # User B connects.
+        self.poll_now(page, **{**self.connected(self.owner("Bob Jones"))})
+        ui = self.connect_ui(page)
+        self.assertEqual(ui["action"], "Bob Jones")
+        self.assertNotIn("Jane", ui["aria"] + ui["title"])
+
+    def test_a_late_older_status_response_cannot_resurrect_an_owner(self):
+        self.state = self.connected(self.owner("Jane Smith"))
+        page = self.open_console(self.superuser)
+        page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__statusQueue = [];
+          window.fetch = (url, opts) => String(url).endsWith('/api/engine/status/')
+            ? new Promise(resolve => window.__statusQueue.push(resolve))
+            : realFetch(url, opts);
+          window.__answerStatus = (i, body) => window.__statusQueue[i](
+            new Response(JSON.stringify(body), {status: 200, headers: {'Content-Type': 'application/json'}}));
+          window.__polls = [poll(), poll()];      // older request 0, newer request 1
+        }""")
+        jane = self.connected(self.owner("Jane Smith"))
+        gone = engine_state(remote_dj_connected=False, remote_dj_owner=None)
+        page.evaluate("async ([b]) => { __answerStatus(1, b); await __polls[1]; }", [gone])
+        page.evaluate("async ([b]) => { __answerStatus(0, b); await __polls[0]; }", [jane])
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Connect", "Offline"))
+        self.assertNotIn("Jane", ui["aria"] + ui["title"])
+
+    def test_status_outage_withholds_identity_until_fresh_status(self):
+        self.state = self.connected(self.owner("Jane Smith"))
+        page = self.open_console(self.superuser)
+        self.status_fails = True
+        page.clock.run_for(3_500)
+        page.wait_for_function("() => document.getElementById('consoleRoot').classList.contains('connection-stale')")
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Remote in use", "Status unavailable"))
+        self.assertNotIn("Jane", ui["aria"] + ui["title"])
+        self.shot(page, "rdj-identity-status-stale")
+        self.status_fails = False
+        page.clock.run_for(1_100)
+        page.wait_for_function("() => document.getElementById('remoteDjConnectAction').textContent === 'Jane Smith'")
+
+    def test_reload_while_another_user_is_connected(self):
+        self.state = self.connected(self.owner("Jane Smith"))
+        page = self.open_console(self.superuser)
+        page.reload()
+        page.clock.run_for(1_100)
+        page.wait_for_function("() => document.getElementById('remoteDjConnectAction').textContent === 'Jane Smith'")
+
+    def test_long_names_never_resize_the_control(self):
+        long_name = "Maximiliana Alexandra Featherstonehaugh-Cholmondeley Jr."
+        for viewport in (DESKTOP, MOBILE_PORTRAIT):
+            with self.subTest(viewport=viewport["width"]):
+                self.state = self.connected(self.owner("Jo"))
+                page = self.open_console(self.superuser, viewport=viewport)
+                short = self.connect_ui(page)
+                self.poll_now(page, **{**self.connected(self.owner(long_name))})
+                long = self.connect_ui(page)
+                self.assertEqual((long["width"], long["height"], long["top"]),
+                                 (short["width"], short["height"], short["top"]))
+                self.assertTrue(long["actionClipped"])
+                self.assertIn(long_name, long["aria"])
+                self.assertIn(long_name, long["title"])
+                self.no_horizontal_overflow(page)
+                self.shot(page, f"rdj-identity-long-name-{viewport['width']}")
+
+    def test_observer_quality_is_the_engine_published_measurement(self):
+        self.state = self.connected(self.owner("Jane Smith"), remote_dj_quality={"overall": "fair"})
+        page = self.open_console(self.superuser)
+        self.assertEqual(self.connect_ui(page)["status"], "Other browser · Fair")
+        self.poll_now(page, **{**self.connected(self.owner("Jane Smith"), remote_dj_quality=None)})
+        self.assertEqual(self.connect_ui(page)["status"], "Other browser · Initializing…")
+
+    def test_remote_host_page_shows_the_connected_dj(self):
+        self.state = self.connected(self.owner("Jane Smith"), live="B")
+        page = self.open_console(self.host, path="/remote-dj/", viewport=MOBILE_PORTRAIT)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Jane Smith", "Other browser · Good", True))
+        self.no_horizontal_overflow(page)
+        self.shot(page, "rdj-identity-remote-dj-mobile-observer")
 
     # -- Remote DJ ----------------------------------------------------------
     def test_remote_dj_mobile_live_deck_first_in_both_slot_arrangements(self):

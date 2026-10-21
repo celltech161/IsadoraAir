@@ -206,6 +206,14 @@
     border-color: var(--accent);
     color: var(--text-main);
   }
+  .rdj-connect-action,
+  .rdj-connect-status {
+    /* Phase 1B: a long Remote DJ name or status never widens the fixed
+       13em control; the full text is in the button's aria-label/title. */
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .rdj-connect-action {
     display: block;
     font-size: 1em;
@@ -227,6 +235,10 @@
   .rdj-connect-status.rdj-status-negotiating,
   .rdj-connect-status.rdj-status-initializing { color: var(--text-muted); }
   #remoteDjConnectBtn.error { color: var(--danger); border-color: var(--danger); }
+  /* Phase 1B: when ANOTHER browser holds the connection the control is
+     disabled (only the owner may disconnect) but now carries who that is,
+     so it stays readable rather than the generic 0.4 disabled fade. */
+  #remoteDjConnectBtn.rdj-observing:disabled { opacity: 0.75; }
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
 
@@ -2247,6 +2259,16 @@ let rdjGainNode = null;
 let rdjCalibrating = false;
 let rdjConnectStartedAt = null;
 let rdjAttemptId = null;
+// Roadmap 2.23 Phase 1B -- one-way key of THIS browser's own connection
+// attempt, compared with the status's remote_dj_owner.browser_key to tell
+// "this browser owns the Remote DJ connection" from "another browser (even
+// one signed in to the same account) owns it". Never sent anywhere.
+let rdjBrowserKey = null;
+async function rdjDeriveBrowserKey(attemptId) {
+  if (!attemptId || !(window.crypto && window.crypto.subtle)) return null;
+  const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(attemptId));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
 let rdjIceServers = [];
 let rdjFirstIceCandidateSeen = false;
 let rdjStatsTimers = [];
@@ -2422,6 +2444,7 @@ async function toggleRemoteDjConnect() {
   );
   rdjConnectStartedAt = performance.now();
   rdjAttemptId = null;
+  rdjBrowserKey = null;
   rdjIceServers = [];
   rdjFirstIceCandidateSeen = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
@@ -2455,6 +2478,11 @@ async function toggleRemoteDjConnect() {
     const tokenResponse = await r.json();
     ({token} = tokenResponse);
     rdjAttemptId = tokenResponse.attempt_id;
+    rdjBrowserKey = null;
+    const keyedAttempt = rdjAttemptId;
+    rdjDeriveBrowserKey(keyedAttempt).then(key => {
+      if (rdjAttemptId === keyedAttempt) rdjBrowserKey = key;
+    }).catch(() => {});
     rdjIceServers = tokenResponse.ice_servers;
     tokenElapsedMs = performance.now() - rdjConnectStartedAt;
     if (!token || !rdjAttemptId || !Array.isArray(rdjIceServers) || !rdjIceServers.length) {
@@ -2628,6 +2656,7 @@ function rdjDisconnect() {
   if (rdjQualityIntervalId !== null) { clearInterval(rdjQualityIntervalId); rdjQualityIntervalId = null; }
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
+  rdjBrowserKey = null;  // Phase 1B: this browser no longer owns a connection
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
   rdjGainNode = null;
   const audio = document.getElementById('remoteMonitorAudio');
@@ -2650,6 +2679,43 @@ function rdjConnectFail(msg) {
   setTimeout(() => btn.classList.remove('error'), 3000);
 }
 
+// Roadmap 2.23 Phase 1B -- who holds the Remote DJ connection, taken only
+// from the server's display-safe remote_dj_owner block. THIS browser is the
+// owner only when its own attempt key matches; the same account signed in
+// elsewhere is an observer ("(you)"). With no usable identity the control
+// keeps the generic r0116 wording rather than guessing a name.
+function rdjOwnerPresentation(data, weAreConnected) {
+  const owner = (data.remote_dj_connected && data.remote_dj_owner) || null;
+  const name = owner && owner.identity === 'known' && owner.display_name ? owner.display_name : null;
+  if (weAreConnected) {
+    const thisBrowser = !!(owner && rdjBrowserKey && owner.browser_key === rdjBrowserKey);
+    return {
+      statusPrefix: thisBrowser ? 'You · ' : '',
+      ariaDetail: thisBrowser
+        ? ' — you are connected in this browser' + (name ? ' as ' + name : '')
+        : '',
+      title: (thisBrowser
+        ? 'You are connected as the Remote DJ in this browser' + (name ? ' (' + name + ')' : '') + '.'
+        : 'Remote DJ connection in this browser.')
+        + (rdjAttemptId ? ' Connection attempt ' + rdjAttemptId + '.' : ''),
+    };
+  }
+  const label = name ? name + (owner.is_current_user ? ' (you)' : '') : 'Remote in use';
+  return {
+    observerAction: label,
+    observerAria: name
+      ? 'Remote DJ connected — ' + name
+        + (owner.is_current_user ? ' (your account, in another browser)' : ' (in another browser)')
+      : 'Remote DJ in use',
+    statusPrefix: owner ? 'Other browser · ' : '',
+    ariaDetail: '',
+    title: name
+      ? 'Remote DJ connected: ' + name + (owner.is_current_user ? ' (your account)' : '')
+        + ', in another browser. Only that browser can disconnect it.'
+      : (data.remote_dj_connected ? 'A Remote DJ is connected in another browser.' : ''),
+  };
+}
+
 function renderRemoteDjConnect(data) {
   const btn = document.getElementById('remoteDjConnectBtn');
   if (!btn) return;
@@ -2668,20 +2734,35 @@ function renderRemoteDjConnect(data) {
   const reconnecting = !!data.remote_dj_reconnecting || (weAreConnected && rdjReconnecting);
   btn.disabled = !data.remote_dj_configured || someoneElseConnected;
   btn.classList.toggle('active', weAreConnected);
+  btn.classList.toggle('rdj-observing', someoneElseConnected);
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
   if (!data.remote_dj_configured) {
     btn.classList.remove('pending');
+    btn.title = '';
     rdjSetConnectPresentation(
       'Connect', 'Unavailable', 'offline', 'Connect Remote DJ — Unavailable',
     );
     return;
   }
+  if (connectionStale && (weAreConnected || someoneElseConnected)) {
+    // Phase 1B -- last-known status can't prove who (if anyone) still holds
+    // the connection: withhold identity and quality until a fresh poll.
+    btn.classList.remove('pending');
+    btn.title = 'Console status is stale; the Remote DJ connection state is unconfirmed.';
+    rdjSetConnectPresentation(
+      weAreConnected ? 'Disconnect' : 'Remote in use', 'Status unavailable', 'offline',
+      (weAreConnected ? 'Disconnect Remote DJ' : 'Remote DJ in use') + ' — status unavailable',
+    );
+    return;
+  }
+  const ident = rdjOwnerPresentation(data, weAreConnected);
+  btn.title = ident.title;
   if (reconnecting && (weAreConnected || someoneElseConnected)) {
     btn.classList.remove('pending');
-    const action = weAreConnected ? 'Disconnect' : 'Remote in use';
-    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : 'Remote DJ in use';
+    const action = weAreConnected ? 'Disconnect' : ident.observerAction;
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : ident.observerAria;
     rdjSetConnectPresentation(
-      action, 'Reconnecting…', 'reconnecting', ariaAction + ' — Reconnecting',
+      action, 'Reconnecting…', 'reconnecting', ariaAction + ident.ariaDetail + ' — Reconnecting',
     );
     return;
   }
@@ -2692,6 +2773,9 @@ function renderRemoteDjConnect(data) {
     );
     return;
   }
+  // Link quality is the ENGINE's published measurement of the active
+  // session (remote_dj_quality), the same for the owning browser and any
+  // observer -- never this browser's own local connection.
   const quality = data.remote_dj_quality;
   const overall = quality && quality.overall;
   const qualityPresentation = {
@@ -2702,25 +2786,26 @@ function renderRemoteDjConnect(data) {
   const presentedQuality = qualityPresentation[overall];
   if (weAreConnected || someoneElseConnected) {
     btn.classList.remove('pending');
-    const action = weAreConnected ? 'Disconnect' : 'Remote in use';
-    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : 'Remote DJ in use';
+    const action = weAreConnected ? 'Disconnect' : ident.observerAction;
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : ident.observerAria;
     if (presentedQuality) {
       rdjSetConnectPresentation(
         action,
-        presentedQuality[0],
+        ident.statusPrefix + presentedQuality[0],
         presentedQuality[1],
-        ariaAction + ' — link quality ' + presentedQuality[0],
+        ariaAction + ident.ariaDetail + ' — link quality ' + presentedQuality[0],
       );
     } else {
       // Missing/initializing B2 data is truthful warm-up, never guessed Good.
       rdjSetConnectPresentation(
-        action, 'Initializing…', 'initializing',
-        ariaAction + ' — link quality initializing',
+        action, ident.statusPrefix + 'Initializing…', 'initializing',
+        ariaAction + ident.ariaDetail + ' — link quality initializing',
       );
     }
     return;
   }
   btn.classList.remove('pending');
+  btn.title = '';
   rdjSetConnectPresentation(
     'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
   );
@@ -2836,6 +2921,8 @@ let connectionStale = false;
 function renderConnectionStale(stale) {
   const banner = document.getElementById('connectionStaleBanner');
   if (banner) banner.hidden = !stale;
+  // Phase 1B: withhold (stale) / restore the Remote DJ owner identity.
+  renderRemoteDjConnect(window.__rdjLastEngineState || {});
   const root = document.getElementById('consoleRoot');
   if (root) root.classList.toggle('connection-stale', stale);
 }
@@ -3653,6 +3740,8 @@ async function insertTrack(trackId, position) {
 }
 
 // --- Main poll loop ---
+let statusPollSeq = 0;
+let latestRemoteDjStatusSeq = 0;
 async function poll() {
   // Evaluated BEFORE the fetch, from elapsed wall-clock time, so a
   // hung/blackholed request (which never resolves and so never lets
@@ -3660,6 +3749,7 @@ async function poll() {
   // the next 1000ms setInterval(poll, ...) tick runs this again
   // regardless of whether an earlier fetchStatus() is still pending.
   checkConnectionStaleness();
+  const seq = ++statusPollSeq;
   const data = await fetchStatus();
   if (data) markStatusSuccess();
   if (!data) return;
@@ -3668,8 +3758,15 @@ async function poll() {
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
   renderMicPtt(data);
-  renderRemoteDjConnect(data);
-  renderRemoteDjGate(data);
+  // Roadmap 2.23 Phase 1B -- Remote DJ ownership/identity renders only from
+  // the NEWEST status request to complete: a slow, older response landing
+  // after a newer one (overlapping 1 s polls) can't resurrect a previous
+  // owner. Ordered by request, not by wall-clock timestamp.
+  if (seq > latestRemoteDjStatusSeq) {
+    latestRemoteDjStatusSeq = seq;
+    renderRemoteDjConnect(data);
+    renderRemoteDjGate(data);
+  }
   renderManualMode(data);
   reconcileFxFires(data.fx_fires);
 }
