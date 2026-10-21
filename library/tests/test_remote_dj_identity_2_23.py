@@ -170,6 +170,18 @@ class StatusIdentityTests(TestCase):
     def test_older_engine_without_the_field_is_generic(self):
         data = self.status(self.staff, _state(owner_user_id=self.dj.pk, include_owner=False))
         self.assertIsNone(data["remote_dj_owner"])
+        self.assertIs(data["remote_dj_owner_supported"], False)
+
+    def test_owner_supported_flag_reflects_the_engine_not_the_viewer(self):
+        # The page uses this to keep r0116 owner behaviour ONLY for an engine
+        # that does not publish ownership at all; a withheld/null block from
+        # a publishing engine stays "unverified" (no mic gate).
+        for user, state in ((self.staff, _state(owner_user_id=self.dj.pk)),
+                            (self.viewer, _state(owner_user_id=self.dj.pk)),
+                            (self.staff, _state(connected=False)),
+                            (self.staff, _state(owner_user_id=self.dj.pk, age=30))):
+            with self.subTest(user=user.username, connected=state["remote_dj_connected"]):
+                self.assertIs(self.status(user, state)["remote_dj_owner_supported"], True)
 
     def test_anonymous_is_refused(self):
         self.state_path.write_text(json.dumps(_state(owner_user_id=self.dj.pk)))

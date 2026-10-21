@@ -845,7 +845,13 @@ class _ConsoleBrowserBase:
         self.assertEqual(self.ui(page)["msg"], "")
 
     def test_overlapping_studio_and_remote_mic_requests_are_independent(self):
-        page = self.deferred_console(remote_dj_connected=True)
+        # The Remote Mic gate is an owner-only action (second-review P2), so
+        # this page is made the VERIFIED owner of the active session first.
+        page = self.deferred_console(remote_dj_connected=True,
+                                     remote_dj_owner=self.owner("Jane Smith", attempt=self.OWNER_ATTEMPT))
+        self.become_owner_browser(page, self.OWNER_ATTEMPT)
+        self.poll_now(page)
+        self.assertFalse(page.locator("#remoteDjGateBtn").is_disabled())
         studio, remote = self.start(page, "toggleMicPtt()", "toggleRemoteDjGate()")
         self.settle_all(page, f"__reject({studio})")
         page.clock.run_for(3_000)
@@ -1041,13 +1047,16 @@ class _ConsoleBrowserBase:
         self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Disconnect", "You · Good", False))
         self.assertIn("you are connected in this browser as Jane Smith", ui["aria"])
         self.shot(page, "rdj-identity-owner-browser")
-        # A page holding a peer connection whose key does NOT match is not
-        # told "You": matching user identity is never proof of ownership.
+        # A page holding a peer connection whose key does NOT match the fresh
+        # owner key is NOT the owner (second-review P2): no Disconnect of the
+        # live session, no "You", gate read-only -- only local cleanup.
         self.become_owner_browser(page, "a-different-attempt-000000")
         self.poll_now(page)
         ui = self.connect_ui(page)
-        self.assertEqual((ui["action"], ui["status"]), ("Disconnect", "Good"))
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]),
+                         ("Close stale link", "In use: Jane Smith", False))
         self.assertNotIn("you are connected", ui["aria"])
+        self.assertTrue(page.locator("#remoteDjGateBtn").is_disabled())
 
     def test_owner_disconnect_is_local_and_unchanged(self):
         self.state = self.connected(self.owner(attempt=self.OWNER_ATTEMPT))
@@ -1170,6 +1179,182 @@ class _ConsoleBrowserBase:
         self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Jane Smith", "Other browser · Good", True))
         self.no_horizontal_overflow(page)
         self.shot(page, "rdj-identity-remote-dj-mobile-observer")
+
+    # -- Second-review P2: a lingering local peer is not ownership ----------
+    ATTEMPT_A = "attempt-AAAAAAAAAAAAAAAAAAAA"
+    ATTEMPT_B = "attempt-BBBBBBBBBBBBBBBBBBBB"
+
+    def gate_ui(self, page):
+        return page.evaluate("""() => {
+          const b = document.getElementById('remoteDjGateBtn');
+          return {disabled: b.disabled, aria: b.getAttribute('aria-label'), state: b.dataset.micState};
+        }""")
+
+    def owned_by_a_then_b(self, page, *, b_name="Bob Jones", current=False, **extra):
+        """Page = browser A (holds A's peer). Fresh status: A owns, then B owns."""
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page, **{**self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))})
+        self.assertEqual(self.connect_ui(page)["action"], "Disconnect")
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        self.poll_now(page, **{**self.connected(self.owner(b_name, current=current, attempt=self.ATTEMPT_B),
+                                                **extra)})
+
+    def test_turnover_makes_the_stale_page_an_observer_with_no_gate(self):
+        page = self.open_console(self.superuser)
+        self.owned_by_a_then_b(page)
+        self.assertEqual(page.evaluate("() => rdjLocalLink(window.__rdjLastEngineState)"), "stale")
+        self.assertTrue(page.evaluate("() => rdjPc !== null"))          # local peer still present
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]),
+                         ("Close stale link", "In use: Bob Jones", False))
+        self.assertIn("the live session is not affected", ui["aria"])
+        gate = self.gate_ui(page)
+        self.assertTrue(gate["disabled"])
+        self.assertIn("read-only: another browser holds the connection", gate["aria"])
+        self.shot(page, "rdj-stale-link-after-turnover")
+        # No gate POST through the owner UI path -- neither a (forced) click
+        # nor the handler invoked directly (keyboard/programmatic).
+        page.locator("#remoteDjGateBtn").click(force=True)
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        page.clock.run_for(200)
+        self.assertEqual([p for p, _ in self.posts if "remote-dj-gate" in p], [])
+
+    def test_stale_page_can_still_close_its_own_local_link(self):
+        page = self.open_console(self.superuser)
+        self.owned_by_a_then_b(page)
+        page.locator("#remoteDjConnectBtn").click()
+        self.assertEqual(page.evaluate("() => [rdjPc, rdjBrowserKey]"), [None, None])
+        self.assertEqual(self.posts, [])                 # purely local teardown
+        self.poll_now(page)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Bob Jones", "Other browser · Good", True))
+
+    def test_the_new_owner_keeps_its_controls(self):
+        self.state = self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_B)
+        self.poll_now(page)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Disconnect", "You · Good", False))
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        with page.expect_request("**/api/engine/remote-dj-gate/"):
+            page.locator("#remoteDjGateBtn").click()
+        page.clock.run_for(100)
+        self.assertEqual([p for p, _ in self.posts], ["/api/engine/remote-dj-gate/"])
+
+    def test_same_account_turnover_is_still_not_ownership(self):
+        page = self.open_console(self.superuser)
+        self.owned_by_a_then_b(page, b_name="Jane Smith", current=True)
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assertTrue(self.gate_ui(page)["disabled"])
+
+    def test_status_outage_keeps_local_cleanup_but_no_gate_action(self):
+        self.state = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        self.status_fails = True
+        page.clock.run_for(3_500)
+        page.wait_for_function("() => document.getElementById('consoleRoot').classList.contains('connection-stale')")
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Disconnect", "Status unavailable", False))
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        self.assertEqual(self.posts, [])
+        page.locator("#remoteDjConnectBtn").click()      # local teardown stays available
+        self.assertEqual(page.evaluate("() => rdjPc"), None)
+        self.assertEqual(self.posts, [])
+
+    def test_older_engine_keeps_r0116_owner_behaviour(self):
+        # No owner identity published at all: the real owner must not be
+        # locked out before the engine restarts (documented compatibility).
+        self.state = engine_state(remote_dj_connected=True, remote_dj_owner=None,
+                                  remote_dj_owner_supported=False, remote_dj_quality={"overall": "good"})
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        self.assertEqual(page.evaluate("() => rdjLocalLink(window.__rdjLastEngineState)"), "legacy")
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Disconnect", "Good", False))
+        self.assertFalse(self.gate_ui(page)["disabled"])
+
+    def test_unverifiable_ownership_on_a_new_engine_withholds_the_gate(self):
+        # The engine publishes ownership but no usable block arrives (e.g.
+        # malformed owner state -> null): local cleanup yes, mic gate no.
+        self.state = engine_state(remote_dj_connected=True, remote_dj_owner=None,
+                                  remote_dj_owner_supported=True, remote_dj_quality={"overall": "good"})
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        self.assertEqual(page.evaluate("() => rdjLocalLink(window.__rdjLastEngineState)"), "unverified")
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["disabled"]), ("Disconnect", False))
+        gate = self.gate_ui(page)
+        self.assertTrue(gate["disabled"])
+        self.assertIn("ownership is unconfirmed", gate["aria"])
+
+    def test_reconnect_grace_for_owner_and_for_a_stale_page(self):
+        self.state = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A), remote_dj_reconnecting=True)
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Disconnect", "Reconnecting…"))
+        self.poll_now(page, **{**self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B),
+                                                remote_dj_reconnecting=True)})
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assertTrue(self.gate_ui(page)["disabled"])
+
+    def test_rapid_ownership_turnover_tracks_the_latest_fresh_status(self):
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        sequence = (
+            (self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A)), "Disconnect", False),
+            (self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B)), "Close stale link", True),
+            (engine_state(remote_dj_connected=False, remote_dj_owner=None), "Disconnect", True),
+            (self.connected(self.owner("Cy Young", attempt="attempt-CCCCCCCCCCCCCCCCCCCC")), "Close stale link", True),
+        )
+        for state, action, gate_disabled in sequence:
+            self.poll_now(page, **state)
+            self.assertEqual(self.connect_ui(page)["action"], action, state.get("remote_dj_owner"))
+            if state["remote_dj_connected"]:
+                self.assertEqual(self.gate_ui(page)["disabled"], gate_disabled)
+
+    def test_a_late_older_status_cannot_restore_stale_ownership(self):
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.__statusQueue = [];
+          window.fetch = (url, opts) => String(url).endsWith('/api/engine/status/')
+            ? new Promise(resolve => window.__statusQueue.push(resolve))
+            : realFetch(url, opts);
+          window.__answerStatus = (i, body) => window.__statusQueue[i](
+            new Response(JSON.stringify(body), {status: 200, headers: {'Content-Type': 'application/json'}}));
+          window.__polls = [poll(), poll()];      // older request 0, newer request 1
+        }""")
+        a_owns = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))
+        b_owns = self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B))
+        page.evaluate("async ([b]) => { __answerStatus(1, b); await __polls[1]; }", [b_owns])
+        page.evaluate("async ([b]) => { __answerStatus(0, b); await __polls[0]; }", [a_owns])
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assertTrue(self.gate_ui(page)["disabled"])
+
+    def test_owner_change_while_a_gate_request_is_pending(self):
+        self.state = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        page.evaluate(self.DEFERRED_FETCH)
+        i, = self.start(page, "toggleRemoteDjGate()")
+        self.poll_now(page, **{**self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B))})
+        self.assertTrue(self.gate_ui(page)["disabled"])          # ownership moved: read-only now
+        self.settle_all(page, f"__respond({i}, 200)")            # the old request completes late
+        self.assertTrue(self.gate_ui(page)["disabled"])
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        # Nothing else was sent from this page's gate path.
+        self.assertEqual(page.evaluate("() => window.__deferred.length"), i + 1)
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        self.assertEqual(page.evaluate("() => window.__deferred.length"), i + 1)
 
     # -- Remote DJ ----------------------------------------------------------
     def test_remote_dj_mobile_live_deck_first_in_both_slot_arrangements(self):

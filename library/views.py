@@ -2845,10 +2845,13 @@ def _public_remote_dj_owner(raw_owner, viewer):
     """Roadmap 2.23 Phase 1B -- the display-safe view of the engine's active
     Remote DJ owner (engine.PlaybackEngine._remote_dj_owner_state).
 
-    Never returns the raw user id or attempt id. ``browser_key`` is a one-way
-    digest of the owning connection attempt, so the owning browser (which
-    alone holds its attempt id) can recognise its own connection while an
-    observer learns nothing usable. ``identity`` is "unavailable" when the
+    Never returns the raw user id or attempt id in this block.
+    ``browser_key`` is a digest of the owning connection attempt that lets the
+    owning browser recognise its own connection. It is a PRESENTATION aid,
+    not a secret and not an authority: the legacy r0116
+    ``remote_dj_connection`` diagnostics still carry the raw attempt id to
+    every status reader (who could therefore compute it), and no server
+    component accepts it. ``identity`` is "unavailable" when the
     owner cannot be established (no user id, or the account no longer
     exists) -- the page then shows a generic connected state rather than
     inventing a name.
@@ -2887,6 +2890,10 @@ def api_engine_status(request):
             data["transport"] = "STALE"
         # The raw owner block never leaves the server. A stale state file
         # can't prove the session is still active, so no identity then.
+        # remote_dj_owner_supported tells the page whether this engine
+        # publishes ownership at all (an older engine doesn't), so it can
+        # keep r0116 behaviour there instead of locking out the real owner.
+        data["remote_dj_owner_supported"] = "remote_dj_owner" in data
         raw_owner = data.pop("remote_dj_owner", None)
         data["remote_dj_owner"] = (
             None if stale or not data.get("remote_dj_connected")

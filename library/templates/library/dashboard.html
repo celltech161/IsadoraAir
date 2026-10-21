@@ -239,6 +239,9 @@
      disabled (only the owner may disconnect) but now carries who that is,
      so it stays readable rather than the generic 0.4 disabled fade. */
   #remoteDjConnectBtn.rdj-observing:disabled { opacity: 0.75; }
+  /* Second-review P2: this page's leftover link -- amber outline; the
+     button only closes local resources (never the live session). */
+  #remoteDjConnectBtn.rdj-stale-link { border-color: #d97706; }
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
 
@@ -2156,7 +2159,9 @@ async function toggleRemoteDjGate() {
   const state = window.__rdjLastEngineState || {};
   const btn = document.getElementById('remoteDjGateBtn');
   if (state.remote_dj_connected) {
-    // PTT gate mode.
+    // PTT gate mode. Re-checked at action time (keyboard/programmatic
+    // clicks included): a page that isn't the verified owner sends nothing.
+    if (!rdjMayGate(state)) return;
     const desiredActive = !btn.classList.contains('active');
     const id = beginControlCommand('remoteDjGateBtn');
     btn.classList.add('pending');
@@ -2259,10 +2264,12 @@ let rdjGainNode = null;
 let rdjCalibrating = false;
 let rdjConnectStartedAt = null;
 let rdjAttemptId = null;
-// Roadmap 2.23 Phase 1B -- one-way key of THIS browser's own connection
-// attempt, compared with the status's remote_dj_owner.browser_key to tell
-// "this browser owns the Remote DJ connection" from "another browser (even
-// one signed in to the same account) owns it". Never sent anywhere.
+// Roadmap 2.23 Phase 1B -- digest of THIS browser's own connection attempt,
+// compared with the status's remote_dj_owner.browser_key to tell "this
+// browser owns the Remote DJ connection" from "another browser (even one
+// signed in to the same account) owns it". A presentation aid only: it is
+// not secret (r0116 diagnostics expose the raw attempt id to status
+// readers) and no server component accepts it. Never sent anywhere.
 let rdjBrowserKey = null;
 async function rdjDeriveBrowserKey(attemptId) {
   if (!attemptId || !(window.crypto && window.crypto.subtle)) return null;
@@ -2679,16 +2686,51 @@ function rdjConnectFail(msg) {
   setTimeout(() => btn.classList.remove('error'), 3000);
 }
 
+// Roadmap 2.23 Phase 1B (second-review P2) -- how THIS page relates to the
+// engine's ACTIVE Remote DJ session. A local RTCPeerConnection alone is not
+// ownership: a page whose link outlived its session (e.g. a half-open socket
+// after a network drop, while the engine has expired it and admitted another
+// browser) still holds rdjPc. This one function governs every owner-only
+// control (Disconnect, the Remote Mic gate):
+//   'owner'      live local peer AND fresh status publishes the owner key AND
+//                it matches this page's own attempt key;
+//   'stale'      live local peer, but fresh status names ANOTHER browser's
+//                attempt -- an observer; only local cleanup is offered;
+//   'unverified' live local peer, ownership can't be checked right now
+//                (console status stale, this page's key not derived yet, or
+//                no owner block although the engine publishes one) -- local
+//                cleanup stays available, the mic gate does not;
+//   'legacy'     live local peer and an older engine that doesn't publish
+//                owner identity at all -- exactly r0116 behaviour, so a real
+//                owner isn't locked out before the engine is restarted;
+//   'none'       no local peer.
+function rdjLocalLink(data) {
+  if (!rdjPc) return 'none';
+  data = data || {};
+  if (connectionStale) return 'unverified';
+  if (data.remote_dj_owner_supported === false) return 'legacy';
+  const owner = data.remote_dj_connected ? data.remote_dj_owner : null;
+  if (!owner || !owner.browser_key || !rdjBrowserKey) return 'unverified';
+  return owner.browser_key === rdjBrowserKey ? 'owner' : 'stale';
+}
+
+// Owner-only mic action: only a verified owner (or the r0116-compatible
+// older-engine case) may gate the Remote Mic from this page.
+function rdjMayGate(data) {
+  const link = rdjLocalLink(data);
+  return link === 'owner' || link === 'legacy';
+}
+
 // Roadmap 2.23 Phase 1B -- who holds the Remote DJ connection, taken only
 // from the server's display-safe remote_dj_owner block. THIS browser is the
 // owner only when its own attempt key matches; the same account signed in
 // elsewhere is an observer ("(you)"). With no usable identity the control
 // keeps the generic r0116 wording rather than guessing a name.
-function rdjOwnerPresentation(data, weAreConnected) {
+function rdjOwnerPresentation(data, weAreConnected, link) {
   const owner = (data.remote_dj_connected && data.remote_dj_owner) || null;
   const name = owner && owner.identity === 'known' && owner.display_name ? owner.display_name : null;
   if (weAreConnected) {
-    const thisBrowser = !!(owner && rdjBrowserKey && owner.browser_key === rdjBrowserKey);
+    const thisBrowser = link === 'owner';
     return {
       statusPrefix: thisBrowser ? 'You · ' : '',
       ariaDetail: thisBrowser
@@ -2720,7 +2762,11 @@ function renderRemoteDjConnect(data) {
   const btn = document.getElementById('remoteDjConnectBtn');
   if (!btn) return;
   data = data || {};
-  const weAreConnected = !!rdjPc;
+  // Owner-only presentation follows rdjLocalLink(), never !!rdjPc alone.
+  // 'unverified'/'legacy' keep the r0116 Disconnect (local cleanup); a
+  // 'stale' page is an observer with an explicit local-cleanup action.
+  const link = rdjLocalLink(data);
+  const weAreConnected = link === 'owner' || link === 'legacy' || link === 'unverified';
   const someoneElseConnected = !!data.remote_dj_connected && !weAreConnected;
   // P1 1.5 Pass B1 -- prefer OUR OWN observed ICE state when we're the
   // connected browser (it updates the instant our RTCPeerConnection
@@ -2732,9 +2778,12 @@ function renderRemoteDjConnect(data) {
   // ICE state remains nominally connected (the production media-loss
   // case).  Local DISCONNECTED remains a faster supplemental signal.
   const reconnecting = !!data.remote_dj_reconnecting || (weAreConnected && rdjReconnecting);
-  btn.disabled = !data.remote_dj_configured || someoneElseConnected;
+  // A 'stale' page keeps the button usable ONLY to close its own leftover
+  // local link (toggleRemoteDjConnect -> rdjDisconnect, purely local).
+  btn.disabled = !data.remote_dj_configured || (someoneElseConnected && link !== 'stale');
   btn.classList.toggle('active', weAreConnected);
-  btn.classList.toggle('rdj-observing', someoneElseConnected);
+  btn.classList.toggle('rdj-observing', someoneElseConnected && link !== 'stale');
+  btn.classList.toggle('rdj-stale-link', link === 'stale');
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
   if (!data.remote_dj_configured) {
     btn.classList.remove('pending');
@@ -2755,7 +2804,24 @@ function renderRemoteDjConnect(data) {
     );
     return;
   }
-  const ident = rdjOwnerPresentation(data, weAreConnected);
+  if (link === 'stale') {
+    // Fresh authoritative status: ANOTHER browser holds the session. This
+    // page's link is leftover; it is not the owner and gets no Disconnect
+    // of the live session -- only closing its own local resources.
+    btn.classList.remove('pending');
+    const owner = data.remote_dj_owner || {};
+    const who = owner.identity === 'known' && owner.display_name ? owner.display_name : null;
+    btn.title = 'This browser\'s Remote DJ link is stale: '
+      + (who ? who + ' is' : 'another browser is') + ' connected now. '
+      + 'Press to close this browser\'s leftover local connection only; it does not affect the live session.';
+    rdjSetConnectPresentation(
+      'Close stale link', who ? 'In use: ' + who : 'In use elsewhere', 'reconnecting',
+      'Close this browser\'s stale Remote DJ link — ' + (who ? who : 'another browser')
+        + ' is connected now; the live session is not affected',
+    );
+    return;
+  }
+  const ident = rdjOwnerPresentation(data, weAreConnected, link);
   btn.title = ident.title;
   if (reconnecting && (weAreConnected || someoneElseConnected)) {
     btn.classList.remove('pending');
@@ -2830,14 +2896,19 @@ function renderRemoteDjGate(data) {
     // ("only togglable by the mic's owner") so a second remote DJ
     // watching the dashboard can see the gate state but can't cut in
     // on the live DJ. The connected DJ themselves keeps self-PTT.
-    const weAreConnected = !!rdjPc;
-    btn.disabled = !weAreConnected;
+    // Phase 1B second-review P2: only a VERIFIED owner page gates the mic
+    // (rdjMayGate), not merely a page still holding a local peer.
+    const mayGate = rdjMayGate(data);
+    btn.disabled = !mayGate;
     const gateLabel = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
+    const readOnlyWhy = rdjLocalLink(data) === 'unverified'
+      ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
+      : ' (read-only: another browser holds the connection)';
     setOpsMicButton(
       btn,
       data.remote_dj_live ? 'on' : 'off',
       data.remote_dj_live ? 'LIVE' : 'OFF',
-      weAreConnected ? gateLabel : gateLabel + ' (read-only: another browser holds the connection)',
+      mayGate ? gateLabel : gateLabel + readOnlyWhy,
     );
   } else {
     // Calibration mode -- always clickable so the operator can (re)cal

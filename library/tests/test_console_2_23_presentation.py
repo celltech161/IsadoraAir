@@ -406,12 +406,23 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         return self.template[start:self.template.index("\n}", start) + 2]
 
     def test_ownership_is_this_browsers_attempt_key_never_user_identity(self):
-        presentation = self._function("rdjOwnerPresentation")
-        self.assertIn("owner.browser_key === rdjBrowserKey", presentation)
-        # is_current_user only labels an observer "(you)"; it never makes a
-        # page the owner (that requires a live peer connection AND the key).
-        self.assertNotIn("is_current_user &&", presentation.split("if (weAreConnected) {")[1].split("}")[0])
-        self.assertIn("const weAreConnected = !!rdjPc;", self._function("renderRemoteDjConnect"))
+        link = self._function("rdjLocalLink")
+        self.assertIn("if (!rdjPc) return 'none';", link)
+        self.assertIn("return owner.browser_key === rdjBrowserKey ? 'owner' : 'stale';", link)
+        self.assertNotIn("is_current_user", link)
+        # Ownership is never inferred from a local peer alone (second-review
+        # P2): every owner-only control path goes through rdjLocalLink().
+        connect = self._function("renderRemoteDjConnect")
+        self.assertIn("const link = rdjLocalLink(data);", connect)
+        self.assertNotIn("const weAreConnected = !!rdjPc;", connect)
+        gate = self._function("renderRemoteDjGate")
+        self.assertIn("const mayGate = rdjMayGate(data);", gate)
+        self.assertIn("btn.disabled = !mayGate;", gate)
+        self.assertNotIn("!!rdjPc", gate)
+        self.assertIn("if (!rdjMayGate(state)) return;", self._function("toggleRemoteDjGate"))
+        may = self._function("rdjMayGate")
+        self.assertIn("return link === 'owner' || link === 'legacy';", may)
+        self.assertIn("const thisBrowser = link === 'owner';", self._function("rdjOwnerPresentation"))
 
     def test_no_raw_identifier_is_read_from_the_owner_block(self):
         for raw in ("remote_dj_owner.user_id", "remote_dj_owner.attempt_id", "owner.user_id", "owner.attempt_id"):
