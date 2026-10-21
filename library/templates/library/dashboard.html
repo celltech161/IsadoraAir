@@ -1585,7 +1585,7 @@ const OPS_REFUSAL_HOLD_MS = 5000;
 let opsRefusalTimer = null;
 function noteOpsRefusal(btn, name, status) {
   if (!btn) return;
-  const why = status === 403 ? 'not authorized right now'
+  const why = status === 403 ? 'permission denied (role or schedule)'
     : status === 503 ? 'the engine command queue is unavailable'
     : 'HTTP ' + status;
   const verb = status === 503 ? 'not queued' : 'refused';
@@ -3315,7 +3315,7 @@ function showDeckCommandResult(slot, action, resp) {
   }
   const verb = { eject: 'Eject', pause: 'Pause', resume: 'Resume' }[action] || action;
   el.textContent = !resp ? `${verb} not sent (network error)`
-    : resp.status === 403 ? `${verb} refused: not authorized right now`
+    : resp.status === 403 ? `${verb} refused: permission denied (role or schedule)`
     : resp.status === 503 ? `${verb} not queued: engine command queue unavailable`
     : `${verb} failed (HTTP ${resp.status})`;
   deckMsgTimers[slot] = setTimeout(() => { el.textContent = ''; }, 5000);

@@ -554,7 +554,7 @@ class _ConsoleBrowserBase:
         self.post_status = {"/api/engine/mic-ptt/": 403, "/api/engine/deck/A/": 403}
         page.locator("#micPttBtn").click()
         page.wait_for_function("() => document.getElementById('opsMsg').textContent.length > 0")
-        self.assertIn("Studio Mic request refused: not authorized", page.locator("#opsMsg").inner_text())
+        self.assertIn("Studio Mic request refused: permission denied", page.locator("#opsMsg").inner_text())
         btn = page.locator("#micPttBtn")
         self.assertIn("refused", btn.get_attribute("class"))
         # The button itself still states the engine's truth.

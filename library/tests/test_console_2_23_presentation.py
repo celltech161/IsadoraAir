@@ -302,7 +302,7 @@ class ConsoleTemplateContractTests(SimpleTestCase):
         command = command[:command.index("async function seekTo")]
         self.assertIn("if (connectionStale) return;", command.splitlines()[1])
         self.assertIn("showDeckCommandResult(slot, action, resp);", command)
-        self.assertIn("refused: not authorized", command)
+        self.assertIn("refused: permission denied", command)
 
     def test_single_waveform_renderer_and_no_overlay_marker(self):
         self.assertNotIn("position-line", self.template)
