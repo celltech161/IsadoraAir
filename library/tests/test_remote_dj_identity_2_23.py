@@ -16,6 +16,7 @@ import json
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -58,6 +59,120 @@ class EngineOwnerStateTests(SimpleTestCase):
                 stand_in = make_minimal_stand_in()
                 stand_in._write_state()
                 self.assertIsNone(json.loads(state_path.read_text())["remote_dj_owner"])
+
+
+class EngineOwnerStateHardeningTests(SimpleTestCase):
+    """Second-review P3: the observational owner field never raises for a
+    missing/malformed session or attempt, never invents or keeps an expired
+    owner, and can never cost the rest of the engine-state snapshot."""
+
+    def engine_with(self, session):
+        engine = object.__new__(eng_module.PlaybackEngine)
+        engine.remote_dj_session = session
+        return engine
+
+    def attempt(self, **overrides):
+        attempt = RemoteDJConnectionAttempt(new_attempt_id(), int(time.time() * 1000))
+        for name, value in overrides.items():
+            setattr(attempt, name, value)
+        return attempt
+
+    def test_normal_session_output_is_unchanged(self):
+        attempt = self.attempt()
+        session = SimpleNamespace(user_id=7, connection_attempt=attempt)
+        self.assertEqual(self.engine_with(session)._remote_dj_owner_state(),
+                         {"user_id": 7, "attempt_id": attempt.attempt_id})
+
+    def test_missing_session_attribute_entirely(self):
+        self.assertIsNone(object.__new__(eng_module.PlaybackEngine)._remote_dj_owner_state())
+
+    def test_missing_or_null_connection_attempt(self):
+        for session in (SimpleNamespace(user_id=7), SimpleNamespace(user_id=7, connection_attempt=None)):
+            with self.subTest(session=session):
+                self.assertIsNone(self.engine_with(session)._remote_dj_owner_state())
+
+    def test_missing_or_malformed_attempt_id(self):
+        for attempt in (SimpleNamespace(status="connected"),
+                        SimpleNamespace(status="connected", attempt_id=None),
+                        SimpleNamespace(status="connected", attempt_id=12345),
+                        SimpleNamespace(status="connected", attempt_id=""),
+                        SimpleNamespace(status="connected", attempt_id="not a minted id!")):
+            with self.subTest(attempt=attempt):
+                session = SimpleNamespace(user_id=7, connection_attempt=attempt)
+                self.assertIsNone(self.engine_with(session)._remote_dj_owner_state())
+
+    def test_missing_or_malformed_user_id_degrades_to_unknown_owner(self):
+        attempt = self.attempt()
+        for session in (SimpleNamespace(connection_attempt=attempt),
+                        *(SimpleNamespace(user_id=bad, connection_attempt=attempt)
+                          for bad in (None, "7", True, 0, -3, 7.0, object()))):
+            with self.subTest(user_id=getattr(session, "user_id", "<missing>")):
+                self.assertEqual(self.engine_with(session)._remote_dj_owner_state(),
+                                 {"user_id": None, "attempt_id": attempt.attempt_id})
+
+    def test_ended_or_failed_attempt_is_never_published(self):
+        for status in ("ended", "failed"):
+            with self.subTest(status=status):
+                session = SimpleNamespace(user_id=7, connection_attempt=self.attempt(status=status))
+                self.assertIsNone(self.engine_with(session)._remote_dj_owner_state())
+
+    def test_reconnect_grace_keeps_the_owner(self):
+        attempt = self.attempt(status="reconnecting")
+        session = SimpleNamespace(user_id=7, connection_attempt=attempt)
+        self.assertEqual(self.engine_with(session)._remote_dj_owner_state()["attempt_id"], attempt.attempt_id)
+
+    def test_session_teardown_clears_the_owner(self):
+        engine = self.engine_with(_session(7, new_attempt_id()))
+        self.assertIsNotNone(engine._remote_dj_owner_state())
+        engine.remote_dj_session = None
+        self.assertIsNone(engine._remote_dj_owner_state())
+
+    def write(self, stand_in):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "engine_state.json"
+            with patch.object(eng_module, "STATE_PATH", state_path):
+                stand_in._write_state()
+                return json.loads(state_path.read_text()) if state_path.exists() else None
+
+    def busy_stand_in(self):
+        stand_in = make_minimal_stand_in()
+        stand_in.mic_live = True
+        stand_in.mic_ptt_valve = object()
+        stand_in.mic_ok = True
+        stand_in.manual_mode = True
+        stand_in._manual_from_mic = True
+        return stand_in
+
+    def test_write_state_survives_malformed_owner_fields_on_a_live_session(self):
+        stand_in = self.busy_stand_in()
+        session = _session(7, new_attempt_id())
+        session.user_id = object()                       # malformed user
+        session.connection_attempt.attempt_id = None     # malformed attempt id
+        stand_in.remote_dj_session = session
+        state = self.write(stand_in)
+        self.assertIsNotNone(state)
+        self.assertIsNone(state["remote_dj_owner"])
+        self.assertTrue(state["remote_dj_connected"])
+        self.assertEqual((state["mic_live"], state["mic_configured"], state["manual_mode"], state["manual_from_mic"]),
+                         (True, True, True, True))
+        self.assertEqual(state["decks"], {"A": None, "B": None})
+
+    def test_write_state_contains_an_owner_helper_failure(self):
+        stand_in = self.busy_stand_in()
+        for exc in (AttributeError("x"), TypeError("x"), ValueError("x")):
+            with self.subTest(exc=type(exc).__name__):
+                with patch.object(eng_module.PlaybackEngine, "_remote_dj_owner_state", side_effect=exc):
+                    state = self.write(stand_in)
+                self.assertIsNotNone(state)
+                self.assertIsNone(state["remote_dj_owner"])
+                self.assertTrue(state["mic_live"])
+
+    def test_unrelated_errors_are_not_swallowed_by_the_owner_guard(self):
+        # Narrow isolation: anything else still reaches _write_state's own
+        # handler exactly as before (no snapshot is written).
+        stand_in = self.busy_stand_in()
+        with patch.object(eng_module.PlaybackEngine, "_remote_dj_owner_state", side_effect=RuntimeError("bug")):
+            self.assertIsNone(self.write(stand_in))
 
 
 def _state(*, connected=True, owner_user_id=None, attempt_id="A" * 24, age=0.0, include_owner=True):

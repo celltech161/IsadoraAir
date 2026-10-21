@@ -47,6 +47,7 @@ from library.services.log_builder import (
 from library.services.schedule_resolution import resolve_schedule_segments
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from library.services.remote_dj_connection import (
+    ATTEMPT_ID_PATTERN,
     FAILURE_DEPENDENCY_SESSION_BUILD,
     FAILURE_ICE_STATE,
     FAILURE_MEDIA_ROUTING,
@@ -10213,12 +10214,29 @@ class PlaybackEngine:
         an ended session can never be reported as owned. Written to
         engine_state.json for library.views.api_engine_status, which turns it
         into a display block for authorized viewers and never passes these
-        raw values through."""
+        raw values through.
+
+        Observational only, so it never raises for a missing or malformed
+        session/attempt (second-review P3): every nested value is read with
+        getattr and validated, and None is returned whenever a trustworthy
+        record can't be built -- never an invented or expired owner. The
+        attempt id is what identifies the owning browser, so it is required
+        (and must look like a minted id); a missing/invalid user id only
+        degrades to None, which the status view reports as an unavailable
+        identity."""
         session = getattr(self, "remote_dj_session", None)
-        attempt = getattr(session, "connection_attempt", None) if session is not None else None
-        if session is None or attempt is None:
+        if session is None:
             return None
-        return {"user_id": session.user_id, "attempt_id": attempt.attempt_id}
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None or getattr(attempt, "status", None) in ("ended", "failed"):
+            return None
+        attempt_id = getattr(attempt, "attempt_id", None)
+        if not isinstance(attempt_id, str) or not ATTEMPT_ID_PATTERN.fullmatch(attempt_id):
+            return None
+        user_id = getattr(session, "user_id", None)
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            user_id = None
+        return {"user_id": user_id, "attempt_id": attempt_id}
 
     def _remote_dj_record_browser_milestone(
         self, attempt_id, milestone, elapsed_ms
@@ -14691,6 +14709,17 @@ class PlaybackEngine:
                 snapshot, decks_out
             )
 
+            # Second-review P3: the optional Remote DJ owner field must not
+            # abandon the deck/mic/automation snapshot. Only the attribute/
+            # type failures a malformed session object could raise are
+            # contained (and logged); anything else still reaches the
+            # writer's own handler as before.
+            try:
+                remote_dj_owner = self._remote_dj_owner_state()
+            except (AttributeError, TypeError, ValueError) as exc:
+                print(f"  Remote DJ owner state unavailable for this snapshot: {exc!r}")
+                remote_dj_owner = None
+
             captured_at = time.time()
             state = {
                 "transport": transport,
@@ -14777,8 +14806,9 @@ class PlaybackEngine:
                 "remote_dj_quality": self._remote_dj_quality_state(),
                 # Roadmap 2.23 Phase 1B -- RAW owner identity for the status
                 # view only (see _remote_dj_owner_state); stripped from every
-                # /api/engine/status/ response.
-                "remote_dj_owner": self._remote_dj_owner_state(),
+                # /api/engine/status/ response. Built above, isolated so this
+                # optional field can never cost the whole snapshot.
+                "remote_dj_owner": remote_dj_owner,
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
                 # progress-bar reconciliation regardless of what
