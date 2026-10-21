@@ -209,11 +209,10 @@ class ConsoleTemplateContractTests(SimpleTestCase):
         cls.icons = ICONS_PATH.read_text(encoding="utf-8")
 
     def _function(self, name):
+        # From the declaration to its own closing brace (top-level functions
+        # in this template close with "}" at column 0).
         start = self.template.index(f"function {name}(")
-        end = self.template.index("\nfunction ", start + 1)
-        async_end = self.template.find("\nasync function ", start + 1)
-        if async_end != -1:
-            end = min(end, async_end)
+        end = self.template.index("\n}", start) + 2
         return self.template[start:end]
 
     def test_line_in_is_disabled_and_inert(self):
@@ -266,15 +265,49 @@ class ConsoleTemplateContractTests(SimpleTestCase):
             with self.subTest(state=state):
                 self.assertIn(f'[data-mic-state="{state}"]', self.template)
 
-    def test_a_refusal_never_replaces_the_engine_state_on_the_button(self):
-        # A refused OFF request while the mic is LIVE must still read LIVE.
-        self.assertNotIn("showOpsRefusal", self.template)
-        refusal = self._function("noteOpsRefusal")
-        self.assertNotIn("setOpsMicButton", refusal)
-        self.assertNotIn("micState", refusal)
-        self.assertNotIn("aria-label", refusal)
-        self.assertIn("btn.classList.add('refused');", refusal)
+    def test_command_feedback_never_replaces_the_engine_state(self):
+        # A refused/failed OFF request while the mic is LIVE must still read
+        # LIVE: the feedback layer never touches engine-owned presentation.
+        for fn in ("finishControlCommand", "setControlWarning", "clearControlWarning",
+                   "renderControlFeedback", "reconcileControlWarning", "postEngineCommand"):
+            with self.subTest(fn=fn):
+                body = self._function(fn)
+                self.assertNotIn("setOpsMicButton", body)
+                self.assertNotIn("micState", body)
+                self.assertNotIn("aria-label", body)
+                self.assertNotIn("'active'", body)
+        self.assertIn("btn.classList.toggle('refused', !!fb.warning);", self._function("renderControlFeedback"))
         self.assertIn('<div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>', self.template)
+
+    def test_every_engine_command_control_uses_the_guarded_post(self):
+        # Codex Phase 1 P2: no unguarded fetch() for these controls.
+        for url in ("/api/engine/mic-ptt/", "/api/engine/remote-dj-gate/", "/api/engine/manual-mode/",
+                    "/api/engine/seek/", "/api/engine/deck/"):
+            with self.subTest(url=url):
+                self.assertNotIn(f"fetch('{url}", self.template)
+                self.assertNotIn(f"fetch(`{url}", self.template)
+        post = self._function("postEngineCommand")
+        self.assertIn("} catch (e) {\n    return { kind: 'unconfirmed', text: 'Connection error — command outcome unconfirmed' };", post)
+        self.assertNotIn("not sent", self.template)
+        for fn, key in (("toggleMicPtt", "'micPttBtn'"), ("toggleRemoteDjGate", "'remoteDjGateBtn'"),
+                        ("toggleManualMode", "'manualModeBtn'"), ("deckCommand", "key"), ("seekTo", "key")):
+            with self.subTest(fn=fn):
+                body = self._function(fn)
+                self.assertIn(f"const id = beginControlCommand({key});", body)
+                self.assertIn("finishControlCommand(", body)
+
+    def test_only_the_newest_request_may_change_a_control(self):
+        finish = self._function("finishControlCommand")
+        self.assertIn("if (id !== fb.seq) return false;", finish)
+        warn = self._function("setControlWarning")
+        self.assertIn("if (fb.warning === warning) clearControlWarning(key);", warn)
+        # Status renders keep an in-flight request's busy indication.
+        for fn, key in (("renderMicPtt", "micPttBtn"), ("renderRemoteDjGate", "remoteDjGateBtn"),
+                        ("renderManualMode", "manualModeBtn")):
+            with self.subTest(fn=fn):
+                body = self._function(fn)
+                self.assertIn(f"if (!isControlInFlight('{key}')) btn.classList.remove('pending');", body)
+                self.assertIn(f"reconcileControlWarning('{key}',", body)
 
     def test_remote_mic_keeps_vu_fill_and_dual_purpose(self):
         gate = self._function("renderRemoteDjGate")
@@ -298,11 +331,11 @@ class ConsoleTemplateContractTests(SimpleTestCase):
         self.assertIn("const CAN_WAVEFORM_SEEK = CAN_DECK_TRANSPORT && !IS_REMOTE_DJ;", self.template)
 
     def test_deck_command_reports_refusals(self):
-        command = self.template[self.template.index("async function deckCommand"):]
-        command = command[:command.index("async function seekTo")]
+        command = self._function("deckCommand")
         self.assertIn("if (connectionStale) return;", command.splitlines()[1])
-        self.assertIn("showDeckCommandResult(slot, action, resp);", command)
-        self.assertIn("refused: permission denied", command)
+        self.assertIn("finishControlCommand(key, id, deckCommandOutcome(action, outcome));", command)
+        self.assertIn("refused: permission denied (role or schedule)", self._function("postEngineCommand"))
+        self.assertIn("renderControlFeedback(`deck-${slot}`);", self._function("buildDeckDOM"))
 
     def test_single_waveform_renderer_and_no_overlay_marker(self):
         self.assertNotIn("position-line", self.template)
@@ -352,7 +385,8 @@ class ConsoleTemplateContractTests(SimpleTestCase):
         self.assertEqual(self.template.count("setInterval(poll, 1000);"), 1)
         self.assertEqual(self.template.count("setInterval(updatePositionIndicators, 100);"), 1)
         for fn in ("drawWaveform", "renderWaveformLayer", "updatePositionIndicators", "buildDeckDOM",
-                   "setOpsMicButton", "noteOpsRefusal", "showDeckCommandResult"):
+                   "setOpsMicButton", "finishControlCommand", "setControlWarning",
+                   "renderControlFeedback", "deckCommandOutcome"):
             with self.subTest(fn=fn):
                 body = self._function(fn)
                 self.assertNotIn("setInterval(", body)

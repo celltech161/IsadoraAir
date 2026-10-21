@@ -98,11 +98,14 @@ def engine_state(live="A", *, position=POSITION, paused=False, **overrides):
     return state
 
 
-def waveform(points=400):
+def waveform(points=400, analysis_duration=DURATION):
+    """``analysis_duration`` may differ slightly from the engine duration (it
+    is the final envelope timestamp), or be None (older analysis), in which
+    case the Console falls back to the engine-reported duration."""
     left = [int(40 + 180 * abs(((i * 7) % 100) - 50) / 50) for i in range(points)]
     right = [int(30 + 170 * abs(((i * 11) % 100) - 50) / 50) for i in range(points)]
     return {"samples_left": left, "samples_right": right, "cue_in_seconds": CUE_IN,
-            "next_start": NEXT_START, "analysis_duration": DURATION}
+            "next_start": NEXT_START, "analysis_duration": analysis_duration}
 
 
 # Read the canvas the way an operator sees it: the playhead column, rows
@@ -237,6 +240,7 @@ class _ConsoleBrowserBase:
         self.status_fails = False
         self.post_status = {}
         self.posts = []
+        self.analysis_duration = DURATION
 
     # -- harness -----------------------------------------------------------
     def _route(self, route, request):
@@ -247,14 +251,19 @@ class _ConsoleBrowserBase:
         if request.method != "GET":
             self.posts.append((path, request.post_data))
             status = self.post_status.get(path, 200)
+            if status == 302:  # the login gate turning an expired session away
+                return route.fulfill(status=302, headers={"Location": "/login-fixture/"})
             body = {"ok": True} if status == 200 else {"error": "refused by test fixture"}
             return route.fulfill(status=status, content_type="application/json", body=json.dumps(body))
+        if path == "/login-fixture/":
+            return route.fulfill(status=200, content_type="text/html", body="<html><body>login</body></html>")
         if path == "/api/engine/status/":
             if self.status_fails:
                 return route.fulfill(status=500, content_type="application/json", body="{}")
             return route.fulfill(content_type="application/json", body=json.dumps(self.state))
         if path.startswith("/api/waveform/"):
-            return route.fulfill(content_type="application/json", body=json.dumps(waveform()))
+            return route.fulfill(content_type="application/json",
+                                 body=json.dumps(waveform(analysis_duration=self.analysis_duration)))
         if path.startswith("/api/albumart/"):
             return route.fulfill(content_type="application/json", body=json.dumps({"art": ART}))
         if path.startswith("/api/") or path.startswith("/monitoring/api/") or path.startswith("/ws/"):
@@ -308,8 +317,11 @@ class _ConsoleBrowserBase:
     def box(self, page, selector):
         return page.evaluate(BOX, selector)
 
+    def time_scale(self):
+        return self.analysis_duration or DURATION
+
     def assert_playhead(self, page, slot, seconds):
-        probe = page.evaluate(PLAYHEAD_PROBE, [slot, seconds, DURATION])
+        probe = page.evaluate(PLAYHEAD_PROBE, [slot, seconds, self.time_scale()])
         self.assertAlmostEqual(probe["cssH"], 62, delta=0.6)
         self.assertEqual(probe["backingH"], round(probe["cssH"] * probe["dpr"]))
         self.assertEqual(probe["backingW"], round(probe["cssW"] * probe["dpr"]))
@@ -554,7 +566,8 @@ class _ConsoleBrowserBase:
         self.post_status = {"/api/engine/mic-ptt/": 403, "/api/engine/deck/A/": 403}
         page.locator("#micPttBtn").click()
         page.wait_for_function("() => document.getElementById('opsMsg').textContent.length > 0")
-        self.assertIn("Studio Mic request refused: permission denied", page.locator("#opsMsg").inner_text())
+        self.assertIn("Studio Mic request refused: permission denied (role or schedule).",
+                      page.locator("#opsMsg").inner_text())
         btn = page.locator("#micPttBtn")
         self.assertIn("refused", btn.get_attribute("class"))
         # The button itself still states the engine's truth.
@@ -562,7 +575,8 @@ class _ConsoleBrowserBase:
         self.assertEqual(btn.get_attribute("aria-label"), "Studio Mic: OFF")
         page.locator("#ejectBtn-A").click()
         page.wait_for_function("() => document.getElementById('deckMsg-A').textContent.length > 0")
-        self.assertIn("Eject refused", page.locator("#deckMsg-A").inner_text())
+        self.assertEqual(page.locator("#deckMsg-A").inner_text(),
+                         "Eject refused: permission denied (role or schedule)")
         self.shot(page, "refusal-feedback")
         # Outlives the next status render, then expires.
         page.clock.run_for(1_100)
@@ -593,6 +607,332 @@ class _ConsoleBrowserBase:
         self.assertEqual(btn.locator(".ops-btn-label").inner_text(), "LIVE")
         self.assertIn("active", btn.get_attribute("class"))
         self.shot(page, "refusal-while-live")
+
+    # -- Codex Phase 1 P3: playhead endpoints, duration mismatch/fallback ----
+    ENDPOINT_PROBE = """
+    (slot) => {
+      const c = document.getElementById('npWaveform-' + slot);
+      const dpr = window.devicePixelRatio || 1;
+      const ctx = c.getContext('2d');
+      const painted = (yCss) => {
+        const y = Math.min(c.height - 1, Math.floor(yCss * dpr));
+        const d = ctx.getImageData(0, y, c.width, 1).data;
+        const cols = [];
+        for (let i = 0; i < c.width; i++) if (d[i * 4 + 3] > 0) cols.push(i / dpr);
+        return cols;
+      };
+      const white = (yCss) => {
+        const y = Math.min(c.height - 1, Math.floor(yCss * dpr));
+        const d = ctx.getImageData(0, y, c.width, 1).data;
+        const cols = [];
+        for (let i = 0; i < c.width; i++) {
+          const o = i * 4;
+          if (d[o] > 245 && d[o + 1] > 245 && d[o + 2] > 245 && d[o + 3] > 245) cols.push(i / dpr);
+        }
+        return cols;
+      };
+      const h = c.height / dpr;
+      return {dpr, cssW: c.width / dpr, top: painted(0.25), bottom: painted(h - 0.25), line: white(h / 2 + 9)};
+    }
+    """
+
+    def _assert_endpoint(self, page, at_end):
+        probe = page.evaluate(self.ENDPOINT_PROBE, "A")
+        w = probe["cssW"]
+        for row in ("top", "bottom"):
+            cols = probe[row]
+            self.assertTrue(cols, probe)
+            if at_end:
+                # The whole 8px triangle base is inside the right edge.
+                self.assertLessEqual(min(cols), w - 8 + 0.01, (row, probe))
+                self.assertGreaterEqual(max(cols), w - 1, (row, probe))
+            else:
+                self.assertEqual(min(cols), 0, (row, probe))
+                self.assertGreaterEqual(max(cols), 7.5, (row, probe))
+        # The line still marks the true (edge) position.
+        line = probe["line"]
+        self.assertTrue(line, probe)
+        if at_end:
+            self.assertGreaterEqual(min(line), w - 2.01, probe)
+        else:
+            self.assertLessEqual(max(line), 2, probe)
+        return probe
+
+    def test_playhead_triangles_stay_whole_at_both_ends(self):
+        for dpr in (1, 2):
+            for name, position in (("start", 0.0), ("end", DURATION)):
+                with self.subTest(dpr=dpr, at=name):
+                    self.state = engine_state(position=position)
+                    page = self.open_console(self.superuser, viewport={"width": 1280, "height": 800}, dpr=dpr)
+                    probe = self._assert_endpoint(page, at_end=(name == "end"))
+                    if probe["dpr"] == dpr:
+                        self.shot(page, f"playhead-{name}-dpr{dpr}")
+
+    def test_playhead_and_seek_use_the_analysis_scale_when_it_differs(self):
+        self.analysis_duration = DURATION - 4.0       # 236.0 vs engine 240.0
+        page = self.open_console(self.superuser)
+        self.assert_playhead(page, "A", POSITION)     # x = 60 / 236 * width
+        canvas = self.box(page, "#npWaveform-A")
+        with page.expect_request("**/api/engine/seek/"):
+            page.mouse.click(canvas["left"] + canvas["width"] * 0.75, canvas["top"] + 20)
+        page.clock.run_for(100)
+        sent = json.loads(self.posts[-1][1])
+        self.assertAlmostEqual(sent["position"], 0.75 * 236.0, delta=236.0 / canvas["width"] + 0.01)
+
+    def test_engine_position_past_the_analysis_span_pins_to_the_end(self):
+        self.analysis_duration = DURATION - 4.0
+        self.state = engine_state(position=DURATION - 1.0)    # beyond 236.0
+        page = self.open_console(self.superuser)
+        self._assert_endpoint(page, at_end=True)
+
+    def test_missing_analysis_duration_falls_back_to_engine_duration(self):
+        self.analysis_duration = None
+        page = self.open_console(self.superuser)
+        self.assertIsNone(page.evaluate("() => waveformState.A.analysisDuration"))
+        self.assert_playhead(page, "A", POSITION)     # x = 60 / 240 * width
+        canvas = self.box(page, "#npWaveform-A")
+        with page.expect_request("**/api/engine/seek/"):
+            page.mouse.click(canvas["left"] + canvas["width"] * 0.5, canvas["top"] + 20)
+        page.clock.run_for(100)
+        sent = json.loads(self.posts[-1][1])
+        self.assertAlmostEqual(sent["position"], 0.5 * DURATION, delta=DURATION / canvas["width"] + 0.01)
+
+    # -- Codex Phase 1 P2: exception-safe, latest-request-wins feedback -------
+    # Engine-command POSTs are replaced IN THE PAGE by deferred promises the
+    # test resolves/rejects explicitly, in any order -- no real-network timing.
+    DEFERRED_FETCH = """() => {
+      const realFetch = window.fetch.bind(window);
+      window.__deferred = [];
+      window.__p = {};
+      window.fetch = (url, opts) => {
+        if (!opts || opts.method !== 'POST') return realFetch(url, opts);
+        return new Promise((resolve, reject) =>
+          window.__deferred.push({url: String(url), body: opts.body, resolve, reject}));
+      };
+      window.__respond = (i, status, body) => window.__deferred[i].resolve(new Response(
+        body !== undefined ? body
+          : JSON.stringify(status === 200 ? {ok: true} : {error: 'refused by test fixture'}),
+        {status, headers: {'Content-Type': 'application/json'}}));
+      window.__reject = (i) => window.__deferred[i].reject(new TypeError('simulated network loss'));
+    }"""
+
+    def deferred_console(self, **state):
+        self.state = engine_state(**state)
+        page = self.open_console(self.superuser)
+        page.evaluate(self.DEFERRED_FETCH)
+        return page
+
+    def start(self, page, *calls):
+        """Start commands (JS call expressions), each of which issues exactly
+        one engine-command POST; return their request indexes. Each command's
+        promise is kept under its request index."""
+        indexes = page.evaluate("""(calls) => calls.map(c => {
+          const before = window.__deferred.length;
+          const promise = (0, eval)(c);
+          if (window.__deferred.length !== before + 1) throw new Error('expected one POST from ' + c);
+          window.__p[before] = promise;
+          return before;
+        })""", list(calls))
+        return indexes
+
+    def settle_all(self, page, action):
+        """Run ONE resolve/reject action ("__respond(i, ...)"/"__reject(i)") and
+        wait for exactly that command to finish -- other outstanding commands
+        stay outstanding, so arrival order is fully controlled."""
+        index = int(action[action.index("(") + 1:].split(",")[0].rstrip(")"))
+        page.evaluate("async ([a, i]) => { (0, eval)(a); await window.__p[i]; }", [action, index])
+
+    def ui(self, page, button="micPttBtn"):
+        return page.evaluate("""(id) => {
+          const b = document.getElementById(id);
+          return {pending: b.classList.contains('pending'), refused: b.classList.contains('refused'),
+                  state: b.dataset.micState, aria: b.getAttribute('aria-label'),
+                  active: b.classList.contains('active'),
+                  msg: document.getElementById('opsMsg').textContent};
+        }""", button)
+
+    def poll_now(self, page, **state):
+        if state:
+            self.state = engine_state(**state)
+        page.evaluate("async () => { await poll(); }")
+
+    def test_network_rejection_clears_pending_and_reports_an_unconfirmed_outcome(self):
+        page = self.deferred_console()
+        i, = self.start(page, "toggleMicPtt()")
+        self.assertTrue(self.ui(page)["pending"])
+        self.settle_all(page, f"__reject({i})")
+        ui = self.ui(page)
+        self.assertFalse(ui["pending"])
+        self.assertTrue(ui["refused"])
+        self.assertEqual(ui["msg"], "Studio Mic: Connection error — command outcome unconfirmed.")
+        self.assertNotIn("not sent", ui["msg"].lower())
+        self.assertEqual((ui["state"], ui["aria"]), ("off", "Studio Mic: OFF"))
+        self.shot(page, "network-error-unconfirmed")
+        page.clock.run_for(6_100)
+        self.assertEqual(self.ui(page)["msg"], "")
+        self.assertFalse(self.ui(page)["refused"])
+
+    def test_network_rejection_while_live_keeps_live_until_the_engine_says_otherwise(self):
+        page = self.deferred_console(mic_live=True)
+        i, = self.start(page, "toggleMicPtt()")              # asks for OFF
+        self.settle_all(page, f"__reject({i})")
+        ui = self.ui(page)
+        self.assertEqual((ui["state"], ui["aria"], ui["active"]), ("on", "Studio Mic: LIVE", True))
+        self.assertIn("command outcome unconfirmed", ui["msg"])
+        self.poll_now(page, mic_live=True)                    # engine: still LIVE
+        self.assertIn("command outcome unconfirmed", self.ui(page)["msg"])
+        self.assertEqual(self.ui(page)["aria"], "Studio Mic: LIVE")
+        self.shot(page, "network-error-while-live")
+        self.poll_now(page, mic_live=False)                   # engine now reports the requested state
+        ui = self.ui(page)
+        self.assertEqual((ui["state"], ui["msg"], ui["refused"]), ("off", "", False))
+
+    def test_older_failure_newer_success_in_either_arrival_order(self):
+        for order in ("newer-first", "older-first"):
+            with self.subTest(order=order):
+                page = self.deferred_console()
+                old, new = self.start(page, "toggleMicPtt()", "toggleMicPtt()")
+                steps = ([f"__respond({new}, 200)", f"__respond({old}, 403)"] if order == "newer-first"
+                         else [f"__respond({old}, 403)", f"__respond({new}, 200)"])
+                for step in steps:
+                    self.settle_all(page, step)
+                ui = self.ui(page)
+                self.assertEqual((ui["refused"], ui["msg"]), (False, ""), ui)
+                self.assertTrue(ui["pending"])        # accepted: busy until the next poll
+                self.poll_now(page, mic_live=True)
+                ui = self.ui(page)
+                self.assertEqual((ui["pending"], ui["state"]), (False, "on"))
+
+    def test_older_success_newer_failure_in_either_arrival_order(self):
+        for order in ("newer-first", "older-first"):
+            with self.subTest(order=order):
+                page = self.deferred_console()
+                old, new = self.start(page, "toggleMicPtt()", "toggleMicPtt()")
+                steps = ([f"__respond({new}, 403)", f"__respond({old}, 200)"] if order == "newer-first"
+                         else [f"__respond({old}, 200)", f"__respond({new}, 403)"])
+                for step in steps:
+                    self.settle_all(page, step)
+                ui = self.ui(page)
+                self.assertTrue(ui["refused"], ui)
+                self.assertEqual(ui["msg"], "Studio Mic request refused: permission denied (role or schedule).")
+                self.assertFalse(ui["pending"])
+
+    def test_repeated_success_clears_an_older_warning(self):
+        page = self.deferred_console()
+        i, = self.start(page, "toggleMicPtt()")
+        self.settle_all(page, f"__respond({i}, 403)")
+        self.assertTrue(self.ui(page)["refused"])
+        for _ in range(2):
+            i, = self.start(page, "toggleMicPtt()")
+            self.settle_all(page, f"__respond({i}, 200)")
+            ui = self.ui(page)
+            self.assertEqual((ui["refused"], ui["msg"]), (False, ""))
+
+    def test_repeated_failure_keeps_the_newest_warning_for_its_full_period(self):
+        page = self.deferred_console()
+        i, = self.start(page, "toggleMicPtt()")
+        self.settle_all(page, f"__respond({i}, 403)")
+        page.clock.run_for(3_000)
+        i, = self.start(page, "toggleMicPtt()")
+        self.settle_all(page, f"__reject({i})")
+        self.assertIn("command outcome unconfirmed", self.ui(page)["msg"])
+        page.clock.run_for(3_100)        # the FIRST warning's 6s would end here
+        self.assertIn("command outcome unconfirmed", self.ui(page)["msg"])
+        page.clock.run_for(3_000)        # the second warning's own 6s
+        self.assertEqual(self.ui(page)["msg"], "")
+
+    def test_overlapping_studio_and_remote_mic_requests_are_independent(self):
+        page = self.deferred_console(remote_dj_connected=True)
+        studio, remote = self.start(page, "toggleMicPtt()", "toggleRemoteDjGate()")
+        self.settle_all(page, f"__reject({studio})")
+        page.clock.run_for(3_000)
+        self.settle_all(page, f"__respond({remote}, 403)")
+        msg = self.ui(page)["msg"]
+        self.assertIn("Studio Mic: Connection error — command outcome unconfirmed.", msg)
+        self.assertIn("Remote Mic request refused: permission denied (role or schedule).", msg)
+        self.assertTrue(self.ui(page, "remoteDjGateBtn")["refused"])
+        self.shot(page, "overlapping-mic-warnings")
+        page.clock.run_for(3_100)        # Studio's timer ends; Remote's must survive it
+        msg = self.ui(page)["msg"]
+        self.assertNotIn("Studio Mic", msg)
+        self.assertIn("Remote Mic request refused", msg)
+        self.assertFalse(self.ui(page)["refused"])
+        self.assertTrue(self.ui(page, "remoteDjGateBtn")["refused"])
+        page.clock.run_for(3_000)
+        self.assertEqual(self.ui(page)["msg"], "")
+
+    def test_status_poll_during_a_request_keeps_it_pending(self):
+        page = self.deferred_console()
+        i, = self.start(page, "toggleMicPtt()")            # asks for LIVE
+        self.poll_now(page)                                 # engine still OFF, request in flight
+        ui = self.ui(page)
+        self.assertEqual((ui["pending"], ui["state"]), (True, "off"))
+        self.settle_all(page, f"__respond({i}, 200)")
+        ui = self.ui(page)
+        self.assertTrue(ui["pending"])                      # queued, not yet confirmed
+        self.assertEqual(ui["state"], "off")                # HTTP success is not execution
+        self.poll_now(page, mic_live=True)
+        ui = self.ui(page)
+        self.assertEqual((ui["pending"], ui["state"], ui["msg"]), (False, "on", ""))
+
+    def test_late_deck_responses_cannot_overwrite_newer_feedback(self):
+        page = self.deferred_console()
+        msg = "() => document.getElementById('deckMsg-A').textContent"
+        old, new = self.start(page, "deckCommand('A', 'pause')", "deckCommand('A', 'eject')")
+        self.settle_all(page, f"__respond({new}, 200)")
+        self.settle_all(page, f"__respond({old}, 403)")
+        self.assertEqual(page.evaluate(msg), "")
+        old, new = self.start(page, "deckCommand('A', 'pause')", "deckCommand('A', 'eject')")
+        self.settle_all(page, f"__respond({new}, 503, JSON.stringify({{error: 'engine command dispatch failed: full'}}))")
+        self.settle_all(page, f"__respond({old}, 200)")
+        self.assertEqual(page.evaluate(msg), "Eject not queued: engine command queue unavailable")
+        self.assertEqual(page.evaluate("() => document.getElementById('deckMsg-B').textContent"), "")
+        i, = self.start(page, "deckCommand('A', 'pause')")   # a newer ACCEPTED request clears it
+        self.settle_all(page, f"__respond({i}, 200)")
+        self.assertEqual(page.evaluate(msg), "")
+
+    def test_a_superseded_seek_never_moves_the_playhead(self):
+        page = self.deferred_console()
+        old, new = self.start(page, "seekTo('A', 30)", "seekTo('A', 90)")
+        self.settle_all(page, f"__respond({new}, 403)")
+        self.settle_all(page, f"__respond({old}, 200)")
+        self.assertEqual(page.evaluate("() => deckState.A.localPosition"), POSITION)
+        self.assertEqual(page.evaluate("() => document.getElementById('deckMsg-A').textContent"),
+                         "Seek refused: permission denied (role or schedule)")
+        i, = self.start(page, "seekTo('A', 120)")
+        self.settle_all(page, f"__respond({i}, 200)")
+        self.assertEqual(page.evaluate("() => deckState.A.localPosition"), 120)
+
+    def test_command_outcome_classification(self):
+        page = self.deferred_console()
+        cases = (
+            ("__respond(I, 200)", "accepted", None),
+            ("__respond(I, 200, 'not json')", "unconfirmed",
+             "Unexpected server response (HTTP 200) — command outcome unconfirmed"),
+            ("__respond(I, 401)", "refused", "refused: permission denied (role or schedule)"),
+            ("__respond(I, 403)", "refused", "refused: permission denied (role or schedule)"),
+            ("__respond(I, 400)", "rejected", "rejected by the server (HTTP 400)"),
+            ("__respond(I, 503, JSON.stringify({error: 'engine command dispatch failed: x'}))", "unqueued",
+             "not queued: engine command queue unavailable"),
+            ("__respond(I, 503, '<html>proxy</html>')", "unconfirmed",
+             "Server error (HTTP 503) — command outcome unconfirmed"),
+            ("__respond(I, 502)", "unconfirmed", "Server error (HTTP 502) — command outcome unconfirmed"),
+            ("__reject(I)", "unconfirmed", "Connection error — command outcome unconfirmed"),
+        )
+        for action, kind, text in cases:
+            with self.subTest(action=action):
+                page.evaluate("() => { window.__out = postEngineCommand('/api/engine/manual-mode/', {active: true}); }")
+                i = page.evaluate("() => window.__deferred.length - 1")
+                result = page.evaluate("async (a) => { (0, eval)(a); return await window.__out; }",
+                                       action.replace("(I", f"({i}"))
+                self.assertEqual(result.get("kind"), kind, result)
+                self.assertEqual(result.get("text"), text, result)
+
+    def test_signed_out_redirect_is_a_definite_refusal(self):
+        page = self.open_console(self.superuser)
+        self.post_status = {"/api/engine/mic-ptt/": 302}
+        result = page.evaluate("async () => await postEngineCommand('/api/engine/mic-ptt/', {active: true})")
+        self.assertEqual(result, {"kind": "refused", "text": "refused: signed out — reload and sign in"})
 
     def test_stale_connection_presentation(self):
         page = self.open_console(self.superuser)

@@ -1575,28 +1575,161 @@ function setOpsMicButton(btn, state, word, ariaLabel) {
   btn.setAttribute('aria-label', ariaLabel);
 }
 
-// A refused or unqueued mic request (403 permission/schedule denial, 503
-// command-queue failure) must not vanish silently -- but it must also never
-// hide what is actually on air. The button therefore keeps showing the
-// engine's own polled state (a LIVE mic still reads LIVE); the refusal is
-// a red outline on that button plus a short message in the #opsMsg live
-// region, for a few seconds.
-const OPS_REFUSAL_HOLD_MS = 5000;
-let opsRefusalTimer = null;
-function noteOpsRefusal(btn, name, status) {
-  if (!btn) return;
-  const why = status === 403 ? 'permission denied (role or schedule)'
-    : status === 503 ? 'the engine command queue is unavailable'
-    : 'HTTP ' + status;
-  const verb = status === 503 ? 'not queued' : 'refused';
-  btn.classList.add('refused');
+// --- Roadmap 2.23: command feedback (Codex Phase 1 P2 corrections) ---
+// The engine never acknowledges a command, so the HTTP outcome of an
+// engine-command POST is only ever "queued", "refused", "not queued" or
+// "unknown". It is shown as a bounded warning and NEVER replaces the
+// engine-owned state (LIVE/OFF, Auto/Manual, deck transport), which comes
+// only from the polled /api/engine/status/.
+//
+// A rejected fetch() does not prove the request never reached the server,
+// so a network failure is reported as an UNCONFIRMED outcome, never "not
+// sent". Only outcomes the server itself states (401/403, our own 503 queue
+// failure, another 4xx before the queue) are reported as definitive.
+async function postEngineCommand(url, body) {
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    return { kind: 'unconfirmed', text: 'Connection error — command outcome unconfirmed' };
+  }
+  let payload = null;
+  try {
+    payload = await resp.json();
+  } catch (e) {
+    payload = null;
+  }
+  if (resp.redirected) {
+    // Engine views never redirect; a redirect is the login gate turning the
+    // request away before any view ran.
+    return { kind: 'refused', text: 'refused: signed out — reload and sign in' };
+  }
+  if (resp.ok) {
+    return (payload && payload.ok === true)
+      ? { kind: 'accepted' }
+      : { kind: 'unconfirmed', text: `Unexpected server response (HTTP ${resp.status}) — command outcome unconfirmed` };
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    return { kind: 'refused', text: 'refused: permission denied (role or schedule)' };
+  }
+  if (resp.status === 503 && payload && typeof payload.error === 'string'
+      && payload.error.startsWith('engine command dispatch failed')) {
+    return { kind: 'unqueued', text: 'not queued: engine command queue unavailable' };
+  }
+  if (resp.status >= 400 && resp.status < 500) {
+    return { kind: 'rejected', text: `rejected by the server (HTTP ${resp.status})` };
+  }
+  return { kind: 'unconfirmed', text: `Server error (HTTP ${resp.status}) — command outcome unconfirmed` };
+}
+
+// Per-control request identity. Keys: the ops buttons' ids, and
+// 'deck-A' / 'deck-B' (Eject, Pause/Resume and click-seek for that deck).
+// Each key has its own monotonically increasing sequence, in-flight marker,
+// warning and timer:
+//   - only the NEWEST request for a key may change that key's pending or
+//     warning UI -- a late response from a superseded request is ignored,
+//     whether it succeeded or failed;
+//   - a newer accepted request clears that key's older warning;
+//   - a warning's timer clears only that same warning, never a newer one or
+//     another control's;
+//   - an UNCONFIRMED warning carrying the requested state is also cleared
+//     once the engine's own status reports that state (the display then
+//     simply shows engine truth; it never claims the command executed).
+const CONTROL_WARNING_MS = 6000;
+const OPS_CONTROL_NAMES = {
+  micPttBtn: 'Studio Mic',
+  manualModeBtn: 'Auto/Manual',
+  remoteDjGateBtn: 'Remote Mic',
+};
+const controlFeedback = {};
+
+function controlFb(key) {
+  if (!controlFeedback[key]) {
+    controlFeedback[key] = { seq: 0, inFlight: null, warning: null, timer: null };
+  }
+  return controlFeedback[key];
+}
+
+function beginControlCommand(key) {
+  const fb = controlFb(key);
+  fb.seq += 1;
+  fb.inFlight = fb.seq;
+  return fb.seq;
+}
+
+function isControlInFlight(key) {
+  return controlFb(key).inFlight !== null;
+}
+
+// Apply `outcome` for request `id` of `key`. Returns false (and changes
+// nothing) when a newer request for the same key has superseded it.
+// `desired` is the engine state the request asked for, when it has one.
+function finishControlCommand(key, id, outcome, desired) {
+  const fb = controlFb(key);
+  if (id !== fb.seq) return false;
+  fb.inFlight = null;
+  if (outcome.kind === 'accepted') {
+    clearControlWarning(key);
+  } else {
+    setControlWarning(key, outcome, desired);
+  }
+  return true;
+}
+
+function setControlWarning(key, outcome, desired) {
+  const fb = controlFb(key);
+  clearTimeout(fb.timer);
+  const warning = { kind: outcome.kind, text: outcome.text, verb: outcome.verb, desired };
+  fb.warning = warning;
+  fb.timer = setTimeout(() => {
+    if (fb.warning === warning) clearControlWarning(key);
+  }, CONTROL_WARNING_MS);
+  renderControlFeedback(key);
+}
+
+function clearControlWarning(key) {
+  const fb = controlFb(key);
+  clearTimeout(fb.timer);
+  fb.timer = null;
+  fb.warning = null;
+  renderControlFeedback(key);
+}
+
+// Called by the status renderers with the engine-reported state.
+function reconcileControlWarning(key, engineState) {
+  const w = controlFb(key).warning;
+  if (w && w.kind === 'unconfirmed' && w.desired !== undefined && w.desired === engineState) {
+    clearControlWarning(key);
+  }
+}
+
+// "Studio Mic request refused: ...", "Eject not queued: ...", or for an
+// unconfirmed outcome "Studio Mic: Connection error — ...".
+function controlWarningText(subject, warning, request) {
+  return warning.kind === 'unconfirmed'
+    ? `${subject}: ${warning.text}`
+    : `${subject}${request ? ' request' : ''} ${warning.text}`;
+}
+
+function renderControlFeedback(key) {
+  const fb = controlFb(key);
+  if (key.startsWith('deck-')) {
+    const el = document.getElementById(`deckMsg-${key.slice(5)}`);
+    if (el) el.textContent = fb.warning ? controlWarningText(fb.warning.verb, fb.warning, false) : '';
+    return;
+  }
+  const btn = document.getElementById(key);
+  if (btn) btn.classList.toggle('refused', !!fb.warning);
   const msg = document.getElementById('opsMsg');
-  if (msg) msg.textContent = `${name} request ${verb}: ${why}.`;
-  clearTimeout(opsRefusalTimer);
-  opsRefusalTimer = setTimeout(() => {
-    document.querySelectorAll('.ops-btn.refused').forEach(b => b.classList.remove('refused'));
-    if (msg) msg.textContent = '';
-  }, OPS_REFUSAL_HOLD_MS);
+  if (!msg) return;
+  msg.textContent = Object.keys(OPS_CONTROL_NAMES)
+    .filter(k => controlFeedback[k] && controlFeedback[k].warning)
+    .map(k => controlWarningText(OPS_CONTROL_NAMES[k], controlFeedback[k].warning, true) + '.')
+    .join(' ');
 }
 
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
@@ -1938,19 +2071,16 @@ async function toggleMicPtt() {
   if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const btn = document.getElementById('micPttBtn');
   const desiredActive = !btn.classList.contains('active');
+  const id = beginControlCommand('micPttBtn');
   btn.classList.add('pending');
-  const resp = await fetch('/api/engine/mic-ptt/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ active: desiredActive }),
-  });
-  if (!resp.ok) {
+  const outcome = await postEngineCommand('/api/engine/mic-ptt/', { active: desiredActive });
+  if (finishControlCommand('micPttBtn', id, outcome, desiredActive) && outcome.kind !== 'accepted') {
     btn.classList.remove('pending');
-    noteOpsRefusal(btn, 'Studio Mic', resp.status);
   }
   // Don't flip .active here -- wait for the next poll() to confirm
   // mic_live from engine_state.json, so the button always reflects
-  // engine reality, never optimistic client state.
+  // engine reality, never optimistic client state. An accepted request
+  // keeps .pending until that poll.
 }
 
 function renderMicPtt(data) {
@@ -1962,7 +2092,9 @@ function renderMicPtt(data) {
   // from a remote seat.
   const weAreRemote = !!rdjPc;
   btn.disabled = !data.mic_configured || weAreRemote;
-  btn.classList.remove('pending');
+  // A request still in flight keeps its busy indication through a poll.
+  if (!isControlInFlight('micPttBtn')) btn.classList.remove('pending');
+  reconcileControlWarning('micPttBtn', !!data.mic_live);
   btn.classList.toggle('active', !!data.mic_live);
   // HW-05/06: mic_ok is a compatibility/recovery flag, not physical-flow
   // proof. Prefer the additive hardware-buffer health signal when present;
@@ -2014,15 +2146,13 @@ async function toggleRemoteDjGate() {
   if (state.remote_dj_connected) {
     // PTT gate mode.
     const desiredActive = !btn.classList.contains('active');
+    const id = beginControlCommand('remoteDjGateBtn');
     btn.classList.add('pending');
-    const resp = await fetch('/api/engine/remote-dj-gate/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-      body: JSON.stringify({ active: desiredActive }),
-    });
-    if (!resp.ok) {
+    const outcome = await postEngineCommand('/api/engine/remote-dj-gate/', { active: desiredActive });
+    if (!finishControlCommand('remoteDjGateBtn', id, outcome, desiredActive)) {
+      // Superseded by a newer Remote Mic request: that one owns the UI.
+    } else if (outcome.kind !== 'accepted') {
       btn.classList.remove('pending');
-      noteOpsRefusal(btn, 'Remote Mic', resp.status);
     } else if (!desiredActive) {
       // [4.1 follow-up] This browser just successfully requested OFF --
       // don't let the VU fill keep animating real, still-flowing
@@ -2601,8 +2731,9 @@ function renderRemoteDjGate(data) {
   if (!btn) return;
   window.__rdjLastEngineState = data;
   if (rdjCalibrating) return;  // countdown owns the label during calibration
-  btn.classList.remove('pending');
+  if (!isControlInFlight('remoteDjGateBtn')) btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.remote_dj_live);
+  reconcileControlWarning('remoteDjGateBtn', !!data.remote_dj_live);
   if (!data.remote_dj_configured) {
     btn.disabled = true;
     setOpsMicButton(btn, 'unavailable', 'N/A', 'Remote Mic: not available (Remote DJ is not enabled)');
@@ -2646,13 +2777,12 @@ async function toggleManualMode() {
   if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const btn = document.getElementById('manualModeBtn');
   const desiredActive = !btn.classList.contains('active');
+  const id = beginControlCommand('manualModeBtn');
   btn.classList.add('pending');
-  const resp = await fetch('/api/engine/manual-mode/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ active: desiredActive }),
-  });
-  if (!resp.ok) btn.classList.remove('pending');
+  const outcome = await postEngineCommand('/api/engine/manual-mode/', { active: desiredActive });
+  if (finishControlCommand('manualModeBtn', id, outcome, desiredActive) && outcome.kind !== 'accepted') {
+    btn.classList.remove('pending');
+  }
   // Same pattern as mic PTT -- wait for the next poll() to confirm
   // manual_mode from engine_state.json rather than flipping optimistically.
 }
@@ -2660,8 +2790,9 @@ async function toggleManualMode() {
 function renderManualMode(data) {
   const btn = document.getElementById('manualModeBtn');
   if (!btn) return;
-  btn.classList.remove('pending');
+  if (!isControlInFlight('manualModeBtn')) btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.manual_mode);
+  reconcileControlWarning('manualModeBtn', !!data.manual_mode);
   // "Manual (mic)" when Manual is being held by a live mic (auto-flipped
   // from Auto by the local PTT or remote gate, not explicitly picked by
   // the operator) -- so it's clear the mode will restore to Auto on
@@ -2899,19 +3030,24 @@ function drawWaveform(slot) {
 
   const t = deckPlayheadSeconds(slot);
   if (t === null) return;
-  // Playhead -- drawn last so it sits on top of everything else. Snapped
-  // to a device pixel and kept fully inside the canvas so neither the
-  // line nor its triangles are clipped at the very start or end.
+  // Playhead -- drawn last so it sits on top of everything else. The LINE
+  // marks the true position, snapped to a device pixel; it is only held 1px
+  // inside the edges so its 2px stroke is never half-clipped. The triangles
+  // are decoration: their 8px base is kept wholly inside the canvas (Codex
+  // Phase 1 P3), while their tips stay on the line -- so at the very start
+  // or end they lean inward instead of being cut off, and nothing moves the
+  // line or alters the time it represents.
   let x = (t / scale) * cssW;
   x = Math.min(cssW - 1, Math.max(1, Math.round(x * dpr) / dpr));
+  const baseLeft = Math.min(Math.max(0, cssW - 8), Math.max(0, x - 4));
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const topTriangle = () => {
     ctx.beginPath();
-    ctx.moveTo(x - 4, 0); ctx.lineTo(x + 4, 0); ctx.lineTo(x, 5); ctx.closePath();
+    ctx.moveTo(baseLeft, 0); ctx.lineTo(baseLeft + 8, 0); ctx.lineTo(x, 5); ctx.closePath();
   };
   const bottomTriangle = () => {
     ctx.beginPath();
-    ctx.moveTo(x - 4, cssH); ctx.lineTo(x + 4, cssH); ctx.lineTo(x, cssH - 5); ctx.closePath();
+    ctx.moveTo(baseLeft, cssH); ctx.lineTo(baseLeft + 8, cssH); ctx.lineTo(x, cssH - 5); ctx.closePath();
   };
   // A thin dark halo under the white marker keeps it visible on a light
   // UITheme palette (and over pale album-art blur); on the default dark
@@ -3078,6 +3214,7 @@ function buildDeckDOM(slot) {
       handlePlayPause(slot);
     });
   }
+  renderControlFeedback(`deck-${slot}`);
   drawWaveform(slot);
 }
 
@@ -3286,50 +3423,33 @@ function renderDeckLive(slot, deck, transport) {
 
 async function deckCommand(slot, action) {
   if (connectionStale) return;  // [P1] 1.7 -- deck transport mutation gate
-  let resp = null;
-  try {
-    resp = await fetch(`/api/engine/deck/${slot}/`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-      body: JSON.stringify({ action }),
-    });
-  } catch (e) {
-    resp = null;
-  }
-  showDeckCommandResult(slot, action, resp);
+  const key = `deck-${slot}`;
+  const id = beginControlCommand(key);
+  const outcome = await postEngineCommand(`/api/engine/deck/${slot}/`, { action });
+  finishControlCommand(key, id, deckCommandOutcome(action, outcome));
   poll();
 }
 
-// Roadmap 2.23 -- truthful deck-command feedback. HTTP 200 only means the
-// command was QUEUED for the engine (the engine sends no acknowledgment),
-// so success stays silent and the deck's own polled state is the proof;
-// a refusal or queue failure is shown on the deck instead of vanishing.
-const deckMsgTimers = { A: null, B: null };
-function showDeckCommandResult(slot, action, resp) {
-  const el = document.getElementById(`deckMsg-${slot}`);
-  if (!el) return;
-  clearTimeout(deckMsgTimers[slot]);
-  if (resp && resp.ok) {
-    el.textContent = '';
-    return;
-  }
-  const verb = { eject: 'Eject', pause: 'Pause', resume: 'Resume' }[action] || action;
-  el.textContent = !resp ? `${verb} not sent (network error)`
-    : resp.status === 403 ? `${verb} refused: permission denied (role or schedule)`
-    : resp.status === 503 ? `${verb} not queued: engine command queue unavailable`
-    : `${verb} failed (HTTP ${resp.status})`;
-  deckMsgTimers[slot] = setTimeout(() => { el.textContent = ''; }, 5000);
+// Deck feedback names the action. HTTP 200 only means the command was
+// QUEUED for the engine, so success stays silent and the deck's own polled
+// state is the proof; anything else is shown on that deck.
+function deckCommandOutcome(action, outcome) {
+  if (outcome.kind === 'accepted') return outcome;
+  const verb = { eject: 'Eject', pause: 'Pause', resume: 'Resume', seek: 'Seek' }[action] || action;
+  return { ...outcome, verb };
 }
 
 async function seekTo(slot, seconds) {
   if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
-  await fetch('/api/engine/seek/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ slot, position: seconds }),
-  });
-  deckState[slot].localPosition = seconds;
-  deckState[slot].lastPollTime = Date.now();
+  const key = `deck-${slot}`;
+  const id = beginControlCommand(key);
+  const outcome = await postEngineCommand('/api/engine/seek/', { slot, position: seconds });
+  // Move the local playhead only for the newest seek the server accepted
+  // (queued); the next poll reports the engine's real position either way.
+  if (finishControlCommand(key, id, deckCommandOutcome('seek', outcome)) && outcome.kind === 'accepted') {
+    deckState[slot].localPosition = seconds;
+    deckState[slot].lastPollTime = Date.now();
+  }
 }
 
 let currentLogId = null;
