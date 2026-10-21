@@ -1016,8 +1016,11 @@ class _ConsoleBrowserBase:
         self.assertEqual((ui["action"], ui["status"], ui["disabled"]), ("Jane Smith", "Other browser · Good", True))
         self.assertEqual(ui["aria"], "Remote DJ connected — Jane Smith (in another browser) — link quality Good")
         self.assertIn("Only that browser can disconnect it", ui["title"])
-        self.assertEqual(page.evaluate(
-            "() => getComputedStyle(document.getElementById('remoteDjConnectBtn')).opacity"), "0.75")
+        # .playnow-btn animates opacity (0.12s, real time -- not the fake
+        # clock): wait for the settled value rather than sampling mid-fade.
+        page.wait_for_function(
+            "() => getComputedStyle(document.getElementById('remoteDjConnectBtn')).opacity === '0.75'",
+            timeout=5_000)
         self.shot(page, "rdj-identity-observer")
 
     def test_same_account_in_another_browser_is_an_observer(self):
