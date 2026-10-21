@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "release_id": "r0116",
+  "target_commit": "a873eb91f8c03ecd095a4195b179509111e6a2c0",
+  "manifest_sha256": "c7b5a34fc174fe2ac95bdb961373e8178ba20213d5cc69b4ebb7db7dfeb8f544",
+  "authorized_manual_operations": [
+    {
+      "ref": "monitoring.0014_provision_active_message_worker_check",
+      "migration_file_sha256": "e87ae5de003d01c857884821106b0d7a618d15e926ec84820fcf072e4a245566",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    }
+  ]
+}
