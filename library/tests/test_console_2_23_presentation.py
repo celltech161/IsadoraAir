@@ -266,6 +266,16 @@ class ConsoleTemplateContractTests(SimpleTestCase):
             with self.subTest(state=state):
                 self.assertIn(f'[data-mic-state="{state}"]', self.template)
 
+    def test_a_refusal_never_replaces_the_engine_state_on_the_button(self):
+        # A refused OFF request while the mic is LIVE must still read LIVE.
+        self.assertNotIn("showOpsRefusal", self.template)
+        refusal = self._function("noteOpsRefusal")
+        self.assertNotIn("setOpsMicButton", refusal)
+        self.assertNotIn("micState", refusal)
+        self.assertNotIn("aria-label", refusal)
+        self.assertIn("btn.classList.add('refused');", refusal)
+        self.assertIn('<div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>', self.template)
+
     def test_remote_mic_keeps_vu_fill_and_dual_purpose(self):
         gate = self._function("renderRemoteDjGate")
         self.assertIn("if (data.remote_dj_connected) {", gate)
@@ -339,7 +349,7 @@ class ConsoleTemplateContractTests(SimpleTestCase):
         self.assertEqual(self.template.count("setInterval(poll, 1000);"), 1)
         self.assertEqual(self.template.count("setInterval(updatePositionIndicators, 100);"), 1)
         for fn in ("drawWaveform", "renderWaveformLayer", "updatePositionIndicators", "buildDeckDOM",
-                   "setOpsMicButton", "showOpsRefusal", "showDeckCommandResult"):
+                   "setOpsMicButton", "noteOpsRefusal", "showDeckCommandResult"):
             with self.subTest(fn=fn):
                 body = self._function(fn)
                 self.assertNotIn("setInterval(", body)

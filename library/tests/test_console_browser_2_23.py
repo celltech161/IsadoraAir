@@ -531,17 +531,23 @@ class _ConsoleBrowserBase:
         page = self.open_console(self.superuser)
         self.post_status = {"/api/engine/mic-ptt/": 403, "/api/engine/deck/A/": 403}
         page.locator("#micPttBtn").click()
-        page.wait_for_function("() => document.getElementById('micPttBtn').dataset.micState === 'denied'")
-        self.assertIn("not authorized", page.locator("#micPttBtn").get_attribute("aria-label"))
+        page.wait_for_function("() => document.getElementById('opsMsg').textContent.length > 0")
+        self.assertIn("Studio Mic request refused: not authorized", page.locator("#opsMsg").inner_text())
+        btn = page.locator("#micPttBtn")
+        self.assertIn("refused", btn.get_attribute("class"))
+        # The button itself still states the engine's truth.
+        self.assertEqual(btn.get_attribute("data-mic-state"), "off")
+        self.assertEqual(btn.get_attribute("aria-label"), "Studio Mic: OFF")
         page.locator("#ejectBtn-A").click()
         page.wait_for_function("() => document.getElementById('deckMsg-A').textContent.length > 0")
         self.assertIn("Eject refused", page.locator("#deckMsg-A").inner_text())
         self.shot(page, "refusal-feedback")
-        # The refusal outlives the next status render, then expires.
+        # Outlives the next status render, then expires.
         page.clock.run_for(1_100)
-        self.assertEqual(page.locator("#micPttBtn").get_attribute("data-mic-state"), "denied")
+        self.assertIn("refused", btn.get_attribute("class"))
         page.clock.run_for(5_200)
-        self.assertEqual(page.locator("#micPttBtn").get_attribute("data-mic-state"), "off")
+        self.assertNotIn("refused", btn.get_attribute("class"))
+        self.assertEqual(page.locator("#opsMsg").inner_text(), "")
         self.assertEqual(page.locator("#deckMsg-A").inner_text(), "")
         # An accepted Eject is exactly one request with the existing body.
         self.post_status = {}
@@ -551,6 +557,20 @@ class _ConsoleBrowserBase:
         page.clock.run_for(100)
         self.assertEqual(self.posts, [("/api/engine/deck/A/", json.dumps({"action": "eject"}, separators=(",", ":")))])
         self.assertEqual(page.locator("#deckMsg-A").inner_text(), "")
+
+    def test_a_refused_request_never_hides_a_live_mic(self):
+        self.state = engine_state(mic_live=True)
+        page = self.open_console(self.superuser)
+        self.post_status = {"/api/engine/mic-ptt/": 403}
+        btn = page.locator("#micPttBtn")
+        btn.click()
+        page.wait_for_function("() => document.getElementById('opsMsg').textContent.length > 0")
+        page.clock.run_for(1_100)
+        self.assertEqual(btn.get_attribute("data-mic-state"), "on")
+        self.assertEqual(btn.get_attribute("aria-label"), "Studio Mic: LIVE")
+        self.assertEqual(btn.locator(".ops-btn-label").inner_text(), "LIVE")
+        self.assertIn("active", btn.get_attribute("class"))
+        self.shot(page, "refusal-while-live")
 
     def test_stale_connection_presentation(self):
         page = self.open_console(self.superuser)

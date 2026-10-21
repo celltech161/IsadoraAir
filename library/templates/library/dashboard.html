@@ -167,6 +167,18 @@
     .ops-icon-btn.pending .ops-icon-chip { animation: none; opacity: 0.5; }
   }
 
+  /* A refused/unqueued mic request: outline only -- the button's own
+     colours, word and aria-label keep showing the engine's real state. */
+  .ops-btn.refused { box-shadow: 0 0 0 2px var(--danger); }
+  .ops-msg {
+    text-align: right;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--danger);
+    margin: -0.55rem 0 0.75rem;
+  }
+  .ops-msg:empty { display: none; }
+
   /* Line In (roadmap 2.23, D5): a reserved, permanently disabled control
      until roadmap 3.6 delivers the real LiveSource/Line Input path. It
      has no click handler and is not a toggle; disabled + aria-disabled
@@ -1424,6 +1436,7 @@
     <span id="remoteDjConnectStatus" class="rdj-connect-status rdj-status-offline" aria-live="polite">Offline</span>
   </button>
 </div>
+<div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
 <div class="decks-row" id="decksRow">
@@ -1562,25 +1575,28 @@ function setOpsMicButton(btn, state, word, ariaLabel) {
   btn.setAttribute('aria-label', ariaLabel);
 }
 
-// A refused mic request (403 permission/schedule denial, 503 queue
-// failure) is shown on the button for a few seconds instead of silently
-// reverting; the ~1Hz status renders re-apply it until it expires, then
-// the engine's own state shows again.
-const OPS_REFUSAL_HOLD_MS = 4000;
-const opsRefusals = {};
+// A refused or unqueued mic request (403 permission/schedule denial, 503
+// command-queue failure) must not vanish silently -- but it must also never
+// hide what is actually on air. The button therefore keeps showing the
+// engine's own polled state (a LIVE mic still reads LIVE); the refusal is
+// a red outline on that button plus a short message in the #opsMsg live
+// region, for a few seconds.
+const OPS_REFUSAL_HOLD_MS = 5000;
+let opsRefusalTimer = null;
 function noteOpsRefusal(btn, name, status) {
   if (!btn) return;
-  opsRefusals[btn.id] = { until: Date.now() + OPS_REFUSAL_HOLD_MS, name, status };
-  showOpsRefusal(btn);
-}
-function showOpsRefusal(btn) {
-  const r = btn && opsRefusals[btn.id];
-  if (!r || Date.now() >= r.until) return false;
-  const why = r.status === 403 ? 'not authorized right now'
-    : r.status === 503 ? 'engine command queue unavailable'
-    : 'request failed (HTTP ' + r.status + ')';
-  setOpsMicButton(btn, 'denied', 'Refused', r.name + ': ' + why);
-  return true;
+  const why = status === 403 ? 'not authorized right now'
+    : status === 503 ? 'the engine command queue is unavailable'
+    : 'HTTP ' + status;
+  const verb = status === 503 ? 'not queued' : 'refused';
+  btn.classList.add('refused');
+  const msg = document.getElementById('opsMsg');
+  if (msg) msg.textContent = `${name} request ${verb}: ${why}.`;
+  clearTimeout(opsRefusalTimer);
+  opsRefusalTimer = setTimeout(() => {
+    document.querySelectorAll('.ops-btn.refused').forEach(b => b.classList.remove('refused'));
+    if (msg) msg.textContent = '';
+  }, OPS_REFUSAL_HOLD_MS);
 }
 
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
@@ -1979,7 +1995,6 @@ function renderMicPtt(data) {
   btn.title = weAreRemote
     ? 'Studio Mic (read-only while this browser is connected as the Remote DJ)'
     : 'Studio Mic push-to-talk';
-  showOpsRefusal(btn);
 }
 
 async function toggleRemoteDjGate() {
@@ -2608,7 +2623,6 @@ function renderRemoteDjGate(data) {
       data.remote_dj_live ? 'LIVE' : 'OFF',
       weAreConnected ? gateLabel : gateLabel + ' (read-only: another browser holds the connection)',
     );
-    showOpsRefusal(btn);
   } else {
     // Calibration mode -- always clickable so the operator can (re)cal
     // even before connecting. Show the currently-persisted gain if any.
