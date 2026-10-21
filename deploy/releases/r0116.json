@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "release_id": "r0116",
+  "previous_release_id": "r0115",
+  "minimum_updater_protocol_version": 5,
+  "summary": "iPortal D3E Active Messages worker infrastructure: the managed isadoraair-active-message-worker (heartbeat v2, crash recovery, process-identity supervision), installed new under protected generation 15 / runtime 13 (ENABLE_NOW; not restarted by r0116); Monitoring's worker check via additive monitoring.0014 under the trusted companion; manual-only retention and reconciliation; read-only board diagnostics. Native airing stays closed. Restart Gunicorn and Monitoring; refresh Runtime Recovery.",
+  "migrations_required": [
+    "monitoring.0014_provision_active_message_worker_check"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [
+    "isadoraair-active-message-worker.service"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 15,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "64f320aebf015896010d29ee667c634c72163fef8f777161f229fbf3ffbb913a",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 13,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0116-primary.json"
+    ]
+  }
+}

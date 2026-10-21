@@ -4,10 +4,10 @@ The worker becomes a managed unit ONLY through the signed protected policy of
 a candidate runtime generation (the r0082 / r0107 / r0109 pattern): this
 branch adds exactly one entry, ``isadoraair-active-message-worker.service:
 ENABLE_NOW``, to deploy/updater_runtime/protected-policy.json -- the policy
-SOURCE of the next generation. It is UNSIGNED PREPARATION: the
+SOURCE of the next generation. It was UNSIGNED PREPARATION on D3E-B: the
 generation-15 descriptor, the release manifest and the primary-release
 attestation are produced by the r0116 release packaging with the real
-signing workflow, never here. The only other runtime change is runtime 13's
+signing workflow (asserted below against r0116's release commit). The only other runtime change is runtime 13's
 release-driven restart authority (CORE_SERVICES / RESTART_ORDER, correction
 B2, test_active_message_worker_restart), which -- as r0112's did -- also seeds
 the compiled fallback map; that map is never consulted while a signed policy
@@ -79,6 +79,16 @@ def _git(*args: str) -> bytes:
     return subprocess.run(["git", "-C", str(PROJECT_ROOT), *args], check=True, capture_output=True).stdout
 
 
+def _r0116() -> str:
+    """r0116's immutable introducing commit: the unique addition of its manifest
+    (it publishes this policy source as signed generation 15)."""
+    commits = _git("log", "--full-history", "--no-renames", "--diff-filter=A", "--format=%H", "HEAD", "--",
+                   "deploy/releases/r0116.json").decode().split()
+    if len(commits) != 1:
+        raise AssertionError(f"r0116.json must have exactly one introducing commit, found {commits!r}")
+    return commits[0]
+
+
 def _keypair(directory: Path, name: str):
     private, public = directory / f"{name}.key", directory / f"{name}.pem"
     subprocess.run(["/usr/bin/openssl", "genpkey", "-algorithm", "ed25519", "-out", str(private)], check=True,
@@ -114,27 +124,36 @@ class PolicySourceTests(SimpleTestCase):
         for unit in units:
             self.assertTrue((PROJECT_ROOT / "deploy" / unit).is_file(), unit)
 
-    def test_unsigned_preparation_only(self):
-        """The descriptor still describes generation 14 (its policy hash is the
-        installed one); no r0116 manifest or attestation is fabricated here."""
-        descriptor = json.loads((PROJECT_ROOT / DESCRIPTOR_PATH).read_text())
-        self.assertEqual(descriptor["generation"], 14)
+    def test_r0116_publishes_exactly_this_policy_as_generation_15(self):
+        """Prepared unsigned on D3E-B (the accepted D3E-D source still carried the
+        generation-14 descriptor); r0116's release-introducing commit publishes
+        these policy bytes as generation 15 / runtime 13, with the
+        primary-release attestation committed alongside -- nothing later."""
+        release = _r0116()
+        self.assertEqual(json.loads(_git("show", f"{release}^:{DESCRIPTOR_PATH}"))["generation"], 14)
+        descriptor = json.loads(_git("show", f"{release}:{DESCRIPTOR_PATH}"))
+        self.assertEqual((descriptor["generation"], descriptor["runtime_version"]), (15, 13))
         [entry] = [item for item in descriptor["files"] if item["path"] == "protected-policy.json"]
-        self.assertEqual(entry["sha256"], GENERATION_14_POLICY_SHA256)
-        self.assertNotEqual(hashlib.sha256(CANDIDATE_RAW).hexdigest(), GENERATION_14_POLICY_SHA256)
-        self.assertFalse((PROJECT_ROOT / "deploy" / "releases" / "r0116.json").exists())
-        self.assertFalse(list((PROJECT_ROOT / "deploy" / "updater_attestations").glob("r0116*")))
+        self.assertEqual(entry["sha256"], hashlib.sha256(CANDIDATE_RAW).hexdigest())
+        self.assertNotEqual(entry["sha256"], GENERATION_14_POLICY_SHA256)
+        self.assertEqual(_git("show", f"{release}:{POLICY_PATH}"), CANDIDATE_RAW)
+        manifest = json.loads(_git("show", f"{release}:deploy/releases/r0116.json"))
+        self.assertEqual(manifest["protected_runtime"]["attestations"],
+                         ["deploy/updater_attestations/r0116-primary.json"])
+        _git("cat-file", "-e", f"{release}:deploy/updater_attestations/r0116-primary.json")
+        self.assertEqual(manifest["systemd_units_new_required"], [WORKER])
 
     def test_the_protected_runtime_changes_are_exactly_policy_and_restart_authority(self):
         """Generation 15's runtime differs from generation 14's by the policy entry
         and runtime 13's restart authority (release.py CORE_SERVICES /
         RESTART_ORDER, __init__.py RUNTIME_VERSION) -- see
-        test_active_message_worker_restart."""
-        tracked = _git("ls-files", "deploy/updater_runtime").decode().split()
-        changed = sorted(path for path in tracked
-                         if (PROJECT_ROOT / path).read_bytes() != _git("show", f"{R0115}:{path}"))
-        self.assertEqual(changed, ["deploy/updater_runtime/isadoraair_updater/__init__.py",
-                                   "deploy/updater_runtime/isadoraair_updater/release.py", POLICY_PATH])
+        test_active_message_worker_restart -- plus the descriptor that r0116
+        publishes for it (bounded by r0116's release commit)."""
+        release = _r0116()
+        changed = _git("diff", "--name-only", R0115, release, "--", "deploy/updater_runtime").decode().split()
+        self.assertEqual(sorted(changed), ["deploy/updater_runtime/isadoraair_updater/__init__.py",
+                                           "deploy/updater_runtime/isadoraair_updater/release.py",
+                                           POLICY_PATH, DESCRIPTOR_PATH])
         service = WORKER.removesuffix(".service")
         self.assertIs(MANAGED_UNIT_POLICIES[WORKER], UnitActivationPolicy.ENABLE_NOW)
         self.assertIn(service, CORE_SERVICES)
