@@ -1,0 +1,38 @@
+{% comment %}
+Roadmap 2.23 -- the Console's operational-control icon boundary.
+
+This file is the ONE place the ops-row artwork lives. Buttons reference
+these symbols by id (<use href="#icon-...">), so custom artwork for the
+Studio Mic, Remote Mic or Line In controls is a drop-in replacement of
+the matching <symbol> below: keep the id, keep viewBox="0 0 24 24" (or
+change it here), and draw in currentColor so the button's state colour
+and the UITheme palette still apply. Nothing else in dashboard.html
+needs to change.
+
+Deliberately plain glyphs (stroked outlines), not branding.
+{% endcomment %}
+<svg xmlns="http://www.w3.org/2000/svg" class="console-icon-defs" aria-hidden="true" focusable="false"
+     style="position:absolute;width:0;height:0;overflow:hidden">
+  <symbol id="icon-mic-studio" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="9" y="2.5" width="6" height="11" rx="3"/>
+    <path d="M5.5 11a6.5 6.5 0 0 0 13 0"/>
+    <path d="M12 17.5v4"/>
+    <path d="M8.5 21.5h7"/>
+  </symbol>
+  <symbol id="icon-mic-remote" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="7" y="2.5" width="6" height="11" rx="3"/>
+    <path d="M3.5 11a6.5 6.5 0 0 0 13 0"/>
+    <path d="M10 17.5v4"/>
+    <path d="M17.5 4.5a4 4 0 0 1 0 5"/>
+    <path d="M20.5 2.5a7.5 7.5 0 0 1 0 9"/>
+  </symbol>
+  <symbol id="icon-line-in" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 12h9"/>
+    <path d="M8.5 8.5 12 12l-3.5 3.5"/>
+    <rect x="14" y="5" width="7.5" height="14" rx="2"/>
+    <circle cx="17.75" cy="12" r="1.6"/>
+  </symbol>
+</svg>

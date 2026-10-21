@@ -46,10 +46,13 @@
   .playnow-btn:hover { opacity: 0.9; }
 
   /* --- Ops bar buttons ---
-     All four buttons share a fixed flex-basis so the row never shifts
+     Every button has a fixed flex-basis so the row never shifts
      horizontally when a button's text changes state (Auto -> Manual,
-     Studio Mic: OFF -> Studio Mic: LIVE, etc). On mobile portrait
-     they collapse to two-per-row via a media query below. */
+     OFF -> LIVE (CHECKING), etc). Roadmap 2.23 order, left to right:
+     Line In, Studio PTT, Auto/Manual, Remote PTT, Connect. The mic
+     buttons carry an icon chip instead of a "... Mic:" text prefix, so
+     they are narrower than the Connect button. On mobile portrait the
+     row reflows via a media query below. */
   .ops-btn {
     border: 1px solid var(--border-subtle);
     background: transparent;
@@ -90,9 +93,86 @@
     opacity: 0.9;
   }
 
+  #manualModeBtn { flex-basis: 8.5em; }
   #manualModeBtn.active { background: #d97706; border-color: #d97706; }
   #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
   #micPttBtn:disabled { opacity: 0.55; }
+
+  /* Roadmap 2.23 -- icon + state-word mic/source buttons. The icon art
+     lives in ONE replaceable file (library/_console_icons.html, SVG
+     <symbol>s referenced by id), so custom Remote Mic / Line In artwork
+     can be dropped in later without touching this template. The chip
+     behind the glyph carries the state colour (green = mic on, dark
+     gray = off) and every state ALSO changes the visible word and the
+     button's aria-label, so colour is never the only signal. The chip
+     keeps a white glyph and a light ring so it reads on dark and light
+     UITheme palettes and on the red LIVE button fill alike. */
+  .ops-btn.ops-icon-btn {
+    flex-basis: 9.5em;
+    gap: 0.4em;
+    justify-content: flex-start;
+    padding: 0 0.5rem;
+  }
+  .ops-icon-chip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.45em;
+    height: 1.45em;
+    border-radius: 50%;
+    background: #4b5563;
+    color: #fff;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+  }
+  .ops-icon-chip svg { width: 0.95em; height: 0.95em; display: block; }
+  .ops-btn-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+  }
+  .ops-icon-btn[data-mic-state="on"] .ops-icon-chip { background: #16a34a; }
+  .ops-icon-btn[data-mic-state="off"] .ops-icon-chip { background: #4b5563; }
+  .ops-icon-btn[data-mic-state="error"] .ops-icon-chip,
+  .ops-icon-btn[data-mic-state="denied"] .ops-icon-chip { background: #b91c1c; }
+  .ops-icon-btn[data-mic-state="checking"] .ops-icon-chip,
+  .ops-icon-btn[data-mic-state="calibrating"] .ops-icon-chip { background: #b45309; }
+  .ops-icon-btn[data-mic-state="calibrate"] .ops-icon-chip {
+    background: transparent;
+    color: var(--text-main);
+    box-shadow: 0 0 0 1px var(--text-muted);
+  }
+  .ops-icon-btn[data-mic-state="unavailable"] .ops-icon-chip {
+    background: transparent;
+    color: var(--text-muted);
+    box-shadow: inset 0 0 0 1px var(--text-muted);
+  }
+  .ops-icon-btn[data-mic-state="unavailable"] .ops-icon-chip::after {
+    /* Diagonal strike: "not available" without relying on colour. */
+    content: "";
+    position: absolute;
+    width: 1.45em;
+    height: 1px;
+    background: currentColor;
+    transform: rotate(-45deg);
+  }
+  .ops-icon-btn[data-mic-state="unavailable"] .ops-icon-chip { position: relative; }
+  /* Busy: a request is in flight and the engine has not confirmed it yet. */
+  .ops-icon-btn.pending .ops-icon-chip { animation: ops-chip-busy 0.9s ease-in-out infinite alternate; }
+  @keyframes ops-chip-busy { from { opacity: 1; } to { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .ops-icon-btn.pending .ops-icon-chip { animation: none; opacity: 0.5; }
+  }
+
+  /* Line In (roadmap 2.23, D5): a reserved, permanently disabled control
+     until roadmap 3.6 delivers the real LiveSource/Line Input path. It
+     has no click handler and is not a toggle; disabled + aria-disabled
+     + the "Unavailable" word all say the same thing. */
+  #lineInBtn { flex-basis: 8.5em; }
+  #lineInBtn:disabled { opacity: 0.45; filter: grayscale(1); }
   /* P1 1.5 r0074 -- the Remote DJ action and overall link state share
      one fixed-size control.  Width and height are explicit so Offline,
      Negotiating, Initializing, Good/Fair/Poor, and Reconnecting never
@@ -186,17 +266,33 @@
   }
   #remoteDjGateBtn:not(.active)::before { display: none; }
 
-  /* Mobile portrait: two buttons per row, slightly smaller text so the
-     longest labels (~"Studio Mic: ERROR", "Disconnect Remote",
-     "Mic Cal: +12.5 dB") still fit inside each half-row. */
+  /* Mobile portrait: the full console's first three controls (Line In,
+     Studio PTT, Auto/Manual) share one row and the two Remote DJ
+     controls share the next; on /remote-dj/ (no Line In / Studio PTT)
+     Auto and Remote PTT share a row and Connect takes the next. Slightly
+     smaller text so the longest labels (~"LIVE (CHECKING)",
+     "Reconnecting…", "Cal +12.5 dB") still fit. */
   @media (max-width: 640px) {
     .ops-btn {
-      flex: 0 0 calc(50% - 0.3rem);
+      flex: 1 1 calc(33.333% - 0.45rem);
+      min-width: 0;
       font-size: 0.78rem;
       padding: 0 0.3rem;
     }
+    /* Same specificity as the desktop widths above, so these win here. */
+    #lineInBtn,
+    #manualModeBtn,
+    .ops-btn.ops-icon-btn {
+      flex-basis: calc(33.333% - 0.45rem);
+      padding: 0 0.3rem;
+    }
+    #remoteDjGateBtn,
+    .console-remote_dj #manualModeBtn {
+      flex-basis: calc(50% - 0.3rem);
+    }
     #remoteDjConnectBtn {
       flex-basis: calc(50% - 0.3rem);
+      flex-grow: 1;
       height: 2rem;
     }
     .playnow-bar { justify-content: space-between; }
@@ -217,8 +313,32 @@
     margin-bottom: 1.25rem;
   }
 
+  /* Roadmap 2.23 -- reserved Start Next position. The slot sits between
+     the two deck panels in the DOM, and only takes a grid column once
+     the row carries .has-start-next (Phase 3, when the engine-owned
+     operation exists). Until then the slot is `hidden` and the row is
+     the unchanged two-column grid. Explicit column placement keeps
+     Deck B in the right-hand column whether or not the slot is shown. */
+  .decks-row.has-start-next {
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  }
+  .decks-row.has-start-next > #deck-A { grid-column: 1; }
+  .decks-row.has-start-next > .start-next-slot { grid-column: 2; }
+  .decks-row.has-start-next > #deck-B { grid-column: 3; }
+  .start-next-slot {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+  }
+  .start-next-slot[hidden] { display: none; }
+
   @media (max-width: 700px) {
-    .decks-row { grid-template-columns: 1fr; }
+    .decks-row,
+    .decks-row.has-start-next { grid-template-columns: 1fr; }
+    .decks-row.has-start-next > #deck-A,
+    .decks-row.has-start-next > .start-next-slot,
+    .decks-row.has-start-next > #deck-B { grid-column: 1; }
   }
 
   /* Remote DJ console, mobile portrait: strip Deck B (Up Next preview)
@@ -241,14 +361,17 @@
       flex-direction: column;
     }
     .console-remote_dj .deck-panel.deck-mode-live { order: 1; }
-    .console-remote_dj .deck-panel.deck-mode-preview { order: 2; }
+    /* The reserved Start Next row stays BETWEEN the live and preview
+       decks whichever slot letter is live. */
+    .console-remote_dj .start-next-slot { order: 2; }
+    .console-remote_dj .deck-panel.deck-mode-preview { order: 3; }
     .console-remote_dj .deck-panel.deck-mode-preview .np-waveform,
     .console-remote_dj .deck-panel.deck-mode-preview .deck-art-bg,
     .console-remote_dj .deck-panel.deck-mode-preview .deck-art-thumb,
     .console-remote_dj .deck-panel.deck-mode-preview .np-timing {
       display: none !important;
     }
-    .console-remote_dj .deck-panel.deck-mode-preview { padding: 0.8rem 1rem; }
+    .console-remote_dj .deck-panel.deck-mode-preview { padding: 0.6rem 0.9rem; }
   }
 
   /* Remote DJ view: transport buttons render on both deck panels
@@ -269,7 +392,8 @@
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
     border-radius: 12px;
-    padding: 1.1rem 1.3rem;
+    /* Roadmap 2.23 compact deck card (was 1.1rem 1.3rem). */
+    padding: 0.8rem 1rem;
     min-width: 0;
   }
 
@@ -290,10 +414,10 @@
 
   .deck-art-thumb {
     position: absolute;
-    top: 0.9rem;
-    right: 1.1rem;
-    width: 150px;
-    height: 150px;
+    top: 0.7rem;
+    right: 0.9rem;
+    width: 128px;
+    height: 128px;
     object-fit: cover;
     border-radius: 8px;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
@@ -304,6 +428,12 @@
   }
 
   .deck-art-thumb.visible { opacity: 1; }
+  /* Phone width: the full-width card's header/title run under the thumb,
+     so a smaller thumb keeps the art readable while covering less of the
+     transport buttons and none of the waveform. */
+  @media (max-width: 640px) {
+    .deck-art-thumb { width: 96px; height: 96px; }
+  }
 
   .deck-content {
     position: relative;
@@ -315,7 +445,7 @@
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.45rem;
   }
 
   .deck-label {
@@ -393,8 +523,21 @@
   }
   .deck-transport-btn:disabled { opacity: var(--deck-transport-disabled-opacity); cursor: not-allowed; border-color: var(--border-subtle); }
 
+  /* Truthful per-deck feedback when the server refuses or cannot queue
+     an Eject/Pause/Resume (the engine itself never acknowledges). */
+  .deck-cmd-msg {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--danger);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .deck-cmd-msg:empty { display: none; }
+
   .np-meta {
-    margin-bottom: 0.6rem;
+    margin-bottom: 0.3rem;
     min-height: 3.6rem;
   }
 
@@ -459,36 +602,35 @@
   /* --- Waveform --- */
   .np-waveform {
     position: relative;
-    margin: 0.65rem 0;
+    margin: 0.4rem 0;
   }
 
+  /* Roadmap 2.23: 62px (about 65% of the former 96px). The canvas is
+     the ONLY playhead renderer -- drawWaveform() paints the cached
+     envelope + cue markers and then the Track Detail-style white line
+     with top/bottom triangles, so there is no second overlay marker.
+     Backing-store size follows the element's CSS size x devicePixelRatio
+     (see sizeWaveformCanvas). */
   .np-waveform canvas {
     width: 100%;
-    height: 96px;
+    height: 62px;
     display: block;
     border-radius: 6px;
-    cursor: pointer;
+    cursor: default;
   }
-
-  .np-waveform .position-line {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: #fff;
-    pointer-events: none;
-  }
+  .np-waveform canvas.seekable { cursor: pointer; }
 
   /* --- Countdown + progress --- */
   .np-timing {
     display: flex;
     align-items: center;
     gap: 0.85rem;
-    margin-top: 0.4rem;
+    margin-top: 0.2rem;
   }
 
   .np-countdown {
-    font-size: 1.6rem;
+    font-size: 1.5rem;
+    line-height: 1.1;
     font-weight: 800;
     font-variant-numeric: tabular-nums;
     color: var(--accent);
@@ -528,7 +670,7 @@
 
   .deck-empty {
     text-align: center;
-    padding: 2.25rem 1rem;
+    padding: 1.75rem 1rem;
     color: var(--text-muted);
     font-size: 0.9rem;
   }
@@ -607,7 +749,7 @@
     font-size: 0.85rem;
     color: var(--deck-startsat-color);
     font-variant-numeric: tabular-nums;
-    margin-top: 0.5rem;
+    margin-top: 0.3rem;
   }
 
   .qt-next-btn {
@@ -1182,6 +1324,13 @@
     cursor: not-allowed;
     pointer-events: none;
   }
+  /* Roadmap 2.23: the mic/Line In chips show LAST-KNOWN state while the
+     status poll is stale -- a dashed ring marks it as unconfirmed, in
+     addition to the dimming above and the CONNECTION LOST banner. */
+  #consoleRoot.connection-stale .ops-icon-chip {
+    outline: 1px dashed var(--text-muted);
+    outline-offset: 2px;
+  }
   /* #remoteDjConnectBtn.active (an existing, still-disconnectable
      session) is deliberately NOT matched by any rule above -- stays
      fully visible/usable through a stale period. */
@@ -1190,6 +1339,8 @@
 
 {% block content %}
 <div class="console-{{ mode|default:'full' }}" id="consoleRoot">
+{% include "library/_console_icons.html" %}
+{{ console_caps|json_script:"console-caps" }}
 <div id="connectionStaleBanner" class="connection-stale-banner" hidden role="status">CONNECTION LOST — STATUS STALE</div>
 <div class="top-status-row">
 <div class="listener-widget" id="listenerWidget" aria-label="Live Shoutcast listener count">
@@ -1241,24 +1392,45 @@
 </div>
 </div><!-- /.top-status-row -->
 <div class="playnow-bar">
+  {% if mode != 'remote_dj' %}
+  {# Roadmap 2.23 D5: reserved for roadmap 3.6 (LiveSource / Line Input). #}
+  {# Deliberately disabled, no handler, no engine command, no routing.    #}
+  <button type="button" class="playnow-btn ops-btn ops-icon-btn" id="lineInBtn" disabled aria-disabled="true"
+          data-mic-state="unavailable"
+          aria-label="Line In — unavailable (not yet supported)"
+          title="Line In is not available yet. A physical line input will be added by a future release; this button does not route any audio.">
+    <span class="ops-icon-chip"><svg aria-hidden="true" focusable="false"><use href="#icon-line-in"></use></svg></span>
+    <span class="ops-btn-label">Line In</span>
+  </button>
+  <button type="button" class="playnow-btn ops-btn ops-icon-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled
+          data-mic-state="unavailable" aria-label="Studio Mic: OFF"
+          title="Studio Mic push-to-talk">
+    <span class="ops-icon-chip"><svg aria-hidden="true" focusable="false"><use href="#icon-mic-studio"></use></svg></span>
+    <span class="ops-btn-label">OFF</span>
+  </button>
+  {% endif %}
   <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
           title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
-  {% if mode != 'remote_dj' %}
-  <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Studio Mic: OFF</button>
-  {% endif %}
+  <button type="button" class="playnow-btn ops-btn ops-icon-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
+          data-mic-state="unavailable" aria-label="Remote Mic: —"
+          title="Opens/closes the currently-connected remote DJ's mic into the on-air mix. Disabled when no remote DJ is connected.">
+    <span class="ops-icon-chip"><svg aria-hidden="true" focusable="false"><use href="#icon-mic-remote"></use></svg></span>
+    <span class="ops-btn-label">—</span>
+  </button>
   <button class="playnow-btn ops-btn" id="remoteDjConnectBtn" onclick="toggleRemoteDjConnect()" disabled
           aria-label="Connect Remote DJ — Offline"
           title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">
     <span id="remoteDjConnectAction" class="rdj-connect-action">Connect</span>
     <span id="remoteDjConnectStatus" class="rdj-connect-status rdj-status-offline" aria-live="polite">Offline</span>
   </button>
-  <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
-          title="Opens/closes the currently-connected remote DJ's mic into the on-air mix. Disabled when no remote DJ is connected.">Remote Mic: —</button>
 </div>
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
-<div class="decks-row">
+<div class="decks-row" id="decksRow">
   <div class="deck-panel" id="deck-A"></div>
+  {# Roadmap 2.23: reserved Start Next position (activated in Phase 3, #}
+  {# once the engine-owned operation exists). Empty and hidden today.   #}
+  <div class="start-next-slot" id="startNextSlot" hidden></div>
   <div class="deck-panel" id="deck-B"></div>
 </div>
 
@@ -1351,12 +1523,65 @@
 <script>
 // Console mode: 'full' for the studio console at /, 'remote_dj' for the
 // stripped-down /remote-dj/ variant. Behaviors that are operator-only
-// (waveform click-seek, deck eject/pause, queue drag-reorder, "next"
-// button, track detail links, search-to-add, Play Now, Studio Mic PTT)
-// gate on this value.
+// (queue drag-reorder, "next" button, track detail links, search-to-add,
+// Play Now, Studio Mic PTT, Line In) gate on this value; deck
+// eject/pause and waveform click-seek additionally require the user's
+// playout.control capability (CONSOLE_CAPS below).
 const CONSOLE_MODE = '{{ mode|default:"full" }}';
 const IS_REMOTE_DJ = CONSOLE_MODE === 'remote_dj';
 const SLOTS = ['A', 'B'];
+
+// Roadmap 2.23 (D10): server-computed capability flags for controls whose
+// visibility must follow what the user may actually do, not the console
+// mode alone (see library.views._console_capabilities). Presentation only:
+// every endpoint still enforces its own capability and schedule policy.
+// A missing/unparseable payload fails closed (nothing extra rendered).
+const CONSOLE_CAPS = (() => {
+  try {
+    const el = document.getElementById('console-caps');
+    return Object.freeze(JSON.parse(el ? el.textContent : '{}') || {});
+  } catch (e) {
+    return Object.freeze({});
+  }
+})();
+// Deck Eject / Play-Pause and waveform click-seek all post to endpoints
+// that require playout.control. Click-seek additionally stays off on
+// /remote-dj/ regardless (a stray tap could jump on-air audio).
+const CAN_DECK_TRANSPORT = CONSOLE_CAPS.playout_control === true;
+const CAN_WAVEFORM_SEEK = CAN_DECK_TRANSPORT && !IS_REMOTE_DJ;
+
+// Roadmap 2.23 -- icon + word mic buttons (#micPttBtn, #remoteDjGateBtn).
+// `state` drives the chip colour via data-mic-state; `word` is the visible
+// text; `ariaLabel` is the full accessible name (e.g. "Studio Mic: LIVE"),
+// so no state is conveyed by colour alone.
+function setOpsMicButton(btn, state, word, ariaLabel) {
+  if (!btn) return;
+  btn.dataset.micState = state;
+  const label = btn.querySelector('.ops-btn-label');
+  if (label) label.textContent = word;
+  btn.setAttribute('aria-label', ariaLabel);
+}
+
+// A refused mic request (403 permission/schedule denial, 503 queue
+// failure) is shown on the button for a few seconds instead of silently
+// reverting; the ~1Hz status renders re-apply it until it expires, then
+// the engine's own state shows again.
+const OPS_REFUSAL_HOLD_MS = 4000;
+const opsRefusals = {};
+function noteOpsRefusal(btn, name, status) {
+  if (!btn) return;
+  opsRefusals[btn.id] = { until: Date.now() + OPS_REFUSAL_HOLD_MS, name, status };
+  showOpsRefusal(btn);
+}
+function showOpsRefusal(btn) {
+  const r = btn && opsRefusals[btn.id];
+  if (!r || Date.now() >= r.until) return false;
+  const why = r.status === 403 ? 'not authorized right now'
+    : r.status === 503 ? 'engine command queue unavailable'
+    : 'request failed (HTTP ' + r.status + ')';
+  setOpsMicButton(btn, 'denied', 'Refused', r.name + ': ' + why);
+  return true;
+}
 
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
 const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#38bdf8' }}";
@@ -1703,7 +1928,10 @@ async function toggleMicPtt() {
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
     body: JSON.stringify({ active: desiredActive }),
   });
-  if (!resp.ok) btn.classList.remove('pending');
+  if (!resp.ok) {
+    btn.classList.remove('pending');
+    noteOpsRefusal(btn, 'Studio Mic', resp.status);
+  }
   // Don't flip .active here -- wait for the next poll() to confirm
   // mic_live from engine_state.json, so the button always reflects
   // engine reality, never optimistic client state.
@@ -1724,19 +1952,34 @@ function renderMicPtt(data) {
   // proof. Prefer the additive hardware-buffer health signal when present;
   // older engine payloads without it retain the legacy ERROR/LIVE/OFF view.
   const micHealth = data.mic_recovery?.media_health?.status || null;
+  // The aria-label carries the full former text ("Studio Mic: ...");
+  // the visible word drops the prefix now that the icon says "mic".
+  let label;
+  let state;
   if (data.mic_live) {
-    btn.textContent = (data.mic_ok === false || micHealth === 'NOT_FLOWING')
+    label = (data.mic_ok === false || micHealth === 'NOT_FLOWING')
       ? 'Studio Mic: LIVE (ERROR)'
       : (micHealth === 'UNVERIFIED')
         ? 'Studio Mic: LIVE (CHECKING)'
         : 'Studio Mic: LIVE';
+    state = label === 'Studio Mic: LIVE' ? 'on'
+      : label === 'Studio Mic: LIVE (ERROR)' ? 'error' : 'checking';
   } else {
-    btn.textContent = (data.mic_configured && (data.mic_ok === false || micHealth === 'NOT_FLOWING'))
+    label = (data.mic_configured && (data.mic_ok === false || micHealth === 'NOT_FLOWING'))
       ? 'Studio Mic: ERROR'
       : (data.mic_configured && micHealth === 'UNVERIFIED')
         ? 'Studio Mic: CHECKING'
         : 'Studio Mic: OFF';
+    state = !data.mic_configured ? 'unavailable'
+      : label === 'Studio Mic: ERROR' ? 'error'
+      : label === 'Studio Mic: CHECKING' ? 'checking' : 'off';
   }
+  const word = !data.mic_configured ? 'N/A' : label.slice('Studio Mic: '.length);
+  setOpsMicButton(btn, state, word, data.mic_configured ? label : 'Studio Mic: not configured');
+  btn.title = weAreRemote
+    ? 'Studio Mic (read-only while this browser is connected as the Remote DJ)'
+    : 'Studio Mic push-to-talk';
+  showOpsRefusal(btn);
 }
 
 async function toggleRemoteDjGate() {
@@ -1764,6 +2007,7 @@ async function toggleRemoteDjGate() {
     });
     if (!resp.ok) {
       btn.classList.remove('pending');
+      noteOpsRefusal(btn, 'Remote Mic', resp.status);
     } else if (!desiredActive) {
       // [4.1 follow-up] This browser just successfully requested OFF --
       // don't let the VU fill keep animating real, still-flowing
@@ -1803,7 +2047,7 @@ async function rdjRunCalibration() {
       },
     });
   } catch (e) {
-    btn.textContent = 'Mic denied';
+    setOpsMicButton(btn, 'denied', 'Denied', 'Remote Mic: microphone permission denied');
     setTimeout(() => { rdjCalibrating = false; btn.disabled = false; renderRemoteDjGate(window.__rdjLastEngineState || {}); }, 2000);
     return;
   }
@@ -1817,7 +2061,8 @@ async function rdjRunCalibration() {
   const startT = ctx.currentTime;
   // Countdown-in-button while we watch peak for 6 seconds.
   for (let s = 6; s >= 1; s--) {
-    btn.textContent = 'Speak: ' + s + 's';
+    setOpsMicButton(btn, 'calibrating', 'Speak ' + s + 's',
+                    'Remote Mic: calibrating, speak normally, ' + s + ' seconds left');
     const stepEnd = startT + (6 - s + 1);
     while (ctx.currentTime < stepEnd) {
       analyser.getFloatTimeDomainData(buf);
@@ -2345,7 +2590,7 @@ function renderRemoteDjGate(data) {
   btn.classList.toggle('active', !!data.remote_dj_live);
   if (!data.remote_dj_configured) {
     btn.disabled = true;
-    btn.textContent = 'Remote Mic: n/a';
+    setOpsMicButton(btn, 'unavailable', 'N/A', 'Remote Mic: not available (Remote DJ is not enabled)');
     return;
   }
   if (data.remote_dj_connected) {
@@ -2356,15 +2601,30 @@ function renderRemoteDjGate(data) {
     // on the live DJ. The connected DJ themselves keeps self-PTT.
     const weAreConnected = !!rdjPc;
     btn.disabled = !weAreConnected;
-    btn.textContent = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
+    const gateLabel = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
+    setOpsMicButton(
+      btn,
+      data.remote_dj_live ? 'on' : 'off',
+      data.remote_dj_live ? 'LIVE' : 'OFF',
+      weAreConnected ? gateLabel : gateLabel + ' (read-only: another browser holds the connection)',
+    );
+    showOpsRefusal(btn);
   } else {
     // Calibration mode -- always clickable so the operator can (re)cal
     // even before connecting. Show the currently-persisted gain if any.
     btn.disabled = false;
     const saved = rdjGetSavedGainDb();
-    btn.textContent = saved !== null
-      ? 'Mic Cal: ' + (saved >= 0 ? '+' : '') + saved.toFixed(1) + ' dB'
-      : 'Calibrate Mic';
+    const calText = saved !== null
+      ? (saved >= 0 ? '+' : '') + saved.toFixed(1) + ' dB'
+      : null;
+    setOpsMicButton(
+      btn,
+      'calibrate',
+      calText !== null ? 'Cal ' + calText : 'Calibrate',
+      calText !== null
+        ? 'Remote Mic: not connected. Calibrated gain ' + calText + '. Press to recalibrate this browser\'s mic.'
+        : 'Remote Mic: not connected. Press to calibrate this browser\'s mic.',
+    );
   }
 }
 
@@ -2480,11 +2740,22 @@ async function fetchStatus() {
   }
 }
 
+// Per-slot token so a slow waveform fetch for a track that has since left
+// the deck can't paint the wrong envelope (same pattern as album art).
+const waveformLoadTokens = { A: 0, B: 0 };
+
 async function loadWaveform(slot, trackId) {
+  const myToken = ++waveformLoadTokens[slot];
+  // Until the new track's data arrives, draw no envelope rather than the
+  // previous track's.
+  waveformState[slot] = { samplesLeft: null, samplesRight: null, cueIn: null, nextStart: null, analysisDuration: null };
+  drawWaveform(slot);
   try {
     const resp = await fetch(`/api/waveform/${trackId}/`);
-    if (!resp.ok) { waveformState[slot].samplesLeft = null; return; }
+    if (myToken !== waveformLoadTokens[slot]) return;
+    if (!resp.ok) return;
     const data = await resp.json();
+    if (myToken !== waveformLoadTokens[slot]) return;
     waveformState[slot] = {
       samplesLeft: data.samples_left,
       samplesRight: data.samples_right,
@@ -2494,28 +2765,55 @@ async function loadWaveform(slot, trackId) {
     };
     drawWaveform(slot);
   } catch {
-    waveformState[slot].samplesLeft = null;
+    // Leave the cleared state; the playhead still renders.
   }
 }
 
-function drawWaveform(slot) {
-  const canvas = document.getElementById(`npWaveform-${slot}`);
-  const wf = waveformState[slot];
-  if (!canvas || !wf.samplesLeft) return;
+// --- Deck waveform renderer (roadmap 2.23) ---
+// ONE renderer per deck canvas, modelled on Track Detail's drawWaveform():
+// the static layer (stereo envelope + cue-in + next-start markers) is
+// painted into an offscreen canvas at device-pixel resolution once per
+// track/size/scale, and drawWaveform() composites that layer and then the
+// playhead -- a 2px white line with 8x5 white triangles at top and bottom
+// -- last, on top of everything. There is no separate DOM position marker.
+//
+// Time mapping: every element uses waveformTimeScale(slot) -- the track's
+// analysis_duration (the span the envelope samples cover, exactly as Track
+// Detail does), falling back to the engine-reported duration only when the
+// analysis has none. Envelope, cue markers, playhead and click-to-seek all
+// share it, so a marker, the playhead and a click at the same x always
+// mean the same media time.
+const waveformLayers = { A: null, B: null };
 
+function waveformTimeScale(slot) {
+  return waveformState[slot].analysisDuration || deckState[slot].localDuration || 1;
+}
+
+// Backing store = CSS box x devicePixelRatio, rounded to whole device
+// pixels. Returns the CSS size the drawing code works in.
+function sizeWaveformCanvas(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
+  const width = Math.max(1, Math.round(rect.width * dpr));
+  const height = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return { dpr, cssW: width / dpr, cssH: height / dpr };
+}
 
-  const w = rect.width;
-  const h = rect.height;
+function renderWaveformLayer(slot, width, height, dpr, scale) {
+  const wf = waveformState[slot];
+  const layer = document.createElement('canvas');
+  layer.width = width;
+  layer.height = height;
+  const ctx = layer.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = width / dpr;
+  const h = height / dpr;
   const n = wf.samplesLeft.length;
   const barW = Math.ceil(w / n);
-
-  ctx.clearRect(0, 0, w, h);
 
   // Zero-amplitude line centered, left channel drawn upward, right
   // channel drawn downward -- same stereo-linear waveform as the track
@@ -2530,17 +2828,15 @@ function drawWaveform(slot) {
   }
   ctx.fillStyle = hexToRgba(WAVEFORM_RIGHT_COLOR, 0.35);
   for (let i = 0; i < n; i++) {
-    const levelR = wf.samplesRight[i] / 255;
+    const levelR = (wf.samplesRight ? wf.samplesRight[i] : 0) / 255;
     const barHR = levelR * mid;
     const x = (i / n) * w;
     ctx.fillRect(x, mid, barW, barHR);
   }
 
-  const dur = wf.analysisDuration || deckState[slot].localDuration || 1;
-
-  if (wf.cueIn && wf.cueIn > 0) {
-    const x = (wf.cueIn / dur) * w;
-    ctx.strokeStyle = '#3b82f6';
+  const drawMarker = (seconds, color) => {
+    const x = (seconds / scale) * w;
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 3]);
     ctx.beginPath();
@@ -2548,35 +2844,116 @@ function drawWaveform(slot) {
     ctx.lineTo(x, h);
     ctx.stroke();
     ctx.setLineDash([]);
-  }
-
-  if (wf.nextStart) {
-    const x = (wf.nextStart / dur) * w;
-    ctx.strokeStyle = '#f97373';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 3]);
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
+  };
+  if (wf.cueIn && wf.cueIn > 0) drawMarker(wf.cueIn, '#3b82f6');
+  if (wf.nextStart) drawMarker(wf.nextStart, '#f97373');
+  return layer;
 }
+
+// The live deck's current media position in seconds, or null when no
+// playhead belongs on this canvas (preview / empty / offline deck). The
+// engine's 1Hz position is interpolated between polls only while
+// playing; a paused deck holds its reported position.
+function deckPlayheadSeconds(slot) {
+  const st = deckState[slot];
+  if (st.mode !== 'live' || !st.localDuration) return null;
+  let pos = st.localPosition;
+  if (!st.paused) pos += (Date.now() - st.lastPollTime) / 1000;
+  return Math.max(0, Math.min(pos, st.localDuration));
+}
+
+function drawWaveform(slot) {
+  const canvas = document.getElementById(`npWaveform-${slot}`);
+  if (!canvas) return;
+  const { dpr, cssW, cssH } = sizeWaveformCanvas(canvas);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const wf = waveformState[slot];
+  const scale = waveformTimeScale(slot);
+  if (wf.samplesLeft && wf.samplesLeft.length) {
+    const key = [canvas.width, canvas.height, dpr, scale, wf.cueIn, wf.nextStart].join('|');
+    let layer = waveformLayers[slot];
+    if (!layer || layer.data !== wf || layer.key !== key) {
+      layer = waveformLayers[slot] = {
+        data: wf, key, canvas: renderWaveformLayer(slot, canvas.width, canvas.height, dpr, scale),
+      };
+    }
+    ctx.drawImage(layer.canvas, 0, 0);
+  }
+
+  const t = deckPlayheadSeconds(slot);
+  if (t === null) return;
+  // Playhead -- drawn last so it sits on top of everything else. Snapped
+  // to a device pixel and kept fully inside the canvas so neither the
+  // line nor its triangles are clipped at the very start or end.
+  let x = (t / scale) * cssW;
+  x = Math.min(cssW - 1, Math.max(1, Math.round(x * dpr) / dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const topTriangle = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - 4, 0); ctx.lineTo(x + 4, 0); ctx.lineTo(x, 5); ctx.closePath();
+  };
+  const bottomTriangle = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - 4, cssH); ctx.lineTo(x + 4, cssH); ctx.lineTo(x, cssH - 5); ctx.closePath();
+  };
+  // A thin dark halo under the white marker keeps it visible on a light
+  // UITheme palette (and over pale album-art blur); on the default dark
+  // palette it is all but invisible.
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, cssH);
+  ctx.stroke();
+  ctx.lineWidth = 2;
+  topTriangle(); ctx.stroke();
+  bottomTriangle(); ctx.stroke();
+  // Track Detail's playhead: 2px white line + white triangles.
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x, 0);
+  ctx.lineTo(x, cssH);
+  ctx.stroke();
+  ctx.fillStyle = '#ffffff';
+  topTriangle(); ctx.fill();
+  bottomTriangle(); ctx.fill();
+}
+
+// Redraw on any canvas box change (window resize, layout reflow, the
+// 700px/640px breakpoints) and on devicePixelRatio change (browser zoom,
+// moving the window to another display).
+const waveformResizeObserver = ('ResizeObserver' in window)
+  ? new ResizeObserver(entries => {
+      entries.forEach(entry => {
+        const slot = entry.target.dataset.slot;
+        if (slot) drawWaveform(slot);
+      });
+    })
+  : null;
+if (!waveformResizeObserver) {
+  window.addEventListener('resize', () => SLOTS.forEach(drawWaveform));
+}
+(function watchDevicePixelRatio() {
+  if (!window.matchMedia) return;
+  const query = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  const onChange = () => {
+    SLOTS.forEach(drawWaveform);
+    watchDevicePixelRatio();
+  };
+  if (query.addEventListener) query.addEventListener('change', onChange, { once: true });
+})();
 
 function updatePositionIndicators() {
   SLOTS.forEach(slot => {
     const st = deckState[slot];
     if (st.mode !== 'live') return;
-    const line = document.getElementById(`posLine-${slot}`);
-    if (!line || !st.localDuration) return;
-
-    let pos = st.localPosition;
-    if (!st.paused) {
-      const elapsed = (Date.now() - st.lastPollTime) / 1000;
-      pos = st.localPosition + elapsed;
-    }
-    const pct = Math.min(100, (pos / st.localDuration) * 100);
-    line.style.left = pct + '%';
+    if (!st.localDuration) return;
+    drawWaveform(slot);
+    const pos = deckPlayheadSeconds(slot);
 
     const countdownEl = document.getElementById(`npCountdown-${slot}`);
     if (countdownEl && st.localNextStart) {
@@ -2591,8 +2968,21 @@ function updatePositionIndicators() {
   });
 }
 
+const EJECT_DESCRIPTION = 'stops this deck immediately (no fade) and starts the next queued item';
+
 function buildDeckDOM(slot) {
   const container = document.getElementById(`deck-${slot}`);
+
+  // Eject / Play-Pause post to /api/engine/deck/<slot>/, which requires
+  // playout.control -- rendered only for users who hold it (D10), never
+  // as dead buttons. Eject is the immediate hard stop-and-advance; it is
+  // NOT Start Next (the soft, engine-faded transition of roadmap 2.23).
+  const transportButtons = CAN_DECK_TRANSPORT ? `
+        <button type="button" class="deck-transport-btn" id="ejectBtn-${slot}"
+                title="Eject Deck ${slot} — ${EJECT_DESCRIPTION}"
+                aria-label="Eject Deck ${slot}: ${EJECT_DESCRIPTION}" disabled>${ICON_EJECT}</button>
+        <button type="button" class="deck-transport-btn" id="playPauseBtn-${slot}"
+                title="Pause Deck ${slot}" aria-label="Pause Deck ${slot}" disabled>${ICON_PLAY}</button>` : '';
 
   container.innerHTML = `
     <div class="deck-art-bg" id="deckArtBg-${slot}"></div>
@@ -2601,10 +2991,9 @@ function buildDeckDOM(slot) {
     <div class="deck-header-row">
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
-        <span class="transport-badge" id="transportBadge-${slot}"></span>
-        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>${ICON_EJECT}</button>
-        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>${ICON_PLAY}</button>
+        <span class="transport-badge" id="transportBadge-${slot}"></span>${transportButtons}
       </div>
+      <span class="deck-cmd-msg" id="deckMsg-${slot}" role="status" aria-live="polite"></span>
     </div>
     <div class="np-meta">
       <div class="np-title" id="npTitle-${slot}"></div>
@@ -2617,8 +3006,8 @@ function buildDeckDOM(slot) {
       <div class="np-startsat" id="npStartsAt-${slot}" style="display:none;"></div>
     </div>
     <div class="np-waveform">
-      <canvas id="npWaveform-${slot}"></canvas>
-      <div class="position-line" id="posLine-${slot}"></div>
+      <canvas id="npWaveform-${slot}" data-slot="${slot}" role="img"
+              aria-label="Deck ${slot} waveform${CAN_WAVEFORM_SEEK ? ' (click to seek)' : ''}"></canvas>
     </div>
     <div class="np-timing">
       <div class="np-countdown" id="npCountdown-${slot}"></div>
@@ -2634,30 +3023,44 @@ function buildDeckDOM(slot) {
 
   deckState[slot].deckBuilt = true;
 
-  // Waveform-click scrubbing stays operator-only -- it's a bigger
-  // control action than a pause/skip and could jump the audible
-  // position by seconds mid-track, which we don't want a remote DJ
-  // to trigger by accidental tap.
-  if (!IS_REMOTE_DJ) {
-    document.getElementById(`npWaveform-${slot}`).addEventListener('click', function(e) {
-      if (!deckState[slot].localDuration) return;
+  const canvas = document.getElementById(`npWaveform-${slot}`);
+  if (waveformResizeObserver) waveformResizeObserver.observe(canvas);
+
+  // Waveform-click scrubbing: playout.control holders on the full console
+  // only -- a bigger control action than a pause/skip that could jump the
+  // audible position by seconds mid-track, which we don't want a remote
+  // DJ to trigger by accidental tap. Seeks only a LIVE deck, and maps the
+  // click with the same time scale the waveform is drawn with.
+  if (CAN_WAVEFORM_SEEK) {
+    canvas.classList.add('seekable');
+    canvas.addEventListener('click', function(e) {
+      const st = deckState[slot];
+      if (st.mode !== 'live' || !st.localDuration) return;
       const rect = this.getBoundingClientRect();
       const pct = (e.clientX - rect.left) / rect.width;
-      const pos = pct * deckState[slot].localDuration;
-      seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
+      const pos = pct * waveformTimeScale(slot);
+      seekTo(slot, Math.max(0, Math.min(st.localDuration, pos)));
     });
   }
 
-  // Transport buttons (next / play-pause) are wired unconditionally --
-  // they render on both console and /remote-dj/, though on remote_dj
-  // mode CSS hides them on the preview deck so only the currently-
-  // playing deck exposes them (see .console-remote_dj
-  // .deck-panel.deck-mode-preview .deck-transport-btn rule).
-  document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
-    deckCommand(slot, 'eject');
-  });
-  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
-    handlePlayPause(slot);
+  if (CAN_DECK_TRANSPORT) {
+    // On /remote-dj/ CSS hides these on the preview deck so only the
+    // currently-playing deck exposes them (see .console-remote_dj
+    // .deck-panel.deck-mode-preview .deck-transport-btn rule).
+    document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
+      deckCommand(slot, 'eject');
+    });
+    document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
+      handlePlayPause(slot);
+    });
+  }
+  drawWaveform(slot);
+}
+
+function setDeckTransportEnabled(slot, enabled) {
+  ['ejectBtn', 'playPauseBtn'].forEach(prefix => {
+    const btn = document.getElementById(`${prefix}-${slot}`);
+    if (btn) btn.disabled = !enabled;
   });
 }
 
@@ -2757,8 +3160,7 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     buildDeckDOM(slot);
     st.mode = 'preview';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).disabled = true;
-    document.getElementById(`ejectBtn-${slot}`).disabled = true;
+    setDeckTransportEnabled(slot, false);
     // .np-timing stays visible in preview mode so the countdown slot
     // can display effective airtime. Progress-wrap under the number
     // is CSS-hidden for preview -- see .deck-mode-preview rule.
@@ -2812,8 +3214,7 @@ function renderDeckLive(slot, deck, transport) {
     buildDeckDOM(slot);
     st.mode = 'live';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).disabled = false;
-    document.getElementById(`ejectBtn-${slot}`).disabled = false;
+    setDeckTransportEnabled(slot, true);
     document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
   }
 
@@ -2844,7 +3245,12 @@ function renderDeckLive(slot, deck, transport) {
   badge.className = 'transport-badge ' + badgeState;
 
   const playPauseBtn = document.getElementById(`playPauseBtn-${slot}`);
-  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? ICON_PLAY : ICON_PAUSE;
+  if (playPauseBtn) {
+    playPauseBtn.innerHTML = st.paused ? ICON_PLAY : ICON_PAUSE;
+    const playPauseLabel = (st.paused ? 'Resume Deck ' : 'Pause Deck ') + slot;
+    playPauseBtn.title = playPauseLabel;
+    playPauseBtn.setAttribute('aria-label', playPauseLabel);
+  }
 
   st.localPosition = deck.position || 0;
   st.localDuration = deck.duration || 0;
@@ -2854,12 +3260,39 @@ function renderDeckLive(slot, deck, transport) {
 
 async function deckCommand(slot, action) {
   if (connectionStale) return;  // [P1] 1.7 -- deck transport mutation gate
-  await fetch(`/api/engine/deck/${slot}/`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ action }),
-  });
+  let resp = null;
+  try {
+    resp = await fetch(`/api/engine/deck/${slot}/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ action }),
+    });
+  } catch (e) {
+    resp = null;
+  }
+  showDeckCommandResult(slot, action, resp);
   poll();
+}
+
+// Roadmap 2.23 -- truthful deck-command feedback. HTTP 200 only means the
+// command was QUEUED for the engine (the engine sends no acknowledgment),
+// so success stays silent and the deck's own polled state is the proof;
+// a refusal or queue failure is shown on the deck instead of vanishing.
+const deckMsgTimers = { A: null, B: null };
+function showDeckCommandResult(slot, action, resp) {
+  const el = document.getElementById(`deckMsg-${slot}`);
+  if (!el) return;
+  clearTimeout(deckMsgTimers[slot]);
+  if (resp && resp.ok) {
+    el.textContent = '';
+    return;
+  }
+  const verb = { eject: 'Eject', pause: 'Pause', resume: 'Resume' }[action] || action;
+  el.textContent = !resp ? `${verb} not sent (network error)`
+    : resp.status === 403 ? `${verb} refused: not authorized right now`
+    : resp.status === 503 ? `${verb} not queued: engine command queue unavailable`
+    : `${verb} failed (HTTP ${resp.status})`;
+  deckMsgTimers[slot] = setTimeout(() => { el.textContent = ''; }, 5000);
 }
 
 async function seekTo(slot, seconds) {

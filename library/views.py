@@ -71,6 +71,37 @@ def _enqueue_engine_command_response(payload):
     return None
 
 
+# Roadmap 2.23 (D10): the Console's capability-sensitive controls. Keys are
+# the JSON names the template reads; values are capability slugs.
+CONSOLE_CAPABILITY_FLAGS = {
+    "playout_control": "playout.control",
+}
+
+
+def _console_capabilities(user):
+    """Which capability-gated Console controls to RENDER for this user.
+
+    Presentation only, never a security boundary: every control's endpoint
+    still calls ``authorize()`` with the real schedule policy. Possession is
+    evaluated with ``SCHEDULE_POLICY_IGNORE`` -- the same reachability
+    convention ``remote_dj_page`` uses -- so a holder outside their window
+    still sees the control and receives the endpoint's own truthful denial,
+    while a user who does not hold the capability at all (e.g. the Remote
+    Host role and ``playout.control``) never sees a control that cannot work.
+    """
+    from authz.evaluator import SCHEDULE_POLICY_IGNORE
+
+    caps = {}
+    for key, slug in CONSOLE_CAPABILITY_FLAGS.items():
+        try:
+            caps[key] = bool(authorize(user, slug, schedule_policy=SCHEDULE_POLICY_IGNORE))
+        except ValueError:
+            # Unknown slug (capability row absent): render nothing extra
+            # rather than failing the whole on-air Console page.
+            caps[key] = False
+    return caps
+
+
 @ensure_csrf_cookie
 def dashboard_page(request):
     from library.models import AnalysisConfig, FXCart
@@ -84,6 +115,7 @@ def dashboard_page(request):
         "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "full",
         "fx_carts": fx_carts,
+        "console_caps": _console_capabilities(request.user),
     })
 
 
@@ -2820,8 +2852,10 @@ def api_engine_levels(request):
 @ensure_csrf_cookie
 def remote_dj_page(request):
     """Remote-DJ-facing console: renders dashboard.html in `remote_dj`
-    mode, which hides the operator-only controls (Studio Mic PTT,
-    per-track edit links, deck eject/pause, waveform click-seek) and
+    mode, which hides the operator-only controls (Studio Mic PTT, Line In,
+    per-track edit links, waveform click-seek; deck eject/pause render only
+    for playout.control holders -- roadmap 2.23 D10, see
+    _console_capabilities) and
     slims Deck B on mobile portrait, but keeps search-to-add, Play
     Now, drag-to-reorder queue, and force-next buttons available
     (same as the full console) -- a remote DJ is trusted to queue,
@@ -2849,6 +2883,7 @@ def remote_dj_page(request):
         "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "remote_dj",
         "fx_carts": FXCart.objects.filter(enabled=True).order_by("sort_order", "name"),
+        "console_caps": _console_capabilities(request.user),
     })
 
 
