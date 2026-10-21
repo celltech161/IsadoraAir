@@ -434,6 +434,28 @@ class _ConsoleBrowserBase:
         self.assertGreater(narrow["cssW"], after["cssW"])   # single column: full-width deck
         self.assertAlmostEqual(wide["cssW"], before["cssW"], delta=1)
 
+    def test_deck_rebuilds_do_not_accumulate_observed_canvases(self):
+        page = self.open_console(self.superuser)
+        page.evaluate("""() => {
+          window.__observed = new Set();
+          const ro = waveformResizeObserver;
+          const observe = ro.observe.bind(ro), unobserve = ro.unobserve.bind(ro);
+          ro.observe = (el) => { window.__observed.add(el); observe(el); };
+          ro.unobserve = (el) => { window.__observed.delete(el); unobserve(el); };
+          document.querySelectorAll('canvas[id^="npWaveform-"]').forEach(c => window.__observed.add(c));
+        }""")
+        for live, transport in (("B", "PLAYING"), ("A", "PLAYING"), ("B", "PLAYING"), ("A", "STOPPED"), ("A", "PLAYING")):
+            self.state = engine_state(live=live, transport=transport)
+            page.evaluate("() => poll()")
+            page.wait_for_function(
+                "([slot, t]) => t === 'STOPPED' ? deckState.A.mode === 'offline'"
+                " : deckState[slot].mode === 'live'", arg=[live, transport])
+        still_observed = page.evaluate(
+            "() => Array.from(window.__observed).map(c => [c.id, c.isConnected])")
+        # Only canvases still in the page are observed: at most one per deck.
+        self.assertTrue(all(connected for _, connected in still_observed), still_observed)
+        self.assertLessEqual(len(still_observed), 2, still_observed)
+
     def test_full_console_mobile_portrait(self):
         page = self.open_console(self.superuser, viewport=MOBILE_PORTRAIT, dpr=2)
         ids = self.ops_ids(page)

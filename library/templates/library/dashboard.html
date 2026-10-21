@@ -2984,7 +2984,17 @@ function updatePositionIndicators() {
 
 const EJECT_DESCRIPTION = 'stops this deck immediately (no fade) and starts the next queued item';
 
+// Every deck-DOM replacement (rebuild, offline, empty) detaches the old
+// canvas; a ResizeObserver keeps its targets alive, so the old one must be
+// released or every live/preview swap would retain a canvas and its pixel
+// buffer for the life of an always-open console.
+function releaseDeckCanvas(slot) {
+  const old = document.getElementById(`npWaveform-${slot}`);
+  if (old && waveformResizeObserver) waveformResizeObserver.unobserve(old);
+}
+
 function buildDeckDOM(slot) {
+  releaseDeckCanvas(slot);
   const container = document.getElementById(`deck-${slot}`);
 
   // Eject / Play-Pause post to /api/engine/deck/<slot>/, which requires
@@ -3140,6 +3150,7 @@ function renderDeck(slot, deck, transport, queue, serverTimestamp) {
 }
 
 function renderDeckOffline(slot, transport) {
+  releaseDeckCanvas(slot);
   const st = deckState[slot];
   st.mode = 'offline';
   st.lastTrackId = null;
@@ -3154,6 +3165,7 @@ function renderDeckOffline(slot, transport) {
 }
 
 function renderDeckEmpty(slot) {
+  releaseDeckCanvas(slot);
   const st = deckState[slot];
   st.mode = 'empty';
   st.lastTrackId = null;

@@ -329,6 +329,9 @@ class ConsoleTemplateContractTests(SimpleTestCase):
     def test_waveform_redraws_on_resize_and_dpr_change(self):
         self.assertIn("new ResizeObserver(", self.template)
         self.assertIn("waveformResizeObserver.observe(canvas);", self._function("buildDeckDOM"))
+        for fn in ("buildDeckDOM", "renderDeckOffline", "renderDeckEmpty"):
+            with self.subTest(fn=fn):
+                self.assertTrue(self._function(fn).split("\n")[1].strip() == "releaseDeckCanvas(slot);")
         self.assertIn("(resolution: ${window.devicePixelRatio || 1}dppx)", self.template)
 
     def test_start_next_slot_is_reserved_hidden_and_between_the_decks(self):
