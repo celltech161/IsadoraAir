@@ -2704,10 +2704,22 @@ function rdjConnectFail(msg) {
 //                owner identity at all -- exactly r0116 behaviour, so a real
 //                owner isn't locked out before the engine is restarted;
 //   'none'       no local peer.
+// Roadmap 2.23 (third-review P2) -- completion-ordered status freshness,
+// maintained by poll(). Every status request gets a sequence number when
+// issued; when it COMPLETES -- success or any failure -- it is applied only
+// if no request issued LATER has already completed. latestStatusOk says
+// whether that newest applied outcome was a success: after a failed latest
+// poll, the last engine state no longer proves current ownership.
+let statusPollSeq = 0;
+let latestStatusOutcomeSeq = 0;
+let latestStatusOk = false;
+
 function rdjLocalLink(data) {
   if (!rdjPc) return 'none';
   data = data || {};
-  if (connectionStale) return 'unverified';
+  // Ownership is only ever verified by the NEWEST completed status, and
+  // only when that status succeeded (third-review P2).
+  if (connectionStale || !latestStatusOk) return 'unverified';
   if (data.remote_dj_owner_supported === false) return 'legacy';
   const owner = data.remote_dj_connected ? data.remote_dj_owner : null;
   if (!owner || !owner.browser_key || !rdjBrowserKey) return 'unverified';
@@ -2793,9 +2805,10 @@ function renderRemoteDjConnect(data) {
     );
     return;
   }
-  if (connectionStale && (weAreConnected || someoneElseConnected)) {
+  if ((connectionStale || !latestStatusOk) && (weAreConnected || someoneElseConnected)) {
     // Phase 1B -- last-known status can't prove who (if anyone) still holds
-    // the connection: withhold identity and quality until a fresh poll.
+    // the connection (console stale, or the newest status poll failed):
+    // withhold identity and quality until a fresh successful poll.
     btn.classList.remove('pending');
     btn.title = 'Console status is stale; the Remote DJ connection state is unconfirmed.';
     rdjSetConnectPresentation(
@@ -3811,8 +3824,15 @@ async function insertTrack(trackId, position) {
 }
 
 // --- Main poll loop ---
-let statusPollSeq = 0;
-let latestRemoteDjStatusSeq = 0;
+// Status ordering (third-review P2; state declared beside rdjLocalLink):
+// a response is applied only if no LATER-issued request has already
+// completed. A newer outcome -- success, HTTP error, rejected or aborted
+// fetch, unparseable body (fetchStatus() returns null for every failure)
+// -- therefore makes every older outstanding response obsolete: it can't
+// clear staleness, replace the last engine state, or render anything.
+// Ordering by COMPLETED outcomes rather than "highest issued" keeps a slow
+// network live: responses that complete in issue order are each applied,
+// even when every request outlasts the 1 s interval.
 async function poll() {
   // Evaluated BEFORE the fetch, from elapsed wall-clock time, so a
   // hung/blackholed request (which never resolves and so never lets
@@ -3822,6 +3842,16 @@ async function poll() {
   checkConnectionStaleness();
   const seq = ++statusPollSeq;
   const data = await fetchStatus();
+  if (seq < latestStatusOutcomeSeq) return;  // superseded by a newer outcome: no effect
+  latestStatusOutcomeSeq = seq;
+  latestStatusOk = !!data;
+  if (!data) {
+    // The newest outcome failed: Remote DJ ownership is unconfirmed now, so
+    // owner-only controls fail closed at once (local cleanup stays).
+    const last = window.__rdjLastEngineState || {};
+    renderRemoteDjConnect(last);
+    renderRemoteDjGate(last);
+  }
   if (data) markStatusSuccess();
   if (!data) return;
   const decks = data.decks || {};
@@ -3829,15 +3859,8 @@ async function poll() {
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
   renderMicPtt(data);
-  // Roadmap 2.23 Phase 1B -- Remote DJ ownership/identity renders only from
-  // the NEWEST status request to complete: a slow, older response landing
-  // after a newer one (overlapping 1 s polls) can't resurrect a previous
-  // owner. Ordered by request, not by wall-clock timestamp.
-  if (seq > latestRemoteDjStatusSeq) {
-    latestRemoteDjStatusSeq = seq;
-    renderRemoteDjConnect(data);
-    renderRemoteDjGate(data);
-  }
+  renderRemoteDjConnect(data);
+  renderRemoteDjGate(data);
   renderManualMode(data);
   reconcileFxFires(data.fx_fires);
 }

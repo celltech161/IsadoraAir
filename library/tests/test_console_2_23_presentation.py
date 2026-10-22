@@ -433,22 +433,41 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         self.assertIn("window.crypto.subtle.digest('SHA-256'", self._function("rdjDeriveBrowserKey"))
         self.assertIn("rdjBrowserKey = null;", self._function("rdjDisconnect"))
 
-    def test_identity_renders_only_from_the_newest_status_response(self):
+    def test_status_outcomes_are_completion_ordered(self):
+        # Third-review P2: EVERY completed outcome -- success or failure --
+        # supersedes older outstanding responses, before anything else runs.
         poll = self._function("poll")
         self.assertIn("const seq = ++statusPollSeq;", poll)
-        guarded = poll[poll.index("if (seq > latestRemoteDjStatusSeq) {"):]
-        guarded = guarded[:guarded.index("}")]
-        self.assertIn("renderRemoteDjConnect(data);", guarded)
-        self.assertIn("renderRemoteDjGate(data);", guarded)
+        barrier = poll.index("if (seq < latestStatusOutcomeSeq) return;")
+        self.assertLess(poll.index("await fetchStatus();"), barrier)
+        for later in ("latestStatusOutcomeSeq = seq;", "latestStatusOk = !!data;",
+                      "if (data) markStatusSuccess();", "renderRemoteDjConnect(data);",
+                      "renderRemoteDjGate(data);"):
+            with self.subTest(later=later):
+                self.assertLess(barrier, poll.index(later))
+        self.assertLess(poll.index("latestStatusOk = !!data;"), poll.index("if (data) markStatusSuccess();"))
         self.assertEqual(poll.count("renderRemoteDjConnect(data);"), 1)
+        # A failed newest outcome re-renders the Remote DJ controls unconfirmed.
+        failed = poll[poll.index("if (!data) {"):]
+        failed = failed[:failed.index("\n  }")]
+        self.assertIn("renderRemoteDjGate(last);", failed)
+        self.assertIn("renderRemoteDjConnect(last);", failed)
+        self.assertNotIn("latestRemoteDjStatusSeq", self.template)
+
+    def test_ownership_needs_a_successful_newest_status(self):
+        self.assertIn("if (connectionStale || !latestStatusOk) return 'unverified';",
+                      self._function("rdjLocalLink"))
+        link = self._function("rdjLocalLink")
+        self.assertLess(link.index("!latestStatusOk"), link.index("remote_dj_owner_supported === false"))
 
     def test_identity_is_withheld_while_status_is_stale(self):
         self.assertIn("renderRemoteDjConnect(window.__rdjLastEngineState || {});",
                       self._function("renderConnectionStale"))
         render = self._function("renderRemoteDjConnect")
-        stale = render[render.index("if (connectionStale && (weAreConnected || someoneElseConnected)) {"):]
+        branch = "if ((connectionStale || !latestStatusOk) && (weAreConnected || someoneElseConnected)) {"
+        stale = render[render.index(branch):]
         self.assertIn("'Status unavailable'", stale[:stale.index("return;")])
-        self.assertLess(render.index("if (connectionStale &&"), render.index("rdjOwnerPresentation(data"))
+        self.assertLess(render.index(branch), render.index("rdjOwnerPresentation(data"))
 
     def test_no_new_polling_loop_or_endpoint(self):
         self.assertEqual(self.template.count("setInterval(poll, 1000);"), 1)

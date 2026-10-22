@@ -1356,6 +1356,255 @@ class _ConsoleBrowserBase:
         page.evaluate("async () => { await toggleRemoteDjGate(); }")
         self.assertEqual(page.evaluate("() => window.__deferred.length"), i + 1)
 
+    # -- Third-review P2: completed status OUTCOMES are ordered -------------
+    # /api/engine/status/ requests are held in the page as deferred promises
+    # and completed / failed / aborted explicitly, in any order.
+    STATUS_QUEUE = """() => {
+      const realFetch = window.fetch.bind(window);
+      window.__status = [];
+      window.__polls = {};
+      window.fetch = (url, opts) => String(url).endsWith('/api/engine/status/')
+        ? new Promise((resolve, reject) => window.__status.push({resolve, reject}))
+        : realFetch(url, opts);
+      const json = (body, code) => new Response(JSON.stringify(body),
+        {status: code || 200, headers: {'Content-Type': 'application/json'}});
+      window.__statusOk = (i, body) => window.__status[i].resolve(json(body));
+      window.__statusHttp = (i, code) => window.__status[i].resolve(json({}, code));
+      window.__statusMalformed = (i) => window.__status[i].resolve(
+        new Response('<html>not json</html>', {status: 200, headers: {'Content-Type': 'text/html'}}));
+      window.__statusReject = (i) => window.__status[i].reject(new TypeError('simulated network loss'));
+      window.__statusAbort = (i) => window.__status[i].reject(new DOMException('aborted', 'AbortError'));
+      window.__startPoll = () => { const i = window.__status.length; window.__polls[i] = poll(); return i; };
+    }"""
+
+    FAILURES = {
+        "http-500": "__statusHttp(I, 500)",
+        "rejected-fetch": "__statusReject(I)",
+        "malformed": "__statusMalformed(I)",
+        "aborted": "__statusAbort(I)",
+    }
+
+    def status_queue(self, page):
+        page.evaluate(self.STATUS_QUEUE)
+
+    def start_poll(self, page):
+        return page.evaluate("() => __startPoll()")
+
+    def finish_poll(self, page, index, action, body=None):
+        # The action runs as a global expression, so the body travels via
+        # window.__statusBody (an indirect eval can't see this closure).
+        page.evaluate("async ([a, i, b]) => { window.__statusBody = b; (0, eval)(a); await window.__polls[i]; }",
+                      [action.replace("(I", f"({index}"), index, body])
+
+    def ok_poll(self, page, index, state):
+        self.finish_poll(page, index, "__statusOk(I, window.__statusBody)", state)
+
+    def fail_poll(self, page, index, kind="http-500"):
+        self.finish_poll(page, index, self.FAILURES[kind])
+
+    def gate_posts(self):
+        return [p for p, _ in self.posts if "remote-dj-gate" in p]
+
+    def try_gate(self, page):
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        page.locator("#remoteDjGateBtn").click(force=True)
+        page.clock.run_for(200)
+
+    def a_owner_page(self):
+        """Browser A, verified owner of the active session (fresh status)."""
+        self.state = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))
+        page = self.open_console(self.superuser)
+        self.become_owner_browser(page, self.ATTEMPT_A)
+        self.poll_now(page)
+        self.assertEqual(self.connect_ui(page)["action"], "Disconnect")
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        return page
+
+    def a_snapshot(self):
+        return self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A))
+
+    def b_snapshot(self):
+        return self.connected(self.owner("Bob Jones", attempt=self.ATTEMPT_B))
+
+    def assert_no_owner_controls(self, page, *, stale_console=None):
+        self.assertNotEqual(page.evaluate("() => rdjLocalLink(window.__rdjLastEngineState)"), "owner")
+        self.assertTrue(self.gate_ui(page)["disabled"])
+        self.assertNotEqual(self.connect_ui(page)["status"], "You · Good")
+        if stale_console is not None:
+            self.assertEqual(page.evaluate(
+                "() => document.getElementById('consoleRoot').classList.contains('connection-stale')"),
+                stale_console)
+        self.try_gate(page)
+        self.assertEqual(self.gate_posts(), [])
+
+    def test_scenario_a_newer_failure_beats_an_older_success_codex_reproducer(self):
+        # Codex's reproducer: A owns; an older A-status request is held; the
+        # console goes stale; a newer request FAILS; the older A success lands.
+        page = self.a_owner_page()
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        page.clock.run_for(3_500)                       # outage: console status stale
+        page.wait_for_function("() => connectionStale === true")
+        self.fail_poll(page, r2)
+        self.assert_no_owner_controls(page, stale_console=True)
+        self.ok_poll(page, r1, self.a_snapshot())            # late, superseded success
+        self.assert_no_owner_controls(page, stale_console=True)
+        self.shot(page, "rdj-ordering-scenario-a-after-late-success")
+
+    def test_scenario_a_exact_codex_sequence(self):
+        # Codex third review, section 2, step by step: stale guard active and
+        # a newer request failed; the older buffered A success must NOT clear
+        # stale, render A as owner, or let a direct gate invocation POST.
+        page = self.a_owner_page()
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        page.clock.run_for(3_500)
+        page.wait_for_function("() => connectionStale === true")
+        self.fail_poll(page, r2)
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        self.assertEqual(self.gate_posts(), [])
+        self.ok_poll(page, r1, self.a_snapshot())
+        self.assertTrue(page.evaluate("() => connectionStale"))
+        self.assertNotEqual(page.evaluate("() => rdjLocalLink(window.__rdjLastEngineState)"), "owner")
+        self.assertNotEqual(self.connect_ui(page)["status"], "You · Good")
+        page.evaluate("async () => { await toggleRemoteDjGate(); }")
+        self.assertEqual(self.gate_posts(), [])
+
+    def test_scenario_a_after_turnover_to_b(self):
+        # A has already seen B take over (stale link); a late pre-turnover
+        # snapshot naming A must not restore A's controls after a newer failure.
+        page = self.a_owner_page()
+        self.poll_now(page, **self.b_snapshot())
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        self.fail_poll(page, r2)
+        self.ok_poll(page, r1, self.a_snapshot())
+        self.assert_no_owner_controls(page)
+        page.locator("#remoteDjConnectBtn").click()     # local cleanup still works
+        self.assertEqual(page.evaluate("() => rdjPc"), None)
+        self.assertEqual(self.posts, [])
+
+    def test_scenario_b_reverse_completion_order(self):
+        page = self.a_owner_page()
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        self.ok_poll(page, r1, self.a_snapshot())            # newest completed so far: accepted
+        self.assertEqual(self.connect_ui(page)["status"], "You · Good")
+        self.fail_poll(page, r2)                             # newer failure: ownership unconfirmed
+        self.assert_no_owner_controls(page)
+        self.assertEqual(self.connect_ui(page)["status"], "Status unavailable")
+
+    def test_scenario_c_recovery_needs_a_newer_successful_status(self):
+        page = self.a_owner_page()
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        self.fail_poll(page, r2)
+        self.ok_poll(page, r1, self.a_snapshot())
+        self.assert_no_owner_controls(page)
+        r3 = self.start_poll(page)                      # issued after the failure
+        self.ok_poll(page, r3, self.a_snapshot())
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["status"]), ("Disconnect", "You · Good"))
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        r4 = self.start_poll(page)                      # ...but a fresh B status keeps A out
+        self.ok_poll(page, r4, self.b_snapshot())
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assertTrue(self.gate_ui(page)["disabled"])
+
+    def test_scenario_c_observer_does_not_gain_controls_on_recovery(self):
+        self.state = self.b_snapshot()
+        page = self.open_console(self.superuser)        # pure observer, no peer
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        self.fail_poll(page, r2)
+        self.ok_poll(page, r1, self.b_snapshot())
+        r3 = self.start_poll(page)
+        self.ok_poll(page, r3, self.b_snapshot())
+        ui = self.connect_ui(page)
+        self.assertEqual((ui["action"], ui["disabled"]), ("Bob Jones", True))
+        self.assertTrue(self.gate_ui(page)["disabled"])
+
+    def test_scenario_d_every_failure_kind_supersedes_older_success(self):
+        for kind in self.FAILURES:
+            with self.subTest(failure=kind):
+                self.posts.clear()
+                page = self.a_owner_page()
+                self.status_queue(page)
+                r1 = self.start_poll(page)
+                r2 = self.start_poll(page)
+                self.fail_poll(page, r2, kind)
+                self.assert_no_owner_controls(page)
+                self.ok_poll(page, r1, self.a_snapshot())
+                self.assert_no_owner_controls(page)
+
+    def test_scenario_e_rapid_turnover_with_overlapping_requests(self):
+        page = self.a_owner_page()
+        self.status_queue(page)
+        r1, r2, r3 = (self.start_poll(page) for _ in range(3))
+        self.ok_poll(page, r3, self.b_snapshot())            # newest: B owns
+        self.ok_poll(page, r1, self.a_snapshot())            # late, older A snapshots
+        self.ok_poll(page, r2, self.a_snapshot())
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assert_no_owner_controls(page)
+
+    def test_scenario_f_same_account_is_not_ownership_under_overlap(self):
+        page = self.a_owner_page()
+        same_account_b = self.connected(self.owner("Jane Smith", current=True, attempt=self.ATTEMPT_B))
+        self.status_queue(page)
+        r1 = self.start_poll(page)
+        r2 = self.start_poll(page)
+        self.fail_poll(page, r2)
+        self.ok_poll(page, r1, self.a_snapshot())
+        self.assert_no_owner_controls(page)
+        r3 = self.start_poll(page)
+        self.ok_poll(page, r3, same_account_b)               # same user, other browser's attempt
+        self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+        self.assert_no_owner_controls(page)
+
+    def test_scenario_g_slow_network_still_makes_progress(self):
+        # Every response takes longer than the 1 s poll interval, so requests
+        # overlap continuously; completions arrive in issue order and each one
+        # must still be applied (no starvation).
+        page = self.a_owner_page()
+        self.status_queue(page)
+        qualities = ("fair", "poor", "good")
+        issued = []
+        for _ in qualities:
+            page.clock.run_for(1_000)                   # the real 1 s setInterval issues the poll
+            issued.append(page.evaluate("() => window.__status.length - 1"))
+        self.assertEqual(len(set(issued)), 3)
+        for index, quality in zip(issued, qualities):
+            state = self.connected(self.owner("Jane Smith", attempt=self.ATTEMPT_A),
+                                   remote_dj_quality={"overall": quality})
+            page.evaluate("([i, b]) => __statusOk(i, b)", [index, state])
+            page.wait_for_function(
+                "(q) => document.getElementById('remoteDjConnectStatus').textContent === 'You · ' + q",
+                arg=quality.capitalize())
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        self.assertFalse(page.evaluate("() => connectionStale"))
+
+    def test_scenario_h_late_gate_feedback_cannot_restore_controls(self):
+        for outcome in ("200", "403", "reject"):
+            with self.subTest(gate_outcome=outcome):
+                page = self.a_owner_page()
+                page.evaluate(self.DEFERRED_FETCH)      # POSTs deferred (status GETs pass through)
+                i, = self.start(page, "toggleRemoteDjGate()")
+                self.poll_now(page, **self.b_snapshot())  # turnover while the POST is in flight
+                action = {"200": f"__respond({i}, 200)", "403": f"__respond({i}, 403)",
+                          "reject": f"__reject({i})"}[outcome]
+                self.settle_all(page, action)
+                self.assertTrue(self.gate_ui(page)["disabled"])
+                self.assertEqual(self.connect_ui(page)["action"], "Close stale link")
+                page.evaluate("async () => { await toggleRemoteDjGate(); }")
+                self.assertEqual(page.evaluate("() => window.__deferred.length"), i + 1)
+
     # -- Remote DJ ----------------------------------------------------------
     def test_remote_dj_mobile_live_deck_first_in_both_slot_arrangements(self):
         for live, preview in (("A", "B"), ("B", "A")):
