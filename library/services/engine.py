@@ -1,4 +1,5 @@
 import functools
+import itertools
 import json
 import math
 import os
@@ -138,6 +139,14 @@ CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 # iPortal D2B: this engine process's identity for native active-message
 # claims (a previous process's accepted/claimed attempt is rotated at start-up).
 ENGINE_INSTANCE = uuid.uuid4().hex
+# Roadmap 2.23 (fourth-review P2) -- engine-authored snapshot freshness. Every
+# _write_state() call stamps state_revision = {"instance": this run's
+# _engine_session_id, "seq": next(...)}: seq strictly increases with each write
+# of THIS process (itertools.count's next() is atomic under the GIL -- no lock,
+# timer or thread). It orders snapshots of one engine run; across a restart the
+# instance changes and the Console treats the first snapshots of a new instance
+# as unconfirmed (see dashboard.html rdjAdmitSnapshot).
+_STATE_REVISION_SEQ = itertools.count(1)
 # A native not-aired report that could not be recorded is retried no sooner.
 ACTIVE_MESSAGE_REPORT_RETRY_SECONDS = 3.0
 # Urgent insertions that keep emergency priority over a native urgent/PA
@@ -14723,6 +14732,12 @@ class PlaybackEngine:
             captured_at = time.time()
             state = {
                 "transport": transport,
+                # When THIS engine produced the snapshot, in engine order --
+                # not when Django read or returned it (fourth-review P2).
+                "state_revision": {
+                    "instance": getattr(self, "_engine_session_id", None),
+                    "seq": next(_STATE_REVISION_SEQ),
+                },
                 "decks": decks_out,
                 "resume": self._build_resume_state(
                     decks_out, captured_at=captured_at, transport=transport

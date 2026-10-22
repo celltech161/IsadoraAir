@@ -310,3 +310,52 @@ class StatusIdentityTests(TestCase):
         self.assertEqual(self.client.get("/api/engine/status/").json()["transport"], "OFFLINE")
         self.state_path.write_text("{not json")
         self.assertEqual(self.client.get("/api/engine/status/").json()["transport"], "ERROR")
+
+
+class EngineStateRevisionTests(SimpleTestCase):
+    """Fourth review: every engine state write carries an engine-authored
+    snapshot revision -- {instance: this run's _engine_session_id, seq} with seq
+    strictly increasing per write within the process -- produced inline, with no
+    extra write, timer, thread or lock."""
+
+    def write(self, stand_in, state_path):
+        with patch.object(eng_module, "STATE_PATH", state_path):
+            stand_in._write_state()
+        return json.loads(state_path.read_text())
+
+    def test_seq_strictly_increases_within_one_engine_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stand_in = make_minimal_stand_in()
+            stand_in._engine_session_id = "run-x"
+            states = [self.write(stand_in, Path(tmp) / "engine_state.json") for _ in range(3)]
+        revisions = [s["state_revision"] for s in states]
+        self.assertEqual({r["instance"] for r in revisions}, {"run-x"})
+        seqs = [r["seq"] for r in revisions]
+        self.assertEqual(seqs, sorted(set(seqs)))
+        self.assertTrue(all(isinstance(n, int) and n > 0 for n in seqs))
+
+    def test_a_restarted_engine_is_a_different_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = make_minimal_stand_in(), make_minimal_stand_in()
+            first._engine_session_id, second._engine_session_id = "run-x", "run-y"
+            a = self.write(first, Path(tmp) / "a.json")["state_revision"]
+            b = self.write(second, Path(tmp) / "b.json")["state_revision"]
+        self.assertNotEqual(a["instance"], b["instance"])
+
+    def test_missing_session_id_still_writes_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stand_in = make_minimal_stand_in()
+            stand_in.mic_live = True
+            stand_in.mic_ptt_valve = object()
+            state = self.write(stand_in, Path(tmp) / "engine_state.json")
+        self.assertIsNone(state["state_revision"]["instance"])   # the Console treats it as unversioned
+        self.assertTrue(state["mic_live"])
+        self.assertEqual(state["decks"], {"A": None, "B": None})
+
+    def test_revision_is_built_inline_in_the_single_write(self):
+        import inspect
+        source = inspect.getsource(eng_module.PlaybackEngine._write_state)
+        self.assertEqual(source.count("next(_STATE_REVISION_SEQ)"), 1)
+        self.assertEqual(source.count("tmp.rename(STATE_PATH)"), 1)
+        self.assertNotIn("threading", source)
+        self.assertNotIn("GLib.timeout_add", source)
