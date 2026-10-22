@@ -59,7 +59,9 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
         self.assertEqual(content.count("setInterval(poll, 1000);"), 1)
         self.assertNotIn("WebSocket(", content.split("toggleRemoteDjConnect")[0])
         # Only ever fetches the existing status endpoint for connectivity.
-        self.assertIn("const resp = await fetch('/api/engine/status/');", content)
+        # Roadmap 2.23 (fourth review): the same single endpoint, now passed the
+        # bounded single-flight request's AbortSignal -- still no new endpoint.
+        self.assertIn("const resp = await fetch('/api/engine/status/', { signal: statusAbortSignal() });", content)
 
     def test_does_not_infer_connectivity_from_levels_or_listener_endpoints(self):
         content = self._content()

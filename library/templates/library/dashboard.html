@@ -2704,33 +2704,92 @@ function rdjConnectFail(msg) {
 //                owner identity at all -- exactly r0116 behaviour, so a real
 //                owner isn't locked out before the engine is restarted;
 //   'none'       no local peer.
-// Roadmap 2.23 (third-review P2) -- completion-ordered status freshness,
-// maintained by poll(). Every status request gets a sequence number when
-// issued; when it COMPLETES -- success or any failure -- it is applied only
-// if no request issued LATER has already completed. latestStatusOk says
-// whether that newest applied outcome was a success: after a failed latest
-// poll, the last engine state no longer proves current ownership.
+// Roadmap 2.23 -- status freshness (third/fourth-review P2), maintained by
+// poll(). Two separate questions:
+//   1. Which REQUEST outcome is current? Status requests are single-flight
+//      (at most one outstanding, bounded by STATUS_FETCH_TIMEOUT_MS); each
+//      outcome -- success, failure or timeout -- is applied at most once.
+//   2. Is the SNAPSHOT newer than what was already accepted? HTTP order is not
+//      engine order, so this is decided only by the engine-authored
+//      state_revision {instance, seq} (see rdjAdmitSnapshot).
+// latestStatusOk: the newest outcome delivered a displayable snapshot.
+// latestSnapshotTrusted: that snapshot was provably newer than the last
+// accepted one of a confirmed engine instance -- the only kind that may
+// verify Remote DJ ownership.
 let statusPollSeq = 0;
 let latestStatusOutcomeSeq = 0;
 let latestStatusOk = false;
+let latestSnapshotTrusted = false;
+let acceptedRevision = null;   // {instance, seq} of the last trusted snapshot
+let candidateRevision = null;  // newest snapshot of a not-yet-confirmed instance
+const retiredEngineInstances = new Set();
+
+function rdjValidRevision(rev) {
+  return !!rev && typeof rev === 'object'
+    && typeof rev.instance === 'string' && rev.instance.length > 0
+    && Number.isSafeInteger(rev.seq) && rev.seq > 0;
+}
+
+// Classify a successful status body by its engine snapshot revision:
+//   'current'     same confirmed instance, seq > accepted -> accept, trusted.
+//                 A newer snapshot of the candidate instance also lands here:
+//                 it confirms an engine restart and retires the old instance.
+//   'repeat'      same instance and seq as accepted (the engine wrote nothing
+//                 new): display it (the server may now say STALE), untrusted.
+//   'older'       lower seq of the accepted instance, or a retired instance:
+//                 obsolete -- not displayed, untrusted.
+//   'provisional' first snapshot seen, or an unconfirmed new instance:
+//                 displayed, untrusted until a newer snapshot of the same
+//                 instance confirms it. A changed instance is never accepted
+//                 just because its response arrived later.
+//   'unversioned' no usable revision (older engine, OFFLINE/ERROR shapes):
+//                 displayed, never trusted.
+function rdjAdmitSnapshot(data) {
+  const rev = data.state_revision;
+  if (!rdjValidRevision(rev)) return 'unversioned';
+  if (retiredEngineInstances.has(rev.instance)) return 'older';
+  if (acceptedRevision && rev.instance === acceptedRevision.instance) {
+    if (rev.seq > acceptedRevision.seq) {
+      acceptedRevision = { instance: rev.instance, seq: rev.seq };
+      candidateRevision = null;
+      return 'current';
+    }
+    return rev.seq === acceptedRevision.seq ? 'repeat' : 'older';
+  }
+  if (candidateRevision && rev.instance === candidateRevision.instance) {
+    if (rev.seq > candidateRevision.seq) {
+      if (acceptedRevision) retiredEngineInstances.add(acceptedRevision.instance);
+      acceptedRevision = { instance: rev.instance, seq: rev.seq };
+      candidateRevision = null;
+      return 'current';
+    }
+    return rev.seq === candidateRevision.seq ? 'provisional' : 'older';
+  }
+  candidateRevision = { instance: rev.instance, seq: rev.seq };
+  return 'provisional';
+}
 
 function rdjLocalLink(data) {
   if (!rdjPc) return 'none';
   data = data || {};
-  // Ownership is only ever verified by the NEWEST completed status, and
-  // only when that status succeeded (third-review P2).
+  // Ownership is only ever verified by the newest status outcome, and only
+  // from a snapshot proven newer than the last accepted one (third- and
+  // fourth-review P2). An older engine that publishes no ownership is
+  // 'legacy': presented like r0116, but it never enables the mic gate.
   if (connectionStale || !latestStatusOk) return 'unverified';
   if (data.remote_dj_owner_supported === false) return 'legacy';
+  if (!latestSnapshotTrusted) return 'unverified';
   const owner = data.remote_dj_connected ? data.remote_dj_owner : null;
   if (!owner || !owner.browser_key || !rdjBrowserKey) return 'unverified';
   return owner.browser_key === rdjBrowserKey ? 'owner' : 'stale';
 }
 
-// Owner-only mic action: only a verified owner (or the r0116-compatible
-// older-engine case) may gate the Remote Mic from this page.
+// Owner-only mic action: only a VERIFIED owner may gate the Remote Mic from
+// this page. (Fourth review: the older-engine 'legacy' case no longer
+// enables it -- its ownership can't be verified, and an engine restart, which
+// installing this release requires, ends any Remote DJ session anyway.)
 function rdjMayGate(data) {
-  const link = rdjLocalLink(data);
-  return link === 'owner' || link === 'legacy';
+  return rdjLocalLink(data) === 'owner';
 }
 
 // Roadmap 2.23 Phase 1B -- who holds the Remote DJ connection, taken only
@@ -2914,9 +2973,12 @@ function renderRemoteDjGate(data) {
     const mayGate = rdjMayGate(data);
     btn.disabled = !mayGate;
     const gateLabel = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
-    const readOnlyWhy = rdjLocalLink(data) === 'unverified'
+    const gateLink = rdjLocalLink(data);
+    const readOnlyWhy = gateLink === 'unverified'
       ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
-      : ' (read-only: another browser holds the connection)';
+      : gateLink === 'legacy'
+        ? ' (read-only: this engine version can\'t confirm connection ownership)'
+        : ' (read-only: another browser holds the connection)';
     setOpsMicButton(
       btn,
       data.remote_dj_live ? 'on' : 'off',
@@ -3048,7 +3110,7 @@ function markStatusSuccess() {
 
 async function fetchStatus() {
   try {
-    const resp = await fetch('/api/engine/status/');
+    const resp = await fetch('/api/engine/status/', { signal: statusAbortSignal() });
     if (!resp.ok) return null;
     return await resp.json();
   } catch {
@@ -3824,15 +3886,44 @@ async function insertTrack(trackId, position) {
 }
 
 // --- Main poll loop ---
-// Status ordering (third-review P2; state declared beside rdjLocalLink):
-// a response is applied only if no LATER-issued request has already
-// completed. A newer outcome -- success, HTTP error, rejected or aborted
-// fetch, unparseable body (fetchStatus() returns null for every failure)
-// -- therefore makes every older outstanding response obsolete: it can't
-// clear staleness, replace the last engine state, or render anything.
-// Ordering by COMPLETED outcomes rather than "highest issued" keeps a slow
-// network live: responses that complete in issue order are each applied,
-// even when every request outlasts the 1 s interval.
+// Single-flight, bounded status polling (fourth-review P2/P3). The 1 s tick
+// always re-checks staleness, but starts a request only when none is
+// outstanding, so responses can't overlap or reorder and pending requests
+// can't accumulate. Each request is bounded by STATUS_FETCH_TIMEOUT_MS
+// (twice the 3 s stale threshold: a slow-but-working server still gets 6 s
+// to answer, while the console has already shown it as stale after 3 s).
+// On timeout the request is aborted AND its slot released, so even a fetch
+// that ignored the abort could never block polling; its outcome is applied
+// at most once (claimStatusOutcome), whichever comes first.
+const STATUS_FETCH_TIMEOUT_MS = 2 * STATUS_STALE_THRESHOLD_MS;
+let statusInFlightSeq = 0;
+let statusAbortController = null;
+
+function statusAbortSignal() {
+  return statusAbortController ? statusAbortController.signal : undefined;
+}
+
+// Apply request `seq`'s outcome exactly once; false if it was already
+// applied (timed out) or a newer outcome superseded it.
+function claimStatusOutcome(seq) {
+  if (statusInFlightSeq === seq) {
+    statusInFlightSeq = 0;
+    statusAbortController = null;
+  }
+  if (seq <= latestStatusOutcomeSeq) return false;
+  latestStatusOutcomeSeq = seq;
+  return true;
+}
+
+// The newest outcome gave no trustworthy snapshot: Remote DJ owner-only
+// controls fail closed at once from the last accepted state (local cleanup
+// stays available).
+function rdjRenderUnconfirmed() {
+  const last = window.__rdjLastEngineState || {};
+  renderRemoteDjConnect(last);
+  renderRemoteDjGate(last);
+}
+
 async function poll() {
   // Evaluated BEFORE the fetch, from elapsed wall-clock time, so a
   // hung/blackholed request (which never resolves and so never lets
@@ -3840,18 +3931,26 @@ async function poll() {
   // the next 1000ms setInterval(poll, ...) tick runs this again
   // regardless of whether an earlier fetchStatus() is still pending.
   checkConnectionStaleness();
+  if (statusInFlightSeq !== 0) return;  // single flight: one request at a time
   const seq = ++statusPollSeq;
+  statusInFlightSeq = seq;
+  statusAbortController = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = setTimeout(() => {
+    if (statusInFlightSeq !== seq) return;
+    if (statusAbortController) statusAbortController.abort();
+    if (!claimStatusOutcome(seq)) return;
+    latestStatusOk = false;
+    latestSnapshotTrusted = false;
+    rdjRenderUnconfirmed();
+  }, STATUS_FETCH_TIMEOUT_MS);
   const data = await fetchStatus();
-  if (seq < latestStatusOutcomeSeq) return;  // superseded by a newer outcome: no effect
-  latestStatusOutcomeSeq = seq;
-  latestStatusOk = !!data;
-  if (!data) {
-    // The newest outcome failed: Remote DJ ownership is unconfirmed now, so
-    // owner-only controls fail closed at once (local cleanup stays).
-    const last = window.__rdjLastEngineState || {};
-    renderRemoteDjConnect(last);
-    renderRemoteDjGate(last);
-  }
+  clearTimeout(timer);
+  if (!claimStatusOutcome(seq)) return;  // timed out already / superseded: no effect
+  const verdict = data ? rdjAdmitSnapshot(data) : 'failed';
+  latestStatusOk = verdict !== 'failed' && verdict !== 'older';
+  latestSnapshotTrusted = verdict === 'current';
+  if (verdict === 'failed' || verdict === 'older') rdjRenderUnconfirmed();
+  if (verdict === 'older') return;  // obsolete engine snapshot: never displayed
   if (data) markStatusSuccess();
   if (!data) return;
   const decks = data.decks || {};

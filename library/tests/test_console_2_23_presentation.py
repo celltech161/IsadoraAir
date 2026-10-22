@@ -421,7 +421,7 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         self.assertNotIn("!!rdjPc", gate)
         self.assertIn("if (!rdjMayGate(state)) return;", self._function("toggleRemoteDjGate"))
         may = self._function("rdjMayGate")
-        self.assertIn("return link === 'owner' || link === 'legacy';", may)
+        self.assertIn("return rdjLocalLink(data) === 'owner';", may)
         self.assertIn("const thisBrowser = link === 'owner';", self._function("rdjOwnerPresentation"))
 
     def test_no_raw_identifier_is_read_from_the_owner_block(self):
@@ -433,32 +433,47 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         self.assertIn("window.crypto.subtle.digest('SHA-256'", self._function("rdjDeriveBrowserKey"))
         self.assertIn("rdjBrowserKey = null;", self._function("rdjDisconnect"))
 
-    def test_status_outcomes_are_completion_ordered(self):
-        # Third-review P2: EVERY completed outcome -- success or failure --
-        # supersedes older outstanding responses, before anything else runs.
+    def test_status_polling_is_single_flight_and_bounded(self):
+        # Fourth review: at most one outstanding status request, bounded by a
+        # timeout derived from the stale threshold; each outcome applied once.
+        self.assertIn("const STATUS_FETCH_TIMEOUT_MS = 2 * STATUS_STALE_THRESHOLD_MS;", self.template)
         poll = self._function("poll")
-        self.assertIn("const seq = ++statusPollSeq;", poll)
-        barrier = poll.index("if (seq < latestStatusOutcomeSeq) return;")
-        self.assertLess(poll.index("await fetchStatus();"), barrier)
-        for later in ("latestStatusOutcomeSeq = seq;", "latestStatusOk = !!data;",
-                      "if (data) markStatusSuccess();", "renderRemoteDjConnect(data);",
-                      "renderRemoteDjGate(data);"):
-            with self.subTest(later=later):
-                self.assertLess(barrier, poll.index(later))
-        self.assertLess(poll.index("latestStatusOk = !!data;"), poll.index("if (data) markStatusSuccess();"))
-        self.assertEqual(poll.count("renderRemoteDjConnect(data);"), 1)
-        # A failed newest outcome re-renders the Remote DJ controls unconfirmed.
-        failed = poll[poll.index("if (!data) {"):]
-        failed = failed[:failed.index("\n  }")]
-        self.assertIn("renderRemoteDjGate(last);", failed)
-        self.assertIn("renderRemoteDjConnect(last);", failed)
-        self.assertNotIn("latestRemoteDjStatusSeq", self.template)
+        self.assertLess(poll.index("checkConnectionStaleness();"),
+                        poll.index("if (statusInFlightSeq !== 0) return;"))
+        self.assertLess(poll.index("if (statusInFlightSeq !== 0) return;"), poll.index("const seq = ++statusPollSeq;"))
+        timeout = poll[poll.index("const timer = setTimeout("):poll.index("STATUS_FETCH_TIMEOUT_MS);")]
+        self.assertIn("statusAbortController.abort();", timeout)
+        self.assertIn("if (!claimStatusOutcome(seq)) return;", timeout)
+        self.assertLess(poll.index("await fetchStatus();"), poll.index("if (!claimStatusOutcome(seq)) return;", poll.index("await fetchStatus();")))
+        claim = self._function("claimStatusOutcome")
+        self.assertIn("if (seq <= latestStatusOutcomeSeq) return false;", claim)
+        self.assertIn("statusInFlightSeq = 0;", claim)
+        self.assertIn("signal: statusAbortSignal()", self._function("fetchStatus"))
 
-    def test_ownership_needs_a_successful_newest_status(self):
-        self.assertIn("if (connectionStale || !latestStatusOk) return 'unverified';",
-                      self._function("rdjLocalLink"))
+    def test_only_a_provably_newer_engine_snapshot_is_trusted(self):
+        poll = self._function("poll")
+        after_claim = poll[poll.index("await fetchStatus();"):]
+        self.assertLess(after_claim.index("const verdict = data ? rdjAdmitSnapshot(data) : 'failed';"),
+                        after_claim.index("if (data) markStatusSuccess();"))
+        self.assertIn("latestSnapshotTrusted = verdict === 'current';", poll)
+        self.assertLess(poll.index("if (verdict === 'older') return;"), poll.index("if (data) markStatusSuccess();"))
+        admit = self._function("rdjAdmitSnapshot")
+        self.assertIn("if (!rdjValidRevision(rev)) return 'unversioned';", admit)
+        self.assertIn("if (retiredEngineInstances.has(rev.instance)) return 'older';", admit)
+        self.assertIn("if (rev.seq > acceptedRevision.seq) {", admit)
+        self.assertIn("return 'provisional';", admit)
+        # Nothing about HTTP request order feeds the snapshot decision.
+        self.assertNotIn("seq ===", admit.replace("rev.seq === ", ""))
+        self.assertNotIn("statusPollSeq", admit)
+        self.assertNotIn("latestStatusOutcomeSeq", admit)
+
+    def test_ownership_needs_a_trusted_snapshot_and_legacy_never_gates(self):
         link = self._function("rdjLocalLink")
+        self.assertIn("if (connectionStale || !latestStatusOk) return 'unverified';", link)
+        self.assertIn("if (!latestSnapshotTrusted) return 'unverified';", link)
         self.assertLess(link.index("!latestStatusOk"), link.index("remote_dj_owner_supported === false"))
+        self.assertLess(link.index("if (!latestSnapshotTrusted)"), link.index("owner.browser_key === rdjBrowserKey"))
+        self.assertIn("return rdjLocalLink(data) === 'owner';", self._function("rdjMayGate"))
 
     def test_identity_is_withheld_while_status_is_stale(self):
         self.assertIn("renderRemoteDjConnect(window.__rdjLastEngineState || {});",
