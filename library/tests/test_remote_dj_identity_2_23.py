@@ -3,8 +3,9 @@
 * the engine publishes the ACTIVE session's owner (signed-token user id +
   attempt id) and nothing for an ended session;
 * /api/engine/status/ never passes those raw values through: it returns a
-  display-safe block (display name, "is this my account", and a one-way key
-  only the owning browser can match) to viewers who may connect as / gate
+  display-safe block (display name, "is this my account", and a browser key
+  the owning page matches against its own attempt -- a presentation aid, not
+  a secret or an authority) to viewers who may connect as / gate
   the Remote DJ, and nothing to anyone else, for a stale state file, or
   without an active session.
 
