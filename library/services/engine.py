@@ -10,7 +10,7 @@ import dataclasses
 import time
 import traceback
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime as datetime_cls, time as datetime_time, timedelta
 from pathlib import Path
 
@@ -63,6 +63,7 @@ from library.services.remote_dj_stats import (
 )
 from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
+from library.services import deck_fade
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -847,6 +848,26 @@ NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 MAX_CLOCK_RECOVERY_SECONDS = 600
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
+# Roadmap 2.23 Start Next (START-NEXT-CONTRACT in the 2.23 evidence). The fade
+# bounds duplicate library.models.START_NEXT_FADE_MS_MIN/MAX: the engine
+# re-validates every command rather than trusting the producer.
+START_NEXT_FADE_MS_MIN = 250
+START_NEXT_FADE_MS_MAX = 10000
+START_NEXT_MAX_COMMAND_AGE_SECONDS = 5.0
+START_NEXT_MAX_FUTURE_SKEW_SECONDS = 2.0
+START_NEXT_RECENT_LIMIT = 8
+START_NEXT_SEEN_LIMIT = 64
+START_NEXT_COMPLETION_GRACE_MS = 60
+START_NEXT_COMPLETION_POLL_MS = 50
+START_NEXT_COMPLETION_MAX_EXTRA_MS = 1500
+START_NEXT_RESTORE_MS = 250
+START_NEXT_SILENT_VOLUME = 0.01
+START_NEXT_WATCHDOG_EXTRA_SECONDS = 5.0
+# The fade is anchored on the outgoing pad's own last_sync (deck_fade); the
+# aggregator syncs a playing pad every ~10 ms. Past this wait (a stalled
+# deck) the clock's running time is used instead.
+START_NEXT_ANCHOR_POLL_MS = 5
+START_NEXT_ANCHOR_MAX_WAIT_MS = 200
 # [P2] 1.6 Phase A -- observational milestone name for the first buffer
 # empirically confirmed to have crossed the deck's post-primer output
 # boundary (concat's src pad once concat's own active-pad bookkeeping
@@ -1909,6 +1930,10 @@ class PlaybackEngine:
         # An explicit operator toggle of manual_mode CLEARS this flag,
         # so a manually-selected Manual survives the next mic release.
         self._manual_from_mic = False
+        # Roadmap 2.23 Start Next: the one active transition (or None) and
+        # the bounded outcome history published in engine_state.json.
+        self._start_next_active = None
+        self._start_next_recent = deque(maxlen=START_NEXT_RECENT_LIMIT)
         # Cached, reporting-only mirror of DuckingConfig.ptt_auto_manual_
         # enabled -- refreshed on every actual mic/PTT transition inside
         # _apply_mic_mode_hold() (same "live-read-on-transition" contract
@@ -2140,6 +2165,11 @@ class PlaybackEngine:
         diagnostics = getattr(self, "_audio_gap_diagnostics", None)
         if diagnostics is not None:
             diagnostics.stop()
+        # Roadmap 2.23: an in-flight Start Next ends with the process (its
+        # GLib timers never fire again); record that in the final state.
+        start_next = getattr(self, "_start_next_active", None)
+        if start_next is not None:
+            self._start_next_terminal(start_next, "cancelled", "engine_stopped")
         # Preserve occurrence identity/position before detach clears the deck
         # map. The subsequent clean segment close excludes all service
         # downtime, and the next process may continue the same PlayEvent.
@@ -6706,6 +6736,9 @@ class PlaybackEngine:
         native_held = self.__dict__.get("_active_message_held", {}).pop(log_item.id, None) is not None
         deck = self._create_deck(slot, log_item)
         if deck is None:
+            # Roadmap 2.23: lets Start Next tell "nothing could be opened"
+            # apart from an ordinarily empty queue.
+            self._deck_open_failures = getattr(self, "_deck_open_failures", 0) + 1
             # File missing — move on to whatever's after it for this slot.
             if native_held or _active_message_candidate(getattr(log_item, "track", None)):
                 self._report_active_message_left(log_item.id, "deck_not_opened")
@@ -8258,11 +8291,12 @@ class PlaybackEngine:
             and all(deck is None for deck in self.decks.values())
             and self._free_slot() is not None
             # Roadmap 2.23 Phase 2a: an empty console is EXPECTED while a VT
-            # transition plays its outro tail / gap / long intro: the VT state
-            # machine starts the next item itself. Restarting here aired it
-            # under the outro VT and the VT then started a second one (two
-            # songs on air).
+            # transition plays its outro tail / gap / long intro, or while a
+            # Start Next owns the handoff. Those state machines start the
+            # next item themselves; restarting here aired it under the outro
+            # VT and the VT then started a second one (two songs on air).
             and self._vt.get("phase", "idle") == "idle"
+            and getattr(self, "_start_next_active", None) is None
         ):
             # With one poisoned slot, the surviving slot is briefly
             # unavailable while its previous generation reaches NULL. A deck
@@ -9389,6 +9423,562 @@ class PlaybackEngine:
         print(f"  VT aborted ({reason}) from phase {vt.get('phase')} (duck released)")
         return True
 
+    # ------------------------------------------------------------------
+    # Start Next (roadmap 2.23 Phase 2b) -- engine-owned soft transition.
+    # Contract: ~/isadoraair-2.23-evidence/track-a/START-NEXT-CONTRACT.md.
+    # Everything below runs on the GLib thread; the only streaming-thread
+    # work is deck_fade's control-point anchoring.
+    # ------------------------------------------------------------------
+    def _start_next_current(self, token):
+        active = getattr(self, "_start_next_active", None)
+        if active is None or active["request_id"] != token:
+            return None
+        return active
+
+    @staticmethod
+    def _start_next_remember(book, key, value=True):
+        book[key] = value
+        while len(book) > START_NEXT_SEEN_LIMIT:
+            book.popitem(last=False)
+
+    @staticmethod
+    def _start_next_deck_identity(deck):
+        if deck is None:
+            return None
+        return {
+            "slot": deck.slot,
+            "log_item_id": getattr(deck.log_item, "id", None),
+            "generation": deck.generation,
+        }
+
+    def _start_next_record(self, record):
+        """Append one terminal outcome to the bounded, published history."""
+        recent = self.__dict__.setdefault("_start_next_recent", deque(maxlen=START_NEXT_RECENT_LIMIT))
+        record.setdefault("finished_at", time.time())
+        recent.appendleft(record)
+        outcome = record.get("outcome")
+        reason = record.get("reason")
+        print(f"  Start Next {record.get('request_id')}: {outcome}"
+              f"{f' ({reason})' if reason else ''}")
+
+    def _start_next_reject(self, record, reason, **extra):
+        record.update({"outcome": "rejected", "reason": reason, **extra})
+        self._start_next_record(record)
+
+    def _start_next_peek_next_item(self):
+        """Read-only: the occurrence _start_next_track would hand out next
+        (the restart-resume occurrence, forced items, the cursor, then the
+        eligible next-hour log -- the automatic crossfade's look-ahead)."""
+        resume_item = getattr(self, "_resume_item", None)
+        if resume_item is not None:
+            return resume_item
+        item = self._peek_playable_at_cursor()
+        if item is not None:
+            return item
+        peek = self._peek_next_hour()
+        if peek:
+            return next(
+                (
+                    it for it in peek[1]
+                    if not self._is_poison_guarded(it) and _log_item_playable(it)[0]
+                ),
+                None,
+            )
+        return None
+
+    def _start_next_command(self, data):
+        """Validate one start_next command (contract 3.1), then accept it in
+        exactly one mode (3.2) or record a refusal that changed nothing."""
+        request_id = data.get("request_id")
+        client_id = data.get("client_request_id")
+        record = {
+            "request_id": request_id if isinstance(request_id, str) else None,
+            "client_request_id": client_id if isinstance(client_id, str) else None,
+            "accepted_at": time.time(),
+        }
+        if not isinstance(request_id, str) or not 0 < len(request_id) <= 64:
+            self._start_next_reject(record, "malformed")
+            return
+        seen = self.__dict__.setdefault("_start_next_seen_ids", OrderedDict())
+        if request_id in seen:
+            print(f"  Start Next {request_id}: duplicate command file ignored")
+            return
+        self._start_next_remember(seen, request_id)
+
+        issued_at = data.get("issued_at")
+        fade_ms = data.get("fade_ms")
+        release_manual = data.get("release_manual", False)
+        if (
+            isinstance(issued_at, bool) or not isinstance(issued_at, (int, float))
+            or isinstance(fade_ms, bool) or not isinstance(fade_ms, int)
+            or not START_NEXT_FADE_MS_MIN <= fade_ms <= START_NEXT_FADE_MS_MAX
+            or not isinstance(release_manual, bool)
+            or (client_id is not None and (not isinstance(client_id, str) or len(client_id) > 64))
+        ):
+            self._start_next_reject(record, "malformed")
+            return
+        record["fade_ms"] = fade_ms
+
+        if client_id is not None:
+            clients = self.__dict__.setdefault("_start_next_seen_clients", OrderedDict())
+            key = (data.get("user_id"), client_id)
+            if key in clients:
+                self._start_next_reject(record, "duplicate_request", duplicate_of=clients[key])
+                return
+            self._start_next_remember(clients, key, request_id)
+
+        instance = data.get("engine_instance")
+        if instance is not None and instance != getattr(self, "_engine_session_id", None):
+            self._start_next_reject(record, "engine_restarted")
+            return
+        age = time.time() - float(issued_at)
+        if age > START_NEXT_MAX_COMMAND_AGE_SECONDS or age < -START_NEXT_MAX_FUTURE_SKEW_SECONDS:
+            self._start_next_reject(record, "stale_command")
+            return
+        if getattr(self, "_start_next_active", None) is not None:
+            self._start_next_reject(record, "busy_start_next")
+            return
+        if self._vt.get("phase", "idle") != "idle":
+            self._start_next_reject(record, "busy_voice_track")
+            return
+        occupied = [deck for deck in self.decks.values() if deck is not None]
+        if any(deck.gated_seek is not None for deck in occupied):
+            self._start_next_reject(record, "busy_seek")
+            return
+
+        live = self._live_decks()
+        expected = data.get("expected")
+        if expected is not None:
+            ids = expected.get("live_log_item_ids") if isinstance(expected, dict) else None
+            if not isinstance(ids, list) or any(
+                isinstance(i, bool) or not isinstance(i, int) for i in ids
+            ):
+                self._start_next_reject(record, "malformed")
+                return
+            actual = sorted(getattr(deck.log_item, "id", None) for deck in live)
+            if sorted(set(ids)) != actual:
+                self._start_next_reject(record, "target_changed")
+                return
+
+        paused = [deck for deck in occupied if deck.paused]
+        transitional = [
+            deck for deck in occupied
+            if deck not in live and deck not in paused
+        ]
+        if transitional:
+            self._start_next_reject(record, "slot_unavailable")
+            return
+        if len(live) == 2:
+            mode, outgoing, incoming = "overlap", live[0], live[1]
+        elif len(live) == 1:
+            if paused:
+                self._start_next_reject(record, "paused_deck_occupies_slot")
+                return
+            mode, outgoing, incoming = "fade_and_start", live[0], None
+            other = self._other_slot(outgoing.slot)
+            if self.decks.get(other) is not None or not self._deck_slot_available(other):
+                self._start_next_reject(record, "slot_unavailable")
+                return
+        else:
+            if len(paused) > 1:
+                self._start_next_reject(record, "paused_deck_occupies_slot")
+                return
+            mode, outgoing, incoming = "start_only", None, None
+            if not paused and self._start_next_peek_next_item() is None:
+                self._start_next_reject(record, "nothing_to_start")
+                return
+            if not paused and self._free_slot() is None:
+                self._start_next_reject(record, "slot_unavailable")
+                return
+        if outgoing is not None and (outgoing.mixer_pad is None or not deck_fade.fade_supported()):
+            self._start_next_reject(record, "fade_unsupported")
+            return
+
+        active = {
+            **record,
+            "user_id": data.get("user_id"),
+            "mode": mode,
+            "phase": "advancing" if mode == "overlap" else "fading",
+            "release_manual": release_manual,
+            "accepted_monotonic": time.monotonic(),
+            "fade_ends_at": record["accepted_at"] + (fade_ms / 1000.0 if outgoing else 0.0),
+            "outgoing": self._start_next_deck_identity(outgoing),
+            "outgoing_deck": outgoing,
+            "outgoing_ended": False,
+            "incoming": (
+                {"slot": incoming.slot, "log_item_id": getattr(incoming.log_item, "id", None)}
+                if incoming is not None else None
+            ),
+            "incoming_slot": (
+                self._other_slot(outgoing.slot) if mode == "fade_and_start" else None
+            ),
+            "incoming_attempted": mode == "overlap",
+            "fade": None,
+            "timers": [],
+            "paused_deck": paused[0] if (mode == "start_only" and paused) else None,
+        }
+        self._start_next_active = active
+        token = request_id
+        print(f"  Start Next {token}: accepted ({mode}, fade {fade_ms} ms)")
+        # A started (or already-running) next item satisfies any withheld
+        # Manual handoff; leaving the hold armed would make a later Auto
+        # release start a second item (Phase 0 hazard 9).
+        self._manual_hold_pending = False
+
+        if mode == "start_only":
+            paused_deck = active["paused_deck"]
+            if paused_deck is not None and paused_deck.claim_completion("start_next"):
+                active["outgoing"] = self._start_next_deck_identity(paused_deck)
+                self._retire_deck_respecting_gated_seek(
+                    paused_deck,
+                    on_retired=lambda: self._start_next_start_only(token),
+                )
+            else:
+                self._start_next_start_only(token)
+            return
+
+        # Block the natural trigger and VT entry for the outgoing deck while
+        # this transition owns "what starts next".
+        self._next_triggered = True
+        active["fade"] = deck_fade.MixerPadFade(outgoing.mixer_pad, self.main_pipeline)
+        active["incoming_delay_ms"] = None
+        if mode == "fade_and_start":
+            peek = self._start_next_peek_next_item()
+            if peek is None:
+                delay_ms = fade_ms
+            else:
+                cue_in = float(getattr(peek.track, "cue_in_seconds", 0.0) or 0.0)
+                delay_ms = max(0, int(round(fade_ms - (cue_in + SILENCE_PRIME_SECONDS) * 1000)))
+            active["incoming_delay_ms"] = delay_ms
+            if delay_ms <= 0:
+                # D7 fallback: the cue-in cannot land at fade end; start the
+                # incoming item (from media position zero) with the fade.
+                self._start_next_incoming_due(token)
+        if self._start_next_current(token) is not None and self._start_next_anchor_due(token):
+            # Not synced yet (the usual case right after binding): retry.
+            active["timers"].append(GLib.timeout_add(
+                START_NEXT_ANCHOR_POLL_MS, self._start_next_anchor_due, token))
+
+    @_glib_safe(default_return=False)
+    def _start_next_anchor_due(self, token):
+        """Begin the fade at the mixer's current position, then time the
+        incoming start (D7) and the fade end from that same moment."""
+        active = self._start_next_current(token)
+        if (
+            active is None or active.get("fade") is None
+            or active["fade"].detached or active["fade"].anchor_ns is not None
+        ):
+            return False
+        waited_ms = (time.monotonic() - active["accepted_monotonic"]) * 1000.0
+        if not active["fade"].anchor(
+            active["fade_ms"] * Gst.MSECOND,
+            fallback_to_clock=waited_ms >= START_NEXT_ANCHOR_MAX_WAIT_MS,
+        ):
+            return True
+        active["fade_ends_at"] = time.time() + active["fade_ms"] / 1000.0
+        delay_ms = active.get("incoming_delay_ms")
+        if delay_ms is not None and not active["incoming_attempted"]:
+            active["timers"].append(GLib.timeout_add(
+                max(1, delay_ms), self._start_next_incoming_due, token))
+        active["timers"].append(GLib.timeout_add(
+            active["fade_ms"] + START_NEXT_COMPLETION_GRACE_MS,
+            self._start_next_completion_due, token))
+        return False
+
+    def _start_next_outgoing_intact(self, active):
+        deck = active.get("outgoing_deck")
+        return (
+            deck is not None
+            and self.decks.get(deck.slot) is deck
+            and self._deck_is_live(deck)
+        )
+
+    def _start_next_start_incoming(self, active, slot):
+        """Exactly-once incoming start through the established path. Returns
+        "started", "empty" or "open_failed"."""
+        active["incoming_attempted"] = True
+        before = {id(deck) for deck in self.decks.values() if deck is not None}
+        failures = getattr(self, "_deck_open_failures", 0)
+        self._start_next_track(slot=slot)
+        started = [
+            deck for deck in self.decks.values()
+            if deck is not None and id(deck) not in before
+        ]
+        if started:
+            deck = started[0]
+            active["incoming"] = {
+                "slot": deck.slot, "log_item_id": getattr(deck.log_item, "id", None),
+            }
+            return "started"
+        if getattr(self, "_deck_open_failures", 0) > failures:
+            return "open_failed"
+        return "empty"
+
+    @_glib_safe(default_return=False)
+    def _start_next_start_only(self, token):
+        active = self._start_next_current(token)
+        if active is None:
+            return False
+        if self._start_next_peek_next_item() is None:
+            active["phase"] = "to_silence"
+            self._start_next_finish(token)
+            return False
+        if self._free_slot() is None:
+            self._start_next_fail(token, "slot_unavailable", restore=False)
+            return False
+        result = self._start_next_start_incoming(active, None)
+        if result == "started":
+            active["phase"] = "advancing"
+            self._start_next_finish(token)
+        elif result == "open_failed":
+            self._start_next_fail(token, "incoming_open_failed", restore=False)
+        else:
+            active["phase"] = "to_silence"
+            self._start_next_finish(token)
+        return False
+
+    @_glib_safe(default_return=False)
+    def _start_next_incoming_due(self, token):
+        """D7: create the incoming deck so its cue-in lands at fade end."""
+        active = self._start_next_current(token)
+        if active is None or active["incoming_attempted"]:
+            return False
+        if not active["outgoing_ended"] and not self._start_next_outgoing_intact(active):
+            self._start_next_cancel(token, "outgoing_retired", restore=False)
+            return False
+        if self._start_next_peek_next_item() is None:
+            active["incoming_attempted"] = True
+            active["phase"] = "to_silence"
+            return False
+        slot = active["incoming_slot"]
+        if self.decks.get(slot) is not None or not self._deck_slot_available(slot):
+            active["incoming_attempted"] = True
+            self._start_next_fail(token, "slot_unavailable", restore=True)
+            return False
+        result = self._start_next_start_incoming(active, slot)
+        if result == "started":
+            active["phase"] = "advancing"
+        elif result == "open_failed":
+            self._start_next_fail(token, "incoming_open_failed", restore=True)
+        else:
+            active["phase"] = "to_silence"
+        return False
+
+    @_glib_safe(default_return=False)
+    def _start_next_completion_due(self, token):
+        """Fade end: retire the outgoing deck once its pad is silent."""
+        active = self._start_next_current(token)
+        if active is None:
+            return False
+        if not active["incoming_attempted"]:
+            self._start_next_incoming_due(token)
+            active = self._start_next_current(token)
+            if active is None:
+                return False
+        if active["outgoing_ended"]:
+            return False
+        if not self._start_next_outgoing_intact(active):
+            self._start_next_cancel(token, "outgoing_retired", restore=False)
+            return False
+        fade = active["fade"]
+        elapsed_ms = (time.monotonic() - active["accepted_monotonic"]) * 1000.0
+        if (
+            fade.current_volume() > START_NEXT_SILENT_VOLUME
+            and elapsed_ms < active["fade_ms"] + START_NEXT_COMPLETION_MAX_EXTRA_MS
+        ):
+            active["timers"].append(GLib.timeout_add(
+                START_NEXT_COMPLETION_POLL_MS, self._start_next_completion_due, token))
+            return False
+        deck = active["outgoing_deck"]
+        if not deck.claim_completion("start_next"):
+            # EOS/error already owns this generation; _handle_deck_finished
+            # routes it to _start_next_outgoing_ended.
+            return False
+        fade.detach()
+        active["outgoing_ended"] = True
+        self._retire_deck_respecting_gated_seek(
+            deck, on_retired=lambda: self._start_next_finish(token)
+        )
+        return False
+
+    def _start_next_outgoing_ended(self, deck):
+        """The outgoing deck ended (EOS/error) before the fade did: retire it,
+        start the incoming item now if it was still waiting (exactly once),
+        then complete."""
+        active = getattr(self, "_start_next_active", None)
+        token = active["request_id"]
+        if active["fade"] is not None:
+            active["fade"].detach()
+        active["outgoing_ended"] = True
+
+        def _after():
+            current = self._start_next_current(token)
+            if current is None:
+                return
+            if not current["incoming_attempted"]:
+                self._start_next_incoming_due(token)
+            if self._start_next_current(token) is not None:
+                self._start_next_finish(token)
+
+        self._retire_deck_respecting_gated_seek(deck, on_retired=_after)
+
+    def _start_next_clear_timers(self, active):
+        context = GLib.MainContext.default()
+        for source_id in active.get("timers", ()):
+            # Fired one-shots are already gone; removing those only warns.
+            source = context.find_source_by_id(source_id)
+            if source is not None and not source.is_destroyed():
+                source.destroy()
+        active["timers"] = []
+
+    def _start_next_terminal(self, active, outcome, reason=None, **extra):
+        self._start_next_clear_timers(active)
+        self._start_next_active = None
+        self._start_next_record({
+            "request_id": active["request_id"],
+            "client_request_id": active.get("client_request_id"),
+            "outcome": outcome,
+            "reason": reason,
+            "mode": active["mode"],
+            "outgoing": active.get("outgoing"),
+            "incoming": active.get("incoming"),
+            "fade_ms": active.get("fade_ms"),
+            "accepted_at": active.get("accepted_at"),
+            **extra,
+        })
+
+    def _start_next_finish(self, token):
+        """Contract 3.6: the outgoing deck is gone; settle the outcome."""
+        active = self._start_next_current(token)
+        if active is None:
+            return
+        self._next_triggered = False
+        to_silence = active["phase"] == "to_silence"
+        manual_released = False
+        if (
+            not to_silence
+            and active["release_manual"]
+            and self.manual_mode
+            and not self._manual_from_mic
+            and not self._any_mic_live()
+            and not self._remote_dj_reconnecting()
+        ):
+            # D8: only an operator-owned hold, with no mic or Remote DJ
+            # recovery depending on it. The hold flag is already clear, so
+            # this cannot double-start.
+            self._manual_hold_pending = False
+            self._set_manual_mode(False)
+            manual_released = True
+        self._start_next_terminal(
+            active,
+            "completed_to_silence" if to_silence else "completed",
+            manual_released=manual_released,
+        )
+        if self._live_decks():
+            return
+        if self.manual_mode:
+            # Same as any natural end while Manual holds: the next Auto
+            # release starts the next item.
+            self._manual_hold_pending = True
+        elif to_silence:
+            # D4: the established end-of-queue path (live fill / next-hour
+            # retry) keeps its future authority; nothing restarts now.
+            slot = (active.get("outgoing") or {}).get("slot") or "A"
+            self._on_log_exhausted(slot)
+        else:
+            # The incoming item already finished during the fade.
+            self._start_next_track()
+
+    def _start_next_fail(self, token, reason, *, restore):
+        active = self._start_next_current(token)
+        if active is None:
+            return
+        self._start_next_release_outgoing(active, restore=restore)
+        self._next_triggered = False
+        self._start_next_terminal(active, "failed", reason)
+
+    def _start_next_cancel(self, token, reason, *, restore):
+        active = self._start_next_current(token)
+        if active is None:
+            return
+        self._start_next_release_outgoing(active, restore=restore)
+        self._next_triggered = False
+        self._start_next_terminal(active, "cancelled", reason)
+
+    def _start_next_release_outgoing(self, active, *, restore):
+        """Undo the fade on a surviving outgoing deck (ramp back to unity),
+        or just drop it when the deck is leaving anyway."""
+        fade = active.get("fade")
+        if fade is None or fade.detached:
+            return
+        if restore and self._start_next_outgoing_intact(active):
+            if fade.restore(START_NEXT_RESTORE_MS * Gst.MSECOND):
+                def _finish_restore(fade=fade):
+                    fade.detach(volume=1.0)
+                    return False
+                GLib.timeout_add(START_NEXT_RESTORE_MS + 100, _finish_restore)
+            return
+        fade.detach()
+
+    def _start_next_cancel_for_operator_command(self, op, slot):
+        """Contract 3.7: an Eject/Pause/Resume/Seek touching a deck of the
+        active transition supersedes it before the command runs."""
+        active = getattr(self, "_start_next_active", None)
+        if active is None:
+            return
+        deck = self.decks.get(slot)
+        involved = {
+            id(d) for d in (active.get("outgoing_deck"), active.get("paused_deck")) if d is not None
+        }
+        incoming = active.get("incoming")
+        if (
+            deck is None
+            or not (id(deck) in involved or (incoming and incoming.get("slot") == slot))
+        ):
+            return
+        targets_outgoing = deck is active.get("outgoing_deck")
+        self._start_next_cancel(
+            active["request_id"], f"superseded_by_{op}", restore=not targets_outgoing
+        )
+
+    def _start_next_cancel_for_reload(self):
+        active = getattr(self, "_start_next_active", None)
+        if active is not None:
+            self._start_next_cancel(active["request_id"], "superseded_by_reload", restore=False)
+
+    def _start_next_watchdog(self):
+        """Backstop for a transition whose GLib timers were lost: never leave
+        a deck partially faded or Start Next permanently busy."""
+        active = getattr(self, "_start_next_active", None)
+        if active is None:
+            return
+        limit = active.get("fade_ms", 0) / 1000.0 + START_NEXT_WATCHDOG_EXTRA_SECONDS
+        if time.monotonic() - active["accepted_monotonic"] <= limit:
+            return
+        fade = active.get("fade")
+        if fade is not None and not fade.detached:
+            fade.detach(volume=1.0 if self._start_next_outgoing_intact(active) else None)
+        self._next_triggered = False
+        self._start_next_terminal(active, "failed", "watchdog_timeout")
+
+    def _start_next_state(self):
+        """The published, bounded ``start_next`` status block (contract 3.8)."""
+        active = getattr(self, "_start_next_active", None)
+        published = None
+        if active is not None:
+            published = {
+                key: active.get(key)
+                for key in (
+                    "request_id", "client_request_id", "phase", "mode", "outgoing",
+                    "incoming", "fade_ms", "accepted_at", "fade_ends_at",
+                )
+            }
+        return {
+            "version": 1,
+            "active": published,
+            "recent": list(self.__dict__.get("_start_next_recent", ())),
+        }
+
     def _get_deck_position(self, deck):
         if deck.paused:
             return deck.paused_position
@@ -9466,6 +10056,8 @@ class PlaybackEngine:
             self._pause_deck(data.get("slot"))
         elif cmd == "deck_resume":
             self._resume_deck(data.get("slot"))
+        elif cmd == "start_next":
+            self._start_next_command(data)
         elif cmd == "deck_eject":
             expected = data.get("expected_log_item_id")
             if isinstance(expected, bool) or not isinstance(expected, int):
@@ -12387,6 +12979,7 @@ class PlaybackEngine:
         deck = self.decks.get(slot)
         if not deck or deck.paused:
             return
+        self._start_next_cancel_for_operator_command("pause", slot)
         if deck.gated_seek is not None:
             # A manual seek/resume is still being prepared for this deck
             # (whether or not its native call has been dispatched yet) --
@@ -12447,6 +13040,7 @@ class PlaybackEngine:
         deck = self.decks.get(slot)
         if not deck or not deck.paused:
             return
+        self._start_next_cancel_for_operator_command("resume", slot)
 
         resume_position = deck.paused_position
         log_item = deck.log_item
@@ -12472,6 +13066,7 @@ class PlaybackEngine:
         deck = self.decks.get(slot)
         if not deck:
             return
+        self._start_next_cancel_for_operator_command("seek", slot)
 
         was_paused = deck.paused
         log_item = deck.log_item
@@ -13577,6 +14172,7 @@ class PlaybackEngine:
             print(f"  [{slot}] Eject ignored -- deck no longer holds log_item "
                   f"{expected_log_item_id}")
             return
+        self._start_next_cancel_for_operator_command("eject", slot)
         vt_phase = self._vt.get("phase", "idle")
 
         if deck is None:
@@ -13638,6 +14234,7 @@ class PlaybackEngine:
         # being replaced; without this its timers could later fire its intro
         # VT and start an extra item, and its duck could stay applied.
         self._vt_abort("reload_current_log")
+        self._start_next_cancel_for_reload()
         with self._lock:
             decks_to_remove = [d for d in self.decks.values() if d]
 
@@ -14014,6 +14611,8 @@ class PlaybackEngine:
         self._check_stuck_decks()
         self._reload_queue_if_changed()
         self._sweep_active_message_queue()
+        if getattr(self, "_start_next_active", None) is not None:
+            self._start_next_watchdog()
 
         leading = self._leading_deck()
         if not leading or leading.finished:
@@ -14371,6 +14970,13 @@ class PlaybackEngine:
             return
         deck.mark_milestone("J_HANDLE_DECK_FINISHED_ENTERED")
         slot = deck.slot
+
+        # Roadmap 2.23: the outgoing deck of an active Start Next ended
+        # before its fade did -- the transition owns what starts next.
+        start_next = getattr(self, "_start_next_active", None)
+        if start_next is not None and start_next.get("outgoing_deck") is deck:
+            self._start_next_outgoing_ended(deck)
+            return
 
         # VT mode: if the deck ending is the outgoing one in a VT
         # sequence, run the VT branch instead of the normal path. VT
@@ -15029,6 +15635,10 @@ class PlaybackEngine:
                 # another open dashboard/remote-DJ session, or an
                 # external trigger like the weather beep bridge).
                 "fx_fires": self._fx_fires_state(),
+                # Roadmap 2.23 -- the engine's own Start Next acknowledgment:
+                # the active transition (if any) and the last terminal
+                # outcomes. The Console never infers execution from HTTP.
+                "start_next": self._start_next_state(),
                 # 1.7 release/version-skew visibility -- fixed at process
                 # start (see __init__), not re-derived here. None if git
                 # was unavailable when this process started.

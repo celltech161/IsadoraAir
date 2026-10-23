@@ -41,6 +41,7 @@ from .models import (
     Playlist,
     PlaylistItem,
     PlaylistLog,
+    PlayoutTransportConfig,
     RemoteDJConfig,
     Rotation,
     RotationSlot,
@@ -70,7 +71,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig", "playouttransportconfig"}
 _LOG_MODELS = {"emaillog", "playevent", "playeventsegment", "mediaplaybackincident", "royaltyreport"}
 
 
@@ -92,6 +93,15 @@ _FX_BUS_APPLY_MODES = {
     "volume_db": "live_runtime_update_after_commit",
     # _fx_fire() reads this value fresh before admitting each new fire.
     "polyphony_cap": "next_fx_fire",
+}
+_PLAYOUT_TRANSPORT_CONFIG_AUDIT_FIELDS = (
+    "start_next_fade_ms", "start_next_releases_manual",
+)
+_PLAYOUT_TRANSPORT_APPLY_MODES = {
+    # api_engine_start_next reads the saved row per click and carries the
+    # values in that command; a running transition keeps its own values.
+    "start_next_fade_ms": "next_start_next_command",
+    "start_next_releases_manual": "next_start_next_command",
 }
 _VOICE_TRACK_CONFIG_AUDIT_FIELDS = (
     "program_duck_db", "duck_ramp_ms", "min_gap_ms",
@@ -1807,6 +1817,61 @@ class VoiceTrackAdmin(admin.ModelAdmin):
                 obj.filepath,
             )
         return format_html('<span title="File OK" style="color:#6c6;">&#9679;</span>')
+
+
+@admin.register(PlayoutTransportConfig)
+class PlayoutTransportConfigAdmin(admin.ModelAdmin):
+    """Singleton (Config > Playout Transport Config). Roadmap 2.23 D1/D8."""
+
+    fieldsets = [
+        (None, {
+            "fields": ["start_next_fade_ms", "start_next_releases_manual"],
+            "description": (
+                "Start Next fades the outgoing deck on its own mixer input (the "
+                "microphone, FX, Voice Track and program gains are never touched) "
+                "and starts the next item so its cue-in lands at the end of the "
+                "fade. Saved values apply to the next Start Next press; a "
+                "transition already running keeps the values it started with. "
+                "No restart is needed."
+            ),
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not PlayoutTransportConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = PlayoutTransportConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_playouttransportconfig_change", args=[obj.pk])
+        )
+
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_singleton_config_snapshot(
+                PlayoutTransportConfig, obj, _PLAYOUT_TRANSPORT_CONFIG_AUDIT_FIELDS
+            )
+            if change else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_library_singleton_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_singleton_config_snapshot(
+                obj, _PLAYOUT_TRANSPORT_CONFIG_AUDIT_FIELDS
+            ),
+            fields=_PLAYOUT_TRANSPORT_CONFIG_AUDIT_FIELDS,
+            title="Playout transport configuration updated",
+            object_type="library.PlayoutTransportConfig",
+            object_name="Playout Transport Config",
+            apply_modes=_PLAYOUT_TRANSPORT_APPLY_MODES,
+        )
 
 
 @admin.register(VoiceTrackConfig)

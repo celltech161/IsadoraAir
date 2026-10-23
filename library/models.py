@@ -2,7 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import URLValidator
+from django.core.validators import MaxValueValidator, MinValueValidator, URLValidator
 from django.db import models, transaction
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
@@ -2390,6 +2390,62 @@ class VoiceTrackConfig(models.Model):
 
     def __str__(self):
         return f"VoiceTrackConfig (duck {self.program_duck_db:+.1f} dB, ramp {self.duck_ramp_ms}ms)"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+# Roadmap 2.23 (D1): Start Next fade bounds. The engine re-checks them on
+# every command (library.services.engine.START_NEXT_FADE_MS_MIN/MAX).
+START_NEXT_FADE_MS_DEFAULT = 2000
+START_NEXT_FADE_MS_MIN = 250
+START_NEXT_FADE_MS_MAX = 10000
+
+
+class PlayoutTransportConfig(models.Model):
+    """Console transport policy. Singleton (Config > Playout Transport).
+
+    Saved versus Running: the Start Next endpoint reads this row when it
+    accepts a click and puts the values into that one engine command, so a
+    save applies to the NEXT Start Next press. A transition already running
+    keeps the values it was accepted with. No reload command and no engine
+    restart are needed."""
+
+    start_next_fade_ms = models.PositiveIntegerField(
+        default=START_NEXT_FADE_MS_DEFAULT,
+        validators=[
+            MinValueValidator(START_NEXT_FADE_MS_MIN),
+            MaxValueValidator(START_NEXT_FADE_MS_MAX),
+        ],
+        verbose_name="Start Next fade (ms)",
+        help_text=(
+            f"How long Start Next fades the outgoing deck "
+            f"({START_NEXT_FADE_MS_MIN}-{START_NEXT_FADE_MS_MAX} ms). The next item "
+            "is started so its cue-in lands at the end of the fade."
+        ),
+    )
+    start_next_releases_manual = models.BooleanField(
+        default=False,
+        verbose_name="Start Next switches Manual to Auto",
+        help_text=(
+            "When on, a completed Start Next returns the Console to Auto, but only "
+            "if Manual was chosen by an operator: never while a Studio Mic or "
+            "Remote Mic holds Manual, and never during a Remote DJ reconnect grace."
+        ),
+    )
+
+    class Meta:
+        verbose_name = "Playout Transport Config"
+        verbose_name_plural = "Playout Transport Config"
+
+    def __str__(self):
+        return f"PlayoutTransportConfig (Start Next fade {self.start_next_fade_ms} ms)"
 
     def save(self, *args, **kwargs):
         self.pk = 1

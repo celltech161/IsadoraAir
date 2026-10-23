@@ -75,6 +75,7 @@ urlpatterns = [
     path('api/engine/queue/insert/', views.api_engine_insert_track, name='api-engine-insert-track'),
     path('api/engine/seek/', views.api_engine_seek, name='api-engine-seek'),
     path('api/engine/deck/<str:slot>/', views.api_engine_deck_command, name='api-engine-deck-command'),
+    path('api/engine/start-next/', views.api_engine_start_next, name='api-engine-start-next'),
     path('api/engine/mic-ptt/', views.api_engine_mic_ptt, name='api-engine-mic-ptt'),
     path('api/engine/remote-dj-gate/', views.api_engine_remote_dj_gate, name='api-engine-remote-dj-gate'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),

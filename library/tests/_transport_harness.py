@@ -192,6 +192,9 @@ class TransportHarness:
             engine.main_pipeline.add(bed_caps)
             bed.link(bed_caps)
             bed_caps.get_static_pad("src").link(target.request_pad_simple("sink_%u"))
+        # Fixed 10 ms program buffers (441 frames): whole-bin Goertzel
+        # analysis at multiples of 100 Hz in tone_level/tone_series.
+        engine.master_mixer.set_property("output-buffer-duration", 10 * Gst.MSECOND)
         engine.master_mixer.link(convert)
         convert.link(caps)
         caps.link(sink)
@@ -220,6 +223,7 @@ class TransportHarness:
         engine._poison_reported_identities = set()
         engine.loop = MagicMock()
         engine._engine_session_id = "harness-engine-instance"
+        engine._start_next_active = None
 
         # Queue.
         engine.log_items = []
@@ -397,6 +401,32 @@ class TransportHarness:
             (running, _goertzel_amplitude(samples, freq))
             for running, samples in self.program_buffers if samples
         ]
+
+
+def running_seconds(engine):
+    clock = engine.main_pipeline.get_clock()
+    return (clock.get_time() - engine.main_pipeline.get_base_time()) / Gst.SECOND
+
+
+def start_next_command(engine, *, fade_ms=400, expected="auto", release_manual=False,
+                       request_id=None, client_request_id=None, issued_at=None,
+                       engine_instance="auto", user_id=1):
+    import uuid as _uuid
+    if expected == "auto":
+        expected = {"live_log_item_ids": sorted(
+            deck.log_item.id for deck in engine._live_decks())}
+    return {
+        "command": "start_next",
+        "request_id": request_id or _uuid.uuid4().hex,
+        "client_request_id": client_request_id or _uuid.uuid4().hex,
+        "user_id": user_id,
+        "issued_at": time.time() if issued_at is None else issued_at,
+        "engine_instance": (engine._engine_session_id if engine_instance == "auto"
+                            else engine_instance),
+        "expected": expected,
+        "fade_ms": fade_ms,
+        "release_manual": release_manual,
+    }
 
 
 def _goertzel_amplitude(samples, freq):

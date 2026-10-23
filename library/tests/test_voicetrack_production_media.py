@@ -647,12 +647,16 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # pattern correction is D3C's own manual operations.
             # 2.22D3D: and active_messages.0005 (on 0004), the operator board's two
             # history indexes -- index operations are manual for the updater.
+            # 2.23: and library.0091 (PlayoutTransportConfig, CreateModel) and
+            # library.0092 (remote_dj Start Next GroupAccess, its own manual RunPython).
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
                               "active_messages.0004_message_content_type_identity",
                               "active_messages.0005_execution_history_indexes",
-                              "library.0090_seed_iportal_nav_item", "spoken.0001_initial",
+                              "library.0090_seed_iportal_nav_item",
+                              "library.0091_playouttransportconfig",
+                              "library.0092_remote_dj_start_next_access", "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
                               "produced_content.0004_backend_regular_only"])
@@ -668,6 +672,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("active_messages.0005_execution_history_indexes", "AddIndex"),
                               ("active_messages.0005_execution_history_indexes", "AddIndex"),
                               ("library.0090_seed_iportal_nav_item", "RunPython"),
+                              ("library.0092_remote_dj_start_next_access", "RunPython"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
