@@ -351,6 +351,12 @@ class StartNextMigrationReversibilityTests(TransactionTestCase):
 
     def test_authz_0009_and_library_0092_round_trip(self):
         from django.core.management import call_command
+        # Earlier TransactionTestCases flush migration-seeded rows; establish
+        # exactly the preconditions the two data migrations act on.
+        for name in ("Station Administrator", "Remote Host"):
+            Role.objects.get_or_create(name=name)
+        dj, _ = Group.objects.get_or_create(name="remote_dj")
+        GroupAccess.objects.get_or_create(group=dj, defaults={"allowed_exact": "/remote-dj/"})
         try:
             call_command("migrate", "authz", "0008", verbosity=0)
             self.assertFalse(Capability.objects.filter(slug="playout.start_next").exists())
