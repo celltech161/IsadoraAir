@@ -8257,6 +8257,12 @@ class PlaybackEngine:
             and not self.manual_mode
             and all(deck is None for deck in self.decks.values())
             and self._free_slot() is not None
+            # Roadmap 2.23 Phase 2a: an empty console is EXPECTED while a VT
+            # transition plays its outro tail / gap / long intro: the VT state
+            # machine starts the next item itself. Restarting here aired it
+            # under the outro VT and the VT then started a second one (two
+            # songs on air).
+            and self._vt.get("phase", "idle") == "idle"
         ):
             # With one poisoned slot, the surviving slot is briefly
             # unavailable while its previous generation reaches NULL. A deck
@@ -13968,7 +13974,20 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|stuck|generation={deck.generation}",
                 )
-                def _finish_watchdog_removal(slot=slot, incident_evidence=incident_evidence):
+                vt_outgoing = (
+                    self._vt.get("phase") in ("outro_playing", "outro_tail")
+                    and deck.track.id == self._vt.get("outgoing_track_id")
+                )
+
+                def _finish_watchdog_removal(slot=slot, incident_evidence=incident_evidence,
+                                             vt_outgoing=vt_outgoing):
+                    if vt_outgoing and self._vt.get("phase") == "outro_playing":
+                        # Roadmap 2.23 Phase 2a: same hand-over as a natural
+                        # EOS of the VT outgoing deck (_handle_deck_finished);
+                        # starting here stranded VT and its duck.
+                        self._vt_handle_outgoing_ended()
+                        self._persist_media_incident(incident_evidence)
+                        return
                     self._next_triggered = False
                     if self.decks.get(self._other_slot(slot)) is None and not self.manual_mode:
                         self._start_next_track(slot=slot)

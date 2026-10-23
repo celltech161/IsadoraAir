@@ -199,6 +199,78 @@ class EjectVoiceTrackTests(SimpleTestCase):
         self.assertLessEqual(len(self.h.live_ids()), 1)
 
 
+class VoiceTrackNaturalTransitionTests(SimpleTestCase):
+    """A VT transition after the outgoing deck ends NATURALLY, with the
+    engine's periodic teardown tick running (as run() installs it): the
+    tick's empty-console restart (5ecbfe3) must not start the incoming item
+    during the outro tail / gap, and the VT must start it exactly once."""
+
+    def setUp(self):
+        self.h = TransportHarness(self)
+        self.engine = self.h.engine
+        outro = fake_voicetrack(self.h.media("outro-vt", seconds=1.2, freq=900), 1.2)
+        intro = fake_voicetrack(self.h.media("intro-vt", seconds=0.6, freq=700), 0.6)
+        patch_voicetracks(self, outro=outro, intro=intro, gap_ms=300)
+        self.h.queue(
+            {"id": 1, "seconds": 1.0, "outro_starts": 0.2},
+            {"id": 2, "seconds": 8}, {"id": 3, "seconds": 8},
+        )
+        self.h.play()
+
+    def test_the_teardown_tick_cannot_bypass_or_duplicate_the_vt_incoming_start(self):
+        deck = _start(self.engine, "A")
+        pump(0.35)
+        self.assertTrue(self.engine._vt_maybe_enter(deck))
+        self.assertTrue(wait_until(lambda: self.engine.decks["A"] is None, 3.0))
+        self.assertIn(self.engine._vt["phase"], ("outro_tail", "inter_gap"))
+        # Outro VT still talking (outro_tail), then the gap: no music yet.
+        pump(0.5)
+        self.assertEqual(self.h.claims, [1], "music started under the outro VT / gap")
+        self.assertTrue(wait_until(lambda: self.engine._vt.get("phase") == "idle", 6.0))
+        pump(0.8)
+        self.assertEqual(self.h.claims, [1, 2])
+        self.assertEqual(self.h.live_ids(), [2])
+        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+
+
+class VoiceTrackWatchdogTests(SimpleTestCase):
+    """A stuck VT outgoing deck retired by the stuck-deck watchdog hands over
+    to the VT state machine exactly like its natural EOS."""
+
+    def setUp(self):
+        self.h = TransportHarness(self)
+        self.engine = self.h.engine
+        outro = fake_voicetrack(self.h.media("outro-vt", seconds=0.8, freq=900), 0.8)
+        intro = fake_voicetrack(self.h.media("intro-vt", seconds=0.4, freq=700), 0.4)
+        patch_voicetracks(self, outro=outro, intro=intro)
+        self.h.queue({"id": 1, "seconds": 8, "outro_starts": 1.0},
+                     {"id": 2, "seconds": 8}, {"id": 3, "seconds": 8})
+        self.engine._persist_media_incident = lambda _evidence: None
+        for mocked in (
+            patch("library.services.engine.DECK_STUCK_TIMEOUT_SECONDS", 0.05),
+            patch("library.services.engine.capture_deck_evidence", lambda *a, **k: {}),
+        ):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        self.h.play()
+
+    def test_watchdog_retirement_of_the_vt_outgoing_deck_keeps_the_vt_transition(self):
+        deck = _start(self.engine, "A")
+        pump(0.3)
+        self.assertTrue(self.engine._vt_maybe_enter(deck))
+        deck.mark_milestone("A_DECODER_AUDIO_EOS")   # an EOS that was never handled
+        pump(0.1)
+        self.engine._check_stuck_decks()
+        pump(0.3)
+        self.assertEqual(self.h.claims, [1], "the watchdog bypassed the VT transition")
+        self.assertEqual(self.h.occupants(), {"A": None, "B": None})
+        self.assertTrue(wait_until(lambda: self.engine._vt.get("phase") == "idle", 6.0),
+                        f"VT stranded in {self.engine._vt.get('phase')!r}")
+        pump(0.6)
+        self.assertEqual(self.h.claims, [1, 2])
+        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+
+
 class VoiceTrackTimerIdentityTests(SimpleTestCase):
     """Stale VT timers and fires are bound to their own sequence."""
 

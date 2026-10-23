@@ -351,6 +351,23 @@ class TransportHarness:
 
     def play(self):
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+        if not getattr(self, "_ticks_installed", False):
+            # The same periodic GLib ticks run() installs: gated seeks and
+            # bounded deck teardown advance only through them.
+            self._ticks_installed = True
+            sources = [
+                GLib.timeout_add(eng_module.DECK_SEEK_TICK_MS, self._tick, "_deck_seek_tick"),
+                GLib.timeout_add(100, self._tick, "_deck_teardown_tick"),
+            ]
+            self.testcase.addCleanup(
+                lambda: [GLib.source_remove(source) for source in sources
+                         if GLib.MainContext.default().find_source_by_id(source)])
+
+    def _tick(self, name):
+        if not self.engine.running:
+            return False
+        getattr(self.engine, name)()
+        return True
 
     # -- observation --------------------------------------------------------
     def occupants(self):
