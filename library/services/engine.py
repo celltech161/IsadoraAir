@@ -14923,6 +14923,17 @@ class PlaybackEngine:
         if deck.finished or deck.retirement_started:
             deck.mark_milestone("ERROR_CALLBACK_STALE_IGNORED")
             return True
+        if deck.paused:
+            # Roadmap 2.23: a paused generation is unlinked from the mixer
+            # (Pause unlinks before PAUSED, so a buffer in flight can fail
+            # not-linked) and contributes no program audio; Resume never
+            # reuses its bin -- it builds a fresh generation. Its error must
+            # not complete the occurrence: that turned Pause into a skip and,
+            # mid-Resume, started a second item next to the resumed one.
+            deck.mark_milestone("ERROR_ON_PAUSED_GENERATION_IGNORED")
+            print(f"  [{deck.slot}] Ignored stream error from paused generation "
+                  f"{deck.generation} ({message.parse_error()[0]})")
+            return True
         if not deck.claim_completion("error"):
             deck.mark_milestone("ERROR_DUPLICATE_COMPLETION_IGNORED")
             return True
@@ -14970,6 +14981,15 @@ class PlaybackEngine:
             return
         deck.mark_milestone("J_HANDLE_DECK_FINISHED_ENTERED")
         slot = deck.slot
+
+        if self.decks.get(slot) is not deck:
+            # Roadmap 2.23: this generation was already superseded in its slot
+            # (a gated seek/resume keeps its predecessor mapped until the
+            # successor prerolls). The successor carries the same occurrence:
+            # retire this one and advance nothing.
+            deck.mark_milestone("J_SUPERSEDED_GENERATION_RETIRED_ONLY")
+            self._retire_deck_respecting_gated_seek(deck)
+            return
 
         # Roadmap 2.23: the outgoing deck of an active Start Next ended
         # before its fade did -- the transition owns what starts next.

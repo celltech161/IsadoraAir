@@ -424,3 +424,67 @@ class OrdinaryAutomaticTransitionRegressionTests(SimpleTestCase):
                         f"decks={self.h.occupants()} closes={self.h.duration_closes}")
         pump(0.5)
         self.assertEqual(self.h.claims, [1, 2])
+
+
+def _post_stream_error(deck):
+    """What wavparse posts when a push fails not-linked: a STREAM error from an
+    element inside this exact generation's bin (routed by _deck_bin_map)."""
+    from gi.repository import GLib, Gst
+    element = deck.pipeline.iterate_elements().next()[1]
+    error = GLib.Error.new_literal(Gst.StreamError.quark(), "Internal data stream error.",
+                                   int(Gst.StreamError.FAILED))
+    element.post_message(Gst.Message.new_error(element, error, "streaming stopped, reason not-linked (-1)"))
+
+
+class NonProgramGenerationErrorTests(SimpleTestCase):
+    """r0116 Pause/Resume hazard found under full-suite load: Pause unlinks
+    the deck before PAUSED, so a buffer in flight can fail not-linked and the
+    bin posts a stream error. That generation contributes no program audio
+    (paused) or has already been superseded in its slot (the paused/seeked
+    predecessor a gated seek keeps until its successor prerolls); its error
+    must not complete the occurrence and start the next item -- observed: the
+    resumed item AND the next item both live."""
+
+    def setUp(self):
+        self.h = TransportHarness(self)
+        self.engine = self.h.engine
+        self.engine._persist_media_incident = lambda _evidence: None
+        patch_voicetracks(self)
+        self.h.queue({"id": 1, "seconds": 30}, {"id": 2, "seconds": 30}, {"id": 3, "seconds": 30})
+        self.h.play()
+
+    def test_an_error_from_a_paused_deck_does_not_start_the_next_item(self):
+        deck = _start(self.engine, "A")
+        pump(0.4)
+        self.engine._pause_deck("A")
+        _post_stream_error(deck)
+        pump(0.6)
+        self.assertEqual(self.h.claims, [1], "Pause turned into a skip")
+        self.assertIs(self.engine.decks["A"], deck)
+        self.assertTrue(deck.paused)
+        self.engine._resume_deck("A")
+        self.assertTrue(wait_until(
+            lambda: self.engine.decks["A"] is not None and self.engine.decks["A"].gated_seek is None, 6.0))
+        pump(0.4)
+        self.assertEqual(self.h.live_ids(), [1])
+
+    def test_an_error_from_a_seek_replaced_predecessor_does_not_start_another_item(self):
+        paused = _start(self.engine, "A")
+        pump(0.4)
+        self.engine._pause_deck("A")
+        self.engine._resume_deck("A")
+        self.assertIsNot(self.engine.decks["A"], paused)      # successor installed, predecessor kept
+        _post_stream_error(paused)
+        self.assertTrue(wait_until(
+            lambda: self.engine.decks["A"] is not None and self.engine.decks["A"].gated_seek is None, 6.0))
+        pump(0.6)
+        self.assertNotIn(2, self.h.claims, "a superseded generation's error started the next item")
+        self.assertEqual(self.h.live_ids(), [1])
+
+    def test_an_error_on_the_playing_deck_still_advances_as_before(self):
+        deck = _start(self.engine, "A")
+        pump(0.4)
+        _post_stream_error(deck)
+        self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 3.0), self.h.claims)
+        pump(0.4)
+        self.assertEqual(self.h.live_ids(), [2])
