@@ -383,6 +383,7 @@ this document.
 | `remote_dj.connect` | yes | **yes** (2.5C) — token issuance, signaling admission, session re-check |
 | `playout.control` | yes | **yes** (2.5C) — seek, deck commands (transport control; operator-only) |
 | `playout.queue_manage` | yes | **yes** (2.5C, new — see below) — queue insert, force-next, playlist play-now |
+| `playout.start_next` | yes | **yes** (2.23, `authz.0009`) — Start Next soft transition only; implies no deck, seek or mic authority |
 | `playout.manual_mode` | yes | **yes** (2.5C) |
 | `remote_dj.mic_gate` | yes | **yes** (2.5C) |
 | `studio.mic_ptt` | yes | **yes** (2.5C) |
@@ -430,6 +431,7 @@ distinction").
 | `POST /api/playlists/<pk>/play-now/` (`api_playlist_play_now`) | `playout.queue_manage` | found during the 2.5C re-sweep, see below |
 | `POST /api/engine/seek/` (`api_engine_seek`) | `playout.control` | |
 | `POST /api/engine/deck/<slot>/` (`api_engine_deck_command`) | `playout.control` | |
+| `POST /api/engine/start-next/` (`api_engine_start_next`) | `playout.start_next` | 2.23; CSRF-enforced; `remote_dj` reaches it through one exact GroupAccess path (`library.0092`) |
 | `POST /api/engine/manual-mode/` (`api_engine_manual_mode`) | `playout.manual_mode` | |
 | `POST /api/engine/remote-dj-gate/` (`api_engine_remote_dj_gate`) | `remote_dj.mic_gate` | usable by operator or the connected DJ |
 | `POST /api/engine/mic-ptt/` (`api_engine_mic_ptt`) | `studio.mic_ptt` | operator-only in practice (no Role grants it but Station Administrator) |
@@ -728,12 +730,12 @@ endpoint with no other check at all:
    `api_track_repick_cue_points`, and the three blocked-slot toggle
    endpoints. Now requires `library.manage_tracks`.
 
-## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006` and `authz.0007`; extended by `authz.0008`)
+## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006` and `authz.0007`; extended by `authz.0008` and `authz.0009`)
 
 | Role | Bound Group | Capabilities |
 |---|---|---|
 | Contributor | `Contributor` | `library.view`, `library.upload` |
-| Remote Host | `remote_dj` | `library.view`, `voicetrack.record`, `remote_dj.connect`, `playout.queue_manage`, `playout.manual_mode`, `remote_dj.mic_gate`, `fx.fire` |
+| Remote Host | `remote_dj` | `library.view`, `voicetrack.record`, `remote_dj.connect`, `playout.queue_manage`, `playout.start_next`, `playout.manual_mode`, `remote_dj.mic_gate`, `fx.fire` |
 | Station Administrator | *(none — not auto-bound to anything)* | every capability in the vocabulary |
 
 `Remote Host` holds `playout.queue_manage`, not `playout.control` — see
@@ -748,6 +750,15 @@ Administrator seed contains the complete capability vocabulary.
 `authz.0008` (iPortal Phase D1) adds `active_message.produce` and
 `active_message.control` to Station Administrator only; Remote Host and
 Contributor receive neither.
+
+`authz.0009` (roadmap 2.23) adds the schedule-restricted
+`playout.start_next` to Station Administrator and Remote Host; Contributor
+receives nothing. It deliberately does not imply `playout.control`: a Remote
+Host can Start Next but still cannot Eject, Pause/Resume or seek a deck.
+`library.0092` adds the single exact path `/api/engine/start-next/` to the
+`remote_dj` GroupAccess row. (An earlier, unimplemented Remote DJ
+gate-binding design draft also proposed an `authz.0009`; any future
+migration from that work must be numbered after, and depend on, this one.)
 
 The seed migration only binds `GroupRole` rows for `Contributor` and
 `remote_dj` because those are the only groups with real, existing
