@@ -1632,6 +1632,12 @@ class Deck:
         self.observed_duration_seconds = None
         self.completion_claimed = False
         self.completion_reason = None
+        # Roadmap 2.23: process-local order in which this logical occurrence
+        # first reached a deck (see PlaybackEngine._assign_occurrence_order).
+        # Continuation generations (seek, pause/resume) inherit it, so the
+        # older of two live decks is the outgoing one regardless of slot
+        # letter or Gst generation serial.
+        self.occurrence_order = 0
         self.probe_handles = []
         self.signal_handles = []
         # [P0] 1.8 WRJE follow-up -- deferred post-seek-EOS re-check.
@@ -5924,6 +5930,47 @@ class PlaybackEngine:
             or snapshot["queue_depth"]
         )
 
+    def _assign_occurrence_order(self, log_item, *, continuation):
+        """Roadmap 2.23: the outgoing/incoming order of logical occurrences.
+
+        A fresh occurrence gets the next process-local serial; a continuation
+        generation of an occurrence already on a deck (seek, resume, gated
+        seek replacement) keeps its serial. Bounded to the occurrences still
+        on a deck."""
+        orders = self.__dict__.setdefault("_occurrence_orders", {})
+        key = getattr(log_item, "id", None)
+        if continuation and key in orders:
+            order = orders[key]
+        else:
+            order = self.__dict__.get("_occurrence_serial", 0) + 1
+            self._occurrence_serial = order
+        on_deck = {
+            getattr(deck.log_item, "id", None)
+            for deck in self.decks.values() if deck is not None
+        }
+        for stale in [k for k in orders if k not in on_deck and k != key]:
+            del orders[stale]
+        orders[key] = order
+        return order
+
+    @staticmethod
+    def _deck_is_live(deck):
+        """Occupied and contributing program: paused decks have released
+        their mixer pad, and finished/retiring generations are leaving."""
+        return (
+            deck is not None
+            and not deck.paused
+            and not deck.finished
+            and not deck.retirement_started
+        )
+
+    def _live_decks(self):
+        """Live decks, oldest occurrence (the outgoing one) first."""
+        return sorted(
+            (deck for deck in self.decks.values() if self._deck_is_live(deck)),
+            key=lambda deck: (getattr(deck, "occurrence_order", 0), deck.generation),
+        )
+
     def _leading_deck(self):
         """The deck whose position the crossfade trigger should watch.
         Normally there's exactly one non-paused occupied slot; during a
@@ -7449,6 +7496,9 @@ class PlaybackEngine:
         )
         deck.probe_handles = probe_handles
         deck.signal_handles = signal_handles
+        deck.occurrence_order = self._assign_occurrence_order(
+            log_item, continuation=continuation_reason is not None
+        )
         # Stable, statically-created decoded-audio boundary for gated seeks.
         # The bin ghost pad starts targetless and only acquires this pad from
         # decodebin's dynamic pad-added callback; attaching the readiness gate
@@ -8993,8 +9043,15 @@ class PlaybackEngine:
         step_dur = max(1, int(duration_ms / steps))
         step_delta = (target_vol - start_vol) / steps
         step_counter = [0]
+        # Roadmap 2.23 Phase 2a: a newer ramp supersedes an older stepper
+        # (an attack still running when a release or abort begins must not
+        # keep writing its stale target afterwards).
+        ramp_serial = self.__dict__.get("_vt_ramp_serial", 0) + 1
+        self._vt_ramp_serial = ramp_serial
 
         def _do_step():
+            if self._vt_ramp_serial != ramp_serial:
+                return False
             step_counter[0] += 1
             new_vol = max(0.0, start_vol + step_delta * step_counter[0])
             self.vt_duck_gain.set_property("volume", new_vol)
@@ -9130,9 +9187,14 @@ class PlaybackEngine:
         incoming_path, incoming_duration = self._vt_resolve_audio(incoming_vt)
 
         cfg = VoiceTrackConfig.load()
+        vt_seq = self.__dict__.get("_vt_seq", 0) + 1
+        self._vt_seq = vt_seq
         with self._vt_lock:
             self._vt = {
                 "phase": "outro_playing",
+                # Roadmap 2.23 Phase 2a: every VT timer and fire is bound to
+                # this sequence; see _vt_current.
+                "seq": vt_seq,
                 "outgoing_track_id": outgoing_deck.track.id,
                 "outgoing_vt_filepath": outgoing_path,
                 "outgoing_vt_gain": outgoing_vt.gain_db if outgoing_vt else 0.0,
@@ -9175,6 +9237,13 @@ class PlaybackEngine:
         finished."""
         with self._vt_lock:
             phase = self._vt.get("phase", "idle")
+            expected_fire = self._vt.get(
+                "outgoing_vt_fire_id" if kind == "outro" else "incoming_vt_fire_id"
+            )
+        if fire_id != expected_fire:
+            # A fire from an aborted/earlier sequence (or a stray EOS) must
+            # never advance or complete the current one.
+            return
 
         if kind == "outro":
             with self._vt_lock:
@@ -9189,7 +9258,12 @@ class PlaybackEngine:
         elif kind == "intro":
             with self._vt_lock:
                 self._vt["incoming_vt_fire_id"] = None
-            self._vt_complete()
+                incoming_started = self._vt.get("incoming_started")
+            if incoming_started:
+                self._vt_complete()
+            # else: the intro VT ended at (or just before) the moment the
+            # incoming deck is due -- _vt_start_incoming_now starts it and,
+            # seeing no intro fire left, completes the sequence itself.
 
     def _vt_handle_outgoing_ended(self):
         """Called from _handle_deck_finished when the outgoing deck
@@ -9208,14 +9282,30 @@ class PlaybackEngine:
         else:
             self._vt_advance_to_intro_gap()
 
+    def _vt_current(self, seq, phase=None):
+        """True iff VT sequence ``seq`` is still the active one (and, if
+        given, still in ``phase``). Roadmap 2.23 Phase 2a: the VT GLib timers
+        carry their sequence, so a timer scheduled for a sequence that was
+        completed or aborted (play-now reload) is a no-op instead of firing an
+        old intro VT or starting an extra item."""
+        with self._vt_lock:
+            if self._vt.get("seq") != seq:
+                return False
+            return phase is None or self._vt.get("phase") == phase
+
     def _vt_advance_to_intro_gap(self):
         with self._vt_lock:
             self._vt["phase"] = "inter_gap"
+            seq = self._vt.get("seq")
         cfg = VoiceTrackConfig.load()
-        GLib.timeout_add(max(1, cfg.min_gap_ms), self._vt_start_intro_phase)
+        GLib.timeout_add(max(1, cfg.min_gap_ms), lambda: self._vt_start_intro_phase(seq))
 
-    def _vt_start_intro_phase(self):
+    def _vt_start_intro_phase(self, seq=None):
+        # seq is None only for a direct (unscheduled) call.
+        if seq is not None and not self._vt_current(seq, "inter_gap"):
+            return False
         with self._vt_lock:
+            seq = self._vt.get("seq")
             filepath = self._vt.get("incoming_vt_filepath")
             gain_db = self._vt.get("incoming_vt_gain") or 0.0
             vt_duration = self._vt.get("incoming_vt_duration") or 0.0
@@ -9238,15 +9328,23 @@ class PlaybackEngine:
             delay_ms = int((vt_duration - intro_until) * 1000)
         else:
             delay_ms = 0
-        GLib.timeout_add(max(1, delay_ms), self._vt_start_incoming_now)
+        GLib.timeout_add(max(1, delay_ms), lambda: self._vt_start_incoming_now(seq))
         return False   # single-shot timeout
 
-    def _vt_start_incoming_now(self):
+    def _vt_start_incoming_now(self, seq=None):
+        if seq is not None and not self._vt_current(seq, "intro_playing"):
+            return False
         # Reset _next_triggered so _start_next_track can fire naturally.
         self._next_triggered = False
-        slot = self._free_slot()
-        if slot is not None:
-            self._start_next_track(slot=slot)
+        if self._live_decks():
+            # Defensive (roadmap 2.23): something else already put program
+            # audio on air during the gap; the VT incoming start must not add
+            # a second item next to it.
+            print("  VT incoming start skipped -- a deck is already live")
+        else:
+            slot = self._free_slot()
+            if slot is not None:
+                self._start_next_track(slot=slot)
         with self._vt_lock:
             self._vt["incoming_started"] = True
             no_intro = self._vt.get("incoming_vt_fire_id") is None
@@ -9262,6 +9360,28 @@ class PlaybackEngine:
         with self._vt_lock:
             self._vt = {"phase": "idle"}
         print("  VT complete (duck released)")
+
+    def _vt_abort(self, reason):
+        """Roadmap 2.23 Phase 2a: end an in-progress VT sequence because the
+        program it belonged to was replaced (play-now log reload). Stops its
+        VT fires, releases vt_duck_gain to unity and returns to idle; the
+        sequence's pending timers then find their sequence gone."""
+        with self._vt_lock:
+            vt = self._vt
+            self._vt = {"phase": "idle"}
+        if vt.get("phase", "idle") == "idle":
+            return False
+        for key in ("outgoing_vt_fire_id", "incoming_vt_fire_id"):
+            fire_id = vt.get(key)
+            if fire_id is not None:
+                self._fx_stop(fire_id)
+        try:
+            ramp_ms = VoiceTrackConfig.load().duck_ramp_ms
+        except Exception:
+            ramp_ms = 300
+        self._vt_ramp_duck_to_db(0.0, ramp_ms)
+        print(f"  VT aborted ({reason}) from phase {vt.get('phase')} (duck released)")
+        return True
 
     def _get_deck_position(self, deck):
         if deck.paused:
@@ -9341,7 +9461,10 @@ class PlaybackEngine:
         elif cmd == "deck_resume":
             self._resume_deck(data.get("slot"))
         elif cmd == "deck_eject":
-            self._eject_deck(data.get("slot"))
+            expected = data.get("expected_log_item_id")
+            if isinstance(expected, bool) or not isinstance(expected, int):
+                expected = None
+            self._eject_deck(data.get("slot"), expected_log_item_id=expected)
         elif cmd == "force_next_hour":
             # Manual testing hook: do exactly what
             # _ensure_upcoming_logs does naturally ~30s before top of
@@ -13422,18 +13545,70 @@ class PlaybackEngine:
             termination_reason="clean_shutdown",
         )
 
-    def _eject_deck(self, slot):
+    def _eject_deck(self, slot, expected_log_item_id=None):
+        """Immediate hard stop of one deck, then advance -- roadmap 2.23
+        Phase 2a (D9) adds the guards that keep it from consuming a second
+        occurrence or bypassing a Voice Tracking transition:
+
+        - Eject starts the next item only if no NEWER live occurrence remains
+          (ejecting the outgoing deck of a crossfade must not start a third
+          item next to the incoming one).
+        - An Eject of an empty slot (typically a delayed command after the
+          deck ended naturally) is a no-op while another deck is live or a
+          VT transition owns "what starts next".
+        - Ejecting the VT outgoing deck ends its music bed early and hands
+          over to the VT state machine exactly as its natural EOS would.
+        - ``expected_log_item_id`` (sent by current Consoles) binds the
+          command to the occurrence the operator saw; a mismatch is a no-op.
+
+        The retired segment records termination_reason="eject"."""
         if slot not in SLOTS:
             return
         deck = self.decks.get(slot)
+        if expected_log_item_id is not None and (
+            deck is None or getattr(deck.log_item, "id", None) != expected_log_item_id
+        ):
+            print(f"  [{slot}] Eject ignored -- deck no longer holds log_item "
+                  f"{expected_log_item_id}")
+            return
+        vt_phase = self._vt.get("phase", "idle")
+
+        if deck is None:
+            if vt_phase != "idle":
+                print(f"  [{slot}] Eject of an empty slot ignored -- Voice Track "
+                      f"transition in progress ({vt_phase})")
+                return
+            if self._live_decks():
+                print(f"  [{slot}] Eject of an empty slot ignored -- another deck is live")
+                return
+            print(f"  [{slot}] Ejected (empty slot)")
+            self._start_next_track(slot=slot)
+            return
+
+        vt_outgoing = (
+            vt_phase in ("outro_playing", "outro_tail")
+            and deck.track.id == self._vt.get("outgoing_track_id")
+        )
+        vt_seq = self._vt.get("seq")
+        if not deck.claim_completion("eject"):
+            # EOS/error already owns this generation's completion and will
+            # advance exactly once itself.
+            print(f"  [{slot}] Eject ignored -- deck is already completing")
+            return
+        order = getattr(deck, "occurrence_order", 0)
 
         def _finish():
             print(f"  [{slot}] Ejected")
+            if vt_outgoing and self._vt_current(vt_seq, "outro_playing"):
+                self._vt_handle_outgoing_ended()
+                return
+            if any(
+                getattr(other, "occurrence_order", 0) > order
+                for other in self._live_decks()
+            ):
+                return
             self._start_next_track(slot=slot)
 
-        if deck is None:
-            _finish()
-            return
         # If deck's own gated seek is still "seeking" (native call maybe
         # in flight), this defers the actual removal -- and therefore
         # _finish() -- to the moment that call genuinely returns. See
@@ -13453,6 +13628,10 @@ class PlaybackEngine:
         deferred via the shared countdown until every slot has actually
         cleared, exactly as it always was when nothing was in flight."""
         _close_old_connections()
+        # Roadmap 2.23 Phase 2a: the VT sequence belonged to the program
+        # being replaced; without this its timers could later fire its intro
+        # VT and start an extra item, and its duck could stay applied.
+        self._vt_abort("reload_current_log")
         with self._lock:
             decks_to_remove = [d for d in self.decks.values() if d]
 
