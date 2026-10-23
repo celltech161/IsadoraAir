@@ -339,7 +339,7 @@ class TransportHarness:
             lead = spec.get("lead_silence", 0.0)
             freq = spec.get("freq", 440.0)
             path = self.media(
-                f"item-{spec['id']}-{seconds}s-{freq}hz-{lead}lead-{spec.get('amplitude', 0.4)}",
+                f"tone-{seconds}s-{freq}hz-{lead}lead-{spec.get('amplitude', 0.4)}",
                 seconds=seconds, freq=freq,
                 lead_silence=lead, amplitude=spec.get("amplitude", 0.4),
             )
