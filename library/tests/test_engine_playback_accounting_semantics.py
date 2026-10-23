@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from django.db import IntegrityError, close_old_connections, transaction
+from django.db import IntegrityError, close_old_connections, connection, transaction
 from django.test import TransactionTestCase
 from django.utils import timezone
 
@@ -177,7 +177,10 @@ class AuthoritativeAirStartTransactionTests(PlaybackAccountingFixture):
             except Exception as exc:  # pragma: no cover - asserted below
                 errors.append(exc)
             finally:
-                close_old_connections()
+                # close_old_connections() keeps a healthy persistent
+                # connection open; this thread's session would then outlive
+                # the test and block the test-database DROP at teardown.
+                connection.close()
 
         threads = [threading.Thread(target=worker) for _ in range(2)]
         for thread in threads:
@@ -367,7 +370,12 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
         # test deliberately restores the production methods.
         deck = engine._create_deck("A", item)
         self.assertIsNotNone(deck)
-        item.refresh_from_db()
+        # Assert on a fresh copy: refreshing ``item`` itself would clear the
+        # cached Category of the very object the deck's streaming-thread
+        # air-start probe reads, making that GStreamer thread lazily query
+        # (and keep) its own database connection -- which then blocks the
+        # test-database DROP. Production queues select_related("category").
+        deck_item, item = item, LogItem.objects.get(pk=item.pk)
         track.refresh_from_db()
         request.refresh_from_db()
         self.assertIsNotNone(item.playback_claimed_at)
@@ -382,7 +390,7 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
             return PlayEvent.objects.filter(log_item_id_snapshot=item.id).exists()
 
         self.assertTrue(_wait_until(committed, timeout=5.0), deck.milestone_snapshot())
-        item.refresh_from_db()
+        item = LogItem.objects.get(pk=deck_item.pk)
         track.refresh_from_db()
         request.refresh_from_db()
         self.assertIsNotNone(item.played_at)
