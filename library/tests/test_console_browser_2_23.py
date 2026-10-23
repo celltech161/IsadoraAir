@@ -386,6 +386,9 @@ class _ConsoleBrowserBase:
         a, b = self.box(page, "#deck-A"), self.box(page, "#deck-B")
         self.assertLess(a["right"], b["left"])
         self.assertAlmostEqual(a["top"], b["top"], delta=1)
+        # This harness's flushed database recreates no playout.start_next row:
+        # an unknown capability fails closed, so Start Next stays hidden here.
+        # Its presence is covered by test_start_next_browser_2_23.
         self.assertFalse(page.locator("#startNextSlot").is_visible())
         self.no_horizontal_overflow(page)
         self.shot(page, "full-desktop-deckA-live")

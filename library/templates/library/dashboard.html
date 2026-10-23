@@ -359,6 +359,69 @@
     min-width: 0;
   }
   .start-next-slot[hidden] { display: none; }
+  .start-next-slot {
+    flex-direction: column;
+    gap: 0.35rem;
+    width: 7.5rem;
+  }
+
+  /* Roadmap 2.23 Phase 3 -- Start Next: the soft, engine-faded transition.
+     Deliberately unlike the small square Eject transport icon: a large
+     accent pill with a visible word, so the two are never confused. */
+  .start-next-btn {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.15rem;
+    width: 100%;
+    min-height: 4.5rem;
+    padding: 0.55rem 0.5rem;
+    border: 2px solid var(--accent);
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--text-main);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .start-next-btn:hover:not(:disabled),
+  .start-next-btn:focus-visible { background: var(--accent); color: var(--bg-darker); }
+  .start-next-btn:focus-visible { outline: 3px solid var(--text-main); outline-offset: 2px; }
+  .start-next-btn:disabled {
+    border-color: var(--border-subtle);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+  .start-next-btn[data-sn-state="busy"],
+  .start-next-btn[data-sn-state="queued"] { border-style: dashed; }
+  .start-next-icon svg { width: 1.5rem; height: 1.5rem; display: block; }
+  .start-next-label { font-size: 0.9rem; line-height: 1.1; }
+  .start-next-route { font-size: 0.72rem; font-weight: 600; color: inherit; opacity: 0.85; }
+  .start-next-progress {
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border-subtle);
+    overflow: hidden;
+  }
+  .start-next-progress[hidden] { display: none; }
+  .start-next-progress > div {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    transition: width 1s linear;
+  }
+  .start-next-status {
+    min-height: 1.1em;
+    font-size: 0.72rem;
+    line-height: 1.2;
+    text-align: center;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+  }
+  .start-next-status[data-sn-tone="error"] { color: var(--danger); }
 
   @media (max-width: 700px) {
     .decks-row,
@@ -366,6 +429,23 @@
     .decks-row.has-start-next > #deck-A,
     .decks-row.has-start-next > .start-next-slot,
     .decks-row.has-start-next > #deck-B { grid-column: 1; }
+    /* Stacked decks: Start Next is its own compact row between them. */
+    .start-next-slot {
+      flex-direction: row;
+      flex-wrap: wrap;
+      width: 100%;
+      justify-content: center;
+    }
+    .start-next-btn {
+      flex-direction: row;
+      gap: 0.5rem;
+      width: auto;
+      min-width: 12rem;
+      min-height: 2.75rem;
+      padding: 0.4rem 1.2rem;
+    }
+    .start-next-progress { width: 12rem; flex-basis: 100%; max-width: 12rem; }
+    .start-next-status { flex-basis: 100%; }
   }
 
   /* Remote DJ console, mobile portrait: strip Deck B (Up Next preview)
@@ -1341,6 +1421,7 @@
   #consoleRoot.connection-stale #remoteDjConnectBtn:not(.active),
   #consoleRoot.connection-stale .playnow-btn:not(.ops-btn),
   #consoleRoot.connection-stale .deck-transport-btn,
+  #consoleRoot.connection-stale .start-next-btn,
   #consoleRoot.connection-stale .qt-next-btn,
   #consoleRoot.connection-stale .qt-drag-handle,
   #consoleRoot.connection-stale .qir-btn,
@@ -1454,11 +1535,25 @@
 <div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
-<div class="decks-row" id="decksRow">
+<div class="decks-row{% if console_caps.start_next %} has-start-next{% endif %}" id="decksRow">
   <div class="deck-panel" id="deck-A"></div>
-  {# Roadmap 2.23: reserved Start Next position (activated in Phase 3, #}
-  {# once the engine-owned operation exists). Empty and hidden today.   #}
+  {# Roadmap 2.23 Phase 3: Start Next, rendered only for playout.start_next #}
+  {# holders (presentation; the endpoint enforces the capability).        #}
+  {% if console_caps.start_next %}
+  <div class="start-next-slot" id="startNextSlot">
+    <button type="button" class="start-next-btn" id="startNextBtn" data-sn-state="unavailable"
+            aria-describedby="startNextStatus" disabled
+            title="Start Next — fade the playing deck and start the next item">
+      <span class="start-next-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 6.5v11l7.5-5.5zM11 6.5v11l7.5-5.5z"/><rect x="19.5" y="6.5" width="2" height="11" rx="0.5"/></svg></span>
+      <span class="start-next-label">Start Next</span>
+      <span class="start-next-route" id="startNextRoute"></span>
+    </button>
+    <div class="start-next-progress" id="startNextProgressWrap" aria-hidden="true" hidden><div id="startNextProgress"></div></div>
+    <div class="start-next-status" id="startNextStatus" role="status" aria-live="polite"></div>
+  </div>
+  {% else %}
   <div class="start-next-slot" id="startNextSlot" hidden></div>
+  {% endif %}
   <div class="deck-panel" id="deck-B"></div>
 </div>
 
@@ -1577,6 +1672,9 @@ const CONSOLE_CAPS = (() => {
 // /remote-dj/ regardless (a stray tap could jump on-air audio).
 const CAN_DECK_TRANSPORT = CONSOLE_CAPS.playout_control === true;
 const CAN_WAVEFORM_SEEK = CAN_DECK_TRANSPORT && !IS_REMOTE_DJ;
+// Start Next posts to /api/engine/start-next/ (playout.start_next). It does
+// not imply deck transport: a Remote Host may hold this and not the above.
+const CAN_START_NEXT = CONSOLE_CAPS.start_next === true;
 
 // Roadmap 2.23 -- icon + word mic buttons (#micPttBtn, #remoteDjGateBtn).
 // `state` drives the chip colour via data-mic-state; `word` is the visible
@@ -1625,7 +1723,7 @@ async function postEngineCommand(url, body) {
   }
   if (resp.ok) {
     return (payload && payload.ok === true)
-      ? { kind: 'accepted' }
+      ? { kind: 'accepted', payload }
       : { kind: 'unconfirmed', text: `Unexpected server response (HTTP ${resp.status}) — command outcome unconfirmed` };
   }
   if (resp.status === 401 || resp.status === 403) {
@@ -3071,6 +3169,7 @@ function renderConnectionStale(stale) {
   renderRemoteDjConnect(window.__rdjLastEngineState || {});
   const root = document.getElementById('consoleRoot');
   if (root) root.classList.toggle('connection-stale', stale);
+  renderStartNext(null);
 }
 
 // Evaluated at the START of every poll() tick, BEFORE awaiting
@@ -3351,7 +3450,7 @@ function updatePositionIndicators() {
   });
 }
 
-const EJECT_DESCRIPTION = 'stops this deck immediately (no fade) and starts the next queued item';
+const EJECT_DESCRIPTION = 'stops this deck immediately (no fade); playback advances to the next item';
 
 // Every deck-DOM replacement (rebuild, offline, empty) detaches the old
 // canvas; a ResizeObserver keeps its targets alive, so the old one must be
@@ -3634,6 +3733,9 @@ function renderDeckLive(slot, deck, transport) {
   }
 
   st.paused = !!deck.paused;
+  // The occurrence this deck shows -- Eject is bound to it (the engine
+  // ignores an Eject whose occurrence has since left the deck).
+  st.logItemId = Number.isSafeInteger(deck.log_item_id) && deck.log_item_id > 0 ? deck.log_item_id : null;
 
   const badge = document.getElementById(`transportBadge-${slot}`);
   const badgeState = st.paused ? 'PAUSED' : transport;
@@ -3658,7 +3760,11 @@ async function deckCommand(slot, action) {
   if (connectionStale) return;  // [P1] 1.7 -- deck transport mutation gate
   const key = `deck-${slot}`;
   const id = beginControlCommand(key);
-  const outcome = await postEngineCommand(`/api/engine/deck/${slot}/`, { action });
+  const body = { action };
+  if (action === 'eject' && deckState[slot].logItemId) {
+    body.expected_log_item_id = deckState[slot].logItemId;
+  }
+  const outcome = await postEngineCommand(`/api/engine/deck/${slot}/`, body);
   finishControlCommand(key, id, deckCommandOutcome(action, outcome));
   poll();
 }
@@ -3683,6 +3789,243 @@ async function seekTo(slot, seconds) {
     deckState[slot].localPosition = seconds;
     deckState[slot].lastPollTime = Date.now();
   }
+}
+
+// --- Roadmap 2.23 Phase 3: Start Next -------------------------------------
+// The engine owns the whole transition (fade, incoming timing, queue
+// advance). The browser only (1) posts one request bound to what it shows
+// -- the engine instance and the live occurrences -- and (2) reports what
+// the ENGINE says about that request in its published start_next block.
+// HTTP 202 means "queued" and nothing more: completion, refusal or failure
+// is shown only from engine status, and a request the engine never reports
+// is shown as unconfirmed after START_NEXT_CONFIRM_MS.
+const START_NEXT_CONFIRM_MS = 6000;
+const START_NEXT_OUTCOME_MS = 8000;
+const startNextUi = { pending: null, shown: null, lastData: null };
+const START_NEXT_REASONS = {
+  busy_start_next: 'another Start Next is in progress',
+  busy_voice_track: 'a Voice Track transition is in progress',
+  busy_seek: 'a seek is in progress',
+  target_changed: 'the decks changed before the engine ran it — press again',
+  stale_command: 'the request expired before the engine ran it',
+  engine_restarted: 'the engine restarted — press again',
+  duplicate_request: 'duplicate request ignored',
+  malformed: 'invalid request',
+  paused_deck_occupies_slot: 'a paused deck occupies the other slot',
+  slot_unavailable: 'the other deck slot is not ready',
+  nothing_to_start: 'nothing is queued',
+  fade_unsupported: 'this engine cannot fade',
+  incoming_open_failed: 'the next item could not be opened — the playing deck was restored',
+  outgoing_retired: 'the playing deck ended another way',
+  watchdog_timeout: 'the transition timed out — the playing deck was restored',
+  engine_stopped: 'the engine stopped',
+  superseded_by_eject: 'superseded by Eject',
+  superseded_by_pause: 'superseded by Pause',
+  superseded_by_resume: 'superseded by Resume',
+  superseded_by_seek: 'superseded by Seek',
+  superseded_by_reload: 'superseded by Play Now',
+};
+
+function startNextClientId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  return 'sn-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+}
+
+function startNextInstance(data) {
+  const rev = data && data.state_revision;
+  if (rev && typeof rev.instance === 'string' && rev.instance) return rev.instance;
+  return data && typeof data.engine_session_id === 'string' ? data.engine_session_id : null;
+}
+
+// Decks the engine reports on air (present and not paused), oldest
+// occurrence first -- the engine's own outgoing choice in an overlap.
+function startNextLiveDecks(data) {
+  const decks = (data && data.decks) || {};
+  return SLOTS.filter(s => decks[s] && !decks[s].paused)
+    .map(s => decks[s])
+    .sort((a, b) => ((a.air_started_at ?? Infinity) - (b.air_started_at ?? Infinity))
+      || ((a.generation || 0) - (b.generation || 0)));
+}
+
+function startNextBlock(data) {
+  const block = data && data.start_next;
+  return block && block.version === 1 && Array.isArray(block.recent) ? block : null;
+}
+
+function startNextOutcomeText(record) {
+  const why = START_NEXT_REASONS[record.reason] || record.reason || '';
+  switch (record.outcome) {
+    case 'completed':
+      return { text: record.manual_released ? 'Next item started · Auto restored' : 'Next item started', tone: 'ok' };
+    case 'completed_to_silence':
+      return { text: 'Faded to silence — nothing was queued', tone: 'ok' };
+    case 'rejected': return { text: `Not started: ${why}`, tone: 'error' };
+    case 'cancelled': return { text: `Stopped: ${why}`, tone: 'error' };
+    case 'failed': return { text: `Failed: ${why}`, tone: 'error' };
+    default: return { text: 'Unknown engine outcome', tone: 'error' };
+  }
+}
+
+function startNextShow(text, tone) {
+  startNextUi.shown = { text, tone, until: Date.now() + START_NEXT_OUTCOME_MS };
+}
+
+// Settle this page's pending request from an engine snapshot.
+function startNextResolvePending(data, block) {
+  const p = startNextUi.pending;
+  if (!p || !p.requestId || !data) return;
+  const instance = startNextInstance(data);
+  if (p.instance && instance && instance !== p.instance) {
+    startNextUi.pending = null;
+    startNextShow('Not confirmed: the engine restarted', 'error');
+    return;
+  }
+  const record = block ? block.recent.find(r => r.request_id === p.requestId) : null;
+  if (record) {
+    startNextUi.pending = null;
+    const view = startNextOutcomeText(record);
+    startNextShow(view.text, view.tone);
+    return;
+  }
+  if (block && block.active && block.active.request_id === p.requestId) {
+    p.engineSeen = true;
+    return;
+  }
+  if (!p.engineSeen && Date.now() - p.acceptedAt >= START_NEXT_CONFIRM_MS) {
+    startNextUi.pending = null;
+    startNextShow('Not confirmed by the engine — check the decks', 'error');
+  }
+}
+
+function startNextRoute(data, block) {
+  const active = block && block.active;
+  if (active && active.outgoing) {
+    const to = active.incoming ? `Deck ${active.incoming.slot}` : (active.phase === 'to_silence' ? 'silence' : '…');
+    return `Deck ${active.outgoing.slot} → ${to}`;
+  }
+  const live = startNextLiveDecks(data);
+  const queued = data && Array.isArray(data.queue) && data.queue.length > 0;
+  if (live.length >= 2) return `fade Deck ${live[0].slot}`;
+  if (live.length === 1) {
+    const other = live[0].slot === 'A' ? 'B' : 'A';
+    return `Deck ${live[0].slot} → ${queued ? 'Deck ' + other : 'silence'}`;
+  }
+  return queued ? 'start next' : '';
+}
+
+function renderStartNext(data) {
+  if (!CAN_START_NEXT) return;
+  const btn = document.getElementById('startNextBtn');
+  if (!btn) return;
+  if (data) startNextUi.lastData = data;
+  data = startNextUi.lastData;
+  const block = startNextBlock(data);
+  startNextResolvePending(data, block);
+  if (startNextUi.shown && Date.now() >= startNextUi.shown.until) startNextUi.shown = null;
+
+  const p = startNextUi.pending;
+  const active = block && block.active;
+  const transport = data && data.transport;
+  const live = startNextLiveDecks(data);
+  const anyDeck = !!(data && data.decks && SLOTS.some(s => data.decks[s]));
+  const queued = !!(data && Array.isArray(data.queue) && data.queue.length);
+  let state = 'ready';
+  let message = '';
+  if (p) {
+    state = p.requestId ? (active && active.request_id === p.requestId ? 'busy' : 'queued') : 'sending';
+  } else if (connectionStale || !data) {
+    state = 'unavailable'; message = 'Unavailable: connection lost';
+  } else if (transport !== 'PLAYING') {
+    state = 'unavailable';
+    message = transport === 'STALE' ? 'Unavailable: engine status is stale' : 'Unavailable: engine not running';
+  } else if (!block) {
+    state = 'unavailable'; message = 'Unavailable: this engine does not support Start Next yet';
+  } else if (active) {
+    state = 'busy';
+  } else if (!live.length && !anyDeck && !queued) {
+    state = 'unavailable'; message = 'Nothing to start';
+  }
+  if (state === 'sending') message = 'Sending…';
+  if (state === 'queued') message = 'Queued — waiting for the engine…';
+  if (state === 'busy' && active) {
+    const verb = active.phase === 'advancing' ? 'Transitioning' : 'Fading';
+    message = `${verb}: Deck ${active.outgoing ? active.outgoing.slot : '?'}`
+      + (active.incoming ? ` → Deck ${active.incoming.slot}` : '')
+      + (p ? '' : ' (another operator)');
+  }
+  let tone = 'info';
+  if (state === 'ready' || state === 'unavailable') {
+    if (startNextUi.shown) {
+      message = startNextUi.shown.text;
+      tone = startNextUi.shown.tone;
+    }
+  }
+
+  btn.disabled = state !== 'ready';
+  btn.dataset.snState = state;
+  btn.setAttribute('aria-busy', state === 'busy' || state === 'queued' || state === 'sending' ? 'true' : 'false');
+  const route = document.getElementById('startNextRoute');
+  if (route) route.textContent = data ? startNextRoute(data, block) : '';
+  const status = document.getElementById('startNextStatus');
+  if (status) {
+    if (status.textContent !== message) status.textContent = message;
+    status.dataset.snTone = tone;
+  }
+  const wrap = document.getElementById('startNextProgressWrap');
+  const bar = document.getElementById('startNextProgress');
+  if (wrap && bar) {
+    const span = active && active.fade_ends_at && active.accepted_at && data && data.timestamp
+      ? active.fade_ends_at - active.accepted_at : 0;
+    wrap.hidden = !(state === 'busy' && span > 0);
+    if (!wrap.hidden) {
+      const fraction = Math.max(0, Math.min(1, (data.timestamp - active.accepted_at) / span));
+      bar.style.width = `${Math.round(fraction * 100)}%`;
+    } else {
+      bar.style.width = '0';
+    }
+  }
+}
+
+async function startNext() {
+  if (!CAN_START_NEXT || connectionStale || startNextUi.pending) return;  // single flight
+  const data = startNextUi.lastData;
+  const btn = document.getElementById('startNextBtn');
+  if (!data || !latestStatusOk || !btn || btn.disabled) return;
+  const live = startNextLiveDecks(data);
+  const ids = live.map(d => d.log_item_id);
+  const body = {
+    client_request_id: startNextClientId(),
+    engine_instance: startNextInstance(data),
+  };
+  // Bind the request to the occurrences on screen; the engine refuses it
+  // (target_changed) if what is on air has moved on, so a delayed or
+  // repeated press can never skip a second item.
+  if (ids.every(id => Number.isSafeInteger(id) && id > 0)) {
+    body.expected = { live_log_item_ids: ids };
+  }
+  const pending = { requestId: null, clientId: body.client_request_id, instance: body.engine_instance,
+                    acceptedAt: null, engineSeen: false };
+  startNextUi.pending = pending;
+  startNextUi.shown = null;
+  renderStartNext(null);
+  const outcome = await postEngineCommand('/api/engine/start-next/', body);
+  if (startNextUi.pending !== pending) return;
+  if (outcome.kind === 'accepted' && outcome.payload && typeof outcome.payload.request_id === 'string') {
+    pending.requestId = outcome.payload.request_id;
+    pending.acceptedAt = Date.now();
+  } else {
+    startNextUi.pending = null;
+    startNextShow(outcome.kind === 'accepted'
+      ? 'Start Next: unexpected server response — outcome unconfirmed'
+      : `Start Next ${outcome.text}`, 'error');
+  }
+  renderStartNext(null);
+  poll();
+}
+
+if (CAN_START_NEXT) {
+  const btn = document.getElementById('startNextBtn');
+  if (btn) btn.addEventListener('click', startNext);
 }
 
 let currentLogId = null;
@@ -3956,6 +4299,7 @@ async function poll() {
   const decks = data.decks || {};
   const queue = data.queue || [];
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
+  renderStartNext(data);
   renderQueue(data);
   renderMicPtt(data);
   renderRemoteDjConnect(data);

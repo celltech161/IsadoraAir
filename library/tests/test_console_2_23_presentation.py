@@ -9,8 +9,9 @@ by itself:
   replaces the endpoint's own enforcement (direct API requests are still
   refused, and no engine command is queued);
 * deterministic template contracts for the Phase 1 markup (ops-row order,
-  disabled Line In, the single icon boundary, the reserved Start Next
-  slot, the single waveform renderer, the honest Eject label).
+  disabled Line In, the single icon boundary, the Start Next slot
+  (activated in Phase 3), the single waveform renderer, the honest Eject
+  label).
 
 ``enqueue_engine_command`` is mocked wherever an endpoint is called, so
 nothing here can reach /run/isadoraair/engine_cmd.d.
@@ -85,7 +86,7 @@ class ConsoleCapabilityFlagTests(TestCase):
 
     def test_superuser_full_console_gets_deck_transport(self):
         self.client.force_login(self.superuser)
-        self.assertEqual(_console_caps(self.client.get("/")), {"playout_control": True})
+        self.assertEqual(_console_caps(self.client.get("/")), {"playout_control": True, "start_next": True})
 
     def test_staff_gets_deck_transport_on_both_pages(self):
         self.client.force_login(self.staff)
@@ -102,11 +103,12 @@ class ConsoleCapabilityFlagTests(TestCase):
         self.client.force_login(self.remote_host)
         response = self.client.get("/remote-dj/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(_console_caps(response), {"playout_control": False})
+        # Phase 3: Start Next (playout.start_next) without deck transport.
+        self.assertEqual(_console_caps(response), {"playout_control": False, "start_next": True})
 
     def test_flag_object_carries_only_the_known_presentation_keys(self):
         self.client.force_login(self.superuser)
-        self.assertEqual(set(_console_caps(self.client.get("/"))), {"playout_control"})
+        self.assertEqual(set(_console_caps(self.client.get("/"))), {"playout_control", "start_next"})
 
     @patch("library.views.enqueue_engine_command")
     def test_hidden_controls_are_still_refused_by_the_server(self, mock_enqueue):
@@ -367,19 +369,41 @@ class ConsoleTemplateContractTests(SimpleTestCase):
                 self.assertTrue(self._function(fn).split("\n")[1].strip() == "releaseDeckCanvas(slot);")
         self.assertIn("(resolution: ${window.devicePixelRatio || 1}dppx)", self.template)
 
-    def test_start_next_slot_is_reserved_hidden_and_between_the_decks(self):
-        row = self.template[self.template.index('<div class="decks-row"'):]
+    def test_start_next_sits_between_the_decks_for_holders_and_stays_hidden_otherwise(self):
+        row = self.template[self.template.index('<div class="decks-row'):]
         row = row[:row.index('<div class="queue-panel')]
+        self.assertIn('{% if console_caps.start_next %} has-start-next{% endif %}', row)
+        holder, _, other = row.partition("{% else %}")
+        # Both branches render the slot between Deck A and Deck B.
         self.assertLess(row.index('id="deck-A"'), row.index('id="startNextSlot"'))
-        self.assertLess(row.index('id="startNextSlot"'), row.index('id="deck-B"'))
-        slot_tag = row[row.index('<div class="start-next-slot"'):]
-        slot_tag = slot_tag[:slot_tag.index(">") + 1]
-        self.assertIn(" hidden", slot_tag)
-        # Phase 1 never activates the slot or calls a Start Next endpoint.
-        self.assertNotIn("has-start-next'", self.template)
-        self.assertNotIn("/api/engine/start-next", self.template)
+        self.assertLess(row.rindex('id="startNextSlot"'), row.index('id="deck-B"'))
+        self.assertIn('id="startNextBtn"', holder)
+        self.assertIn('aria-describedby="startNextStatus"', holder)
+        self.assertIn('role="status" aria-live="polite"', holder)
+        self.assertIn('<div class="start-next-slot" id="startNextSlot" hidden></div>', other)
         self.assertIn(".console-remote_dj .start-next-slot { order: 2; }", self.template)
         self.assertIn(".console-remote_dj .deck-panel.deck-mode-preview { order: 3; }", self.template)
+
+    def test_start_next_is_engine_authoritative_with_no_browser_transport_timing(self):
+        self.assertIn("const CAN_START_NEXT = CONSOLE_CAPS.start_next === true;", self.template)
+        self.assertEqual(self.template.count("postEngineCommand('/api/engine/start-next/'"), 1)
+        self.assertIn("postEngineCommand('/api/engine/start-next/', body)", self._function("startNext"))
+        for fn in ("startNext", "renderStartNext", "startNextResolvePending", "startNextRoute"):
+            with self.subTest(fn=fn):
+                body = self._function(fn)
+                self.assertNotIn("setInterval", body)
+                self.assertNotIn("setTimeout", body)
+                self.assertNotIn("volume", body)
+        # 202 only records the request id; completion comes from the engine.
+        self.assertIn("pending.requestId = outcome.payload.request_id;", self._function("startNext"))
+        resolve = self._function("startNextResolvePending")
+        self.assertIn("block.recent.find(r => r.request_id === p.requestId)", resolve)
+        self.assertIn("instance !== p.instance", resolve)
+
+    def test_eject_is_bound_to_the_occurrence_the_deck_shows(self):
+        command = self._function("deckCommand")
+        self.assertIn("body.expected_log_item_id = deckState[slot].logItemId;", command)
+        self.assertIn("if (action === 'eject' && deckState[slot].logItemId) {", command)
 
     def test_no_new_polling_or_transport_timers(self):
         self.assertEqual(self.template.count("setInterval(poll, 1000);"), 1)
