@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "release_id": "r0117",
+  "previous_release_id": "r0116",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 2.23 Track A: engine-owned Start Next (fades the outgoing deck's own mixer input, cue-in lands at fade end, exactly once, fade-to-silence when nothing is queued) for the new playout.start_next capability (Station Administrator, Remote Host); Console control between the decks; Eject and Voice Tracking safety fixes. authz.0009/library.0092 RunPython under the trusted companion, library.0091 CreateModel. Restart Gunicorn and the engine. No runtime, nginx, unit or package change.",
+  "migrations_required": [
+    "authz.0009_playout_start_next_capability",
+    "library.0091_playouttransportconfig",
+    "library.0092_remote_dj_start_next_access"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
