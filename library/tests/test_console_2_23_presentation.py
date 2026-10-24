@@ -449,10 +449,15 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         self.assertIn("const link = rdjLocalLink(data);", connect)
         self.assertNotIn("const weAreConnected = !!rdjPc;", connect)
         gate = self._function("renderRemoteDjGate")
-        self.assertIn("const mayGate = rdjMayGate(data);", gate)
+        # Roadmap 2.17A: the gate needs the verified owner AND the complete
+        # session binding (rdjGateBinding starts from rdjMayGate).
+        self.assertIn("const mayGate = rdjGateBinding(data) !== null;", gate)
         self.assertIn("btn.disabled = !mayGate;", gate)
         self.assertNotIn("!!rdjPc", gate)
-        self.assertIn("if (!rdjMayGate(state)) return;", self._function("toggleRemoteDjGate"))
+        toggle = self._function("toggleRemoteDjGate")
+        self.assertIn("const binding = rdjGateBinding(state);\n    if (!binding) return;", toggle)
+        self.assertIn("if (!rdjMayGate(data) || !rdjAttemptId || !rdjControlKey) return null;",
+                      self._function("rdjGateBinding"))
         may = self._function("rdjMayGate")
         self.assertIn("return rdjLocalLink(data) === 'owner';", may)
         self.assertIn("const thisBrowser = link === 'owner';", self._function("rdjOwnerPresentation"))
@@ -461,6 +466,31 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         for raw in ("remote_dj_owner.user_id", "remote_dj_owner.attempt_id", "owner.user_id", "owner.attempt_id"):
             with self.subTest(raw=raw):
                 self.assertNotIn(raw, self.template)
+
+    def test_remote_mic_requests_carry_the_2_17a_session_binding(self):
+        toggle = self._function("toggleRemoteDjGate")
+        self.assertIn("const body = { active: desiredActive, sequence: rdjGateSeq, ...binding };", toggle)
+        # Exactly one same-body retry, only for a lost response.
+        self.assertEqual(toggle.count("postEngineCommand('/api/engine/remote-dj-gate/', body)"), 2)
+        self.assertIn("if (outcome.kind === 'unconfirmed' && controlFb('remoteDjGateBtn').seq === id\n"
+                      "        && rdjGateStillBound(binding)) {", toggle)
+        self.assertNotIn("{ active: desiredActive })", toggle)
+        binding = self._function("rdjGateBinding")
+        self.assertIn("return { attempt_id: rdjAttemptId, control_key: rdjControlKey, engine_instance: instance };",
+                      binding)
+
+    def test_control_key_lives_only_in_page_memory_for_one_attempt(self):
+        self.assertIn("rdjControlKey = null;", self._function("rdjDisconnect"))
+        connect = self._function("toggleRemoteDjConnect")
+        self.assertIn("/^[0-9a-f]{64}$/.test(tokenResponse.control_key)", connect)
+        self.assertIn("if (!token || !rdjAttemptId || !rdjControlKey ||", connect)
+        self.assertLess(connect.index("rdjControlKey = null;"), connect.index("fetch('/api/remote-dj/token/'"))
+        uses = [line.strip() for line in self.template.splitlines() if "rdjControlKey" in line]
+        for line in uses:
+            with self.subTest(line=line):
+                for sink in ("localStorage", "sessionStorage", "title", "textContent", "innerHTML",
+                             "console.", "setAttribute", "rdjWs.send", "dataset"):
+                    self.assertNotIn(sink, line)
 
     def test_browser_key_is_derived_locally_and_dropped_on_disconnect(self):
         self.assertIn("window.crypto.subtle.digest('SHA-256'", self._function("rdjDeriveBrowserKey"))

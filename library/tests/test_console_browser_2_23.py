@@ -1034,6 +1034,7 @@ class _ConsoleBrowserBase:
           rdjPc = { close() {}, iceConnectionState: 'connected' };
           rdjAttemptId = attempt;
           rdjBrowserKey = await rdjDeriveBrowserKey(attempt);
+          rdjControlKey = 'ab'.repeat(32);   // 2.17A: the token response's control key
         }""", attempt)
 
     def test_observer_sees_who_is_connected(self):

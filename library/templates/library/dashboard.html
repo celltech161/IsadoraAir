@@ -1727,14 +1727,14 @@ async function postEngineCommand(url, body) {
       : { kind: 'unconfirmed', text: `Unexpected server response (HTTP ${resp.status}) — command outcome unconfirmed` };
   }
   if (resp.status === 401 || resp.status === 403) {
-    return { kind: 'refused', text: 'refused: permission denied (role or schedule)' };
+    return { kind: 'refused', text: 'refused: permission denied (role or schedule)', payload };
   }
   if (resp.status === 503 && payload && typeof payload.error === 'string'
       && payload.error.startsWith('engine command dispatch failed')) {
     return { kind: 'unqueued', text: 'not queued: engine command queue unavailable' };
   }
   if (resp.status >= 400 && resp.status < 500) {
-    return { kind: 'rejected', text: `rejected by the server (HTTP ${resp.status})` };
+    return { kind: 'rejected', text: `rejected by the server (HTTP ${resp.status})`, payload };
   }
   return { kind: 'unconfirmed', text: `Server error (HTTP ${resp.status}) — command outcome unconfirmed` };
 }
@@ -2258,12 +2258,28 @@ async function toggleRemoteDjGate() {
   const btn = document.getElementById('remoteDjGateBtn');
   if (state.remote_dj_connected) {
     // PTT gate mode. Re-checked at action time (keyboard/programmatic
-    // clicks included): a page that isn't the verified owner sends nothing.
-    if (!rdjMayGate(state)) return;
+    // clicks included): a page that isn't the verified owner, or lacks any
+    // part of the session binding, sends nothing.
+    const binding = rdjGateBinding(state);
+    if (!binding) return;
     const desiredActive = !btn.classList.contains('active');
+    // Roadmap 2.17A: one press = one sequence number, reused verbatim on the
+    // retry below, so the engine applies it at most once and never after a
+    // newer press.
+    rdjGateSeq += 1;
+    const body = { active: desiredActive, sequence: rdjGateSeq, ...binding };
+    rdjGateSentSeq = rdjGateSeq;
     const id = beginControlCommand('remoteDjGateBtn');
     btn.classList.add('pending');
-    const outcome = await postEngineCommand('/api/engine/remote-dj-gate/', { active: desiredActive });
+    let outcome = await postEngineCommand('/api/engine/remote-dj-gate/', body);
+    if (outcome.kind === 'unconfirmed' && controlFb('remoteDjGateBtn').seq === id
+        && rdjGateStillBound(binding)) {
+      // Lost response, not a refusal: resend the SAME press once -- but only
+      // while this page still holds that exact binding (a page that lost
+      // ownership meanwhile sends nothing more).
+      outcome = await postEngineCommand('/api/engine/remote-dj-gate/', body);
+    }
+    outcome = rdjGateOutcome(outcome);
     if (!finishControlCommand('remoteDjGateBtn', id, outcome, desiredActive)) {
       // Superseded by a newer Remote Mic request: that one owns the UI.
     } else if (outcome.kind !== 'accepted') {
@@ -2374,6 +2390,15 @@ async function rdjDeriveBrowserKey(attemptId) {
   const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(attemptId));
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
 }
+// Roadmap 2.17A -- this attempt's Remote Mic control credential, from the
+// token response that minted the attempt. Proves to the server that a gate
+// request comes from THIS browser (the attempt id and browser key are not
+// secret). Page memory only: never stored, logged, shown or sent anywhere but
+// the gate request; cleared with the connection.
+let rdjControlKey = null;
+let rdjGateSeq = 0;          // per-attempt press counter (the request's sequence)
+let rdjGateSentSeq = 0;      // newest sequence this page sent
+let rdjGateReportedSeq = 0;  // newest engine outcome already shown
 let rdjIceServers = [];
 let rdjFirstIceCandidateSeen = false;
 let rdjStatsTimers = [];
@@ -2550,6 +2575,10 @@ async function toggleRemoteDjConnect() {
   rdjConnectStartedAt = performance.now();
   rdjAttemptId = null;
   rdjBrowserKey = null;
+  rdjControlKey = null;
+  rdjGateSeq = 0;
+  rdjGateSentSeq = 0;
+  rdjGateReportedSeq = 0;
   rdjIceServers = [];
   rdjFirstIceCandidateSeen = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
@@ -2588,9 +2617,11 @@ async function toggleRemoteDjConnect() {
     rdjDeriveBrowserKey(keyedAttempt).then(key => {
       if (rdjAttemptId === keyedAttempt) rdjBrowserKey = key;
     }).catch(() => {});
+    rdjControlKey = typeof tokenResponse.control_key === 'string'
+      && /^[0-9a-f]{64}$/.test(tokenResponse.control_key) ? tokenResponse.control_key : null;
     rdjIceServers = tokenResponse.ice_servers;
     tokenElapsedMs = performance.now() - rdjConnectStartedAt;
-    if (!token || !rdjAttemptId || !Array.isArray(rdjIceServers) || !rdjIceServers.length) {
+    if (!token || !rdjAttemptId || !rdjControlKey || !Array.isArray(rdjIceServers) || !rdjIceServers.length) {
       throw new Error('incomplete token response');
     }
     btn.title = 'Connection attempt ' + rdjAttemptId;
@@ -2762,6 +2793,7 @@ function rdjDisconnect() {
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
   rdjBrowserKey = null;  // Phase 1B: this browser no longer owns a connection
+  rdjControlKey = null;  // 2.17A: nor its Remote Mic credential
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
   rdjGainNode = null;
   const audio = document.getElementById('remoteMonitorAudio');
@@ -2888,6 +2920,61 @@ function rdjLocalLink(data) {
 // installing this release requires, ends any Remote DJ session anyway.)
 function rdjMayGate(data) {
   return rdjLocalLink(data) === 'owner';
+}
+
+// Roadmap 2.17A -- the Remote Mic request's mandatory session binding: the
+// verified owner page's own attempt, its control credential and the engine
+// run of the same fresh snapshot. null when any part is missing -- the gate
+// is then read-only and nothing is sent. The server and the engine enforce
+// the binding themselves; this only keeps the page from sending what they
+// would refuse.
+function rdjGateBinding(data) {
+  if (!rdjMayGate(data) || !rdjAttemptId || !rdjControlKey) return null;
+  const instance = startNextInstance(data);
+  if (!instance) return null;
+  return { attempt_id: rdjAttemptId, control_key: rdjControlKey, engine_instance: instance };
+}
+
+function rdjGateStillBound(binding) {
+  const now = rdjGateBinding(window.__rdjLastEngineState || {});
+  return !!now && now.attempt_id === binding.attempt_id && now.control_key === binding.control_key
+    && now.engine_instance === binding.engine_instance;
+}
+
+const RDJ_GATE_REFUSALS = {
+  not_owner: 'this browser does not hold the Remote DJ connection',
+  not_current_session: 'that connection is no longer the live session',
+  engine_unavailable: 'engine status is unavailable',
+  engine_restarted: 'the engine restarted',
+  stale_command: 'the request arrived too late',
+  out_of_order: 'a newer Remote Mic press superseded it',
+  not_authorized: 'permission denied (role or schedule)',
+  no_session: 'no Remote DJ session is active',
+  session_ended: 'the Remote DJ session ended',
+};
+
+// Name the server's refusal reason, when it gave one.
+function rdjGateOutcome(outcome) {
+  const reason = outcome && outcome.payload && outcome.payload.reason;
+  if ((outcome.kind === 'refused' || outcome.kind === 'rejected') && RDJ_GATE_REFUSALS[reason]) {
+    return { ...outcome, text: 'refused: ' + RDJ_GATE_REFUSALS[reason] };
+  }
+  return outcome;
+}
+
+// The engine's outcome for this page's newest press (owner-only status
+// field): a refusal is reported once, as a warning; an applied press needs
+// nothing -- the button already follows remote_dj_live.
+function rdjReportGateResult(data) {
+  const result = data && data.remote_dj_owner && data.remote_dj_owner.gate_result;
+  if (!result || !Number.isSafeInteger(result.sequence) || result.sequence !== rdjGateSentSeq
+      || result.sequence <= rdjGateReportedSeq || typeof result.outcome !== 'string') return;
+  rdjGateReportedSeq = result.sequence;
+  if (!result.outcome.startsWith('refused:')) return;
+  const reason = result.outcome.slice('refused:'.length);
+  setControlWarning('remoteDjGateBtn', {
+    kind: 'refused', text: 'refused by the engine: ' + (RDJ_GATE_REFUSALS[reason] || reason),
+  }, result.active);
 }
 
 // Roadmap 2.23 Phase 1B -- who holds the Remote DJ connection, taken only
@@ -3068,11 +3155,13 @@ function renderRemoteDjGate(data) {
     // on the live DJ. The connected DJ themselves keeps self-PTT.
     // Phase 1B second-review P2: only a VERIFIED owner page gates the mic
     // (rdjMayGate), not merely a page still holding a local peer.
-    const mayGate = rdjMayGate(data);
+    // Roadmap 2.17A: and only with the complete session binding.
+    const mayGate = rdjGateBinding(data) !== null;
     btn.disabled = !mayGate;
+    if (mayGate) rdjReportGateResult(data);
     const gateLabel = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
     const gateLink = rdjLocalLink(data);
-    const readOnlyWhy = gateLink === 'unverified'
+    const readOnlyWhy = gateLink === 'unverified' || gateLink === 'owner'
       ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
       : gateLink === 'legacy'
         ? ' (read-only: this engine version can\'t confirm connection ownership)'
