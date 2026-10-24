@@ -861,6 +861,9 @@ START_NEXT_COMPLETION_GRACE_MS = 60
 START_NEXT_COMPLETION_POLL_MS = 50
 START_NEXT_COMPLETION_MAX_EXTRA_MS = 1500
 START_NEXT_RESTORE_MS = 250
+# A restoration is owned (new Start Next refused) until its ramp has run plus
+# this margin for the aggregator to sync the final unity value.
+START_NEXT_RESTORE_SETTLE_MS = 100
 START_NEXT_SILENT_VOLUME = 0.01
 START_NEXT_WATCHDOG_EXTRA_SECONDS = 5.0
 # The fade is anchored on the outgoing pad's own last_sync (deck_fade); the
@@ -1659,6 +1662,10 @@ class Deck:
         # older of two live decks is the outgoing one regardless of slot
         # letter or Gst generation serial.
         self.occurrence_order = 0
+        # Roadmap 2.23 Start Next: this generation's ONE volume controller on
+        # its mixer request pad (deck_fade.PadVolumeControl), created on first
+        # use and dropped only when that pad is released.
+        self.volume_control = None
         self.probe_handles = []
         self.signal_handles = []
         # [P0] 1.8 WRJE follow-up -- deferred post-seek-EOS re-check.
@@ -1933,6 +1940,7 @@ class PlaybackEngine:
         # Roadmap 2.23 Start Next: the one active transition (or None) and
         # the bounded outcome history published in engine_state.json.
         self._start_next_active = None
+        self._start_next_restoring = None
         self._start_next_recent = deque(maxlen=START_NEXT_RECENT_LIMIT)
         # Cached, reporting-only mirror of DuckingConfig.ptt_auto_manual_
         # enabled -- refreshed on every actual mic/PTT transition inside
@@ -2170,6 +2178,7 @@ class PlaybackEngine:
         start_next = getattr(self, "_start_next_active", None)
         if start_next is not None:
             self._start_next_terminal(start_next, "cancelled", "engine_stopped")
+        self._start_next_clear_restore()
         # Preserve occurrence identity/position before detach clears the deck
         # map. The subsequent clean segment close excludes all service
         # downtime, and the next process may continue the same PlayEvent.
@@ -8165,6 +8174,9 @@ class PlaybackEngine:
                 deck.mark_milestone("M_MIXER_REQUEST_PAD_RELEASE_FAILED", state=repr(exc))
             finally:
                 deck.mixer_pad = None
+                # The request pad is out of the mixer: its binding (if any)
+                # is finalized with it, after any in-progress sync.
+                deck.volume_control = None
 
         try:
             removed = self.main_pipeline.remove(deck.pipeline)
@@ -9538,6 +9550,9 @@ class PlaybackEngine:
         if getattr(self, "_start_next_active", None) is not None:
             self._start_next_reject(record, "busy_start_next")
             return
+        if self._start_next_restore_in_progress():
+            self._start_next_reject(record, "busy_restoring")
+            return
         if self._vt.get("phase", "idle") != "idle":
             self._start_next_reject(record, "busy_voice_track")
             return
@@ -9593,6 +9608,15 @@ class PlaybackEngine:
         if outgoing is not None and (outgoing.mixer_pad is None or not deck_fade.fade_supported()):
             self._start_next_reject(record, "fade_unsupported")
             return
+        control = None
+        if outgoing is not None:
+            try:
+                control = self._deck_volume_control(outgoing)
+            except deck_fade.ControlConflict:
+                # A foreign volume binding on this pad: never replace it under
+                # the streaming thread.
+                self._start_next_reject(record, "fade_unsupported")
+                return
 
         active = {
             **record,
@@ -9613,7 +9637,12 @@ class PlaybackEngine:
                 self._other_slot(outgoing.slot) if mode == "fade_and_start" else None
             ),
             "incoming_attempted": mode == "overlap",
-            "fade": None,
+            "fade": control,
+            # True while this transition owns the pad's controller program;
+            # cleared when it hands the pad back (completion, restore, or the
+            # deck leaving).
+            "fade_owned": control is not None,
+            "fade_anchored": False,
             "timers": [],
             "paused_deck": paused[0] if (mode == "start_only" and paused) else None,
         }
@@ -9640,7 +9669,7 @@ class PlaybackEngine:
         # Block the natural trigger and VT entry for the outgoing deck while
         # this transition owns "what starts next".
         self._next_triggered = True
-        active["fade"] = deck_fade.MixerPadFade(outgoing.mixer_pad, self.main_pipeline)
+        control.arm()
         active["incoming_delay_ms"] = None
         if mode == "fade_and_start":
             peek = self._start_next_peek_next_item()
@@ -9666,15 +9695,16 @@ class PlaybackEngine:
         active = self._start_next_current(token)
         if (
             active is None or active.get("fade") is None
-            or active["fade"].detached or active["fade"].anchor_ns is not None
+            or not active["fade_owned"] or active["fade_anchored"]
         ):
             return False
         waited_ms = (time.monotonic() - active["accepted_monotonic"]) * 1000.0
-        if not active["fade"].anchor(
+        if not active["fade"].anchor_fade(
             active["fade_ms"] * Gst.MSECOND,
             fallback_to_clock=waited_ms >= START_NEXT_ANCHOR_MAX_WAIT_MS,
         ):
             return True
+        active["fade_anchored"] = True
         active["fade_ends_at"] = time.time() + active["fade_ms"] / 1000.0
         delay_ms = active.get("incoming_delay_ms")
         if delay_ms is not None and not active["incoming_attempted"]:
@@ -9794,7 +9824,9 @@ class PlaybackEngine:
             # EOS/error already owns this generation; _handle_deck_finished
             # routes it to _start_next_outgoing_ended.
             return False
-        fade.detach()
+        # The pad stays at the curve's final 0.0 while it is unlinked and
+        # released; its binding goes with it (deck_fade module docstring).
+        active["fade_owned"] = False
         active["outgoing_ended"] = True
         self._retire_deck_respecting_gated_seek(
             deck, on_retired=lambda: self._start_next_finish(token)
@@ -9807,8 +9839,7 @@ class PlaybackEngine:
         then complete."""
         active = getattr(self, "_start_next_active", None)
         token = active["request_id"]
-        if active["fade"] is not None:
-            active["fade"].detach()
+        active["fade_owned"] = False   # the deck is leaving with its pad
         active["outgoing_ended"] = True
 
         def _after():
@@ -9906,19 +9937,74 @@ class PlaybackEngine:
         self._start_next_terminal(active, "cancelled", reason)
 
     def _start_next_release_outgoing(self, active, *, restore):
-        """Undo the fade on a surviving outgoing deck (ramp back to unity),
-        or just drop it when the deck is leaving anyway."""
-        fade = active.get("fade")
-        if fade is None or fade.detached:
+        """Hand the outgoing pad's controller back.
+
+        If the deck still owns that pad, its gain is ramped back to unity on
+        the SAME binding (never a new one) and the restoration is tracked
+        until it completes: a new Start Next is refused (busy_restoring)
+        rather than racing it, and only the restoration's own callback can
+        end it. ``restore`` is False when the superseding operation removes
+        the deck anyway (Eject, Pause, Seek, reload); the ramp is still
+        programmed whenever the pad survives, so no path can leave a live deck
+        attenuated if that operation does not complete."""
+        control = active.get("fade")
+        if control is None or not active.get("fade_owned"):
             return
-        if restore and self._start_next_outgoing_intact(active):
-            if fade.restore(START_NEXT_RESTORE_MS * Gst.MSECOND):
-                def _finish_restore(fade=fade):
-                    fade.detach(volume=1.0)
-                    return False
-                GLib.timeout_add(START_NEXT_RESTORE_MS + 100, _finish_restore)
-            return
-        fade.detach()
+        active["fade_owned"] = False
+        deck = active.get("outgoing_deck")
+        if deck is None or deck.volume_control is not control or deck.mixer_pad is not control.pad:
+            return   # the pad already left the mixer with its binding
+        if control.ramp_to_unity(START_NEXT_RESTORE_MS * Gst.MSECOND):
+            self._start_next_track_restore(deck, control, active["request_id"])
+
+    def _start_next_track_restore(self, deck, control, token):
+        """Own one restoration until its ramp has completed."""
+        self._start_next_clear_restore()
+        source_id = GLib.timeout_add(
+            START_NEXT_RESTORE_MS + START_NEXT_RESTORE_SETTLE_MS, self._start_next_restore_done, token
+        )
+        self._start_next_restoring = {
+            "token": token, "deck": deck, "control": control, "source_id": source_id,
+        }
+
+    @_glib_safe(default_return=False)
+    def _start_next_restore_done(self, token):
+        """The restoration's own completion: ends ONLY that restoration. It
+        never writes a volume -- the control source already holds unity -- so
+        a stale callback can never disturb a newer fade."""
+        restoring = getattr(self, "_start_next_restoring", None)
+        if restoring is not None and restoring["token"] == token:
+            self._start_next_restoring = None
+        return False
+
+    def _start_next_clear_restore(self):
+        restoring = getattr(self, "_start_next_restoring", None)
+        self._start_next_restoring = None
+        if restoring is not None:
+            source = GLib.MainContext.default().find_source_by_id(restoring["source_id"])
+            if source is not None and not source.is_destroyed():
+                source.destroy()
+
+    def _start_next_restore_in_progress(self):
+        """A restoration still owns a live pad. One whose deck already left
+        (retired/paused: pad released) ends here."""
+        restoring = getattr(self, "_start_next_restoring", None)
+        if restoring is None:
+            return False
+        deck = restoring["deck"]
+        if self._deck_is_live(deck) and deck.volume_control is restoring["control"]:
+            return True
+        self._start_next_clear_restore()
+        return False
+
+    def _deck_volume_control(self, deck):
+        """The deck's single volume controller, created on first use for its
+        current mixer pad (deck_fade.PadVolumeControl)."""
+        control = deck.volume_control
+        if control is None or control.pad is not deck.mixer_pad:
+            control = deck_fade.PadVolumeControl(deck.mixer_pad, self.main_pipeline)
+            deck.volume_control = control
+        return control
 
     def _start_next_cancel_for_operator_command(self, op, slot):
         """Contract 3.7: an Eject/Pause/Resume/Seek touching a deck of the
@@ -9955,9 +10041,7 @@ class PlaybackEngine:
         limit = active.get("fade_ms", 0) / 1000.0 + START_NEXT_WATCHDOG_EXTRA_SECONDS
         if time.monotonic() - active["accepted_monotonic"] <= limit:
             return
-        fade = active.get("fade")
-        if fade is not None and not fade.detached:
-            fade.detach(volume=1.0 if self._start_next_outgoing_intact(active) else None)
+        self._start_next_release_outgoing(active, restore=True)
         self._next_triggered = False
         self._start_next_terminal(active, "failed", "watchdog_timeout")
 
@@ -13013,6 +13097,7 @@ class PlaybackEngine:
         if deck.mixer_pad is not None:
             self.mixer.release_request_pad(deck.mixer_pad)
         deck.mixer_pad = None
+        deck.volume_control = None   # released with the pad (see _remove_deck)
 
         # Mixer unlink is the truthful end of this generation's program
         # contribution. Pause is a continuation boundary, never a logical

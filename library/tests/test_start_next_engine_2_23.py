@@ -26,6 +26,7 @@ from library.tests._transport_harness import (
     patch_voicetracks,
     pump,
     running_seconds,
+    attached_volume_bindings,
     start_next_command,
     wait_until,
 )
@@ -67,7 +68,7 @@ class _StartNextBase(SimpleTestCase):
     def assert_untouched_program_gains(self):
         for element in (self.engine.vt_duck_gain, self.engine.duck_gain):
             self.assertEqual(element.get_property("volume"), 1.0, element.get_name())
-            self.assertFalse(element.has_active_control_bindings(), element.get_name())
+            self.assertEqual(len(element.control_bindings), 0, element.get_name())
 
 
 class StartNextModeTests(_StartNextBase):
@@ -122,7 +123,7 @@ class StartNextModeTests(_StartNextBase):
         self.assertEqual(self.h.claims, [1, 2], "Start Next consumed a third occurrence")
         self.assertEqual(self.h.occupants(), {"A": None, "B": 2})
         self.assertEqual(incoming_pad.get_property("volume"), 1.0)
-        self.assertFalse(incoming_pad.has_active_control_bindings())
+        self.assertEqual(attached_volume_bindings(incoming_pad), (0, None))   # never bound
 
     def test_overlap_in_manual_is_identical_and_keeps_manual(self):
         incoming_slot = self._overlap("A")
@@ -481,7 +482,7 @@ class StartNextInterruptionTests(_StartNextBase):
         self.assertNotIn(2, self.h.claims)
         pad = self.engine.decks["A"].mixer_pad
         self.assertEqual(pad.get_property("volume"), 1.0)
-        self.assertFalse(pad.has_active_control_bindings())
+        self.assertEqual(attached_volume_bindings(pad), (0, None))   # a new generation, never bound
 
     def test_eject_of_the_incoming_deck_restores_the_outgoing_deck(self):
         _start(self.engine, "A")
@@ -491,9 +492,10 @@ class StartNextInterruptionTests(_StartNextBase):
         self.engine._eject_deck("B")
         self.assertEqual(self.last()["reason"], "superseded_by_eject")
         pump(0.6)
-        pad = self.engine.decks["A"].mixer_pad
-        self.assertEqual(pad.get_property("volume"), 1.0)
-        self.assertFalse(pad.has_active_control_bindings())
+        deck = self.engine.decks["A"]
+        self.assertEqual(deck.mixer_pad.get_property("volume"), 1.0)
+        self.assertEqual(attached_volume_bindings(deck.mixer_pad), (1, deck.volume_control.binding))
+        self.assertIsNone(self.engine._start_next_restoring)
         self.assertEqual(self.h.claims, [1, 2, 3])
         self.assertEqual(self.h.live_ids(), [1, 3])
 
@@ -558,9 +560,9 @@ class StartNextInterruptionTests(_StartNextBase):
         self.assertEqual((record["outcome"], record["reason"]), ("failed", "incoming_open_failed"))
         pump(0.6)
         self.assertEqual(self.h.live_ids(), [1])
-        pad = self.engine.decks["A"].mixer_pad
-        self.assertEqual(pad.get_property("volume"), 1.0)
-        self.assertFalse(pad.has_active_control_bindings())
+        deck = self.engine.decks["A"]
+        self.assertEqual(deck.mixer_pad.get_property("volume"), 1.0)
+        self.assertEqual(attached_volume_bindings(deck.mixer_pad), (1, deck.volume_control.binding))
         self.assertFalse(self.engine._next_triggered)
 
     def test_one_unopenable_item_is_skipped_as_ever(self):
@@ -598,9 +600,10 @@ class StartNextInterruptionTests(_StartNextBase):
         self.engine._start_next_watchdog()
         record = self.last()
         self.assertEqual((record["outcome"], record["reason"]), ("failed", "watchdog_timeout"))
-        pad = self.engine.decks["A"].mixer_pad
-        self.assertEqual(pad.get_property("volume"), 1.0)
-        self.assertFalse(pad.has_active_control_bindings())
+        pump(0.5)
+        deck = self.engine.decks["A"]
+        self.assertEqual(deck.mixer_pad.get_property("volume"), 1.0)
+        self.assertEqual(attached_volume_bindings(deck.mixer_pad), (1, deck.volume_control.binding))
         self.assertFalse(self.engine._next_triggered)
 
 
@@ -734,3 +737,123 @@ class StartNextAudioTests(_StartNextBase):
         self.assertAlmostEqual(after, before, delta=0.03 * before)
         self.assertLess(self.h.tone_level(t0 + 1.05, t0 + 1.3, self.A_HZ), 0.01)
         self.assert_untouched_program_gains()
+
+
+class StartNextBindingLifecycleTests(_StartNextBase):
+    """r0117 review SN-GST-1: one volume binding per live pad, reused for
+    every fade/cancel/restore, never removed/replaced/disabled; restoration is
+    owned until complete; stale callbacks cannot touch a newer fade."""
+
+    def setUp(self):
+        super().setUp()
+        self.h.queue(*({"id": i, "seconds": 30} for i in range(1, 30)))
+        self.h.play()
+        self.deck = _start(self.engine, "A")
+        pump(0.4)
+
+    def fade(self, fade_ms=3000):
+        command = self.send(fade_ms=fade_ms)
+        self.assertTrue(wait_until(lambda: self.engine._start_next_active
+                                   and self.engine._start_next_active.get("fade_anchored"), 2.0))
+        pump(0.15)
+        return command
+
+    def cancel(self):
+        active = self.engine._start_next_active
+        self.engine._start_next_cancel(active["request_id"], "test_cancel", restore=True)
+        self.assertEqual(self.last()["outcome"], "cancelled")
+
+    def binding(self):
+        count, binding = attached_volume_bindings(self.deck.mixer_pad)
+        self.assertEqual(count, 1, "exactly one attached binding on the surviving pad")
+        self.assertIs(binding, self.deck.volume_control.binding)
+        return binding
+
+    def wait_restored(self):
+        self.assertTrue(wait_until(lambda: self.engine._start_next_restoring is None, 2.0))
+        pump(0.1)
+        self.assertAlmostEqual(self.deck.mixer_pad.get_property("volume"), 1.0)
+
+    def test_same_pad_cancel_restore_retry_before_and_after_restore_reuses_one_binding(self):
+        self.fade()
+        first = self.binding()
+        self.assertLess(self.deck.mixer_pad.get_property("volume"), 1.0)
+        self.cancel()
+        # Immediately, while the restoration owns the pad: refused, nothing added.
+        self.send()
+        self.assertEqual(self.last()["reason"], "busy_restoring")
+        self.assertIs(self.binding(), first)
+        self.assertEqual(self.engine._deck_volume_control(self.deck).control_points()[-1][1], 1.0)
+        self.wait_restored()
+        # After restoration: the same pad fades again on the SAME binding.
+        self.fade(fade_ms=400)
+        self.assertIs(self.binding(), first)
+        self.assertEqual(self.settle()["outcome"], "completed")
+        self.assertEqual(self.h.claims, [1, 2])
+        self.assertIsNone(self.deck.volume_control)            # released with its pad
+        self.assertIsNone(self.deck.mixer_pad)
+
+    def test_a_stale_restore_callback_cannot_touch_a_newer_fade(self):
+        self.fade()
+        self.cancel()
+        old_token = self.engine._start_next_restoring["token"]
+        self.wait_restored()
+        self.fade()
+        before = self.engine._deck_volume_control(self.deck).control_points()
+        self.engine._start_next_restore_done(old_token)        # a late, stale completion
+        pump(0.3)
+        self.assertEqual(self.engine._deck_volume_control(self.deck).control_points(), before)
+        self.assertEqual(before[-1][1], 0.0)                    # still the newer fade's curve
+        earlier = self.deck.mixer_pad.get_property("volume")
+        pump(0.4)
+        self.assertLess(self.deck.mixer_pad.get_property("volume"), earlier)   # still fading down
+        self.assertLess(earlier, 1.0)
+        self.assertIsNotNone(self.engine._start_next_active)
+
+    def test_cancellation_during_the_restore_is_deterministic(self):
+        self.fade()
+        self.cancel()
+        self.engine._pause_deck("A")                           # the deck leaves during its restore
+        self.assertIsNone(self.deck.volume_control)
+        self.send(expected={"live_log_item_ids": []})                 # paused only -> start_only
+        self.assertNotEqual(self.last()["reason"], "busy_restoring")
+        self.assertIsNone(self.engine._start_next_restoring)
+        self.assertEqual(self.settle()["outcome"], "completed")
+
+    def test_shutdown_invalidates_a_pending_restore(self):
+        self.fade()
+        self.cancel()
+        source_id = self.engine._start_next_restoring["source_id"]
+        self.engine._media_validation_worker = None
+        self.engine.stop()
+        self.assertIsNone(self.engine._start_next_restoring)
+        from gi.repository import GLib
+        self.assertIsNone(GLib.MainContext.default().find_source_by_id(source_id))
+
+    def test_a_foreign_volume_binding_is_never_replaced(self):
+        gi.require_version("GstController", "1.0")
+        from gi.repository import GstController
+        foreign = GstController.DirectControlBinding.new_absolute(
+            self.deck.mixer_pad, "volume", GstController.InterpolationControlSource())
+        self.deck.mixer_pad.add_control_binding(foreign)
+        self.send()
+        self.assertEqual(self.last()["reason"], "fade_unsupported")
+        self.assertEqual(attached_volume_bindings(self.deck.mixer_pad), (1, foreign))
+        self.assertEqual(self.h.claims, [1])
+
+    def test_repeated_same_pad_fade_cancel_restore_cycles(self):
+        identities = set()
+        for cycle in range(12):
+            self.fade()
+            identities.add(id(self.binding()))
+            self.cancel()
+            if cycle % 2 == 0:                                 # immediate retry: refused
+                self.send()
+                self.assertEqual(self.last()["reason"], "busy_restoring")
+            self.wait_restored()
+            identities.add(id(self.binding()))
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(self.h.claims, [1])                    # cancels consumed nothing
+        self.fade(fade_ms=300)
+        self.assertEqual(self.settle()["outcome"], "completed")
+        self.assertEqual(self.h.claims, [1, 2])

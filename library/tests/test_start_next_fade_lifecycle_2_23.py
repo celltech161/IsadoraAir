@@ -1,17 +1,20 @@
 """Roadmap 2.23 -- Start Next fade-controller lifecycle under churn.
 
-During development, removing a GstController binding from a pad the
-aggregator was still syncing crashed the process (SIGSEGV in
-gst_object_sync_values, which walks bindings without the object lock).
-deck_fade now only DISABLES a binding and lets it go with the pad. This
-drives many complete / cancel+restore / overlap / reload / seek cycles on
-the real program topology (appsink, clock-synchronised) and proves:
+Removing a GstController binding from a pad the aggregator is still syncing
+-- or adding a second binding for the same property, which replaces the first
+-- crashes the process (SIGSEGV in gst_object_sync_values, which walks bindings
+without the object lock; r0117 review SN-GST-1). deck_fade now gives each live
+pad exactly ONE persistent binding, reprogrammed for every fade/cancel/restore
+and released only with the pad. This drives many complete / cancel+restore /
+immediate retry / overlap / pause / reload / seek cycles on the real program
+topology (appsink, clock-synchronised) and proves:
 
 - the process survives (a crash would abort the whole test run);
-- no fade controller, mixer request pad, GLib timer or deck generation
-  accumulates;
-- every surviving pad ends at unity with no active binding, and no later
-  gain stage is ever touched;
+- every surviving pad has at most one ATTACHED binding (the real list, not
+  just "active" ones), and it is that deck's own controller binding;
+- a retry while a restoration owns the pad is refused, never bound again;
+- no controller, mixer request pad, GLib timer or deck generation
+  accumulates; every pad ends at unity; no later gain stage is touched;
 - no stale Start Next callback acts after its transition ended.
 """
 
@@ -44,7 +47,7 @@ class FadeControllerLifecycleTests(SimpleTestCase):
         self.engine._invalidate_schedule_authority = lambda _reason: None
         self.engine._load_log_for = lambda _date, _hour: None   # reload keeps the queue
         self.fades = []
-        original = deck_fade.MixerPadFade
+        original = deck_fade.PadVolumeControl
 
         harness = self
 
@@ -53,12 +56,12 @@ class FadeControllerLifecycleTests(SimpleTestCase):
                 super().__init__(*args, **kwargs)
                 harness.fades.append(weakref.ref(self))
 
-        tracked = patch.object(deck_fade, "MixerPadFade", TrackedFade)
+        tracked = patch.object(deck_fade, "PadVolumeControl", TrackedFade)
         tracked.start()
         self.addCleanup(tracked.stop)
         self.late_calls = []
         for name in ("_start_next_incoming_due", "_start_next_completion_due",
-                     "_start_next_anchor_due"):
+                     "_start_next_anchor_due", "_start_next_restore_done"):
             self._spy(name)
         self.h.play()
 
@@ -66,9 +69,14 @@ class FadeControllerLifecycleTests(SimpleTestCase):
         bound = getattr(self.engine, name)
 
         def spy(token, _bound=bound, _name=name):
-            active = self.engine._start_next_active
-            if active is None or active["request_id"] != token:
-                self.late_calls.append(_name)
+            if _name == "_start_next_restore_done":
+                owner = self.engine._start_next_restoring
+                if owner is None or owner["token"] != token:
+                    self.late_calls.append(_name)
+            else:
+                active = self.engine._start_next_active
+                if active is None or active["request_id"] != token:
+                    self.late_calls.append(_name)
             return _bound(token)
 
         setattr(self.engine, name, spy)
@@ -88,14 +96,25 @@ class FadeControllerLifecycleTests(SimpleTestCase):
         self.assertTrue(wait_until(lambda: len(self.h.live_ids()) == 1, 3.0), self.h.occupants())
         pump(0.15)
 
-    def assert_clean_program(self):
+    def assert_one_binding_per_pad(self):
         for deck in self.engine.decks.values():
             if deck is not None and deck.mixer_pad is not None:
-                self.assertFalse(deck.mixer_pad.has_active_control_bindings())
+                count = len(deck.mixer_pad.control_bindings)
+                self.assertLessEqual(count, 1, "a second binding was attached to a live pad")
+                if count:
+                    self.assertIs(deck.mixer_pad.get_control_binding("volume"),
+                                  deck.volume_control.binding)
+
+    def assert_clean_program(self):
+        self.assertTrue(wait_until(lambda: self.engine._start_next_restoring is None, 2.0))
+        pump(0.1)
+        self.assert_one_binding_per_pad()
+        for deck in self.engine.decks.values():
+            if deck is not None and deck.mixer_pad is not None:
                 self.assertAlmostEqual(deck.mixer_pad.get_property("volume"), 1.0)
         for element in (self.engine.vt_duck_gain, self.engine.duck_gain):
             self.assertEqual(element.get_property("volume"), 1.0)
-            self.assertFalse(element.has_active_control_bindings())
+            self.assertEqual(len(element.control_bindings), 0)
         self.assertLessEqual(len(list(self.engine.mixer.sinkpads)), 2)
         self.assertIsNone(self.engine._start_next_active)
 
@@ -115,6 +134,10 @@ class FadeControllerLifecycleTests(SimpleTestCase):
             incoming_slot = self.engine._start_next_active["incoming"]["slot"]
             self.engine._eject_deck(incoming_slot)
             outcomes.append(self.engine._start_next_state()["recent"][0]["reason"])
+            # Immediate retry on the same still-restoring pad: refused, unbound.
+            self.send()
+            outcomes.append(self.engine._start_next_state()["recent"][0]["reason"])
+            self.assert_one_binding_per_pad()
             pump(0.5)
             # 3. overlap: fade the older of two live decks
             live = self.engine._live_decks()
@@ -155,7 +178,7 @@ class FadeControllerLifecycleTests(SimpleTestCase):
             self.assert_clean_program()
 
         self.assertEqual(outcomes, [
-            "completed", "superseded_by_eject", "completed", "superseded_by_pause",
+            "completed", "superseded_by_eject", "busy_restoring", "completed", "superseded_by_pause",
             "superseded_by_reload", "superseded_by_seek",
         ] * self.CYCLES)
         pump(0.8)
@@ -169,5 +192,7 @@ class FadeControllerLifecycleTests(SimpleTestCase):
         pump(0.3)
         gc.collect()
         alive = [ref for ref in self.fades if ref() is not None]
-        self.assertEqual(alive, [], f"{len(alive)} of {len(self.fades)} fade controllers leaked")
-        self.assertEqual(len(self.fades), 6 * self.CYCLES + 1)
+        self.assertEqual(alive, [], f"{len(alive)} of {len(self.fades)} volume controllers leaked")
+        # One controller per bound pad generation, reused within it -- never
+        # more than one per fade.
+        self.assertLessEqual(len(self.fades), 6 * self.CYCLES + 1)

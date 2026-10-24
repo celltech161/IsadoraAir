@@ -224,6 +224,7 @@ class TransportHarness:
         engine.loop = MagicMock()
         engine._engine_session_id = "harness-engine-instance"
         engine._start_next_active = None
+        engine._start_next_restoring = None
 
         # Queue.
         engine.log_items = []
@@ -427,6 +428,12 @@ def start_next_command(engine, *, fade_ms=400, expected="auto", release_manual=F
         "fade_ms": fade_ms,
         "release_manual": release_manual,
     }
+
+
+def attached_volume_bindings(pad):
+    """The pad's ACTUAL attached binding list (disabled ones included) and the
+    binding currently attached for ``volume``."""
+    return len(pad.control_bindings), pad.get_control_binding("volume")
 
 
 def _goertzel_amplitude(samples, freq):
