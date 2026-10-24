@@ -2853,36 +2853,84 @@ def api_engine_mic_ptt(request):
     return JsonResponse({"ok": True})
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_remote_dj_gate(request):
-    """Gate toggle for the currently-connected remote DJ's mic. Usable
-    by either the operator (console) OR the connected remote DJ
-    themselves (dashboard.html's remoteDjGateBtn is NOT hidden in
-    remote_dj mode -- both parties may see and use this control); the
-    engine ignores it if no remote-DJ session is active.
+    """Open or close the Remote Mic of the caller's OWN connected Remote DJ
+    session (roadmap 2.17A; contract in library.services.
+    remote_dj_gate_identity).
 
-    Roadmap 2.5C: requires remote_dj.mic_gate (schedule-restricted for
-    non-staff/superuser)."""
+    Requires remote_dj.mic_gate with the real schedule policy, plus the
+    session binding: the request must name the engine's active attempt,
+    prove it comes from the browser that started that attempt
+    (``control_key``, returned only by api_remote_dj_token), carry that
+    attempt's owning user as the authenticated caller, the engine run it saw
+    and a per-attempt ``sequence``. Opening AND closing are refused without
+    it -- a stale OFF would mute the next DJ. There is no staff bypass: a
+    Station Administrator gates only a session they own (an emergency staff
+    mute is a separate, not-yet-approved path).
+
+    Checked here against fresh engine state before queueing, and again by
+    the engine against its live session immediately before the gate changes.
+    202 means only "queued": the browser follows the engine-reported state.
+    Not csrf_exempt (r0117's Console already sends X-CSRFToken)."""
+    from library.services import remote_dj_gate_identity as gate_identity
+
     result = authorize(request.user, "remote_dj.mic_gate")
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="remote_dj.mic_gate")
 
     try:
-        body = json.loads(request.body)
+        body = json.loads(request.body or b"{}")
     except (json.JSONDecodeError, ValueError):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
+    try:
+        gate_request = gate_identity.parse_request(body)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
 
-    active = body.get("active")
-    if not isinstance(active, bool):
-        return JsonResponse({"error": "active must be a boolean"}, status=400)
+    # Ownership proof first: knowing a (non-secret) attempt id is not enough.
+    if not gate_identity.verify_control_key(
+            request.user.pk, gate_request["attempt_id"], gate_request["control_key"]):
+        return JsonResponse(
+            {"error": "this browser does not hold that Remote DJ connection", "reason": "not_owner"},
+            status=403,
+        )
 
-    error_response = _enqueue_engine_command_response(
-        {"command": "remote_dj_gate", "active": active}
-    )
+    state = _read_fresh_engine_state(REMOTE_DJ_GATE_STATE_MAX_AGE_SECONDS)
+    if state is None:
+        return JsonResponse(
+            {"error": "engine status is unavailable", "reason": "engine_unavailable"}, status=409)
+    revision = state.get("state_revision")
+    instance = revision.get("instance") if isinstance(revision, dict) else None
+    if gate_request["engine_instance"] != instance:
+        return JsonResponse(
+            {"error": "the engine has restarted since this page saw it", "reason": "engine_restarted"},
+            status=409,
+        )
+    owner = state.get("remote_dj_owner") if state.get("remote_dj_connected") else None
+    if not (isinstance(owner, dict)
+            and owner.get("attempt_id") == gate_request["attempt_id"]
+            and owner.get("user_id") == request.user.pk):
+        return JsonResponse(
+            {"error": "that Remote DJ connection is not the active session", "reason": "not_current_session"},
+            status=409,
+        )
+
+    command = gate_identity.build_command(
+        user_id=request.user.pk, request=gate_request, issued_at_ms=time_mod.time() * 1000)
+    error_response = _enqueue_engine_command_response(command)
     if error_response is not None:
         return error_response
-    return JsonResponse({"ok": True})
+    return JsonResponse(
+        {
+            "ok": True,
+            "accepted": True,
+            "executed": False,
+            "request_id": command["request_id"],
+            "sequence": command["sequence"],
+        },
+        status=202,
+    )
 
 
 @csrf_exempt
@@ -2913,6 +2961,26 @@ def api_engine_manual_mode(request):
 
 
 ENGINE_STATE_PATH = Path("/run/isadoraair/engine_state.json")
+# Roadmap 2.17A: the Remote Mic gate is checked against engine state no older
+# than the Console's own staleness threshold (api_engine_status).
+REMOTE_DJ_GATE_STATE_MAX_AGE_SECONDS = 10
+
+
+def _read_fresh_engine_state(max_age_seconds):
+    """The raw engine_state.json (server-side only), or None when it is
+    missing, unreadable or older than ``max_age_seconds``."""
+    try:
+        state = json.loads(ENGINE_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    timestamp = state.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return None
+    if time_mod.time() - timestamp > max_age_seconds:
+        return None
+    return state
 REMOTE_DJ_OWNER_NAME_MAX = 64
 # Who may see WHO holds the Remote DJ connection: anyone who may connect as,
 # or gate, the Remote DJ (staff/superuser via authorize()'s own bypass).
@@ -2960,12 +3028,24 @@ def _public_remote_dj_owner(raw_owner, viewer):
     display_name = None
     if owner is not None:
         display_name = (owner.get_full_name().strip() or owner.get_username())[:REMOTE_DJ_OWNER_NAME_MAX]
-    return {
+    is_current_user = owner is not None and owner.pk == viewer.pk
+    public = {
         "identity": "known" if display_name else "unavailable",
         "display_name": display_name,
-        "is_current_user": owner is not None and owner.pk == viewer.pk,
+        "is_current_user": is_current_user,
         "browser_key": hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32],
     }
+    # Roadmap 2.17A: the engine's outcome for the owner's newest Remote Mic
+    # command (sequence, requested state, applied/refused reason), shown only
+    # to the owning account so its browser can report a refusal truthfully.
+    gate_result = raw_owner.get("gate_result")
+    if is_current_user and isinstance(gate_result, dict):
+        sequence, active, outcome = (
+            gate_result.get("sequence"), gate_result.get("active"), gate_result.get("outcome"))
+        if (isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0
+                and isinstance(active, bool) and isinstance(outcome, str) and len(outcome) <= 64):
+            public["gate_result"] = {"sequence": sequence, "active": active, "outcome": outcome}
+    return public
 
 
 @require_http_methods(["GET"])
@@ -3245,7 +3325,6 @@ def api_fx_fire(request):
     })
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def api_remote_dj_token(request):
     """Mints a short-lived signaling token for the Remote DJ over WebRTC
@@ -3265,7 +3344,15 @@ def api_remote_dj_token(request):
     see forbidden_response and AuthzResult.reason's own construction;
     nothing here exposes signing keys, other users' schedules, or
     anything beyond what this account itself needs to understand why it
-    was refused."""
+    was refused.
+
+    Roadmap 2.17A: the response also carries ``control_key``, the attempt's
+    Remote Mic control credential (remote_dj_gate_identity). Only this
+    response ever contains it -- never a log line, status or event -- and the
+    browser keeps it in page memory for that one attempt. No longer
+    csrf_exempt: the Console already sends X-CSRFToken here."""
+    from library.services.remote_dj_gate_identity import control_key_for
+
     result = authorize(request.user, "remote_dj.connect")
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="remote_dj.connect")
@@ -3286,6 +3373,7 @@ def api_remote_dj_token(request):
     return JsonResponse({
         "token": token,
         "attempt_id": attempt_id,
+        "control_key": control_key_for(request.user.id, attempt_id),
         "ice_servers": ice_servers,
     })
 

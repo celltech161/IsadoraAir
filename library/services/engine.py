@@ -65,6 +65,7 @@ from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
 from library.services import deck_fade
 from library.services import start_next_identity
+from library.services import remote_dj_gate_identity
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -1478,6 +1479,14 @@ class RemoteDJSession:
         # connection recovers without them touching anything. See
         # _remote_dj_on_connection_state.
         self.gate_desired = False
+        # Roadmap 2.17A -- the newest user gate command applied to THIS
+        # session (remote_dj_gate_identity): a sequence is applied at most
+        # once and never an older one. A new session starts from zero, so it
+        # inherits no predecessor's command state. gate_result is the last
+        # outcome for this session's own commands, published to its owner.
+        self.gate_last_sequence = 0
+        self.gate_last_request_id = None
+        self.gate_result = None
         # Per-session diagnostic state. The original static-on-connect
         # investigation is resolved, but these bounded breadcrumbs remain
         # useful for future Remote DJ post-mortems. None of this state is
@@ -10183,7 +10192,7 @@ class PlaybackEngine:
             else:
                 self._insert_urgent_next(data.get("category", "WxAlert"))
         elif cmd == "remote_dj_gate":
-            self._remote_dj_set_gate(bool(data.get("active")))
+            self._remote_dj_gate_command(data)
         elif cmd == "remote_dj_disconnect":
             self._remote_dj_session_stop()
         elif cmd == "fx_fire":
@@ -11055,7 +11064,13 @@ class PlaybackEngine:
         user_id = getattr(session, "user_id", None)
         if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
             user_id = None
-        return {"user_id": user_id, "attempt_id": attempt_id}
+        owner = {"user_id": user_id, "attempt_id": attempt_id}
+        # Roadmap 2.17A: the outcome of this session's newest gate command
+        # (no key or proof; library.views passes it only to the owner).
+        gate_result = getattr(session, "gate_result", None)
+        if isinstance(gate_result, dict):
+            owner["gate_result"] = dict(gate_result)
+        return owner
 
     def _remote_dj_record_browser_milestone(
         self, attempt_id, milestone, elapsed_ms
@@ -12787,11 +12802,101 @@ class PlaybackEngine:
         )
         return False
 
+    def _remote_dj_gate_command(self, data):
+        """Roadmap 2.17A -- the ONLY route from a user's request to the Remote
+        Mic gate. Applies one remote_dj_gate command iff it is bound to this
+        engine's live session (remote_dj_gate_identity): same engine run,
+        fresh, the active session's own attempt and user, a valid control
+        proof, a newer sequence, and the user still holds remote_dj.mic_gate
+        under the real schedule policy. Anything else -- including the old
+        unbound {"active"} shape -- is refused before gate_desired, the
+        physical gate, ducking or Manual ownership is touched.
+
+        Internal fail-safe muting (recovery, session stop, authorization
+        revocation, shutdown) never comes through here and needs no browser
+        credential. Returns the outcome string (tests and diagnostics)."""
+        try:
+            command = remote_dj_gate_identity.parse_command(data)
+        except ValueError:
+            return self._remote_dj_gate_refused(None, None, "malformed")
+        attempt_id = command["attempt_id"]
+        sequence = command["sequence"]
+        if command["engine_instance"] != getattr(self, "_engine_session_id", None):
+            return self._remote_dj_gate_refused(None, command, "engine_restarted")
+        age_ms = time.time() * 1000 - command["issued_at_ms"]
+        if age_ms > remote_dj_gate_identity.MAX_COMMAND_AGE_MS \
+                or age_ms < -remote_dj_gate_identity.MAX_FUTURE_SKEW_MS:
+            return self._remote_dj_gate_refused(None, command, "stale_command")
+
+        session = self.remote_dj_session
+        attempt = getattr(session, "connection_attempt", None) if session is not None else None
+        if session is None or session.slot_id is None or attempt is None:
+            return self._remote_dj_gate_refused(None, command, "no_session")
+        if attempt.attempt_id != attempt_id:
+            # A superseded or never-admitted attempt: B never sees A's command.
+            return self._remote_dj_gate_refused(None, command, "not_current_session")
+        if attempt.status in ("ended", "failed"):
+            return self._remote_dj_gate_refused(None, command, "session_ended")
+        if session.user_id != command["user_id"]:
+            return self._remote_dj_gate_refused(None, command, "wrong_user")
+        if not remote_dj_gate_identity.verify_command_proof(command):
+            return self._remote_dj_gate_refused(None, command, "bad_proof")
+        # From here the command is this session's own: outcomes are published.
+        if sequence <= session.gate_last_sequence:
+            if sequence == session.gate_last_sequence \
+                    and command["request_id"] == session.gate_last_request_id:
+                print(f"  Remote DJ gate seq={sequence}: duplicate delivery ignored")
+                return "duplicate"
+            return self._remote_dj_gate_refused(session, command, "out_of_order")
+        if not self._remote_dj_user_may_gate(command["user_id"]):
+            return self._remote_dj_gate_refused(session, command, "not_authorized")
+
+        session.gate_last_sequence = sequence
+        session.gate_last_request_id = command["request_id"]
+        held = self._remote_dj_set_gate(command["active"])
+        outcome = "applied_held_muted" if held else "applied"
+        session.gate_result = {"sequence": sequence, "active": command["active"], "outcome": outcome}
+        return outcome
+
+    def _remote_dj_gate_refused(self, session, command, reason):
+        """Record one refused gate command. Nothing audio-related changes.
+        Only a command already proven to be ``session``'s own may publish its
+        outcome there; a stale or forged one leaves the live session's state
+        (and its owner's display) untouched. Never logs key or proof."""
+        attempt_id = command["attempt_id"] if command else "?"
+        sequence = command["sequence"] if command else "?"
+        print(f"  Remote DJ gate refused: reason={reason} attempt={attempt_id} seq={sequence}")
+        if session is not None and command is not None:
+            session.gate_result = {
+                "sequence": command["sequence"], "active": command["active"],
+                "outcome": f"refused:{reason}",
+            }
+        return f"refused:{reason}"
+
+    def _remote_dj_user_may_gate(self, user_id):
+        """remote_dj.mic_gate with the real schedule policy, re-evaluated at
+        execution against a fresh User row (bypass_cache: see
+        _remote_dj_authorization_tick). Fails closed on any error."""
+        try:
+            _close_old_connections()
+            from django.contrib.auth import get_user_model
+            from authz.evaluator import authorize as _authorize
+
+            user = get_user_model().objects.filter(pk=user_id).first()
+            return user is not None and bool(_authorize(user, "remote_dj.mic_gate", bypass_cache=True))
+        except Exception as exc:
+            print(f"  Remote DJ gate authorization check failed closed: {type(exc).__name__}")
+            return False
+
     def _remote_dj_set_gate(self, active):
+        """Apply one gate intent to the active session. Reached for a user
+        request only through _remote_dj_gate_command, after the session
+        binding has been verified. Returns True when an ON intent is held
+        physically muted for Reconnecting."""
         session = self.remote_dj_session
         if session is None or session.slot_id is None:
             print("  remote_dj_gate requested but no session is active — ignoring")
-            return
+            return False
         slot = self.dj_slots[session.slot_id]
         # Remember the DJ's intent BEFORE touching the volume element --
         # if the connection is currently DISCONNECTED and we're being
@@ -12816,6 +12921,7 @@ class PlaybackEngine:
             self._apply_mic_mode_hold()
         suffix = " (desired; held muted during Reconnecting)" if active and recovering else ""
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}{suffix}")
+        return active and recovering
 
     def _remote_dj_emit_ownership_outcome(self, attempt_id, pre_manual, pre_manual_from_mic):
         """P1 1.5 Pass B1 requirement 8 -- bounded, nonsecret evidence of

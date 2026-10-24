@@ -153,14 +153,17 @@ class EngineEndpointCapabilityTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         mock_enqueue.assert_called_once()
 
-    # ---- remote_dj.mic_gate: Remote Host YES (shared control) ----
+    # ---- remote_dj.mic_gate: Remote Host YES, own session only (2.17A) ----
 
     @patch("library.views.enqueue_engine_command")
-    def test_remote_dj_gate_allowed_for_remote_host(self, mock_enqueue):
+    def test_remote_dj_gate_capability_passes_for_remote_host(self, mock_enqueue):
+        # The capability check passes; the 2.17A session binding then refuses
+        # this unbound body before queueing (positive owner coverage lives in
+        # test_remote_dj_gate_binding_2_17a).
         self.client.force_login(self.remote_host)
         resp = self.client.post(reverse("library:api-engine-remote-dj-gate"), data={"active": True}, content_type="application/json")
-        self.assertEqual(resp.status_code, 200)
-        mock_enqueue.assert_called_once()
+        self.assertEqual(resp.status_code, 400)
+        mock_enqueue.assert_not_called()
 
     @patch("library.views.enqueue_engine_command")
     def test_remote_dj_gate_denied_for_contributor(self, mock_enqueue):

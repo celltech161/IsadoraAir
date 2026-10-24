@@ -65,13 +65,33 @@ class EngineCommandHttpProducerTests(TestCase):
 
     @patch("library.views.enqueue_engine_command")
     def test_remote_dj_gate_enqueues_exact_payload(self, enqueue):
-        response = views.api_engine_remote_dj_gate(
-            self._post("/api/engine/remote-dj-gate/", {"active": False})
-        )
-        self.assertEqual(response.status_code, 200)
-        enqueue.assert_called_once_with(
-            {"command": "remote_dj_gate", "active": False}
-        )
+        # Roadmap 2.17A: bound to the caller's own active session; the queue
+        # carries a proof, never the control key.
+        from library.services import remote_dj_gate_identity as gate_identity
+
+        attempt = "producerAttempt000000001"
+        state = {"timestamp": 1_000_000.0, "remote_dj_connected": True,
+                 "remote_dj_owner": {"user_id": self.superuser.pk, "attempt_id": attempt},
+                 "state_revision": {"instance": "engine-run-1", "seq": 3}}
+        key = gate_identity.control_key_for(self.superuser.pk, attempt)
+        body = {"active": False, "attempt_id": attempt, "control_key": key, "sequence": 2,
+                "engine_instance": "engine-run-1"}
+        with patch.object(views, "_read_fresh_engine_state", return_value=state), \
+                patch.object(views.time_mod, "time", return_value=1_000_000.5):
+            response = views.api_engine_remote_dj_gate(self._post("/api/engine/remote-dj-gate/", body))
+        self.assertEqual(response.status_code, 202)
+        expected = {
+            "command": "remote_dj_gate",
+            "request_id": gate_identity.derive_request_id(self.superuser.pk, attempt, 2),
+            "user_id": self.superuser.pk,
+            "attempt_id": attempt,
+            "sequence": 2,
+            "active": False,
+            "engine_instance": "engine-run-1",
+            "issued_at_ms": 1_000_000_500,
+        }
+        expected["proof"] = gate_identity.command_proof(key, expected)
+        enqueue.assert_called_once_with(expected)
 
     @patch("library.views.enqueue_engine_command")
     def test_manual_mode_enqueues_exact_payload(self, enqueue):

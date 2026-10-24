@@ -424,7 +424,7 @@ distinction").
 
 | Endpoint | Capability | Notes |
 |---|---|---|
-| `POST /api/remote-dj/token/` (`api_remote_dj_token`) | `remote_dj.connect` | `schedule_policy="enforce"` (default) |
+| `POST /api/remote-dj/token/` (`api_remote_dj_token`) | `remote_dj.connect` | `schedule_policy="enforce"` (default); 2.17A: CSRF-enforced, and also returns the attempt's Remote Mic `control_key` (see "Remote Mic session binding") |
 | `GET /remote-dj/` (`remote_dj_page`) | `remote_dj.connect` | `schedule_policy="ignore"` — reachability only, see "Safe activation" |
 | `POST /api/engine/queue/set-next/` (`api_engine_set_next`) | `playout.queue_manage` | |
 | `POST /api/engine/queue/insert/` (`api_engine_insert_track`) | `playout.queue_manage` | |
@@ -433,7 +433,7 @@ distinction").
 | `POST /api/engine/deck/<slot>/` (`api_engine_deck_command`) | `playout.control` | |
 | `POST /api/engine/start-next/` (`api_engine_start_next`) | `playout.start_next` | 2.23; CSRF-enforced; `remote_dj` reaches it through one exact GroupAccess path (`library.0092`) |
 | `POST /api/engine/manual-mode/` (`api_engine_manual_mode`) | `playout.manual_mode` | |
-| `POST /api/engine/remote-dj-gate/` (`api_engine_remote_dj_gate`) | `remote_dj.mic_gate` | usable by operator or the connected DJ |
+| `POST /api/engine/remote-dj-gate/` (`api_engine_remote_dj_gate`) | `remote_dj.mic_gate` | 2.17A: CSRF-enforced; only the connected DJ's own browser, for its own active session — see "Remote Mic session binding" |
 | `POST /api/engine/mic-ptt/` (`api_engine_mic_ptt`) | `studio.mic_ptt` | operator-only in practice (no Role grants it but Station Administrator) |
 | `POST /api/fx/fire/` (`api_fx_fire`) | `fx.fire` | |
 | `_can_edit_voicetracks()` (5 call sites: upload/audio/save/delete + `voicetracks_page`) | `voicetrack.record` | not schedule-restricted; unchanged effective behavior |
@@ -802,3 +802,49 @@ the field actually changes value.
 assignment row for every affected active non-staff/non-superuser account;
 inactive-only rows block activation, while an active future specific-date
 or recurring assignment is sufficient.
+
+## Remote Mic session binding (roadmap 2.17A)
+
+Holding `remote_dj.mic_gate` is necessary but not sufficient to open or close
+a Remote DJ microphone. Every user request to `POST /api/engine/remote-dj-gate/`
+must be bound to the caller's own active Remote DJ session
+(`library/services/remote_dj_gate_identity.py`). The body is exactly:
+
+| Field | Meaning |
+|---|---|
+| `active` | JSON boolean: the requested gate state |
+| `attempt_id` | the connection attempt being controlled |
+| `control_key` | the attempt's control credential: an HMAC of (user, attempt) under `SECRET_KEY`, returned only by the `api_remote_dj_token` response that minted the attempt |
+| `sequence` | the browser's per-attempt press counter, reused on an HTTP retry |
+| `engine_instance` | the engine run (`state_revision.instance`) the browser saw |
+
+**Enforcement.** The check runs at two boundaries:
+- **Django**, before queueing:
+  - the strict schema;
+  - the control key for (caller, attempt);
+  - fresh engine state, no older than 10 s;
+  - the same engine run;
+  - the attempt and its user being the engine's active Remote DJ owner.
+- **The engine**, immediately before `gate_desired`, the physical gate,
+  ducking or Manual ownership changes:
+  - the same engine run;
+  - a command no older than 5 s;
+  - the live session's own attempt and user;
+  - a proof (an HMAC of the whole command under the control key; the key
+    itself is never queued);
+  - a newer `sequence`;
+  - `remote_dj.mic_gate` re-evaluated with the real schedule policy.
+
+Opening and closing are refused alike: a stale OFF would mute the next DJ. A
+refusal changes nothing.
+
+**What is not a credential.** The attempt id and the status `browser_key` are
+not secrets. The control key is never logged, published in status or events,
+queued, or stored by the browser.
+
+**Staff.** There is no staff bypass: a Station Administrator gates only a
+session they own.
+
+**Internal fail-safe muting is unchanged.** Recovery, session stop,
+authorization revocation and shutdown do not use this path.
+
