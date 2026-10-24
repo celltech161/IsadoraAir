@@ -3824,6 +3824,7 @@ const START_NEXT_REASONS = {
   superseded_by_resume: 'superseded by Resume',
   superseded_by_seek: 'superseded by Seek',
   superseded_by_reload: 'superseded by Play Now',
+  busy_restoring: 'the playing deck is still being restored after a cancelled Start Next — press again',
 };
 
 function startNextClientId() {
@@ -3834,7 +3835,28 @@ function startNextClientId() {
 function startNextInstance(data) {
   const rev = data && data.state_revision;
   if (rev && typeof rev.instance === 'string' && rev.instance) return rev.instance;
-  return data && typeof data.engine_session_id === 'string' ? data.engine_session_id : null;
+  return data && typeof data.engine_session_id === 'string' && data.engine_session_id
+    ? data.engine_session_id : null;
+}
+
+// The request's mandatory binding (r0117 review SN-AUTH-1), from ONE engine
+// snapshot: the engine instance and every live deck's exact occurrence and
+// generation (an empty list when nothing is live). null when the snapshot
+// lacks any of it -- the control is then unavailable, never sent unbound.
+function startNextBinding(data) {
+  const instance = startNextInstance(data);
+  if (!instance) return null;
+  const decks = (data && data.decks) || {};
+  const live = [];
+  for (const slot of SLOTS) {
+    const deck = decks[slot];
+    if (!deck || deck.paused) continue;
+    const okId = Number.isSafeInteger(deck.log_item_id) && deck.log_item_id > 0;
+    const okGen = Number.isSafeInteger(deck.generation) && deck.generation > 0;
+    if (!okId || !okGen) return null;
+    live.push({ slot, log_item_id: deck.log_item_id, generation: deck.generation });
+  }
+  return { engine_instance: instance, expected: { live_decks: live } };
 }
 
 // Decks the engine reports on air (present and not paused), oldest
@@ -3940,6 +3962,8 @@ function renderStartNext(data) {
     message = transport === 'STALE' ? 'Unavailable: engine status is stale' : 'Unavailable: engine not running';
   } else if (!block) {
     state = 'unavailable'; message = 'Unavailable: this engine does not support Start Next yet';
+  } else if (!latestStatusOk || !startNextBinding(data)) {
+    state = 'unavailable'; message = 'Unavailable: engine status is incomplete';
   } else if (active) {
     state = 'busy';
   } else if (!live.length && !anyDeck && !queued) {
@@ -3991,25 +4015,27 @@ async function startNext() {
   const data = startNextUi.lastData;
   const btn = document.getElementById('startNextBtn');
   if (!data || !latestStatusOk || !btn || btn.disabled) return;
-  const live = startNextLiveDecks(data);
-  const ids = live.map(d => d.log_item_id);
-  const body = {
-    client_request_id: startNextClientId(),
-    engine_instance: startNextInstance(data),
-  };
-  // Bind the request to the occurrences on screen; the engine refuses it
-  // (target_changed) if what is on air has moved on, so a delayed or
-  // repeated press can never skip a second item.
-  if (ids.every(id => Number.isSafeInteger(id) && id > 0)) {
-    body.expected = { live_log_item_ids: ids };
-  }
-  const pending = { requestId: null, clientId: body.client_request_id, instance: body.engine_instance,
+  // Every field is mandatory and comes from the same fresh snapshot; the
+  // engine refuses the request (target_changed / engine_restarted) if what
+  // is on air has moved on, so a delayed or repeated press can never skip a
+  // second item.
+  const binding = startNextBinding(data);
+  if (!binding) return;
+  const body = { client_request_id: startNextClientId(), ...binding };
+  const pending = { requestId: null, clientId: body.client_request_id, instance: binding.engine_instance,
                     acceptedAt: null, engineSeen: false };
   startNextUi.pending = pending;
   startNextUi.shown = null;
   renderStartNext(null);
-  const outcome = await postEngineCommand('/api/engine/start-next/', body);
+  let outcome = await postEngineCommand('/api/engine/start-next/', body);
   if (startNextUi.pending !== pending) return;
+  if (outcome.kind === 'unconfirmed') {
+    // The response was lost, not refused: retry the SAME press once. The
+    // server derives the same request id from this client_request_id, so the
+    // engine executes it at most once whichever copy arrives.
+    outcome = await postEngineCommand('/api/engine/start-next/', body);
+    if (startNextUi.pending !== pending) return;
+  }
   if (outcome.kind === 'accepted' && outcome.payload && typeof outcome.payload.request_id === 'string') {
     pending.requestId = outcome.payload.request_id;
     pending.acceptedAt = Date.now();

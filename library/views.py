@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 import re
-import uuid
 import shutil
 import time as time_mod
 from datetime import date as date_type, time
@@ -2746,25 +2745,28 @@ def api_engine_deck_command(request, slot):
     return JsonResponse({"ok": True})
 
 
-_START_NEXT_CLIENT_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-
-
 @require_http_methods(["POST"])
 def api_engine_start_next(request):
     """Roadmap 2.23 Start Next: a server-authoritative soft transition.
 
     Requires playout.start_next (D3) with the real schedule policy; it does
-    not imply playout.control (Eject/Pause/Resume/seek). The request is
-    identified by a server-minted ``request_id`` and carries the saved
-    PlayoutTransportConfig values, the engine instance and the live
-    occurrences the browser saw, so the engine can refuse a stale, delayed,
-    replayed or duplicated command (START-NEXT-CONTRACT 3.1).
+    not imply playout.control (Eject/Pause/Resume/seek). Every request MUST
+    carry its binding (r0117 review SN-AUTH-1; library.services.
+    start_next_identity): the browser's ``client_request_id`` for this press,
+    the ``engine_instance`` it saw, and ``expected.live_decks`` -- the exact
+    live occurrences and generations it saw, or an explicit ``[]``. Anything
+    missing or malformed is refused here before queueing, and again by the
+    engine before any transport change.
 
-    202 means only "queued for the engine": the browser follows the
-    engine-reported ``start_next`` status block for execution and outcome.
+    The engine ``request_id`` is derived from (user, client_request_id), so an
+    HTTP retry of the same press queues the same request id and the engine
+    executes it at most once. 202 means only "queued for the engine": the
+    browser follows the engine-reported ``start_next`` status block.
 
     Unlike the older engine endpoints this one is NOT csrf_exempt: the
     Console already sends X-CSRFToken on every engine POST."""
+    from library.services import start_next_identity as identity
+
     result = authorize(request.user, "playout.start_next")
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="playout.start_next")
@@ -2777,37 +2779,24 @@ def api_engine_start_next(request):
         return JsonResponse({"error": "body must be a JSON object"}, status=400)
 
     client_request_id = body.get("client_request_id")
-    if client_request_id is not None and (
-        not isinstance(client_request_id, str)
-        or not _START_NEXT_CLIENT_ID.match(client_request_id)
-    ):
-        return JsonResponse({"error": "client_request_id must be 1-64 letters, digits or '-'"}, status=400)
-
+    if not identity.valid_client_request_id(client_request_id):
+        return JsonResponse(
+            {"error": "client_request_id is required: 8-64 letters, digits or '-'"}, status=400)
     engine_instance = body.get("engine_instance")
-    if engine_instance is not None and (
-        not isinstance(engine_instance, str) or not 0 < len(engine_instance) <= 64
-    ):
-        return JsonResponse({"error": "engine_instance must be a short string"}, status=400)
-
-    expected = body.get("expected")
-    expected_payload = None
-    if expected is not None:
-        live_ids = expected.get("live_log_item_ids") if isinstance(expected, dict) else None
-        if (
-            not isinstance(live_ids, list)
-            or len(live_ids) > 2
-            or any(isinstance(i, bool) or not isinstance(i, int) or i < 1 for i in live_ids)
-        ):
-            return JsonResponse(
-                {"error": "expected.live_log_item_ids must be a list of at most two positive integers"},
-                status=400,
-            )
-        expected_payload = {"live_log_item_ids": sorted(set(live_ids))}
+    if not identity.valid_engine_instance(engine_instance):
+        return JsonResponse({"error": "engine_instance is required"}, status=400)
+    if "expected" not in body:
+        return JsonResponse(
+            {"error": "expected.live_decks is required ([] for a stopped console)"}, status=400)
+    try:
+        expected = identity.parse_expected_live_decks(body["expected"])
+    except ValueError as exc:
+        return JsonResponse({"error": f"expected: {exc}"}, status=400)
 
     from library.models import PlayoutTransportConfig
 
     config = PlayoutTransportConfig.load()
-    request_id = uuid.uuid4().hex
+    request_id = identity.derive_request_id(request.user.pk, client_request_id)
     payload = {
         "command": "start_next",
         "request_id": request_id,
@@ -2815,7 +2804,7 @@ def api_engine_start_next(request):
         "user_id": request.user.pk,
         "issued_at": time_mod.time(),
         "engine_instance": engine_instance,
-        "expected": expected_payload,
+        "expected": identity.live_decks_payload(expected),
         "fade_ms": config.start_next_fade_ms,
         "release_manual": config.start_next_releases_manual,
     }

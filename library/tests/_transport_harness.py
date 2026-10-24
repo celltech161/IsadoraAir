@@ -409,13 +409,20 @@ def running_seconds(engine):
     return (clock.get_time() - engine.main_pipeline.get_base_time()) / Gst.SECOND
 
 
+def live_decks_expected(engine):
+    """The mandatory expected binding for what is live now."""
+    return {"live_decks": [
+        {"slot": deck.slot, "log_item_id": deck.log_item.id, "generation": deck.generation}
+        for deck in sorted(engine._live_decks(), key=lambda d: d.slot)
+    ]}
+
+
 def start_next_command(engine, *, fade_ms=400, expected="auto", release_manual=False,
                        request_id=None, client_request_id=None, issued_at=None,
                        engine_instance="auto", user_id=1):
     import uuid as _uuid
     if expected == "auto":
-        expected = {"live_log_item_ids": sorted(
-            deck.log_item.id for deck in engine._live_decks())}
+        expected = live_decks_expected(engine)
     return {
         "command": "start_next",
         "request_id": request_id or _uuid.uuid4().hex,

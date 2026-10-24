@@ -50,11 +50,15 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
         RoleCapability.objects.create(role=Role.objects.get(name="Remote Host (test)"), capability=cap)
         self.state = sn_state()
         self.request_serial = 0
+        self.abort_next_start_next = 0
 
     def _route(self, route, request):
         from urllib.parse import urlparse
         if request.method != "GET" and urlparse(request.url).path == START_NEXT:
             self.posts.append((START_NEXT, request.post_data))
+            if self.abort_next_start_next:
+                self.abort_next_start_next -= 1
+                return route.abort("connectionreset")   # the response is lost in transit
             status = self.post_status.get(START_NEXT, 202)
             if status == 202:
                 self.request_serial += 1
@@ -157,7 +161,9 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
         self.assertEqual(page.locator("#startNextRoute").inner_text(), "fade Deck A")
         self.click(page)
         body = self.sn_posts()[0]
-        self.assertEqual(sorted(body["expected"]["live_log_item_ids"]), [LOG_ITEM["A"], LOG_ITEM["B"]])
+        self.assertEqual(body["expected"], {"live_decks": [
+            {"slot": "A", "log_item_id": LOG_ITEM["A"], "generation": 7},
+            {"slot": "B", "log_item_id": LOG_ITEM["B"], "generation": 7}]})
         # The engine, not the browser, says which deck is outgoing.
         self.state = {**state, "start_next": {"version": 1, "recent": [], "active": {
             "request_id": "req-1", "phase": "advancing", "mode": "overlap",
@@ -174,7 +180,8 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
         posts = self.sn_posts()
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0]["engine_instance"], self.engine_instance)
-        self.assertEqual(posts[0]["expected"], {"live_log_item_ids": [LOG_ITEM["A"]]})
+        self.assertEqual(posts[0]["expected"],
+                         {"live_decks": [{"slot": "A", "log_item_id": LOG_ITEM["A"], "generation": 7}]})
         self.assertRegex(posts[0]["client_request_id"], r"^[A-Za-z0-9-]{8,64}$")
         self.assertIn("Queued", self.status_text(page))
         self.assertTrue(page.locator("#startNextBtn").is_disabled())
@@ -279,6 +286,52 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
         self.wait_status(page, "another operator")
         self.assertTrue(page.locator("#startNextBtn").is_disabled())
         self.assertEqual(self.sn_posts(), [])
+
+    def test_incomplete_engine_identity_disables_start_next_and_sends_nothing(self):
+        cases = {
+            "no generation": lambda state: state["decks"]["A"].pop("generation"),
+            "no log item": lambda state: state["decks"]["A"].pop("log_item_id"),
+            "no engine instance": lambda state: state.update(state_revision=None),
+        }
+        for label, damage in cases.items():
+            with self.subTest(label):
+                state = sn_state()
+                damage(state)
+                self.state = state
+                page = self.open_console(self.superuser)
+                self.assertTrue(page.locator("#startNextBtn").is_disabled())
+                self.assertIn("engine status is incomplete", self.status_text(page))
+                page.evaluate("() => startNext()")
+                page.clock.run_for(200)
+                self.assertEqual(self.sn_posts(), [])
+        self.shot(page, "start-next-incomplete-identity")
+
+    def test_an_explicit_empty_live_set_is_sent_for_a_stopped_console(self):
+        state = sn_state()
+        state["decks"]["A"]["paused"] = True     # nothing live, a paused deck to retire
+        self.state = state
+        page = self.open_console(self.superuser)
+        self.click(page)
+        self.assertEqual(self.sn_posts()[0]["expected"], {"live_decks": []})
+        self.assertEqual(self.sn_posts()[0]["engine_instance"], self.engine_instance)
+
+    def test_a_lost_response_is_retried_once_with_the_same_press_identity(self):
+        self.abort_next_start_next = 1
+        page = self.open_console(self.superuser)
+        self.click(page)
+        posts = self.sn_posts()
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0], posts[1])                 # same client_request_id, same binding
+        self.assertIn("Queued", self.status_text(page))
+        page.wait_for_function("() => startNextUi.pending && startNextUi.pending.requestId === 'req-1'")
+
+    def test_every_request_carries_all_three_bindings(self):
+        page = self.open_console(self.superuser)
+        self.click(page)
+        body = self.sn_posts()[0]
+        self.assertEqual(set(body), {"client_request_id", "engine_instance", "expected"})
+        self.assertTrue(body["engine_instance"])
+        self.assertRegex(body["client_request_id"], r"^[A-Za-z0-9-]{8,64}$")
 
     def test_eject_is_bound_to_the_occurrence_on_screen(self):
         page = self.open_console(self.superuser)

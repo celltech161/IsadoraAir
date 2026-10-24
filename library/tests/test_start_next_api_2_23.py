@@ -25,11 +25,14 @@ User = get_user_model()
 URL = "/api/engine/start-next/"
 
 
+LIVE_A = {"slot": "A", "log_item_id": 7, "generation": 3}
+
+
 def _body(**overrides):
     body = {
-        "client_request_id": "c1-click",
+        "client_request_id": "c1-click-0001",
         "engine_instance": "engine-1",
-        "expected": {"live_log_item_ids": [7]},
+        "expected": {"live_decks": [LIVE_A]},
     }
     body.update(overrides)
     return body
@@ -170,41 +173,73 @@ class StartNextEndpointTests(TestCase):
         config.start_next_releases_manual = True
         config.save()
         before = time.time()
-        response = self.post(self.remote_host, _body(expected={"live_log_item_ids": [9, 7]}))
+        live_b = {"slot": "B", "log_item_id": 9, "generation": 4}
+        response = self.post(self.remote_host, _body(expected={"live_decks": [live_b, LIVE_A]}))
         self.assertEqual(response.status_code, 202)
         reply = response.json()
         command = self.queued()
         self.assertEqual(reply["request_id"], command["request_id"])
         self.assertRegex(command["request_id"], r"^[0-9a-f]{32}$")
         self.assertIs(reply["executed"], False)
-        self.assertEqual(command["client_request_id"], "c1-click")
+        self.assertEqual(command["client_request_id"], "c1-click-0001")
         self.assertEqual(command["engine_instance"], "engine-1")
-        self.assertEqual(command["expected"], {"live_log_item_ids": [7, 9]})
+        self.assertEqual(command["expected"], {"live_decks": [LIVE_A, live_b]})   # sorted by slot
         self.assertEqual((command["fade_ms"], command["release_manual"]), (3500, True))
         self.assertEqual(command["user_id"], self.remote_host.pk)
         self.assertLessEqual(before, command["issued_at"])
         self.assertLessEqual(command["issued_at"], time.time())
 
-    def test_each_click_gets_its_own_server_request_id(self):
-        self.post(self.remote_host)
-        self.post(self.remote_host)
+    def test_each_press_gets_its_own_request_id(self):
+        self.post(self.remote_host, _body(client_request_id="press-0000000a"))
+        self.post(self.remote_host, _body(client_request_id="press-0000000b"))
         ids = {call.args[0]["request_id"] for call in self.enqueue.call_args_list}
         self.assertEqual(len(ids), 2)
 
-    def test_defaults_apply_when_the_singleton_is_missing(self):
+    def test_a_retried_press_is_the_same_engine_request(self):
+        # Two POSTs of one press (e.g. a retry after a lost response) queue the
+        # SAME request id, which the engine executes at most once.
+        first = self.post(self.remote_host).json()
+        second = self.post(self.remote_host).json()
+        self.assertEqual(first["request_id"], second["request_id"])
+        ids = [call.args[0]["request_id"] for call in self.enqueue.call_args_list]
+        self.assertEqual(ids, [first["request_id"]] * 2)
+
+    def test_the_same_client_id_from_another_user_is_another_request(self):
+        mine = self.post(self.remote_host).json()["request_id"]
+        theirs = self.post(self.operator).json()["request_id"]
+        self.assertNotEqual(mine, theirs)
+
+    def test_settings_default_when_the_singleton_is_missing(self):
         PlayoutTransportConfig.objects.all().delete()
         self.post(self.operator)
         command = self.queued()
         self.assertEqual((command["fade_ms"], command["release_manual"]), (2000, False))
 
-    def test_invalid_bodies_are_refused_before_queueing(self):
+    def test_every_binding_is_mandatory_and_nothing_is_queued_without_it(self):
+        for field in ("client_request_id", "engine_instance", "expected"):
+            with self.subTest(missing=field):
+                body = _body()
+                del body[field]
+                self.assertEqual(self.post(self.operator, body).status_code, 400)
+        self.assertEqual(self.post(self.operator, {}).status_code, 400)
+        self.enqueue.assert_not_called()
+
+    def test_null_empty_and_malformed_bindings_are_refused_before_queueing(self):
         for body in (
-            _body(client_request_id="has space"), _body(client_request_id="x" * 65),
-            _body(client_request_id=5), _body(engine_instance=""), _body(engine_instance=5),
-            _body(expected={"live_log_item_ids": [1, 2, 3]}),
-            _body(expected={"live_log_item_ids": [0]}),
-            _body(expected={"live_log_item_ids": [True]}),
-            _body(expected={"live_log_item_ids": "7"}), _body(expected=[7]), ["not", "object"],
+            _body(client_request_id=None), _body(client_request_id=""), _body(client_request_id="short"),
+            _body(client_request_id="has space here"), _body(client_request_id="x" * 65),
+            _body(client_request_id=5), _body(engine_instance=None), _body(engine_instance=""),
+            _body(engine_instance=" padded"), _body(engine_instance=5), _body(engine_instance="e" * 65),
+            _body(expected=None), _body(expected={}), _body(expected=[]),
+            _body(expected={"live_log_item_ids": [7]}),
+            _body(expected={"live_decks": [{"slot": "A", "log_item_id": 7}]}),
+            _body(expected={"live_decks": [{"slot": "C", "log_item_id": 7, "generation": 1}]}),
+            _body(expected={"live_decks": [{**LIVE_A, "log_item_id": 0}]}),
+            _body(expected={"live_decks": [{**LIVE_A, "generation": True}]}),
+            _body(expected={"live_decks": [LIVE_A, {**LIVE_A, "log_item_id": 8}]}),
+            _body(expected={"live_decks": [LIVE_A] * 3}),
+            _body(expected={"live_decks": [LIVE_A], "extra": 1}),
+            _body(expected={"live_decks": "A"}), ["not", "object"],
         ):
             with self.subTest(body=body):
                 self.assertEqual(self.post(self.operator, body).status_code, 400)
@@ -212,11 +247,9 @@ class StartNextEndpointTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.enqueue.assert_not_called()
 
-    def test_optional_fields_may_be_omitted(self):
-        self.assertEqual(self.post(self.operator, {}).status_code, 202)
-        command = self.queued()
-        self.assertIsNone(command["expected"])
-        self.assertIsNone(command["client_request_id"])
+    def test_an_explicit_empty_live_set_is_a_legitimate_stopped_console(self):
+        self.assertEqual(self.post(self.operator, _body(expected={"live_decks": []})).status_code, 202)
+        self.assertEqual(self.queued()["expected"], {"live_decks": []})
 
     def test_get_is_not_allowed(self):
         self.client.force_login(self.operator)

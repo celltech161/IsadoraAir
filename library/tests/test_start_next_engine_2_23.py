@@ -27,6 +27,7 @@ from library.tests._transport_harness import (
     pump,
     running_seconds,
     attached_volume_bindings,
+    live_decks_expected,
     start_next_command,
     wait_until,
 )
@@ -148,7 +149,7 @@ class StartNextModeTests(_StartNextBase):
         _start(self.engine, "A")
         pump(0.4)
         self.engine._pause_deck("A")
-        self.send(expected={"live_log_item_ids": []})
+        self.send(expected={"live_decks": []})
         record = self.settle()
         self.assertEqual(record["outcome"], "completed")
         self.assertEqual(record["mode"], "start_only")
@@ -169,14 +170,14 @@ class StartNextModeTests(_StartNextBase):
         self.assertEqual(self.engine.decks["B"].mixer_pad.get_property("volume"), 1.0)
 
     def test_stopped_console_starts_the_next_item_immediately(self):
-        self.send(expected={"live_log_item_ids": []})
+        self.send(expected={"live_decks": []})
         record = self.settle()
         self.assertEqual((record["outcome"], record["mode"]), ("completed", "start_only"))
         self.assertEqual(self.h.claims, [1])
 
     def test_stopped_console_with_nothing_queued_is_refused(self):
         self.h.queue()
-        self.send(expected={"live_log_item_ids": []})
+        self.send(expected={"live_decks": []})
         record = self.last()
         self.assertEqual((record["outcome"], record["reason"]), ("rejected", "nothing_to_start"))
         self.assertEqual(self.h.on_log_exhausted_calls, [])
@@ -345,7 +346,7 @@ class StartNextIdentityTests(_StartNextBase):
         self.assertEqual(self.last()["reason"], "malformed")
 
     def test_a_target_the_operator_did_not_see_is_refused(self):
-        self.send(expected={"live_log_item_ids": [99]})
+        self.send(expected={"live_decks": [{"slot": "A", "log_item_id": 99, "generation": 1}]})
         self.assert_rejected("target_changed")
 
     def test_a_duplicate_command_file_is_ignored_silently(self):
@@ -358,8 +359,8 @@ class StartNextIdentityTests(_StartNextBase):
         self.assertEqual(self.h.claims, [1, 2])
 
     def test_a_retried_client_request_is_refused_as_a_duplicate(self):
-        first = self.send(client_request_id="click-1")
-        self.send(client_request_id="click-1")
+        first = self.send(client_request_id="click-0001")
+        self.send(client_request_id="click-0001")
         record = self.last()
         self.assertEqual(record["reason"], "duplicate_request")
         self.assertEqual(record["duplicate_of"], first["request_id"])
@@ -367,14 +368,14 @@ class StartNextIdentityTests(_StartNextBase):
         self.assertEqual(self.h.claims, [1, 2])
 
     def test_the_same_client_id_from_another_user_is_independent(self):
-        self.send(client_request_id="click-1", user_id=1)
+        self.send(client_request_id="click-0001", user_id=1)
         self.settle()
-        self.send(client_request_id="click-1", user_id=2)
+        self.send(client_request_id="click-0001", user_id=2)
         self.assertEqual(self.settle()["outcome"], "completed")
         self.assertEqual(self.h.claims, [1, 2, 3])
 
     def test_double_click_and_a_delayed_click_advance_exactly_once(self):
-        expected = {"live_log_item_ids": [1]}
+        expected = live_decks_expected(self.engine)
         self.send(expected=expected)
         self.send(expected=expected)
         self.assertEqual(self.last()["reason"], "busy_start_next")
@@ -739,6 +740,121 @@ class StartNextAudioTests(_StartNextBase):
         self.assert_untouched_program_gains()
 
 
+class StartNextMandatoryIdentityTests(_StartNextBase):
+    """r0117 review SN-AUTH-1: the engine boundary refuses any command whose
+    client, engine-instance or live-occurrence binding is missing or wrong --
+    before any claim, deck, fade binding, VT, mic or Manual change."""
+
+    def setUp(self):
+        super().setUp()
+        self.h.queue(*({"id": i, "seconds": 8} for i in range(1, 6)))
+        self.h.play()
+        self.deck = _start(self.engine, "A")
+        pump(0.4)
+
+    def assert_no_effect(self, reason):
+        record = self.last()
+        self.assertEqual((record["outcome"], record["reason"]), ("rejected", reason))
+        self.assertIsNone(self.engine._start_next_active)
+        self.assertEqual(self.h.claims, [1])
+        self.assertEqual(self.h.live_ids(), [1])
+        self.assertEqual(attached_volume_bindings(self.deck.mixer_pad), (0, None))
+        self.assertIsNone(self.deck.volume_control)
+        self.assertFalse(self.engine._next_triggered)
+        self.assertFalse(self.engine.manual_mode)
+        self.assertEqual(self.engine._vt["phase"], "idle")
+
+    def test_each_missing_binding_is_refused_without_effect(self):
+        for field in ("client_request_id", "engine_instance", "expected"):
+            with self.subTest(missing=field):
+                command = start_next_command(self.engine)
+                del command[field]
+                self.engine._dispatch_engine_command(command)
+                self.assert_no_effect("malformed")
+
+    def test_null_empty_and_malformed_bindings_are_refused(self):
+        cases = {
+            "null client": {"client_request_id": None},
+            "empty client": {"client_request_id": ""},
+            "short client": {"client_request_id": "abc"},
+            "client with spaces": {"client_request_id": "a b c d e f g h"},
+            "null instance": {"engine_instance": None},
+            "empty instance": {"engine_instance": ""},
+            "numeric instance": {"engine_instance": 5},
+            "null expected": {"expected": None},
+            "empty object": {"expected": {}},
+            "old id-only shape": {"expected": {"live_log_item_ids": [1]}},
+            "missing generation": {"expected": {"live_decks": [{"slot": "A", "log_item_id": 1}]}},
+            "bad slot": {"expected": {"live_decks": [{"slot": "C", "log_item_id": 1, "generation": 1}]}},
+            "duplicate slot": {"expected": {"live_decks": [
+                {"slot": "A", "log_item_id": 1, "generation": 1},
+                {"slot": "A", "log_item_id": 2, "generation": 2}]}},
+            "bool id": {"expected": {"live_decks": [{"slot": "A", "log_item_id": True, "generation": 1}]}},
+            "three decks": {"expected": {"live_decks": [
+                {"slot": "A", "log_item_id": 1, "generation": 1}] * 3}},
+            "extra key": {"expected": {"live_decks": [], "any": True}},
+        }
+        for label, override in cases.items():
+            with self.subTest(label):
+                command = start_next_command(self.engine)
+                command.update(override)
+                self.engine._dispatch_engine_command(command)
+                self.assert_no_effect("malformed")
+
+    def test_an_empty_expected_set_is_not_a_wildcard(self):
+        self.send(expected={"live_decks": []})
+        self.assert_no_effect("target_changed")
+
+    def test_a_stale_engine_instance_and_a_restart_after_creation_are_refused(self):
+        self.send(engine_instance="engine-before-restart")
+        self.assert_no_effect("engine_restarted")
+        command = start_next_command(self.engine)
+        self.engine._engine_session_id = "engine-after-restart"   # restart between POST and execution
+        self.engine._dispatch_engine_command(command)
+        self.assert_no_effect("engine_restarted")
+
+    def test_a_deck_replacement_in_the_same_slot_is_a_changed_target(self):
+        stale = start_next_command(self.engine)              # generation 1 of item 1
+        self.engine._seek_deck("A", 2.0)
+        self.assertTrue(wait_until(lambda: self.engine.decks["A"].gated_seek is None
+                                   and self.engine.decks["A"] is not self.deck, 6.0))
+        pump(0.3)
+        self.deck = self.engine.decks["A"]
+        self.assertEqual(self.deck.log_item.id, 1)            # same occurrence, new generation
+        self.engine._dispatch_engine_command(stale)
+        record = self.last()
+        self.assertEqual((record["outcome"], record["reason"]), ("rejected", "target_changed"))
+        self.assertNotIn(2, self.h.claims)
+
+    def test_a_command_delayed_until_another_song_started_cannot_advance_again(self):
+        delayed = start_next_command(self.engine)
+        self.send()                                           # the first press executes
+        self.assertEqual(self.settle()["outcome"], "completed")
+        self.engine._dispatch_engine_command(delayed)         # the same view of the decks, later
+        self.assertEqual(self.last()["reason"], "target_changed")
+        pump(0.4)
+        self.assertEqual(self.h.claims, [1, 2])
+
+    def test_two_command_files_of_one_logical_request_execute_once(self):
+        command = start_next_command(self.engine, client_request_id="press-00000001")
+        self.engine._dispatch_engine_command(dict(command))
+        self.engine._dispatch_engine_command(dict(command, issued_at=time.time()))   # HTTP retry copy
+        self.assertEqual(self.settle()["outcome"], "completed")
+        self.assertEqual(len([r for r in self.engine._start_next_state()["recent"]
+                              if r["request_id"] == command["request_id"]]), 1)
+        pump(0.4)
+        self.assertEqual(self.h.claims, [1, 2])
+
+    def test_one_client_press_under_two_request_ids_executes_once(self):
+        first = self.send(client_request_id="press-00000002")
+        self.send(client_request_id="press-00000002")
+        self.assertEqual((self.last()["reason"], self.last()["duplicate_of"]),
+                         ("duplicate_request", first["request_id"]))
+        self.settle()
+        pump(0.4)
+        self.assertEqual(self.h.claims, [1, 2])
+
+
 class StartNextBindingLifecycleTests(_StartNextBase):
     """r0117 review SN-GST-1: one volume binding per live pad, reused for
     every fade/cancel/restore, never removed/replaced/disabled; restoration is
@@ -815,7 +931,7 @@ class StartNextBindingLifecycleTests(_StartNextBase):
         self.cancel()
         self.engine._pause_deck("A")                           # the deck leaves during its restore
         self.assertIsNone(self.deck.volume_control)
-        self.send(expected={"live_log_item_ids": []})                 # paused only -> start_only
+        self.send(expected={"live_decks": []})                 # paused only -> start_only
         self.assertNotEqual(self.last()["reason"], "busy_restoring")
         self.assertIsNone(self.engine._start_next_restoring)
         self.assertEqual(self.settle()["outcome"], "completed")

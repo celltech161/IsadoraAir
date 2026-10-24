@@ -64,6 +64,7 @@ from library.services.remote_dj_stats import (
 from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
 from library.services import deck_fade
+from library.services import start_next_identity
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -9520,27 +9521,35 @@ class PlaybackEngine:
         issued_at = data.get("issued_at")
         fade_ms = data.get("fade_ms")
         release_manual = data.get("release_manual", False)
+        instance = data.get("engine_instance")
+        # r0117 review SN-AUTH-1: every binding is mandatory here too, so an
+        # old command file, a malformed producer or a client bypassing the
+        # Console cannot evade restart, duplicate or target refusal.
+        try:
+            expected = start_next_identity.parse_expected_live_decks(data.get("expected"))
+        except ValueError:
+            expected = None
         if (
             isinstance(issued_at, bool) or not isinstance(issued_at, (int, float))
             or isinstance(fade_ms, bool) or not isinstance(fade_ms, int)
             or not START_NEXT_FADE_MS_MIN <= fade_ms <= START_NEXT_FADE_MS_MAX
             or not isinstance(release_manual, bool)
-            or (client_id is not None and (not isinstance(client_id, str) or len(client_id) > 64))
+            or not start_next_identity.valid_client_request_id(client_id)
+            or not start_next_identity.valid_engine_instance(instance)
+            or expected is None
         ):
             self._start_next_reject(record, "malformed")
             return
         record["fade_ms"] = fade_ms
 
-        if client_id is not None:
-            clients = self.__dict__.setdefault("_start_next_seen_clients", OrderedDict())
-            key = (data.get("user_id"), client_id)
-            if key in clients:
-                self._start_next_reject(record, "duplicate_request", duplicate_of=clients[key])
-                return
-            self._start_next_remember(clients, key, request_id)
+        clients = self.__dict__.setdefault("_start_next_seen_clients", OrderedDict())
+        key = (data.get("user_id"), client_id)
+        if key in clients:
+            self._start_next_reject(record, "duplicate_request", duplicate_of=clients[key])
+            return
+        self._start_next_remember(clients, key, request_id)
 
-        instance = data.get("engine_instance")
-        if instance is not None and instance != getattr(self, "_engine_session_id", None):
+        if instance != getattr(self, "_engine_session_id", None):
             self._start_next_reject(record, "engine_restarted")
             return
         age = time.time() - float(issued_at)
@@ -9562,18 +9571,14 @@ class PlaybackEngine:
             return
 
         live = self._live_decks()
-        expected = data.get("expected")
-        if expected is not None:
-            ids = expected.get("live_log_item_ids") if isinstance(expected, dict) else None
-            if not isinstance(ids, list) or any(
-                isinstance(i, bool) or not isinstance(i, int) for i in ids
-            ):
-                self._start_next_reject(record, "malformed")
-                return
-            actual = sorted(getattr(deck.log_item, "id", None) for deck in live)
-            if sorted(set(ids)) != actual:
-                self._start_next_reject(record, "target_changed")
-                return
+        actual = tuple(sorted(
+            (deck.slot, getattr(deck.log_item, "id", None), deck.generation) for deck in live
+        ))
+        if expected != actual:
+            # Not exactly the occurrences AND generations the operator saw (a
+            # delayed/repeated press, a crossfade or a seek in between).
+            self._start_next_reject(record, "target_changed")
+            return
 
         paused = [deck for deck in occupied if deck.paused]
         transitional = [
