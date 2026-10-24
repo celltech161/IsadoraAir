@@ -386,8 +386,17 @@ class ConsoleTemplateContractTests(SimpleTestCase):
 
     def test_start_next_is_engine_authoritative_with_no_browser_transport_timing(self):
         self.assertIn("const CAN_START_NEXT = CONSOLE_CAPS.start_next === true;", self.template)
-        self.assertEqual(self.template.count("postEngineCommand('/api/engine/start-next/'"), 1)
-        self.assertIn("postEngineCommand('/api/engine/start-next/', body)", self._function("startNext"))
+        # One press posts once, plus exactly one retry of the SAME body when the
+        # first response was lost (r0117 SN-AUTH-1: the server derives the same
+        # request id from the press's client_request_id).
+        start_next = self._function("startNext")
+        self.assertEqual(self.template.count("postEngineCommand('/api/engine/start-next/'"), 2)
+        self.assertEqual(start_next.count("postEngineCommand('/api/engine/start-next/', body)"), 2)
+        self.assertIn("if (outcome.kind === 'unconfirmed') {", start_next)
+        self.assertIn("const binding = startNextBinding(data);", start_next)
+        self.assertIn("if (!binding) return;", start_next)
+        self.assertIn("const body = { client_request_id: startNextClientId(), ...binding };", start_next)
+        self.assertIn("if (!instance) return null;", self._function("startNextBinding"))
         for fn in ("startNext", "renderStartNext", "startNextResolvePending", "startNextRoute"):
             with self.subTest(fn=fn):
                 body = self._function(fn)
