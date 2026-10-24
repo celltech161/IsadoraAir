@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0117",
+  "target_commit": "ad52af0e97b0f7242dc4f91f0bca886cf69780be",
+  "manifest_sha256": "bf1275c0d8e0f8775633760a0e98ab99a3b64894b5d01f09ba7d49030afd0e5f",
+  "authorized_manual_operations": [
+    {
+      "ref": "authz.0009_playout_start_next_capability",
+      "migration_file_sha256": "e6c6dfb8b14771b22b89d40722d1fc77b183b573ed75288d87f15da01de79309",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0092_remote_dj_start_next_access",
+      "migration_file_sha256": "af6eca694f248d38b440f287c23a3793b2235895265afa4b92a9d8c7f85a7752",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    }
+  ]
+}
