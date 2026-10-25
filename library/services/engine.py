@@ -1487,6 +1487,12 @@ class RemoteDJSession:
         self.gate_last_sequence = 0
         self.gate_last_request_id = None
         self.gate_result = None
+        # 2.17A correction: when the engine itself forces this session's mic
+        # off (lost/unverifiable remote_dj.mic_gate), no user command issued
+        # at or before that moment may apply afterwards -- only a deliberate
+        # press made later. gate_forced is the bounded, owner-visible reason.
+        self.gate_mute_floor_ms = 0
+        self.gate_forced = None
         # Per-session diagnostic state. The original static-on-connect
         # investigation is resolved, but these bounded breadcrumbs remain
         # useful for future Remote DJ post-mortems. None of this state is
@@ -11070,6 +11076,9 @@ class PlaybackEngine:
         gate_result = getattr(session, "gate_result", None)
         if isinstance(gate_result, dict):
             owner["gate_result"] = dict(gate_result)
+        gate_forced = getattr(session, "gate_forced", None)
+        if isinstance(gate_forced, dict):
+            owner["gate_forced"] = dict(gate_forced)
         return owner
 
     def _remote_dj_record_browser_milestone(
@@ -11544,29 +11553,57 @@ class PlaybackEngine:
         particular, a scheduled effective_end is exclusive (roadmap
         2.5B's half-open interval) -- the FIRST tick at or after that
         instant sees authorize() deny and retires the session; there is
-        no added grace beyond the tick cadence itself."""
+        no added grace beyond the tick cadence itself.
+
+        Roadmap 2.17A correction: while connect stays authorized, the tick
+        ALSO re-evaluates remote_dj.mic_gate on its own. A denied or
+        unverifiable microphone permission forces that exact session's mic
+        off (_remote_dj_force_gate_off) -- it is not a transport failure, so
+        no recovery grace applies -- and the DJ stays connected to monitor.
+        The mic stays off until the same session is authorized again AND its
+        owner presses ON afresh. Registered with GLib.timeout_add_seconds,
+        so the interval is nominally 5 s and may be aligned to a whole-
+        second wakeup; enforcement is periodic, not instantaneous."""
         session = self.remote_dj_session
         if session is None:
             return True
         user_id = getattr(session, "user_id", None)
         if user_id is None:
             return True
+        attempt = getattr(session, "connection_attempt", None)
+        attempt_id = attempt.attempt_id if attempt is not None else "untracked"
 
-        _close_old_connections()
-        from django.contrib.auth import get_user_model
-        from authz.evaluator import authorize as _authorize
-
+        # Roadmap 2.17A correction: remote_dj.connect and remote_dj.mic_gate
+        # are evaluated independently. Every evaluation failure is caught:
+        # an exception escaping this GLib callback would remove the timer
+        # and silently end ALL future re-authorization.
         try:
-            user = get_user_model().objects.get(pk=user_id)
-        except get_user_model().DoesNotExist:
-            allowed, code, reason = False, "account_deleted", "Account no longer exists."
-        else:
-            result = _authorize(user, "remote_dj.connect", bypass_cache=True)
-            allowed, code, reason = result.allowed, result.code, result.reason
+            _close_old_connections()
+            from django.contrib.auth import get_user_model
+            from authz.evaluator import authorize as _authorize
+
+            user = get_user_model().objects.filter(pk=user_id).first()
+            if user is None:
+                allowed, code, reason = False, "account_deleted", "Account no longer exists."
+                mic_allowed, mic_code = False, "account_deleted"
+            else:
+                result = _authorize(user, "remote_dj.connect", bypass_cache=True)
+                allowed, code, reason = result.allowed, result.code, result.reason
+                mic_allowed, mic_code = False, None
+                if allowed:
+                    mic = _authorize(user, "remote_dj.mic_gate", bypass_cache=True)
+                    mic_allowed, mic_code = mic.allowed, mic.code
+        except Exception as exc:
+            # Cannot verify: fail safe on the MICROPHONE (a transient database
+            # fault must not keep a live mic open), but do not tear the
+            # session down on an unverified basis.
+            print(f"  Remote DJ [{attempt_id}]: re-authorization could not be evaluated "
+                  f"({type(exc).__name__}) -- forcing the mic off")
+            self._remote_dj_force_gate_off(session, attempt_id, reason="authorization_unverifiable",
+                                           user_id=user_id)
+            return True
 
         if not allowed:
-            attempt = getattr(session, "connection_attempt", None)
-            attempt_id = attempt.attempt_id if attempt is not None else "untracked"
             print(
                 f"  Remote DJ [{attempt_id}]: authorization revoked "
                 f"(code={code}) -- terminating session"
@@ -11582,6 +11619,66 @@ class PlaybackEngine:
             except Exception as exc:
                 print(f"  Remote DJ: failed to emit session-revoked audit event: {exc}")
             self._remote_dj_session_stop()
+            return True
+
+        if not mic_allowed:
+            # Connected for monitoring, but no longer allowed to be on air.
+            self._remote_dj_force_gate_off(session, attempt_id, reason=f"mic_permission:{mic_code}",
+                                           user_id=user_id)
+        return True
+
+    def _remote_dj_force_gate_off(self, session, attempt_id, *, reason, user_id=None, audit=None):
+        """Roadmap 2.17A -- engine-owned fail-safe mute of ONE exact session.
+
+        No browser credential: this is the engine closing a microphone its
+        own authority check no longer supports, never a user opening one. It
+        acts only if ``session`` is still the active session for
+        ``attempt_id`` (a replacement is never touched), then:
+
+        * physical gate to 0 and gate_desired=False, so no same-session
+          recovery can restore it (_remote_dj_complete_recovery restores
+          only a desired gate);
+        * ducking recomputed and _apply_mic_mode_hold re-evaluated, which
+          releases Manual only if the microphone owned it -- operator-held
+          Manual and a live Studio Mic are preserved;
+        * gate_mute_floor_ms = now: a command issued at or before this
+          moment (an old pending ON) is refused even if permission returns;
+          only a deliberate later press can reopen the mic;
+        * gate_forced records the bounded reason, published to the owner;
+        * one audit event when it actually changed a live/desired gate.
+
+        Returns True iff the gate was live or desired before the call."""
+        attempt = getattr(session, "connection_attempt", None)
+        if (self.remote_dj_session is not session or attempt is None
+                or attempt.attempt_id != attempt_id or session.slot_id is None):
+            return False
+        slot = self.dj_slots[session.slot_id]
+        was_live = slot.remote_gate.get_property("volume") > 0.0
+        was_desired = bool(session.gate_desired)
+        session.gate_mute_floor_ms = int(time.time() * 1000)
+        if not (was_live or was_desired):
+            return False
+        slot.remote_gate.set_property("volume", 0.0)
+        session.gate_desired = False
+        session.gate_forced = {"reason": reason.split(":", 1)[0]}
+        self._apply_talk_ducking()
+        self._apply_mic_mode_hold()
+        print(f"  Remote DJ [{attempt_id}]: mic forced OFF (reason={reason}, "
+              f"was_live={was_live}, was_desired={was_desired})")
+        detail = {"user_id": user_id, "attempt_id": attempt_id, "reason": reason,
+                  "was_live": was_live, "was_desired": was_desired}
+        if audit:
+            detail.update(audit)
+        try:
+            emit_event(
+                category="authz",
+                level="warning",
+                title="Remote DJ microphone forced off",
+                detail=detail,
+                dedupe_key=f"authz|remote_dj_mic_forced_off|{attempt_id}|{reason}",
+            )
+        except Exception as exc:
+            print(f"  Remote DJ: failed to emit mic-forced-off audit event: {exc}")
         return True
 
     @staticmethod
@@ -12842,6 +12939,9 @@ class PlaybackEngine:
         if not remote_dj_gate_identity.verify_command_proof(command):
             return self._remote_dj_gate_refused(None, command, "bad_proof")
         # From here the command is this session's own: outcomes are published.
+        if command["issued_at_ms"] <= session.gate_mute_floor_ms:
+            # Issued before the engine forced this mic off: never reopens it.
+            return self._remote_dj_gate_refused(session, command, "superseded_by_mute")
         if sequence <= session.gate_last_sequence:
             if sequence == session.gate_last_sequence \
                     and command["request_id"] == session.gate_last_request_id:
@@ -12849,10 +12949,15 @@ class PlaybackEngine:
                 return "duplicate"
             return self._remote_dj_gate_refused(session, command, "out_of_order")
         if not self._remote_dj_user_may_gate(command["user_id"]):
+            # The engine has just learned the owner may no longer gate: close
+            # the mic now rather than waiting for the next authorization tick.
+            self._remote_dj_force_gate_off(session, attempt_id, reason="mic_permission:command_check",
+                                           user_id=command["user_id"])
             return self._remote_dj_gate_refused(session, command, "not_authorized")
 
         session.gate_last_sequence = sequence
         session.gate_last_request_id = command["request_id"]
+        session.gate_forced = None
         held = self._remote_dj_set_gate(command["active"])
         outcome = "applied_held_muted" if held else "applied"
         session.gate_result = {"sequence": sequence, "active": command["active"], "outcome": outcome}

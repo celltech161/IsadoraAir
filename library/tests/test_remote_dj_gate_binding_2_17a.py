@@ -368,7 +368,12 @@ class RemoteDjGateEndpointTests(TestCase):
 
 
 # ---------------------------------------------------------------------------
-class RemoteDjGateEngineTests(TestCase):
+class GateEngineHarness:
+    """A bare PlaybackEngine with one real persistent slot gate (synthetic
+    GStreamer volume element), real ducking/Manual/recovery/session-stop
+    code, and only the duck ramp timer, GLib timeouts, SystemEvents and the
+    connection recycler stubbed. Shared by the 2.17A engine test modules."""
+
     def setUp(self):
         cfg = ScheduleAccessConfig.load()
         cfg.scheduled_enforcement_enabled = False
@@ -473,6 +478,8 @@ class RemoteDjGateEngineTests(TestCase):
 
     DUCKED = round(10 ** (-12.0 / 20.0), 4)
 
+
+class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
     # -- positive ---------------------------------------------------------------
     def test_owner_opens_and_closes_their_own_mic(self):
         session = self.connect(self.dj_a, ATTEMPT_A)
@@ -612,9 +619,16 @@ class RemoteDjGateEngineTests(TestCase):
         cfg = ScheduleAccessConfig.load()
         cfg.scheduled_enforcement_enabled = True          # no TalentAssignment window
         cfg.save()
-        for sequence, active in ((2, False), (3, True)):
-            outcome, before = self.send(self.dj_a, ATTEMPT_A, active=active, sequence=sequence)
-            self.assert_no_effect(outcome, before, "not_authorized")
+        # The OFF is refused (no authority), but the engine -- having just
+        # learned mic permission is gone -- forces the live mic off itself
+        # (2.17A correction; test_remote_dj_mic_permission_expiry_2_17a).
+        outcome, _ = self.send(self.dj_a, ATTEMPT_A, active=False, sequence=2)
+        self.assertEqual(outcome, "refused:not_authorized")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
+        self.assertFalse(self.engine.manual_mode)
+        # An ON is refused with no effect at all.
+        outcome, before = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3)
+        self.assert_no_effect(outcome, before, "not_authorized")
         self.assertEqual(session.gate_last_sequence, 1)
         # The revocation lifecycle itself (the existing authorization tick)
         # retires the session and mutes through the internal path.

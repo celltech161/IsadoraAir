@@ -513,6 +513,40 @@ FIRST tick at or after that instant sees `authorize()` deny and retires
 the session — no additional grace is layered on top of the tick cadence
 itself.
 
+**Microphone permission (2.17A correction).** While `remote_dj.connect`
+stays authorized, each tick also evaluates `remote_dj.mic_gate`
+independently.
+
+If it is denied (revoked, the schedule ended) or cannot be evaluated, the
+engine forces that exact session's microphone off
+(`_remote_dj_force_gate_off`):
+- physical gate 0 and `gate_desired=False`;
+- ducking recomputed;
+- Manual released only if the microphone owned it;
+- an `authz` SystemEvent "Remote DJ microphone forced off".
+
+The session stays connected for monitoring, and no recovery grace applies.
+
+The microphone never reopens by itself:
+- a recovery restores only a desired gate;
+- a gate command issued at or before the forced mute is refused
+  (`superseded_by_mute`);
+- the owner must press ON again once authorized.
+
+An evaluation error also forces the mic off (without tearing the session
+down), and never stops the tick.
+
+An owner OFF from a user who lost `mic_gate` is still refused at both
+boundaries; the engine-owned mute is the closure. When the engine refuses
+such a session-bound command as `not_authorized`, it applies the same mute
+immediately.
+
+**Timing.** The tick uses `GLib.timeout_add_seconds`, which may align
+wakeups to whole seconds. Enforcement is therefore periodic: a database
+change takes effect at the next tick, nominally ≤5 s, plus up to about 1 s
+of alignment and any main-loop latency (measured in the 2.17A evidence).
+It is not instantaneous.
+
 **Termination** reuses the existing, unmodified `_remote_dj_session_stop()`
 path verbatim: gate closes, manual-mode-from-mic folds back to Auto, slot/
 signaling teardown all happen exactly as an ordinary disconnect. This is
