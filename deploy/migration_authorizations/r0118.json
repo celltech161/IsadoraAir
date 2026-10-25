@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "release_id": "r0118",
+  "target_commit": "3cbe9ce4bc1e134040a3d9571b3ac6523cbb535f",
+  "manifest_sha256": "1419135f075242fa912e84f716065763079ed7f4f7688b16321c46b8157a73d2",
+  "authorized_manual_operations": [
+    {
+      "ref": "authz.0010_remote_dj_admin_capabilities",
+      "migration_file_sha256": "d674a54a6bd88fed02e36036df662933535b129060a2f1769bb95d31695e1825",
+      "operation_index": 0,
+      "operation": "RunPython",
+      "classification": "manual"
+    }
+  ]
+}
