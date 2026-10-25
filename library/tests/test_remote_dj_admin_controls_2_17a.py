@@ -1,9 +1,9 @@
-"""Roadmap 2.17A -- Station Administrator emergency controls for a connected
+"""Roadmap 2.17A -- Role-granted emergency controls for a connected
 Remote DJ: Emergency Mute (session latch), Release Emergency Mute, and Kick.
 
 Contract: library.services.remote_dj_admin_identity. Capabilities
 remote_dj.emergency_mute / remote_dj.force_disconnect come from the real
-authz.0010 seed (Station Administrator only). Engine tests use the shared
+authz.0010 seed (on Station Administrator by default). Engine tests use the shared
 GateEngineHarness (real gate/ducking/Manual/recovery/teardown code, synthetic
 GStreamer gate).
 """
@@ -45,6 +45,20 @@ def station_admin(username):
     user = User.objects.create_user(username, password="x")     # not staff: the grant is the authority
     user.groups.add(group)
     return user
+
+
+def emergency_operator(username, slugs, *, is_staff=False):
+    """A real User -> Group -> GroupRole -> RoleCapability assignment."""
+    role = Role.objects.create(name=f"{username} emergency role")
+    for slug in slugs:
+        RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug=slug))
+    group = Group.objects.create(name=f"{username} emergency group")
+    GroupRole.objects.create(group=group, role=role)
+    from library.models import GroupAccess
+    GroupAccess.objects.create(group=group, allowed_prefixes="/\n", landing_url="/")
+    user = User.objects.create_user(username, password="x", is_staff=is_staff)
+    user.groups.add(group)
+    return user, role
 
 
 def admin_request(action, attempt_id=ATTEMPT_A, *, instance=INSTANCE, client_id="admin-press-0001", **extra):
@@ -215,6 +229,50 @@ class AdminEndpointTests(TestCase):
                                       capability__slug="remote_dj.force_disconnect").delete()
         self.refused(self.post(self.admin, admin_request("kick")), 403)
         self.assertEqual(self.post(self.admin, admin_request("emergency_mute")).status_code, 202)
+
+    def test_ordinary_staff_needs_independent_role_grants_at_endpoint_and_console(self):
+        ungranted = User.objects.create_user("adm217a_ungranted_staff", password="x", is_staff=True)
+        mute_staff, _ = emergency_operator(
+            "adm217a_mute_staff", ["remote_dj.emergency_mute"], is_staff=True
+        )
+        kick_staff, _ = emergency_operator(
+            "adm217a_kick_staff", ["remote_dj.force_disconnect"], is_staff=True
+        )
+        cases = (
+            (ungranted, False, False),
+            (mute_staff, True, False),
+            (kick_staff, False, True),
+        )
+        for user, can_mute, can_kick in cases:
+            with self.subTest(user=user.username):
+                self.enqueue.reset_mock()
+                self.assertEqual(
+                    self.post(user, admin_request("emergency_mute")).status_code,
+                    202 if can_mute else 403,
+                )
+                self.enqueue.reset_mock()
+                self.assertEqual(
+                    self.post(user, admin_request("release_mute")).status_code,
+                    202 if can_mute else 403,
+                )
+                self.enqueue.reset_mock()
+                self.assertEqual(
+                    self.post(user, admin_request("kick")).status_code,
+                    202 if can_kick else 403,
+                )
+                client = Client()
+                client.force_login(user)
+                html = client.get("/").content.decode()
+                self.assertEqual('id="rdjEmergencyMuteBtn"' in html, can_mute)
+                self.assertEqual('id="rdjKickBtn"' in html, can_kick)
+
+    def test_custom_nonstaff_role_is_authoritative_at_service_boundary(self):
+        custom, _ = emergency_operator(
+            "adm217a_custom_nonstaff", ["remote_dj.force_disconnect"]
+        )
+        self.assertEqual(self.post(custom, admin_request("kick")).status_code, 202)
+        self.enqueue.reset_mock()
+        self.refused(self.post(custom, admin_request("emergency_mute")), 403)
 
     def test_copied_microphone_owner_credential_grants_nothing(self):
         key = gate_mod.control_key_for(self.dj.pk, ATTEMPT_A)
@@ -462,6 +520,58 @@ class AdminEngineTests(GateEngineHarness, TestCase):
             self.assertEqual(self.run_admin(action, client_id=f"noauth-{action.replace('_', '-')}"), "refused:not_authorized")
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(len(self.admin_events("refused:not_authorized")), 2)
+
+    def test_role_revoked_after_queue_acceptance_is_refused_at_execution(self):
+        staff, role = emergency_operator(
+            "adm217a_queued_staff", ["remote_dj.force_disconnect"], is_staff=True
+        )
+        self.live()
+        queued = admin_command(staff, "kick", ATTEMPT_A, self.dj_a, client_id="queued-before-revoke")
+        RoleCapability.objects.filter(
+            role=role, capability__slug="remote_dj.force_disconnect"
+        ).delete()
+        before = self.snapshot()
+        self.assertEqual(self.engine._remote_dj_admin_command(queued), "refused:not_authorized")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_engine_bypasses_stale_process_cache_for_revoke_and_grant(self):
+        from authz import evaluator
+
+        staff, role = emergency_operator(
+            "adm217a_fresh_staff", ["remote_dj.emergency_mute"], is_staff=True
+        )
+        group_name = staff.groups.get().name
+        self.live()
+
+        # Simulate the engine process retaining the pre-revocation map. The
+        # execution boundary must read the database, not this stale cache.
+        stale_granted = {group_name: frozenset({"remote_dj.emergency_mute"})}
+        RoleCapability.objects.filter(
+            role=role, capability__slug="remote_dj.emergency_mute"
+        ).delete()
+        with mock.patch.object(evaluator, "_GROUP_CAPABILITY_CACHE", stale_granted):
+            self.assertEqual(
+                self.engine._remote_dj_admin_command(admin_command(
+                    staff, "emergency_mute", ATTEMPT_A, self.dj_a,
+                    client_id="fresh-revoke-01",
+                )),
+                "refused:not_authorized",
+            )
+
+        # The inverse is equally important: a grant made through Admin must
+        # work without restarting the separate engine process.
+        stale_denied = {group_name: frozenset()}
+        RoleCapability.objects.create(
+            role=role, capability=Capability.objects.get(slug="remote_dj.emergency_mute")
+        )
+        with mock.patch.object(evaluator, "_GROUP_CAPABILITY_CACHE", stale_denied):
+            self.assertEqual(
+                self.engine._remote_dj_admin_command(admin_command(
+                    staff, "emergency_mute", ATTEMPT_A, self.dj_a,
+                    client_id="fresh-grant-0001",
+                )),
+                "executed",
+            )
 
     def test_a_remote_host_cannot_be_the_administrator_even_in_a_signed_command(self):
         self.live()

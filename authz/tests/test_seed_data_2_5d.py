@@ -1,7 +1,7 @@
 """Roadmap 2.5D seed-data closeout tests."""
 from django.test import TestCase
 
-from authz.models import Capability, Role
+from authz.models import Capability, GroupRole, Role
 
 
 class StationAdministratorSeedTests(TestCase):
@@ -32,4 +32,12 @@ class StationAdministratorSeedTests(TestCase):
             remote_host.capabilities.filter(
                 slug__in=("monitoring.reset_listener_counters", "aircheck.control")
             ).exists()
+        )
+
+    def test_station_administrator_role_is_not_implicitly_bound_to_staff_or_any_group(self):
+        # authz.0010 seeds RoleCapability defaults, not account membership.
+        # A superuser must deliberately bind this (or a custom Role) to a
+        # Group and place designated operators in that Group.
+        self.assertFalse(
+            GroupRole.objects.filter(role__name="Station Administrator").exists()
         )

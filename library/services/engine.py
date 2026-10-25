@@ -12997,7 +12997,7 @@ class PlaybackEngine:
         return self._remote_dj_user_has(user_id, "remote_dj.mic_gate")
 
     def _remote_dj_admin_command(self, data):
-        """Roadmap 2.17A -- a Station Administrator's Emergency Mute, Release
+        """Roadmap 2.17A -- a Role-authorized operator's Emergency Mute, Release
         Emergency Mute or Kick for ONE exact Remote DJ session
         (remote_dj_admin_identity). Executes iff: strict schema, a valid
         server signature over every field including the command type and

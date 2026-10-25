@@ -264,7 +264,7 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
 
 
 class _AdminControlCases(_RemoteMicHarness):
-    """Roadmap 2.17A Station Administrator controls on the full Console."""
+    """Roadmap 2.17A Role-granted emergency controls on the full Console."""
 
     def admin_page(self, viewport=DESKTOP, **state):
         self.state = self.connected_state(current=False, **state)
@@ -288,6 +288,49 @@ class _AdminControlCases(_RemoteMicHarness):
     def click(self, page, selector):
         page.locator(selector).click()
         page.wait_for_function("() => rdjAdminUi.pending === null || rdjAdminUi.pending.requestId !== null")
+
+    def test_staff_controls_follow_independent_role_grants_after_page_refresh(self):
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Group
+        from authz.models import Capability, GroupRole, Role, RoleCapability
+
+        user = get_user_model().objects.create_user(
+            "rdj_browser_staff", password="x", is_staff=True
+        )
+        self.state = self.connected_state(current=False)
+        ungranted = self.open_console(user)
+        self.poll_now(ungranted)
+        self.assertIsNone(self.admin_ui(ungranted)["bar"])
+        self.assertEqual(
+            ungranted.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
+            [False, False],
+        )
+
+        role = Role.objects.create(name="Browser Emergency Mute Only")
+        mute = Capability.objects.get(slug="remote_dj.emergency_mute")
+        kick = Capability.objects.get(slug="remote_dj.force_disconnect")
+        grant = RoleCapability.objects.create(role=role, capability=mute)
+        group = Group.objects.create(name="Browser Emergency Operators")
+        GroupRole.objects.create(group=group, role=role)
+        user.groups.add(group)
+
+        mute_page = self.open_console(user)
+        self.poll_now(mute_page)
+        self.assertEqual(
+            mute_page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
+            [True, False],
+        )
+        self.assertIsNotNone(self.admin_ui(mute_page)["bar"])
+
+        grant.delete()
+        RoleCapability.objects.create(role=role, capability=kick)
+        kick_page = self.open_console(user)
+        self.poll_now(kick_page)
+        self.assertEqual(
+            kick_page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
+            [False, True],
+        )
+        self.assertIsNotNone(self.admin_ui(kick_page)["bar"])
 
     def test_controls_target_the_observed_session_desktop_and_mobile(self):
         for name, viewport in (("desktop", DESKTOP), ("mobile", MOBILE_PORTRAIT)):

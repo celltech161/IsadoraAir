@@ -14,17 +14,17 @@ which needs to call authorize() from the engine's GLib thread / the
 signaling server's asyncio loop -- neither of which is ever inside a
 Django request.
 
-Staff/superuser compatibility (see PROJECT_NOTES.md's "Roadmap 2.5"
-section for the full reasoning): both `is_superuser` and `is_staff`
-unconditionally satisfy every operational capability, mirroring
-library.middleware.GroupBasedAccessMiddleware's existing "staff/superuser
-bypass all group checks" convention for GroupAccess. This is NOT the
-same thing as a capability granting staff/superuser authority -- the
-implication is strictly one-way (staff/superuser -> capability), never
-the reverse. Nothing in this module ever sets or checks is_staff/
-is_superuser as an OUTPUT of a capability grant. This bypass applies to
-schedule-restricted capabilities too (roadmap 2.5B) -- staff/superuser
-are never required to hold a TalentAssignment.
+Staff/superuser compatibility (see docs/AUTHORIZATION.md): `is_superuser`
+unconditionally satisfies every operational capability. `is_staff` keeps
+the same compatibility behavior for every capability EXCEPT the two
+session-destructive Remote DJ emergency controls in
+STAFF_ROLE_REQUIRED_CAPABILITIES. Ordinary staff must receive those exact
+capabilities through the normal User -> Group -> GroupRole -> Role ->
+RoleCapability path, so a Django Admin grant is also genuinely revocable.
+This narrow exception does not alter GroupAccess reachability and does not
+turn a capability into staff/superuser status. The staff bypass continues
+to apply to every schedule-restricted capability, so staff are still never
+required to hold a TalentAssignment.
 
 Roadmap 2.5B -- scheduled authorization: a Capability with
 `requires_schedule=True` additionally requires an active TalentAssignment
@@ -145,6 +145,17 @@ CODE_INACTIVE_ASSIGNMENT = "inactive_assignment"
 SCHEDULE_POLICY_ENFORCE = "enforce"
 SCHEDULE_POLICY_STRICT = "strict"
 SCHEDULE_POLICY_IGNORE = "ignore"
+
+# Roadmap 2.17A corrective round 3: these live-session emergency powers
+# must be explicitly assignable and revocable through the existing Role
+# model even for ordinary Django staff. Superuser remains unconditional
+# break-glass authority. Keep this list deliberately narrow: every other
+# operational capability retains the longstanding staff compatibility
+# bypass.
+STAFF_ROLE_REQUIRED_CAPABILITIES = frozenset({
+    "remote_dj.emergency_mute",
+    "remote_dj.force_disconnect",
+})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -346,17 +357,15 @@ def authorize(
     if not user.is_active:
         return _denied(CODE_DISABLED_ACCOUNT, "This account is disabled.")
 
-    # Staff/superuser compatibility (see module docstring + PROJECT_NOTES.md
-    # "Roadmap 2.5" section): unconditional operational authority, mirroring
-    # GroupBasedAccessMiddleware's existing bypass. This is intentionally
-    # checked BEFORE looking at the user's Role-derived capability set --
-    # a staff/superuser account need not (and, per the transition plan,
-    # generally won't yet) be a member of a Group bound to a Role, and
-    # (2.5B) is never required to hold a TalentAssignment either.
+    # Superuser is unconditional break-glass authority. Ordinary staff keeps
+    # the legacy compatibility bypass except for the two explicitly
+    # configurable Remote DJ emergency capabilities above. For those two,
+    # staff falls through to the exact same Role-derived evaluation as every
+    # other account; no view/engine-specific policy exists.
     if user.is_superuser:
         return _allowed("Authorized: superuser break-glass authority.")
-    if user.is_staff:
-        return _allowed("Authorized: staff compatibility bypass (see PROJECT_NOTES.md).")
+    if user.is_staff and capability_slug not in STAFF_ROLE_REQUIRED_CAPABILITIES:
+        return _allowed("Authorized: staff compatibility bypass (see docs/AUTHORIZATION.md).")
 
     capability_map = _load_group_capability_map() if bypass_cache else get_group_capability_map()
     user_group_names = set(user.groups.values_list("name", flat=True))

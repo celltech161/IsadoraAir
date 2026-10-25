@@ -108,6 +108,61 @@ class CapabilityCompositionTests(TestCase):
         result = authorize(staff, "monitoring.restart_service")
         self.assertTrue(result.allowed)
 
+    def test_superuser_keeps_break_glass_for_remote_dj_emergency_capabilities(self):
+        su = User.objects.create_superuser("emergency_su", "emergency-su@example.invalid", "pw")
+        for slug in ("remote_dj.emergency_mute", "remote_dj.force_disconnect"):
+            with self.subTest(slug=slug):
+                self.assertTrue(authorize(su, slug).allowed)
+
+    def test_ordinary_staff_needs_role_grants_for_remote_dj_emergency_capabilities(self):
+        staff = User.objects.create_user("emergency_staff", password="pw", is_staff=True)
+        for slug in ("remote_dj.emergency_mute", "remote_dj.force_disconnect"):
+            with self.subTest(slug=slug):
+                result = authorize(staff, slug)
+                self.assertFalse(result.allowed)
+                self.assertEqual(result.code, CODE_CAPABILITY_MISSING)
+        # The exception is deliberately exact: unrelated legacy staff
+        # compatibility remains unchanged.
+        self.assertTrue(authorize(staff, "monitoring.restart_service").allowed)
+
+    def test_staff_emergency_grants_are_role_derived_independent_and_revocable(self):
+        role = make_role("Emergency Mute Only", ["remote_dj.emergency_mute"])
+        group = make_group_with_role("Emergency Mute Operators", role)
+        staff = User.objects.create_user("granted_emergency_staff", password="pw", is_staff=True)
+        staff.groups.add(group)
+
+        self.assertTrue(authorize(staff, "remote_dj.emergency_mute").allowed)
+        self.assertFalse(authorize(staff, "remote_dj.force_disconnect").allowed)
+
+        kick = RoleCapability.objects.create(
+            role=role, capability=Capability.objects.get(slug="remote_dj.force_disconnect")
+        )
+        self.assertTrue(authorize(staff, "remote_dj.force_disconnect").allowed)
+
+        RoleCapability.objects.filter(
+            role=role, capability__slug="remote_dj.emergency_mute"
+        ).delete()
+        self.assertFalse(authorize(staff, "remote_dj.emergency_mute").allowed)
+        self.assertTrue(authorize(staff, "remote_dj.force_disconnect").allowed)
+        kick.delete()
+        self.assertFalse(authorize(staff, "remote_dj.force_disconnect").allowed)
+
+    def test_nonstaff_role_grant_and_disabled_staff_contract(self):
+        role = make_role("Emergency Custom Role", ["remote_dj.force_disconnect"])
+        group = make_group_with_role("Emergency Custom Group", role)
+        nonstaff = User.objects.create_user("emergency_nonstaff", password="pw")
+        disabled_staff = User.objects.create_user(
+            "disabled_emergency_staff", password="pw", is_staff=True, is_active=False
+        )
+        nonstaff.groups.add(group)
+        disabled_staff.groups.add(group)
+
+        self.assertTrue(authorize(nonstaff, "remote_dj.force_disconnect").allowed)
+        self.assertFalse(authorize(nonstaff, "remote_dj.emergency_mute").allowed)
+        result = authorize(disabled_staff, "remote_dj.force_disconnect")
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.code, CODE_DISABLED_ACCOUNT)
+
     def test_ordinary_talent_capability_does_not_grant_administrative_authority(self):
         """The one-way implication from PROJECT_NOTES.md's "Roadmap 2.5"
         section: holding an ordinary talent capability must never make

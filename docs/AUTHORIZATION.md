@@ -163,32 +163,29 @@ it also records a lightweight audit event — see "Audit trail" below.
 
 ### Staff/superuser compatibility
 
-Both `user.is_superuser` and `user.is_staff` unconditionally satisfy
-every operational capability, checked *before* any Role lookup:
+`user.is_superuser` remains IsadoraAir's unconditional break-glass
+authority and never needs a Role. Ordinary `user.is_staff` retains the
+historic compatibility bypass for every operational capability except these
+two live-session emergency powers:
 
-- **Superuser** is IsadoraAir's unconditional break-glass authority by
-  explicit operator decision — never required to hold a Role.
-- **Staff** gets the same unconditional pass as a *compatibility*
-  decision: `library.middleware.GroupBasedAccessMiddleware` already lets
-  staff bypass `GroupAccess` reachability entirely (its own docstring:
-  "Staff/superuser bypass this table entirely"), so mirroring that exact
-  convention in `authorize()` preserves every existing staff account's
-  operational authority with zero migration/backfill and zero risk of a
-  staff account silently losing access to something it could do
-  yesterday. The alternative (backfilling staff into a Role via a Group)
-  would only cover staff accounts existing at migration time, not staff
-  accounts created afterward — rejected for exactly that reason.
+- `remote_dj.emergency_mute`
+- `remote_dj.force_disconnect`
 
-**The implication is strictly one way.** Staff/superuser status grants
-capability authority; no capability ever grants `is_staff`,
-`is_superuser`, Django Admin access, or Update Center authority. A
-powerful talent Role (e.g. one holding every scheduled on-air capability)
-is not and can never become a system administrator through this
-mechanism. This bypass applies to schedule-restricted capabilities too
-(2.5B): staff/superuser are never required to hold a `TalentAssignment`.
-This is a deliberate compatibility policy for the current migration, not
-a statement that talent Roles may ever gain administrative authority —
-the two remain unrelated.
+For exactly those capabilities, ordinary staff follows the normal
+`User -> Group -> GroupRole -> Role -> RoleCapability` path. This makes an
+Admin grant genuinely configurable and revocable while leaving every other
+legacy staff behavior unchanged. Staff still bypasses `GroupAccess`
+reachability, but reachability is not authority: an ungranted staff account
+can open the Console and still cannot see, submit, or execute these controls.
+The emergency exception is centralized in `authorize()`; views, templates,
+and the engine do not implement a separate staff rule.
+
+**The implication is strictly one way.** Staff/superuser status never comes
+from a capability. A Role grant does not confer `is_staff`, `is_superuser`,
+Django Admin access, or Update Center authority. The ordinary staff bypass
+continues to cover schedule-restricted capabilities (2.5B), so staff are not
+required to hold a `TalentAssignment`; the two emergency capabilities are
+not schedule-restricted. Superuser break-glass remains unconditional.
 
 ## Scheduled authorization (Phase 2.5B)
 
@@ -434,7 +431,7 @@ distinction").
 | `POST /api/engine/start-next/` (`api_engine_start_next`) | `playout.start_next` | 2.23; CSRF-enforced; `remote_dj` reaches it through one exact GroupAccess path (`library.0092`) |
 | `POST /api/engine/manual-mode/` (`api_engine_manual_mode`) | `playout.manual_mode` | |
 | `POST /api/engine/remote-dj-gate/` (`api_engine_remote_dj_gate`) | `remote_dj.mic_gate` | 2.17A: CSRF-enforced; only the connected DJ's own browser, for its own active session — see "Remote Mic session binding" |
-| `POST /api/engine/remote-dj-admin/` (`api_engine_remote_dj_admin`) | `remote_dj.emergency_mute` (`emergency_mute`, `release_mute`) or `remote_dj.force_disconnect` (`kick`) | 2.17A; Station Administrator only; CSRF-enforced; targets the exact observed session — see "Remote DJ administrator emergency controls" |
+| `POST /api/engine/remote-dj-admin/` (`api_engine_remote_dj_admin`) | `remote_dj.emergency_mute` (`emergency_mute`, `release_mute`) or `remote_dj.force_disconnect` (`kick`) | 2.17A; explicit Role grant for ordinary users/staff, superuser break-glass; CSRF-enforced; targets the exact observed session — see "Remote DJ administrator emergency controls" |
 | `POST /api/engine/mic-ptt/` (`api_engine_mic_ptt`) | `studio.mic_ptt` | operator-only in practice (no Role grants it but Station Administrator) |
 | `POST /api/fx/fire/` (`api_fx_fire`) | `fx.fire` | |
 | `_can_edit_voicetracks()` (5 call sites: upload/audio/save/delete + `voicetracks_page`) | `voicetrack.record` | not schedule-restricted; unchanged effective behavior |
@@ -787,9 +784,10 @@ Administrator seed contains the complete capability vocabulary.
 Contributor receive neither.
 
 `authz.0010` (roadmap 2.17A) adds `remote_dj.emergency_mute` and
-`remote_dj.force_disconnect`, not schedule-restricted, to Station Administrator
-only. Remote Host and Contributor receive neither, and no GroupAccess path is
-added.
+`remote_dj.force_disconnect`, not schedule-restricted, to the seeded Station
+Administrator Role. Remote Host and Contributor receive neither, no
+`GroupRole` or user membership is created, and no GroupAccess path is added.
+A station may instead grant either capability independently to a custom Role.
 
 `authz.0009` (roadmap 2.23) adds the schedule-restricted
 `playout.start_next` to Station Administrator and Remote Host; Contributor
@@ -804,9 +802,11 @@ The seed migration only binds `GroupRole` rows for `Contributor` and
 `remote_dj` because those are the only groups with real, existing
 effective behavior to preserve. `Station Administrator` exists as a Role
 an operator can bind to a Group of their own choosing (e.g. a future
-"Station Managers" Group) — it is deliberately not auto-bound to
-anything, since `is_staff`/`is_superuser` already cover that need today
-(see the staff/superuser compatibility rule above).
+"Station Managers" Group) — it is deliberately not auto-bound to anything.
+In particular, neither the Role name nor `is_staff=True` creates a
+`GroupRole` or Group membership. A superuser must perform the deliberate
+bootstrap below before an ordinary staff account receives either Remote DJ
+emergency capability.
 
 ## Admin
 
@@ -819,6 +819,30 @@ attached to the existing customized `auth.Group` admin
 this group go" (`GroupAccess`) and "what can this group do" (`GroupRole`
 → `Role` → capabilities) on the same page, as two clearly separate
 inlines/models, never merged into one row.
+
+**Remote DJ emergency bootstrap (2.17A).** Sign in as a superuser, then:
+
+1. Under **Config → Capabilities**, inspect `remote_dj.emergency_mute` and
+   `remote_dj.force_disconnect`.
+2. Under **Config → Roles**, edit Station Administrator or create a narrower
+   custom Role. Add only the required capability or capabilities in the Role
+   Capability inline; either grant can be removed independently.
+3. Under **Authentication and Authorization → Groups**, create or edit the
+   designated operator Group and select that Role in the Group Role inline.
+   Configure Group Access separately if a nonstaff operator must reach the
+   Console; staff already has page reachability, but not emergency authority.
+4. On each designated user's Admin page, add or remove that Group in the
+   **Groups** field. Reload the Console to refresh rendered controls.
+
+Only a superuser or an administrator holding Django's corresponding model
+permissions for Roles/Role Capabilities, Groups/Group Roles, and Users may
+perform these steps. Merely having `is_staff=True` admits a user to Django
+Admin but does not supply those model permissions, so an unprivileged staff
+user cannot self-grant. Request-side caches are invalidated by model-change
+signals. The separate engine process deliberately re-reads Role assignments
+with `bypass_cache=True` at execution, so grants and revocations require no
+engine restart; a queued command whose grant was subsequently revoked is
+refused.
 
 **Roadmap 2.5B**: `authz.admin.TalentAssignmentInline` is attached to the
 existing customized User admin (`library.admin.InviteCapableUserAdmin`)
@@ -922,9 +946,12 @@ No action can open a microphone.
 `authz` SystemEvent. The newest outcome is shown only to administrators
 (`remote_dj_admin_result`).
 
-**Staff.** These capabilities follow `authorize()`'s existing staff/superuser
-compatibility rule. Ordinary `remote_dj.mic_gate` stays owner-bound for
-everyone.
+**Staff.** Superusers retain unconditional break-glass authority. Ordinary
+staff must hold each emergency capability through a Group-bound Role; Mute and
+Release share `remote_dj.emergency_mute`, while Kick independently requires
+`remote_dj.force_disconnect`. Nonstaff users may also receive either Role
+grant, subject to existing `GroupAccess` page reachability. Ordinary
+`remote_dj.mic_gate` remains owner-bound for everyone.
 
 The old unbound `remote_dj_disconnect` engine command (it had no producer) is
 removed.

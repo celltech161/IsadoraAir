@@ -2953,7 +2953,7 @@ def _audit_remote_dj_admin(user, action, outcome, **detail):
 
 @require_http_methods(["POST"])
 def api_engine_remote_dj_admin(request):
-    """Station Administrator emergency controls for the connected Remote DJ
+    """Role-granted emergency controls for the connected Remote DJ
     (roadmap 2.17A; contract in library.services.remote_dj_admin_identity):
     ``emergency_mute`` / ``release_mute`` need remote_dj.emergency_mute,
     ``kick`` needs remote_dj.force_disconnect. None can open a microphone.
