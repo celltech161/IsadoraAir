@@ -90,6 +90,36 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
         page.wait_for_function(
             "() => startNextUi.pending === null || startNextUi.pending.requestId !== null", timeout=10_000)
 
+    def contrast(self, page, selector):
+        """Return the rendered WCAG contrast ratio for an element."""
+        return page.locator(selector).evaluate("""element => {
+          const rgb = value => value.match(/[\\d.]+/g).slice(0, 3).map(Number);
+          const luminance = value => {
+            const channels = rgb(value).map(channel => {
+              channel /= 255;
+              return channel <= 0.04045
+                ? channel / 12.92
+                : Math.pow((channel + 0.055) / 1.055, 2.4);
+            });
+            return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+          };
+          const style = getComputedStyle(element);
+          const values = [luminance(style.color), luminance(style.backgroundColor)].sort((a, b) => b - a);
+          return (values[0] + 0.05) / (values[1] + 0.05);
+        }""")
+
+    def luminance(self, page, selector, property_name):
+        return page.locator(selector).evaluate("""(element, propertyName) => {
+          const rgb = getComputedStyle(element)[propertyName].match(/[\\d.]+/g).slice(0, 3).map(Number);
+          const channels = rgb.map(channel => {
+            channel /= 255;
+            return channel <= 0.04045
+              ? channel / 12.92
+              : Math.pow((channel + 0.055) / 1.055, 2.4);
+          });
+          return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+        }""", property_name)
+
     # -- layout and identity --------------------------------------------
     def test_desktop_button_sits_between_the_decks_and_names_the_route(self):
         for live, route in (("A", "Deck A → Deck B"), ("B", "Deck B → Deck A")):
@@ -110,6 +140,40 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
                 self.shot(page, f"start-next-desktop-deck{live}-live")
         self.assertEqual(self.posts, [])
 
+    def test_desktop_visual_contract_is_compact_card_height_and_accessible(self):
+        page = self.open_console(self.superuser, viewport=DESKTOP)
+        deck = self.box(page, "#deck-A")
+        slot = self.box(page, "#startNextSlot")
+        button = self.box(page, "#startNextBtn")
+
+        # 4.875rem is 65% of the former 7.5rem slot.
+        self.assertAlmostEqual(slot["width"], 78.0, delta=1.0)
+        self.assertAlmostEqual(slot["top"], deck["top"], delta=1.0)
+        self.assertAlmostEqual(slot["bottom"], deck["bottom"], delta=1.0)
+        self.assertAlmostEqual(button["top"], deck["top"], delta=1.0)
+        self.assertGreater(button["height"], deck["height"] * 0.85)
+
+        normal_background = self.luminance(page, "#startNextBtn", "backgroundColor")
+        normal_foreground = self.luminance(page, "#startNextBtn", "color")
+        self.assertGreaterEqual(self.contrast(page, "#startNextBtn"), 4.5)
+        self.assertLess(float(page.locator("#startNextBtn").evaluate(
+            "e => parseFloat(getComputedStyle(e).borderTopLeftRadius)")), 16.0)
+
+        page.locator("#startNextBtn").hover()
+        self.assertGreaterEqual(self.contrast(page, "#startNextBtn"), 4.5)
+        self.assertGreater(self.luminance(page, "#startNextBtn", "backgroundColor"), normal_background)
+        self.assertGreater(self.luminance(page, "#startNextBtn", "color"), normal_foreground)
+
+        page.locator("#startNextBtn").focus()
+        focus = page.locator("#startNextBtn").evaluate(
+            "e => ({style: getComputedStyle(e).outlineStyle, width: parseFloat(getComputedStyle(e).outlineWidth)})")
+        self.assertEqual(focus["style"], "solid")
+        self.assertGreaterEqual(focus["width"], 3.0)
+
+        page.locator("#startNextBtn").evaluate("e => { e.disabled = true; e.blur(); }")
+        self.assertGreaterEqual(self.contrast(page, "#startNextBtn"), 4.5)
+        self.assertEqual(page.locator("#startNextBtn").evaluate("e => getComputedStyle(e).cursor"), "not-allowed")
+
     def test_stacked_layouts_give_start_next_its_own_row_between_the_decks(self):
         for name, viewport in (("tablet", TABLET), ("mobile-portrait", MOBILE_PORTRAIT),
                                ("mobile-landscape", MOBILE_LANDSCAPE)):
@@ -123,6 +187,11 @@ class _StartNextBrowserBase(_ConsoleBrowserBase):
                     self.assertLess(a["right"], slot["left"])
                     self.assertLess(slot["right"], b["left"])
                 self.assertTrue(page.locator("#startNextBtn").is_visible())
+                if viewport["width"] <= 700:
+                    button = self.box(page, "#startNextBtn")
+                    self.assertGreaterEqual(button["height"], 44.0)
+                    self.assertLessEqual(button["height"], 56.0)
+                    self.assertGreaterEqual(self.contrast(page, "#startNextBtn"), 4.5)
                 self.no_horizontal_overflow(page)
                 self.shot(page, f"start-next-full-{name}")
 

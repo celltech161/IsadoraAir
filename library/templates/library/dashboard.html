@@ -381,36 +381,49 @@
   .start-next-slot {
     flex-direction: column;
     gap: 0.35rem;
-    width: 7.5rem;
+    width: 4.875rem;
   }
 
   /* Roadmap 2.23 Phase 3 -- Start Next: the soft, engine-faded transition.
      Deliberately unlike the small square Eject transport icon: a large
-     accent pill with a visible word, so the two are never confused. */
+     green control with a visible word, so the two are never confused.
+     The two foregrounds deliberately stay dark: near-white type on the
+     requested lighter hover green cannot meet AA contrast. The hover
+     foreground is still visibly lighter than the normal foreground while
+     retaining a 5.2:1 contrast ratio (normal is 4.6:1). */
   .start-next-btn {
     display: inline-flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 0.15rem;
+    flex: 1 1 auto;
     width: 100%;
-    min-height: 4.5rem;
+    min-height: 0;
     padding: 0.55rem 0.5rem;
-    border: 2px solid var(--accent);
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--text-main);
+    border: 2px solid #86efac;
+    border-radius: 0.65rem;
+    background: #168c42;
+    color: #020b05;
     font: inherit;
     font-weight: 700;
     cursor: pointer;
   }
   .start-next-btn:hover:not(:disabled),
-  .start-next-btn:focus-visible { background: var(--accent); color: var(--bg-darker); }
-  .start-next-btn:focus-visible { outline: 3px solid var(--text-main); outline-offset: 2px; }
+  .start-next-btn:focus-visible {
+    border-color: #bbf7d0;
+    background: #4ade80;
+    color: #14532d;
+  }
+  .start-next-btn:focus-visible {
+    outline: 3px solid #f0fdf4;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 5px #14532d;
+  }
   .start-next-btn:disabled {
-    border-color: var(--border-subtle);
-    background: transparent;
-    color: var(--text-muted);
+    border-color: #657068;
+    background: #26332c;
+    color: #b7c0ba;
     cursor: not-allowed;
   }
   .start-next-btn[data-sn-state="busy"],
@@ -457,10 +470,12 @@
     }
     .start-next-btn {
       flex-direction: row;
+      flex: 0 0 auto;
       gap: 0.5rem;
       width: auto;
       min-width: 12rem;
       min-height: 2.75rem;
+      height: auto;
       padding: 0.4rem 1.2rem;
     }
     .start-next-progress { width: 12rem; flex-basis: 100%; max-width: 12rem; }
