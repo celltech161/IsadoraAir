@@ -9,9 +9,8 @@ Covers:
   * send_test_email(): the "Send Test Email" admin action's service
     function. Success, no-recipients, and SMTP-exception paths, plus
     the SystemEvent each records.
-  * maybe_notify()'s pre-existing cooldown/notify_on_warning/recovery
-    gating, confirmed UNCHANGED by this pass (no prior test coverage
-    existed for this function at all before this file).
+  * maybe_notify()'s cooldown and preference gating plus persisted
+    per-incident recovery eligibility.
 
 Django's test runner forces EMAIL_BACKEND to the locmem backend for
 the whole run (see django.test.utils.setup_test_environment) --
@@ -259,16 +258,149 @@ class MaybeNotifyExistingBehaviorTests(TestCase):
         make_config(cooldown_minutes=30)
         check = make_check()
         cooldowns = {}
-        with patch.object(notify, "_send") as mock_send:
+        with patch.object(notify, "_send", return_value="sent") as mock_send:
             notify.maybe_notify(check, "critical", {}, "ok", cooldowns)
             notify.maybe_notify(check, "critical", {}, "critical", cooldowns)
         self.assertEqual(mock_send.call_count, 1)
 
-    def test_recovery_notification_sent_and_clears_cooldown(self):
+    def test_recovery_notification_sent_and_clears_incident_state(self):
         make_config()
         check = make_check()
-        cooldowns = {str(check.id): 0}
-        with patch.object(notify, "_send") as mock_send:
-            notify.maybe_notify(check, "ok", {}, "critical", cooldowns)
+        cid = str(check.id)
+        cooldowns = {cid: 1.0}
+        incidents = {
+            cid: {
+                "attempted_severity": "critical",
+                "attempted_at": 1.0,
+                "delivery_outcome": "sent",
+            }
+        }
+        with patch.object(notify, "_send", return_value="sent") as mock_send:
+            notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
         mock_send.assert_called_once()
-        self.assertNotIn(str(check.id), cooldowns)
+        self.assertNotIn(cid, cooldowns)
+        self.assertNotIn(cid, incidents)
+
+
+class IncidentRecoveryLifecycleTests(TestCase):
+    def test_disabled_warning_never_creates_recovery(self):
+        make_config()
+        check = make_check(notify_on_warning=False)
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "warning", {"value": 1}, "ok", cooldowns, incidents)
+        notify.maybe_notify(check, "ok", {"value": 0}, "warning", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_attempted_warning_creates_one_matching_recovery(self):
+        make_config()
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "warning", {}, "ok", cooldowns, incidents)
+        self.assertEqual(incidents[str(check.id)]["attempted_severity"], "warning")
+        self.assertEqual(incidents[str(check.id)]["delivery_outcome"], "sent")
+        notify.maybe_notify(check, "ok", {}, "warning", cooldowns, incidents)
+        self.assertEqual([message.subject for message in mail.outbox], [
+            "[IsadoraAir] Test Check: WARNING",
+            "[IsadoraAir] Test Check: RECOVERED",
+        ])
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_attempted_critical_creates_one_matching_recovery(self):
+        make_config()
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "critical", {}, "ok", cooldowns, incidents)
+        notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
+        self.assertEqual([message.subject for message in mail.outbox], [
+            "[IsadoraAir] Test Check: CRITICAL",
+            "[IsadoraAir] Test Check: RECOVERED",
+        ])
+
+    def test_smtp_failure_still_qualifies_incident_for_recovery(self):
+        make_config()
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        with patch("django.core.mail.send_mail", side_effect=RuntimeError("smtp down")):
+            outcome = notify.maybe_notify(
+                check, "critical", {}, "ok", cooldowns, incidents
+            )
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(incidents[str(check.id)]["delivery_outcome"], "failed")
+        notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("RECOVERED", mail.outbox[0].subject)
+
+    def test_critical_eligibility_survives_warning_with_warning_disabled(self):
+        make_config()
+        check = make_check(notify_on_warning=False, notify_on_critical=True)
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "critical", {}, "ok", cooldowns, incidents)
+        notify.maybe_notify(check, "warning", {}, "critical", cooldowns, incidents)
+        self.assertEqual(incidents[str(check.id)]["attempted_severity"], "critical")
+        notify.maybe_notify(check, "ok", {}, "warning", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 2)
+        self.assertIn("CRITICAL", mail.outbox[0].subject)
+        self.assertIn("RECOVERED", mail.outbox[1].subject)
+
+    def test_cooldown_suppressed_incident_has_no_recovery(self):
+        make_config(cooldown_minutes=30)
+        check = make_check()
+        cooldowns = {str(check.id): __import__("time").time()}
+        incidents = {}
+        notify.maybe_notify(check, "warning", {}, "ok", cooldowns, incidents)
+        notify.maybe_notify(check, "ok", {}, "warning", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_no_recipients_means_no_attempt_and_no_recovery(self):
+        make_config(recipients="")
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        outcome = notify.maybe_notify(
+            check, "critical", {}, "ok", cooldowns, incidents
+        )
+        self.assertEqual(outcome, "no_recipients")
+        notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_disabling_warning_during_warning_incident_cancels_recovery(self):
+        make_config()
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "warning", {}, "ok", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 1)
+        check.notify_on_warning = False
+        notify.reconcile_notification_preferences(check, incidents)
+        self.assertEqual(incidents, {})
+        notify.maybe_notify(check, "ok", {}, "warning", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_global_disable_during_incident_cancels_recovery(self):
+        config = make_config()
+        check = make_check()
+        cooldowns, incidents = {}, {}
+        notify.maybe_notify(check, "critical", {}, "ok", cooldowns, incidents)
+        config.enabled = False
+        config.save(update_fields=["enabled"])
+        notify.reconcile_notification_preferences(
+            check, incidents, notifications_enabled=False
+        )
+        notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual((cooldowns, incidents), ({}, {}))
+
+    def test_policy_is_kind_agnostic_for_every_monitor_check_kind(self):
+        make_config()
+        check = make_check()
+        for kind, _label in MonitorCheck.KIND_CHOICES:
+            with self.subTest(kind=kind):
+                mail.outbox.clear()
+                check.kind = kind
+                cooldowns, incidents = {}, {}
+                notify.maybe_notify(check, "critical", {}, "ok", cooldowns, incidents)
+                notify.maybe_notify(check, "ok", {}, "critical", cooldowns, incidents)
+                self.assertEqual(len(mail.outbox), 2)
+                self.assertEqual((cooldowns, incidents), ({}, {}))

@@ -13,29 +13,95 @@ import time
 from monitoring.models import NotificationConfig
 
 
-def maybe_notify(check, status, detail, prev_status, cooldowns):
-    """cooldowns is a dict of {str(check.id): last_notified_at timestamp},
-    mutated in place and persisted by the caller across poll cycles."""
-    config = NotificationConfig.load()
-    if not config.enabled:
-        return
+def clear_notification_incident(check, cooldowns, incidents):
+    """Clear all per-incident delivery state after a check resolves."""
+    cid = str(check.id)
+    cooldowns.pop(cid, None)
+    incidents.pop(cid, None)
 
+
+def reconcile_notification_preferences(check, incidents, *, notifications_enabled=True):
+    """Apply live preference changes to an already-active incident.
+
+    A warning-only incident loses recovery eligibility as soon as warning
+    notifications are disabled. A critical attempt remains eligible while the
+    check later sits at warning, because its authority comes from the critical
+    preference, not the warning preference.
+    """
+    cid = str(check.id)
+    incident = incidents.get(cid)
+    if not isinstance(incident, dict):
+        incidents.pop(cid, None)
+        return
+    severity = incident.get("attempted_severity")
+    enabled = {
+        "warning": check.notify_on_warning,
+        "critical": check.notify_on_critical,
+    }.get(severity, False)
+    if not notifications_enabled or not enabled:
+        incidents.pop(cid, None)
+
+
+def maybe_notify(check, status, detail, prev_status, cooldowns, incidents=None, *, config=None):
+    """Send an eligible alert or its incident-matched recovery.
+
+    ``cooldowns`` remains the persisted last-attempt ledger. ``incidents`` is
+    separate persisted state proving that this particular unresolved incident
+    had an actual email-delivery attempt. SMTP success and failure both count;
+    no recipients, disabled preferences, and cooldown suppression do not.
+    """
+    incidents = incidents if incidents is not None else {}
+    config = config or NotificationConfig.load()
     cid = str(check.id)
 
-    if status in ("critical", "warning"):
-        if status == "warning" and not check.notify_on_warning:
-            return
-        if status == "critical" and not check.notify_on_critical:
-            return
-        now = time.time()
-        last = cooldowns.get(cid, 0)
-        if now - last < config.cooldown_minutes * 60:
-            return
-        cooldowns[cid] = now
-        _send(config, f"[IsadoraAir] {check.name}: {status.upper()}", _format_body(check, status, detail))
-    elif status == "ok" and prev_status in ("critical", "warning"):
-        _send(config, f"[IsadoraAir] {check.name}: RECOVERED", _format_body(check, status, detail))
-        cooldowns.pop(cid, None)
+    reconcile_notification_preferences(
+        check, incidents, notifications_enabled=config.enabled
+    )
+
+    if status == "ok":
+        incident = incidents.get(cid)
+        clear_notification_incident(check, cooldowns, incidents)
+        if incident is not None and config.enabled:
+            return _send(
+                config,
+                f"[IsadoraAir] {check.name}: RECOVERED",
+                _format_body(check, status, detail),
+            )
+        return None
+
+    if not config.enabled or status not in ("critical", "warning"):
+        return None
+    if status == "warning" and not check.notify_on_warning:
+        return None
+    if status == "critical" and not check.notify_on_critical:
+        return None
+
+    now = time.time()
+    last = cooldowns.get(cid, 0)
+    if now - last < config.cooldown_minutes * 60:
+        return None
+
+    outcome = _send(
+        config,
+        f"[IsadoraAir] {check.name}: {status.upper()}",
+        _format_body(check, status, detail),
+    )
+    if outcome not in ("sent", "failed"):
+        # _send returns no_recipients without making a delivery attempt.
+        return outcome
+
+    cooldowns[cid] = now
+    existing = incidents.get(cid)
+    rank = {"warning": 1, "critical": 2}
+    if not isinstance(existing, dict) or rank[status] >= rank.get(
+        existing.get("attempted_severity"), 0
+    ):
+        incidents[cid] = {
+            "attempted_severity": status,
+            "attempted_at": now,
+            "delivery_outcome": outcome,
+        }
+    return outcome
 
 
 def _format_body(check, status, detail):

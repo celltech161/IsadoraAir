@@ -23,9 +23,19 @@ from django.db import close_old_connections  # noqa: E402
 from django.utils import timezone as django_tz  # noqa: E402
 
 from encoders.models import Encoder  # noqa: E402
-from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emit_event  # noqa: E402
+from monitoring.models import (  # noqa: E402
+    ListenerPeak,
+    MonitorCheck,
+    NotificationConfig,
+    TransmitterConfig,
+    emit_event,
+)
 from monitoring.services import sd_notify, supervision  # noqa: E402
-from monitoring.services.notify import maybe_notify  # noqa: E402
+from monitoring.services.notify import (  # noqa: E402
+    clear_notification_incident,
+    maybe_notify,
+    reconcile_notification_preferences,
+)
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
 from monitoring.services.transmitters import create_transmitter_driver  # noqa: E402
@@ -56,6 +66,7 @@ class MonitorManager:
         self._since = {}             # check.id -> timestamp status last changed
         self._current_status = {}    # check.id -> "ok"|"warning"|"critical"|"unknown" (post-debounce)
         self._cooldowns = {}         # str(check.id) -> last_notified_at, persisted in state file
+        self._notification_incidents = {}  # str(check.id) -> qualifying alert-attempt evidence
         self._last_tx_poll = 0.0
         self._last_tx_result = {}    # check.id -> {"status":.., "detail":..} from the last real poll
         self._last_tx_type = None
@@ -64,7 +75,7 @@ class MonitorManager:
         self.running = True
         close_old_connections()
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._load_persisted_cooldowns()
+        self._load_persisted_notification_state()
         psutil.cpu_percent(interval=None)  # prime the comparator -- first real call is meaningless otherwise
 
         # P1 1.11 -- supervision-marker evidence. See
@@ -167,6 +178,12 @@ class MonitorManager:
                 print(f"  [transmitter] Failed to connect: {exc}")
                 tx_client = None
 
+        notification_config = NotificationConfig.load()
+        active_check_ids = {str(check.id) for check in checks}
+        for cid in list(self._notification_incidents):
+            if cid not in active_check_ids:
+                self._notification_incidents.pop(cid, None)
+
         results = []
         for check in checks:
             is_transmitter = check.kind in _TRANSMITTER_KINDS
@@ -202,17 +219,26 @@ class MonitorManager:
                 # like a statically unsupported capability, without debounce,
                 # events, or notifications, and continue the rest of the poll.
                 self._clear_transmitter_state([check])
+                clear_notification_incident(
+                    check, self._cooldowns, self._notification_incidents
+                )
                 continue
 
             prev_status = self._current_status.get(check.id, "ok")
             status = self._debounce(check, status)
-            if status != prev_status or check.id not in self._since:
+            first_observation = check.id not in self._since
+            reconcile_notification_preferences(
+                check,
+                self._notification_incidents,
+                notifications_enabled=notification_config.enabled,
+            )
+            if status != prev_status or first_observation:
                 # `self._since` membership BEFORE we assign it here is
                 # the "have we ever observed this check before" signal
                 # -- distinguishes a real edge from the first-tick
                 # catch-up after a service restart. Only real edges get
                 # an event and (independently) a notification.
-                is_transition = check.id in self._since
+                is_transition = not first_observation
                 self._since[check.id] = time.time()
                 if is_transition:
                     # Record the transition in SystemEvent BEFORE
@@ -222,7 +248,23 @@ class MonitorManager:
                     # or on cooldown. The feed's whole point is
                     # at-a-glance visibility without email/SMS wired up.
                     self._emit_transition_event(check, prev_status, status, detail)
-                maybe_notify(check, status, detail, prev_status, self._cooldowns)
+                if first_observation and status == "ok":
+                    # A persisted incident cannot prove that recovery happened
+                    # during downtime. Clear it before the normal no-op initial
+                    # notification call rather than fabricate a startup
+                    # RECOVERED message from stale state.
+                    clear_notification_incident(
+                        check, self._cooldowns, self._notification_incidents
+                    )
+                maybe_notify(
+                    check,
+                    status,
+                    detail,
+                    prev_status,
+                    self._cooldowns,
+                    self._notification_incidents,
+                    config=notification_config,
+                )
 
             results.append(self._build_result(check, status, detail))
             if is_transmitter:
@@ -531,19 +573,48 @@ class MonitorManager:
         self._current_status[cid] = raw_status
         return raw_status
 
-    def _load_persisted_cooldowns(self):
-        if STATE_PATH.is_file():
-            try:
-                data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                self._cooldowns = data.get("_cooldowns", {})
-            except (OSError, ValueError):
-                pass
+    def _load_persisted_notification_state(self):
+        """Load compatible cooldowns plus validated incident attribution.
+
+        Older state files have no incident ledger and therefore load an empty
+        one: a legacy cooldown alone cannot prove that email delivery was ever
+        attempted. Malformed records fail closed instead of manufacturing a
+        later recovery message.
+        """
+        if not STATE_PATH.is_file():
+            return
+        try:
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+
+        cooldowns = data.get("_cooldowns", {})
+        self._cooldowns = cooldowns if isinstance(cooldowns, dict) else {}
+        raw_incidents = data.get("_notification_incidents", {})
+        if not isinstance(raw_incidents, dict):
+            return
+        for cid, incident in raw_incidents.items():
+            if not isinstance(cid, str) or not isinstance(incident, dict):
+                continue
+            if incident.get("attempted_severity") not in ("warning", "critical"):
+                continue
+            if incident.get("delivery_outcome") not in ("sent", "failed"):
+                continue
+            attempted_at = incident.get("attempted_at")
+            if not isinstance(attempted_at, (int, float)):
+                continue
+            self._notification_incidents[cid] = {
+                "attempted_severity": incident["attempted_severity"],
+                "attempted_at": attempted_at,
+                "delivery_outcome": incident["delivery_outcome"],
+            }
 
     def _write_state(self, results):
         state = {
             "timestamp": time.time(),
             "checks": results,
             "_cooldowns": self._cooldowns,
+            "_notification_incidents": self._notification_incidents,
             # 1.7 release/version-skew visibility -- fixed at process
             # start (see __init__), None if git was unavailable then.
             "runtime_commit": self._runtime_commit,
