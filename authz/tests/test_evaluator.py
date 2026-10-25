@@ -147,6 +147,27 @@ class CapabilityCompositionTests(TestCase):
         kick.delete()
         self.assertFalse(authorize(staff, "remote_dj.force_disconnect").allowed)
 
+    def test_emergency_grants_bypass_stale_process_local_cache(self):
+        from unittest import mock
+
+        from authz import evaluator
+
+        role = make_role("Fresh Emergency Role", ["remote_dj.emergency_mute"])
+        group = make_group_with_role("Fresh Emergency Group", role)
+        staff = User.objects.create_user("fresh_emergency_staff", password="pw", is_staff=True)
+        staff.groups.add(group)
+
+        stale_denied = {group.name: frozenset()}
+        with mock.patch.object(evaluator, "_GROUP_CAPABILITY_CACHE", stale_denied):
+            self.assertTrue(authorize(staff, "remote_dj.emergency_mute").allowed)
+
+        RoleCapability.objects.filter(
+            role=role, capability__slug="remote_dj.emergency_mute"
+        ).delete()
+        stale_granted = {group.name: frozenset({"remote_dj.emergency_mute"})}
+        with mock.patch.object(evaluator, "_GROUP_CAPABILITY_CACHE", stale_granted):
+            self.assertFalse(authorize(staff, "remote_dj.emergency_mute").allowed)
+
     def test_nonstaff_role_grant_and_disabled_staff_contract(self):
         role = make_role("Emergency Custom Role", ["remote_dj.force_disconnect"])
         group = make_group_with_role("Emergency Custom Group", role)

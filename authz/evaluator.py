@@ -367,7 +367,17 @@ def authorize(
     if user.is_staff and capability_slug not in STAFF_ROLE_REQUIRED_CAPABILITIES:
         return _allowed("Authorized: staff compatibility bypass (see docs/AUTHORIZATION.md).")
 
-    capability_map = _load_group_capability_map() if bypass_cache else get_group_capability_map()
+    # These two grants are live-session emergency authority and must become
+    # effective (or cease to be effective) across every Gunicorn worker after
+    # an Admin edit. Django model signals only invalidate the process that
+    # handled the edit, so the process-local cache is not authoritative for
+    # them. Keep all other capability lookups on the established cached path.
+    fresh_role_lookup = capability_slug in STAFF_ROLE_REQUIRED_CAPABILITIES
+    capability_map = (
+        _load_group_capability_map()
+        if bypass_cache or fresh_role_lookup
+        else get_group_capability_map()
+    )
     user_group_names = set(user.groups.values_list("name", flat=True))
     granted = frozenset().union(
         *(capability_map.get(name, frozenset()) for name in user_group_names)

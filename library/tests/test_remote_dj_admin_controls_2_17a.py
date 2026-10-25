@@ -274,6 +274,35 @@ class AdminEndpointTests(TestCase):
         self.enqueue.reset_mock()
         self.refused(self.post(custom, admin_request("emergency_mute")), 403)
 
+    def test_web_boundary_ignores_stale_worker_cache_after_grant_and_revoke(self):
+        from authz import evaluator
+
+        staff, role = emergency_operator(
+            "adm217a_web_cache_staff", ["remote_dj.emergency_mute"], is_staff=True
+        )
+        group_name = staff.groups.get().name
+
+        # Simulate a different Gunicorn worker retaining its pre-grant cache.
+        with mock.patch.object(
+            evaluator, "_GROUP_CAPABILITY_CACHE", {group_name: frozenset()}
+        ):
+            self.assertEqual(
+                self.post(staff, admin_request("emergency_mute")).status_code,
+                202,
+            )
+
+        RoleCapability.objects.filter(
+            role=role, capability__slug="remote_dj.emergency_mute"
+        ).delete()
+        self.enqueue.reset_mock()
+        # Simulate another worker retaining its pre-revocation cache.
+        with mock.patch.object(
+            evaluator,
+            "_GROUP_CAPABILITY_CACHE",
+            {group_name: frozenset({"remote_dj.emergency_mute"})},
+        ):
+            self.refused(self.post(staff, admin_request("emergency_mute")), 403)
+
     def test_copied_microphone_owner_credential_grants_nothing(self):
         key = gate_mod.control_key_for(self.dj.pk, ATTEMPT_A)
         self.refused(self.post(self.dj, {**admin_request("emergency_mute"), "control_key": key}), 403)

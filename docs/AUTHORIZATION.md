@@ -838,11 +838,12 @@ Only a superuser or an administrator holding Django's corresponding model
 permissions for Roles/Role Capabilities, Groups/Group Roles, and Users may
 perform these steps. Merely having `is_staff=True` admits a user to Django
 Admin but does not supply those model permissions, so an unprivileged staff
-user cannot self-grant. Request-side caches are invalidated by model-change
-signals. The separate engine process deliberately re-reads Role assignments
-with `bypass_cache=True` at execution, so grants and revocations require no
-engine restart; a queued command whose grant was subsequently revoked is
-refused.
+user cannot self-grant. Because model-change signals cannot invalidate the
+other Gunicorn workers' process-local caches, `authorize()` always re-reads
+Role assignments for these two emergency capabilities. The separate engine
+process also requests a fresh lookup at execution. Grants and revocations
+therefore require neither a web-worker nor engine restart, and a queued command
+whose grant was subsequently revoked is refused.
 
 **Roadmap 2.5B**: `authz.admin.TalentAssignmentInline` is attached to the
 existing customized User admin (`library.admin.InviteCapableUserAdmin`)
