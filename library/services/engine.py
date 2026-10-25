@@ -66,6 +66,7 @@ from library.services import audio_recovery
 from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
+from library.services import remote_dj_admin_identity
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -1493,6 +1494,11 @@ class RemoteDJSession:
         # press made later. gate_forced is the bounded, owner-visible reason.
         self.gate_mute_floor_ms = 0
         self.gate_forced = None
+        # 2.17A Emergency Mute latch: set by a Station Administrator for THIS
+        # session only. While set, the owner's ON is refused; it survives a
+        # same-session recovery and dies with the session. Lifted only by an
+        # explicit administrator release, which never opens the mic.
+        self.emergency_latch = None
         # Per-session diagnostic state. The original static-on-connect
         # investigation is resolved, but these bounded breadcrumbs remain
         # useful for future Remote DJ post-mortems. None of this state is
@@ -10199,8 +10205,10 @@ class PlaybackEngine:
                 self._insert_urgent_next(data.get("category", "WxAlert"))
         elif cmd == "remote_dj_gate":
             self._remote_dj_gate_command(data)
-        elif cmd == "remote_dj_disconnect":
-            self._remote_dj_session_stop()
+        elif cmd == "remote_dj_admin":
+            # 2.17A: replaces the old unbound "remote_dj_disconnect" branch
+            # (no producer), which ended whatever session was current.
+            self._remote_dj_admin_command(data)
         elif cmd == "fx_fire":
             cart_id = data.get("cart_id")
             if cart_id:
@@ -11079,6 +11087,9 @@ class PlaybackEngine:
         gate_forced = getattr(session, "gate_forced", None)
         if isinstance(gate_forced, dict):
             owner["gate_forced"] = dict(gate_forced)
+        # Only while latched, so a normal session's owner shape is unchanged.
+        if getattr(session, "emergency_latch", None) is not None:
+            owner["emergency_mute"] = True
         return owner
 
     def _remote_dj_record_browser_milestone(
@@ -12789,6 +12800,7 @@ class PlaybackEngine:
         slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
         if (
             session.gate_desired
+            and getattr(session, "emergency_latch", None) is None
             and slot is not None
             and slot.remote_gate.get_property("volume") == 0.0
         ):
@@ -12942,6 +12954,8 @@ class PlaybackEngine:
         if command["issued_at_ms"] <= session.gate_mute_floor_ms:
             # Issued before the engine forced this mic off: never reopens it.
             return self._remote_dj_gate_refused(session, command, "superseded_by_mute")
+        if command["active"] and session.emergency_latch is not None:
+            return self._remote_dj_gate_refused(session, command, "emergency_muted")
         if sequence <= session.gate_last_sequence:
             if sequence == session.gate_last_sequence \
                     and command["request_id"] == session.gate_last_request_id:
@@ -12979,18 +12993,130 @@ class PlaybackEngine:
         return f"refused:{reason}"
 
     def _remote_dj_user_may_gate(self, user_id):
-        """remote_dj.mic_gate with the real schedule policy, re-evaluated at
-        execution against a fresh User row (bypass_cache: see
-        _remote_dj_authorization_tick). Fails closed on any error."""
+        """remote_dj.mic_gate with the real schedule policy at execution."""
+        return self._remote_dj_user_has(user_id, "remote_dj.mic_gate")
+
+    def _remote_dj_admin_command(self, data):
+        """Roadmap 2.17A -- a Station Administrator's Emergency Mute, Release
+        Emergency Mute or Kick for ONE exact Remote DJ session
+        (remote_dj_admin_identity). Executes iff: strict schema, a valid
+        server signature over every field including the command type and
+        action, not already executed (request_id), this engine run, fresh,
+        the live session IS the targeted attempt and user, and the
+        administrator still holds the action's capability. Nothing here can
+        open a microphone. Every outcome is audited and published as
+        remote_dj_admin_result for administrators. Returns the outcome."""
+        try:
+            command = remote_dj_admin_identity.parse_command(data)
+        except ValueError:
+            return self._remote_dj_admin_outcome(None, "refused:malformed")
+        if not remote_dj_admin_identity.verify_signature(command):
+            return self._remote_dj_admin_outcome(command, "refused:bad_signature")
+        # Executed at most once: an already-executed request id is a no-op.
+        # Only executions are remembered, so a retry of a refused copy is
+        # simply evaluated (and refused) again on its own merits.
+        seen = self.__dict__.setdefault("_remote_dj_admin_seen", OrderedDict())
+        if command["request_id"] in seen:
+            print(f"  Remote DJ admin {command['request_id']}: duplicate delivery ignored")
+            return "duplicate"
+
+        if command["engine_instance"] != getattr(self, "_engine_session_id", None):
+            return self._remote_dj_admin_outcome(command, "refused:engine_restarted")
+        age_ms = time.time() * 1000 - command["issued_at_ms"]
+        if age_ms > remote_dj_admin_identity.MAX_COMMAND_AGE_MS \
+                or age_ms < -remote_dj_admin_identity.MAX_FUTURE_SKEW_MS:
+            return self._remote_dj_admin_outcome(command, "refused:stale_command")
+        session = self.remote_dj_session
+        attempt = getattr(session, "connection_attempt", None) if session is not None else None
+        if (session is None or attempt is None or session.slot_id is None
+                or attempt.attempt_id != command["attempt_id"]
+                or attempt.status in ("ended", "failed")
+                or session.user_id != command["target_user_id"]):
+            # Not the session the administrator saw (ended, or replaced --
+            # even by the same user): never act on whatever is current.
+            return self._remote_dj_admin_outcome(command, "stale_target")
+        capability = remote_dj_admin_identity.ACTION_CAPABILITY[command["action"]]
+        if not self._remote_dj_user_has(command["admin_user_id"], capability):
+            return self._remote_dj_admin_outcome(command, "refused:not_authorized")
+
+        attempt_id = command["attempt_id"]
+        action = command["action"]
+        audit = {"admin_user_id": command["admin_user_id"], "action": action,
+                 "request_id": command["request_id"]}
+        if action == "emergency_mute":
+            self._remote_dj_silence(session, reason="emergency_mute", audit=audit)
+            session.emergency_latch = {"since_ms": int(time.time() * 1000),
+                                       "by_user_id": command["admin_user_id"]}
+            session.gate_forced = {"reason": "emergency_mute"}
+        elif action == "release_mute":
+            if session.emergency_latch is None:
+                return self._remote_dj_admin_outcome(command, "refused:not_latched")
+            # Lift the latch only: the mic stays OFF, and no owner command
+            # issued while latched can apply afterwards.
+            session.emergency_latch = None
+            session.gate_mute_floor_ms = int(time.time() * 1000)
+            session.gate_forced = None
+        else:  # kick
+            # Silence first, then the normal teardown: signaling retirement
+            # closes the browser's socket, the slot is released, and every
+            # late callback is attempt/session-guarded.
+            self._remote_dj_silence(session, reason="kick", audit=audit)
+            if self._remote_dj_server is not None:
+                self._remote_dj_server.send_json_threadsafe(
+                    attempt_id, {"type": "kicked", "reason": "station_administrator"})
+            self._remote_dj_session_stop(attempt_id)
+        seen[command["request_id"]] = True
+        while len(seen) > 256:
+            seen.popitem(last=False)
+        return self._remote_dj_admin_outcome(command, "executed")
+
+    def _remote_dj_silence(self, session, *, reason, audit):
+        """Administrator silencing of one exact session: the same engine-owned
+        mute as a permission loss, applied even if the gate is already off so
+        the floor always moves forward."""
+        attempt_id = session.connection_attempt.attempt_id
+        self._remote_dj_force_gate_off(session, attempt_id, reason=reason,
+                                       user_id=session.user_id, audit=audit)
+
+    def _remote_dj_admin_outcome(self, command, outcome):
+        """Publish and audit one administrator command outcome. Never logs
+        the signature."""
+        record = {
+            "request_id": command["request_id"] if command else None,
+            "action": command["action"] if command else None,
+            "outcome": outcome,
+            "at": time.time(),
+        }
+        self._remote_dj_admin_result = record
+        detail = {key: command[key] for key in ("action", "request_id", "admin_user_id", "attempt_id",
+                                                "target_user_id", "reason")} if command else {}
+        detail["outcome"] = outcome
+        print(f"  Remote DJ admin {record['action']}: {outcome} "
+              f"(attempt={detail.get('attempt_id')}, admin={detail.get('admin_user_id')})")
+        try:
+            emit_event(
+                category="authz",
+                level="warning" if outcome == "executed" or outcome.startswith("refused") else "info",
+                title=f"Remote DJ administrator action {outcome.split(':', 1)[0]}",
+                detail=detail,
+                dedupe_key=f"authz|remote_dj_admin|{record['request_id']}|{outcome}",
+            )
+        except Exception as exc:
+            print(f"  Remote DJ: failed to emit administrator audit event: {exc}")
+        return outcome
+
+    def _remote_dj_user_has(self, user_id, capability):
+        """A capability under the real schedule policy, re-evaluated against
+        a fresh User row (bypass_cache). Fails closed on any error."""
         try:
             _close_old_connections()
             from django.contrib.auth import get_user_model
             from authz.evaluator import authorize as _authorize
 
             user = get_user_model().objects.filter(pk=user_id).first()
-            return user is not None and bool(_authorize(user, "remote_dj.mic_gate", bypass_cache=True))
+            return user is not None and bool(_authorize(user, capability, bypass_cache=True))
         except Exception as exc:
-            print(f"  Remote DJ gate authorization check failed closed: {type(exc).__name__}")
+            print(f"  Remote DJ {capability} check failed closed: {type(exc).__name__}")
             return False
 
     def _remote_dj_set_gate(self, active):
@@ -15949,6 +16075,9 @@ class PlaybackEngine:
                 # /api/engine/status/ response. Built above, isolated so this
                 # optional field can never cost the whole snapshot.
                 "remote_dj_owner": remote_dj_owner,
+                # 2.17A: newest administrator action outcome (no signature);
+                # library.views shows it only to administrators.
+                "remote_dj_admin_result": self.__dict__.get("_remote_dj_admin_result"),
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
                 # progress-bar reconciliation regardless of what

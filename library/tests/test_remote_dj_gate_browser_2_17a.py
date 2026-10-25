@@ -37,6 +37,8 @@ OTHER_ATTEMPT = "browserAttempt2017A00002"
 INSTANCE = "engine-run-1"
 KEY = "ab" * 32
 GATE = "/api/engine/remote-dj-gate/"
+ADMIN = "/api/engine/remote-dj-admin/"
+ADMIN_REQUEST_ID = "f" * 32
 
 
 class _RemoteMicHarness(_ConsoleBrowserBase):
@@ -45,12 +47,24 @@ class _RemoteMicHarness(_ConsoleBrowserBase):
 
     def setUp(self):
         super().setUp()
+        # The TransactionTestCase flush removed authz.0010's rows: recreate them.
+        from authz.models import Capability
+        for slug in ("remote_dj.emergency_mute", "remote_dj.force_disconnect"):
+            Capability.objects.get_or_create(slug=slug, defaults={"label": slug, "requires_schedule": False})
         self.gate_aborts = 0              # gate POSTs to drop with a network error
         self.gate_reply = None            # (status, body) for gate POSTs
         self.passthrough = False          # let gate POSTs reach the real view
+        self.admin_reply = None           # (status, body) for administrator POSTs
 
     def _route(self, route, request):
         path = request.url.split(self.live_server_url, 1)[-1].split("?", 1)[0]
+        if request.method == "POST" and path == ADMIN:
+            self.posts.append((path, request.post_data))
+            if self.passthrough:
+                return route.continue_()
+            status, body = self.admin_reply or (202, {"ok": True, "accepted": True, "executed": False,
+                                                      "request_id": ADMIN_REQUEST_ID})
+            return route.fulfill(status=status, content_type="application/json", body=json.dumps(body))
         if request.method == "POST" and path == GATE:
             self.posts.append((path, request.post_data))
             if self.passthrough:
@@ -63,16 +77,18 @@ class _RemoteMicHarness(_ConsoleBrowserBase):
         return super()._route(route, request)
 
     # -- fixtures --------------------------------------------------------------
-    def owner_block(self, attempt=ATTEMPT, *, current=True, gate_result=None):
+    def owner_block(self, attempt=ATTEMPT, *, current=True, gate_result=None, emergency_mute=False):
         block = {"identity": "known", "display_name": "Ann Air", "is_current_user": current,
-                 "browser_key": self.browser_key(attempt)}
+                 "browser_key": self.browser_key(attempt), "emergency_mute": emergency_mute}
         if gate_result is not None:
             block["gate_result"] = gate_result
         return block
 
-    def connected_state(self, attempt=ATTEMPT, *, current=True, gate_result=None, **overrides):
+    def connected_state(self, attempt=ATTEMPT, *, current=True, gate_result=None, emergency_mute=False,
+                        **overrides):
         return engine_state(remote_dj_connected=True, remote_dj_quality={"overall": "good"},
-                            remote_dj_owner=self.owner_block(attempt, current=current, gate_result=gate_result),
+                            remote_dj_owner=self.owner_block(attempt, current=current, gate_result=gate_result,
+                                                             emergency_mute=emergency_mute),
                             **overrides)
 
     def become_owner(self, page, *, attempt=ATTEMPT, key=KEY):
@@ -232,6 +248,11 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
         self.assertIn("that connection is no longer the live session", self.gate_ui(page)["msg"])
         self.assertEqual(self.gate_ui(page)["state"], "off")       # the engine state is unchanged
 
+    def test_emergency_mute_makes_the_djs_gate_read_only(self):
+        page = self.owner_page()
+        self.poll_now(page, **self.connected_state(emergency_mute=True))
+        self.assert_read_only_and_silent(page, "muted by the station")
+
     def test_engine_refusal_for_this_press_is_reported_once(self):
         page = self.owner_page()
         self.press(page)
@@ -240,6 +261,119 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
         self.assertIn("refused by the engine: permission denied", self.gate_ui(page)["msg"])
         self.assertEqual(self.gate_ui(page)["state"], "off")
         self.assertEqual(page.evaluate("() => rdjGateReportedSeq"), 1)
+
+
+class _AdminControlCases(_RemoteMicHarness):
+    """Roadmap 2.17A Station Administrator controls on the full Console."""
+
+    def admin_page(self, viewport=DESKTOP, **state):
+        self.state = self.connected_state(current=False, **state)
+        page = self.open_console(self.superuser, viewport=viewport)
+        self.poll_now(page)
+        return page
+
+    def admin_ui(self, page):
+        return page.evaluate("""() => {
+          const q = id => document.getElementById(id);
+          const b = id => q(id) ? {hidden: q(id).hidden, disabled: q(id).disabled} : null;
+          return {bar: q('rdjAdminBar') ? q('rdjAdminBar').hidden : null,
+                  target: q('rdjAdminTarget') ? q('rdjAdminTarget').textContent : null,
+                  msg: q('rdjAdminMsg') ? q('rdjAdminMsg').textContent : null,
+                  mute: b('rdjEmergencyMuteBtn'), release: b('rdjReleaseMuteBtn'), kick: b('rdjKickBtn')};
+        }""")
+
+    def admin_bodies(self):
+        return [json.loads(body) for path, body in self.posts if path == ADMIN]
+
+    def click(self, page, selector):
+        page.locator(selector).click()
+        page.wait_for_function("() => rdjAdminUi.pending === null || rdjAdminUi.pending.requestId !== null")
+
+    def test_controls_target_the_observed_session_desktop_and_mobile(self):
+        for name, viewport in (("desktop", DESKTOP), ("mobile", MOBILE_PORTRAIT)):
+            with self.subTest(layout=name):
+                page = self.admin_page(viewport=viewport)
+                ui = self.admin_ui(page)
+                self.assertFalse(ui["bar"])
+                self.assertEqual(ui["target"], f"Remote DJ: Ann Air · session {self.browser_key(ATTEMPT)[:8]}")
+                self.assertEqual((ui["mute"], ui["release"], ui["kick"]),
+                                 ({"hidden": False, "disabled": False}, {"hidden": True, "disabled": False},
+                                  {"hidden": False, "disabled": False}))
+                self.no_horizontal_overflow(page)
+                self.shot(page, f"rdj-admin-controls-{name}")
+
+    def test_emergency_mute_sends_the_exact_target_and_waits_for_the_engine(self):
+        page = self.admin_page()
+        self.click(page, "#rdjEmergencyMuteBtn")
+        bodies = self.admin_bodies()
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual({k: v for k, v in bodies[0].items() if k != "client_request_id"},
+                         {"action": "emergency_mute", "target_session": self.browser_key(ATTEMPT),
+                          "engine_instance": INSTANCE})
+        self.assertRegex(bodies[0]["client_request_id"], r"^[A-Za-z0-9-]{8,64}$")
+        ui = self.admin_ui(page)
+        self.assertIn("queued — waiting for the engine", ui["msg"])        # accepted is not executed
+        self.assertTrue(ui["mute"]["disabled"])                             # single flight
+        result = {"request_id": ADMIN_REQUEST_ID, "action": "emergency_mute", "outcome": "executed"}
+        self.poll_now(page, **self.connected_state(current=False, emergency_mute=True,
+                                                   remote_dj_admin_result=result))
+        ui = self.admin_ui(page)
+        self.assertIn("microphone is OFF and latched", ui["msg"])
+        self.assertIn("EMERGENCY MUTED", ui["target"])
+        self.assertEqual((ui["mute"]["hidden"], ui["release"]["hidden"], ui["release"]["disabled"]),
+                         (True, False, False))
+        self.shot(page, "rdj-admin-emergency-muted")
+
+    def test_release_and_engine_refusals_are_reported_from_engine_results(self):
+        page = self.admin_page(emergency_mute=True)
+        self.click(page, "#rdjReleaseMuteBtn")
+        self.assertEqual(self.admin_bodies()[0]["action"], "release_mute")
+        result = {"request_id": ADMIN_REQUEST_ID, "action": "release_mute", "outcome": "stale_target"}
+        self.poll_now(page, **self.connected_state(current=False, emergency_mute=True,
+                                                   remote_dj_admin_result=result))
+        self.assertIn("Release Emergency Mute refused: that Remote DJ session is no longer the live session",
+                      self.admin_ui(page)["msg"])
+
+    def test_kick_requires_a_confirmation_naming_the_target(self):
+        page = self.admin_page()
+        messages = []
+        page.once("dialog", lambda d: (messages.append(d.message), d.dismiss()))
+        page.locator("#rdjKickBtn").click()
+        page.wait_for_timeout(100)
+        self.assertEqual(self.admin_bodies(), [])
+        self.assertIn(f"Kick Ann Air (session {self.browser_key(ATTEMPT)[:8]})", messages[0])
+        page.once("dialog", lambda d: d.accept())
+        self.click(page, "#rdjKickBtn")
+        self.assertEqual(self.admin_bodies()[0]["action"], "kick")
+
+    def test_server_refusal_is_shown(self):
+        page = self.admin_page()
+        self.admin_reply = (409, {"error": "x", "reason": "stale_target"})
+        self.click(page, "#rdjEmergencyMuteBtn")
+        self.assertIn("Emergency Mute refused: that Remote DJ session is no longer the live session",
+                      self.admin_ui(page)["msg"])
+
+    def test_unverified_stale_or_absent_session_disables_the_controls(self):
+        page = self.admin_page()
+        self.poll_now(page, **{**self.connected_state(current=False), "state_revision": None})
+        ui = self.admin_ui(page)
+        self.assertTrue(ui["mute"]["disabled"] and ui["kick"]["disabled"])
+        self.assertIn("status unconfirmed", ui["target"])
+        page.evaluate("async () => { await rdjAdminCommand('emergency_mute'); await rdjAdminCommand('kick'); }")
+        self.poll_now(page, **engine_state())                               # nobody connected
+        self.assertTrue(self.admin_ui(page)["bar"])
+        self.status_fails = True
+        page.clock.run_for(3_500)
+        page.evaluate("async () => { await rdjAdminCommand('emergency_mute'); }")
+        self.assertEqual(self.admin_bodies(), [])
+
+    def test_remote_dj_talent_surface_has_no_admin_controls(self):
+        self.state = self.connected_state()
+        for user in (self.host, self.superuser):
+            with self.subTest(user=user.username):
+                page = self.open_console(user, path="/remote-dj/")
+                self.assertIsNone(self.admin_ui(page)["bar"])
+                self.assertEqual(page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"), [False, False])
 
 
 class _EndToEndCases(_RemoteMicHarness):
@@ -288,6 +422,35 @@ class _EndToEndCases(_RemoteMicHarness):
         self.assertIn("this browser does not hold the Remote DJ connection", self.gate_ui(page)["msg"])
         self.assertEqual(self.queued, [])
 
+    def test_admin_emergency_mute_is_accepted_and_signed_by_the_real_view(self):
+        self.state = self.connected_state(current=False)
+        page = self.open_console(self.superuser)
+        self.poll_now(page)
+        page.locator("#rdjEmergencyMuteBtn").click()
+        page.wait_for_function("() => rdjAdminUi.pending && rdjAdminUi.pending.requestId")
+        self.assertEqual(len(self.queued), 1)
+        queued = self.queued[0]
+        from library.services import remote_dj_admin_identity as admin_identity
+        self.assertEqual((queued["command"], queued["action"], queued["attempt_id"], queued["target_user_id"]),
+                         ("remote_dj_admin", "emergency_mute", ATTEMPT, self.host.pk))
+        self.assertTrue(admin_identity.verify_signature(queued))
+
+    def test_a_remote_host_page_cannot_call_the_admin_api(self):
+        self.state = self.connected_state()
+        page = self.open_console(self.host, path="/remote-dj/")
+        statuses = page.evaluate("""async (url) => {
+          const out = [];
+          for (const action of ['emergency_mute', 'release_mute', 'kick']) {
+            const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json',
+              'X-CSRFToken': getCookie('csrftoken')}, body: JSON.stringify({action,
+              target_session: 'a'.repeat(32), engine_instance: 'engine-run-1', client_request_id: 'forged-press-1'})});
+            out.push(r.status);
+          }
+          return out;
+        }""", ADMIN)
+        self.assertEqual(statuses, [403, 403, 403])
+        self.assertEqual(self.queued, [])
+
     def test_forged_direct_posts_get_the_same_enforcement(self):
         self.state = self.connected_state()
         page = self.open_console(self.host, path="/remote-dj/")
@@ -332,3 +495,16 @@ class RemoteMicEndToEndChromiumTests(_EndToEndCases, StaticLiveServerTestCase):
 @override_settings(SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False)
 class RemoteMicEndToEndFirefoxTests(_EndToEndCases, StaticLiveServerTestCase):
     BROWSER = "firefox"
+
+
+@unittest.skipIf(sync_playwright is None, "Playwright not available")
+@override_settings(SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False)
+class RemoteDjAdminChromiumTests(_AdminControlCases, StaticLiveServerTestCase):
+    BROWSER = "chromium"
+
+
+@unittest.skipIf(sync_playwright is None, "Playwright not available")
+@override_settings(SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False)
+class RemoteDjAdminFirefoxTests(_AdminControlCases, StaticLiveServerTestCase):
+    BROWSER = "firefox"
+

@@ -78,6 +78,9 @@ def _enqueue_engine_command_response(payload):
 CONSOLE_CAPABILITY_FLAGS = {
     "playout_control": "playout.control",
     "start_next": "playout.start_next",
+    # Roadmap 2.17A: Station Administrator emergency controls (full Console only).
+    "rdj_emergency_mute": "remote_dj.emergency_mute",
+    "rdj_force_disconnect": "remote_dj.force_disconnect",
 }
 
 
@@ -2933,6 +2936,89 @@ def api_engine_remote_dj_gate(request):
     )
 
 
+def _audit_remote_dj_admin(user, action, outcome, **detail):
+    try:
+        from monitoring.models import emit_event
+
+        emit_event(
+            category="authz",
+            level="warning",
+            title=f"Remote DJ administrator action {outcome.split(':', 1)[0]}",
+            detail={"admin_user_id": user.pk, "action": action, "outcome": outcome, **detail},
+            dedupe_key=f"authz|remote_dj_admin|{user.pk}|{action}|{outcome}|{detail.get('request_id')}",
+        )
+    except Exception as exc:
+        print(f"  Remote DJ administrator audit event failed: {exc}")
+
+
+@require_http_methods(["POST"])
+def api_engine_remote_dj_admin(request):
+    """Station Administrator emergency controls for the connected Remote DJ
+    (roadmap 2.17A; contract in library.services.remote_dj_admin_identity):
+    ``emergency_mute`` / ``release_mute`` need remote_dj.emergency_mute,
+    ``kick`` needs remote_dj.force_disconnect. None can open a microphone.
+
+    The request must name the session the administrator observed
+    (``target_session``) and the engine run; it is refused unless fresh
+    engine state shows exactly that session live, then queued as a
+    server-signed command bound to the exact attempt and user. The engine
+    re-checks all of it -- and the administrator's capability -- before
+    acting. 202 means only "queued"; the outcome is the engine-published
+    ``remote_dj_admin_result``. CSRF-enforced; no generic engine command is
+    exposed."""
+    from library.services import remote_dj_admin_identity as admin_identity
+
+    try:
+        body = json.loads(request.body or b"{}")
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    action = body.get("action") if isinstance(body, dict) else None
+    capability = admin_identity.ACTION_CAPABILITY.get(action)
+    if capability is None:
+        return JsonResponse({"error": "action must be emergency_mute, release_mute or kick"}, status=400)
+    result = authorize(request.user, capability)
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug=capability)
+    try:
+        admin_request = admin_identity.parse_request(body)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    def refuse(reason, message):
+        _audit_remote_dj_admin(request.user, action, f"refused:{reason}",
+                               target_session=admin_request["target_session"])
+        return JsonResponse({"error": message, "reason": reason}, status=409)
+
+    state = _read_fresh_engine_state(REMOTE_DJ_GATE_STATE_MAX_AGE_SECONDS)
+    if state is None:
+        return refuse("engine_unavailable", "engine status is unavailable")
+    revision = state.get("state_revision")
+    if admin_request["engine_instance"] != (revision.get("instance") if isinstance(revision, dict) else None):
+        return refuse("engine_restarted", "the engine has restarted since this page saw it")
+    owner = state.get("remote_dj_owner") if state.get("remote_dj_connected") else None
+    attempt_id = owner.get("attempt_id") if isinstance(owner, dict) else None
+    target_user_id = owner.get("user_id") if isinstance(owner, dict) else None
+    if not (isinstance(attempt_id, str) and isinstance(target_user_id, int)
+            and not isinstance(target_user_id, bool) and target_user_id > 0
+            and admin_identity.session_ref(attempt_id) == admin_request["target_session"]):
+        return refuse("stale_target", "that Remote DJ session is no longer the live session")
+
+    command = admin_identity.build_command(
+        admin_user_id=request.user.pk, request=admin_request, attempt_id=attempt_id,
+        target_user_id=target_user_id, issued_at_ms=time_mod.time() * 1000)
+    error_response = _enqueue_engine_command_response(command)
+    if error_response is not None:
+        return error_response
+    _audit_remote_dj_admin(request.user, action, "accepted", request_id=command["request_id"],
+                           attempt_id=attempt_id, target_user_id=target_user_id,
+                           reason=admin_request["reason"])
+    return JsonResponse(
+        {"ok": True, "accepted": True, "executed": False, "action": action,
+         "request_id": command["request_id"]},
+        status=202,
+    )
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_manual_mode(request):
@@ -2999,6 +3085,19 @@ def _can_view_remote_dj_identity(user):
     return False
 
 
+def _can_use_remote_dj_admin(user):
+    from authz.evaluator import SCHEDULE_POLICY_IGNORE
+    from library.services.remote_dj_admin_identity import ADMIN_CAPABILITIES
+
+    for slug in ADMIN_CAPABILITIES:
+        try:
+            if authorize(user, slug, schedule_policy=SCHEDULE_POLICY_IGNORE):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _public_remote_dj_owner(raw_owner, viewer):
     """Roadmap 2.23 Phase 1B -- the display-safe view of the engine's active
     Remote DJ owner (engine.PlaybackEngine._remote_dj_owner_state).
@@ -3035,6 +3134,14 @@ def _public_remote_dj_owner(raw_owner, viewer):
         "is_current_user": is_current_user,
         "browser_key": hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32],
     }
+    # Roadmap 2.17A: whether the station has latched this session's mic off,
+    # and why the engine last forced it off (no identities).
+    if raw_owner.get("emergency_mute") is True:
+        public["emergency_mute"] = True
+    forced = raw_owner.get("gate_forced")
+    if isinstance(forced, dict) and forced.get("reason") in ("mic_permission", "authorization_unverifiable",
+                                                              "emergency_mute"):
+        public["gate_forced"] = forced["reason"]
     # Roadmap 2.17A: the engine's outcome for the owner's newest Remote Mic
     # command (sequence, requested state, applied/refused reason), shown only
     # to the owning account so its browser can report a refusal truthfully.
@@ -3065,6 +3172,10 @@ def api_engine_status(request):
         # keep r0116 behaviour there instead of locking out the real owner.
         data["remote_dj_owner_supported"] = "remote_dj_owner" in data
         raw_owner = data.pop("remote_dj_owner", None)
+        admin_result = data.pop("remote_dj_admin_result", None)
+        if isinstance(admin_result, dict) and _can_use_remote_dj_admin(request.user):
+            data["remote_dj_admin_result"] = {
+                key: admin_result.get(key) for key in ("request_id", "action", "outcome")}
         data["remote_dj_owner"] = (
             None if stale or not data.get("remote_dj_connected")
             else _public_remote_dj_owner(raw_owner, request.user)

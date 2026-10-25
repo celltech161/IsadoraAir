@@ -84,7 +84,7 @@ def derive_request_id(user_id, attempt_id, sequence):
 
 def _proof_message(command):
     return "|".join(str(part) for part in (
-        PROOF_VERSION, command["request_id"], command["user_id"], command["attempt_id"],
+        PROOF_VERSION, command["command"], command["request_id"], command["user_id"], command["attempt_id"],
         command["sequence"], int(command["active"]), command["engine_instance"],
         command["issued_at_ms"],
     ))

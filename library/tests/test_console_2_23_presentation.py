@@ -86,7 +86,8 @@ class ConsoleCapabilityFlagTests(TestCase):
 
     def test_superuser_full_console_gets_deck_transport(self):
         self.client.force_login(self.superuser)
-        self.assertEqual(_console_caps(self.client.get("/")), {"playout_control": True, "start_next": True})
+        self.assertEqual(_console_caps(self.client.get("/")), {"playout_control": True, "start_next": True,
+                                                                "rdj_emergency_mute": True, "rdj_force_disconnect": True})
 
     def test_staff_gets_deck_transport_on_both_pages(self):
         self.client.force_login(self.staff)
@@ -104,11 +105,14 @@ class ConsoleCapabilityFlagTests(TestCase):
         response = self.client.get("/remote-dj/")
         self.assertEqual(response.status_code, 200)
         # Phase 3: Start Next (playout.start_next) without deck transport.
-        self.assertEqual(_console_caps(response), {"playout_control": False, "start_next": True})
+        # 2.17A: and never the administrator emergency controls.
+        self.assertEqual(_console_caps(response), {"playout_control": False, "start_next": True,
+                                                   "rdj_emergency_mute": False, "rdj_force_disconnect": False})
 
     def test_flag_object_carries_only_the_known_presentation_keys(self):
         self.client.force_login(self.superuser)
-        self.assertEqual(set(_console_caps(self.client.get("/"))), {"playout_control", "start_next"})
+        self.assertEqual(set(_console_caps(self.client.get("/"))),
+                         {"playout_control", "start_next", "rdj_emergency_mute", "rdj_force_disconnect"})
 
     @patch("library.views.enqueue_engine_command")
     def test_hidden_controls_are_still_refused_by_the_server(self, mock_enqueue):
@@ -176,7 +180,18 @@ class ConsoleRenderedMarkupTests(TestCase):
 
     @staticmethod
     def _ops_row(content):
-        return content[content.index('<div class="playnow-bar">'):content.index('<audio id="remoteMonitorAudio"')]
+        # The ops bar ends at its status line (opsMsg); the 2.17A administrator
+        # row that follows is a separate control group.
+        return content[content.index('<div class="playnow-bar">'):content.index('<div class="ops-msg"')]
+
+    def test_admin_emergency_controls_are_a_separate_row_on_the_full_console_only(self):
+        self.client.force_login(self.superuser)
+        page = self.client.get("/").content.decode("utf-8")
+        admin = page[page.index('<div class="rdj-admin-bar"'):page.index('<audio id="remoteMonitorAudio"')]
+        self.assertGreater(page.index('<div class="rdj-admin-bar"'), page.index('<div class="ops-msg"'))
+        self.assertEqual(re.findall(r'<button[^>]*\bid="([A-Za-z]+Btn)"', admin),
+                         ["rdjEmergencyMuteBtn", "rdjReleaseMuteBtn", "rdjKickBtn"])
+        self.assertNotIn('id="rdjAdminBar"', self.client.get("/remote-dj/").content.decode("utf-8"))
 
     def test_full_console_ops_row_order(self):
         self.client.force_login(self.superuser)

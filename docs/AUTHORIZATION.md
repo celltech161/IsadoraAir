@@ -434,6 +434,7 @@ distinction").
 | `POST /api/engine/start-next/` (`api_engine_start_next`) | `playout.start_next` | 2.23; CSRF-enforced; `remote_dj` reaches it through one exact GroupAccess path (`library.0092`) |
 | `POST /api/engine/manual-mode/` (`api_engine_manual_mode`) | `playout.manual_mode` | |
 | `POST /api/engine/remote-dj-gate/` (`api_engine_remote_dj_gate`) | `remote_dj.mic_gate` | 2.17A: CSRF-enforced; only the connected DJ's own browser, for its own active session — see "Remote Mic session binding" |
+| `POST /api/engine/remote-dj-admin/` (`api_engine_remote_dj_admin`) | `remote_dj.emergency_mute` (`emergency_mute`, `release_mute`) or `remote_dj.force_disconnect` (`kick`) | 2.17A; Station Administrator only; CSRF-enforced; targets the exact observed session — see "Remote DJ administrator emergency controls" |
 | `POST /api/engine/mic-ptt/` (`api_engine_mic_ptt`) | `studio.mic_ptt` | operator-only in practice (no Role grants it but Station Administrator) |
 | `POST /api/fx/fire/` (`api_fx_fire`) | `fx.fire` | |
 | `_can_edit_voicetracks()` (5 call sites: upload/audio/save/delete + `voicetracks_page`) | `voicetrack.record` | not schedule-restricted; unchanged effective behavior |
@@ -785,6 +786,11 @@ Administrator seed contains the complete capability vocabulary.
 `active_message.control` to Station Administrator only; Remote Host and
 Contributor receive neither.
 
+`authz.0010` (roadmap 2.17A) adds `remote_dj.emergency_mute` and
+`remote_dj.force_disconnect`, not schedule-restricted, to Station Administrator
+only. Remote Host and Contributor receive neither, and no GroupAccess path is
+added.
+
 `authz.0009` (roadmap 2.23) adds the schedule-restricted
 `playout.start_next` to Station Administrator and Remote Host; Contributor
 receives nothing. It deliberately does not imply `playout.control`: a Remote
@@ -881,4 +887,45 @@ session they own.
 
 **Internal fail-safe muting is unchanged.** Recovery, session stop,
 authorization revocation and shutdown do not use this path.
+
+## Remote DJ administrator emergency controls (roadmap 2.17A)
+
+`POST /api/engine/remote-dj-admin/` (`library/services/remote_dj_admin_identity.py`).
+Body: `action`, `target_session`, `engine_instance`, `client_request_id`, and
+optionally `reason`.
+
+| Action | Capability | Effect |
+|---|---|---|
+| `emergency_mute` | `remote_dj.emergency_mute` | Physical gate 0, `gate_desired=False`, ducking recomputed, mic-owned Manual released (operator Manual and Studio Mic preserved), and a session-scoped **latch**. While latched, the owner's ON is refused (`emergency_muted`); the latch survives a same-session network recovery and ends with the session. |
+| `release_mute` | `remote_dj.emergency_mute` | Lifts the latch only. The mic stays OFF; owner commands issued while latched cannot apply; the owner must press ON again. |
+| `kick` | `remote_dj.force_disconnect` | Silences the mic first, notifies the DJ's browser, then ends the session through the normal teardown: signaling retired, slot released, late callbacks attempt-guarded. A Kick is not a ban — revoke access to prevent reconnection. |
+
+**Targeting.** `target_session` is the status owner block's `browser_key`
+(`sha256(attempt_id)[:32]`), i.e. the session the administrator saw:
+- Django refuses `stale_target` unless fresh engine state shows exactly that
+  session live on the same engine run.
+- It then queues the exact attempt and user, signed with the server
+  `SECRET_KEY` over every field, including the literal command type and
+  action.
+- The engine re-verifies before acting:
+  - the signature;
+  - single execution per `request_id`;
+  - the engine run;
+  - freshness (5 s);
+  - the exact attempt and user;
+  - the administrator's capability.
+
+A delayed action for one attempt never affects another, even the same user's.
+No action can open a microphone.
+
+**Audit.** Every accepted, executed, refused and stale-target outcome is an
+`authz` SystemEvent. The newest outcome is shown only to administrators
+(`remote_dj_admin_result`).
+
+**Staff.** These capabilities follow `authorize()`'s existing staff/superuser
+compatibility rule. Ordinary `remote_dj.mic_gate` stays owner-bound for
+everyone.
+
+The old unbound `remote_dj_disconnect` engine command (it had no producer) is
+removed.
 

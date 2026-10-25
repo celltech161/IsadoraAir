@@ -78,6 +78,7 @@ urlpatterns = [
     path('api/engine/start-next/', views.api_engine_start_next, name='api-engine-start-next'),
     path('api/engine/mic-ptt/', views.api_engine_mic_ptt, name='api-engine-mic-ptt'),
     path('api/engine/remote-dj-gate/', views.api_engine_remote_dj_gate, name='api-engine-remote-dj-gate'),
+    path('api/engine/remote-dj-admin/', views.api_engine_remote_dj_admin, name='api-engine-remote-dj-admin'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
     path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
     path('api/fx/fire/', views.api_fx_fire, name='api-fx-fire'),
