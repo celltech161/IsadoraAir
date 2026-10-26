@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0119",
+  "previous_release_id": "r0118",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Remote DJ control consolidation: administrator Disable/Enable Remote PTT moves into the Remote PTT button and Kick into the Connect button; the dedicated emergency row is removed. Engine-owned PTT generations reject stale ON after Disable/Enable while an authenticated current-session OFF still silences recovery safely. Older pages fail closed until reloaded. No migration, companion, static, unit, package, nginx or protected-runtime change. Restart Gunicorn, then the audio engine.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
