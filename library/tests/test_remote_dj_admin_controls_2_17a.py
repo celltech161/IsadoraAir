@@ -28,6 +28,7 @@ from library.tests.test_remote_dj_gate_binding_2_17a import (
     INSTANCE,
     GateEngineHarness,
     command,
+    request_body,
     remote_host_group,
 )
 
@@ -165,7 +166,8 @@ class AdminEndpointTests(TestCase):
         self.state_path.write_text(json.dumps({
             "timestamp": time.time() if timestamp is None else timestamp,
             "remote_dj_connected": connected,
-            "remote_dj_owner": {"user_id": user.pk, "attempt_id": attempt, **(extra or {})} if user else None,
+            "remote_dj_owner": {"user_id": user.pk, "attempt_id": attempt, "gate_generation": 1,
+                                **(extra or {})} if user else None,
             "state_revision": {"instance": instance, "seq": 4},
             "remote_dj_admin_result": {"request_id": "r" * 32, "action": "kick", "outcome": "executed",
                                        "at": 1.0},
@@ -389,6 +391,7 @@ class AdminEndpointTests(TestCase):
 
 
 # ---------------------------------------------------------------------------
+@override_settings(SECURE_SSL_REDIRECT=False)
 class AdminEngineTests(GateEngineHarness, TestCase):
     def setUp(self):
         super().setUp()
@@ -407,6 +410,36 @@ class AdminEngineTests(GateEngineHarness, TestCase):
     def admin_events(self, outcome=None):
         events = [e for e in self.events if e.get("title", "").startswith("Remote DJ administrator action")]
         return [e for e in events if outcome is None or e["detail"]["outcome"] == outcome]
+
+    def queue_owner_gate(self, body, generation, *, receipt_ms=None):
+        """POST through the real Django boundary and capture only the IPC write."""
+        state = {
+            "state_revision": {"instance": INSTANCE, "seq": 99},
+            "remote_dj_connected": True,
+            "remote_dj_owner": {
+                "attempt_id": ATTEMPT_A, "user_id": self.dj_a.pk,
+                "gate_generation": generation,
+            },
+        }
+        queued = []
+        client = Client()
+        client.force_login(self.dj_a)
+        patches = [
+            mock.patch.object(views, "_read_fresh_engine_state", return_value=state),
+            mock.patch.object(views, "_enqueue_engine_command_response",
+                              side_effect=lambda item: queued.append(item) or None),
+        ]
+        if receipt_ms is not None:
+            patches.append(mock.patch.object(views.time_mod, "time", return_value=receipt_ms / 1000))
+        with patches[0], patches[1]:
+            if len(patches) == 3:
+                with patches[2]:
+                    response = client.post("/api/engine/remote-dj-gate/", data=json.dumps(body),
+                                           content_type="application/json")
+            else:
+                response = client.post("/api/engine/remote-dj-gate/", data=json.dumps(body),
+                                       content_type="application/json")
+        return response, queued
 
     def live(self, user=None, attempt=ATTEMPT_A):
         session = self.connect(user or self.dj_a, attempt)
@@ -455,16 +488,69 @@ class AdminEngineTests(GateEngineHarness, TestCase):
         session = self.live()
         self.run_admin("emergency_mute", client_id="mute-press-01")
         latched_on = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=2,   # pressed while latched
+                             generation=session.gate_generation,
                              issued_at_ms=session.gate_mute_floor_ms)
         self.assertEqual(self.run_admin("release_mute", client_id="release-press1"), "executed")
         self.assertIsNone(session.emergency_latch)
         self.assertNotIn("emergency_mute", self.engine._remote_dj_owner_state())   # normal shape again
         self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
         before = self.snapshot()
-        self.assert_no_effect(self.engine._remote_dj_gate_command(latched_on), before, "superseded_by_mute")
+        self.assert_no_effect(self.engine._remote_dj_gate_command(latched_on), before, "stale_generation")
         self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3,                    # fresh press
                                    issued_at_ms=session.gate_mute_floor_ms + 1)[0], "applied")
         self.assertEqual(self.gate.get_property("volume"), 1.0)
+
+    def test_delayed_original_on_received_after_disable_enable_is_rejected_by_django(self):
+        """The exact acceptance-review exploit: receipt time is after release."""
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        saved_body = request_body(self.dj_a.pk, ATTEMPT_A, active=True, sequence=1,
+                                  generation=session.gate_generation)
+        self.assertEqual(self.run_admin("emergency_mute", client_id="delayed-http-mute"), "executed")
+        self.assertEqual(self.run_admin("release_mute", client_id="delayed-http-release"), "executed")
+        self.assertEqual(session.gate_generation, 3)
+        before = self.snapshot()
+        response, queued = self.queue_owner_gate(
+            saved_body, session.gate_generation, receipt_ms=session.gate_mute_floor_ms + 1)
+        self.assertEqual((response.status_code, response.json()["reason"]), (409, "stale_generation"))
+        self.assertEqual(queued, [])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
+        self.assertFalse(self.engine.manual_mode)
+
+    def test_queued_on_becomes_stale_across_disable_enable_and_fresh_on_works(self):
+        """Django acceptance cannot outrun the engines execution-time check."""
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        old_body = request_body(self.dj_a.pk, ATTEMPT_A, active=True, sequence=1,
+                                generation=session.gate_generation)
+        accepted, queued = self.queue_owner_gate(old_body, session.gate_generation)
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(self.run_admin("emergency_mute", client_id="queued-mute-001"), "executed")
+        self.assertEqual(self.run_admin("release_mute", client_id="queued-release1"), "executed")
+        before = self.snapshot()
+        self.assert_no_effect(self.engine._remote_dj_gate_command(queued[0]), before, "stale_generation")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
+
+        fresh_body = request_body(self.dj_a.pk, ATTEMPT_A, active=True, sequence=2,
+                                  generation=session.gate_generation)
+        accepted, fresh = self.queue_owner_gate(fresh_body, session.gate_generation)
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(self.engine._remote_dj_gate_command(fresh[0]), "applied")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (1.0, True))
+
+    def test_capability_revocation_after_django_acceptance_is_enforced_by_engine(self):
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        body = request_body(self.dj_a.pk, ATTEMPT_A, active=True, sequence=1,
+                            generation=session.gate_generation)
+        accepted, queued = self.queue_owner_gate(body, session.gate_generation)
+        self.assertEqual((accepted.status_code, len(queued)), (202, 1))
+        RoleCapability.objects.filter(
+            role__name="Remote Host", capability__slug="remote_dj.mic_gate").delete()
+        self.assertEqual(self.engine._remote_dj_gate_command(queued[0]),
+                         "refused:not_authorized")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired,
+                          self.engine.manual_mode, session.gate_generation),
+                         (0.0, False, False, 2))
 
     def test_release_without_a_latch_is_refused(self):
         self.live()

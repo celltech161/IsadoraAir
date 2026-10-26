@@ -71,11 +71,11 @@ class EngineCommandHttpProducerTests(TestCase):
 
         attempt = "producerAttempt000000001"
         state = {"timestamp": 1_000_000.0, "remote_dj_connected": True,
-                 "remote_dj_owner": {"user_id": self.superuser.pk, "attempt_id": attempt},
+                 "remote_dj_owner": {"user_id": self.superuser.pk, "attempt_id": attempt, "gate_generation": 1},
                  "state_revision": {"instance": "engine-run-1", "seq": 3}}
         key = gate_identity.control_key_for(self.superuser.pk, attempt)
         body = {"active": False, "attempt_id": attempt, "control_key": key, "sequence": 2,
-                "engine_instance": "engine-run-1"}
+                "generation": 1, "engine_instance": "engine-run-1"}
         with patch.object(views, "_read_fresh_engine_state", return_value=state), \
                 patch.object(views.time_mod, "time", return_value=1_000_000.5):
             response = views.api_engine_remote_dj_gate(self._post("/api/engine/remote-dj-gate/", body))
@@ -86,6 +86,7 @@ class EngineCommandHttpProducerTests(TestCase):
             "user_id": self.superuser.pk,
             "attempt_id": attempt,
             "sequence": 2,
+            "generation": 1,
             "active": False,
             "engine_instance": "engine-run-1",
             "issued_at_ms": 1_000_000_500,

@@ -542,7 +542,7 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
                       toggle)
         self.assertNotIn("{ active: desiredActive })", toggle)
         binding = self._function("rdjGateBinding")
-        self.assertIn("return { attempt_id: rdjAttemptId, control_key: rdjControlKey, engine_instance: instance };",
+        self.assertIn("return { attempt_id: rdjAttemptId, control_key: rdjControlKey, generation, engine_instance: instance };",
                       binding)
 
     def test_control_key_lives_only_in_page_memory_for_one_attempt(self):

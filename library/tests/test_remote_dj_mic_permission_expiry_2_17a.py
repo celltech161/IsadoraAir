@@ -75,14 +75,17 @@ class MicPermissionExpiryTests(GateEngineHarness, TestCase):
     def test_revoked_while_on_and_connected_forces_the_mic_off(self):
         session = self.live_owner()
         self.assertEqual(self.ramps, [self.DUCKED])
+        self.assertEqual(session.gate_generation, 1)
         self.revoke_mic_gate()
         self.tick()
+        self.assertEqual(session.gate_generation, 2)
         self.assert_forced_off(session, manual=False)                       # mic-owned Manual released
         self.assertEqual(self.ramps, [self.DUCKED, 1.0])                     # ducking released
         self.engine._remote_dj_session_stop = mock.MagicMock()
         self.tick()                                                          # repeated ticks: idempotent
         self.engine._remote_dj_session_stop.assert_not_called()
         self.assertEqual(len(self.forced_events()), 1)
+        self.assertEqual(session.gate_generation, 2)              # polling does not keep advancing it
         self.assertEqual(self.ramps, [self.DUCKED, 1.0])
 
     def test_revoked_while_off_changes_nothing_audible(self):
@@ -92,6 +95,7 @@ class MicPermissionExpiryTests(GateEngineHarness, TestCase):
         self.tick()
         after = self.snapshot()
         self.assertEqual(after, before)
+        self.assertEqual(session.gate_generation, 2)              # invalidates a queued ON even while OFF
         self.assertIs(self.engine.remote_dj_session, session)
         self.assertEqual(self.forced_events(), [])
         self.assertGreater(session.gate_mute_floor_ms, 0)                    # older presses are void
@@ -208,8 +212,8 @@ class MicPermissionExpiryTests(GateEngineHarness, TestCase):
         self.tick()
         self.restore_mic_gate()
         before = self.snapshot()
-        self.assert_no_effect(self.engine._remote_dj_gate_command(pending_on), before, "superseded_by_mute")
-        self.assertEqual(session.gate_result["outcome"], "refused:superseded_by_mute")
+        self.assert_no_effect(self.engine._remote_dj_gate_command(pending_on), before, "stale_generation")
+        self.assertEqual(session.gate_result["outcome"], "refused:stale_generation")
 
     def test_owner_off_after_revocation_is_refused_but_the_engine_closes_the_mic(self):
         session = self.live_owner()

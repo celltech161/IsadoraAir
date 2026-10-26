@@ -17,7 +17,11 @@ A user's gate request is bound to:
 * ``sequence`` -- the browser's per-attempt press counter, reused verbatim on
   an HTTP retry. The engine applies a sequence at most once and never an
   older one, so a retried, duplicated or reordered press cannot undo a newer
-  one.
+  one;
+* ``generation`` -- the engine-owned PTT-authority generation observed by the
+  owning browser when the press began. Administrative Disable/Enable and
+  other authoritative invalidation boundaries advance it, so a request that
+  reaches Django late cannot be repackaged as a post-intervention press.
 
 Django derives the engine ``request_id`` from (user, attempt, sequence), and
 queues a ``proof`` -- an HMAC of the whole command under the control key --
@@ -41,16 +45,19 @@ CONTROL_KEY_SALT = "isadoraair.remote-dj.gate-control.v1"
 PROOF_VERSION = "remote_dj_gate.v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MAX_SEQUENCE = 2**31 - 1
+MAX_GENERATION = 2**31 - 1
 MAX_REQUEST_ID_LENGTH = 64
 # The engine refuses a command queued longer ago than this (a delayed press
 # must not act on a later moment), or stamped implausibly far in the future.
 MAX_COMMAND_AGE_MS = 5000
 MAX_FUTURE_SKEW_MS = 2000
 
-REQUEST_FIELDS = frozenset({"active", "attempt_id", "control_key", "sequence", "engine_instance"})
+REQUEST_FIELDS = frozenset({
+    "active", "attempt_id", "control_key", "sequence", "generation", "engine_instance",
+})
 COMMAND_FIELDS = frozenset({
     "command", "request_id", "user_id", "attempt_id", "sequence", "active",
-    "engine_instance", "issued_at_ms", "proof",
+    "generation", "engine_instance", "issued_at_ms", "proof",
 })
 
 
@@ -85,7 +92,7 @@ def derive_request_id(user_id, attempt_id, sequence):
 def _proof_message(command):
     return "|".join(str(part) for part in (
         PROOF_VERSION, command["command"], command["request_id"], command["user_id"], command["attempt_id"],
-        command["sequence"], int(command["active"]), command["engine_instance"],
+        command["sequence"], command["generation"], int(command["active"]), command["engine_instance"],
         command["issued_at_ms"],
     ))
 
@@ -98,12 +105,12 @@ def command_proof(control_key, command):
 
 def parse_request(body):
     """A browser request body -> dict, or ValueError naming what is wrong.
-    Exactly the five fields, each strictly typed (a real JSON boolean)."""
+    Exactly the six fields, each strictly typed (a real JSON boolean)."""
     if not isinstance(body, dict):
         raise ValueError("body must be a JSON object")
     if set(body) != REQUEST_FIELDS:
         raise ValueError("body must contain exactly active, attempt_id, control_key, "
-                         "sequence and engine_instance")
+                         "sequence, generation and engine_instance")
     if not isinstance(body["active"], bool):
         raise ValueError("active must be a boolean")
     if not valid_attempt_id(body["attempt_id"]):
@@ -112,6 +119,8 @@ def parse_request(body):
         raise ValueError("control_key is malformed")
     if not _positive_int(body["sequence"], MAX_SEQUENCE):
         raise ValueError("sequence must be a positive integer")
+    if not _positive_int(body["generation"], MAX_GENERATION):
+        raise ValueError("generation must be a positive integer")
     if not valid_engine_instance(body["engine_instance"]):
         raise ValueError("engine_instance is malformed")
     return dict(body)
@@ -126,6 +135,7 @@ def build_command(*, user_id, request, issued_at_ms):
         "user_id": int(user_id),
         "attempt_id": request["attempt_id"],
         "sequence": request["sequence"],
+        "generation": request["generation"],
         "active": request["active"],
         "engine_instance": request["engine_instance"],
         "issued_at_ms": int(issued_at_ms),
@@ -148,6 +158,8 @@ def parse_command(data):
         raise ValueError("attempt_id is malformed")
     if not _positive_int(data["sequence"], MAX_SEQUENCE):
         raise ValueError("sequence is malformed")
+    if not _positive_int(data["generation"], MAX_GENERATION):
+        raise ValueError("generation is malformed")
     if not isinstance(data["active"], bool):
         raise ValueError("active is malformed")
     if not valid_engine_instance(data["engine_instance"]):

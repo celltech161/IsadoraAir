@@ -1007,10 +1007,12 @@ class _ConsoleBrowserBase:
     def browser_key(attempt_id):
         return hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
 
-    def owner(self, name="Jane Smith", *, current=False, attempt=None, identity="known"):
+    def owner(self, name="Jane Smith", *, current=False, attempt=None, identity="known",
+              generation=1):
         return {"identity": identity, "display_name": name if identity == "known" else None,
                 "is_current_user": current,
-                "browser_key": self.browser_key(attempt or "someone-elses-attempt-xyz")}
+                "browser_key": self.browser_key(attempt or "someone-elses-attempt-xyz"),
+                "gate_generation": generation}
 
     def connected(self, owner, **overrides):
         state = dict(remote_dj_connected=True, remote_dj_owner=owner,

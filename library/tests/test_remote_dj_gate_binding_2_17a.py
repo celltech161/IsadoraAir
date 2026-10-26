@@ -53,20 +53,21 @@ def browser_key(attempt_id):
     return hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
 
 
-def request_body(user_id, attempt_id, *, active=True, sequence=1, instance=INSTANCE, key=None):
+def request_body(user_id, attempt_id, *, active=True, sequence=1, generation=1, instance=INSTANCE, key=None):
     return {
         "active": active,
         "attempt_id": attempt_id,
         "control_key": key if key is not None else gi_mod.control_key_for(user_id, attempt_id),
         "sequence": sequence,
+        "generation": generation,
         "engine_instance": instance,
     }
 
 
-def command(user_id, attempt_id, *, active=True, sequence=1, instance=INSTANCE, key=None,
+def command(user_id, attempt_id, *, active=True, sequence=1, generation=1, instance=INSTANCE, key=None,
             issued_at_ms=None):
     request = request_body(user_id, attempt_id, active=active, sequence=sequence,
-                           instance=instance, key=key)
+                           generation=generation, instance=instance, key=key)
     return gi_mod.build_command(
         user_id=user_id, request=request,
         issued_at_ms=issued_at_ms if issued_at_ms is not None else time.time() * 1000)
@@ -111,6 +112,9 @@ class RemoteDjGateIdentityTests(SimpleTestCase):
             {**good, "active": "true"}, {**good, "active": 1}, {**good, "active": None},
             {**good, "sequence": 0}, {**good, "sequence": True}, {**good, "sequence": 1.0},
             {**good, "sequence": "1"}, {**good, "sequence": gi_mod.MAX_SEQUENCE + 1},
+            {**good, "generation": 0}, {**good, "generation": True},
+            {**good, "generation": -1}, {**good, "generation": 1.5},
+            {**good, "generation": gi_mod.MAX_GENERATION + 1},
             {**good, "attempt_id": "short"}, {**good, "attempt_id": None},
             {**good, "control_key": "f" * 63}, {**good, "control_key": "F" * 64},
             {**good, "engine_instance": ""}, {**good, "engine_instance": " x"},
@@ -130,7 +134,7 @@ class RemoteDjGateIdentityTests(SimpleTestCase):
 
     def test_proof_binds_every_field(self):
         cmd = command(7, ATTEMPT_A, active=True, sequence=3)
-        for field, value in (("active", False), ("sequence", 4), ("engine_instance", "engine-run-2"),
+        for field, value in (("active", False), ("sequence", 4), ("generation", 2), ("engine_instance", "engine-run-2"),
                              ("issued_at_ms", cmd["issued_at_ms"] + 1), ("user_id", 8),
                              ("attempt_id", ATTEMPT_B)):
             with self.subTest(field=field):
@@ -145,7 +149,10 @@ class RemoteDjGateIdentityTests(SimpleTestCase):
                     {**cmd, "control_key": "f" * 64},
                     {**cmd, "request_id": "0" * 32},                      # not derived from its binding
                     {**cmd, "active": 1}, {**cmd, "user_id": True}, {**cmd, "issued_at_ms": 1.5},
-                    {k: v for k, v in cmd.items() if k != "proof"}):
+                    {**cmd, "generation": 0}, {**cmd, "generation": True},
+                    {**cmd, "generation": gi_mod.MAX_GENERATION + 1},
+                    {k: v for k, v in cmd.items() if k != "proof"},
+                    {k: v for k, v in cmd.items() if k != "generation"}):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     gi_mod.parse_command(bad)
@@ -189,7 +196,8 @@ class RemoteDjGateEndpointTests(TestCase):
         state = {
             "timestamp": time.time() if timestamp is None else timestamp,
             "remote_dj_connected": connected,
-            "remote_dj_owner": {"user_id": user.pk, "attempt_id": attempt, **(extra or {})} if user else None,
+            "remote_dj_owner": {"user_id": user.pk, "attempt_id": attempt, "gate_generation": 1,
+                                **(extra or {})} if user else None,
             "state_revision": {"instance": instance, "seq": 5},
         }
         self.state_path.write_text(json.dumps(state))
@@ -217,8 +225,8 @@ class RemoteDjGateEndpointTests(TestCase):
             queued = self.enqueue.call_args.args[0]
             self.assertEqual(set(queued), gi_mod.COMMAND_FIELDS)
             self.assertEqual((queued["command"], queued["user_id"], queued["attempt_id"], queued["active"],
-                              queued["sequence"], queued["engine_instance"]),
-                             ("remote_dj_gate", self.dj_a.pk, ATTEMPT_A, active, sequence, INSTANCE))
+                              queued["sequence"], queued["generation"], queued["engine_instance"]),
+                             ("remote_dj_gate", self.dj_a.pk, ATTEMPT_A, active, sequence, 1, INSTANCE))
             self.assertTrue(gi_mod.verify_command_proof(queued))
             self.assertEqual(body["request_id"], queued["request_id"])
             # The queue never carries the credential itself.
@@ -304,11 +312,22 @@ class RemoteDjGateEndpointTests(TestCase):
         self.set_owner(self.dj_a, ATTEMPT_A, instance="engine-run-2")
         self.assert_refused(self.post(self.dj_a, body), 409, "engine_restarted")
 
+    def test_generation_must_be_available_and_match_current_session(self):
+        body = request_body(self.dj_a.pk, ATTEMPT_A, generation=1)
+        self.set_owner(self.dj_a, ATTEMPT_A, extra={"gate_generation": 2})
+        self.assert_refused(self.post(self.dj_a, body), 409, "stale_generation")
+        for unavailable in (None, True, 0, -1, "2", gi_mod.MAX_GENERATION + 1):
+            with self.subTest(generation=unavailable):
+                self.enqueue.reset_mock()
+                self.set_owner(self.dj_a, ATTEMPT_A, extra={"gate_generation": unavailable})
+                self.assert_refused(self.post(self.dj_a, body), 409, "generation_unavailable")
+
     def test_malformed_requests_are_refused_before_any_check(self):
         good = request_body(self.dj_a.pk, ATTEMPT_A)
         for body in ({"active": True}, {**good, "active": "false"}, {**good, "active": 0},
                      {**good, "extra": True}, {k: v for k, v in good.items() if k != "control_key"},
-                     {k: v for k, v in good.items() if k != "sequence"}, [good]):
+                     {k: v for k, v in good.items() if k != "sequence"},
+                     {k: v for k, v in good.items() if k != "generation"}, [good]):
             with self.subTest(body=body):
                 self.assert_refused(self.post(self.dj_a, body), 400)
         client = Client()
@@ -450,6 +469,9 @@ class GateEngineHarness:
         return session
 
     def send(self, user, attempt_id, **kwargs):
+        session = self.engine.remote_dj_session
+        if "generation" not in kwargs and session is not None:
+            kwargs["generation"] = session.gate_generation
         cmd = command(user.pk, attempt_id, **kwargs)
         before = self.snapshot()
         return self.engine._remote_dj_gate_command(cmd), before
@@ -494,6 +516,14 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
         self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
         self.assertFalse(self.engine.manual_mode)               # mic-owned Manual released to Auto
         self.assertEqual(self.ramps, [self.DUCKED, 1.0])
+
+    def test_wrong_generation_is_refused_without_any_session_or_audio_mutation(self):
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        stale = command(self.dj_a.pk, ATTEMPT_A, active=True, generation=2)
+        before = self.snapshot()
+        self.assert_no_effect(self.engine._remote_dj_gate_command(stale), before, "stale_generation")
+        self.assertEqual((session.gate_generation, session.gate_last_sequence), (1, 0))
+        self.assertIsNone(session.emergency_latch)
 
     def test_the_queued_command_goes_through_the_real_dispatcher(self):
         self.connect(self.dj_a, ATTEMPT_A)
@@ -566,7 +596,7 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
         old = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=7)
         self.engine._remote_dj_session_stop()
         session = self.connect(self.dj_a, ATTEMPT_A2)
-        self.assertEqual((session.gate_last_sequence, session.gate_result), (0, None))   # nothing inherited
+        self.assertEqual((session.gate_last_sequence, session.gate_result, session.gate_generation), (0, None, 1))   # nothing inherited
         before = self.snapshot()
         self.assert_no_effect(self.engine._remote_dj_gate_command(old), before, "not_current_session")
         # The new attempt starts its own sequence at 1.
@@ -693,6 +723,25 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
         self.engine._remote_dj_complete_recovery(session, trigger="transport_connected")
         self.assertEqual(self.gate.get_property("volume"), 1.0)
         self.assertTrue(self.engine.manual_mode)
+
+    def test_recovery_advances_once_rejects_queued_pre_recovery_on_and_allows_fresh_intent(self):
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        queued_on = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=1, generation=1)
+        self.assertTrue(self.engine._remote_dj_begin_recovery(
+            session, reason="transport_disconnected"))
+        self.assertEqual(session.gate_generation, 2)
+        self.assertFalse(self.engine._remote_dj_begin_recovery(
+            session, reason="transport_disconnected"))
+        self.assertEqual(session.gate_generation, 2)
+        before = self.snapshot()
+        self.assert_no_effect(
+            self.engine._remote_dj_gate_command(queued_on), before, "stale_generation")
+        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=2)[0],
+                         "applied_held_muted")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired),
+                         (0.0, True))
+        self.engine._remote_dj_complete_recovery(session, trigger="transport_connected")
+        self.assertEqual(self.gate.get_property("volume"), 1.0)
 
     def test_recovery_mutes_without_any_credential(self):
         session = self.connect(self.dj_a, ATTEMPT_A)

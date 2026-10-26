@@ -51,7 +51,7 @@ class EngineOwnerStateTests(SimpleTestCase):
         attempt_id = new_attempt_id()
         engine = object.__new__(eng_module.PlaybackEngine)
         engine.remote_dj_session = _session(42, attempt_id)
-        self.assertEqual(engine._remote_dj_owner_state(), {"user_id": 42, "attempt_id": attempt_id})
+        self.assertEqual(engine._remote_dj_owner_state(), {"user_id": 42, "attempt_id": attempt_id, "gate_generation": 1})
 
     def test_write_state_carries_the_owner_block(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,7 +82,7 @@ class EngineOwnerStateHardeningTests(SimpleTestCase):
         attempt = self.attempt()
         session = SimpleNamespace(user_id=7, connection_attempt=attempt)
         self.assertEqual(self.engine_with(session)._remote_dj_owner_state(),
-                         {"user_id": 7, "attempt_id": attempt.attempt_id})
+                         {"user_id": 7, "attempt_id": attempt.attempt_id, "gate_generation": None})
 
     def test_missing_session_attribute_entirely(self):
         self.assertIsNone(object.__new__(eng_module.PlaybackEngine)._remote_dj_owner_state())
@@ -109,7 +109,7 @@ class EngineOwnerStateHardeningTests(SimpleTestCase):
                           for bad in (None, "7", True, 0, -3, 7.0, object()))):
             with self.subTest(user_id=getattr(session, "user_id", "<missing>")):
                 self.assertEqual(self.engine_with(session)._remote_dj_owner_state(),
-                                 {"user_id": None, "attempt_id": attempt.attempt_id})
+                                 {"user_id": None, "attempt_id": attempt.attempt_id, "gate_generation": None})
 
     def test_ended_or_failed_attempt_is_never_published(self):
         for status in ("ended", "failed"):
@@ -176,7 +176,8 @@ class EngineOwnerStateHardeningTests(SimpleTestCase):
             self.assertIsNone(self.write(stand_in))
 
 
-def _state(*, connected=True, owner_user_id=None, attempt_id="A" * 24, age=0.0, include_owner=True):
+def _state(*, connected=True, owner_user_id=None, attempt_id="A" * 24, age=0.0, include_owner=True,
+           generation=1):
     state = {
         "transport": "PLAYING", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": [],
         "timestamp": time.time() - age,
@@ -185,7 +186,7 @@ def _state(*, connected=True, owner_user_id=None, attempt_id="A" * 24, age=0.0, 
     }
     if include_owner:
         state["remote_dj_owner"] = (
-            {"user_id": owner_user_id, "attempt_id": attempt_id} if connected else None
+            {"user_id": owner_user_id, "attempt_id": attempt_id, "gate_generation": generation} if connected else None
         )
     return state
 
@@ -226,6 +227,7 @@ class StatusIdentityTests(TestCase):
             "display_name": "Jane Smith",
             "is_current_user": False,
             "browser_key": hashlib.sha256(attempt_id.encode()).hexdigest()[:32],
+            "gate_generation": 1,
         })
 
     def test_staff_observer_sees_the_owner(self):
@@ -243,7 +245,7 @@ class StatusIdentityTests(TestCase):
         session_key = self.client.session.session_key
         data = self.status(self.other_host, _state(owner_user_id=self.dj.pk, attempt_id=attempt_id))
         owner = data["remote_dj_owner"]
-        self.assertEqual(set(owner), {"identity", "display_name", "is_current_user", "browser_key"})
+        self.assertEqual(set(owner), {"identity", "display_name", "is_current_user", "browser_key", "gate_generation"})
         self.assertNotIn("user_id", json.dumps(owner))
         self.assertNotIn(attempt_id, json.dumps(owner))
         body = json.dumps(data)

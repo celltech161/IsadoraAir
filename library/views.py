@@ -2918,6 +2918,16 @@ def api_engine_remote_dj_gate(request):
             {"error": "that Remote DJ connection is not the active session", "reason": "not_current_session"},
             status=409,
         )
+    generation = owner.get("gate_generation")
+    if (isinstance(generation, bool) or not isinstance(generation, int)
+            or not 0 < generation <= gate_identity.MAX_GENERATION):
+        return JsonResponse(
+            {"error": "the engine does not publish a usable PTT generation",
+             "reason": "generation_unavailable"}, status=409)
+    if gate_request["generation"] != generation:
+        return JsonResponse(
+            {"error": "that PTT request predates a microphone safety transition",
+             "reason": "stale_generation"}, status=409)
 
     command = gate_identity.build_command(
         user_id=request.user.pk, request=gate_request, issued_at_ms=time_mod.time() * 1000)
@@ -3115,6 +3125,8 @@ def _public_remote_dj_owner(raw_owner, viewer):
     """
     if not isinstance(raw_owner, dict):
         return None
+    from library.services import remote_dj_gate_identity as gate_identity
+
     attempt_id = raw_owner.get("attempt_id")
     if not isinstance(attempt_id, str) or not attempt_id:
         return None
@@ -3134,6 +3146,10 @@ def _public_remote_dj_owner(raw_owner, viewer):
         "is_current_user": is_current_user,
         "browser_key": hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32],
     }
+    generation = raw_owner.get("gate_generation")
+    if (isinstance(generation, int) and not isinstance(generation, bool)
+            and 0 < generation <= gate_identity.MAX_GENERATION):
+        public["gate_generation"] = generation
     # Roadmap 2.17A: whether the station has latched this session's mic off,
     # and why the engine last forced it off (no identities).
     if raw_owner.get("emergency_mute") is True:

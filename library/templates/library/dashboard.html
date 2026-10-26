@@ -3011,19 +3011,25 @@ function rdjMayGate(data) {
 // is then read-only and nothing is sent. The server and the engine enforce
 // the binding themselves; this only keeps the page from sending what they
 // would refuse.
+function rdjGateGeneration(data) {
+  const generation = data && data.remote_dj_owner && data.remote_dj_owner.gate_generation;
+  return Number.isSafeInteger(generation) && generation > 0 ? generation : null;
+}
+
 function rdjGateBinding(data) {
   if (!rdjMayGate(data) || !rdjAttemptId || !rdjControlKey) return null;
   // The station's Emergency Mute latch: no binding, so nothing is sent.
   if (data.remote_dj_owner && data.remote_dj_owner.emergency_mute === true) return null;
   const instance = startNextInstance(data);
-  if (!instance) return null;
-  return { attempt_id: rdjAttemptId, control_key: rdjControlKey, engine_instance: instance };
+  const generation = rdjGateGeneration(data);
+  if (!instance || generation === null) return null;
+  return { attempt_id: rdjAttemptId, control_key: rdjControlKey, generation, engine_instance: instance };
 }
 
 function rdjGateStillBound(binding) {
   const now = rdjGateBinding(window.__rdjLastEngineState || {});
   return !!now && now.attempt_id === binding.attempt_id && now.control_key === binding.control_key
-    && now.engine_instance === binding.engine_instance;
+    && now.generation === binding.generation && now.engine_instance === binding.engine_instance;
 }
 
 const RDJ_GATE_REFUSALS = {
@@ -3032,6 +3038,8 @@ const RDJ_GATE_REFUSALS = {
   engine_unavailable: 'engine status is unavailable',
   engine_restarted: 'the engine restarted',
   stale_command: 'the request arrived too late',
+  stale_generation: 'the request predates a microphone safety transition',
+  generation_unavailable: 'PTT safety state is unavailable; reload after the engine restarts',
   out_of_order: 'a newer Remote Mic press superseded it',
   not_authorized: 'permission denied (role or schedule)',
   no_session: 'no Remote DJ session is active',
@@ -3266,6 +3274,7 @@ function renderRemoteDjGate(data) {
     if (latched) rdjLatchesSeen += 1;
     const mayGate = rdjGateBinding(data) !== null;
     const gateLink = rdjLocalLink(data);
+    const generationAvailable = rdjGateGeneration(data) !== null;
     // r0119: an administrator page holding no link of its own operates the
     // OFF-only Disable/Enable through this same button.
     const admin = mayGate ? null : rdjAdminGateMode(data);
@@ -3291,6 +3300,8 @@ function renderRemoteDjGate(data) {
       btn.disabled = !mayGate;
       const readOnlyWhy = latched
         ? (gateLink === 'owner' ? ' — you cannot turn it on until the station enables it' : '')
+        : gateLink === 'owner' && !generationAvailable
+          ? ' (read-only: PTT safety state is unavailable; reload after the engine restarts)'
         : gateLink === 'unverified' || gateLink === 'owner'
         ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
         : gateLink === 'legacy'

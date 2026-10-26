@@ -77,18 +77,20 @@ class _RemoteMicHarness(_ConsoleBrowserBase):
         return super()._route(route, request)
 
     # -- fixtures --------------------------------------------------------------
-    def owner_block(self, attempt=ATTEMPT, *, current=True, gate_result=None, emergency_mute=False):
+    def owner_block(self, attempt=ATTEMPT, *, current=True, gate_result=None, emergency_mute=False,
+                    generation=1):
         block = {"identity": "known", "display_name": "Ann Air", "is_current_user": current,
-                 "browser_key": self.browser_key(attempt), "emergency_mute": emergency_mute}
+                 "browser_key": self.browser_key(attempt), "emergency_mute": emergency_mute,
+                 "gate_generation": generation}
         if gate_result is not None:
             block["gate_result"] = gate_result
         return block
 
     def connected_state(self, attempt=ATTEMPT, *, current=True, gate_result=None, emergency_mute=False,
-                        **overrides):
+                        generation=1, **overrides):
         return engine_state(remote_dj_connected=True, remote_dj_quality={"overall": "good"},
                             remote_dj_owner=self.owner_block(attempt, current=current, gate_result=gate_result,
-                                                             emergency_mute=emergency_mute),
+                                                             emergency_mute=emergency_mute, generation=generation),
                             **overrides)
 
     def become_owner(self, page, *, attempt=ATTEMPT, key=KEY):
@@ -119,9 +121,9 @@ class _RemoteMicHarness(_ConsoleBrowserBase):
     def press(self, page):
         page.evaluate("async () => { await toggleRemoteDjGate(); }")
 
-    def expected_body(self, active, sequence, *, key=KEY, attempt=ATTEMPT):
+    def expected_body(self, active, sequence, *, key=KEY, attempt=ATTEMPT, generation=1):
         return {"active": active, "sequence": sequence, "attempt_id": attempt, "control_key": key,
-                "engine_instance": INSTANCE}
+                "generation": generation, "engine_instance": INSTANCE}
 
 
 
@@ -199,6 +201,33 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
         self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1)])       # the original only, no retry
         self.assertIn("outcome unconfirmed", self.gate_ui(page)["msg"])
 
+    def test_lost_response_never_retries_against_a_new_generation(self):
+        page = self.owner_page()
+        page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, opts) => {
+            if (!opts || opts.method !== 'POST') return realFetch(url, opts);
+            const s = window.__rdjLastEngineState;
+            window.__rdjLastEngineState = {...s, remote_dj_owner: {
+              ...s.remote_dj_owner, gate_generation: 2}};
+            return realFetch(url, opts).then(() => { throw new TypeError('network'); });
+          };
+        }""")
+        self.press(page)
+        self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1, generation=1)])
+        self.assertIn("outcome unconfirmed", self.gate_ui(page)["msg"])
+
+    def test_disable_release_requires_a_fresh_press_with_the_new_generation(self):
+        page = self.owner_page()
+        self.poll_now(page, **self.connected_state(emergency_mute=True, generation=2))
+        self.assertTrue(self.gate_ui(page)["disabled"])
+        self.assertEqual(self.gate_bodies(), [])
+        self.poll_now(page, **self.connected_state(emergency_mute=False, generation=3))
+        self.assertFalse(self.gate_ui(page)["disabled"])
+        self.assertEqual(self.gate_bodies(), [])
+        self.press(page)
+        self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1, generation=3)])
+
     # -- fail closed in the page ---------------------------------------------
     def assert_read_only_and_silent(self, page, why=None):
         ui = self.gate_ui(page)
@@ -228,6 +257,31 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
     def test_owner_page_without_its_control_key_cannot_gate(self):
         page = self.owner_page(key=None)
         self.assert_read_only_and_silent(page, "ownership is unconfirmed")
+
+    def test_owner_status_without_a_generation_fails_closed_truthfully(self):
+        page = self.owner_page()
+        self.poll_now(page, **self.connected_state(generation=None))
+        self.assert_read_only_and_silent(page, "PTT safety state is unavailable")
+
+    def test_older_status_cannot_roll_generation_back(self):
+        page = self.owner_page()
+        seq = page.evaluate("() => acceptedRevision.seq")
+        newer = self.connected_state(generation=3)
+        newer["state_revision"] = {"instance": INSTANCE, "seq": seq + 1}
+        self.poll_now(page, **newer)
+        self.assertEqual(page.evaluate(
+            "() => window.__rdjLastEngineState.remote_dj_owner.gate_generation"), 3)
+        older = self.connected_state(generation=1)
+        older["state_revision"] = {"instance": INSTANCE, "seq": seq}
+        self.poll_now(page, **older)
+        self.assertEqual(page.evaluate(
+            "() => window.__rdjLastEngineState.remote_dj_owner.gate_generation"), 3)
+        self.assertTrue(self.gate_ui(page)["disabled"])
+        newest = self.connected_state(generation=3)
+        newest["state_revision"] = {"instance": INSTANCE, "seq": seq + 2}
+        self.poll_now(page, **newest)
+        self.press(page)
+        self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1, generation=3)])
 
     def test_status_without_an_engine_instance_fails_closed(self):
         page = self.owner_page()
@@ -620,7 +674,7 @@ class _EndToEndCases(_RemoteMicHarness):
         # Dated ahead so it stays fresh however long the browser takes to start.
         self.state_path.write_text(json.dumps({
             "timestamp": time.time() + 3600, "remote_dj_connected": True,
-            "remote_dj_owner": {"user_id": self.host.pk, "attempt_id": ATTEMPT},
+            "remote_dj_owner": {"user_id": self.host.pk, "attempt_id": ATTEMPT, "gate_generation": 1},
             "state_revision": {"instance": INSTANCE, "seq": 9},
         }))
         patcher = mock.patch.object(views, "ENGINE_STATE_PATH", self.state_path)

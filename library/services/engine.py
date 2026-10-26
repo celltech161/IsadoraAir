@@ -1488,6 +1488,12 @@ class RemoteDJSession:
         self.gate_last_sequence = 0
         self.gate_last_request_id = None
         self.gate_result = None
+        # r0119: engine-owned PTT authority version for this exact session.
+        # A browser press is bound to the generation it observed. Safety
+        # interventions advance it, invalidating requests still in HTTP/IPC
+        # flight without relying on wall-clock ordering. It never survives a
+        # session replacement because every RemoteDJSession starts at one.
+        self.gate_generation = 1
         # 2.17A correction: when the engine itself forces this session's mic
         # off (lost/unverifiable remote_dj.mic_gate), no user command issued
         # at or before that moment may apply afterwards -- only a deliberate
@@ -11079,6 +11085,7 @@ class PlaybackEngine:
         if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
             user_id = None
         owner = {"user_id": user_id, "attempt_id": attempt_id}
+        owner["gate_generation"] = getattr(session, "gate_generation", None)
         # Roadmap 2.17A: the outcome of this session's newest gate command
         # (no key or proof; library.views passes it only to the owner).
         gate_result = getattr(session, "gate_result", None)
@@ -11638,7 +11645,26 @@ class PlaybackEngine:
                                            user_id=user_id)
         return True
 
-    def _remote_dj_force_gate_off(self, session, attempt_id, *, reason, user_id=None, audit=None):
+    def _remote_dj_advance_gate_generation(self, session, *, reason):
+        """Invalidate every ordinary PTT request prepared against the current generation.
+
+        The counter belongs to one RemoteDJSession. It advances only at
+        explicit safety boundaries, never on status polling. If corrupt or
+        exhausted, advance beyond the accepted wire range so PTT fails closed.
+        """
+        current = getattr(session, "gate_generation", None)
+        if (isinstance(current, bool) or not isinstance(current, int) or current <= 0
+                or current > remote_dj_gate_identity.MAX_GENERATION):
+            current = remote_dj_gate_identity.MAX_GENERATION
+        session.gate_generation = current + 1
+        attempt = getattr(session, "connection_attempt", None)
+        attempt_id = getattr(attempt, "attempt_id", "?")
+        print(f"  Remote DJ [{attempt_id}]: PTT generation advanced to "
+              f"{session.gate_generation} (reason={reason})")
+        return session.gate_generation
+
+    def _remote_dj_force_gate_off(self, session, attempt_id, *, reason, user_id=None, audit=None,
+                                  advance_generation=None):
         """Roadmap 2.17A -- engine-owned fail-safe mute of ONE exact session.
 
         No browser credential: this is the engine closing a microphone its
@@ -11666,12 +11692,18 @@ class PlaybackEngine:
         slot = self.dj_slots[session.slot_id]
         was_live = slot.remote_gate.get_property("volume") > 0.0
         was_desired = bool(session.gate_desired)
+        reason_code = reason.split(":", 1)[0]
+        prior_forced = getattr(session, "gate_forced", None)
+        already_forced = isinstance(prior_forced, dict) and prior_forced.get("reason") == reason_code
+        invalidate = (not already_forced) if advance_generation is None else bool(advance_generation)
+        if invalidate:
+            self._remote_dj_advance_gate_generation(session, reason=reason_code)
         session.gate_mute_floor_ms = int(time.time() * 1000)
+        session.gate_forced = {"reason": reason_code}
         if not (was_live or was_desired):
             return False
         slot.remote_gate.set_property("volume", 0.0)
         session.gate_desired = False
-        session.gate_forced = {"reason": reason.split(":", 1)[0]}
         self._apply_talk_ducking()
         self._apply_mic_mode_hold()
         print(f"  Remote DJ [{attempt_id}]: mic forced OFF (reason={reason}, "
@@ -12717,6 +12749,10 @@ class PlaybackEngine:
 
         if not attempt.mark_reconnecting():
             return False
+        # One advance per recovery episode: a queued pre-recovery press may
+        # not create fresh intent after the protective mute. Already-applied
+        # gate_desired is deliberately preserved by the accepted B1 contract.
+        self._remote_dj_advance_gate_generation(session, reason="recovery")
         session.recovery_reason = reason
         session.media_recovery_observations = 0
         session.media_recovery_first_monotonic = None
@@ -12951,6 +12987,8 @@ class PlaybackEngine:
         if not remote_dj_gate_identity.verify_command_proof(command):
             return self._remote_dj_gate_refused(None, command, "bad_proof")
         # From here the command is this session's own: outcomes are published.
+        if command["generation"] != getattr(session, "gate_generation", None):
+            return self._remote_dj_gate_refused(session, command, "stale_generation")
         if command["issued_at_ms"] <= session.gate_mute_floor_ms:
             # Issued before the engine forced this mic off: never reopens it.
             return self._remote_dj_gate_refused(session, command, "superseded_by_mute")
@@ -13044,15 +13082,18 @@ class PlaybackEngine:
         audit = {"admin_user_id": command["admin_user_id"], "action": action,
                  "request_id": command["request_id"]}
         if action == "emergency_mute":
-            self._remote_dj_silence(session, reason="emergency_mute", audit=audit)
+            self._remote_dj_silence(session, reason="emergency_mute", audit=audit,
+                                    advance_generation=True)
             session.emergency_latch = {"since_ms": int(time.time() * 1000),
                                        "by_user_id": command["admin_user_id"]}
             session.gate_forced = {"reason": "emergency_mute"}
         elif action == "release_mute":
             if session.emergency_latch is None:
                 return self._remote_dj_admin_outcome(command, "refused:not_latched")
-            # Lift the latch only: the mic stays OFF, and no owner command
-            # issued while latched can apply afterwards.
+            # Lift the latch only: the mic stays OFF. Advancing before the
+            # release makes every pre-release browser body and queued command
+            # obsolete; only a press bound to the published new generation may act.
+            self._remote_dj_advance_gate_generation(session, reason="emergency_release")
             session.emergency_latch = None
             session.gate_mute_floor_ms = int(time.time() * 1000)
             session.gate_forced = None
@@ -13060,7 +13101,8 @@ class PlaybackEngine:
             # Silence first, then the normal teardown: signaling retirement
             # closes the browser's socket, the slot is released, and every
             # late callback is attempt/session-guarded.
-            self._remote_dj_silence(session, reason="kick", audit=audit)
+            self._remote_dj_silence(session, reason="kick", audit=audit,
+                                    advance_generation=False)
             if self._remote_dj_server is not None:
                 self._remote_dj_server.send_json_threadsafe(
                     attempt_id, {"type": "kicked", "reason": "station_administrator"})
@@ -13070,13 +13112,15 @@ class PlaybackEngine:
             seen.popitem(last=False)
         return self._remote_dj_admin_outcome(command, "executed")
 
-    def _remote_dj_silence(self, session, *, reason, audit):
+    def _remote_dj_silence(self, session, *, reason, audit, advance_generation):
         """Administrator silencing of one exact session: the same engine-owned
         mute as a permission loss, applied even if the gate is already off so
         the floor always moves forward."""
         attempt_id = session.connection_attempt.attempt_id
-        self._remote_dj_force_gate_off(session, attempt_id, reason=reason,
-                                       user_id=session.user_id, audit=audit)
+        self._remote_dj_force_gate_off(
+            session, attempt_id, reason=reason, user_id=session.user_id, audit=audit,
+            advance_generation=advance_generation,
+        )
 
     def _remote_dj_admin_outcome(self, command, outcome):
         """Publish and audit one administrator command outcome. Never logs
