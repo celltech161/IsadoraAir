@@ -473,7 +473,22 @@ class AdminEngineTests(GateEngineHarness, TestCase):
                                     issued_at_ms=session.gate_mute_floor_ms + 1)
         self.assert_no_effect(outcome, before, "emergency_muted")
         self.assertEqual(session.gate_result["outcome"], "refused:emergency_muted")
-        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=False, sequence=3)[0], "applied")   # OFF is fine
+        # Keep this command deterministically newer than the latch floor too;
+        # wall-clock equality is possible on a fast test run.
+        outcome, _ = self.send(
+            self.dj_a,
+            ATTEMPT_A,
+            active=False,
+            sequence=3,
+            issued_at_ms=session.gate_mute_floor_ms + 1,
+        )
+        self.assertEqual(outcome, "applied")  # OFF is fine
+        self.assertEqual(
+            (self.gate.get_property("volume"), session.gate_desired,
+             self.engine.manual_mode, session.gate_last_sequence),
+            (0.0, False, False, 3),
+        )
+        self.assertIsNotNone(session.emergency_latch)
 
     def test_recovery_cannot_undo_the_latch(self):
         session = self.live()
