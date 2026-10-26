@@ -316,6 +316,19 @@ class RemoteDjGateEndpointTests(TestCase):
         body = request_body(self.dj_a.pk, ATTEMPT_A, generation=1)
         self.set_owner(self.dj_a, ATTEMPT_A, extra={"gate_generation": 2})
         self.assert_refused(self.post(self.dj_a, body), 409, "stale_generation")
+
+        # Generation gates activation, not a proven owner's request to make
+        # this exact current session safer. The queued command retains the
+        # observed generation for independent engine validation.
+        self.enqueue.reset_mock()
+        stale_off = request_body(
+            self.dj_a.pk, ATTEMPT_A, active=False, sequence=2, generation=1)
+        response = self.post(self.dj_a, stale_off)
+        self.assertEqual(response.status_code, 202, response.content)
+        queued = self.enqueue.call_args.args[0]
+        self.assertEqual((queued["active"], queued["generation"]), (False, 1))
+        self.assertTrue(gi_mod.verify_command_proof(queued))
+
         for unavailable in (None, True, 0, -1, "2", gi_mod.MAX_GENERATION + 1):
             with self.subTest(generation=unavailable):
                 self.enqueue.reset_mock()
@@ -524,6 +537,49 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
         self.assert_no_effect(self.engine._remote_dj_gate_command(stale), before, "stale_generation")
         self.assertEqual((session.gate_generation, session.gate_last_sequence), (1, 0))
         self.assertIsNone(session.emergency_latch)
+
+    def test_stale_generation_off_during_recovery_is_safe_ordered_and_does_not_block_fresh_on(self):
+        session = self.connect(self.dj_a, ATTEMPT_A)
+        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=1)[0],
+                         "applied")
+        stale_off = command(
+            self.dj_a.pk, ATTEMPT_A, active=False, sequence=2, generation=1)
+        self.engine._remote_dj_begin_recovery(
+            session, reason="transport_disconnected")
+        self.assertEqual(session.gate_generation, 2)
+
+        self.assertEqual(self.engine._remote_dj_gate_command(stale_off), "applied")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired,
+                          self.engine.manual_mode, session.gate_last_sequence),
+                         (0.0, False, False, 2))
+        before = self.snapshot()
+        self.assertEqual(self.engine._remote_dj_gate_command(dict(stale_off)), "duplicate")
+        self.assertEqual(self.snapshot(), before)
+
+        fresh_on = command(
+            self.dj_a.pk, ATTEMPT_A, active=True, sequence=3, generation=2)
+        self.assertEqual(self.engine._remote_dj_gate_command(fresh_on),
+                         "applied_held_muted")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired),
+                         (0.0, True))
+
+        # Once the later ON is accepted, neither an older OFF nor an old-
+        # generation ON can override it.
+        before = self.snapshot()
+        self.assert_no_effect(
+            self.engine._remote_dj_gate_command(dict(stale_off)), before,
+            "out_of_order")
+        old_on = command(
+            self.dj_a.pk, ATTEMPT_A, active=True, sequence=4, generation=1)
+        before = self.snapshot()
+        self.assert_no_effect(
+            self.engine._remote_dj_gate_command(old_on), before,
+            "stale_generation")
+
+        self.engine._remote_dj_complete_recovery(
+            session, trigger="transport_connected")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired),
+                         (1.0, True))
 
     def test_the_queued_command_goes_through_the_real_dispatcher(self):
         self.connect(self.dj_a, ATTEMPT_A)

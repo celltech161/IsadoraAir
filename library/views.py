@@ -2867,10 +2867,12 @@ def api_engine_remote_dj_gate(request):
     prove it comes from the browser that started that attempt
     (``control_key``, returned only by api_remote_dj_token), carry that
     attempt's owning user as the authenticated caller, the engine run it saw
-    and a per-attempt ``sequence``. Opening AND closing are refused without
-    it -- a stale OFF would mute the next DJ. There is no staff bypass: a
-    Station Administrator gates only a session they own (an emergency staff
-    mute is a separate, not-yet-approved path).
+    and a per-attempt ``sequence``. Both directions require that exact
+    ownership proof -- a stale OFF must never mute the next DJ. PTT ON also
+    requires the current engine-owned generation. A proven OFF may retain an
+    older generation so a recovery transition cannot defeat the owner's
+    attempt to silence this exact session. There is no staff bypass: a
+    Station Administrator gates only a session they own.
 
     Checked here against fresh engine state before queueing, and again by
     the engine against its live session immediately before the gate changes.
@@ -2924,7 +2926,11 @@ def api_engine_remote_dj_gate(request):
         return JsonResponse(
             {"error": "the engine does not publish a usable PTT generation",
              "reason": "generation_unavailable"}, status=409)
-    if gate_request["generation"] != generation:
+    # r0119 final correction: generation is activation authority. It must
+    # never let a stale ON through, but an authenticated OFF for this exact
+    # current session remains safe when recovery advanced before status was
+    # published to the owner. The engine independently repeats all checks.
+    if gate_request["active"] and gate_request["generation"] != generation:
         return JsonResponse(
             {"error": "that PTT request predates a microphone safety transition",
              "reason": "stale_generation"}, status=409)

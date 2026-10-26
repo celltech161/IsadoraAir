@@ -552,6 +552,42 @@ class AdminEngineTests(GateEngineHarness, TestCase):
                           self.engine.manual_mode, session.gate_generation),
                          (0.0, False, False, 2))
 
+    def test_owner_off_with_pre_recovery_generation_prevents_live_restore(self):
+        """The owner presses OFF during recovery before its status catches up."""
+        session = self.live()
+        prior_generation = session.gate_generation
+        self.assertTrue(self.engine._remote_dj_begin_recovery(
+            session, reason="transport_disconnected"))
+        self.assertEqual((prior_generation, session.gate_generation), (1, 2))
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired),
+                         (0.0, True))
+
+        # Django still sees the last published generation. The saved body is
+        # the exact press -- neither this acceptance nor transport retry may
+        # silently acquire generation 2.
+        off = request_body(self.dj_a.pk, ATTEMPT_A, active=False, sequence=2,
+                           generation=prior_generation)
+        accepted, queued = self.queue_owner_gate(off, prior_generation)
+        self.assertEqual((accepted.status_code, len(queued)), (202, 1))
+        self.assertEqual(queued[0]["generation"], prior_generation)
+
+        self.assertEqual(self.engine._remote_dj_gate_command(queued[0]), "applied")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired,
+                          self.engine.manual_mode, session.gate_last_sequence),
+                         (0.0, False, False, 2))
+        self.assertTrue(self.engine._remote_dj_complete_recovery(
+            session, trigger="transport_connected"))
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired,
+                          self.engine.manual_mode), (0.0, False, False))
+
+        fresh = request_body(self.dj_a.pk, ATTEMPT_A, active=True, sequence=3,
+                             generation=session.gate_generation)
+        accepted, queued = self.queue_owner_gate(fresh, session.gate_generation)
+        self.assertEqual((accepted.status_code, len(queued)), (202, 1))
+        self.assertEqual(self.engine._remote_dj_gate_command(queued[0]), "applied")
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired),
+                         (1.0, True))
+
     def test_release_without_a_latch_is_refused(self):
         self.live()
         before = self.snapshot()

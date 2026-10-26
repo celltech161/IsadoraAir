@@ -154,6 +154,18 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
         self.press(page)
         self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1)])
 
+    def test_off_during_unpublished_recovery_generation_uses_the_observed_binding(self):
+        page = self.owner_page()
+        # The engine may already have advanced internally, but until its next
+        # status snapshot this is the only trusted binding the browser has.
+        self.poll_now(page, **self.connected_state(
+            remote_dj_live=True, generation=1))
+        self.press(page)
+        self.assertEqual(
+            self.gate_bodies(),
+            [self.expected_body(False, 1, generation=1)],
+        )
+
     def test_lost_response_is_retried_once_with_the_identical_body(self):
         page = self.owner_page()
         self.gate_aborts = 1
@@ -791,4 +803,3 @@ class RemoteDjAdminChromiumTests(_AdminControlCases, StaticLiveServerTestCase):
 @override_settings(SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False)
 class RemoteDjAdminFirefoxTests(_AdminControlCases, StaticLiveServerTestCase):
     BROWSER = "firefox"
-

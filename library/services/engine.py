@@ -12953,9 +12953,13 @@ class PlaybackEngine:
         engine's live session (remote_dj_gate_identity): same engine run,
         fresh, the active session's own attempt and user, a valid control
         proof, a newer sequence, and the user still holds remote_dj.mic_gate
-        under the real schedule policy. Anything else -- including the old
-        unbound {"active"} shape -- is refused before gate_desired, the
-        physical gate, ducking or Manual ownership is touched.
+        under the real schedule policy. PTT ON additionally requires the
+        live session's exact generation. OFF may carry an older generation
+        so a recovery advance cannot defeat a proven current owner's attempt
+        to silence this exact session; freshness, ordering, authorization and
+        every identity/proof check still apply. Anything else -- including
+        the old unbound {"active"} shape -- is refused before gate_desired,
+        the physical gate, ducking or Manual ownership is touched.
 
         Internal fail-safe muting (recovery, session stop, authorization
         revocation, shutdown) never comes through here and needs no browser
@@ -12987,7 +12991,10 @@ class PlaybackEngine:
         if not remote_dj_gate_identity.verify_command_proof(command):
             return self._remote_dj_gate_refused(None, command, "bad_proof")
         # From here the command is this session's own: outcomes are published.
-        if command["generation"] != getattr(session, "gate_generation", None):
+        # Generation grants authority to activate, never authority to keep
+        # audio live. Recovery can advance it before the owner sees status;
+        # allow only OFF to continue through the remaining safety checks.
+        if command["active"] and command["generation"] != getattr(session, "gate_generation", None):
             return self._remote_dj_gate_refused(session, command, "stale_generation")
         if command["issued_at_ms"] <= session.gate_mute_floor_ms:
             # Issued before the engine forced this mic off: never reopens it.
