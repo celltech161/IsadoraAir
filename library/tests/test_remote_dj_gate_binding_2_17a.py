@@ -614,8 +614,18 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
             self.assert_no_effect(outcome, before, "stale_command")
 
     def test_scheduled_access_expiry_refuses_both_directions(self):
+        """r0119: deterministic. The refused OFF makes the engine force the
+        mic off and set gate_mute_floor_ms = now. A later ON is then refused
+        by ONE of two safe checks, depending only on its issue time relative
+        to that floor (the floor check runs before re-authorization): issued
+        in the floor's millisecond or earlier -> superseded_by_mute; after it
+        -> not_authorized. r0118's version stamped the ON with the wall clock,
+        so which refusal it saw depended on whether both stamps fell in the
+        same millisecond. Both orderings are pinned here, each with zero
+        effect; the safety invariants are asserted directly."""
         session = self.connect(self.dj_a, ATTEMPT_A)
         self.send(self.dj_a, ATTEMPT_A, active=True, sequence=1)
+        self.assertEqual((self.engine.manual_mode, self.engine._manual_from_mic), (True, True))
         cfg = ScheduleAccessConfig.load()
         cfg.scheduled_enforcement_enabled = True          # no TalentAssignment window
         cfg.save()
@@ -624,18 +634,33 @@ class RemoteDjGateEngineTests(GateEngineHarness, TestCase):
         # (2.17A correction; test_remote_dj_mic_permission_expiry_2_17a).
         outcome, _ = self.send(self.dj_a, ATTEMPT_A, active=False, sequence=2)
         self.assertEqual(outcome, "refused:not_authorized")
+        floor = session.gate_mute_floor_ms
+        self.assertGreater(floor, 0)
         self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
-        self.assertFalse(self.engine.manual_mode)
-        # An ON is refused with no effect at all.
-        outcome, before = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3)
-        self.assert_no_effect(outcome, before, "not_authorized")
-        self.assertEqual(session.gate_last_sequence, 1)
+        self.assertFalse(self.engine.manual_mode)              # mic-owned Manual released
+        # An ON is refused with no effect at all, whichever check sees it first.
+        for issued_at_ms, reason in ((floor, "superseded_by_mute"), (floor + 1, "not_authorized")):
+            with self.subTest(issued_at_ms=issued_at_ms - floor):
+                outcome, before = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3,
+                                            issued_at_ms=issued_at_ms)
+                self.assert_no_effect(outcome, before, reason)
+                self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
+                self.assertFalse(self.engine.manual_mode)
+                self.assertEqual(session.gate_last_sequence, 1)
         # The revocation lifecycle itself (the existing authorization tick)
         # retires the session and mutes through the internal path.
         self.engine._remote_dj_authorization_tick()
         self.assertIsNone(self.engine.remote_dj_session)
         self.assertEqual(self.gate.get_property("volume"), 0.0)
         self.assertFalse(self.engine.manual_mode)
+        # A stale action for the retired session cannot touch its replacement.
+        cfg.scheduled_enforcement_enabled = False
+        cfg.save()
+        replacement = self.connect(self.dj_b, ATTEMPT_B)
+        stale_on = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=4)
+        before = self.snapshot()
+        self.assert_no_effect(self.engine._remote_dj_gate_command(stale_on), before, "not_current_session")
+        self.assertIs(self.engine.remote_dj_session, replacement)
 
     def test_no_session_or_ended_session(self):
         outcome, before = self.send(self.dj_a, ATTEMPT_A)
