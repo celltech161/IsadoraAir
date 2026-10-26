@@ -179,24 +179,26 @@
   }
   .ops-msg:empty { display: none; }
 
-  /* Roadmap 2.17A -- Station Administrator emergency controls for the
-     connected Remote DJ (full Console only; its own row, not the ops bar). */
-  .rdj-admin-bar {
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end;
-    gap: 0.5rem; margin: -0.35rem 0 0.75rem; font-size: 0.8rem;
+  /* r0119 -- the Remote DJ emergency controls live IN the Remote PTT and
+     Connect buttons (no separate row). Only their compact status line
+     remains: progress and the engine-confirmed outcome of an administrator
+     action, full Console only. */
+  .rdj-admin-msg {
+    text-align: right;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: -0.55rem 0 0.75rem;
   }
-  .rdj-admin-bar[hidden] { display: none; }
-  .rdj-admin-target { color: var(--text-muted); margin-right: auto; min-width: 0; overflow-wrap: anywhere; }
-  .rdj-admin-latched { color: var(--danger); font-weight: 700; }
-  .rdj-admin-btn {
-    border: 1px solid var(--danger); background: transparent; color: var(--danger);
-    border-radius: 6px; padding: 0.3rem 0.7rem; font-weight: 700; cursor: pointer;
-  }
-  .rdj-admin-btn.rdj-admin-mute { background: var(--danger); color: #fff; }
-  .rdj-admin-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .rdj-admin-btn[hidden] { display: none; }
-  .rdj-admin-msg { flex-basis: 100%; text-align: right; font-weight: 600; }
   .rdj-admin-msg:empty { display: none; }
+  /* PTT DISABLED: the station's Emergency Mute latch on this session. */
+  .ops-icon-btn[data-mic-state="disabled"] .ops-icon-chip { background: #7f1d1d; }
+  .ops-icon-btn[data-mic-state="disabled"] .ops-btn-label { color: var(--danger); }
+  /* An administrator's OFF-only Disable/Enable (Remote PTT) or Kick
+     (Connect): a dashed danger outline marks the administrative action. */
+  #remoteDjGateBtn.rdj-admin-mode,
+  #remoteDjConnectBtn.rdj-kick-mode { outline: 2px dashed var(--danger); outline-offset: -4px; }
+  #remoteDjConnectBtn.rdj-kick-mode .rdj-connect-action { color: var(--danger); }
 
   /* Line In (roadmap 2.23, D5): a reserved, permanently disabled control
      until roadmap 3.6 delivers the real LiveSource/Line Input path. It
@@ -1568,21 +1570,9 @@
 </div>
 <div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>
 {% if mode != 'remote_dj' %}{% if console_caps.rdj_emergency_mute or console_caps.rdj_force_disconnect %}
-{# Roadmap 2.17A: shown only while a Remote DJ is connected (renderRdjAdmin). #}
-<div class="rdj-admin-bar" id="rdjAdminBar" hidden>
-  <span class="rdj-admin-target" id="rdjAdminTarget"></span>
-  {% if console_caps.rdj_emergency_mute %}
-  <button type="button" class="rdj-admin-btn rdj-admin-mute" id="rdjEmergencyMuteBtn" disabled
-          title="Force the connected Remote DJ's microphone OFF and keep it off until released. Never opens a microphone.">Emergency Mute</button>
-  <button type="button" class="rdj-admin-btn" id="rdjReleaseMuteBtn" disabled hidden
-          title="Lift the emergency mute. The microphone stays OFF until the DJ turns it on.">Release Emergency Mute</button>
-  {% endif %}
-  {% if console_caps.rdj_force_disconnect %}
-  <button type="button" class="rdj-admin-btn" id="rdjKickBtn" disabled
-          title="Forcibly disconnect the connected Remote DJ.">Kick Remote DJ</button>
-  {% endif %}
-  <span class="rdj-admin-msg" id="rdjAdminMsg" role="status" aria-live="polite"></span>
-</div>
+{# r0119: the emergency controls are the Remote PTT and Connect buttons; this #}
+{# line reports an administrator action's progress and engine outcome.        #}
+<div class="rdj-admin-msg" id="rdjAdminMsg" role="status" aria-live="polite"></div>
 {% endif %}{% endif %}
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
@@ -2314,7 +2304,13 @@ async function toggleRemoteDjGate() {
     // clicks included): a page that isn't the verified owner, or lacks any
     // part of the session binding, sends nothing.
     const binding = rdjGateBinding(state);
-    if (!binding) return;
+    if (!binding) {
+      // r0119: not this page's own session -- an administrator page may
+      // only Disable/Enable Remote PTT (never open the microphone).
+      const admin = rdjAdminGateMode(state);
+      if (admin) await rdjAdminCommand(admin.action);
+      return;
+    }
     const desiredActive = !btn.classList.contains('active');
     // Roadmap 2.17A: one press = one sequence number, reused verbatim on the
     // retry below, so the engine applies it at most once and never after a
@@ -2612,7 +2608,15 @@ function rdjSetConnectPresentation(action, status, statusClass, ariaLabel) {
 }
 
 async function toggleRemoteDjConnect() {
+  // Own link first: Disconnect / Close stale link are purely local cleanup.
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
+  const live = window.__rdjLastEngineState || {};
+  if (live.remote_dj_connected) {
+    // Another browser holds the session: never start a connection here.
+    // r0119: an authorized administrator page Kicks it instead.
+    if (rdjAdminKickMode(live)) await rdjAdminCommand('kick');
+    return;
+  }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
   // connection -- tearing an existing one down (above) is a purely
   // local WebRTC/WebSocket cleanup with no engine round-trip, and
@@ -3097,11 +3101,16 @@ function renderRemoteDjConnect(data) {
   // ICE state remains nominally connected (the production media-loss
   // case).  Local DISCONNECTED remains a faster supplemental signal.
   const reconnecting = !!data.remote_dj_reconnecting || (weAreConnected && rdjReconnecting);
+  // r0119: an authorized administrator page holding no link of its own
+  // operates Kick through this button; never a page with any local link.
+  const kick = someoneElseConnected && link === 'none' ? rdjAdminKickMode(data) : null;
+  const kickBusy = rdjAdminPending('kick');
   // A 'stale' page keeps the button usable ONLY to close its own leftover
   // local link (toggleRemoteDjConnect -> rdjDisconnect, purely local).
-  btn.disabled = !data.remote_dj_configured || (someoneElseConnected && link !== 'stale');
+  btn.disabled = !data.remote_dj_configured || (someoneElseConnected && link !== 'stale' && (!kick || kickBusy));
   btn.classList.toggle('active', weAreConnected);
-  btn.classList.toggle('rdj-observing', someoneElseConnected && link !== 'stale');
+  btn.classList.toggle('rdj-observing', someoneElseConnected && link !== 'stale' && !kick);
+  btn.classList.toggle('rdj-kick-mode', !!kick);
   btn.classList.toggle('rdj-stale-link', link === 'stale');
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
   if (!data.remote_dj_configured) {
@@ -3142,11 +3151,15 @@ function renderRemoteDjConnect(data) {
     return;
   }
   const ident = rdjOwnerPresentation(data, weAreConnected, link);
-  btn.title = ident.title;
+  btn.title = kick
+    ? `Kick ${kick.name} (session ${kick.target_session.slice(0, 8)}): silence their microphone and end their connection now. Asks for confirmation.`
+    : ident.title;
+  const observerAction = kick ? (kickBusy ? 'Kicking…' : 'Kick Remote DJ') : ident.observerAction;
+  const observerAria = kick ? 'Kick Remote DJ — ' + ident.observerAria : ident.observerAria;
   if (reconnecting && (weAreConnected || someoneElseConnected)) {
     btn.classList.remove('pending');
-    const action = weAreConnected ? 'Disconnect' : ident.observerAction;
-    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : ident.observerAria;
+    const action = weAreConnected ? 'Disconnect' : observerAction;
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : observerAria;
     rdjSetConnectPresentation(
       action, 'Reconnecting…', 'reconnecting', ariaAction + ident.ariaDetail + ' — Reconnecting',
     );
@@ -3171,9 +3184,9 @@ function renderRemoteDjConnect(data) {
   };
   const presentedQuality = qualityPresentation[overall];
   if (weAreConnected || someoneElseConnected) {
-    btn.classList.remove('pending');
-    const action = weAreConnected ? 'Disconnect' : ident.observerAction;
-    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : ident.observerAria;
+    btn.classList.toggle('pending', kickBusy && !!kick);
+    const action = weAreConnected ? 'Disconnect' : observerAction;
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : observerAria;
     if (presentedQuality) {
       rdjSetConnectPresentation(
         action,
@@ -3197,6 +3210,8 @@ function renderRemoteDjConnect(data) {
   );
 }
 
+const RDJ_GATE_TITLE = 'Opens/closes the currently-connected remote DJ\'s mic into the on-air mix. Disabled when no remote DJ is connected.';
+
 function renderRemoteDjGate(data) {
   const btn = document.getElementById('remoteDjGateBtn');
   if (!btn) return;
@@ -3205,6 +3220,9 @@ function renderRemoteDjGate(data) {
   if (!isControlInFlight('remoteDjGateBtn')) btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.remote_dj_live);
   reconcileControlWarning('remoteDjGateBtn', !!data.remote_dj_live);
+  // r0119: administrator mode exists only for a connected target (below).
+  btn.classList.remove('rdj-admin-mode');
+  btn.title = RDJ_GATE_TITLE;
   if (!data.remote_dj_configured) {
     btn.disabled = true;
     setOpsMicButton(btn, 'unavailable', 'N/A', 'Remote Mic: not available (Remote DJ is not enabled)');
@@ -3222,23 +3240,38 @@ function renderRemoteDjGate(data) {
     // while the station holds an Emergency Mute on this session.
     const latched = !!(data.remote_dj_owner && data.remote_dj_owner.emergency_mute);
     const mayGate = rdjGateBinding(data) !== null;
-    btn.disabled = !mayGate;
-    if (mayGate) rdjReportGateResult(data);
-    const gateLabel = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
     const gateLink = rdjLocalLink(data);
-    const readOnlyWhy = latched
-      ? ' (muted by the station: Emergency Mute)'
-      : gateLink === 'unverified' || gateLink === 'owner'
-      ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
-      : gateLink === 'legacy'
-        ? ' (read-only: this engine version can\'t confirm connection ownership)'
-        : ' (read-only: another browser holds the connection)';
-    setOpsMicButton(
-      btn,
-      data.remote_dj_live ? 'on' : 'off',
-      data.remote_dj_live ? 'LIVE' : 'OFF',
-      mayGate ? gateLabel : gateLabel + readOnlyWhy,
-    );
+    // r0119: an administrator page holding no link of its own operates the
+    // OFF-only Disable/Enable through this same button.
+    const admin = mayGate ? null : rdjAdminGateMode(data);
+    const adminBusy = rdjAdminPending('gate');
+    btn.classList.toggle('rdj-admin-mode', !!admin);
+    if (adminBusy) btn.classList.add('pending');
+    if (mayGate) rdjReportGateResult(data);
+    const live = !!data.remote_dj_live;
+    const state = latched ? 'disabled' : live ? 'on' : 'off';
+    const word = latched ? 'PTT DISABLED' : live ? 'LIVE' : 'OFF';
+    const gateLabel = latched ? 'Remote Mic: PTT DISABLED by the station'
+      : live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
+    if (admin) {
+      btn.disabled = adminBusy;
+      btn.title = latched
+        ? `Remote PTT is disabled for ${admin.target.name}. Press to enable it; the microphone stays OFF until the DJ turns it on.`
+        : `Press to disable Remote PTT for ${admin.target.name}: the microphone is forced OFF and stays off until enabled.`;
+      setOpsMicButton(btn, state, word, latched
+        ? gateLabel + ' — press to enable Remote PTT (the microphone stays OFF)'
+        : gateLabel + ' — press to disable Remote PTT (Emergency Mute)');
+    } else {
+      btn.disabled = !mayGate;
+      const readOnlyWhy = latched
+        ? (gateLink === 'owner' ? ' — you cannot turn it on until the station enables it' : '')
+        : gateLink === 'unverified' || gateLink === 'owner'
+        ? ' (read-only: this browser\'s connection ownership is unconfirmed)'
+        : gateLink === 'legacy'
+          ? ' (read-only: this engine version can\'t confirm connection ownership)'
+          : ' (read-only: another browser holds the connection)';
+      setOpsMicButton(btn, state, word, mayGate ? gateLabel : gateLabel + readOnlyWhy);
+    }
   } else {
     // Calibration mode -- always clickable so the operator can (re)cal
     // even before connecting. Show the currently-persisted gain if any.
@@ -3258,14 +3291,20 @@ function renderRemoteDjGate(data) {
   }
 }
 
-// Roadmap 2.17A -- Station Administrator emergency controls. The target is
-// the session this page currently sees: its session reference (the owner
-// block's browser_key) plus the engine run, from ONE fresh, trusted
-// snapshot. No target, no command. Success is shown only from the engine's
-// own remote_dj_admin_result for this request, never from HTTP acceptance.
+// Roadmap 2.17A / r0119 -- Remote DJ emergency controls, operated through the
+// existing Remote PTT and Connect buttons (no separate row):
+//   Remote PTT -> OFF-only Disable (emergency_mute) / Enable (release_mute);
+//   Connect    -> Kick (kick).
+// Only a page holding NO Remote DJ link of its own (rdjLocalLink 'none', no
+// socket, not connecting) gets them, with the matching capability and a
+// verified target: the session reference (owner browser_key) plus the engine
+// run from ONE fresh, trusted snapshot. A page that owns the connection --
+// whatever the account's privileges -- keeps ordinary PTT and Disconnect; a
+// stale local link only ever closes itself. Success is shown only from the
+// engine's own remote_dj_admin_result for this request, never from HTTP 202.
 const RDJ_ADMIN_RESULT_TIMEOUT_MS = 10000;
 const rdjAdminUi = { pending: null, lastData: null };
-const RDJ_ADMIN_LABELS = { emergency_mute: 'Emergency Mute', release_mute: 'Release Emergency Mute',
+const RDJ_ADMIN_LABELS = { emergency_mute: 'Disable Remote PTT', release_mute: 'Enable Remote PTT',
                            kick: 'Kick' };
 const RDJ_ADMIN_REFUSALS = {
   stale_target: 'that Remote DJ session is no longer the live session',
@@ -3273,7 +3312,7 @@ const RDJ_ADMIN_REFUSALS = {
   engine_restarted: 'the engine restarted',
   stale_command: 'the request arrived too late',
   not_authorized: 'permission denied',
-  not_latched: 'no Emergency Mute is active',
+  not_latched: 'Remote PTT is not disabled',
   bad_signature: 'the command failed verification',
   malformed: 'the command was malformed',
 };
@@ -3292,6 +3331,34 @@ function rdjAdminTarget(data) {
   };
 }
 
+// This page holds no Remote DJ link of its own at all.
+function rdjPageHasNoLink(data) {
+  return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none';
+}
+
+// Remote PTT administrator mode: null, or {target, action}. The action is
+// decided by the engine-reported latch, never by the live/off state, so it
+// can only ever be emergency_mute (OFF + latch) or release_mute (latch off,
+// mic stays OFF). There is no administrator path that opens a microphone.
+function rdjAdminGateMode(data) {
+  if (!CAN_RDJ_MUTE || !rdjPageHasNoLink(data)) return null;
+  const target = rdjAdminTarget(data);
+  if (!target) return null;
+  return { target, action: target.latched ? 'release_mute' : 'emergency_mute' };
+}
+
+// Connect-button Kick mode: null, or the target.
+function rdjAdminKickMode(data) {
+  if (!CAN_RDJ_KICK || !rdjPageHasNoLink(data)) return null;
+  return rdjAdminTarget(data);
+}
+
+function rdjAdminPending(kind) {
+  const pending = rdjAdminUi.pending;
+  if (!pending) return false;
+  return kind === 'kick' ? pending.action === 'kick' : pending.action !== 'kick';
+}
+
 let rdjAdminMsgTimer = null;
 // A final outcome clears itself after a while; progress text stays until replaced.
 function rdjAdminShow(text, final = false) {
@@ -3301,7 +3368,7 @@ function rdjAdminShow(text, final = false) {
   msg.textContent = text;
   if (final) {
     rdjAdminMsgTimer = setTimeout(() => {
-      if (msg.textContent === text) { msg.textContent = ''; renderRdjAdmin(rdjAdminUi.lastData); }
+      if (msg.textContent === text) msg.textContent = '';
     }, RDJ_ADMIN_RESULT_TIMEOUT_MS);
   }
 }
@@ -3310,16 +3377,17 @@ function rdjAdminOutcomeText(action, outcome) {
   const label = RDJ_ADMIN_LABELS[action] || 'Remote DJ action';
   if (outcome === 'executed') {
     return action === 'kick' ? 'Kick: the Remote DJ was disconnected.'
-      : action === 'emergency_mute' ? 'Emergency Mute: the Remote DJ microphone is OFF and latched.'
-      : 'Emergency Mute released: the microphone stays OFF until the DJ turns it on.';
+      : action === 'emergency_mute' ? 'Remote PTT disabled: the Remote DJ microphone is OFF and latched.'
+      : 'Remote PTT enabled: the microphone stays OFF until the DJ turns it on.';
   }
   const reason = outcome === 'stale_target' ? 'stale_target' : String(outcome).replace(/^refused:/, '');
   return `${label} refused: ${RDJ_ADMIN_REFUSALS[reason] || reason}.`;
 }
 
-function renderRdjAdmin(data) {
-  const bar = document.getElementById('rdjAdminBar');
-  if (!bar) return;
+// Called by poll() BEFORE the Remote DJ buttons render: keeps the newest
+// snapshot and settles a pending administrator request from the engine's
+// own outcome for exactly that request id.
+function rdjAdminTrack(data) {
   rdjAdminUi.lastData = data;
   const pending = rdjAdminUi.pending;
   const result = data && data.remote_dj_admin_result;
@@ -3330,34 +3398,27 @@ function renderRdjAdmin(data) {
     rdjAdminUi.pending = null;
     rdjAdminShow(`${RDJ_ADMIN_LABELS[pending.action]}: no engine confirmation — outcome unconfirmed.`, true);
   }
-  const owner = data && data.remote_dj_connected ? data.remote_dj_owner : null;
-  const showBar = !!owner || !!rdjAdminUi.pending || document.getElementById('rdjAdminMsg').textContent !== '';
-  bar.hidden = !showBar;
-  const target = rdjAdminTarget(data);
-  const busy = !!rdjAdminUi.pending;
-  const label = document.getElementById('rdjAdminTarget');
-  label.textContent = target
-    ? `Remote DJ: ${target.name} · session ${target.target_session.slice(0, 8)}`
-    : (owner ? 'Remote DJ: status unconfirmed — controls unavailable' : 'No Remote DJ connected');
-  if (target && target.latched) {
-    const flag = document.createElement('span');
-    flag.className = 'rdj-admin-latched';
-    flag.textContent = ' · EMERGENCY MUTED';
-    label.appendChild(flag);
-  }
-  const mute = document.getElementById('rdjEmergencyMuteBtn');
-  const release = document.getElementById('rdjReleaseMuteBtn');
-  const kick = document.getElementById('rdjKickBtn');
-  if (mute) { mute.hidden = !!(target && target.latched); mute.disabled = !target || busy; }
-  if (release) { release.hidden = !(target && target.latched); release.disabled = !target || busy; }
-  if (kick) kick.disabled = !target || busy;
+}
+
+function rdjAdminRerender() {
+  const data = rdjAdminUi.lastData;
+  if (!data) return;
+  renderRemoteDjConnect(data);
+  renderRemoteDjGate(data);
 }
 
 async function rdjAdminCommand(action) {
   if (rdjAdminUi.pending) return;  // single flight
-  const allowed = action === 'kick' ? CAN_RDJ_KICK : CAN_RDJ_MUTE;
-  const target = rdjAdminTarget(rdjAdminUi.lastData);
-  if (!allowed || !target) return;
+  const data = rdjAdminUi.lastData;
+  // Re-derived at action time (keyboard/programmatic clicks included).
+  let target = null;
+  if (action === 'kick') {
+    target = rdjAdminKickMode(data);
+  } else {
+    const mode = rdjAdminGateMode(data);
+    target = mode && mode.action === action ? mode.target : null;
+  }
+  if (!target) return;
   if (action === 'kick' && !window.confirm(
       `Kick ${target.name} (session ${target.target_session.slice(0, 8)})? `
       + 'Their microphone is silenced and their connection is ended now.')) return;
@@ -3366,7 +3427,7 @@ async function rdjAdminCommand(action) {
   const pending = { action, requestId: null, acceptedAt: null };
   rdjAdminUi.pending = pending;
   rdjAdminShow(`${RDJ_ADMIN_LABELS[action]}: sending…`);
-  renderRdjAdmin(rdjAdminUi.lastData);
+  rdjAdminRerender();
   let outcome = await postEngineCommand('/api/engine/remote-dj-admin/', body);
   if (outcome.kind === 'unconfirmed') {
     // Lost response: the same press again (the engine executes it at most once).
@@ -3384,14 +3445,8 @@ async function rdjAdminCommand(action) {
       ? `${RDJ_ADMIN_LABELS[action]} refused: ${RDJ_ADMIN_REFUSALS[reason]}.`
       : `${RDJ_ADMIN_LABELS[action]} ${outcome.text}`, true);
   }
-  renderRdjAdmin(rdjAdminUi.lastData);
+  rdjAdminRerender();
   poll();
-}
-
-for (const [id, action] of [['rdjEmergencyMuteBtn', 'emergency_mute'], ['rdjReleaseMuteBtn', 'release_mute'],
-                            ['rdjKickBtn', 'kick']]) {
-  const btn = document.getElementById(id);
-  if (btn) btn.addEventListener('click', () => rdjAdminCommand(action));
 }
 
 async function toggleManualMode() {
@@ -4620,9 +4675,9 @@ async function poll() {
   renderStartNext(data);
   renderQueue(data);
   renderMicPtt(data);
+  rdjAdminTrack(data);
   renderRemoteDjConnect(data);
   renderRemoteDjGate(data);
-  renderRdjAdmin(data);
   renderManualMode(data);
   reconcileFxFires(data.fx_fires);
 }

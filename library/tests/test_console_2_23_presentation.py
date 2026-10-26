@@ -184,14 +184,24 @@ class ConsoleRenderedMarkupTests(TestCase):
         # row that follows is a separate control group.
         return content[content.index('<div class="playnow-bar">'):content.index('<div class="ops-msg"')]
 
-    def test_admin_emergency_controls_are_a_separate_row_on_the_full_console_only(self):
+    def test_r0119_emergency_controls_live_in_the_existing_remote_buttons(self):
+        # r0119: no dedicated Emergency Mute / Release / Kick buttons or row;
+        # the Remote PTT and Connect buttons carry them. The ops row keeps
+        # exactly its five buttons and only a compact status line follows.
         self.client.force_login(self.superuser)
         page = self.client.get("/").content.decode("utf-8")
-        admin = page[page.index('<div class="rdj-admin-bar"'):page.index('<audio id="remoteMonitorAudio"')]
-        self.assertGreater(page.index('<div class="rdj-admin-bar"'), page.index('<div class="ops-msg"'))
-        self.assertEqual(re.findall(r'<button[^>]*\bid="([A-Za-z]+Btn)"', admin),
-                         ["rdjEmergencyMuteBtn", "rdjReleaseMuteBtn", "rdjKickBtn"])
-        self.assertNotIn('id="rdjAdminBar"', self.client.get("/remote-dj/").content.decode("utf-8"))
+        for gone in ('id="rdjAdminBar"', 'id="rdjEmergencyMuteBtn"', 'id="rdjReleaseMuteBtn"',
+                     'id="rdjKickBtn"', 'id="rdjAdminTarget"', 'class="rdj-admin-bar"', 'rdj-admin-btn'):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, page)
+        after_ops = page[page.index('<div class="ops-msg"'):page.index('<audio id="remoteMonitorAudio"')]
+        self.assertEqual(re.findall(r"<button\b", after_ops), [])
+        self.assertIn('<div class="rdj-admin-msg" id="rdjAdminMsg" role="status" aria-live="polite"></div>',
+                      after_ops)
+        remote = self.client.get("/remote-dj/").content.decode("utf-8")
+        self.assertNotIn('id="rdjAdminMsg"', remote)              # talent surface: no admin status
+        for gone in ('id="rdjEmergencyMuteBtn"', 'id="rdjKickBtn"', 'id="rdjAdminBar"'):
+            self.assertNotIn(gone, remote)
 
     def test_full_console_ops_row_order(self):
         self.client.force_login(self.superuser)
@@ -470,12 +480,41 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         self.assertIn("btn.disabled = !mayGate;", gate)
         self.assertNotIn("!!rdjPc", gate)
         toggle = self._function("toggleRemoteDjGate")
-        self.assertIn("const binding = rdjGateBinding(state);\n    if (!binding) return;", toggle)
+        # r0119: without the owner binding, the only other path is the
+        # administrator's OFF-only Disable/Enable.
+        self.assertIn("const binding = rdjGateBinding(state);\n    if (!binding) {", toggle)
+        self.assertIn("const admin = rdjAdminGateMode(state);\n      if (admin) await rdjAdminCommand(admin.action);\n"
+                      "      return;\n    }", toggle)
         self.assertIn("if (!rdjMayGate(data) || !rdjAttemptId || !rdjControlKey) return null;",
                       self._function("rdjGateBinding"))
         may = self._function("rdjMayGate")
         self.assertIn("return rdjLocalLink(data) === 'owner';", may)
         self.assertIn("const thisBrowser = link === 'owner';", self._function("rdjOwnerPresentation"))
+
+    def test_r0119_administrator_paths_can_never_open_a_microphone(self):
+        gate_mode = self._function("rdjAdminGateMode")
+        self.assertIn("action: target.latched ? 'release_mute' : 'emergency_mute'", gate_mode)
+        for fn in ("rdjAdminGateMode", "rdjAdminKickMode", "rdjAdminCommand", "rdjPageHasNoLink"):
+            with self.subTest(fn=fn):
+                body = self._function(fn)
+                self.assertNotIn("remote-dj-gate", body)
+                self.assertNotIn("active: true", body)
+        # Ownership is browser-session ownership, never account identity.
+        self.assertIn("return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none';",
+                      self._function("rdjPageHasNoLink"))
+        # The owner path always wins; administrator mode only without a binding.
+        toggle = self._function("toggleRemoteDjGate")
+        self.assertLess(toggle.index("const binding = rdjGateBinding(state);"),
+                        toggle.index("rdjAdminGateMode(state)"))
+        # Own link (Disconnect / stale cleanup) is handled before Kick, and a
+        # page never starts a connection while another session is live.
+        connect = self._function("toggleRemoteDjConnect")
+        self.assertLess(connect.index("if (rdjPc || rdjWs) { rdjDisconnect(); return; }"),
+                        connect.index("rdjAdminKickMode(live)"))
+        self.assertLess(connect.index("if (live.remote_dj_connected) {"), connect.index("fetch('/api/remote-dj/token/'"))
+        # Results come only from the engine's outcome for this request.
+        track = self._function("rdjAdminTrack")
+        self.assertIn("result.request_id === pending.requestId", track)
 
     def test_no_raw_identifier_is_read_from_the_owner_block(self):
         for raw in ("remote_dj_owner.user_id", "remote_dj_owner.attempt_id", "owner.user_id", "owner.attempt_id"):

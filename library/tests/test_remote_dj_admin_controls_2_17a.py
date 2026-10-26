@@ -263,8 +263,12 @@ class AdminEndpointTests(TestCase):
                 client = Client()
                 client.force_login(user)
                 html = client.get("/").content.decode()
-                self.assertEqual('id="rdjEmergencyMuteBtn"' in html, can_mute)
-                self.assertEqual('id="rdjKickBtn"' in html, can_kick)
+                # r0119: no dedicated buttons; the Remote PTT / Connect
+                # buttons act on these per-capability flags.
+                self.assertNotIn('id="rdjEmergencyMuteBtn"', html)
+                self.assertNotIn('id="rdjKickBtn"', html)
+                caps = client.get("/").context["console_caps"]
+                self.assertEqual((caps["rdj_emergency_mute"], caps["rdj_force_disconnect"]), (can_mute, can_kick))
 
     def test_custom_nonstaff_role_is_authoritative_at_service_boundary(self):
         custom, _ = emergency_operator(
@@ -350,19 +354,38 @@ class AdminEndpointTests(TestCase):
                 self.assertEqual(owner["gate_forced"], "emergency_mute")
                 self.assertNotIn(ATTEMPT_A, json.dumps(data))
 
-    def test_console_renders_admin_controls_only_for_their_holders(self):
-        for user, mute, kick in ((self.admin, True, True), (self.su, True, True),
-                                 (self.operator, False, False)):
+    def test_console_flags_follow_each_grant_with_no_dedicated_buttons(self):
+        # r0119: the controls live in the Remote PTT / Connect buttons; the
+        # page carries per-capability flags and a status line, nothing else.
+        mute_only = emergency_operator("adm217a_mute_only", ["remote_dj.emergency_mute"])[0]
+        kick_only = emergency_operator("adm217a_kick_only", ["remote_dj.force_disconnect"])[0]
+        for user, mute, kick in ((self.admin, True, True), (self.su, True, True), (mute_only, True, False),
+                                 (kick_only, False, True), (self.operator, False, False)):
             with self.subTest(user=user.username):
                 client = Client()
                 client.force_login(user)
-                html = client.get("/").content.decode()
-                self.assertEqual('id="rdjEmergencyMuteBtn"' in html, mute)
-                self.assertEqual('id="rdjKickBtn"' in html, kick)
+                response = client.get("/")
+                caps = response.context["console_caps"]
+                self.assertEqual((caps["rdj_emergency_mute"], caps["rdj_force_disconnect"]), (mute, kick))
+                html = response.content.decode()
+                for gone in ('id="rdjEmergencyMuteBtn"', 'id="rdjReleaseMuteBtn"', 'id="rdjKickBtn"',
+                             'id="rdjAdminBar"'):
+                    self.assertNotIn(gone, html)
+                self.assertEqual('id="rdjAdminMsg"' in html, mute or kick)
         client = Client()
         client.force_login(self.su)
         remote_page = client.get("/remote-dj/").content.decode()     # talent surface: never
-        self.assertNotIn('id="rdjAdminBar"', remote_page)
+        self.assertNotIn('id="rdjAdminMsg"', remote_page)
+
+    def test_mute_only_and_kick_only_operators_are_isolated(self):
+        mute_only = emergency_operator("adm217a_mute_only2", ["remote_dj.emergency_mute"])[0]
+        kick_only = emergency_operator("adm217a_kick_only2", ["remote_dj.force_disconnect"])[0]
+        self.refused(self.post(mute_only, admin_request("kick", client_id="mute-only-kick")), 403)
+        for action in ("emergency_mute", "release_mute"):
+            self.refused(self.post(kick_only, admin_request(action, client_id=f"kick-only-{action[:4]}")), 403)
+        self.assertEqual(self.post(mute_only, admin_request("emergency_mute", client_id="mute-only-mute")).status_code,
+                         202)
+        self.assertEqual(self.post(kick_only, admin_request("kick", client_id="kick-only-kick")).status_code, 202)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +631,37 @@ class AdminEngineTests(GateEngineHarness, TestCase):
         before = self.snapshot()
         self.assertEqual(self.engine._remote_dj_admin_command(cmd), "refused:not_authorized")
         self.assertEqual(self.snapshot(), before)
+
+    def test_mute_only_cannot_kick_and_kick_only_cannot_disable_or_enable(self):
+        mute_only = emergency_operator("adm217a_eng_mute_only", ["remote_dj.emergency_mute"])[0]
+        kick_only = emergency_operator("adm217a_eng_kick_only", ["remote_dj.force_disconnect"])[0]
+        session = self.live()
+        before = self.snapshot()
+        self.assertEqual(self.engine._remote_dj_admin_command(
+            admin_command(mute_only, "kick", ATTEMPT_A, self.dj_a, client_id="iso-kick-001")), "refused:not_authorized")
+        for action in ("emergency_mute", "release_mute"):
+            self.assertEqual(self.engine._remote_dj_admin_command(
+                admin_command(kick_only, action, ATTEMPT_A, self.dj_a, client_id=f"iso-{action[:4]}-01")),
+                "refused:not_authorized")
+        self.assertEqual(self.snapshot(), before)
+        self.assertIs(self.engine.remote_dj_session, session)
+        self.assertEqual(self.engine._remote_dj_admin_command(
+            admin_command(mute_only, "emergency_mute", ATTEMPT_A, self.dj_a, client_id="iso-mute-ok")), "executed")
+        self.assertEqual(self.engine._remote_dj_admin_command(
+            admin_command(kick_only, "kick", ATTEMPT_A, self.dj_a, client_id="iso-kick-ok")), "executed")
+
+    def test_disable_while_off_latches_without_any_audio_change(self):
+        session = self.connect(self.dj_a, ATTEMPT_A)                    # connected, PTT OFF
+        before = self.snapshot()
+        self.assertEqual(self.run_admin("emergency_mute", client_id="off-latch-01"), "executed")
+        self.assertIsNotNone(session.emergency_latch)
+        self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
+        self.assertEqual(self.ramps, before["ramps"])                    # no duck/unduck at all
+        self.assertEqual((self.engine.manual_mode, self.engine._manual_from_mic),
+                         (before["manual"], before["manual_from_mic"]))
+        time.sleep(0.002)
+        outcome, unchanged = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=1)
+        self.assert_no_effect(outcome, unchanged, "emergency_muted")
 
     def test_studio_mic_and_operator_manual_are_unaffected(self):
         self.engine._set_manual_mode(True)

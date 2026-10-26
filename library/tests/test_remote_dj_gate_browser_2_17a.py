@@ -251,7 +251,11 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
     def test_emergency_mute_makes_the_djs_gate_read_only(self):
         page = self.owner_page()
         self.poll_now(page, **self.connected_state(emergency_mute=True))
-        self.assert_read_only_and_silent(page, "muted by the station")
+        # r0119: the owner's button clearly reads PTT DISABLED.
+        self.assertEqual(page.evaluate(
+            "() => [document.querySelector('#remoteDjGateBtn .ops-btn-label').textContent,"
+            " document.getElementById('remoteDjGateBtn').dataset.micState]"), ["PTT DISABLED", "disabled"])
+        self.assert_read_only_and_silent(page, "PTT DISABLED by the station")
 
     def test_engine_refusal_for_this_press_is_reported_once(self):
         page = self.owner_page()
@@ -264,159 +268,286 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
 
 
 class _AdminControlCases(_RemoteMicHarness):
-    """Roadmap 2.17A Role-granted emergency controls on the full Console."""
+    """r0119: the Remote DJ emergency controls operate through the existing
+    Remote PTT (OFF-only Disable/Enable) and Connect (Kick) buttons; there is
+    no dedicated row. Ownership is this browser's session, never the account."""
 
-    def admin_page(self, viewport=DESKTOP, **state):
+    DEDICATED = ("rdjAdminBar", "rdjEmergencyMuteBtn", "rdjReleaseMuteBtn", "rdjKickBtn", "rdjAdminTarget")
+
+    def admin_page(self, viewport=DESKTOP, user=None, **state):
         self.state = self.connected_state(current=False, **state)
-        page = self.open_console(self.superuser, viewport=viewport)
+        page = self.open_console(user or self.superuser, viewport=viewport)
         self.poll_now(page)
         return page
 
-    def admin_ui(self, page):
-        return page.evaluate("""() => {
-          const q = id => document.getElementById(id);
-          const b = id => q(id) ? {hidden: q(id).hidden, disabled: q(id).disabled} : null;
-          return {bar: q('rdjAdminBar') ? q('rdjAdminBar').hidden : null,
-                  target: q('rdjAdminTarget') ? q('rdjAdminTarget').textContent : null,
-                  msg: q('rdjAdminMsg') ? q('rdjAdminMsg').textContent : null,
-                  mute: b('rdjEmergencyMuteBtn'), release: b('rdjReleaseMuteBtn'), kick: b('rdjKickBtn')};
-        }""")
+    def ui(self, page):
+        return page.evaluate("""(dedicated) => {
+          const g = document.getElementById('remoteDjGateBtn');
+          const c = document.getElementById('remoteDjConnectBtn');
+          const a = document.getElementById('remoteDjConnectAction');
+          const m = document.getElementById('rdjAdminMsg');
+          return {
+            gate: {disabled: g.disabled, state: g.dataset.micState, word: g.querySelector('.ops-btn-label').textContent,
+                   aria: g.getAttribute('aria-label'), admin: g.classList.contains('rdj-admin-mode'),
+                   pending: g.classList.contains('pending')},
+            connect: {disabled: c.disabled, action: a.textContent,
+                      status: document.getElementById('remoteDjConnectStatus').textContent,
+                      aria: c.getAttribute('aria-label'), title: c.title, kick: c.classList.contains('rdj-kick-mode'),
+                      clipped: a.scrollWidth > a.clientWidth},
+            msg: m ? m.textContent : null,
+            dedicated: dedicated.filter(id => document.getElementById(id) !== null),
+          };
+        }""", list(self.DEDICATED))
 
     def admin_bodies(self):
         return [json.loads(body) for path, body in self.posts if path == ADMIN]
 
-    def click(self, page, selector):
-        page.locator(selector).click()
+    def other_posts(self):
+        return [path for path, _ in self.posts if path != ADMIN]
+
+    def settle(self, page):
         page.wait_for_function("() => rdjAdminUi.pending === null || rdjAdminUi.pending.requestId !== null")
 
-    def test_staff_controls_follow_independent_role_grants_after_page_refresh(self):
-        from django.contrib.auth import get_user_model
-        from django.contrib.auth.models import Group
-        from authz.models import Capability, GroupRole, Role, RoleCapability
+    def press_gate(self, page):
+        page.locator("#remoteDjGateBtn").click()
+        self.settle(page)
 
-        user = get_user_model().objects.create_user(
-            "rdj_browser_staff", password="x", is_staff=True
-        )
-        self.state = self.connected_state(current=False)
-        ungranted = self.open_console(user)
-        self.poll_now(ungranted)
-        self.assertIsNone(self.admin_ui(ungranted)["bar"])
-        self.assertEqual(
-            ungranted.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
-            [False, False],
-        )
+    def engine_result(self, page, action, outcome="executed", **state):
+        result = {"request_id": ADMIN_REQUEST_ID, "action": action, "outcome": outcome}
+        self.poll_now(page, **self.connected_state(current=False, remote_dj_admin_result=result, **state))
 
-        role = Role.objects.create(name="Browser Emergency Mute Only")
-        mute = Capability.objects.get(slug="remote_dj.emergency_mute")
-        kick = Capability.objects.get(slug="remote_dj.force_disconnect")
-        grant = RoleCapability.objects.create(role=role, capability=mute)
-        group = Group.objects.create(name="Browser Emergency Operators")
-        GroupRole.objects.create(group=group, role=role)
-        user.groups.add(group)
+    def expected(self, action):
+        return {"action": action, "target_session": self.browser_key(ATTEMPT), "engine_instance": INSTANCE}
 
-        mute_page = self.open_console(user)
-        self.poll_now(mute_page)
-        self.assertEqual(
-            mute_page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
-            [True, False],
-        )
-        self.assertIsNotNone(self.admin_ui(mute_page)["bar"])
+    def body_without_id(self, body):
+        self.assertRegex(body["client_request_id"], r"^[A-Za-z0-9-]{8,64}$")
+        return {k: v for k, v in body.items() if k != "client_request_id"}
 
-        grant.delete()
-        RoleCapability.objects.create(role=role, capability=kick)
-        kick_page = self.open_console(user)
-        self.poll_now(kick_page)
-        self.assertEqual(
-            kick_page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"),
-            [False, True],
-        )
-        self.assertIsNotNone(self.admin_ui(kick_page)["bar"])
-
-    def test_controls_target_the_observed_session_desktop_and_mobile(self):
+    # -- layout and routing ----------------------------------------------------------
+    def test_observing_admin_gets_disable_and_kick_in_the_existing_buttons(self):
         for name, viewport in (("desktop", DESKTOP), ("mobile", MOBILE_PORTRAIT)):
             with self.subTest(layout=name):
                 page = self.admin_page(viewport=viewport)
-                ui = self.admin_ui(page)
-                self.assertFalse(ui["bar"])
-                self.assertEqual(ui["target"], f"Remote DJ: Ann Air · session {self.browser_key(ATTEMPT)[:8]}")
-                self.assertEqual((ui["mute"], ui["release"], ui["kick"]),
-                                 ({"hidden": False, "disabled": False}, {"hidden": True, "disabled": False},
-                                  {"hidden": False, "disabled": False}))
+                ui = self.ui(page)
+                self.assertEqual(ui["dedicated"], [])
+                self.assertEqual((ui["gate"]["disabled"], ui["gate"]["state"], ui["gate"]["word"], ui["gate"]["admin"]),
+                                 (False, "off", "OFF", True))
+                self.assertIn("press to disable Remote PTT", ui["gate"]["aria"])
+                self.assertEqual((ui["connect"]["disabled"], ui["connect"]["action"], ui["connect"]["status"],
+                                  ui["connect"]["kick"]), (False, "Kick Remote DJ", "Other browser · Good", True))
+                self.assertFalse(ui["connect"]["clipped"])
+                self.assertIn(f"Kick Ann Air (session {self.browser_key(ATTEMPT)[:8]})", ui["connect"]["title"])
                 self.no_horizontal_overflow(page)
-                self.shot(page, f"rdj-admin-controls-{name}")
+                self.shot(page, f"r0119-admin-observer-{name}")
 
-    def test_emergency_mute_sends_the_exact_target_and_waits_for_the_engine(self):
+    def test_same_account_in_another_browser_gets_the_administrator_controls(self):
+        page = self.admin_page(**{})
+        self.poll_now(page, **self.connected_state(current=True))      # the owner is this very account
+        ui = self.ui(page)
+        self.assertTrue(ui["gate"]["admin"] and ui["connect"]["kick"])
+
+    def test_owner_browser_gets_ordinary_ptt_and_disconnect_even_as_superuser(self):
+        page = self.owner_page(user=self.superuser, path="/")
+        ui = self.ui(page)
+        self.assertEqual((ui["gate"]["admin"], ui["connect"]["kick"], ui["connect"]["action"]),
+                         (False, False, "Disconnect"))
+        self.press(page)
+        self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1)])     # the owner's own gate request
+        self.assertEqual(self.admin_bodies(), [])
+        # Latched by the station: PTT DISABLED, read-only, nothing sent.
+        self.posts.clear()
+        self.poll_now(page, **self.connected_state(emergency_mute=True))
+        ui = self.ui(page)
+        self.assertEqual((ui["gate"]["word"], ui["gate"]["state"], ui["gate"]["disabled"], ui["gate"]["admin"]),
+                         ("PTT DISABLED", "disabled", True, False))
+        self.assertIn("you cannot turn it on until the station enables it", ui["gate"]["aria"])
+        self.press(page)
+        page.locator("#remoteDjGateBtn").click(force=True)
+        self.assertEqual(self.posts, [])
+        self.shot(page, "r0119-owner-ptt-disabled")
+        # Own Disconnect stays local, never a Kick.
+        page.locator("#remoteDjConnectBtn").click()
+        self.assertEqual(self.posts, [])
+        self.assertIsNone(page.evaluate("() => rdjPc"))
+
+    # -- Disable / Enable --------------------------------------------------------------
+    def test_disable_while_live_sends_emergency_mute_and_waits_for_the_engine(self):
+        page = self.admin_page(remote_dj_live=True)
+        self.assertEqual(self.ui(page)["gate"]["word"], "LIVE")
+        self.press_gate(page)
+        self.assertEqual([self.body_without_id(b) for b in self.admin_bodies()], [self.expected("emergency_mute")])
+        self.assertEqual(self.gate_bodies(), [])
+        ui = self.ui(page)
+        self.assertIn("queued — waiting for the engine", ui["msg"])              # 202 is not executed
+        self.assertTrue(ui["gate"]["disabled"] and ui["gate"]["pending"])       # single flight
+        self.assertEqual(ui["gate"]["word"], "LIVE")                             # engine state unchanged yet
+        page.evaluate("async () => { await toggleRemoteDjGate(); await rdjAdminCommand('emergency_mute'); }")
+        self.assertEqual(len(self.admin_bodies()), 1)                            # repeated clicks: one command
+        self.engine_result(page, "emergency_mute", emergency_mute=True, remote_dj_live=False)
+        ui = self.ui(page)
+        self.assertIn("Remote PTT disabled: the Remote DJ microphone is OFF and latched", ui["msg"])
+        self.assertEqual((ui["gate"]["word"], ui["gate"]["state"], ui["gate"]["disabled"]),
+                         ("PTT DISABLED", "disabled", False))
+        self.assertIn("press to enable Remote PTT (the microphone stays OFF)", ui["gate"]["aria"])
+        self.shot(page, "r0119-admin-ptt-disabled")
+
+    def test_disable_while_off_latches_without_any_gate_request(self):
         page = self.admin_page()
-        self.click(page, "#rdjEmergencyMuteBtn")
-        bodies = self.admin_bodies()
-        self.assertEqual(len(bodies), 1)
-        self.assertEqual({k: v for k, v in bodies[0].items() if k != "client_request_id"},
-                         {"action": "emergency_mute", "target_session": self.browser_key(ATTEMPT),
-                          "engine_instance": INSTANCE})
-        self.assertRegex(bodies[0]["client_request_id"], r"^[A-Za-z0-9-]{8,64}$")
-        ui = self.admin_ui(page)
-        self.assertIn("queued — waiting for the engine", ui["msg"])        # accepted is not executed
-        self.assertTrue(ui["mute"]["disabled"])                             # single flight
-        result = {"request_id": ADMIN_REQUEST_ID, "action": "emergency_mute", "outcome": "executed"}
-        self.poll_now(page, **self.connected_state(current=False, emergency_mute=True,
-                                                   remote_dj_admin_result=result))
-        ui = self.admin_ui(page)
-        self.assertIn("microphone is OFF and latched", ui["msg"])
-        self.assertIn("EMERGENCY MUTED", ui["target"])
-        self.assertEqual((ui["mute"]["hidden"], ui["release"]["hidden"], ui["release"]["disabled"]),
-                         (True, False, False))
-        self.shot(page, "rdj-admin-emergency-muted")
+        self.press_gate(page)
+        self.assertEqual([self.body_without_id(b) for b in self.admin_bodies()], [self.expected("emergency_mute")])
+        self.assertEqual(self.other_posts(), [])
 
-    def test_release_and_engine_refusals_are_reported_from_engine_results(self):
+    def test_enable_releases_the_latch_and_never_opens_the_mic(self):
         page = self.admin_page(emergency_mute=True)
-        self.click(page, "#rdjReleaseMuteBtn")
-        self.assertEqual(self.admin_bodies()[0]["action"], "release_mute")
-        result = {"request_id": ADMIN_REQUEST_ID, "action": "release_mute", "outcome": "stale_target"}
-        self.poll_now(page, **self.connected_state(current=False, emergency_mute=True,
-                                                   remote_dj_admin_result=result))
-        self.assertIn("Release Emergency Mute refused: that Remote DJ session is no longer the live session",
-                      self.admin_ui(page)["msg"])
+        self.assertEqual(self.ui(page)["gate"]["word"], "PTT DISABLED")
+        self.press_gate(page)
+        self.assertEqual([self.body_without_id(b) for b in self.admin_bodies()], [self.expected("release_mute")])
+        self.engine_result(page, "release_mute")                                   # latch gone, mic OFF
+        ui = self.ui(page)
+        self.assertIn("Remote PTT enabled: the microphone stays OFF until the DJ turns it on", ui["msg"])
+        self.assertEqual((ui["gate"]["word"], ui["gate"]["admin"]), ("OFF", True))  # Disable available again
+        self.assertEqual(self.gate_bodies(), [])                                      # never a mic-ON request
+        self.assertNotIn("active", json.dumps(self.admin_bodies()))
 
-    def test_kick_requires_a_confirmation_naming_the_target(self):
+    def test_server_refusal_is_reported_on_the_status_line(self):
+        page = self.admin_page()
+        self.admin_reply = (409, {"error": "x", "reason": "stale_target"})
+        self.press_gate(page)
+        self.assertIn("Disable Remote PTT refused: that Remote DJ session is no longer the live session",
+                      self.ui(page)["msg"])
+        self.assertFalse(self.ui(page)["gate"]["disabled"])
+
+    # -- Kick ------------------------------------------------------------------------------
+    def test_kick_through_connect_requires_confirmation_and_never_connects(self):
         page = self.admin_page()
         messages = []
         page.once("dialog", lambda d: (messages.append(d.message), d.dismiss()))
-        page.locator("#rdjKickBtn").click()
+        page.locator("#remoteDjConnectBtn").click()
         page.wait_for_timeout(100)
-        self.assertEqual(self.admin_bodies(), [])
+        self.assertEqual(self.posts, [])                                            # cancelled: nothing sent
         self.assertIn(f"Kick Ann Air (session {self.browser_key(ATTEMPT)[:8]})", messages[0])
+        self.assertIsNone(page.evaluate("() => rdjWs"))                             # no connection attempt
         page.once("dialog", lambda d: d.accept())
-        self.click(page, "#rdjKickBtn")
-        self.assertEqual(self.admin_bodies()[0]["action"], "kick")
+        page.locator("#remoteDjConnectBtn").click()
+        self.settle(page)
+        self.assertEqual([self.body_without_id(b) for b in self.admin_bodies()], [self.expected("kick")])
+        self.assertEqual(self.other_posts(), [])                                    # no token request
+        ui = self.ui(page)
+        self.assertEqual((ui["connect"]["action"], ui["connect"]["disabled"]), ("Kicking…", True))
+        self.poll_now(page, **engine_state(remote_dj_admin_result={"request_id": ADMIN_REQUEST_ID, "action": "kick",
+                                                                   "outcome": "executed"}))
+        ui = self.ui(page)
+        self.assertIn("Kick: the Remote DJ was disconnected.", ui["msg"])
+        self.assertEqual((ui["connect"]["action"], ui["connect"]["kick"]), ("Connect", False))
+        self.assertEqual(ui["gate"]["state"], "calibrate")                          # no target, no admin mode
 
-    def test_server_refusal_is_shown(self):
+    def test_stale_local_link_only_closes_itself(self):
         page = self.admin_page()
-        self.admin_reply = (409, {"error": "x", "reason": "stale_target"})
-        self.click(page, "#rdjEmergencyMuteBtn")
-        self.assertIn("Emergency Mute refused: that Remote DJ session is no longer the live session",
-                      self.admin_ui(page)["msg"])
+        self.become_owner(page, attempt=OTHER_ATTEMPT)                              # leftover local link
+        self.poll_now(page)
+        ui = self.ui(page)
+        self.assertEqual((ui["connect"]["action"], ui["connect"]["kick"]), ("Close stale link", False))
+        self.assertEqual((ui["gate"]["admin"], ui["gate"]["disabled"]), (False, True))
+        page.locator("#remoteDjConnectBtn").click()
+        self.assertEqual(self.posts, [])                                            # local teardown only
+        self.assertIsNone(page.evaluate("() => rdjPc"))
 
-    def test_unverified_stale_or_absent_session_disables_the_controls(self):
+    # -- capability isolation -----------------------------------------------------------
+    def grant_user(self, username, slugs):
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Group
+        from authz.models import Capability, GroupRole, Role, RoleCapability
+        from library.models import GroupAccess
+
+        user = get_user_model().objects.create_user(username, password="x", is_staff=True)
+        role = Role.objects.create(name=f"{username} role")
+        for slug in slugs:
+            RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug=slug))
+        group = Group.objects.create(name=f"{username} group")
+        GroupRole.objects.create(group=group, role=role)
+        GroupAccess.objects.create(group=group, allowed_prefixes="/\n", landing_url="/")
+        user.groups.add(group)
+        return user
+
+    def test_capabilities_route_each_button_independently(self):
+        cases = (("r0119_none", (), False, False),
+                 ("r0119_mute", ("remote_dj.emergency_mute",), True, False),
+                 ("r0119_kick", ("remote_dj.force_disconnect",), False, True))
+        for username, slugs, can_mute, can_kick in cases:
+            with self.subTest(user=username):
+                self.posts.clear()
+                page = self.admin_page(user=self.grant_user(username, slugs))
+                ui = self.ui(page)
+                self.assertEqual(ui["dedicated"], [])
+                self.assertEqual((ui["gate"]["admin"], ui["gate"]["disabled"]), (can_mute, not can_mute))
+                self.assertEqual((ui["connect"]["kick"], ui["connect"]["disabled"]), (can_kick, not can_kick))
+                self.assertEqual(ui["msg"] is not None, can_mute or can_kick)
+                if not can_kick:
+                    self.assertNotEqual(ui["connect"]["action"], "Kick Remote DJ")
+                page.evaluate("""async () => { await toggleRemoteDjGate(); await rdjAdminCommand('emergency_mute');
+                                               await rdjAdminCommand('release_mute'); }""")
+                if not can_kick:
+                    page.evaluate("async () => { await rdjAdminCommand('kick'); }")
+                sent = [b["action"] for b in self.admin_bodies()]
+                self.assertEqual(sent, ["emergency_mute"] if can_mute else [])
+                self.assertEqual(self.gate_bodies(), [])
+
+    def test_staff_controls_follow_independent_role_grants_after_page_refresh(self):
+        # r0118: ordinary staff need real Role grants; r0119 routes them
+        # into the buttons. A refreshed page reflects grant changes.
+        from authz.models import Capability, RoleCapability
+
+        user = self.grant_user("rdj_browser_staff", ())
+        page = self.admin_page(user=user)
+        self.assertEqual(page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"), [False, False])
+        self.assertIsNone(self.ui(page)["msg"])
+        from authz.models import GroupRole
+        role = GroupRole.objects.get(group=user.groups.get()).role
+        grant = RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug="remote_dj.emergency_mute"))
+        page = self.admin_page(user=user)
+        self.assertEqual(page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"), [True, False])
+        self.assertTrue(self.ui(page)["gate"]["admin"])
+        grant.delete()
+        RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug="remote_dj.force_disconnect"))
+        page = self.admin_page(user=user)
+        self.assertEqual(page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"), [False, True])
+        ui = self.ui(page)
+        self.assertEqual((ui["gate"]["admin"], ui["connect"]["kick"]), (False, True))
+
+    # -- fail closed ---------------------------------------------------------------------
+    def test_unverified_stale_or_absent_session_offers_no_administrator_action(self):
         page = self.admin_page()
         self.poll_now(page, **{**self.connected_state(current=False), "state_revision": None})
-        ui = self.admin_ui(page)
-        self.assertTrue(ui["mute"]["disabled"] and ui["kick"]["disabled"])
-        self.assertIn("status unconfirmed", ui["target"])
+        ui = self.ui(page)
+        self.assertEqual((ui["gate"]["admin"], ui["gate"]["disabled"], ui["connect"]["kick"], ui["connect"]["disabled"]),
+                         (False, True, False, True))
+        page.evaluate("""async () => { await toggleRemoteDjGate(); await toggleRemoteDjConnect();
+                                       await rdjAdminCommand('emergency_mute'); await rdjAdminCommand('kick'); }""")
+        self.poll_now(page, **engine_state())                                       # nobody connected
+        ui = self.ui(page)
+        self.assertEqual((ui["gate"]["state"], ui["gate"]["admin"], ui["connect"]["action"], ui["connect"]["kick"]),
+                         ("calibrate", False, "Connect", False))
         page.evaluate("async () => { await rdjAdminCommand('emergency_mute'); await rdjAdminCommand('kick'); }")
-        self.poll_now(page, **engine_state())                               # nobody connected
-        self.assertTrue(self.admin_ui(page)["bar"])
+        self.poll_now(page, **self.connected_state(current=False))
         self.status_fails = True
         page.clock.run_for(3_500)
-        page.evaluate("async () => { await rdjAdminCommand('emergency_mute'); }")
-        self.assertEqual(self.admin_bodies(), [])
+        page.wait_for_function("() => document.getElementById('consoleRoot').classList.contains('connection-stale')")
+        page.evaluate("async () => { await toggleRemoteDjGate(); await rdjAdminCommand('kick'); }")
+        self.assertEqual(self.posts, [])
 
-    def test_remote_dj_talent_surface_has_no_admin_controls(self):
-        self.state = self.connected_state()
+    def test_remote_dj_talent_surface_gains_no_administrator_behavior(self):
+        self.state = self.connected_state(current=False)
         for user in (self.host, self.superuser):
             with self.subTest(user=user.username):
                 page = self.open_console(user, path="/remote-dj/")
-                self.assertIsNone(self.admin_ui(page)["bar"])
+                self.poll_now(page)
+                ui = self.ui(page)
                 self.assertEqual(page.evaluate("() => [CAN_RDJ_MUTE, CAN_RDJ_KICK]"), [False, False])
+                self.assertEqual((ui["msg"], ui["dedicated"], ui["gate"]["admin"], ui["connect"]["kick"]),
+                                 (None, [], False, False))
+                self.assertTrue(ui["gate"]["disabled"] and ui["connect"]["disabled"])
+                page.evaluate("async () => { await toggleRemoteDjGate(); await rdjAdminCommand('kick'); }")
+        self.assertEqual(self.posts, [])
 
 
 class _EndToEndCases(_RemoteMicHarness):
@@ -469,7 +600,7 @@ class _EndToEndCases(_RemoteMicHarness):
         self.state = self.connected_state(current=False)
         page = self.open_console(self.superuser)
         self.poll_now(page)
-        page.locator("#rdjEmergencyMuteBtn").click()
+        page.locator("#remoteDjGateBtn").click()                 # r0119: the Remote PTT button
         page.wait_for_function("() => rdjAdminUi.pending && rdjAdminUi.pending.requestId")
         self.assertEqual(len(self.queued), 1)
         queued = self.queued[0]
