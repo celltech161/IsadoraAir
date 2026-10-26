@@ -2308,7 +2308,7 @@ async function toggleRemoteDjGate() {
       // r0119: not this page's own session -- an administrator page may
       // only Disable/Enable Remote PTT (never open the microphone).
       const admin = rdjAdminGateMode(state);
-      if (admin) await rdjAdminCommand(admin.action);
+      if (admin && btn.dataset.adminAction === admin.action) await rdjAdminCommand(admin.action);
       return;
     }
     const desiredActive = !btn.classList.contains('active');
@@ -2317,12 +2317,17 @@ async function toggleRemoteDjGate() {
     // newer press.
     rdjGateSeq += 1;
     const body = { active: desiredActive, sequence: rdjGateSeq, ...binding };
+    const pressedAt = Date.now();
+    const latchesAtPress = rdjLatchesSeen;
     rdjGateSentSeq = rdjGateSeq;
     const id = beginControlCommand('remoteDjGateBtn');
     btn.classList.add('pending');
     let outcome = await postEngineCommand('/api/engine/remote-dj-gate/', body);
     if (outcome.kind === 'unconfirmed' && controlFb('remoteDjGateBtn').seq === id
-        && rdjGateStillBound(binding)) {
+        && rdjGateStillBound(binding)
+        // r0119 review F4: never resend a press once the station has latched
+        // this session since (a release must not revive it), nor a stale one.
+        && rdjLatchesSeen === latchesAtPress && Date.now() - pressedAt <= RDJ_GATE_RETRY_WINDOW_MS) {
       // Lost response, not a refusal: resend the SAME press once -- but only
       // while this page still holds that exact binding (a page that lost
       // ownership meanwhile sends nothing more).
@@ -2445,6 +2450,9 @@ async function rdjDeriveBrowserKey(attemptId) {
 // secret). Page memory only: never stored, logged, shown or sent anywhere but
 // the gate request; cleared with the connection.
 let rdjControlKey = null;
+// r0119 review F4: emergency-mute latches observed on this page's session.
+let rdjLatchesSeen = 0;
+const RDJ_GATE_RETRY_WINDOW_MS = 3000;
 let rdjKickedNotice = false;  // 2.17A: the server said this session was kicked
 let rdjGateSeq = 0;          // per-attempt press counter (the request's sequence)
 let rdjGateSentSeq = 0;      // newest sequence this page sent
@@ -2613,8 +2621,10 @@ async function toggleRemoteDjConnect() {
   const live = window.__rdjLastEngineState || {};
   if (live.remote_dj_connected) {
     // Another browser holds the session: never start a connection here.
-    // r0119: an authorized administrator page Kicks it instead.
-    if (rdjAdminKickMode(live)) await rdjAdminCommand('kick');
+    // r0119: an authorized administrator page Kicks it instead -- only
+    // when the button is actually showing Kick (review F1).
+    const btn = document.getElementById('remoteDjConnectBtn');
+    if (btn && btn.dataset.adminAction === 'kick' && rdjAdminKickMode(live)) await rdjAdminCommand('kick');
     return;
   }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
@@ -2849,6 +2859,8 @@ async function toggleRemoteDjConnect() {
 }
 
 function rdjDisconnect() {
+  // r0119 review F1: remember the snapshot this page's own link closed at.
+  rdjLinkClosedRevision = acceptedRevision ? { ...acceptedRevision } : { instance: null, seq: 0 };
   rdjReconnecting = false;
   rdjConnecting = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
@@ -2868,6 +2880,12 @@ function rdjDisconnect() {
   rdjSetConnectPresentation(
     'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
   );
+  // Reflect the closed link at once (never an administrator action: see
+  // rdjSeenSinceOwnClose), rather than waiting for the next status poll.
+  if (window.__rdjLastEngineState) {
+    renderRemoteDjConnect(window.__rdjLastEngineState);
+    renderRemoteDjGate(window.__rdjLastEngineState);
+  }
 }
 
 function rdjConnectFail(msg) {
@@ -3105,9 +3123,14 @@ function renderRemoteDjConnect(data) {
   // operates Kick through this button; never a page with any local link.
   const kick = someoneElseConnected && link === 'none' ? rdjAdminKickMode(data) : null;
   const kickBusy = rdjAdminPending('kick');
+  // r0119 review F1/F2: a click performs only the action this button is
+  // SHOWING; none while its transient error text is up or while any
+  // administrator request is in flight.
+  const kickShown = !!kick && !btn.classList.contains('error') && !rdjAdminUi.pending;
+  btn.dataset.adminAction = kickShown ? 'kick' : '';
   // A 'stale' page keeps the button usable ONLY to close its own leftover
   // local link (toggleRemoteDjConnect -> rdjDisconnect, purely local).
-  btn.disabled = !data.remote_dj_configured || (someoneElseConnected && link !== 'stale' && (!kick || kickBusy));
+  btn.disabled = !data.remote_dj_configured || (someoneElseConnected && link !== 'stale' && !kickShown);
   btn.classList.toggle('active', weAreConnected);
   btn.classList.toggle('rdj-observing', someoneElseConnected && link !== 'stale' && !kick);
   btn.classList.toggle('rdj-kick-mode', !!kick);
@@ -3222,6 +3245,7 @@ function renderRemoteDjGate(data) {
   reconcileControlWarning('remoteDjGateBtn', !!data.remote_dj_live);
   // r0119: administrator mode exists only for a connected target (below).
   btn.classList.remove('rdj-admin-mode');
+  btn.dataset.adminAction = '';
   btn.title = RDJ_GATE_TITLE;
   if (!data.remote_dj_configured) {
     btn.disabled = true;
@@ -3239,14 +3263,16 @@ function renderRemoteDjGate(data) {
     // Roadmap 2.17A: and only with the complete session binding, and never
     // while the station holds an Emergency Mute on this session.
     const latched = !!(data.remote_dj_owner && data.remote_dj_owner.emergency_mute);
+    if (latched) rdjLatchesSeen += 1;
     const mayGate = rdjGateBinding(data) !== null;
     const gateLink = rdjLocalLink(data);
     // r0119: an administrator page holding no link of its own operates the
     // OFF-only Disable/Enable through this same button.
     const admin = mayGate ? null : rdjAdminGateMode(data);
-    const adminBusy = rdjAdminPending('gate');
+    const adminBusy = !!rdjAdminUi.pending;     // review F2: any admin request in flight
     btn.classList.toggle('rdj-admin-mode', !!admin);
-    if (adminBusy) btn.classList.add('pending');
+    if (admin && rdjAdminPending('gate')) btn.classList.add('pending');
+    if (admin && !adminBusy) btn.dataset.adminAction = admin.action;   // what a click will do
     if (mayGate) rdjReportGateResult(data);
     const live = !!data.remote_dj_live;
     const state = latched ? 'disabled' : live ? 'on' : 'off';
@@ -3333,7 +3359,19 @@ function rdjAdminTarget(data) {
 
 // This page holds no Remote DJ link of its own at all.
 function rdjPageHasNoLink(data) {
-  return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none';
+  return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none' && rdjSeenSinceOwnClose();
+}
+
+// r0119 review F1: after this page closes its OWN link, no administrator
+// action is offered until a trusted engine snapshot strictly newer than that
+// moment arrives -- a Kick is only ever offered against a session the page
+// has observed as someone else's AFTER its own link was gone.
+let rdjLinkClosedRevision = null;
+function rdjSeenSinceOwnClose() {
+  const closed = rdjLinkClosedRevision;
+  if (closed === null) return true;
+  return !!acceptedRevision && latestSnapshotTrusted
+    && (acceptedRevision.instance !== closed.instance || acceptedRevision.seq > closed.seq);
 }
 
 // Remote PTT administrator mode: null, or {target, action}. The action is

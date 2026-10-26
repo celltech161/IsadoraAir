@@ -14,7 +14,6 @@ gate/ducking/Manual/recovery/teardown code, synthetic GStreamer volume gate
 (GateEngineHarness).
 """
 import datetime as dt
-import time
 from unittest import mock
 
 from django.test import TestCase
@@ -196,8 +195,9 @@ class MicPermissionExpiryTests(GateEngineHarness, TestCase):
         self.restore_mic_gate()
         self.tick()
         self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
-        time.sleep(0.002)                                                    # a press made after the mute
-        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=2)[0], "applied")
+        # A press made after the mute (explicit time, not a sleep).
+        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=2,
+                                   issued_at_ms=session.gate_mute_floor_ms + 1)[0], "applied")
         self.assertEqual(self.gate.get_property("volume"), 1.0)
         self.assertIsNone(session.gate_forced)
 

@@ -435,8 +435,9 @@ class AdminEngineTests(GateEngineHarness, TestCase):
     def test_dj_cannot_reopen_while_latched(self):
         session = self.live()
         self.run_admin("emergency_mute")
-        time.sleep(0.002)
-        outcome, before = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=2)
+        # Issued after the latch (explicit time, not a sleep).
+        outcome, before = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=2,
+                                    issued_at_ms=session.gate_mute_floor_ms + 1)
         self.assert_no_effect(outcome, before, "emergency_muted")
         self.assertEqual(session.gate_result["outcome"], "refused:emergency_muted")
         self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=False, sequence=3)[0], "applied")   # OFF is fine
@@ -453,16 +454,16 @@ class AdminEngineTests(GateEngineHarness, TestCase):
     def test_release_lifts_the_latch_but_never_opens_the_mic(self):
         session = self.live()
         self.run_admin("emergency_mute", client_id="mute-press-01")
-        latched_on = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=2)   # pressed while latched
-        time.sleep(0.002)
+        latched_on = command(self.dj_a.pk, ATTEMPT_A, active=True, sequence=2,   # pressed while latched
+                             issued_at_ms=session.gate_mute_floor_ms)
         self.assertEqual(self.run_admin("release_mute", client_id="release-press1"), "executed")
         self.assertIsNone(session.emergency_latch)
         self.assertNotIn("emergency_mute", self.engine._remote_dj_owner_state())   # normal shape again
         self.assertEqual((self.gate.get_property("volume"), session.gate_desired), (0.0, False))
         before = self.snapshot()
         self.assert_no_effect(self.engine._remote_dj_gate_command(latched_on), before, "superseded_by_mute")
-        time.sleep(0.002)
-        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3)[0], "applied")   # fresh press
+        self.assertEqual(self.send(self.dj_a, ATTEMPT_A, active=True, sequence=3,                    # fresh press
+                                   issued_at_ms=session.gate_mute_floor_ms + 1)[0], "applied")
         self.assertEqual(self.gate.get_property("volume"), 1.0)
 
     def test_release_without_a_latch_is_refused(self):
@@ -659,8 +660,8 @@ class AdminEngineTests(GateEngineHarness, TestCase):
         self.assertEqual(self.ramps, before["ramps"])                    # no duck/unduck at all
         self.assertEqual((self.engine.manual_mode, self.engine._manual_from_mic),
                          (before["manual"], before["manual_from_mic"]))
-        time.sleep(0.002)
-        outcome, unchanged = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=1)
+        outcome, unchanged = self.send(self.dj_a, ATTEMPT_A, active=True, sequence=1,
+                                       issued_at_ms=session.gate_mute_floor_ms + 1)
         self.assert_no_effect(outcome, unchanged, "emergency_muted")
 
     def test_studio_mic_and_operator_manual_are_unaffected(self):

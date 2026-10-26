@@ -182,6 +182,23 @@ class _RemoteMicBindingCases(_RemoteMicHarness):
         self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1)])
         self.assertIn("outcome unconfirmed", self.gate_ui(page)["msg"])
 
+    def test_review_f4_no_owner_retry_once_a_latch_was_seen_since_the_press(self):
+        page = self.owner_page()
+        page.evaluate("""() => {
+          const realFetch = window.fetch.bind(window);
+          window.fetch = (url, opts) => {
+            if (!opts || opts.method !== 'POST') return realFetch(url, opts);
+            // While the press is in flight the station latches, then releases.
+            const s = window.__rdjLastEngineState;
+            renderRemoteDjGate({...s, remote_dj_owner: {...s.remote_dj_owner, emergency_mute: true}});
+            renderRemoteDjGate(s);
+            return realFetch(url, opts).then(() => { throw new TypeError('network'); });
+          };
+        }""")
+        self.press(page)
+        self.assertEqual(self.gate_bodies(), [self.expected_body(True, 1)])       # the original only, no retry
+        self.assertIn("outcome unconfirmed", self.gate_ui(page)["msg"])
+
     # -- fail closed in the page ---------------------------------------------
     def assert_read_only_and_silent(self, page, why=None):
         ui = self.gate_ui(page)
@@ -451,6 +468,45 @@ class _AdminControlCases(_RemoteMicHarness):
         page.locator("#remoteDjConnectBtn").click()
         self.assertEqual(self.posts, [])                                            # local teardown only
         self.assertIsNone(page.evaluate("() => rdjPc"))
+
+    def test_review_f1_closing_its_own_link_never_turns_a_press_into_kick(self):
+        # Double press on "Close stale link": the first closes the local link;
+        # the second must not reach Kick (no newer trusted snapshot yet).
+        page = self.admin_page()
+        self.become_owner(page, attempt=OTHER_ATTEMPT)
+        self.poll_now(page)
+        self.assertEqual(self.ui(page)["connect"]["action"], "Close stale link")
+        dialogs = []
+        page.on("dialog", lambda d: (dialogs.append(d.message), d.dismiss()))
+        page.locator("#remoteDjConnectBtn").dblclick(force=True)
+        page.evaluate("async () => { await toggleRemoteDjConnect(); await toggleRemoteDjConnect(); }")
+        ui = self.ui(page)
+        self.assertEqual((ui["connect"]["kick"], ui["connect"]["disabled"], ui["gate"]["admin"]), (False, True, False))
+        self.assertEqual((self.posts, dialogs), ([], []))
+        # The local socket's close then flashes an error: still nothing.
+        page.evaluate("() => rdjConnectFail('Closed (1006)')")
+        page.evaluate("async () => { await toggleRemoteDjConnect(); }")
+        ui = self.ui(page)
+        self.assertTrue(ui["connect"]["disabled"])
+        self.assertEqual((self.posts, dialogs), ([], []))
+        # Only a newer trusted snapshot, seen AFTER the close, offers Kick.
+        page.clock.run_for(3_100)                                                   # error text expires
+        self.poll_now(page)
+        ui = self.ui(page)
+        self.assertEqual((ui["connect"]["action"], ui["connect"]["kick"], ui["gate"]["admin"]),
+                         ("Kick Remote DJ", True, True))
+
+    def test_review_f2_any_pending_admin_request_blocks_the_other_button(self):
+        page = self.admin_page()
+        dialogs = []
+        page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+        self.press_gate(page)                                                       # Disable pending
+        ui = self.ui(page)
+        self.assertTrue(ui["connect"]["disabled"])
+        self.assertNotEqual(ui["connect"]["action"], "Kicking…")
+        page.evaluate("async () => { await toggleRemoteDjConnect(); await rdjAdminCommand('kick'); }")
+        self.assertEqual([b["action"] for b in self.admin_bodies()], ["emergency_mute"])
+        self.assertEqual(dialogs, [])
 
     # -- capability isolation -----------------------------------------------------------
     def grant_user(self, username, slugs):

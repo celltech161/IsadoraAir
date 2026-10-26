@@ -483,7 +483,9 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         # r0119: without the owner binding, the only other path is the
         # administrator's OFF-only Disable/Enable.
         self.assertIn("const binding = rdjGateBinding(state);\n    if (!binding) {", toggle)
-        self.assertIn("const admin = rdjAdminGateMode(state);\n      if (admin) await rdjAdminCommand(admin.action);\n"
+        # ...and only the action the button is SHOWING (r0119 review F1/F3).
+        self.assertIn("const admin = rdjAdminGateMode(state);\n"
+                      "      if (admin && btn.dataset.adminAction === admin.action) await rdjAdminCommand(admin.action);\n"
                       "      return;\n    }", toggle)
         self.assertIn("if (!rdjMayGate(data) || !rdjAttemptId || !rdjControlKey) return null;",
                       self._function("rdjGateBinding"))
@@ -500,8 +502,15 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
                 self.assertNotIn("remote-dj-gate", body)
                 self.assertNotIn("active: true", body)
         # Ownership is browser-session ownership, never account identity.
-        self.assertIn("return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none';",
+        self.assertIn("return !rdjPc && !rdjWs && !rdjConnecting && rdjLocalLink(data) === 'none' && rdjSeenSinceOwnClose();",
                       self._function("rdjPageHasNoLink"))
+        # r0119 review F1: after this page's own close, a strictly newer
+        # trusted snapshot is required before any administrator action.
+        self.assertIn("rdjLinkClosedRevision = acceptedRevision ? { ...acceptedRevision } : { instance: null, seq: 0 };",
+                      self._function("rdjDisconnect"))
+        self.assertIn("(acceptedRevision.instance !== closed.instance || acceptedRevision.seq > closed.seq)",
+                      self._function("rdjSeenSinceOwnClose"))
+        self.assertIn("btn.dataset.adminAction === 'kick' && rdjAdminKickMode(live)", self._function("toggleRemoteDjConnect"))
         # The owner path always wins; administrator mode only without a binding.
         toggle = self._function("toggleRemoteDjGate")
         self.assertLess(toggle.index("const binding = rdjGateBinding(state);"),
@@ -527,7 +536,10 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         # Exactly one same-body retry, only for a lost response.
         self.assertEqual(toggle.count("postEngineCommand('/api/engine/remote-dj-gate/', body)"), 2)
         self.assertIn("if (outcome.kind === 'unconfirmed' && controlFb('remoteDjGateBtn').seq === id\n"
-                      "        && rdjGateStillBound(binding)) {", toggle)
+                      "        && rdjGateStillBound(binding)\n", toggle)
+        # r0119 review F4: bounded in time and void once a latch was seen.
+        self.assertIn("&& rdjLatchesSeen === latchesAtPress && Date.now() - pressedAt <= RDJ_GATE_RETRY_WINDOW_MS) {",
+                      toggle)
         self.assertNotIn("{ active: desiredActive })", toggle)
         binding = self._function("rdjGateBinding")
         self.assertIn("return { attempt_id: rdjAttemptId, control_key: rdjControlKey, engine_instance: instance };",
