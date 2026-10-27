@@ -1025,12 +1025,16 @@ class LogItem(models.Model):
     ORIGIN_LIVE_FILL = "live_fill"
     ORIGIN_OPERATOR_INSERTED = "operator_inserted"
     ORIGIN_ENGINE_INSERTED = "engine_inserted"
+    # Roadmap 2.27 Phase C: a guarded hour-refill install. Never
+    # generated_schedule, so it can never itself become an Eject cause.
+    ORIGIN_REFILL_INSTALLED = "refill_installed"
     ORIGIN_CHOICES = [
         (ORIGIN_GENERATED_SCHEDULE, "Generated schedule"),
         (ORIGIN_GENERATED_FILL, "Build-time fill"),
         (ORIGIN_LIVE_FILL, "Live fill"),
         (ORIGIN_OPERATOR_INSERTED, "Operator inserted"),
         (ORIGIN_ENGINE_INSERTED, "Engine inserted (urgent, native, dedication intro)"),
+        (ORIGIN_REFILL_INSTALLED, "Hour-refill install (2.27)"),
     ]
     origin = models.CharField(max_length=24, choices=ORIGIN_CHOICES, null=True, blank=True, editable=False)
 
@@ -1341,6 +1345,62 @@ class HourRefillCause(models.Model):
     def save(self, *args, **kwargs):
         if not self._state.adding:
             raise ValueError("HourRefillCause is append-only evidence; rows are never updated")
+        super().save(*args, **kwargs)
+
+
+class HourRefillInstall(models.Model):
+    """Append-only ledger of committed roadmap 2.27 Phase C installs. Its
+    unique install_key (log + canonical qualified cause set) is what stops
+    a retry, a concurrent worker or a restart from installing the same
+    refill twice. Like HourRefillCause it has no foreign keys. The LogItem
+    rows remain the playback authority; a ledger row means committed, never
+    aired. No listener data."""
+
+    STATE_COMMITTED = "committed"
+    STATE_CHOICES = [(STATE_COMMITTED, "Committed (rows written; not proof of air)")]
+    PLACEMENT_TAIL_APPEND = "tail_append"
+    PLACEMENT_INSERT_BEFORE = "insert_before"
+    PLACEMENT_CHOICES = [
+        (PLACEMENT_TAIL_APPEND, "Tail append after the final music row"),
+        (PLACEMENT_INSERT_BEFORE, "Insert before the protected closing block"),
+    ]
+
+    install_key = models.CharField(max_length=128, unique=True)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default=STATE_COMMITTED)
+    committed_at = models.DateTimeField(auto_now_add=True)
+    playlist_log_id_snapshot = models.BigIntegerField()
+    log_date = models.DateField()
+    log_hour = models.PositiveSmallIntegerField()
+    cause_ids = models.JSONField(default=list)
+    placement_mode = models.CharField(max_length=16, choices=PLACEMENT_CHOICES)
+    anchor_log_item_id = models.BigIntegerField(null=True, blank=True)
+    installed_log_item_ids = models.JSONField(default=list)
+    track_ids = models.JSONField(default=list)
+    net_before_seconds = models.FloatField()
+    residual_after_seconds = models.FloatField()
+    safety_budget_seconds = models.FloatField()
+    engine_instance = models.CharField(max_length=64, blank=True, default="")
+    snapshot_digest = models.CharField(max_length=64)
+
+    class Meta:
+        ordering = ["committed_at", "id"]
+        indexes = [models.Index(fields=["playlist_log_id_snapshot"], name="hour_refill_install_log")]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(state="committed"), name="hour_refill_install_state"),
+            models.CheckConstraint(
+                condition=models.Q(placement_mode__in=["tail_append", "insert_before"]),
+                name="hour_refill_install_placement",
+            ),
+            models.CheckConstraint(condition=models.Q(safety_budget_seconds__gt=0),
+                                   name="hour_refill_install_positive_budget"),
+        ]
+
+    def __str__(self):
+        return f"{self.install_key} ({self.placement_mode})"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValueError("HourRefillInstall is an append-only ledger; rows are never updated")
         super().save(*args, **kwargs)
 
 
