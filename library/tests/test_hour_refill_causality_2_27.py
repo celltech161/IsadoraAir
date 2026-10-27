@@ -353,8 +353,11 @@ class OffParityStructureTests(SimpleTestCase):
 
         source = (REPO / "library/services/engine.py").read_text()
         names = set(re.findall(r"\b\w*(?:hour_refill|HourRefill)\w*\b", source, flags=re.IGNORECASE))
+        # Phase C adds only the memory-only RefillCoordinator import
+        # (hour_refill_install); the engine never calls the installer.
         self.assertEqual(names, {"hour_refill_causality", "hour_refill_evidence",
-                                 "HourRefillEvidenceRecorder", "_hour_refill_evidence"})
+                                 "HourRefillEvidenceRecorder", "_hour_refill_evidence",
+                                 "hour_refill_install"})
         self.assertNotIn("HourRefillCause", source)
         self.assertNotIn("HourRefillPolicy", source)
 

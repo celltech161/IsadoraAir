@@ -69,6 +69,7 @@ from library.services import remote_dj_gate_identity
 from library.services import remote_dj_admin_identity
 from library.services.hour_refill_causality import eject_evidence_from_engine
 from library.services.hour_refill_evidence import HourRefillEvidenceRecorder
+from library.services.hour_refill_install import RefillCoordinator
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -1875,6 +1876,9 @@ class PlaybackEngine:
         self._media_validation_worker = MediaValidationWorker()
         # Roadmap 2.27 Phase A: the only owner of refill-evidence DB writes.
         self._hour_refill_evidence = HourRefillEvidenceRecorder()
+        # 2.27 Phase C: single-flight arbitration between a causal refill
+        # install and ordinary live fill (memory only, under self._lock).
+        self._refill_coordinator = RefillCoordinator()
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
@@ -6256,6 +6260,11 @@ class PlaybackEngine:
                 return False
             if not self.current_log or not self.log_items:
                 return False
+            # 2.27 Phase C: never dispatch while a causal refill owns this
+            # engine or its committed rows are not reloaded yet.
+            coordinator = getattr(self, "_refill_coordinator", None)
+            if coordinator is not None and coordinator.blocks_legacy(self.current_log.id, self.log_items):
+                return False
             self._live_fill_in_progress = True
             self._live_fill_generation += 1
             generation = self._live_fill_generation
@@ -6356,6 +6365,13 @@ class PlaybackEngine:
             if not new_picks:
                 return
             if self.running:  # don't schedule queue mutations mid-teardown
+                # 2.27 Phase C: the install stays "pending" from here until
+                # the callback runs, so a causal refill cannot slip in
+                # between this worker ending and its install.
+                coordinator = getattr(self, "_refill_coordinator", None)
+                if coordinator is not None:
+                    with self._lock:
+                        coordinator.legacy_callback_pending = True
                 GLib.idle_add(self._install_live_fill, log_id, generation, new_picks, original_count, start_position)
         except Exception as exc:
             print(f"  Live-fill worker crashed (non-fatal): {exc}")
@@ -6372,6 +6388,25 @@ class PlaybackEngine:
 
     @_glib_safe(default_return=False)
     def _install_live_fill(self, log_id, generation, new_picks, expected_prior_count, start_position):
+        """2.27 Phase C arbitration wrapper (memory only): discard while a
+        causal refill's committed rows await reload, and always clear the
+        pending-callback mark."""
+        coordinator = getattr(self, "_refill_coordinator", None)
+        try:
+            if coordinator is not None:
+                with self._lock:
+                    if coordinator.blocks_legacy(log_id, self.log_items):
+                        coordinator.legacy_discards += 1
+                        return False
+            return self._install_live_fill_checked(
+                log_id, generation, new_picks, expected_prior_count, start_position,
+            )
+        finally:
+            if coordinator is not None:
+                with self._lock:
+                    coordinator.legacy_callback_pending = False
+
+    def _install_live_fill_checked(self, log_id, generation, new_picks, expected_prior_count, start_position):
         """One-shot GLib.idle_add callback -- runs on the main thread,
         so it's safe to touch engine state here, and is the ONLY place
         a live-fill proposal is allowed to touch the database. A stale
