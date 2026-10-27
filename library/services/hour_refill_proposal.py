@@ -640,7 +640,7 @@ class RefillProposal:
         if p is not None:
             projection = {
                 "outcome": p.outcome, "reasons": list(p.reasons), "snapshot_digest": p.snapshot_digest,
-                "captured_at": p.captured_at.isoformat(), "active_log_id": p.active_log_id,
+                "captured_at": timezone.localtime(p.captured_at).isoformat(), "active_log_id": p.active_log_id,
                 "active_log_date": str(p.active_log_date) if p.active_log_date else None,
                 "active_log_hour": p.active_log_hour,
                 "boundary": p.boundary.as_dict() if p.boundary else None,
@@ -672,7 +672,7 @@ class RefillProposal:
                                   "provenance": list(s.provenance), "status": s.status}
                                  for s in self.category_sources],
             "selection": dict(self.selection), "request_digest": self.request_digest,
-            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "expires_at": timezone.localtime(self.expires_at).isoformat() if self.expires_at else None,
             "uncertainty": list(self.uncertainty), "notes": list(self.notes),
         }
 
@@ -770,7 +770,7 @@ def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None):
                  "evaluations": fit.evaluations, "search_truncated": fit.truncated,
                  "media_unavailable_track_ids": sorted(unavailable), "media_checks": len(media_cache),
                  "media_retry_exhausted": exhausted,
-                 "freshness": {"recency_basis_at": snapshot.captured_at.isoformat(),
+                 "freshness": {"recency_basis_at": timezone.localtime(snapshot.captured_at).isoformat(),
                                "media_checked": "winners only, at proposal time",
                                "snapshot_digest": projection.snapshot_digest},
                  "ranking": "zero overrun; smallest residual; original-cause category; fewer tracks; "

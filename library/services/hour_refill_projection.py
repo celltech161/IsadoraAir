@@ -401,7 +401,7 @@ class BoundaryProof:
 
     def as_dict(self):
         return {
-            "kind": self.kind, "instant": self.instant.isoformat() if self.instant else None,
+            "kind": self.kind, "instant": timezone.localtime(self.instant).isoformat() if self.instant else None,
             "source": self.source, "target_date": str(self.target_date) if self.target_date else None,
             "target_hour": self.target_hour, "next_log_id": self.next_log_id,
             "handoff": self.handoff, "reason": self.reason,

@@ -396,6 +396,7 @@ class RepresentativeDryRunTests(RefillFixtures, TestCase):
         self.assertEqual(p.net_before_seconds, 309.5)
         self.assertEqual(p.status, svc.STATUS_PROPOSED)
         self.assertEqual(p.residual_after_seconds, 0.0)
+        self.assertEqual(p.as_dict()["projection"]["boundary"]["instant"], "2027-06-01T14:20:00-05:00")
 
 
 class CandidateEligibilityTests(RefillFixtures, TestCase):
