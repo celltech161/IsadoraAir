@@ -263,7 +263,10 @@ class Command(BaseCommand):
             if not _is_dead_slot(item)
         ]
         for item in fulfillment_candidates:
-            maybe_schedule_song_request(item)
+            # Phase A evidence capture is confined to this non-realtime
+            # reconciler. The engine's last-second playback path intentionally
+            # leaves maybe_schedule_song_request's default False untouched.
+            maybe_schedule_song_request(item, capture_refill_evidence=True)
 
         # Re-check: the proactive pass above may have just scheduled
         # some of these.

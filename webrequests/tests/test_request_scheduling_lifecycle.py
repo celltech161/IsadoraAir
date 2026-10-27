@@ -488,7 +488,11 @@ class DriftedScheduledTimeCandidateTests(WebRequestFixtureMixin, TransactionTest
 
         with patch.object(refresh_module.timezone, "now", return_value=fake_now), \
              patch.object(refresh_module.timezone, "localtime", return_value=fake_now), \
-             patch.object(refresh_module, "maybe_schedule_song_request", lambda log_item: log_item):
+             patch.object(
+                 refresh_module,
+                 "maybe_schedule_song_request",
+                 lambda log_item, *, capture_refill_evidence: log_item,
+             ):
             RefreshCommand().handle()
 
         req.refresh_from_db()
@@ -650,7 +654,11 @@ class DriftedScheduledTimeCandidateTests(WebRequestFixtureMixin, TransactionTest
 
         with patch.object(refresh_module.timezone, "now", return_value=fake_now), \
              patch.object(refresh_module.timezone, "localtime", return_value=fake_now), \
-             patch.object(refresh_module, "maybe_schedule_song_request", lambda log_item: log_item):
+             patch.object(
+                 refresh_module,
+                 "maybe_schedule_song_request",
+                 lambda log_item, *, capture_refill_evidence: log_item,
+             ):
             RefreshCommand().handle()
 
         req.refresh_from_db()

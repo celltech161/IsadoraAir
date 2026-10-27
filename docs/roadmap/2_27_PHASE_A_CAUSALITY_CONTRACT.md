@@ -100,13 +100,21 @@ recorded as a cause.
   `COMMIT` and roll back the request swap.
 * `source_key` is `UNIQUE`. A replayed or retried event cannot create a second
   row. For request swaps the swap and its cause commit in the same transaction,
-  and a re-run sees the slot already reserved and does not swap again.
+  and a re-run sees the slot already reserved and does not swap again. If an
+  operator manually restores A and later the same request changes the same slot
+  A→B again, the existing row remains the one occurrence-level cause: the final
+  schedule is shortened once, not twice, and the Phase A trace already
+  deduplicates causes by `(cause_type, log_item_id)` for that reason.
 * Check constraints require positive observed shortening, the request fields
   for `request_substitution`, the engine fields for `operator_eject`, and
   `state = 'recorded'`.
 * `state` has one value in Phase A: `recorded` (evidence only). It cannot be
   confused with installed filler (`LogItem`) or aired content
   (`PlayEvent`/`PlayEventSegment`). `played_at` is never read as completion.
+* Append-only is enforced by `HourRefillCause.save()` and by keeping the model
+  out of editing surfaces. PostgreSQL does not have an update/delete trigger;
+  direct SQL and `QuerySet.update()` can mutate a row. That explicit Phase A
+  limitation is acceptable because no runtime consumer exists yet.
 * Ordering for combining causes: `(occurred_at, id)`. The primary key is the
   commit-order tiebreaker.
 
@@ -122,7 +130,8 @@ There is no consumer, install hook or live action whatever the row says.
 
 ## 6. Request-swap transaction, lock order and fail-safe
 
-Unchanged r0119 sequence, with one addition (step 6):
+The non-realtime `refresh_song_request_statuses` reconciler uses the unchanged
+r0119 sequence with one addition (step 6):
 
 1. `SET LOCAL lock_timeout = '250ms'`.
 2. Lock `PlaylistLog` (approved) → lock `LogItem` (`of=("self",)`).
@@ -148,9 +157,14 @@ Consequences:
 * Preparation (the policy read and, when capture is on, the displaced Track
   read) runs in its own savepoint and also never raises. So even "code
   deployed before its migration" (relation missing) leaves the swap intact.
-* With the policy Off (or no policy row) the added work is
-  `SAVEPOINT` + one primary-key read of `HourRefillPolicy` + `RELEASE`, and
-  only on the path where a swap is actually being made. There is no insert.
+* The engine's last-second playback-control caller does **not** opt in. Its
+  default path performs no Phase A policy query, savepoint, displaced-Track
+  lookup or cause insert, whether the policy row is On or Off. It is SQL/lock
+  equivalent to r0119. If only that last-second safety net performs a swap, the
+  cause can be missed; this is an intentional best-effort evidence tradeoff.
+* With the policy Off (or no policy row), the non-realtime periodic reconciler's
+  opt-in path performs `SAVEPOINT` + one primary-key policy read + `RELEASE`,
+  only when it is actually making a swap. There is no insert.
 * The displaced Track row is read (one primary-key `SELECT`) only when capture
   is on. No network, file or solver work happens under the lock.
 * Collapsed requests are not listed on the cause; they are recoverable from
@@ -178,7 +192,7 @@ The right capture point is in `_eject_deck` immediately after
 `_get_deck_position(deck)` (a GStreamer query, no DB). Building the envelope
 there is pure and cheap.
 
-The blocker is **persistence**:
+The blocker is **reliable scheduled-occurrence provenance**:
 
 * Writing on the GLib thread adds a blocking DB round trip to the Eject path.
   The workorder forbids that.
@@ -187,22 +201,22 @@ The blocker is **persistence**:
   is still an added blocking statement. It also couples the evidence to a path
   that returns `False` with no `PlayEvent`, and would change the
   accounting-path code the workorder says not to change.
-* Handing the envelope to a background writer is non-blocking, but an engine
-  crash between the Eject and the write loses the cause. The durable
-  `PlayEventSegment(termination_reason="eject")` survives, but it does not
-  carry the position at Eject, so the remaining airtime cannot be
-  reconstructed reliably (seeks and pauses break `confirmed_duration`
-  arithmetic).
-* Two facts are still unresolved: how to tell a scheduled occurrence from an
-  operator-inserted LogItem on a deck (both are `LogItem`s of the same log),
-  and whether ejecting the *incoming* deck of an overlap should ever count.
+* Handing the envelope to a bounded background writer is nonblocking. An
+  immediate hard engine-process crash may lose the queued cause; that is an
+  explicitly accepted v1 limitation. No journal, synchronous fallback or
+  exactly-once replay is required. An orderly stop should attempt only a short,
+  bounded drain.
+* A scheduled and an operator-inserted music `LogItem` can become
+  indistinguishable after queue position normalization. Phase A must not invent
+  that provenance. Any Eject during an active overlap/crossfade is excluded for
+  both incoming and outgoing decks, and Start Next itself is never a cause.
 
 Phase A therefore ships the envelope, the source key, the classifier and its
-fixtures, and **no engine change**. A later pass must choose and prove one
-persistence design. The recommended one is a bounded in-process queue drained
-by a worker thread, with the envelope also recorded in the resume snapshot so
-a restart can replay it under the unique key. That design needs its own
-review.
+fixtures, and **no engine change**. The minimal remaining prerequisite is a
+durable, conservative scheduled-versus-inserted occurrence marker. Once that
+exists, a single-purpose bounded in-process queue and one persistence worker
+can be added without any ORM work on the engine thread; hard-crash replay is
+not required for v1.
 
 ## 8. Privacy
 

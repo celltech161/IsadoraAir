@@ -10,10 +10,12 @@ TransactionTestCase, like test_request_scheduling_lifecycle.py: several
 tests hold row locks from a second connection."""
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from django.db import close_old_connections, connection, transaction
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from library.models import (
@@ -26,13 +28,22 @@ from library.services.hour_refill_causality import (
 )
 from monitoring.models import SystemEvent
 from webrequests.models import SongRequest
-from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request
+from webrequests.services import (
+    SCHEDULING_CONTENDED,
+    maybe_schedule_song_request as _maybe_schedule_song_request,
+)
 import webrequests.services as services_module
 
 from webrequests.tests.test_request_scheduling_lifecycle import WebRequestFixtureMixin
 
+REPO = Path(__file__).resolve().parents[2]
 PRIVATE_NAME = "Zelda Privateperson"
 PRIVATE_MESSAGE = "secret dedication for my sister"
+
+
+def maybe_schedule_song_request(log_item):
+    """Opt in exactly like the non-realtime periodic reconciler."""
+    return _maybe_schedule_song_request(log_item, capture_refill_evidence=True)
 
 
 class HourRefillRequestCauseTests(WebRequestFixtureMixin, TransactionTestCase):
@@ -414,6 +425,38 @@ class HourRefillRequestCauseTests(WebRequestFixtureMixin, TransactionTestCase):
         self.assertEqual(row.original_effective_airtime_seconds, 298.0)
 
     # -- default-Off parity with r0119 ----------------------------------------
+
+    def test_engine_safe_default_adds_no_phase_a_query_savepoint_or_hook(self):
+        # Stronger than policy Off: even an enabled policy cannot add optional
+        # telemetry work when the caller (the engine) keeps the safe default.
+        self.enable_capture()
+        _scheduled, requested, item, req = self.shorter_swap_fixture()
+        with patch.object(
+            services_module,
+            "record_request_substitution_cause",
+            side_effect=AssertionError("engine-safe default entered Phase A capture"),
+        ), CaptureQueriesContext(connection) as queries:
+            result = _maybe_schedule_song_request(item)
+
+        self.assertEqual(result.track_id, requested.id)
+        req.refresh_from_db()
+        self.assertEqual((req.status, req.log_item_id), ("scheduled", item.id))
+        self.assertEqual(HourRefillCause.objects.count(), 0)
+        phase_a_sql = "\n".join(query["sql"] for query in queries.captured_queries).lower()
+        self.assertNotIn("library_hourrefillpolicy", phase_a_sql)
+        self.assertNotIn("library_hourrefillcause", phase_a_sql)
+        self.assertNotIn("savepoint", phase_a_sql)
+
+    def test_only_periodic_reconciler_opts_in_to_capture(self):
+        engine_source = (REPO / "library/services/engine.py").read_text()
+        command_source = (
+            REPO / "webrequests/management/commands/refresh_song_request_statuses.py"
+        ).read_text()
+        self.assertNotIn("capture_refill_evidence=True", engine_source)
+        self.assertIn(
+            "maybe_schedule_song_request(item, capture_refill_evidence=True)",
+            command_source,
+        )
 
     def test_off_parity_scheduling_identical_and_no_causes(self):
         settings = {

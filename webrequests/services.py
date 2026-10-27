@@ -314,7 +314,7 @@ def mark_song_requests_aired(log_item, aired_at):
     )
 
 
-def maybe_schedule_song_request(log_item):
+def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False):
     """Web Requests scheduling. If `log_item` is a music-kind slot in
     an open request hour and there's an eligible waiting request, swaps
     the track in-place (mutating track / track_title / track_artist)
@@ -479,14 +479,20 @@ def maybe_schedule_song_request(log_item):
                         if not is_track_eligible_at(track, eligibility_time, recency_cfg):
                             continue  # ineligible or recency-blocked right now -- leave waiting for a later slot
 
-                        # Roadmap 2.27 Phase A (evidence only): snapshot the
-                        # displaced Track before it is overwritten. Never
-                        # raises; None unless capture is enabled and this is
-                        # a genuinely shorter, different-Track substitution.
-                        commit_refill_cause = record_request_substitution_cause(
-                            locked_log=locked_log, locked_item=locked_item,
-                            replacement_track=track, song_request=candidate, occurred_at=now,
-                        )
+                        # Roadmap 2.27 Phase A (evidence only). The engine's
+                        # time-sensitive last-second caller deliberately keeps
+                        # the default False: it gets the exact r0119 SQL/lock
+                        # path with no policy read, savepoint, displaced-Track
+                        # lookup or cause insert. The periodic reconciler opts
+                        # in explicitly; a cause missed because only the engine
+                        # performed the swap is preferable to adding optional
+                        # telemetry work to the playback-control thread.
+                        commit_refill_cause = None
+                        if capture_refill_evidence:
+                            commit_refill_cause = record_request_substitution_cause(
+                                locked_log=locked_log, locked_item=locked_item,
+                                replacement_track=track, song_request=candidate, occurred_at=now,
+                            )
 
                         locked_item.track = track
                         locked_item.track_title = track.title
