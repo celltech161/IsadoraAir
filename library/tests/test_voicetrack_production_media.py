@@ -649,6 +649,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # history indexes -- index operations are manual for the updater.
             # 2.23: and library.0091 (PlayoutTransportConfig, CreateModel) and
             # library.0092 (remote_dj Start Next GroupAccess, its own manual RunPython).
+            # 2.27 Phase A: and library.0093 (HourRefillCause/Policy, CreateModel) and
+            # library.0094 (nullable LogItem.origin AddField) -- both additive.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -656,7 +658,9 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "active_messages.0005_execution_history_indexes",
                               "library.0090_seed_iportal_nav_item",
                               "library.0091_playouttransportconfig",
-                              "library.0092_remote_dj_start_next_access", "spoken.0001_initial",
+                              "library.0092_remote_dj_start_next_access",
+                              "library.0093_hour_refill_cause_policy", "library.0094_logitem_origin",
+                              "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
                               "produced_content.0004_backend_regular_only"])

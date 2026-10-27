@@ -451,7 +451,7 @@ class EngineLifecycleStructureTests(SimpleTestCase):
     def test_one_recorder_started_with_the_engine_and_stopped_after_audio_is_null(self):
         source = (REPO / "library/services/engine.py").read_text()
         self.assertEqual(source.count("HourRefillEvidenceRecorder()"), 1)
-        self.assertEqual(source.count("self._hour_refill_evidence.start()"), 1)
+        self.assertEqual(source.count("evidence.start()"), 1)
         stop_body = source[source.index("    def stop(self):"):source.index("    def _handle_signal_glib(self):")]
         self.assertLess(stop_body.index("self.main_pipeline.set_state(Gst.State.NULL)"),
                         stop_body.index("evidence.stop()"))

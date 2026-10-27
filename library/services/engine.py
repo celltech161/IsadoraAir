@@ -2172,7 +2172,9 @@ class PlaybackEngine:
             self._checkpoint_playback_durations,
         )
         self._media_validation_worker.start()
-        self._hour_refill_evidence.start()
+        evidence = getattr(self, "_hour_refill_evidence", None)
+        if evidence is not None:
+            evidence.start()
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
