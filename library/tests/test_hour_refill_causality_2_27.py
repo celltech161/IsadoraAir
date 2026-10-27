@@ -326,9 +326,15 @@ class PolicyTests(TestCase):
         HourRefillPolicy(enabled=True).save()
         self.assertEqual(HourRefillPolicy.objects.count(), 1)
 
-    def test_dry_run_only_cannot_be_cleared_in_phase_a(self):
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            HourRefillPolicy(dry_run_only=False).save()
+    def test_dry_run_only_needs_the_phase_d_gate_migration(self):
+        # Phase A forbade dry_run_only=False with a check constraint. Phase D's
+        # reviewed migration 0096 removes it (applied in this test database);
+        # the default stays True and installing still needs the host arming
+        # flag (test_hour_refill_runner_2_27.GateMigrationTests covers the
+        # constraint before 0096 and the reverse migration).
+        HourRefillPolicy(dry_run_only=False).save()
+        self.assertEqual(HourRefillPolicy.objects.get().dry_run_only, False)
+        self.assertIs(HourRefillPolicy().dry_run_only, True)
 
     def test_policy_is_separate_from_log_fill_config(self):
         HourRefillPolicy(enabled=True, capture_request_substitution=True).save()

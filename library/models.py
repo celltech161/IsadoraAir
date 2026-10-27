@@ -1195,25 +1195,27 @@ class LogFillConfig(models.Model):
 class HourRefillPolicy(models.Model):
     """Singleton -- roadmap 2.27 hour-refill policy, separate from
     LogFillConfig so enabling causal refill can never change the accepted
-    1.1 normal fill. Phase A: every flag defaults Off and only enables
-    EVIDENCE capture (HourRefillCause rows); nothing consumes them, and
-    dry_run_only cannot be cleared (check constraint). See
-    docs/roadmap/2_27_PHASE_A_CAUSALITY_CONTRACT.md."""
+    1.1 normal fill. Every flag defaults Off. `enabled` gates evidence
+    capture and the Phase D runner; the two cause switches choose which
+    causes are captured and may drive a refill; dry_run_only keeps the
+    runner to advisory observation. Clearing dry_run_only needs migration
+    0096 (which removes the Phase A check constraint, a reviewed manual
+    migration) AND settings.HOUR_REFILL_INSTALL_ARMED on the host. See
+    docs/roadmap/2_27_PHASE_D_OPERATIONAL_CONTRACT.md."""
     enabled = models.BooleanField(default=False)
     capture_request_substitution = models.BooleanField(default=False)
     capture_operator_eject = models.BooleanField(default=False)
-    dry_run_only = models.BooleanField(default=True, editable=False)
+    dry_run_only = models.BooleanField(
+        default=True, verbose_name="Observation only (dry run)",
+        help_text="While checked, the hour-refill runner only reports advisory proposals and never "
+                  "writes to a log. Installation also requires the station's reviewed gate migration "
+                  "and HOUR_REFILL_INSTALL_ARMED in its .env.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Hour Refill Policy"
         verbose_name_plural = "Hour Refill Policy"
-        constraints = [
-            models.CheckConstraint(
-                condition=models.Q(dry_run_only=True),
-                name="hour_refill_policy_dry_run_only_phase_a",
-            ),
-        ]
 
     def __str__(self):
         return "Hour Refill Policy"

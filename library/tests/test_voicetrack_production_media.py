@@ -653,6 +653,9 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # library.0094 (nullable LogItem.origin AddField) -- both additive.
             # 2.27 Phase C: and library.0095 (HourRefillInstall CreateModel plus a
             # choices-only LogItem.origin AlterField) -- additive.
+            # 2.27 Phase D: and library.0096, the hour-refill install gate
+            # (RemoveConstraint + an editable/label AlterField) -- deliberately
+            # manual, so a station needs a reviewed approval to apply it.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -663,6 +666,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0092_remote_dj_start_next_access",
                               "library.0093_hour_refill_cause_policy", "library.0094_logitem_origin",
                               "library.0095_hour_refill_install",
+                              "library.0096_hour_refill_install_gate",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
@@ -680,6 +684,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("active_messages.0005_execution_history_indexes", "AddIndex"),
                               ("library.0090_seed_iportal_nav_item", "RunPython"),
                               ("library.0092_remote_dj_start_next_access", "RunPython"),
+                              ("library.0096_hour_refill_install_gate", "RemoveConstraint"),
+                              ("library.0096_hour_refill_install_gate", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),

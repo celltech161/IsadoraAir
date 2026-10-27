@@ -294,6 +294,16 @@ WEB_REQUESTS_INGEST_MAX_RESPONSE_BYTES = config(
     'WEB_REQUESTS_INGEST_MAX_RESPONSE_BYTES', default=1048576, cast=int,
 )
 
+# Roadmap 2.27 Phase D hour refill. HOUR_REFILL_INSTALL_ARMED is the host
+# arming flag: without it the engine never installs refill rows, whatever
+# HourRefillPolicy says. Deliberately not editable from the web .env editor;
+# set it only under an approved station rollout and restart the engine.
+# HOUR_REFILL_PSA_CATEGORY_ID optionally names the spot-kind category for the
+# residual PSA; empty keeps the PSA off. See
+# docs/roadmap/2_27_PHASE_D_OPERATIONAL_CONTRACT.md.
+HOUR_REFILL_INSTALL_ARMED = config('HOUR_REFILL_INSTALL_ARMED', default=False, cast=bool)
+HOUR_REFILL_PSA_CATEGORY_ID = config('HOUR_REFILL_PSA_CATEGORY_ID', default='')
+
 # Persistent (survives reboot, unlike /run's tmpfs) last-known-good
 # encoder configuration state -- see encoders/services/lkg.py. Contains
 # the exact rendered Liquidsoap script (with credentials embedded, since

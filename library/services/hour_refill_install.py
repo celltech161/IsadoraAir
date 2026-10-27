@@ -8,9 +8,11 @@ COMMIT is the only linearization point; the engine adopts the rows through
 its existing guarded 3-second queue reload. The worker never touches GLib
 memory, and GLib never waits on the worker.
 
-Nothing calls this automatically, and install_permitted() is False on every
-station (HourRefillPolicy.dry_run_only is enforced by a check constraint).
-See docs/roadmap/2_27_PHASE_C_GUARDED_INSTALL_CONTRACT.md.
+The only caller is the Phase D HourRefillRunner (hour_refill_runner.py).
+install_permitted() is False on every station until migration 0096 removes
+the dry-run constraint, the host is armed and an operator clears dry run.
+See docs/roadmap/2_27_PHASE_C_GUARDED_INSTALL_CONTRACT.md and
+docs/roadmap/2_27_PHASE_D_OPERATIONAL_CONTRACT.md.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from django.db import IntegrityError, OperationalError, close_old_connections, c
 from django.db.models import F
 from django.utils import timezone
 
+from library.services.hour_refill_causality import CAUSE_OPERATOR_EJECT, CAUSE_REQUEST_SUBSTITUTION
 from library.services.hour_refill_projection import EVIDENCE_NOTE, project_refill
 from library.services.hour_refill_proposal import (
     PSA_CATEGORY_KIND,
@@ -59,16 +62,29 @@ STATUS_UNSAFE = "unsafe_window"
 STATUS_NO_SAFE_ANCHOR = "no_safe_anchor"
 STATUS_LOCK_CONTENDED = "lock_contended"
 STATUS_DUPLICATE = "duplicate_install"
+STATUS_POLICY_REFUSED = "policy_refused"
 
 
-def install_permitted():
-    """True only when the persisted policy allows real installation:
-    enabled AND not dry_run_only. The Phase A check constraint keeps
-    dry_run_only True, so this is False everywhere until Phase D."""
+def install_permitted(*, cause_types=(), lock=False):
+    """True only when real installation is allowed: the policy row is
+    enabled and not dry_run_only, the host is armed
+    (settings.HOUR_REFILL_INSTALL_ARMED), and every cause type in
+    `cause_types` has its switch on. A missing row is Off. lock=True reads
+    the row FOR UPDATE inside the install transaction, so an operator save
+    either commits first and is seen, or waits for this transaction."""
+    from django.conf import settings
+
     from library.models import HourRefillPolicy
 
-    row = HourRefillPolicy.objects.filter(pk=1).values_list("enabled", "dry_run_only").first()
-    return bool(row and row[0] and not row[1])
+    rows = HourRefillPolicy.objects.filter(pk=1)
+    if lock:
+        rows = rows.select_for_update()
+    row = rows.values_list("enabled", "dry_run_only", "capture_request_substitution",
+                           "capture_operator_eject").first()
+    if not (row and row[0] and not row[1] and getattr(settings, "HOUR_REFILL_INSTALL_ARMED", False) is True):
+        return False
+    switches = {CAUSE_REQUEST_SUBSTITUTION: row[2], CAUSE_OPERATOR_EJECT: row[3]}
+    return all(switches.get(cause_type, False) for cause_type in cause_types)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +248,10 @@ def safety_budget():
     return (SAFETY_BUDGET_BASE_SECONDS, SAFETY_BUDGET_PER_ITEM_SECONDS)
 
 
+def _cause_types(projection):
+    return tuple(sorted({c.cause_type for c in projection.qualified_causes}))
+
+
 # ---------------------------------------------------------------------------
 # Installer
 # ---------------------------------------------------------------------------
@@ -355,6 +375,10 @@ class HourRefillInstaller:
         if ([c.cause_id for c in projection.qualified_causes]
                 != [c.cause_id for c in proposal.projection.qualified_causes]):
             raise _Abort(STATUS_STALE, "cause_set_changed")
+        # Phase D: every qualified cause type must be switched on; a set is
+        # never filtered down to the permitted subset.
+        if not install_permitted(cause_types=_cause_types(projection)):
+            raise _Abort(STATUS_POLICY_REFUSED, "not_permitted_for_cause_types")
         placement = assess_placement(s2, load_request_context())
         if (placement.mode, placement.anchor_log_item_id) != (proposal.placement.mode,
                                                               proposal.placement.anchor_log_item_id):
@@ -404,6 +428,10 @@ class HourRefillInstaller:
                     cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
                 log = PlaylistLog.objects.select_for_update().get(pk=s2.active_log_id)
                 self._hook("locked")
+                # Phase D: the policy decides again, under its own row lock,
+                # before anything is written (lock order: log, then policy).
+                if not install_permitted(cause_types=_cause_types(proposal.projection), lock=True):
+                    raise _Abort(STATUS_POLICY_REFUSED, "policy_changed_before_commit")
                 if HourRefillInstall.objects.filter(install_key=key).exists():
                     raise _Abort(STATUS_DUPLICATE, "install_key_exists")
                 if (log.status, log.date, log.hour) != ("approved", s2.active_log_date, s2.active_log_hour):
