@@ -346,13 +346,13 @@ def search_best_fit(candidates, frame, *, max_tracks=MAX_MUSIC_TRACKS, budget=PA
     for candidate in ordered:
         consider([candidate])
     if max_tracks >= 2 and len(ordered) > 1:
-        efforts = [c.effective for c in ordered]
+        airtimes = [c.effective for c in ordered]
         available = frame.window - frame.base_total()
         for first in sorted(ordered, key=lambda c: c.track_id):
             if evaluations >= budget:
                 truncated = True
                 break
-            index = bisect.bisect_right(efforts, available - first.effective) - 1
+            index = bisect.bisect_right(airtimes, available - first.effective) - 1
             valid = scanned = 0
             while index >= 0 and valid < PAIR_NEIGHBOURS and scanned < PAIR_SCAN_LIMIT:
                 second = ordered[index]
@@ -534,17 +534,20 @@ def search_with_media(candidates, frame, *, max_tracks, media_cache, unavailable
 # ---------------------------------------------------------------------------
 
 def last_remaining_music(snapshot):
-    """(ItemTiming, None) for the last MUSIC-slot occurrence still ahead or
-    on the deck, in play order, or (None, reason). An unknown-kind row after
-    it makes the answer ambiguous (fail closed). Never a PSA, ID, imaging
-    or underwriting row, never the requested Track's own category."""
+    """(ItemTiming, None) for the active log's last MUSIC-slot occurrence
+    still ahead or on the deck, in play order, or (None, reason). Rows of
+    another log (a previous hour's song still on the deck, a forced item
+    carried across a rollover) are never this hour's source. An unknown-kind
+    row after it makes the answer ambiguous (fail closed). Never a PSA, ID,
+    imaging or underwriting row, never the requested Track's own category."""
     (deck,) = [d for d in snapshot.decks if d.live]
     sequence = [deck.item]
     forced_ids = {it.log_item_id for it in snapshot.forced}
     sequence += list(snapshot.forced)
     sequence += [it for it in snapshot.queue[snapshot.cursor:] if it.log_item_id not in forced_ids]
     for item in reversed(sequence):
-        if item is None or item.track_id is None or (item.playlist_log_id, item.log_item_id) in snapshot.poison_skip:
+        if (item is None or item.track_id is None or item.playlist_log_id != snapshot.active_log_id
+                or (item.playlist_log_id, item.log_item_id) in snapshot.poison_skip):
             continue
         if item.category_kind is None:
             return None, "remaining_kind_unknown"
@@ -767,6 +770,9 @@ def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None):
                  "evaluations": fit.evaluations, "search_truncated": fit.truncated,
                  "media_unavailable_track_ids": sorted(unavailable), "media_checks": len(media_cache),
                  "media_retry_exhausted": exhausted,
+                 "freshness": {"recency_basis_at": snapshot.captured_at.isoformat(),
+                               "media_checked": "winners only, at proposal time",
+                               "snapshot_digest": projection.snapshot_digest},
                  "ranking": "zero overrun; smallest residual; original-cause category; fewer tracks; "
                             "ascending track ids"}
     if not fit.items:

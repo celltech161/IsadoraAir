@@ -446,6 +446,14 @@ class PlacementTests(SimpleTestCase):
         last, reason = last_remaining_music(snap)
         self.assertEqual((last.log_item_id, last.category_id, reason), (4, RECURRENT, None))
 
+    def test_last_remaining_music_is_only_from_the_active_log(self):
+        # The previous hour's song still on the deck across the rollover is not
+        # this hour's category source; only closers remain in the active log.
+        carried = item(90, 300.0, category=RECURRENT, log=LOG - 1, played=True)
+        closers = [item(4, 60.0, kind="spot", category=PSA), item(5, 10.0, kind="legal_id", category=LEGAL)]
+        snap = snapshot(closers, 0, [deck(carried, 20.0)])
+        self.assertEqual(last_remaining_music(snap), (None, "no_remaining_music"))
+
     def test_last_remaining_music_fails_closed_on_unknown_kind(self):
         snap = self.closer_hour()
         snap = replace(snap, queue=snap.queue[:5] + (replace(snap.queue[5], category_kind=None),))
