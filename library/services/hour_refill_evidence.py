@@ -52,6 +52,7 @@ class HourRefillEvidenceRecorder:
         self._start_lock = threading.Lock()
         self._thread = None
         self._stopping = threading.Event()
+        self._drain_expired = threading.Event()
         self._policy_loaded = threading.Event()
         # Engine-side gates. Written only by the worker; False until the first
         # successful policy read and after any failed one (fail closed).
@@ -70,19 +71,19 @@ class HourRefillEvidenceRecorder:
         raises. Returns True only if queued."""
         try:
             if self._thread is None or not self._thread.is_alive() or self._stopping.is_set():
-                self._count("dropped_not_running")
+                self._count("dropped_not_running", emit=False)
                 return False
             self._queue.put_nowait(evidence)
             return True
         except queue.Full:
-            self._count("dropped_full")
+            self._count("dropped_full", emit=False)
             return False
         except Exception:  # noqa: BLE001
-            self._count("dropped_error")
+            self._count("dropped_error", emit=False)
             return False
 
     def note_snapshot_error(self):
-        self._count("snapshot_error")
+        self._count("snapshot_error", emit=False)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -91,6 +92,7 @@ class HourRefillEvidenceRecorder:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stopping.clear()
+            self._drain_expired.clear()
             self._thread = threading.Thread(target=self._run, name="hour-refill-evidence", daemon=True)
             self._thread.start()
 
@@ -108,6 +110,11 @@ class HourRefillEvidenceRecorder:
         except queue.Full:
             pass  # the worker sees _stopping after its current item
         thread.join(timeout=max(0.0, drain_seconds))
+        if thread.is_alive():
+            # The in-flight DB call cannot safely be cancelled. Once it
+            # returns, abandon the remaining queue instead of continuing to
+            # write after the bounded orderly-drain window has expired.
+            self._drain_expired.set()
 
     def wait_until_ready(self, timeout):
         """Tests and diagnostics only."""
@@ -115,9 +122,9 @@ class HourRefillEvidenceRecorder:
 
     # -- worker thread -------------------------------------------------------
 
-    def _count(self, name):
+    def _count(self, name, *, emit=True):
         self.counters[name] = self.counters.get(name, 0) + 1
-        if name.startswith("dropped") or name == "snapshot_error":
+        if emit and (name.startswith("dropped") or name == "snapshot_error"):
             total = self.counters[name]
             if total == 1 or total % 100 == 0:
                 print(f"  Hour-refill evidence {name} (count={total}); playout unaffected")
@@ -154,6 +161,8 @@ class HourRefillEvidenceRecorder:
             self._refresh_policy()
             next_refresh = time.monotonic() + self._policy_refresh_seconds
             while True:
+                if self._drain_expired.is_set():
+                    break
                 if self._stopping.is_set() and self._queue.empty():
                     break
                 timeout = max(0.0, next_refresh - time.monotonic())

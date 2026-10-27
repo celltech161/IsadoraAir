@@ -266,7 +266,8 @@ thread owns every evidence database operation:
 
 * the engine side calls `offer()`: a `put_nowait` into a queue of at most 64,
   never waiting; when the worker is not running, or the queue is full, the
-  event is dropped and counted;
+  event is dropped and counted without printing or other I/O on the engine
+  thread;
 * the worker reads the policy at start and every 30 s and publishes two
   booleans (`capture_requests`, `capture_eject`), which are the engine's only
   gate. They are False until the first successful read and after any failed
@@ -276,8 +277,12 @@ thread owns every evidence database operation:
   `source_key` is counted as a duplicate; any other error drops the event;
   nothing is retried;
 * `stop()` turns both gates off, then waits at most 1 s while the worker
-  writes what is already queued; anything left is dropped;
-* drops print a single line on the 1st and every 100th occurrence per reason.
+  writes what is already queued. If a database call is still in flight, it is
+  not cancelled, but after it returns the worker drops the remaining queue
+  rather than continuing past the bounded drain window;
+* worker-side policy/write/shutdown drops print a single line on the 1st and
+  every 100th occurrence per reason. Engine-side queue/snapshot drops are
+  counters only, so optional diagnostics never add playback-thread I/O.
 
 A hard crash, SIGKILL or power loss loses whatever is still queued. This is
 accepted (operator decision); there is no journal, synchronous fallback or

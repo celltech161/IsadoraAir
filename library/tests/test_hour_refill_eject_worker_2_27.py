@@ -9,7 +9,7 @@ import time
 from datetime import date, datetime, timezone as dt_timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from django.db import connection
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
@@ -354,8 +354,12 @@ class EvidenceWorkerTests(TransactionTestCase):
 
     def test_not_running_drops_without_waiting(self):
         recorder = self.recorder()
-        self.assertFalse(recorder.offer(_eject_evidence()))
+        with patch("builtins.print") as output:
+            self.assertFalse(recorder.offer(_eject_evidence()))
+            recorder.note_snapshot_error()
+        output.assert_not_called()  # both methods may run on the playback thread
         self.assertEqual(recorder.counters["dropped_not_running"], 1)
+        self.assertEqual(recorder.counters["snapshot_error"], 1)
 
     def test_queue_full_drops_immediately(self):
         self.enable()
@@ -419,8 +423,10 @@ class EvidenceWorkerTests(TransactionTestCase):
         self.enable()
         release = threading.Event()
         entered = threading.Event()
+        inserted = []
 
         def stuck_insert(evidence):
+            inserted.append(evidence.source_key)
             entered.set()
             release.wait(10)
 
@@ -430,9 +436,15 @@ class EvidenceWorkerTests(TransactionTestCase):
         recorder.wait_until_ready(5)
         recorder.offer(_eject_evidence(1))
         self.assertTrue(entered.wait(5))
+        recorder.offer(_eject_evidence(2))
         started = time.monotonic()
         recorder.stop(drain_seconds=0.2)
         self.assertLess(time.monotonic() - started, 1.0)
+        release.set()
+        recorder._thread.join(2.0)
+        self.assertFalse(recorder._thread.is_alive())
+        self.assertEqual(inserted, [_eject_evidence(1).source_key])
+        self.assertEqual(recorder.counters["dropped_shutdown"], 1)
 
     def test_start_is_idempotent(self):
         recorder = self.recorder()
