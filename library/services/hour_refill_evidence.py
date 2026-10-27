@@ -44,8 +44,11 @@ class HourRefillEvidenceRecorder:
     """Engine-owned evidence writer. Start once; stop once at shutdown."""
 
     def __init__(self, *, max_queued=MAX_QUEUED, policy_refresh_seconds=POLICY_REFRESH_SECONDS,
-                 read_flags=_read_capture_flags, insert=_insert_cause):
+                 read_flags=_read_capture_flags, insert=_insert_cause, on_recorded=None):
         self._queue = queue.Queue(maxsize=max_queued)
+        # Phase D: called on this worker thread after each committed cause
+        # (the runner's coalescing wake). Must not block; errors are ignored.
+        self._on_recorded = on_recorded
         self._policy_refresh_seconds = policy_refresh_seconds
         self._read_flags = read_flags
         self._insert = insert
@@ -151,6 +154,11 @@ class HourRefillEvidenceRecorder:
             close_old_connections()
             self._insert(evidence)
             self._count("recorded")
+            if self._on_recorded is not None:
+                try:
+                    self._on_recorded()
+                except Exception:  # noqa: BLE001 -- a wake is optional
+                    pass
         except IntegrityError:
             self._count("duplicate")
         except Exception:  # noqa: BLE001

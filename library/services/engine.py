@@ -70,6 +70,7 @@ from library.services import remote_dj_admin_identity
 from library.services.hour_refill_causality import eject_evidence_from_engine
 from library.services.hour_refill_evidence import HourRefillEvidenceRecorder
 from library.services.hour_refill_install import RefillCoordinator
+from library.services.hour_refill_runner import HourRefillRunner
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -1874,8 +1875,13 @@ class PlaybackEngine:
         # from the instance whose on-air state it is recovering.
         self._engine_session_id = str(uuid.uuid4())
         self._media_validation_worker = MediaValidationWorker()
+        # Roadmap 2.27 Phase D: the single off-thread refill caller (policy
+        # gated, Off by default); the evidence recorder wakes it after each
+        # committed cause.
+        self._hour_refill_runner = HourRefillRunner(self, idle_add=GLib.idle_add)
         # Roadmap 2.27 Phase A: the only owner of refill-evidence DB writes.
-        self._hour_refill_evidence = HourRefillEvidenceRecorder()
+        self._hour_refill_evidence = HourRefillEvidenceRecorder(on_recorded=self._hour_refill_runner.wake)
+        self._hour_refill_runner.evidence = self._hour_refill_evidence
         # 2.27 Phase C: single-flight arbitration between a causal refill
         # install and ordinary live fill (memory only, under self._lock).
         self._refill_coordinator = RefillCoordinator()
@@ -2179,6 +2185,9 @@ class PlaybackEngine:
         evidence = getattr(self, "_hour_refill_evidence", None)
         if evidence is not None:
             evidence.start()
+        runner = getattr(self, "_hour_refill_runner", None)
+        if runner is not None:
+            runner.start()
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -2209,6 +2218,10 @@ class PlaybackEngine:
                 self._stop_started = True
 
         self.running = False
+        # 2.27 Phase D: no new refill evaluation from here on (signal only).
+        runner = getattr(self, "_hour_refill_runner", None)
+        if runner is not None:
+            runner.stop(join_seconds=0)
         diagnostics = getattr(self, "_audio_gap_diagnostics", None)
         if diagnostics is not None:
             diagnostics.stop()
@@ -2253,6 +2266,8 @@ class PlaybackEngine:
         evidence = getattr(self, "_hour_refill_evidence", None)
         if evidence is not None:
             evidence.stop()
+        if runner is not None:
+            runner.stop()  # bounded join; an in-flight DB call is not cancelled
         if self.loop.is_running():
             self.loop.quit()
         print("Engine stopped.")

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, SortableTabularInline
@@ -13,6 +14,7 @@ from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
+from django.utils import timezone
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
@@ -32,6 +34,8 @@ from .models import (
     EmailLog,
     GroupAccess,
     Holiday,
+    HourRefillInstall,
+    HourRefillPolicy,
     LogFillConfig,
     LogItem,
     MediaPlaybackIncident,
@@ -71,7 +75,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig", "playouttransportconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "hourrefillpolicy", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig", "playouttransportconfig"}
 _LOG_MODELS = {"emaillog", "playevent", "playeventsegment", "mediaplaybackincident", "royaltyreport"}
 
 
@@ -854,6 +858,225 @@ class LogFillConfigAdmin(admin.ModelAdmin):
         return HttpResponseRedirect(
             reverse("admin:library_logfillconfig_change", args=[obj.pk])
         )
+
+
+_HOUR_REFILL_POLICY_AUDIT_FIELDS = (
+    "enabled", "capture_request_substitution", "capture_operator_eject", "dry_run_only",
+)
+_HOUR_REFILL_APPLY_MODES = {
+    # The engine's runner re-reads the row every 15 s; evidence capture
+    # re-reads it every 30 s. Every install transaction re-reads it under a
+    # row lock before writing, so turning installation off is never missed.
+    "enabled": "next_hour_refill_runner_check",
+    "capture_request_substitution": "next_hour_refill_runner_check",
+    "capture_operator_eject": "next_hour_refill_runner_check",
+    "dry_run_only": "next_hour_refill_runner_check_and_every_install_transaction",
+}
+
+
+class HourRefillPolicyForm(forms.ModelForm):
+    class Meta:
+        model = HourRefillPolicy
+        fields = list(_HOUR_REFILL_POLICY_AUDIT_FIELDS)
+        labels = {
+            "enabled": "Hour refill enabled (master switch)",
+            "capture_request_substitution": "Request-substitution cause",
+            "capture_operator_eject": "Operator Eject cause",
+        }
+
+    def clean(self):
+        from library.services.hour_refill_status import dry_run_gate_present
+
+        data = super().clean()
+        if data.get("dry_run_only") is False and dry_run_gate_present():
+            raise forms.ValidationError({
+                "dry_run_only": "This station's database still enforces observation only: the reviewed "
+                                "gate migration (library 0096) has not been applied here.",
+            })
+        return data
+
+
+@admin.register(HourRefillPolicy)
+class HourRefillPolicyAdmin(admin.ModelAdmin):
+    """Roadmap 2.27 Phase D: the hour-refill switches plus a read-only
+    status panel. Model view/change permissions apply, as for other config."""
+    form = HourRefillPolicyForm
+    readonly_fields = ("mode_display", "gates_display", "rules_display", "runner_display",
+                       "last_outcome_display", "counters_display", "recent_installs_display")
+    fieldsets = [
+        ("Switches", {
+            "fields": ["enabled", "capture_request_substitution", "capture_operator_eject", "dry_run_only"],
+            "description": "Off by default. The master switch also controls cause evidence capture. A cause set "
+                           "drives a refill only if every cause type in it is switched on. Observation only "
+                           "(dry run) shows advisory proposals and never writes to a log.",
+        }),
+        ("Status", {"fields": ["mode_display", "gates_display", "runner_display", "last_outcome_display",
+                               "counters_display"]}),
+        ("Fixed rules (v1)", {"fields": ["rules_display"]}),
+        ("Recent committed installs", {
+            "fields": ["recent_installs_display"],
+            "description": "Committed means rows were written to the log. Only an existing play record "
+                           "shows that a row aired.",
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not HourRefillPolicy.objects.exists() and super().has_add_permission(request)
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        # Never creates the row on a GET: a missing row means Off.
+        if not self.has_view_or_change_permission(request):
+            raise PermissionDenied
+        obj = HourRefillPolicy.objects.filter(pk=1).first()
+        if obj is None:
+            return HttpResponseRedirect(reverse("admin:library_hourrefillpolicy_add"))
+        return HttpResponseRedirect(reverse("admin:library_hourrefillpolicy_change", args=[obj.pk]))
+
+    def save_model(self, request, obj, form, change):
+        before = (_persisted_singleton_config_snapshot(HourRefillPolicy, obj, _HOUR_REFILL_POLICY_AUDIT_FIELDS)
+                  if change else None)
+        super().save_model(request, obj, form, change)
+        _audit_library_singleton_config_change(
+            request=request, action="update" if change else "create", before=before,
+            after=_current_singleton_config_snapshot(obj, _HOUR_REFILL_POLICY_AUDIT_FIELDS),
+            fields=_HOUR_REFILL_POLICY_AUDIT_FIELDS, title="Hour refill policy updated",
+            object_type="library.HourRefillPolicy", object_name="Hour Refill Policy",
+            apply_modes=_HOUR_REFILL_APPLY_MODES,
+        )
+
+    # -- read-only status panel ---------------------------------------------
+
+    @staticmethod
+    def _rows(pairs):
+        return format_html(
+            '<table class="hour-refill-status">{}</table>',
+            mark_safe("".join(str(format_html("<tr><th>{}</th><td>{}</td></tr>", k, v)) for k, v in pairs)),
+        )
+
+    def _saved(self, obj):
+        return HourRefillPolicy.objects.filter(pk=obj.pk).first() if obj is not None and obj.pk else None
+
+    def _runner(self):
+        from library.services.hour_refill_status import read_runner_status
+
+        return read_runner_status()
+
+    @admin.display(description="Mode (saved settings)")
+    def mode_display(self, obj):
+        from library.services.hour_refill_status import MODE_LABELS, mode_code
+
+        saved = self._saved(obj)
+        enabled = "yes" if saved and saved.enabled else "no"
+        dry_run = "yes" if saved is None or saved.dry_run_only else "no"
+        return self._rows([
+            ("Mode", MODE_LABELS[mode_code(saved)]),
+            ("Master switch", enabled),
+            ("Observation only (dry run)", dry_run),
+            ("Request-substitution cause", "on" if saved and saved.capture_request_substitution else "off"),
+            ("Operator Eject cause", "on" if saved and saved.capture_operator_eject else "off"),
+        ])
+
+    @admin.display(description="Install gates")
+    def gates_display(self, obj):
+        from library.services.hour_refill_runner import host_armed
+        from library.services.hour_refill_status import dry_run_gate_present
+
+        doc, freshness = self._runner()
+        engine_armed = "unknown"
+        if doc and freshness == "fresh":
+            engine_armed = "yes" if (doc.get("policy") or {}).get("host_armed") else "no"
+        return self._rows([
+            ("Database dry-run gate", "present: installation impossible (migration 0096 not applied)"
+             if dry_run_gate_present() else "removed by reviewed migration 0096"),
+            ("Host armed (this web process)", "yes" if host_armed() else "no"),
+            ("Host armed (as the engine reports)", engine_armed),
+        ])
+
+    @admin.display(description="Rules")
+    def rules_display(self, obj):
+        from library.services.hour_refill_causality import REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS
+        from library.services.hour_refill_install import (
+            INSERTION_LEAD_SECONDS, SAFETY_BUDGET_BASE_SECONDS, SAFETY_BUDGET_PER_ITEM_SECONDS,
+        )
+        from library.services.hour_refill_projection import EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS
+
+        return self._rows([
+            ("Request or mixed causes", f"net shortage greater than {REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS} s"),
+            ("Eject causes only", f"net shortage greater than {EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS} s "
+                                  "(operator-approved, provisional)"),
+            ("Insertion lead", f"{INSERTION_LEAD_SECONDS:g} s: provisional engineering margin, not measured"),
+            ("Reserve after the install", f"{SAFETY_BUDGET_BASE_SECONDS:g} s + {SAFETY_BUDGET_PER_ITEM_SECONDS:g} s "
+                                          "per item: provisional engineering margin, not measured"),
+            ("At most", "two music tracks plus one optional PSA, tail append or before a closing block"),
+        ])
+
+    @admin.display(description="Runner")
+    def runner_display(self, obj):
+        doc, freshness = self._runner()
+        if doc is None or freshness != "fresh":
+            return self._rows([("State", f"unknown ({freshness} status)")])
+        runner = doc.get("runner") or {}
+        return self._rows([
+            ("State", "running" if runner.get("running") else "stopped"),
+            ("Engine mode", (doc.get("policy") or {}).get("mode", "unknown")),
+            ("Last check", runner.get("last_check_at") or "never"),
+            ("Status written", doc.get("written_at")),
+            ("PSA residual", doc.get("psa_residual", "unknown")),
+        ])
+
+    @admin.display(description="Last outcome")
+    def last_outcome_display(self, obj):
+        doc, freshness = self._runner()
+        outcome = (doc or {}).get("last_outcome") if freshness == "fresh" else None
+        if not outcome:
+            return "none"
+        keys = ("at", "kind", "status", "reasons", "mode", "log_id", "log_date", "log_hour", "cause_types",
+                "cause_ids", "net_shortage_seconds", "threshold_seconds", "safety_budget_seconds",
+                "residual_after_seconds", "residual_beyond_budget_seconds", "placement_mode", "track_ids",
+                "category_ids", "installed_log_item_ids", "psa_status")
+        return self._rows([(k, json.dumps(outcome[k]) if not isinstance(outcome[k], str) else outcome[k])
+                           for k in keys if k in outcome and outcome[k] not in (None, [], {})])
+
+    @admin.display(description="Counters since engine start")
+    def counters_display(self, obj):
+        doc, freshness = self._runner()
+        if doc is None or freshness != "fresh":
+            return "unknown"
+        counters = doc.get("counters") or {}
+        evidence = doc.get("evidence_counters") or {}
+        dropped = sum(v for k, v in evidence.items() if k.startswith("dropped") or k == "snapshot_error")
+        return self._rows([
+            ("Installed (committed)", counters.get("installed", 0)),
+            ("Advisory proposals", counters.get("advisory_proposals", 0)),
+            ("Abstained", sum((doc.get("abstentions") or {}).values())),
+            ("Checks skipped: policy off", counters.get("skipped_policy_off", 0)),
+            ("Ordinary live fill owned the window", counters.get("live_fill_conflicts", 0)),
+            ("Live-fill installs discarded for a refill", (doc.get("live_fill") or {}).get("legacy_discards", 0)),
+            ("Evidence recorded / dropped", f"{evidence.get('recorded', 0)} / {dropped}"),
+            ("Runner errors", counters.get("errors", 0)),
+        ])
+
+    @admin.display(description="Installs")
+    def recent_installs_display(self, obj):
+        from library.services.hour_refill_status import recent_installs
+
+        rows = recent_installs()
+        if not rows:
+            return "none"
+        lines = []
+        for row in rows:
+            items = ", ".join(
+                f"item {i['log_item_id']} (track {i['track_id']}): "
+                + (f"aired {timezone.localtime(i['aired_at']):%Y-%m-%d %H:%M:%S}" if i["aired_at"] else "no play record")
+                for i in row["items"])
+            lines.append(format_html(
+                "<li>{} &middot; log {} ({} {}:00) &middot; {} &middot; committed (not proof of air) &middot; {}</li>",
+                timezone.localtime(row["committed_at"]).strftime("%Y-%m-%d %H:%M:%S"), row["log_id"],
+                row["log_date"], row["log_hour"], row["placement_mode"], items))
+        return format_html("<ul>{}</ul>", mark_safe("".join(str(line) for line in lines)))
 
 
 @admin.register(UploadConfig)

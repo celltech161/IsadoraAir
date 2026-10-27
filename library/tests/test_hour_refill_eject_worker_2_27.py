@@ -462,7 +462,9 @@ class EngineLifecycleStructureTests(SimpleTestCase):
 
     def test_one_recorder_started_with_the_engine_and_stopped_after_audio_is_null(self):
         source = (REPO / "library/services/engine.py").read_text()
-        self.assertEqual(source.count("HourRefillEvidenceRecorder()"), 1)
+        # Phase D passes the runner's wake as on_recorded; still exactly one.
+        self.assertEqual(source.count("HourRefillEvidenceRecorder("), 1)
+        self.assertIn("HourRefillEvidenceRecorder(on_recorded=self._hour_refill_runner.wake)", source)
         self.assertEqual(source.count("evidence.start()"), 1)
         stop_body = source[source.index("    def stop(self):"):source.index("    def _handle_signal_glib(self):")]
         self.assertLess(stop_body.index("self.main_pipeline.set_state(Gst.State.NULL)"),
