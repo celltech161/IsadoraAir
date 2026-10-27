@@ -55,18 +55,19 @@ class GLibHarness:
         self.busy_ms, self.pipeline_wanted = busy_ms, pipeline
         self.engine, self.watch, self.errors = None, None, []
         self.loop, self.thread, self.pipeline = GLib.MainLoop(), None, None
+        self.poll_id, self.bus, self.stopped = None, None, False
 
     def start(self):
         ready = threading.Event()
 
         def run():
-            GLib.timeout_add(250, self._poll)
+            self.poll_id = GLib.timeout_add(250, self._poll)
             GLib.idle_add(lambda: (ready.set(), False)[1])
             if self.pipeline_wanted:
                 Gst.init(None)
                 self.pipeline = Gst.parse_launch(
                     "audiotestsrc is-live=true wave=silence ! audiomixer ! fakesink sync=true")
-                bus = self.pipeline.get_bus()
+                self.bus = bus = self.pipeline.get_bus()
                 bus.add_signal_watch()
                 bus.connect("message", lambda *a: None)
                 self.pipeline.set_state(Gst.State.PLAYING)
@@ -77,6 +78,8 @@ class GLibHarness:
         assert ready.wait(10)
 
     def _poll(self):
+        if self.stopped:
+            return False
         try:
             if self.busy_ms:
                 end = time.monotonic() + self.busy_ms / 1000.0
@@ -97,6 +100,14 @@ class GLibHarness:
         done = threading.Event()
 
         def finish():
+            # Leave nothing attached to the shared default main context: later
+            # tests (real GStreamer fades) run their own loops on it.
+            self.stopped = True
+            if self.poll_id is not None:
+                GLib.source_remove(self.poll_id)
+                self.poll_id = None
+            if self.bus is not None:
+                self.bus.remove_signal_watch()
             if self.pipeline is not None:
                 self.pipeline.set_state(Gst.State.NULL)
             connection.close()
