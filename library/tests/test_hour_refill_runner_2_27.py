@@ -289,6 +289,25 @@ class OffParityTests(RunnerFixtures, TestCase):
         self.assertEqual(self.glib.calls, 1)  # one primitive capture
         self.assert_no_writes(before)
 
+    def test_one_journal_line_per_evaluation_and_none_otherwise(self):
+        import io
+        from contextlib import redirect_stdout
+
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        runner = self.make_runner(engine)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            runner.run_once()  # Off: silent
+            self.set_policy()
+            runner.run_once()  # one evaluation
+            runner.run_once()  # backoff: silent
+        lines = [line for line in out.getvalue().splitlines() if "Hour-refill evaluation" in line]
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0].split("Hour-refill evaluation ", 1)[1])
+        self.assertEqual((record["status"], record["committed_runway_seconds"]), ("proposed", 810.75))
+        self.assertIn("captured_at", record)
+
     def test_install_requested_but_not_armed_stays_observation(self):
         engine = self.eject_engine()
         self.track(200.0), self.track(180.0)

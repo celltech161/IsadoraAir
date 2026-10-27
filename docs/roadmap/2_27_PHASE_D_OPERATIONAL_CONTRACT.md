@@ -93,7 +93,8 @@ every 15 s, or on wake:
 | per cause set | ≥30 s between evaluations, at most 6 evaluations | transient blocks (transition, Manual) get a few retries; never a busy loop |
 | install attempts | Phase C cap: 3 per log | unchanged |
 | outstanding work | one evaluation (single thread) and one GLib capture | coalesced wakes |
-| status file | written on change, else every 60 s | no per-poll write, no system log output |
+| status file | written on change, else every 60 s | no per-poll write |
+| journal | one line per evaluation (ids and numbers), plus the 1st and every 100th runner error | evaluations are bounded by the cause-set cap; Off and "no new cause" checks print nothing |
 | memory | backoff entries for the current log only | pruned on log change |
 
 **Lifecycle.** **[now]**

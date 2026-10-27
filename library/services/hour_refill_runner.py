@@ -332,7 +332,22 @@ class HourRefillRunner:
         if not self._live(generation):
             return
         self.counters["evaluations"] += 1
-        self._evaluate(entry, log_id, cause_ids)
+        try:
+            self._evaluate(entry, log_id, cause_ids)
+        finally:
+            self._journal_evaluation()
+
+    def _journal_evaluation(self):
+        """One compact line per evaluation (runner thread, never GLib):
+        bounded by the per-cause-set cap, ids and numbers only. The shadow
+        observation window in the rollout packet is built from these."""
+        outcome = self.last_outcome or {}
+        keys = ("mode", "status", "log_id", "cause_ids", "net_shortage_seconds", "threshold_seconds",
+                "captured_at", "committed_runway_seconds", "boundary_instant", "placement_mode", "track_ids",
+                "safety_budget_seconds", "insertion_lead_seconds", "installed_log_item_ids")
+        self.counters["journal_lines"] += 1
+        print("  Hour-refill evaluation " + json.dumps({k: outcome.get(k) for k in keys if k in outcome},
+                                                        sort_keys=True, separators=(",", ":")))
 
     def _evaluate(self, entry, log_id, cause_ids):
         snapshot = request_snapshot(self.engine, idle_add=self._bounded_idle_add, wall_clock=self.wall_clock)
@@ -455,6 +470,12 @@ class HourRefillRunner:
                 net_shortage_seconds=projection.net_shortage_seconds,
                 threshold_seconds=projection.threshold_seconds, threshold_basis=projection.threshold_basis,
                 boundary_kind=projection.boundary.kind if projection.boundary else None,
+                # Field timing validation: compare captured_at + committed_runway_seconds
+                # with the as-run PlayEvent start of the item after the runway.
+                captured_at=_iso(projection.captured_at), window_seconds=projection.window_seconds,
+                committed_runway_seconds=projection.runway.total_seconds if projection.runway else None,
+                boundary_instant=_iso(projection.boundary.instant)
+                if projection.boundary and projection.boundary.instant else None,
             )
         if proposal is not None:
             outcome.update(
