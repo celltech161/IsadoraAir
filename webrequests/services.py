@@ -17,7 +17,10 @@ from isadoraair.announcements import (
 from isadoraair.tts.errors import TTSConfigurationError
 from library.models import LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
-from library.services.hour_refill_causality import record_request_substitution_cause
+from library.services.hour_refill_causality import (
+    record_request_substitution_cause,
+    request_substitution_from_memory,
+)
 from library.services.related_artists import track_identity_keys
 from monitoring.models import SystemEvent, emit_event
 
@@ -314,7 +317,7 @@ def mark_song_requests_aired(log_item, aired_at):
     )
 
 
-def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False):
+def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False, refill_evidence_sink=None):
     """Web Requests scheduling. If `log_item` is a music-kind slot in
     an open request hour and there's an eligible waiting request, swaps
     the track in-place (mutating track / track_title / track_artist)
@@ -493,6 +496,22 @@ def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False):
                                 locked_log=locked_log, locked_item=locked_item,
                                 replacement_track=track, song_request=candidate, occurred_at=now,
                             )
+                        elif refill_evidence_sink is not None:
+                            # Engine path with capture On: build the evidence
+                            # from objects already in memory (no query) and
+                            # hand it over only if this swap commits. A
+                            # rollback discards the callback; the callback
+                            # itself is a bounded put_nowait.
+                            memory_evidence = request_substitution_from_memory(
+                                caller_item=log_item, locked_log=locked_log, locked_item=locked_item,
+                                replacement_track=track, song_request=candidate, occurred_at=now,
+                            )
+                            if memory_evidence is not None:
+                                commit_refill_cause = (
+                                    lambda evidence=memory_evidence: transaction.on_commit(
+                                        lambda: refill_evidence_sink(evidence), robust=True,
+                                    )
+                                )
 
                         locked_item.track = track
                         locked_item.track_title = track.title

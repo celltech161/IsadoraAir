@@ -67,6 +67,8 @@ from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
 from library.services import remote_dj_admin_identity
+from library.services.hour_refill_causality import eject_evidence_from_engine
+from library.services.hour_refill_evidence import HourRefillEvidenceRecorder
 from isadoraair.engine_commands import (
     ENGINE_COMMAND_BATCH_SIZE,
     EngineCommandError,
@@ -1871,6 +1873,8 @@ class PlaybackEngine:
         # from the instance whose on-air state it is recovering.
         self._engine_session_id = str(uuid.uuid4())
         self._media_validation_worker = MediaValidationWorker()
+        # Roadmap 2.27 Phase A: the only owner of refill-evidence DB writes.
+        self._hour_refill_evidence = HourRefillEvidenceRecorder()
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
@@ -2168,6 +2172,7 @@ class PlaybackEngine:
             self._checkpoint_playback_durations,
         )
         self._media_validation_worker.start()
+        self._hour_refill_evidence.start()
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -2237,6 +2242,11 @@ class PlaybackEngine:
             self._remote_dj_session_stop()
         if self.main_pipeline:
             self.main_pipeline.set_state(Gst.State.NULL)
+        # Audio is already NULL: a short bounded drain of queued refill
+        # evidence; anything left is dropped (roadmap 2.27, best effort).
+        evidence = getattr(self, "_hour_refill_evidence", None)
+        if evidence is not None:
+            evidence.stop()
         if self.loop.is_running():
             self.loop.quit()
         print("Engine stopped.")
@@ -6737,7 +6747,13 @@ class PlaybackEngine:
         # restart) so it holds until _create_deck actually consumes and
         # clears it.
         if not is_forced and not getattr(self, "_resume_hint", None):
-            result = maybe_schedule_song_request(log_item)
+            # Roadmap 2.27: with request capture On, a committed swap hands
+            # in-memory evidence to the worker (on commit, put_nowait only).
+            recorder = getattr(self, "_hour_refill_evidence", None)
+            if recorder is not None and recorder.capture_requests:
+                result = maybe_schedule_song_request(log_item, refill_evidence_sink=recorder.offer)
+            else:
+                result = maybe_schedule_song_request(log_item)
             if result is SCHEDULING_CONTENDED:
                 # Another transaction is mid-write to this exact
                 # LogItem and didn't resolve within the bounded wait --
@@ -14650,6 +14666,9 @@ class PlaybackEngine:
             print(f"  [{slot}] Eject ignored -- deck no longer holds log_item "
                   f"{expected_log_item_id}")
             return
+        # Roadmap 2.27: transition ownership as it was when the Eject arrived.
+        start_next_was_active = getattr(self, "_start_next_active", None) is not None
+        transition_was_pending = bool(getattr(self, "_next_triggered", False))
         self._start_next_cancel_for_operator_command("eject", slot)
         vt_phase = self._vt.get("phase", "idle")
 
@@ -14675,6 +14694,9 @@ class PlaybackEngine:
             # advance exactly once itself.
             print(f"  [{slot}] Eject ignored -- deck is already completing")
             return
+        self._offer_eject_refill_evidence(
+            deck, slot, expected_log_item_id, start_next_was_active, transition_was_pending,
+        )
         order = getattr(deck, "occurrence_order", 0)
 
         def _finish():
@@ -14694,6 +14716,27 @@ class PlaybackEngine:
         # _finish() -- to the moment that call genuinely returns. See
         # _retire_deck_respecting_gated_seek.
         self._retire_deck_respecting_gated_seek(deck, on_retired=_finish)
+
+    def _offer_eject_refill_evidence(self, deck, slot, expected_log_item_id,
+                                     start_next_was_active, transition_was_pending):
+        """Roadmap 2.27 Phase A, evidence only: hand a completed, eligible
+        Eject to the evidence worker. In-memory reads plus one bounded
+        put_nowait -- no query, lock or wait -- and it can never affect the
+        Eject itself. Off (the default) costs one attribute read."""
+        recorder = getattr(self, "_hour_refill_evidence", None)
+        if recorder is None or not recorder.capture_eject:
+            return
+        try:
+            evidence, _reason = eject_evidence_from_engine(
+                self, deck, slot=slot, expected_log_item_id=expected_log_item_id,
+                start_next_active=start_next_was_active,
+                transition_pending=transition_was_pending,
+                occurred_at=timezone.now(),
+            )
+            if evidence is not None:
+                recorder.offer(evidence)
+        except Exception:  # noqa: BLE001 -- evidence must never touch playout
+            recorder.note_snapshot_error()
 
     def _reload_and_restart_current_log(self):
         """Tear down whatever's playing and switch to the current

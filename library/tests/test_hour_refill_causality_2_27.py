@@ -106,7 +106,7 @@ class EjectClassificationTests(SimpleTestCase):
     GOOD = EjectObservation(
         engine_instance="eng-1", slot="A", expected_log_item_id=200, deck_present=True,
         deck_log_item_id=200, deck_generation=17, completion_claimed=True,
-        on_air=True, scheduled_category_kind_code="music",
+        occurrence_source="scheduled", on_air=True, scheduled_category_kind_code="music",
         position_seconds=100.0, cue_in_seconds=2.0, next_start_seconds=250.0, duration_seconds=260.0,
     )
 
@@ -136,8 +136,11 @@ class EjectClassificationTests(SimpleTestCase):
             "identity_unknown": dict(deck_generation=None),
             "manual_hold": dict(manual_mode=True),
             "remote_dj_owner": dict(remote_dj_owner=True),
+            "mic_live": dict(mic_live=True),
+            "start_next_transition": dict(start_next_active=True),
             "vt_transition": dict(vt_phase="outro_playing"),
             "overlap": dict(other_live_deck=True),
+            "transition_pending": dict(transition_pending=True),
             "not_scheduled_occurrence": dict(occurrence_source="insert"),
             "not_music": dict(scheduled_category_kind_code="legal_id"),
             "not_on_air": dict(on_air=False),
@@ -151,8 +154,11 @@ class EjectClassificationTests(SimpleTestCase):
                 self.assertIsNone(envelope)
                 self.assertEqual(reason, expected)
 
-    def test_forced_dedication_and_resumed_occurrences_are_not_causes(self):
-        for source in ("forced", "resume", "play_now"):
+    def test_unproven_occurrence_sources_are_not_causes(self):
+        self.assertEqual(EjectObservation(engine_instance="e", slot="A", expected_log_item_id=None,
+                                          deck_present=True).occurrence_source, "unknown")
+        for source in ("unknown", "continuation", "generated_fill", "live_fill",
+                       "operator_inserted", "engine_inserted"):
             with self.subTest(source):
                 _, reason = classify_eject_observation(replace(self.GOOD, occurrence_source=source))
                 self.assertEqual(reason, "not_scheduled_occurrence")
@@ -332,9 +338,8 @@ class PolicyTests(TestCase):
 class OffParityStructureTests(SimpleTestCase):
     """Phase A must leave the engine, live fill and normal fill as r0119."""
 
-    def test_no_engine_or_fill_code_references_the_refill_evidence(self):
+    def test_no_fill_code_references_the_refill_evidence(self):
         for relative in (
-            "library/services/engine.py",
             "library/services/log_builder.py",
             "webrequests/management/commands/refresh_song_request_statuses.py",
         ):
@@ -342,6 +347,16 @@ class OffParityStructureTests(SimpleTestCase):
             with self.subTest(relative):
                 self.assertNotIn("hour_refill", source)
                 self.assertNotIn("HourRefill", source)
+
+    def test_engine_touches_only_the_evidence_snapshot_and_worker(self):
+        import re
+
+        source = (REPO / "library/services/engine.py").read_text()
+        names = set(re.findall(r"\b\w*(?:hour_refill|HourRefill)\w*\b", source, flags=re.IGNORECASE))
+        self.assertEqual(names, {"hour_refill_causality", "hour_refill_evidence",
+                                 "HourRefillEvidenceRecorder", "_hour_refill_evidence"})
+        self.assertNotIn("HourRefillCause", source)
+        self.assertNotIn("HourRefillPolicy", source)
 
     def test_only_the_request_swap_calls_the_capture(self):
         callers = []

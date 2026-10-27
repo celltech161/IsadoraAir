@@ -8,19 +8,24 @@ records yet; see docs/roadmap/2_27_PHASE_A_CAUSALITY_CONTRACT.md.
   from plain values, whether a real swap is a cause;
   record_request_substitution_cause() persists it inside the caller's
   transaction, in a savepoint, and never lets a failure escape.
-- operator Eject: classify_eject_observation() is the contract for a
-  later live hook. No engine code calls it in Phase A.
+- operator Eject: eject_evidence_from_engine() snapshots a completed Eject
+  from in-memory engine state only and classify_eject_observation() decides
+  eligibility; the engine hands the result to the evidence worker
+  (hour_refill_evidence), which alone writes it.
+- engine-path request swaps: request_substitution_from_memory() builds the
+  same evidence from objects the swap already holds, for an on-commit
+  handoff to the worker. No query, savepoint or lock.
 - trace: build_causality_trace() orders, deduplicates and summarises
   causes. It reports observed shortening, never a net hour deficit.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 
 from django.db import transaction
 
-from library.services.log_builder import effective_airtime_seconds
+from library.services.log_builder import _effective_airtime, effective_airtime_seconds
 
 CAUSE_REQUEST_SUBSTITUTION = "request_substitution"
 CAUSE_OPERATOR_EJECT = "operator_eject"
@@ -37,6 +42,35 @@ def request_music_threshold_exceeded(net_deficit_seconds):
 
 def _ms(value):
     return round(float(value), 3)
+
+
+_MISSING = object()
+
+
+def _loaded(instance, name):
+    """A concrete field's value only if already loaded on `instance` -- never
+    a deferred-field query. _MISSING otherwise."""
+    if instance is None:
+        return _MISSING
+    return getattr(instance, "__dict__", {}).get(name, _MISSING)
+
+
+def _cached(instance, name):
+    """A forward relation's object only if already cached on `instance` --
+    never a lazy query. None otherwise (including for non-model stand-ins)."""
+    state = getattr(instance, "_state", None)
+    cache = getattr(state, "fields_cache", None)
+    if not isinstance(cache, dict):
+        return None
+    return cache.get(name)
+
+
+def _loaded_airtime(track):
+    """effective_airtime from already-loaded Track fields, else None."""
+    values = [_loaded(track, n) for n in ("next_start_seconds", "duration_seconds", "cue_in_seconds")]
+    if any(v is _MISSING for v in values):
+        return None
+    return _effective_airtime(*values)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +97,30 @@ class RequestSubstitutionEvidence:
     replacement_effective_airtime_seconds: float
     observed_shortening_seconds: float
     song_request_id: int
+
+    def cause_fields(self):
+        """HourRefillCause column values."""
+        return dict(
+            source_key=self.source_key,
+            cause_type=CAUSE_REQUEST_SUBSTITUTION,
+            occurred_at=self.occurred_at,
+            playlist_log_id_snapshot=self.playlist_log_id,
+            log_date=self.log_date,
+            log_hour=self.log_hour,
+            log_item_id_snapshot=self.log_item_id,
+            log_item_position=self.log_item_position,
+            scheduled_category_id_snapshot=self.scheduled_category_id,
+            scheduled_category_code=self.scheduled_category_code,
+            scheduled_category_kind_code=self.scheduled_category_kind_code,
+            original_track_id_snapshot=self.original_track_id,
+            original_track_title=self.original_track_title,
+            original_track_artist=self.original_track_artist,
+            original_effective_airtime_seconds=self.original_effective_airtime_seconds,
+            replacement_track_id_snapshot=self.replacement_track_id,
+            replacement_effective_airtime_seconds=self.replacement_effective_airtime_seconds,
+            observed_shortening_seconds=self.observed_shortening_seconds,
+            song_request_id_snapshot=self.song_request_id,
+        )
 
 
 def request_substitution_source_key(log_item_id, song_request_id, original_track_id, replacement_track_id):
@@ -186,27 +244,7 @@ def persist_request_substitution_evidence(evidence):
 
     try:
         with transaction.atomic():
-            HourRefillCause.objects.create(
-                source_key=evidence.source_key,
-                cause_type=CAUSE_REQUEST_SUBSTITUTION,
-                occurred_at=evidence.occurred_at,
-                playlist_log_id_snapshot=evidence.playlist_log_id,
-                log_date=evidence.log_date,
-                log_hour=evidence.log_hour,
-                log_item_id_snapshot=evidence.log_item_id,
-                log_item_position=evidence.log_item_position,
-                scheduled_category_id_snapshot=evidence.scheduled_category_id,
-                scheduled_category_code=evidence.scheduled_category_code,
-                scheduled_category_kind_code=evidence.scheduled_category_kind_code,
-                original_track_id_snapshot=evidence.original_track_id,
-                original_track_title=evidence.original_track_title,
-                original_track_artist=evidence.original_track_artist,
-                original_effective_airtime_seconds=evidence.original_effective_airtime_seconds,
-                replacement_track_id_snapshot=evidence.replacement_track_id,
-                replacement_effective_airtime_seconds=evidence.replacement_effective_airtime_seconds,
-                observed_shortening_seconds=evidence.observed_shortening_seconds,
-                song_request_id_snapshot=evidence.song_request_id,
-            )
+            HourRefillCause.objects.create(**evidence.cause_fields())
         return True
     except Exception as exc:  # noqa: BLE001 -- evidence must never break scheduling
         error = type(exc).__name__
@@ -233,8 +271,54 @@ def _emit_capture_failure(detail):
     )
 
 
+def request_substitution_from_memory(*, caller_item, locked_log, locked_item, replacement_track,
+                                     song_request, occurred_at):
+    """Evidence for an engine-path swap from objects already in memory, else
+    None. Never queries: the displaced Track's airtime comes from the
+    engine's own queue object (`caller_item`, loaded with its Track) and only
+    when it is provably the same Track the locked row still holds; the slot
+    category and kind come from the locked row's select_related cache.
+    Anything not already loaded fails closed. Never raises."""
+    try:
+        original_track = _cached(caller_item, "track")
+        if (
+            original_track is None
+            or _loaded(caller_item, "track_id") != locked_item.track_id
+            or _loaded(original_track, "id") != locked_item.track_id
+        ):
+            return None
+        original_airtime = _loaded_airtime(original_track)
+        replacement_airtime = _loaded_airtime(replacement_track)
+        category = _cached(locked_item, "category")
+        kind = _cached(category, "kind")
+        if original_airtime is None or replacement_airtime is None or kind is None:
+            return None
+        title = _loaded(original_track, "title")
+        evidence, _reason = build_request_substitution_evidence(
+            occurred_at=occurred_at,
+            playlist_log_id=locked_log.id,
+            log_date=locked_log.date,
+            log_hour=locked_log.hour,
+            log_item_id=locked_item.id,
+            log_item_position=locked_item.position,
+            scheduled_category_id=locked_item.category_id,
+            scheduled_category_code=_loaded(category, "code") if _loaded(category, "code") is not _MISSING else "",
+            scheduled_category_kind_code=_loaded(kind, "code") if _loaded(kind, "code") is not _MISSING else "",
+            original_track_id=locked_item.track_id,
+            original_track_title=locked_item.track_title or ("" if title is _MISSING else title),
+            original_track_artist=locked_item.track_artist,
+            original_effective_airtime_seconds=original_airtime,
+            replacement_track_id=_loaded(replacement_track, "id"),
+            replacement_effective_airtime_seconds=replacement_airtime,
+            song_request_id=song_request.id,
+        )
+        return evidence
+    except Exception:  # noqa: BLE001 -- evidence must never break scheduling
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Operator Eject (contract only -- no live hook in Phase A)
+# Operator Eject
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -249,13 +333,18 @@ class EjectObservation:
     deck_log_item_id: int | None = None
     deck_generation: int | None = None
     completion_claimed: bool = False
-    occurrence_source: str = "scheduled"   # scheduled | insert | forced | resume | play_now
+    # "scheduled" only for LogItem.origin == generated_schedule on a fresh
+    # (non-continuation) deck; otherwise the origin, "continuation" or "unknown".
+    occurrence_source: str = "unknown"
     on_air: bool = False                   # first real buffer recorded
     paused: bool = False
     other_live_deck: bool = False
     vt_phase: str = "idle"
     manual_mode: bool = False
     remote_dj_owner: bool = False
+    mic_live: bool = False
+    start_next_active: bool = False        # a Start Next transition existed at the Eject
+    transition_pending: bool = False       # something else owned "what starts next"
     scheduled_category_kind_code: str = ""
     position_seconds: float | None = None
     cue_in_seconds: float | None = 0.0
@@ -308,10 +397,16 @@ def classify_eject_observation(obs):
         return None, "manual_hold"
     if obs.remote_dj_owner:
         return None, "remote_dj_owner"
+    if obs.mic_live:
+        return None, "mic_live"
+    if obs.start_next_active:
+        return None, "start_next_transition"
     if obs.vt_phase != "idle":
         return None, "vt_transition"
     if obs.other_live_deck:
         return None, "overlap"
+    if obs.transition_pending:
+        return None, "transition_pending"
     if obs.occurrence_source != "scheduled":
         return None, "not_scheduled_occurrence"
     if obs.scheduled_category_kind_code != "music":
@@ -337,6 +432,145 @@ def classify_eject_observation(obs):
         log_item_id=obs.deck_log_item_id,
         eject_position_seconds=_ms(obs.position_seconds),
         remaining_effective_airtime_seconds=remaining,
+    ), None
+
+
+@dataclass(frozen=True)
+class EjectCauseEvidence:
+    """Primitive-only snapshot of a completed, eligible Eject, handed to the
+    evidence worker. Built on the engine thread without any query."""
+    envelope: EjectCauseEnvelope
+    occurred_at: datetime
+    playlist_log_id: int
+    log_date: date
+    log_hour: int
+    log_item_position: int
+    scheduled_category_id: int | None
+    scheduled_category_code: str
+    scheduled_category_kind_code: str
+    original_track_id: int
+    original_track_title: str
+    original_track_artist: str
+    original_effective_airtime_seconds: float
+
+    @property
+    def source_key(self):
+        return self.envelope.source_key
+
+    def cause_fields(self):
+        """HourRefillCause column values."""
+        env = self.envelope
+        return dict(
+            source_key=env.source_key,
+            cause_type=CAUSE_OPERATOR_EJECT,
+            occurred_at=self.occurred_at,
+            playlist_log_id_snapshot=self.playlist_log_id,
+            log_date=self.log_date,
+            log_hour=self.log_hour,
+            log_item_id_snapshot=env.log_item_id,
+            log_item_position=self.log_item_position,
+            scheduled_category_id_snapshot=self.scheduled_category_id,
+            scheduled_category_code=self.scheduled_category_code,
+            scheduled_category_kind_code=self.scheduled_category_kind_code,
+            original_track_id_snapshot=self.original_track_id,
+            original_track_title=self.original_track_title,
+            original_track_artist=self.original_track_artist,
+            original_effective_airtime_seconds=self.original_effective_airtime_seconds,
+            observed_shortening_seconds=env.remaining_effective_airtime_seconds,
+            engine_instance=env.engine_instance,
+            deck_slot=env.slot,
+            deck_generation=env.deck_generation,
+            eject_position_seconds=env.eject_position_seconds,
+        )
+
+
+def _occurrence_source(deck, log_item):
+    from library.models import LogItem
+
+    if getattr(deck, "continuation_reason", None):
+        return "continuation"
+    origin = _loaded(log_item, "origin")
+    if origin is _MISSING or not origin:
+        return "unknown"
+    return "scheduled" if origin == LogItem.ORIGIN_GENERATED_SCHEDULE else origin
+
+
+def eject_evidence_from_engine(engine, deck, *, slot, expected_log_item_id, start_next_active,
+                               transition_pending, occurred_at):
+    """Called by PlaybackEngine._eject_deck on the engine thread, only after
+    claim_completion("eject") succeeded and before retirement. Reads
+    in-memory engine/deck state, the deck's current position (a GStreamer
+    query, no database) and already-loaded LogItem/Track/Category fields.
+    Returns (EjectCauseEvidence, None) or (None, reason). Never queries."""
+    log_item = deck.log_item
+    track = deck.track
+    category = _cached(log_item, "category")
+    kind = _cached(category, "kind")
+    kind_code = _loaded(kind, "code")
+    obs = EjectObservation(
+        engine_instance=getattr(engine, "_engine_session_id", "") or "",
+        slot=slot,
+        expected_log_item_id=expected_log_item_id,
+        deck_present=True,
+        deck_log_item_id=_loaded(log_item, "id") if _loaded(log_item, "id") is not _MISSING else None,
+        deck_generation=getattr(deck, "generation", None),
+        completion_claimed=getattr(deck, "completion_claimed", False)
+        and getattr(deck, "completion_reason", None) == "eject",
+        occurrence_source=_occurrence_source(deck, log_item),
+        on_air=bool(getattr(deck, "air_start_recorded", False)),
+        paused=bool(getattr(deck, "paused", False)),
+        other_live_deck=any(other is not deck for other in engine._live_decks()),
+        vt_phase=(getattr(engine, "_vt", None) or {}).get("phase", "idle"),
+        manual_mode=bool(getattr(engine, "manual_mode", False)),
+        remote_dj_owner=getattr(engine, "remote_dj_session", None) is not None,
+        mic_live=bool(engine._any_mic_live()),
+        start_next_active=start_next_active,
+        transition_pending=transition_pending,
+        scheduled_category_kind_code="" if kind_code is _MISSING else kind_code,
+        cue_in_seconds=None,
+        next_start_seconds=None,
+        duration_seconds=None,
+    )
+    # Cheap exclusions first (placeholder position/end point that cannot
+    # themselves exclude); the position query only for a possible cause.
+    envelope, reason = classify_eject_observation(replace(obs, position_seconds=0.0, next_start_seconds=1.0))
+    if envelope is None:
+        return None, reason
+    values = {n: _loaded(track, n) for n in ("next_start_seconds", "duration_seconds", "cue_in_seconds")}
+    playlist_log = _cached(log_item, "playlist_log")
+    identity = {
+        "log_date": _loaded(playlist_log, "date"),
+        "log_hour": _loaded(playlist_log, "hour"),
+        "position": _loaded(log_item, "position"),
+        "track_id": _loaded(track, "id"),
+        "log_id": _loaded(log_item, "playlist_log_id"),
+        "category_id": _loaded(log_item, "category_id"),
+    }
+    if any(v is _MISSING for v in values.values()) or any(v is _MISSING for v in identity.values()):
+        return None, "identity_unknown"
+    obs = replace(obs, position_seconds=engine._get_deck_position(deck), **values)
+    envelope, reason = classify_eject_observation(obs)
+    if envelope is None:
+        return None, reason
+    title = _loaded(log_item, "track_title")
+    artist = _loaded(log_item, "track_artist")
+    code = _loaded(category, "code")
+    return EjectCauseEvidence(
+        envelope=envelope,
+        occurred_at=occurred_at,
+        playlist_log_id=identity["log_id"],
+        log_date=identity["log_date"],
+        log_hour=identity["log_hour"],
+        log_item_position=identity["position"],
+        scheduled_category_id=identity["category_id"],
+        scheduled_category_code="" if code is _MISSING else code,
+        scheduled_category_kind_code=kind_code,
+        original_track_id=identity["track_id"],
+        original_track_title="" if title is _MISSING else title,
+        original_track_artist="" if artist is _MISSING else artist,
+        original_effective_airtime_seconds=_ms(_effective_airtime(
+            values["next_start_seconds"], values["duration_seconds"], values["cue_in_seconds"],
+        )),
     ), None
 
 

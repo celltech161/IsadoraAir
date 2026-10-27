@@ -2,7 +2,8 @@
 
 Status: **Phase A, evidence only.** Baseline r0119 (`9e7adc0`). Nothing in this
 phase selects, installs, appends, reorders or plays anything. The engine's
-on-air behaviour is unchanged from r0119.
+on-air behaviour is unchanged from r0119: its only additions are in-memory
+reads and one bounded `put_nowait` handoff, and only when capture is On.
 
 This document defines what counts as a **cause** for a later skip-aware or
 request-aware hour refill, how a cause is captured and stored, and what Phase A
@@ -46,15 +47,23 @@ Captured, immediately before `locked_item.track` is overwritten:
 A swap into a **future** hour is recorded with that hour's date/hour. It is a
 future cause only; it never authorises repair of the current hour.
 
-### 2.2 `operator_eject` — contract defined, live capture **deferred**
+### 2.2 `operator_eject` — implemented (best effort, via the evidence worker)
 
 Eligible only for a **completed** Eject: the exact deck generation the command
 targeted (honouring `expected_log_item_id`), `claim_completion("eject")`
-returned true, the occurrence is a scheduled music `LogItem` that is already on
-air (first real buffer recorded), it is the only live deck (no crossfade or
-overlap), no Voice Track transition, Manual hold or Remote DJ ownership is
-active, the deck is not paused, and the **remaining listener-facing airtime**
-at the Eject instant is positive:
+returned true, and **all** of the following:
+
+* the occurrence's `LogItem.origin` is `generated_schedule` (§7.1) on a fresh
+  deck (no `continuation_reason`: not a restart resume or seek recreation);
+* its **scheduled** `LogItem.category` kind is `music`;
+* it is already on air (`air_start_recorded`, the first real buffer committed);
+* it is the only live deck (no crossfade or overlap, **either** deck);
+* no Start Next transition existed when the Eject arrived, and nothing else
+  owned "what starts next" (`_next_triggered`: VT, Start Next, a held trigger);
+* no Voice Track phase, Manual mode, live microphone (local or remote) or
+  connected Remote DJ session;
+* the deck is not paused; and the **remaining listener-facing airtime** at the
+  Eject instant is positive:
 
 ```
 remaining = (next_start or duration) − max(position, cue_in)      (> 0)
@@ -65,8 +74,9 @@ Full file length is never used as the amount lost. The identity is
 the deck generation is a per-process serial, so engine instance + generation is
 unique across restarts.
 
-The classifier (`classify_eject_observation`) and its fixtures are implemented.
-The live hook is **not** wired; see §7.
+Every input is read from memory; anything not already loaded (for example
+the category of a restart-resumed item, which is loaded without it) fails
+closed. The live hook is wired; see §7.
 
 ## 3. Not causes in v1
 
@@ -79,8 +89,11 @@ an already-reserved slot), an equal or longer substitution, a same-Track
 "swap", a claimed or played slot, lock contention, a rolled-back transaction,
 an Eject that was only queued, an Eject of an empty slot, a stale/mismatched
 `expected_log_item_id`, a repeated completion (`claim_completion` false), an
-Eject of the outgoing deck of a crossfade, an Eject during a VT transition and
-an Eject of a non-music item.
+Eject of **either** deck during a crossfade or overlap, an Eject during a Start
+Next or VT transition, an Eject of a non-music item, and an Eject of any
+occurrence whose origin is not `generated_schedule` (operator inserted, live
+fill, build-time fill, engine inserted, unknown/legacy) or which is a
+continuation deck.
 
 ## 4. Thresholds
 
@@ -157,11 +170,18 @@ Consequences:
 * Preparation (the policy read and, when capture is on, the displaced Track
   read) runs in its own savepoint and also never raises. So even "code
   deployed before its migration" (relation missing) leaves the swap intact.
-* The engine's last-second playback-control caller does **not** opt in. Its
-  default path performs no Phase A policy query, savepoint, displaced-Track
-  lookup or cause insert, whether the policy row is On or Off. It is SQL/lock
-  equivalent to r0119. If only that last-second safety net performs a swap, the
-  cause can be missed; this is an intentional best-effort evidence tradeoff.
+* The engine's last-second playback-control caller never uses the in-transaction
+  path (Codex `10ca80e`). With request capture Off (the worker's cached flag) it
+  calls `maybe_schedule_song_request(log_item)` exactly as r0119. With capture
+  On it passes `refill_evidence_sink=recorder.offer`; the swap then builds the
+  evidence **from objects it already holds** -- the slot category and kind from
+  the locked row's `select_related`, the new Track from the candidate's
+  `select_related`, the displaced Track from the engine's own queue object, used
+  only if it is provably the same Track the locked row still holds -- and,
+  after the swap's writes, registers `transaction.on_commit(sink, robust=True)`.
+  No SQL, savepoint, lock or lazy load is added (tested by query count). A
+  rolled-back swap discards the callback, so it cannot create a false cause.
+  Anything not in memory fails closed: no evidence, swap unchanged.
 * With the policy Off (or no policy row), the non-realtime periodic reconciler's
   opt-in path performs `SAVEPOINT` + one primary-key policy read + `RELEASE`,
   only when it is actually making a swap. There is no insert.
@@ -170,7 +190,20 @@ Consequences:
 * Collapsed requests are not listed on the cause; they are recoverable from
   `SongRequest.log_item_id`.
 
-## 7. Eject capture: why the live hook is deferred
+### 6.1 Request coverage
+
+| Caller | Thread / transaction | Evidence path | Durability |
+| --- | --- | --- | --- |
+| `refresh_song_request_statuses` (run only by `ingest_web_requests`, systemd timer every 20 s, after a successful public-site fetch) | management command; the swap's own transaction | in-transaction savepoint insert (§6) | atomic with the swap |
+| `PlaybackEngine._start_next_track` last-second safety net (non-forced, non-resume items) | GLib thread; the swap's own transaction | in-memory evidence, on-commit `put_nowait` to the evidence worker | best effort: lost on queue full, worker down, policy unreadable, insert failure or hard crash before the write |
+
+There are no other callers. Not proven from source: what share of real swaps
+each path performs. The reconciler only runs after a successful public-site
+fetch (`ingest_web_requests` raises before calling it otherwise), so during a
+public-site outage every swap is an engine-path swap. Phase B must therefore
+treat request evidence as **non-exhaustive**.
+
+## 7. Operator Eject capture
 
 Map (r0119):
 
@@ -192,31 +225,63 @@ The right capture point is in `_eject_deck` immediately after
 `_get_deck_position(deck)` (a GStreamer query, no DB). Building the envelope
 there is pure and cheap.
 
-The blocker is **reliable scheduled-occurrence provenance**:
+Implemented exactly there. `_eject_deck` records whether a Start Next
+transition existed and whether `_next_triggered` was set **before** it cancels
+Start Next, then, only after `claim_completion("eject")` succeeds, calls
+`_offer_eject_refill_evidence`. With capture Off (the default) that is one
+attribute read. With capture On it runs `eject_evidence_from_engine`: cheap
+in-memory exclusions first, then one `_get_deck_position` GStreamer query, then
+one `put_nowait`. The whole call is wrapped so a snapshot error is counted and
+can never affect the Eject; retirement, advancement, VT hand-off and duration
+accounting are untouched. **Database operations added to the engine thread:
+zero** (tested by running every Eject case under a connection blocker).
 
-* Writing on the GLib thread adds a blocking DB round trip to the Eject path.
-  The workorder forbids that.
-* Joining the existing `_persist_deck_duration` transaction would add the
-  insert to a transaction that is already synchronous on the GLib thread. That
-  is still an added blocking statement. It also couples the evidence to a path
-  that returns `False` with no `PlayEvent`, and would change the
-  accounting-path code the workorder says not to change.
-* Handing the envelope to a bounded background writer is nonblocking. An
-  immediate hard engine-process crash may lose the queued cause; that is an
-  explicitly accepted v1 limitation. No journal, synchronous fallback or
-  exactly-once replay is required. An orderly stop should attempt only a short,
-  bounded drain.
-* A scheduled and an operator-inserted music `LogItem` can become
-  indistinguishable after queue position normalization. Phase A must not invent
-  that provenance. Any Eject during an active overlap/crossfade is excluded for
-  both incoming and outgoing decks, and Start Next itself is never a cause.
+### 7.1 Occurrence provenance (`LogItem.origin`)
 
-Phase A therefore ships the envelope, the source key, the classifier and its
-fixtures, and **no engine change**. The minimal remaining prerequisite is a
-durable, conservative scheduled-versus-inserted occurrence marker. Once that
-exists, a single-purpose bounded in-process queue and one persistence worker
-can be added without any ORM work on the engine thread; hard-crash replay is
-not required for v1.
+Set once, at creation, by the writers that can prove it; never derived from
+position (operator inserts start at 9999 and are renumbered) or category:
+
+| Writer | origin |
+| --- | --- |
+| `build_hour_log` (engine auto-build, admin rebuild) | `generated_schedule` |
+| LogFillConfig fill picks during a build | `generated_fill` |
+| `append_fill_items` (async live fill) | `live_fill` |
+| `api_engine_insert_track` | `operator_inserted` |
+| engine `_splice_log_item_db_at` (urgent, native, dedication intro) | `engine_inserted` |
+| Play Now playlist builds, admin-added rows, legacy rows, any other writer | NULL (unknown) |
+
+Reorder (`api_engine_set_next`, `_reposition_items`) and request Track swaps
+(`update_fields` excludes it) never change it; `editable=False` keeps it out of
+admin forms. Only `generated_schedule` can qualify for an Eject cause.
+Build-time fill is excluded conservatively. Migration 0094 is a nullable
+`AddField` with no database default, so code from before the migration keeps
+inserting rows (as NULL) during an upgrade.
+
+### 7.2 Evidence worker (`library.services.hour_refill_evidence`)
+
+One `HourRefillEvidenceRecorder` per `PlaybackEngine`, constructed in
+`__init__`, started with the engine's other workers (idempotent `start()`),
+stopped at the end of `stop()` **after** the main pipeline is NULL. One daemon
+thread owns every evidence database operation:
+
+* the engine side calls `offer()`: a `put_nowait` into a queue of at most 64,
+  never waiting; when the worker is not running, or the queue is full, the
+  event is dropped and counted;
+* the worker reads the policy at start and every 30 s and publishes two
+  booleans (`capture_requests`, `capture_eject`), which are the engine's only
+  gate. They are False until the first successful read and after any failed
+  one (fail closed). The worker re-reads the policy before each write and
+  drops the event if that trigger is now Off;
+* each write is one `HourRefillCause` insert; `IntegrityError` on
+  `source_key` is counted as a duplicate; any other error drops the event;
+  nothing is retried;
+* `stop()` turns both gates off, then waits at most 1 s while the worker
+  writes what is already queued; anything left is dropped;
+* drops print a single line on the 1st and every 100th occurrence per reason.
+
+A hard crash, SIGKILL or power loss loses whatever is still queued. This is
+accepted (operator decision); there is no journal, synchronous fallback or
+exactly-once delivery, and the recorder must not be described as durable.
 
 ## 8. Privacy
 
@@ -245,7 +310,9 @@ It always reports `net_deficit_seconds = None` and `authoritative = False`.
   forced dedication pairs in the runway.
 * Whether the displaced Track would actually have aired in full (an operator
   could have ejected it later anyway).
-* For Eject: everything in §7.
+* Eject causes and engine-path request causes are best effort (§6.1, §7.2):
+  absence of a cause is not evidence that nothing happened.
+* Build-time fill and Play Now occurrences never produce Eject causes.
 
 ## 11. Interface for Phase B (recommendation, not built)
 
