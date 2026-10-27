@@ -141,6 +141,7 @@ class PlaybackWindowSnapshot:
             return [it.log_item_id, it.playlist_log_id, it.position, it.track_id, it.category_id,
                     it.claimed, it.played]
         payload = {
+            "engine_instance": self.engine_instance,
             "log": [self.active_log_id, str(self.active_log_date), self.active_log_hour],
             "cursor": self.cursor,
             "queue": [item(it) for it in self.queue],
@@ -523,6 +524,7 @@ class RefillProjection:
     reasons: tuple
     snapshot_digest: str
     captured_at: datetime
+    engine_instance: str
     active_log_id: int | None
     active_log_date: object
     active_log_hour: int | None
@@ -589,6 +591,7 @@ def project_refill(snapshot, *, causes, boundary, allowance=TRANSITION_ALLOWANCE
     base = dict(
         snapshot_digest=snapshot.digest(),
         captured_at=snapshot.captured_at,
+        engine_instance=snapshot.engine_instance,
         active_log_id=snapshot.active_log_id,
         active_log_date=snapshot.active_log_date,
         active_log_hour=snapshot.active_log_hour,

@@ -406,6 +406,10 @@ class SnapshotDigestTests(SimpleTestCase):
         later = replace(snap, captured_at=at(14, 41), decks=(replace(snap.decks[0], position_seconds=70.0),))
         self.assertEqual(snap.digest(), later.digest())
 
+    def test_engine_restart_changes_the_digest(self):
+        snap = hour([290])
+        self.assertNotEqual(snap.digest(), replace(snap, engine_instance="replacement-engine").digest())
+
 
 class PlacementTests(SimpleTestCase):
     # Case 5 -- protected closing rows.
@@ -540,3 +544,12 @@ class StalenessTests(SimpleTestCase):
         late = snap.captured_at + timedelta(seconds=PROPOSAL_TTL_SECONDS)
         self.assertEqual(proposal_staleness(proposal, fresh_snapshot=snap, now=late,
                                             active_request_track_ids=set()), ("expired",))
+
+    def test_engine_restart_makes_the_proposal_stale(self):
+        snap = hour([290, 290, 290])
+        restarted = replace(snap, engine_instance="replacement-engine")
+        self.assertEqual(
+            proposal_staleness(self.proposal(snap), fresh_snapshot=restarted, now=snap.captured_at,
+                               active_request_track_ids=set()),
+            ("engine_instance_changed",),
+        )

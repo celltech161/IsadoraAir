@@ -114,6 +114,32 @@ def resolve_boundary(snapshot):
 
     if snapshot.active_log_date is None or snapshot.active_log_hour is None:
         return BoundaryProof(BOUNDARY_UNKNOWN, None, "none", reason="no_active_log")
+    profile = _active_profile()
+    if profile is None:
+        return BoundaryProof(BOUNDARY_UNKNOWN, None, "none", reason="no_active_schedule_profile")
+
+    # Phase B does not model an intra-log program handoff. A later segment
+    # in the active hour is therefore an earlier protected boundary, not
+    # spare runway to the next hour. Abstain rather than proposing material
+    # that Phase C could place across that transition.
+    active_start = timezone.make_aware(
+        datetime.combine(snapshot.active_log_date, dtime(snapshot.active_log_hour)),
+        timezone.get_current_timezone(),
+    )
+    future_transitions = [
+        active_start + timedelta(minutes=segment.start_minute)
+        for segment in resolve_schedule_segments(
+            snapshot.active_log_date, snapshot.active_log_hour, profile,
+        )
+        if active_start + timedelta(minutes=segment.start_minute) > snapshot.captured_at
+    ]
+    if future_transitions:
+        return BoundaryProof(
+            BOUNDARY_UNKNOWN, None, "schedule_resolution",
+            snapshot.active_log_date, snapshot.active_log_hour,
+            reason="future_intra_log_transition_unmodelled",
+        )
+
     n_date, n_hour = next_hour_key(snapshot.active_log_date, snapshot.active_log_hour)
     n_start = timezone.make_aware(datetime.combine(n_date, dtime(n_hour)), timezone.get_current_timezone())
     row = (PlaylistLog.objects.filter(date=n_date, hour=n_hour, status="approved")
@@ -129,9 +155,6 @@ def resolve_boundary(snapshot):
         if takeover is None:
             return BoundaryProof(BOUNDARY_ORDINARY, n_start, "approved_next_log", n_date, n_hour, log_id)
         return BoundaryProof(BOUNDARY_PARTIAL, takeover, "approved_next_log", n_date, n_hour, log_id)
-    profile = _active_profile()
-    if profile is None:
-        return BoundaryProof(BOUNDARY_UNKNOWN, None, "none", n_date, n_hour, reason="no_active_schedule_profile")
     segments = resolve_schedule_segments(n_date, n_hour, profile)
     if not segments:
         return BoundaryProof(BOUNDARY_UNKNOWN, None, "none", n_date, n_hour, reason="next_hour_unscheduled")
@@ -640,7 +663,8 @@ class RefillProposal:
         if p is not None:
             projection = {
                 "outcome": p.outcome, "reasons": list(p.reasons), "snapshot_digest": p.snapshot_digest,
-                "captured_at": timezone.localtime(p.captured_at).isoformat(), "active_log_id": p.active_log_id,
+                "captured_at": timezone.localtime(p.captured_at).isoformat(),
+                "engine_instance": p.engine_instance, "active_log_id": p.active_log_id,
                 "active_log_date": str(p.active_log_date) if p.active_log_date else None,
                 "active_log_hour": p.active_log_hour,
                 "boundary": p.boundary.as_dict() if p.boundary else None,
@@ -807,7 +831,10 @@ def proposal_staleness(proposal, *, fresh_snapshot, now, active_request_track_id
         reasons.append("expired")
     if projection is None or fresh_snapshot.active_log_id != projection.active_log_id:
         reasons.append("active_log_changed")
-    if projection is None or fresh_snapshot.digest() != projection.snapshot_digest:
+    engine_changed = projection is None or fresh_snapshot.engine_instance != projection.engine_instance
+    if engine_changed:
+        reasons.append("engine_instance_changed")
+    elif fresh_snapshot.digest() != projection.snapshot_digest:
         reasons.append("queue_or_deck_changed")
     proposed = {m.track_id for m in proposal.music} | ({proposal.psa.track_id} if proposal.psa else set())
     if proposed & set(active_request_track_ids):

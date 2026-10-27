@@ -97,6 +97,7 @@ class RefillFixtures:
         self.talk = Category.objects.create(code="B_TALK", name="Talk", kind=kinds["talk"])
         self.n = 0
         self.log = PlaylistLog.objects.create(date=DAY, hour=14, status="approved")
+        ensure_schedule_profile_state()
 
     def track(self, seconds, category=None, *, artist=None, ready=True, cue_in=0.0, next_start=None, file=True,
               related="", blocked=None):
@@ -273,6 +274,25 @@ class BoundaryResolutionTests(RefillFixtures, TestCase):
         make_row(profile, 15, 30, rotation=Rotation.objects.create(name="B-later"), dow=DAY.weekday())
         b = svc.resolve_boundary(self.bare())
         self.assertEqual((b.kind, b.instant), (proj.BOUNDARY_PARTIAL, at(15, 30)))
+
+    def test_future_intra_log_program_transition_forces_abstention(self):
+        self.next_hour(0)
+        profile = ensure_schedule_profile_state().active_profile
+        make_row(profile, 14, 0, rotation=Rotation.objects.create(name="B-current"), dow=DAY.weekday())
+        make_row(profile, 14, 50, rotation=Rotation.objects.create(name="B-protected"), dow=DAY.weekday())
+        b = svc.resolve_boundary(self.bare())
+        self.assertEqual(
+            (b.kind, b.source, b.reason),
+            (proj.BOUNDARY_UNKNOWN, "schedule_resolution", "future_intra_log_transition_unmodelled"),
+        )
+
+    def test_passed_intra_log_transition_does_not_hide_next_boundary(self):
+        self.next_hour(0)
+        profile = ensure_schedule_profile_state().active_profile
+        make_row(profile, 14, 0, rotation=Rotation.objects.create(name="B-before"), dow=DAY.weekday())
+        make_row(profile, 14, 30, rotation=Rotation.objects.create(name="B-current"), dow=DAY.weekday())
+        b = svc.resolve_boundary(self.bare())
+        self.assertEqual((b.kind, b.instant), (proj.BOUNDARY_ORDINARY, at(15)))
 
     def test_blank_next_hour_is_unproven(self):
         ensure_schedule_profile_state()
@@ -634,12 +654,14 @@ class NoSideEffectTests(RefillFixtures, TestCase):
         self.request_cause(swapped, original)
         self.track(240.0)
         self.track(229.0)
-        p = self.evaluate(self.snap(cursor=2, deck_index=1, deck_position=10.0))
+        snap = self.snap(cursor=2, deck_index=1, deck_position=10.0)
+        p = self.evaluate(snap)
         text = json.dumps(p.as_dict())
         self.assertEqual(p.status, svc.STATUS_PROPOSED)
         for secret in ("Private Person", "Secret words", "secret-req", "requester", "dedication_message"):
             self.assertNotIn(secret, text)
         self.assertIsNotNone(on_deck)
+        self.assertEqual(p.as_dict()["projection"]["engine_instance"], snap.engine_instance)
 
     def test_new_request_or_same_count_edit_makes_the_proposal_stale(self):
         snap = self.eject_hour()
