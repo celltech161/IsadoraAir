@@ -1232,6 +1232,9 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
             "scheduled_time": scheduled_time,
             "track": track,
             "category": category,
+            # Roadmap 2.27 provenance; append_fill_items records live fill
+            # as live_fill regardless.
+            "origin": LogItem.ORIGIN_GENERATED_FILL,
         })
         # Always accumulate for within-build hard exclusion; see the
         # parallel comment in _build_from_rotation and pick_track's
@@ -1856,8 +1859,10 @@ def _emit_selection_diagnostics(ctx, records):
         print(f"  Hour log selection diagnostics for {target_date} {hour:02d}:00 (healthy, no monitoring event needed):", diagnostics_detail)
 
 
-def _build_hour_from_plans(target_date, hour, plans, target_duration_seconds, schedule_profile):
-    """Plan every segment, then persist the hour exactly ONCE."""
+def _build_hour_from_plans(target_date, hour, plans, target_duration_seconds, schedule_profile, origin=None):
+    """Plan every segment, then persist the hour exactly ONCE. `origin` is
+    the roadmap 2.27 LogItem provenance for picks that don't carry their own
+    (None = unknown)."""
     ctx, records, error = _plan_hour(target_date, hour, plans, target_duration_seconds)
     if error:
         return None, error
@@ -1869,7 +1874,7 @@ def _build_hour_from_plans(target_date, hour, plans, target_duration_seconds, sc
         ])
     if ctx.rotation_walked:
         _emit_selection_diagnostics(ctx, records)
-    return _persist_log(target_date, hour, ctx.picks, schedule_profile=schedule_profile)
+    return _persist_log(target_date, hour, ctx.picks, schedule_profile=schedule_profile, origin=origin)
 
 
 def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS,
@@ -1886,7 +1891,7 @@ def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NO
     )
 
 
-def _persist_log(target_date, hour, picks, schedule_profile=None):
+def _persist_log(target_date, hour, picks, schedule_profile=None, origin=None):
     """Delete-then-recreate is only safe as one atomic unit -- an
     exception (or a concurrent process crash) between the delete and the
     bulk_create used to be able to leave an hour with NO PlaylistLog row
@@ -1918,6 +1923,7 @@ def _persist_log(target_date, hour, picks, schedule_profile=None):
                 track_title=pick["track"].title,
                 track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
                 category=pick["category"],
+                origin=pick.get("origin", origin),
             )
             for pick in picks
         ]
@@ -1947,6 +1953,7 @@ def append_fill_items(log, picks, start_position):
                 track_title=pick["track"].title,
                 track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
                 category=pick["category"],
+                origin=LogItem.ORIGIN_LIVE_FILL,
             )
             for i, pick in enumerate(picks)
         ]
@@ -1976,7 +1983,7 @@ def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECON
         return None, "ScheduleBlock has neither rotation nor playlist."
     return _build_hour_from_plans(
         target_date, hour, [_plan_for_segment(segment) for segment in segments],
-        target_duration_seconds, profile,
+        target_duration_seconds, profile, origin=LogItem.ORIGIN_GENERATED_SCHEDULE,
     )
 
 

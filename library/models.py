@@ -1013,6 +1013,27 @@ class LogItem(models.Model):
     playback_claimed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     played_at = models.DateTimeField(null=True, blank=True)
 
+    # Roadmap 2.27: which writer created this occurrence. Set once at
+    # creation by the writers that can prove it; never derived from
+    # position or category, and unchanged by reorder or a request Track
+    # swap. NULL means unknown -- legacy rows, Play Now, admin-added rows and
+    # any other writer -- and is never treated as generated programming.
+    # Nullable (no database default) so code from before this migration can
+    # keep inserting rows during an upgrade.
+    ORIGIN_GENERATED_SCHEDULE = "generated_schedule"
+    ORIGIN_GENERATED_FILL = "generated_fill"
+    ORIGIN_LIVE_FILL = "live_fill"
+    ORIGIN_OPERATOR_INSERTED = "operator_inserted"
+    ORIGIN_ENGINE_INSERTED = "engine_inserted"
+    ORIGIN_CHOICES = [
+        (ORIGIN_GENERATED_SCHEDULE, "Generated schedule"),
+        (ORIGIN_GENERATED_FILL, "Build-time fill"),
+        (ORIGIN_LIVE_FILL, "Live fill"),
+        (ORIGIN_OPERATOR_INSERTED, "Operator inserted"),
+        (ORIGIN_ENGINE_INSERTED, "Engine inserted (urgent, native, dedication intro)"),
+    ]
+    origin = models.CharField(max_length=24, choices=ORIGIN_CHOICES, null=True, blank=True, editable=False)
+
     class Meta:
         ordering = ["playlist_log", "position"]
         unique_together = [("playlist_log", "position")]

@@ -2666,6 +2666,7 @@ def api_engine_insert_track(request):
         track_title=track.title,
         track_artist=track.artist.name if track.artist_id else "",
         category=track.category,
+        origin=LogItem.ORIGIN_OPERATOR_INSERTED,
     )
 
     insert_idx = cursor if position == "next" else len(all_items)

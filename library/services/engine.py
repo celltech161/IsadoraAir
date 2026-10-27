@@ -10309,7 +10309,7 @@ class PlaybackEngine:
         return LogItem.objects.create(
             playlist_log=self.current_log, position=new_position, scheduled_time=timezone.localtime(),
             track=track, track_title=track.title, track_artist=track.artist.name if track.artist_id else "",
-            category=category,
+            category=category, origin=LogItem.ORIGIN_ENGINE_INSERTED,
         )
 
     def _apply_log_item_insert(self, insert_at, new_item):
