@@ -287,6 +287,10 @@ class FitFrame:
     suffix_first_cue: float | None
     suffix_total: float
     allowance: float
+    # Phase C safety budget: seconds that must stay unused after the
+    # inserted items (base + per inserted item). Zero in Phase B.
+    reserve_base: float = 0.0
+    reserve_per_item: float = 0.0
 
     def _last(self, successor_cue):
         last = self.last_prefix
@@ -296,15 +300,23 @@ class FitFrame:
     def base_total(self):
         return self.prefix_fixed + self._last(self.suffix_first_cue) + self.suffix_total
 
+    def reserve(self, count):
+        return self.reserve_base + self.reserve_per_item * count if count else 0.0
+
     def total(self, seq):
+        """Runway with `seq` inserted, plus the safety reserve for it."""
         total = self.prefix_fixed + self._last(seq[0].cue_in) + self.suffix_total
         for index, item in enumerate(seq):
             successor = seq[index + 1].cue_in if index + 1 < len(seq) else self.suffix_first_cue
             total += element_span(item.cue_in, item.end, successor, allowance=self.allowance)
-        return total
+        return total + self.reserve(len(seq))
+
+    def insertion_lead(self, first):
+        """Seconds from the snapshot until `first` would start."""
+        return self.prefix_fixed + self._last(first.cue_in)
 
 
-def build_fit_frame(snapshot, projection, placement, allowance=TRANSITION_ALLOWANCE_SECONDS):
+def build_fit_frame(snapshot, projection, placement, allowance=TRANSITION_ALLOWANCE_SECONDS, safety_budget=None):
     (deck,) = [d for d in snapshot.decks if d.live]
     elements, _skipped, _problems = committed_sequence(snapshot, deck)
     split = len(elements)
@@ -328,6 +340,8 @@ def build_fit_frame(snapshot, projection, placement, allowance=TRANSITION_ALLOWA
         suffix_first_cue=suffix[0].cue_in if suffix else None,
         suffix_total=sum(suffix_spans),
         allowance=allowance,
+        reserve_base=safety_budget[0] if safety_budget else 0.0,
+        reserve_per_item=safety_budget[1] if safety_budget else 0.0,
     )
 
 
@@ -649,6 +663,9 @@ class RefillProposal:
     uncertainty: tuple = ()
     advisory: bool = True
     installed: bool = False
+    # The chosen Candidate objects (music, then PSA) for a Phase C
+    # revalidation; never serialised.
+    chosen: tuple = ()
     notes: tuple = (
         "ADVISORY ONLY: nothing was inserted, reordered, reserved or played",
         "may be stale immediately; Phase C must revalidate everything in its own transaction",
@@ -747,7 +764,7 @@ def _psa_stage(policy, frame, music, ctx, residual, media_cache, unavailable, co
     return candidate, "psa_proposed", _ms(total), _ms(left)
 
 
-def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None):
+def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None, safety_budget=None):
     """The Phase B entry point. Never writes. With the policy Off (the
     default) and no explicit offline_dry_run it reads one flag and returns
     `off`. offline_dry_run never changes the persisted policy."""
@@ -774,7 +791,7 @@ def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None):
     common["placement"] = placement
     if placement.mode is None:
         return RefillProposal(STATUS_NO_SAFE_ANCHOR, (placement.reason,), **common)
-    frame = build_fit_frame(snapshot, projection, placement)
+    frame = build_fit_frame(snapshot, projection, placement, safety_budget=safety_budget)
     if frame is None:
         return RefillProposal(STATUS_NO_SAFE_ANCHOR, ("anchor_not_in_committed_sequence",), **common)
     ctx = build_exclusion_context(snapshot, projection, request_ctx)
@@ -815,6 +832,7 @@ def evaluate_hour_refill(snapshot, *, offline_dry_run=False, psa_policy=None):
         psa=(ProposedItem(psa.track_id, psa.category_id, "psa_residual", _ms(psa.effective))
              if psa is not None else None),
         psa_status=psa_status,
+        chosen=tuple(music) + ((psa,) if psa is not None else ()),
         residual_after_seconds=psa_residual if psa is not None else fit.residual_seconds,
         total_runway_after_seconds=psa_total if psa is not None else fit.total_seconds,
         **common,
