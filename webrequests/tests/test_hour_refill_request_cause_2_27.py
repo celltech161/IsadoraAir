@@ -154,6 +154,8 @@ class HourRefillRequestCauseTests(WebRequestFixtureMixin, TransactionTestCase):
         result = maybe_schedule_song_request(item)
         self.assertEqual(result.track_id, expected_track.id)
         self.assertEqual(HourRefillCause.objects.count(), 0)
+        # Not attempted at all -- not merely rejected by a DB constraint.
+        self.assertFalse(SystemEvent.objects.filter(title__startswith="Hour-refill cause").exists())
         return result
 
     def test_equal_and_longer_substitutions_are_not_causes(self):
