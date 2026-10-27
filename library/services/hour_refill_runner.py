@@ -204,6 +204,7 @@ class HourRefillRunner:
         self._capture_outstanding = False
         self._backoff = {}
         self._pending_adoption = None
+        self._evaluating = None           # (log_id, cause_ids) while this check evaluates
         self._last_published_key = None
         self._last_write = None
         self.started_at = None
@@ -279,6 +280,7 @@ class HourRefillRunner:
         """One bounded check. Never raises. False only after an error."""
         generation = self._generation if generation is None else generation
         ok = True
+        self._evaluating = None
         try:
             self._check(generation)
         except Exception as exc:  # noqa: BLE001 -- the runner must never take the engine down
@@ -287,7 +289,14 @@ class HourRefillRunner:
             total = self.counters["errors"]
             if total == 1 or total % 100 == 0:
                 print(f"  Hour-refill runner error (count={total}); playout unaffected: {type(exc).__name__}")
-            self._set_outcome(OUTCOME_ERROR, (type(exc).__name__,), KIND_ABSTAINED)
+            log_id, cause_ids = self._evaluating or (None, ())
+            self._set_outcome(OUTCOME_ERROR, (type(exc).__name__,), KIND_ABSTAINED, log_id=log_id,
+                              cause_ids=cause_ids)
+        # Journal only after this check's own outcome is final, so an
+        # evaluation that raised is logged as `error`, never as the previous
+        # evaluation's outcome.
+        if self._evaluating is not None:
+            self._journal_evaluation()
         try:
             self._publish(generation)
         except Exception:  # noqa: BLE001 -- status is optional
@@ -332,10 +341,8 @@ class HourRefillRunner:
         if not self._live(generation):
             return
         self.counters["evaluations"] += 1
-        try:
-            self._evaluate(entry, log_id, cause_ids)
-        finally:
-            self._journal_evaluation()
+        self._evaluating = (log_id, cause_ids)
+        self._evaluate(entry, log_id, cause_ids)
 
     def _journal_evaluation(self):
         """One compact line per evaluation (runner thread, never GLib):

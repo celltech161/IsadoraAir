@@ -308,6 +308,37 @@ class OffParityTests(RunnerFixtures, TestCase):
         self.assertEqual((record["status"], record["committed_runway_seconds"]), ("proposed", 810.75))
         self.assertIn("captured_at", record)
 
+    def test_a_failing_evaluation_journals_its_own_error_not_the_previous_outcome(self):
+        # F1: success, then an exception inside the next evaluation.
+        import io
+        from contextlib import redirect_stdout
+
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        self.set_policy()
+        runner = self.make_runner(engine)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            runner.run_once()
+            self.assertEqual(self.outcome(runner)["status"], "proposed")
+            self.advance(runner_mod.RETRY_SECONDS)
+            with patch.object(runner_mod, "project_refill", side_effect=RuntimeError("injected")):
+                self.assertFalse(runner.run_once())
+            # Errors outside an evaluation are counted, never journaled as one.
+            self.advance(runner_mod.RETRY_SECONDS)
+            with patch.object(runner_mod.HourRefillRunner, "_cause_ids", side_effect=RuntimeError("db")):
+                self.assertFalse(runner.run_once())
+        records = [json.loads(line.split("Hour-refill evaluation ", 1)[1])
+                   for line in out.getvalue().splitlines() if "Hour-refill evaluation " in line]
+        self.assertEqual([r["status"] for r in records], ["proposed", "error"])
+        failed = records[1]
+        self.assertEqual((failed["log_id"], failed["cause_ids"]),
+                         (self.log.id, [HourRefillCause.objects.get().id]))
+        for key in ("net_shortage_seconds", "track_ids", "committed_runway_seconds", "captured_at"):
+            self.assertNotIn(key, failed)  # nothing carried over from the successful evaluation
+        self.assertEqual((self.outcome(runner)["status"], runner.counters["errors"],
+                          runner.counters["journal_lines"]), ("error", 2, 2))
+
     def test_install_requested_but_not_armed_stays_observation(self):
         engine = self.eject_engine()
         self.track(200.0), self.track(180.0)
