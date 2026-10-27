@@ -53,15 +53,16 @@ no I/O, query, wait or print.
 | Field | Meaning |
 | --- | --- |
 | `refill_owner` | token of the single in-flight causal attempt, or None |
-| `legacy_callback_pending` | an ordinary live-fill worker has scheduled `_install_live_fill` and it has not run yet |
+| `legacy_callbacks_pending` | generations of ordinary live-fill callbacks that have been scheduled and have not run yet |
 | `pending_adoption` | `(log_id, frozenset(installed LogItem ids))` after a causal commit, until those ids are in `log_items` |
 | `attempts` | per-log attempt count (cap 3) |
 
 Ordinary live fill is busy when `_live_fill_in_progress` (dispatch until
-the worker ends) **or** `legacy_callback_pending` (the worker scheduled its
-install until the callback runs) is set. Together they cover dispatch,
-worker and late callback without a gap: the worker sets the pending flag
-*before* `GLib.idle_add`, and clears `_live_fill_in_progress` in `finally`.
+the worker ends) **or** `legacy_callbacks_pending` is non-empty. Generation
+identity means an older callback cannot clear a newer callback's marker.
+Together they cover dispatch, worker and late callback without a gap: the
+worker marks the generation *before* `GLib.idle_add`, and clears
+`_live_fill_in_progress` in `finally`.
 
 * `reserve(engine)` (worker): fails when legacy is busy, another refill owns
   the coordinator, or the log's adoption is pending.
@@ -69,13 +70,13 @@ worker and late callback without a gap: the worker sets the pending flag
   block): when `blocks_legacy(log_id, log_items)` says a refill owns the
   coordinator or a committed refill has not been reloaded yet, it does not
   dispatch. This is a set-membership check over in-memory ids.
-* `_install_live_fill` (GLib): clears `legacy_callback_pending`. If a refill
+* `_install_live_fill` (GLib): clears its own pending generation. If a refill
   commit for that log is still awaiting reload, it discards its proposal,
   which is already guaranteed by mutual exclusion; this is defence in depth.
 
 With 2.27 Off the coordinator is never reserved, so `blocks_legacy` is
 always False. Ordinary live fill then behaves exactly as r0119 apart from
-setting and clearing one boolean (tested by the unchanged
+adding and removing its generation from one in-memory set (tested by the unchanged
 `test_async_live_fill` and `test_live_fill_deficit` suites).
 
 ## 3. Install sequence (worker W, GLib G, database D)
@@ -92,12 +93,14 @@ W  7  idle_add(capture S2) --------> G  capture, put_nowait
 W  8  CAS-1  digest(S2) == digest(S1); same engine instance and log;
        re-resolve boundary == proposal's; re-project on S2 (eligible,
        same threshold); placement == proposal's (no fallback);
-       fit with budget on S2; insertion lead >= 20 s               -> stale_discarded / unsafe_window / ...
+       fit with budget on S2; insertion lead >= 20 s; re-run bounded Phase B
+       selection and require the identical candidates             -> stale_discarded / unsafe_window / ...
 W  9  BEGIN; SET LOCAL lock_timeout 250ms; PlaylistLog FOR UPDATE ----> D   -> lock_contended
 W 10  CAS-2 (database under lock): ledger key absent; log still approved
        with the same date and hour; ordered rows (id, position, Track,
        category) == S2's queue (poison-filtered); no claim or play on any
        row at or after S2's cursor; Tracks unchanged and Ready-to-Air;
+       category membership/kind, identity and active-holiday exclusion unchanged;
        no new active request for them; no request or intro tied to the
        closing block                                                     -> duplicate_install / stale_discarded / no_safe_anchor
 W 11  INSERT ledger row; insert_before: two-pass shift of the closing
@@ -169,7 +172,9 @@ lock, file check or hash on GLib.
 * **Insertion lead:** the trigger that will read the first inserted row must
   be at least **20 s** after S2. That trigger is S2 plus the prefix runway,
   minus the new row's own cue-in: the engine reads the next row at its
-  trigger, not at its audible start. That covers:
+  trigger, not at its audible start. The calculation removes the fit model's
+  optional 250 ms late-poll allowance for every prefix item because this
+  deadline must use the earliest possible trigger. It covers:
   * at most 2 s from S2 to COMMIT;
   * the 3 s reload throttle plus the reload's own query;
   * `CACHE_WARM_LEAD_SECONDS` (3 s) before the trigger;

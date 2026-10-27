@@ -6371,8 +6371,18 @@ class PlaybackEngine:
                 coordinator = getattr(self, "_refill_coordinator", None)
                 if coordinator is not None:
                     with self._lock:
-                        coordinator.legacy_callback_pending = True
-                GLib.idle_add(self._install_live_fill, log_id, generation, new_picks, original_count, start_position)
+                        coordinator.mark_legacy_pending(generation)
+                try:
+                    GLib.idle_add(self._install_live_fill, log_id, generation, new_picks,
+                                  original_count, start_position)
+                except Exception:
+                    # Scheduling failed, so no callback exists to clear this
+                    # generation. Do it here before the outer handler records
+                    # the worker failure.
+                    if coordinator is not None:
+                        with self._lock:
+                            coordinator.clear_legacy_pending(generation)
+                    raise
         except Exception as exc:
             print(f"  Live-fill worker crashed (non-fatal): {exc}")
             emit_event(
@@ -6404,7 +6414,7 @@ class PlaybackEngine:
         finally:
             if coordinator is not None:
                 with self._lock:
-                    coordinator.legacy_callback_pending = False
+                    coordinator.clear_legacy_pending(generation)
 
     def _install_live_fill_checked(self, log_id, generation, new_picks, expected_prior_count, start_position):
         """One-shot GLib.idle_add callback -- runs on the main thread,

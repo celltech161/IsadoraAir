@@ -287,6 +287,11 @@ class FitFrame:
     suffix_first_cue: float | None
     suffix_total: float
     allowance: float
+    # Number of prefix elements whose spans contribute `allowance` to
+    # prefix_fixed + _last(). Fit arithmetic intentionally uses that
+    # upper-bound allowance, but an adoption deadline needs the opposite
+    # bound: the earliest possible trigger.
+    prefix_element_count: int = 1
     # Phase C safety budget: seconds that must stay unused after the
     # inserted items (base + per inserted item). Zero in Phase B.
     reserve_base: float = 0.0
@@ -312,8 +317,15 @@ class FitFrame:
         return total + self.reserve(len(seq))
 
     def insertion_lead(self, first):
-        """Seconds from the snapshot until `first` would start."""
-        return self.prefix_fixed + self._last(first.cue_in)
+        """Conservative seconds until `first` can become audible.
+
+        The fit model adds one poll allowance per prefix transition because
+        later playback is the safe bound for avoiding boundary overrun. An
+        adoption deadline must not count those allowances: the engine can
+        observe every trigger without any late poll at all.
+        """
+        upper = self.prefix_fixed + self._last(first.cue_in)
+        return max(0.0, upper - self.allowance * self.prefix_element_count)
 
 
 def build_fit_frame(snapshot, projection, placement, allowance=TRANSITION_ALLOWANCE_SECONDS, safety_budget=None):
@@ -340,6 +352,7 @@ def build_fit_frame(snapshot, projection, placement, allowance=TRANSITION_ALLOWA
         suffix_first_cue=suffix[0].cue_in if suffix else None,
         suffix_total=sum(suffix_spans),
         allowance=allowance,
+        prefix_element_count=len(prefix),
         reserve_base=safety_budget[0] if safety_budget else 0.0,
         reserve_per_item=safety_budget[1] if safety_budget else 0.0,
     )

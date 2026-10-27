@@ -27,6 +27,7 @@ from django.utils import timezone
 
 from library.services.hour_refill_projection import EVIDENCE_NOTE, project_refill
 from library.services.hour_refill_proposal import (
+    PSA_CATEGORY_KIND,
     STATUS_PROPOSED,
     _window_slots,
     assess_placement,
@@ -81,7 +82,11 @@ class RefillCoordinator:
 
     def __init__(self):
         self.refill_owner = None
-        self.legacy_callback_pending = False
+        # Multiple generations can coexist: the worker guard is released
+        # before an older GLib callback necessarily runs. Track generations,
+        # rather than one boolean an older callback can clear underneath a
+        # newer callback.
+        self.legacy_callbacks_pending = set()
         self.pending_adoption = None       # (log_id, frozenset(item ids))
         self.attempts = {}
         self.legacy_discards = 0
@@ -104,12 +109,18 @@ class RefillCoordinator:
         """Ordinary live fill must not dispatch or install now."""
         return self.refill_owner is not None or self._adoption_outstanding(log_id, log_items)
 
+    def mark_legacy_pending(self, generation):
+        self.legacy_callbacks_pending.add(generation)
+
+    def clear_legacy_pending(self, generation):
+        self.legacy_callbacks_pending.discard(generation)
+
     # -- worker side ---------------------------------------------------------
 
     def reserve(self, engine, token):
         """None on success, else an abstention status."""
         with engine._lock:
-            if getattr(engine, "_live_fill_in_progress", False) or self.legacy_callback_pending:
+            if getattr(engine, "_live_fill_in_progress", False) or self.legacy_callbacks_pending:
                 return STATUS_LIVE_FILL_PENDING
             if self.refill_owner is not None:
                 return STATUS_REFILL_IN_FLIGHT
@@ -296,10 +307,10 @@ class HourRefillInstaller:
         if s2 is None:
             return InstallResult(STATUS_SNAPSHOT_UNAVAILABLE)
         try:
-            frame, lead = self._cas_one(s1, s2, proposal, planned)
             # Last file check, outside any database lock.
             if any(not Path(c.filepath).is_file() for c in planned.items):
                 raise _Abort(STATUS_STALE, "media_missing")
+            frame, lead = self._cas_one(s1, s2, proposal, planned)
             self._hook("before_transaction", s2)
             return self._commit(s2, proposal, planned, frame, lead, received)
         except _Abort as abort:
@@ -313,6 +324,17 @@ class HourRefillInstaller:
         if proposal.psa is not None:
             categories.append(proposal.psa.category_id)
         return _Planned(proposal, tuple(proposal.chosen), tuple(categories))
+
+    @staticmethod
+    def _selection_signature(planned):
+        return tuple(
+            (
+                candidate.track_id, category_id, candidate.cue_in,
+                candidate.end, candidate.effective, candidate.filepath,
+                tuple(sorted(candidate.identity_keys)),
+            )
+            for candidate, category_id in zip(planned.items, planned.categories)
+        )
 
     def _cas_one(self, s1, s2, proposal, planned):
         """S2 must equal S1 and re-prove the window, threshold, placement,
@@ -348,10 +370,27 @@ class HourRefillInstaller:
         lead = frame.insertion_lead(planned.items[0]) - (planned.items[0].cue_in or 0.0)
         if lead < INSERTION_LEAD_SECONDS:
             raise _Abort(STATUS_UNSAFE, "insertion_too_soon")
+
+        # S1 selected the candidates. Re-run the complete bounded Phase B
+        # selection from S2 so category membership/kind, recency, holidays,
+        # related-artist separation, next-hour commitments, requests and media
+        # are all fresh too. Matching queue digests alone do not cover any of
+        # those database-side eligibility inputs.
+        fresh = evaluate_hour_refill(
+            s2, offline_dry_run=True, psa_policy=self.psa_policy,
+            safety_budget=safety_budget(),
+        )
+        if fresh.status != STATUS_PROPOSED:
+            raise _Abort(STATUS_STALE, f"candidate_revalidation:{fresh.status}")
+        fresh_planned = self._planned(fresh)
+        if self._selection_signature(fresh_planned) != self._selection_signature(planned):
+            raise _Abort(STATUS_STALE, "candidate_selection_changed")
         return frame, lead
 
     def _commit(self, s2, proposal, planned, frame, lead, received):
-        from library.models import HourRefillInstall, LogItem, PlaylistLog, Track
+        from library.models import Category, HourRefillInstall, LogItem, PlaylistLog, Track
+        from library.services.log_builder import _active_holidays_at
+        from library.services.related_artists import track_identity_keys
         from webrequests.models import SongRequest
 
         placement = proposal.placement
@@ -380,11 +419,23 @@ class HourRefillInstaller:
                     raise _Abort(STATUS_STALE, "engine_advanced")
                 tracks = {t["id"]: t for t in Track.objects.filter(id__in=track_ids).values(
                     "id", "ready2air", "blocked_slots", "cue_in_seconds", "next_start_seconds",
-                    "duration_seconds", "filepath", "title", "artist__name")}
+                    "duration_seconds", "filepath", "title", "artist__name", "category_id",
+                    "related_artists")}
+                category_kinds = dict(Category.objects.filter(id__in=planned.categories)
+                                      .values_list("id", "kind__code"))
+                additional = set(Track.additional_categories.through.objects.filter(
+                    track_id__in=track_ids, category_id__in=planned.categories,
+                ).values_list("track_id", "category_id"))
                 slots = set(_window_slots(s2.captured_at, proposal.projection.boundary.instant,
                                           timezone.get_current_timezone()))
-                for candidate in planned.items:
+                for index, (candidate, category_id) in enumerate(zip(planned.items, planned.categories)):
                     t = tracks.get(candidate.track_id)
+                    expected_kind = "music" if index < len(proposal.music) else PSA_CATEGORY_KIND
+                    if category_kinds.get(category_id) != expected_kind:
+                        raise _Abort(STATUS_STALE, "category_changed")
+                    if t is not None and t["category_id"] != category_id \
+                            and (candidate.track_id, category_id) not in additional:
+                        raise _Abort(STATUS_STALE, "category_membership_changed")
                     if t is not None and slots & set(t["blocked_slots"] or []):
                         raise _Abort(STATUS_STALE, "track_restricted")
                     end = t["next_start_seconds"] if t and t["next_start_seconds"] is not None else (
@@ -392,6 +443,13 @@ class HourRefillInstaller:
                     if (t is None or not t["ready2air"] or t["filepath"] != candidate.filepath
                             or (t["cue_in_seconds"] or 0.0) != candidate.cue_in or end != candidate.end):
                         raise _Abort(STATUS_STALE, "track_changed")
+                    if track_identity_keys(t["artist__name"], t["related_artists"]) != candidate.identity_keys:
+                        raise _Abort(STATUS_STALE, "track_identity_changed")
+                active_holidays = [h.code for h in _active_holidays_at(
+                    s2.captured_at.astimezone(timezone.get_current_timezone()))]
+                if active_holidays and Track.objects.filter(
+                        id__in=track_ids, holidays__code__in=active_holidays).exists():
+                    raise _Abort(STATUS_STALE, "track_holiday_changed")
                 if SongRequest.objects.filter(status__in=SongRequest.ACTIVE_STATUSES,
                                               track_id__in=track_ids).exists():
                     raise _Abort(STATUS_STALE, "track_requested")

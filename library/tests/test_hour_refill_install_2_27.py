@@ -294,6 +294,18 @@ class CoreInstallTests(InstallFixtures, TestCase):
                              reserve_per_item=inst.SAFETY_BUDGET_PER_ITEM_SECONDS)
         self.assertEqual([frame.reserve(n) for n in (1, 2, 3)], [6.0, 7.0, 8.0])
 
+    def test_insertion_lead_does_not_count_late_poll_allowances(self):
+        frame = svc.FitFrame(
+            window=100.0, prefix_fixed=15.75,
+            last_prefix=proj.TimingElement(4, 0.0, 5.0),
+            suffix_first_cue=None, suffix_total=0.0, allowance=0.25,
+            prefix_element_count=4,
+        )
+        first = svc.Candidate(1, 1, 0, 0.0, 60.0, 60.0, frozenset(), "/tmp/x")
+        # Raw upper-bound runway is 21 seconds. Four optional late polls are
+        # not guaranteed lead, so the adoption deadline may count only 20.
+        self.assertEqual(frame.insertion_lead(first), 20.0)
+
     # Case 9 -- boundaries.
     def test_future_intra_hour_transition_installs_nothing(self):
         engine = self.eject_engine()
@@ -552,6 +564,31 @@ class StaleStateTests(InstallFixtures, TestCase):
         self.assertEqual((result.status, result.reasons), (inst.STATUS_STALE, ("snapshot_too_old_at_commit",)))
         self.assert_nothing_installed(result, before)
 
+    def test_candidate_category_change_between_snapshots_is_revalidated(self):
+        engine = self.eject_engine()
+        pool = [self.track(200.0), self.track(180.0)]
+        before = self.rows()
+        result = self.attempt(engine, hooks={
+            "before_second_snapshot": lambda: Track.objects.filter(
+                id__in=[t.id for t in pool]).update(category=self.recur),
+        })
+        self.assert_nothing_installed(result, before)
+        self.assertEqual(result.status, inst.STATUS_STALE)
+        self.assertTrue(result.reasons[0].startswith("candidate_revalidation:"), result.reasons)
+
+    def test_candidate_category_change_under_log_lock_is_rejected(self):
+        engine = self.eject_engine()
+        pool = [self.track(200.0), self.track(180.0)]
+        before = self.rows()
+        result = self.attempt(engine, hooks={
+            "locked": lambda: Track.objects.filter(
+                id__in=[t.id for t in pool]).update(category=self.recur),
+        })
+        self.assert_nothing_installed(result, before)
+        self.assertEqual(
+            (result.status, result.reasons),
+            (inst.STATUS_STALE, ("category_membership_changed",)),
+        )
     # Case 11 -- insert-before anchor problems never fall back to tail.
     def closer_engine(self):
         self.next_hour()
@@ -601,7 +638,7 @@ class LiveFillArbitrationTests(InstallFixtures, TestCase):
         engine._live_fill_in_progress = True
         self.assertEqual(self.attempt(engine).status, inst.STATUS_LIVE_FILL_PENDING)
         engine._live_fill_in_progress = False
-        engine._refill_coordinator.legacy_callback_pending = True  # worker done, callback not yet run
+        engine._refill_coordinator.mark_legacy_pending(1)  # worker done, callback not yet run
         self.assertEqual(self.attempt(engine).status, inst.STATUS_LIVE_FILL_PENDING)
         self.assertFalse(HourRefillInstall.objects.exists())
 
@@ -637,12 +674,12 @@ class LiveFillArbitrationTests(InstallFixtures, TestCase):
         self.track(200.0), self.track(180.0)
         stale_count = len(engine.log_items)
         self.assertEqual(self.attempt(engine).status, inst.STATUS_INSTALLED)
-        engine._refill_coordinator.legacy_callback_pending = True
+        engine._refill_coordinator.mark_legacy_pending(0)
         picks = [{"track": self.track(120.0), "category": self.gold}]
         with patch.object(eng_module, "append_fill_items") as append:
             self.assertFalse(engine._install_live_fill(self.log.id, 0, picks, stale_count, 99))
         append.assert_not_called()
-        self.assertFalse(engine._refill_coordinator.legacy_callback_pending)
+        self.assertFalse(engine._refill_coordinator.legacy_callbacks_pending)
         result_late = engine._refill_coordinator.legacy_discards
         self.assertEqual(result_late, 1)
 
@@ -657,9 +694,38 @@ class LiveFillArbitrationTests(InstallFixtures, TestCase):
                 patch.object(eng_module.connection, "close"):
             engine._live_fill_worker(self.log.id, 1, [{"track": None}], 1, 0.0, hour_start, 9, 300.0)
         idle_add.assert_called_once()
-        self.assertTrue(engine._refill_coordinator.legacy_callback_pending)
+        self.assertTrue(engine._refill_coordinator.legacy_callbacks_pending)
         self.assertFalse(engine._live_fill_in_progress)
         self.assertEqual(self.attempt(engine).status, inst.STATUS_LIVE_FILL_PENDING)
+
+    def test_older_callback_cannot_clear_a_newer_pending_generation(self):
+        engine = self.eject_engine()
+        coordinator = engine._refill_coordinator
+        coordinator.mark_legacy_pending(1)
+        coordinator.mark_legacy_pending(2)
+        engine._live_fill_generation = 2
+        self.assertFalse(engine._install_live_fill(
+            self.log.id, 1, [], len(engine.log_items), 9,
+        ))
+        self.assertEqual(coordinator.legacy_callbacks_pending, {2})
+
+    def test_idle_add_failure_clears_the_unscheduled_generation(self):
+        engine = self.eject_engine()
+        engine._live_fill_in_progress = True
+        hour_start = at(14)
+        with patch.object(
+                eng_module, "fill_remaining_hour",
+                return_value=([{"track": None}, {
+                    "track": self.track(100.0), "category": self.gold,
+                }], 0)), \
+                patch.object(eng_module.GLib, "idle_add", side_effect=RuntimeError("stopped")), \
+                patch.object(eng_module, "_close_old_connections"), \
+                patch.object(eng_module.connection, "close"), \
+                patch.object(eng_module, "emit_event"):
+            engine._live_fill_worker(
+                self.log.id, 3, [{"track": None}], 1, 0.0, hour_start, 9, 300.0,
+            )
+        self.assertFalse(engine._refill_coordinator.legacy_callbacks_pending)
 
 
 class ConcurrentInstallTests(InstallFixtures, TransactionTestCase):
