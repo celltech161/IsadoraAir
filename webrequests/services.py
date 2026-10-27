@@ -17,6 +17,7 @@ from isadoraair.announcements import (
 from isadoraair.tts.errors import TTSConfigurationError
 from library.models import LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
+from library.services.hour_refill_causality import record_request_substitution_cause
 from library.services.related_artists import track_identity_keys
 from monitoring.models import SystemEvent, emit_event
 
@@ -478,6 +479,15 @@ def maybe_schedule_song_request(log_item):
                         if not is_track_eligible_at(track, eligibility_time, recency_cfg):
                             continue  # ineligible or recency-blocked right now -- leave waiting for a later slot
 
+                        # Roadmap 2.27 Phase A (evidence only): snapshot the
+                        # displaced Track before it is overwritten. Never
+                        # raises; None unless capture is enabled and this is
+                        # a genuinely shorter, different-Track substitution.
+                        commit_refill_cause = record_request_substitution_cause(
+                            locked_log=locked_log, locked_item=locked_item,
+                            replacement_track=track, song_request=candidate, occurred_at=now,
+                        )
+
                         locked_item.track = track
                         locked_item.track_title = track.title
                         locked_item.track_artist = track.artist.name if track.artist_id else ""
@@ -494,6 +504,8 @@ def maybe_schedule_song_request(log_item):
                             "status", "log_item", "scheduled_at", "fulfilled_at",
                             "resolved_at", "estimated_play_time", "status_updated_at",
                         ])
+                        if commit_refill_cause is not None:
+                            commit_refill_cause()  # own savepoint; atomic with this swap
                         print(f"  Web request scheduled: {track.artist.name if track.artist_id else '?'} - {track.title} (request id={candidate.external_request_id})")
                         break
 

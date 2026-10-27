@@ -1167,6 +1167,162 @@ class LogFillConfig(models.Model):
         return obj
 
 
+class HourRefillPolicy(models.Model):
+    """Singleton -- roadmap 2.27 hour-refill policy, separate from
+    LogFillConfig so enabling causal refill can never change the accepted
+    1.1 normal fill. Phase A: every flag defaults Off and only enables
+    EVIDENCE capture (HourRefillCause rows); nothing consumes them, and
+    dry_run_only cannot be cleared (check constraint). See
+    docs/roadmap/2_27_PHASE_A_CAUSALITY_CONTRACT.md."""
+    enabled = models.BooleanField(default=False)
+    capture_request_substitution = models.BooleanField(default=False)
+    capture_operator_eject = models.BooleanField(default=False)
+    dry_run_only = models.BooleanField(default=True, editable=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Hour Refill Policy"
+        verbose_name_plural = "Hour Refill Policy"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(dry_run_only=True),
+                name="hour_refill_policy_dry_run_only_phase_a",
+            ),
+        ]
+
+    def __str__(self):
+        return "Hour Refill Policy"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def capture_flags(cls):
+        """(request_substitution, operator_eject) capture switches. Read
+        only -- never creates the row, so it is safe inside another
+        transaction's locks. A missing row means everything Off."""
+        row = (
+            cls.objects.filter(pk=1)
+            .values_list("enabled", "capture_request_substitution", "capture_operator_eject")
+            .first()
+        )
+        if row is None or not row[0]:
+            return False, False
+        return bool(row[1]), bool(row[2])
+
+
+class HourRefillCause(models.Model):
+    """Append-only evidence that one positively identified event shortened
+    the planned airtime of one LogItem (roadmap 2.27 Phase A). Observed
+    shortening of one occurrence, NOT a net hour deficit, and never a
+    record of installed filler or aired content.
+
+    Deliberately no foreign keys: every reference is an immutable scalar
+    snapshot, so deleting a Track/LogItem/log/category never erases the
+    cause, the insert takes no FOR KEY SHARE lock on referenced rows
+    inside the request-swap transaction, and no deferred FK check can
+    fail at COMMIT and roll back the swap it describes."""
+
+    CAUSE_REQUEST_SUBSTITUTION = "request_substitution"
+    CAUSE_OPERATOR_EJECT = "operator_eject"
+    CAUSE_CHOICES = [
+        (CAUSE_REQUEST_SUBSTITUTION, "Shorter web-request substitution"),
+        (CAUSE_OPERATOR_EJECT, "Completed operator Eject"),
+    ]
+    STATE_RECORDED = "recorded"
+    STATE_CHOICES = [
+        (STATE_RECORDED, "Recorded (evidence only; nothing installed)"),
+    ]
+
+    source_key = models.CharField(max_length=160, unique=True)
+    cause_type = models.CharField(max_length=32, choices=CAUSE_CHOICES)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default=STATE_RECORDED)
+    occurred_at = models.DateTimeField()
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+    playlist_log_id_snapshot = models.BigIntegerField()
+    log_date = models.DateField()
+    log_hour = models.PositiveSmallIntegerField()
+    log_item_id_snapshot = models.BigIntegerField()
+    log_item_position = models.PositiveIntegerField()
+
+    # The SCHEDULED LogItem.category, not the replacement Track's own category.
+    scheduled_category_id_snapshot = models.BigIntegerField(null=True, blank=True)
+    scheduled_category_code = models.CharField(max_length=64, blank=True, default="")
+    scheduled_category_kind_code = models.CharField(max_length=64, blank=True, default="")
+
+    original_track_id_snapshot = models.BigIntegerField(null=True, blank=True)
+    original_track_title = models.CharField(max_length=255, blank=True, default="")
+    original_track_artist = models.CharField(max_length=255, blank=True, default="")
+    original_effective_airtime_seconds = models.FloatField()
+    replacement_track_id_snapshot = models.BigIntegerField(null=True, blank=True)
+    replacement_effective_airtime_seconds = models.FloatField(null=True, blank=True)
+    observed_shortening_seconds = models.FloatField()
+
+    # Internal id only -- never requester name, dedication or request text.
+    song_request_id_snapshot = models.BigIntegerField(null=True, blank=True)
+
+    # operator_eject evidence (live capture deferred past Phase A).
+    engine_instance = models.CharField(max_length=64, blank=True, default="")
+    deck_slot = models.CharField(max_length=1, blank=True, default="")
+    deck_generation = models.BigIntegerField(null=True, blank=True)
+    eject_position_seconds = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [
+            models.Index(fields=["playlist_log_id_snapshot", "occurred_at", "id"],
+                         name="hour_refill_cause_log_order"),
+            models.Index(fields=["log_date", "log_hour"], name="hour_refill_cause_hour"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(observed_shortening_seconds__gt=0),
+                name="hour_refill_cause_positive_shortening",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(state="recorded"),
+                name="hour_refill_cause_phase_a_state",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(cause_type="request_substitution")
+                    | models.Q(
+                        song_request_id_snapshot__isnull=False,
+                        original_track_id_snapshot__isnull=False,
+                        replacement_track_id_snapshot__isnull=False,
+                        replacement_effective_airtime_seconds__isnull=False,
+                    )
+                ),
+                name="hour_refill_cause_request_fields",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(cause_type="operator_eject")
+                    | (
+                        models.Q(deck_generation__isnull=False, eject_position_seconds__isnull=False)
+                        & ~models.Q(engine_instance="")
+                        & ~models.Q(deck_slot="")
+                    )
+                ),
+                name="hour_refill_cause_eject_fields",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(cause_type__in=["request_substitution", "operator_eject"]),
+                name="hour_refill_cause_known_type",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.cause_type} li={self.log_item_id_snapshot} -{self.observed_shortening_seconds:.1f}s"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValueError("HourRefillCause is append-only evidence; rows are never updated")
+        super().save(*args, **kwargs)
+
+
 class UploadConfig(models.Model):
     """Singleton — limits for the drag-and-drop track upload page
     (library/import/). Default (100) matches the real-world limit that
