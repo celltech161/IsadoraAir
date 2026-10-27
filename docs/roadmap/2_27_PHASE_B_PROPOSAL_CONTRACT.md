@@ -41,7 +41,7 @@ timer or call site into the engine.
 `category_id` and its kind code (`None` = not loaded => unknown), `origin`,
 cue-in / next-start / duration, and claimed / played flags.
 
-`snapshot.digest()` is a SHA-256 over the active log, cursor, the ordered
+`snapshot.digest()` is a SHA-256 over the engine instance, active log, cursor, the ordered
 queue `(id, log, position, track, category, claimed, played)`, forced items,
 deck occupancy `(slot, generation, item, track)` and the poison set.
 Playheads and the clock are excluded. A reorder, a same-count Track swap or a
@@ -51,6 +51,12 @@ new claim changes it. It is a proposal token, not a lock.
 
 The boundary is the next programming takeover after the **active log's**
 hour (`N` = active hour + 1):
+
+Before resolving that next-hour boundary, Phase B resolves the active
+profile for the active log's own hour. If the profile is unavailable, or it
+contains a segment transition later than the snapshot instant, Phase B
+abstains. It does not model or place material across an intra-log program
+handoff.
 
 1. an **approved** log for `N`: its earliest persisted `scheduled_time`,
    evaluated with the engine's own `PlaybackEngine._takeover_eligibility`
@@ -278,16 +284,17 @@ queue objects (tested).
 
 `proposal_staleness(proposal, fresh_snapshot=..., now=...,
 active_request_track_ids=...)` is a cheap pure pre-check. It flags an
-expired proposal, a changed log, a changed digest, a proposed Track that is
-now requested, or one that is now committed.
+expired proposal, a changed engine instance, a changed log or digest, a
+proposed Track that is now requested, or one that is now committed.
 
 ## 10. Known limitations
 
 * The runway is an upper bound. Two things are not modelled: the cue-in of
   the next hour's first item on the final transition (taken as 0), and
   pipeline preroll beyond one poll tick.
-* Program-segment handoffs inside a log are not re-timed. Only the hour's
-  end is projected.
+* Program-segment handoffs inside a log are not re-timed. A future handoff
+  visible in the active schedule profile makes Phase B abstain rather than
+  project through it.
 * Protected closers are inferred from the slot category kind (any non-music
   kind at the tail), not from an operator-owned post model. A legal ID filed
   under a music category would not be recognised.
@@ -301,11 +308,22 @@ now requested, or one that is now committed.
 
 ## 11. Phase C interface handoff (not implemented)
 
-A Phase C installer must treat a proposal as advisory input only and, inside
-its own `transaction.atomic()` with the established `PlaylistLog -> LogItem`
-lock order and a short lock timeout, re-establish **all** of the following
-from fresh engine memory (a new snapshot on the GLib thread) and fresh
-database rows:
+A Phase C installer must treat a proposal as advisory input only. The thread
+boundary is mandatory:
+
+* GLib may only capture a bounded primitive snapshot and, after a successful
+  install, adopt a small immutable memory plan. It must not query the
+  database, open or wait for a transaction, take a row lock, run candidate
+  selection, hash a proposal, check media, or wait for the worker.
+* A worker owns boundary/cause queries, proposal work, media checks, and the
+  complete `transaction.atomic()` using the established `PlaylistLog ->
+  LogItem` lock order and a short lock timeout.
+* Phase C must define and test a generation/CAS-style handoff around commit
+  so a changed GLib snapshot or a commit failure cannot leave database and
+  memory views disagreeing. Phase B does not supply that coordinator.
+
+Using a fresh primitive snapshot supplied by GLib and fresh database rows,
+the worker must re-establish **all** of the following:
 
 1. The same active approved `PlaylistLog` id, date and hour, still the
    current or continuation owner (`wrong_hour` rules).
@@ -319,7 +337,9 @@ database rows:
    still where the cause says.
 5. A **fresh net shortage** above the same threshold, and a fresh total with
    the proposed items of no more than the window. Never reuse the proposal's
-   numbers.
+   numbers. Phase B's exact-zero modeled residual is not, by itself, proof
+   against unbounded pipeline/preroll delay: Phase C must reserve a separately
+   justified timing safety budget or abstain when it cannot establish one.
 6. The same boundary kind, instant and proof source, recomputed. For
    `insert_before`, the anchor is still unclaimed, unplayed, not on a deck,
    not forced, not a request or intro, not next up, and the closing block's
@@ -333,9 +353,11 @@ database rows:
    cause set), so a restart, a retry or the ordinary live fill cannot install
    twice. Arbitration with `_try_extend_live_log_async` happens through one
    coordinator.
-10. DB-then-memory adoption on the GLib thread, without restarting, seeking or
-   ejecting a deck, and with cursor preservation tested for both placement
-   modes.
+10. Memory adoption is dispatched to GLib as a bounded, non-waiting operation,
+   without restarting, seeking or ejecting a deck. The commit/adoption
+   protocol must fail closed on a changed generation and prove cursor
+   preservation for both placement modes without moving database work onto
+   GLib.
 
 On any mismatch: discard with zero side effects, and at most a bounded retry
 from a new snapshot.
