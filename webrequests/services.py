@@ -434,6 +434,10 @@ def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False, refi
                     .select_related("category", "category__kind")
                     .get(pk=log_item.pk)
                 )
+                # `locked_log` is already the authoritative, locked parent.
+                # Cache it on the returned object without another query so a
+                # later engine-thread Eject snapshot can remain ORM-free.
+                locked_item.playlist_log = locked_log
 
                 # Re-validate against the FRESH, locked row -- the
                 # caller's object (checked above) may be stale by the

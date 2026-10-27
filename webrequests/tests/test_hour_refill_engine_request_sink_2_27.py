@@ -154,9 +154,14 @@ class EngineRequestSinkTests(WebRequestFixtureMixin, TransactionTestCase):
 
     def test_swap_preserves_the_occurrence_origin(self):
         _scheduled, _requested, item, _req = self.fixture()
-        maybe_schedule_song_request(item, refill_evidence_sink=self.sink)
+        result = maybe_schedule_song_request(item, refill_evidence_sink=self.sink)
         item.refresh_from_db()
         self.assertEqual(item.origin, LogItem.ORIGIN_GENERATED_SCHEDULE)
+        # The engine uses the returned object to create the deck. Its later
+        # Eject snapshot must not lazily fetch the parent log on the GLib
+        # thread, so the already-locked parent is retained in the cache.
+        self.assertIn("playlist_log", result._state.fields_cache)
+        self.assertEqual(result._state.fields_cache["playlist_log"].id, self.log.id)
 
     def test_end_to_end_with_the_real_worker_and_reconciler_key_deduplication(self):
         HourRefillPolicy(enabled=True, capture_request_substitution=True).save()
