@@ -325,6 +325,22 @@ class OffParityTests(RunnerFixtures, TestCase):
         self.assertEqual(self.glib.calls, 0)
         self.assertLessEqual(len(queries.captured_queries), 3)
 
+    def test_policy_changes_take_effect_at_the_next_check(self):
+        # Latency is one check: CHECK_INTERVAL_SECONDS (15 s), or sooner on a wake.
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        runner = self.make_runner(engine)
+        runner.run_once()
+        self.assertEqual((runner.policy.mode, self.glib.calls), ("off", 0))
+        self.set_policy(dry_run=True)
+        runner.run_once()
+        self.assertEqual((runner.policy.mode, self.outcome(runner)["kind"]), ("observation", "advisory"))
+        HourRefillPolicy.objects.filter(pk=1).update(enabled=False)
+        calls = self.glib.calls
+        runner.run_once()
+        self.assertEqual((runner.policy.mode, self.glib.calls), ("off", calls))
+        self.assertEqual(runner_mod.CHECK_INTERVAL_SECONDS, 15.0)
+
     def test_no_active_log_abstains(self):
         engine = self.eject_engine()
         engine.current_log = None
