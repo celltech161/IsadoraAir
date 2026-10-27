@@ -343,7 +343,9 @@ class HourRefillInstaller:
             raise _Abort(STATUS_NO_SAFE_ANCHOR, "anchor_not_in_committed_sequence")
         if frame.window - frame.total(list(planned.items)) < 0:
             raise _Abort(STATUS_UNSAFE, "safety_budget_not_met")
-        lead = frame.insertion_lead(planned.items[0])
+        # Measured to the trigger that will read the first new row (its
+        # audible start minus its own cue-in), not to its audible start.
+        lead = frame.insertion_lead(planned.items[0]) - (planned.items[0].cue_in or 0.0)
         if lead < INSERTION_LEAD_SECONDS:
             raise _Abort(STATUS_UNSAFE, "insertion_too_soon")
         return frame, lead
@@ -399,7 +401,7 @@ class HourRefillInstaller:
                     if not rows or rows[-1][0] != placement.after_log_item_id:
                         raise _Abort(STATUS_STALE, "tail_changed")
                     new_positions = [rows[-1][1] + 1 + i for i in range(k)]
-                start = s2.captured_at + timedelta(seconds=lead)
+                start = s2.captured_at + timedelta(seconds=frame.insertion_lead(planned.items[0]))
                 created = []
                 for index, (candidate, category_id, position) in enumerate(
                         zip(planned.items, planned.categories, new_positions)):

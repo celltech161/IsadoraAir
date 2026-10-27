@@ -166,8 +166,10 @@ lock, file check or hash on GLib.
   An exact-zero Phase B residual therefore never installs. These values are
   **provisional**: Phase D must check them against as-run `PlayEvent`
   timings before activation. They are not a proven universal bound.
-* **Insertion lead:** the first inserted item must be at least **20 s** away
-  from starting (S2 instant plus the prefix runway). That covers:
+* **Insertion lead:** the trigger that will read the first inserted row must
+  be at least **20 s** after S2. That trigger is S2 plus the prefix runway,
+  minus the new row's own cue-in: the engine reads the next row at its
+  trigger, not at its audible start. That covers:
   * at most 2 s from S2 to COMMIT;
   * the 3 s reload throttle plus the reload's own query;
   * `CACHE_WARM_LEAD_SECONDS` (3 s) before the trigger;

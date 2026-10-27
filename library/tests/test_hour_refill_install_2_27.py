@@ -335,6 +335,17 @@ class CoreInstallTests(InstallFixtures, TestCase):
         self.assertFalse(HourRefillInstall.objects.exists())
 
     # Case 17 -- dormant by default.
+    def test_lead_is_measured_to_the_trigger_not_the_audible_start(self):
+        self.next_hour()
+        self.row(self.track(240.0), 0, played=True)
+        ejected = self.row(self.track(240.0), 1, played=True)
+        self.row(self.track(240.0), 2, played=True)
+        self.eject_cause(ejected)
+        engine = self.engine(cursor=3, deck_index=2, deck_position=212.0)  # 28.25 s to the audible start
+        self.track(600.0, cue_in=10.0)  # ... but its trigger is 10 s earlier: 18.25 s
+        result = self.attempt(engine)
+        self.assertEqual((result.status, result.reasons), (inst.STATUS_UNSAFE, ("insertion_too_soon",)))
+
     def test_policy_off_or_dry_run_only_never_installs(self):
         engine = self.eject_engine()
         self.track(200.0)
