@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "release_id": "r0120",
+  "previous_release_id": "r0119",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 2.27 v1: default-Off, gated net hour-deficit advisory/refill for eligible operator Eject and shorter web-request substitutions. Library 0093-0096, with reviewed 0096 manual operations covered by the immutable trusted r0120 migration companion. Restart Gunicorn then engine; no protected-runtime or infrastructure changes.",
+  "migrations_required": [
+    "library.0093_hour_refill_cause_policy",
+    "library.0094_logitem_origin",
+    "library.0095_hour_refill_install",
+    "library.0096_hour_refill_install_gate"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
