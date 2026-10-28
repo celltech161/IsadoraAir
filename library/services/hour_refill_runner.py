@@ -287,14 +287,18 @@ class HourRefillRunner:
             ok = False
             self.counters["errors"] += 1
             total = self.counters["errors"]
-            if total == 1 or total % 100 == 0:
-                print(f"  Hour-refill runner error (count={total}); playout unaffected: {type(exc).__name__}")
             log_id, cause_ids = self._evaluating or (None, ())
             self._set_outcome(OUTCOME_ERROR, (type(exc).__name__,), KIND_ABSTAINED, log_id=log_id,
                               cause_ids=cause_ids)
+            if total == 1 or total % 100 == 0:
+                try:
+                    print(f"  Hour-refill runner error (count={total}); playout unaffected: {type(exc).__name__}")
+                except Exception:  # noqa: BLE001 -- a journal write never ends the runner thread
+                    self.counters["journal_write_errors"] += 1
         # Journal only after this check's own outcome is final, so an
         # evaluation that raised is logged as `error`, never as the previous
-        # evaluation's outcome.
+        # evaluation's outcome. A failed journal write leaves that outcome
+        # and the publish below untouched.
         if self._evaluating is not None:
             self._journal_evaluation()
         try:
@@ -352,9 +356,13 @@ class HourRefillRunner:
         keys = ("mode", "status", "log_id", "cause_ids", "net_shortage_seconds", "threshold_seconds",
                 "captured_at", "committed_runway_seconds", "boundary_instant", "placement_mode", "track_ids",
                 "safety_budget_seconds", "insertion_lead_seconds", "installed_log_item_ids")
+        try:
+            print("  Hour-refill evaluation " + json.dumps({k: outcome.get(k) for k in keys if k in outcome},
+                                                            sort_keys=True, separators=(",", ":")))
+        except Exception:  # noqa: BLE001 -- telemetry only: counted, never raised
+            self.counters["journal_write_errors"] += 1
+            return
         self.counters["journal_lines"] += 1
-        print("  Hour-refill evaluation " + json.dumps({k: outcome.get(k) for k in keys if k in outcome},
-                                                        sort_keys=True, separators=(",", ":")))
 
     def _evaluate(self, entry, log_id, cause_ids):
         snapshot = request_snapshot(self.engine, idle_add=self._bounded_idle_add, wall_clock=self.wall_clock)

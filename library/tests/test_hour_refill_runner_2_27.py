@@ -86,6 +86,26 @@ class StrictGLibSpy:
             self.run(fn, *args)
 
 
+class _BrokenJournal:
+    """A stdout whose every write fails, as a closed journald stream would."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def write(self, text):
+        self.attempts += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+def redirect_stdout_broken():
+    from contextlib import redirect_stdout
+
+    return redirect_stdout(_BrokenJournal())
+
+
 class RunnerFixtures(InstallFixtures):
     def set_policy(self, *, enabled=True, dry_run=True, request=True, eject=True):
         HourRefillPolicy.objects.all().delete()
@@ -338,6 +358,56 @@ class OffParityTests(RunnerFixtures, TestCase):
             self.assertNotIn(key, failed)  # nothing carried over from the successful evaluation
         self.assertEqual((self.outcome(runner)["status"], runner.counters["errors"],
                           runner.counters["journal_lines"]), ("error", 2, 2))
+
+    def test_a_journal_write_failure_keeps_the_outcome_publishes_and_the_runner_continues(self):
+        import io
+        from contextlib import redirect_stdout
+
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        self.set_policy()
+        runner = self.make_runner(engine)
+        broken = _BrokenJournal()
+        with redirect_stdout(broken):
+            self.assertTrue(runner.run_once())  # returns normally: no exception escapes
+        self.assertGreater(broken.attempts, 0)
+        outcome = self.outcome(runner)
+        self.assertEqual((outcome["kind"], outcome["status"]), ("advisory", "proposed"))  # not replaced by error
+        self.assertEqual((runner.counters["journal_write_errors"], runner.counters["journal_lines"],
+                          runner.counters["errors"], runner.counters["status_writes"]), (1, 0, 0, 1))
+        doc, freshness = status_mod.read_runner_status(self.status_path)
+        self.assertEqual((freshness, doc["last_outcome"]["status"], doc["counters"]["journal_write_errors"]),
+                         ("fresh", "proposed", 1))
+
+        # The same runner keeps working once the journal is writable again.
+        self.advance(runner_mod.RETRY_SECONDS)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertTrue(runner.run_once())
+        lines = [line for line in out.getvalue().splitlines() if "Hour-refill evaluation " in line]
+        self.assertEqual([json.loads(line.split("Hour-refill evaluation ", 1)[1])["status"] for line in lines],
+                         ["proposed"])
+        self.assertEqual((runner.counters["evaluations"], runner.counters["journal_lines"],
+                          runner.counters["journal_write_errors"], runner.counters["errors"]), (2, 1, 1, 0))
+
+    def test_a_failing_evaluation_with_a_broken_journal_still_records_its_own_error(self):
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        self.set_policy()
+        runner = self.make_runner(engine)
+        with redirect_stdout_broken(), \
+                patch.object(runner_mod, "project_refill", side_effect=RuntimeError("injected")):
+            self.assertFalse(runner.run_once())  # the evaluation's error, not an escaped OSError
+        outcome = self.outcome(runner)
+        self.assertEqual((outcome["status"], outcome["log_id"], outcome["cause_ids"]),
+                         ("error", self.log.id, [HourRefillCause.objects.get().id]))
+        for key in ("net_shortage_seconds", "track_ids", "committed_runway_seconds", "captured_at"):
+            self.assertNotIn(key, outcome)
+        # The error diagnostic and the evaluation line both failed to write.
+        self.assertEqual((runner.counters["errors"], runner.counters["journal_write_errors"],
+                          runner.counters["journal_lines"]), (1, 2, 0))
+        doc, _ = status_mod.read_runner_status(self.status_path)
+        self.assertEqual((doc["last_outcome"]["status"], doc["counters"]["journal_write_errors"]), ("error", 2))
 
     def test_install_requested_but_not_armed_stays_observation(self):
         engine = self.eject_engine()
@@ -925,6 +995,30 @@ class LifecycleTests(RunnerFixtures, TransactionTestCase):
             runner._thread.join(10)
         self.assertFalse(runner._thread.is_alive())
         self.assertEqual(runner.counters["status_writes"], writes + 1)  # its final, still-current publish
+
+    def test_a_journal_write_failure_never_ends_the_runner_thread(self):
+        self.track(200.0), self.track(180.0)
+        self.set_policy()
+        runner, checked = self._runner()
+        with redirect_stdout_broken():
+            runner.start()
+            self.assertTrue(checked.acquire(timeout=10))  # first evaluation: journal write fails
+            self.assertTrue(runner.alive)
+            self.assertEqual((self.outcome(runner)["status"], runner.counters["journal_write_errors"]),
+                             ("proposed", 1))
+            self.advance(runner_mod.RETRY_SECONDS)
+            runner.wake()
+            self.assertTrue(checked.acquire(timeout=10))  # the same thread evaluates again
+            self.assertTrue(runner.alive)
+        self.assertTrue(runner.stop())
+        self.assertEqual((runner.counters["evaluations"], runner.counters["journal_write_errors"],
+                          runner.counters["errors"]), (2, 2, 0))
+        # Published both times; the file itself is rewritten only on a
+        # meaningful change or the heartbeat, never for counters alone.
+        self.assertEqual((runner.last_status["last_outcome"]["status"],
+                          runner.last_status["counters"]["journal_write_errors"]), ("proposed", 2))
+        doc, _ = status_mod.read_runner_status(self.status_path)
+        self.assertEqual((doc["last_outcome"]["status"], doc["counters"]["journal_write_errors"]), ("proposed", 1))
 
     def test_a_stale_generation_never_publishes(self):
         runner, _ = self._runner()
