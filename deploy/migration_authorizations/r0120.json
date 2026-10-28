@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0120",
+  "target_commit": "07fd80bf44406b9219dc91d144f8a336c50e1796",
+  "manifest_sha256": "eb498296303e53e97222c23522013726e181877b0a4ff4af45d49ed6b3504576",
+  "authorized_manual_operations": [
+    {
+      "ref": "library.0096_hour_refill_install_gate",
+      "migration_file_sha256": "635ee001f385d5088952c8c201c1b3f7f4016a56d0abc5f06a71370ce917727f",
+      "operation_index": 0,
+      "operation": "RemoveConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0096_hour_refill_install_gate",
+      "migration_file_sha256": "635ee001f385d5088952c8c201c1b3f7f4016a56d0abc5f06a71370ce917727f",
+      "operation_index": 1,
+      "operation": "AlterField",
+      "classification": "manual"
+    }
+  ]
+}
