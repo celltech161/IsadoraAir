@@ -556,5 +556,5 @@ def describe(state):
     db = state["database"]
     lines.append(f"  database: DB_NAME={db['NAME']} DB_USER={db['USER']}")
     for name, configured in sorted(state["stale_configuration"].items()):
-        lines.append(f"  NOTICE: configured {name}={configured} was NOT honoured (redirected to the namespace)")
+        lines.append(f"  NOTICE: configured {name}={configured} was NOT honoured (replaced by an isolated value)")
     return "\n".join(lines)

@@ -61,9 +61,8 @@ class ProtectedPathClassificationTests(_Scratch):
         self.assertTrue(iso.protected_match("/var/lib", ancestors=True))
 
     def test_traversal_and_symlink_aliases_resolve_to_the_protected_root(self):
+        (self.station / "waveforms").mkdir()           # created before the directory is declared protected
         with self.protected():
-            target = self.station / "waveforms"
-            target.mkdir()
             alias = self.tmp / "alias"
             alias.symlink_to(self.station, target_is_directory=True)
             chain = self.tmp / "chain"
