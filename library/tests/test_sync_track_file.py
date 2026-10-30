@@ -208,9 +208,13 @@ class ProtectedWaveformCollisionTests(TestCase):
             self._sync(WAVEFORMS_DIR=str(self.protected))
         self.assertEqual(sentinel.read_bytes(), self.SENTINEL)
         self.assertEqual(sorted(p.name for p in self.protected.iterdir()), [sentinel.name])
+        # The boundary stops the very first mutation aimed at the station directory (the
+        # directory-ensuring mkdir in get_waveforms_dir), before any file is opened.
         blocked = test_isolation.blocked_writes()
-        self.assertEqual([entry[0] for entry in blocked][:1], ["open"])
-        self.assertEqual(Path(blocked[0][1]), sentinel)
+        self.assertGreaterEqual(len(blocked), 1)
+        for event, path, root, _stack in blocked:
+            self.assertEqual(root, str(self.protected), event)
+            self.assertTrue(Path(path) == self.protected or self.protected in Path(path).parents, path)
 
     def test_a_symlink_alias_of_station_storage_is_refused_too(self):
         track, _ = self._sync(WAVEFORMS_DIR=str(self.scratch))
