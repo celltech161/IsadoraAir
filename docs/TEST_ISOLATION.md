@@ -310,6 +310,16 @@ env -u ISADORAAIR_SANDBOX_EVIDENCE -u ISADORAAIR_PREFLIGHT_COPY \
 
 ## Qualification inside the kernel sandbox (2026-10-30, test HEAD `928cc37`)
 
+**Outcome.** The test-containment objective passed: every process of every run stayed
+inside the kernel sandbox with its disposable database, and no run reached station
+storage, runtime state, services or the production database. All 17 application suites
+were exercised in the sandbox, and 9,674 of the 10,421 selected tests passed. The
+media-validation failures, the excluded browser and systemd-dependent tests, and the
+remaining historical failures are **not** passing application tests, and this is not a
+qualification of the whole application suite. Improving that qualification (validation
+across sandboxes, the inherited umask, the remaining fixtures, a disposable VM for the
+excluded tests) is separate follow-up work.
+
 Every app, one run each, through the procedure above. Containment held for every run:
 attestation present, no escape, cleanup complete, station files and the repaired waveforms
 unchanged. "Selected" leaves out the exclusions below.
