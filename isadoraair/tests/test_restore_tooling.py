@@ -11,12 +11,14 @@ inspect_backup.sh is the one script fully exercised for real here --
 against small, synthetic, temp-directory-only archives (never a real
 production backup), which is enough to prove its actual pass/fail logic
 works without needing production data in the test suite."""
+import grp
 import hashlib
 import importlib.util
 import os
 import io
 import json
 import pty
+import pwd
 import shutil
 import socket
 import stat
@@ -31,6 +33,28 @@ from django.test import SimpleTestCase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESTORE_DIR = REPO_ROOT / "deploy" / "restore"
+
+_HOST_TOOL_SHIMS = None
+
+
+def setUpModule():
+    """90-system-config.sh lints the units it installs with ``systemd-analyze verify``
+    (informational only). The real tool writes /run/systemd/systemd-units-load when it
+    can; in the test sandbox that lands in the private /run, which the isolation proof
+    then rightly reports. Every stage run in this module finds a silent stand-in first."""
+    global _HOST_TOOL_SHIMS
+    _HOST_TOOL_SHIMS = tempfile.TemporaryDirectory(prefix="isadoraair-restore-shims-")
+    shim = Path(_HOST_TOOL_SHIMS.name) / "systemd-analyze"
+    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    shim.chmod(0o755)
+    os.environ["PATH"] = f"{_HOST_TOOL_SHIMS.name}{os.pathsep}{os.environ['PATH']}"
+
+
+def tearDownModule():
+    prefix = f"{_HOST_TOOL_SHIMS.name}{os.pathsep}"
+    if os.environ["PATH"].startswith(prefix):
+        os.environ["PATH"] = os.environ["PATH"][len(prefix):]
+    _HOST_TOOL_SHIMS.cleanup()
 STAGE_SCRIPTS = sorted(RESTORE_DIR.glob("*.sh"))
 
 
@@ -3278,6 +3302,13 @@ class Stage90NginxExitCodeGatingTests(SimpleTestCase):
         self.target_root = self.tmpdir / "opt" / "isadoraair"
         self.fakebin = self.tmpdir / "fakebin"
         self.fakebin.mkdir()
+        # systemd-tmpfiles --root resolves the config's owner (this user) from that root.
+        user, group = pwd.getpwuid(os.getuid()), grp.getgrgid(os.getgid())
+        (self.tmpdir / "tmpfiles-root" / "etc").mkdir(parents=True)
+        (self.tmpdir / "tmpfiles-root" / "etc" / "passwd").write_text(
+            f"{user.pw_name}:x:{user.pw_uid}:{user.pw_gid}::/nonexistent:/usr/sbin/nologin\n", encoding="utf-8")
+        (self.tmpdir / "tmpfiles-root" / "etc" / "group").write_text(
+            f"{group.gr_name}:x:{group.gr_gid}:\n", encoding="utf-8")
         self.sudo_log = self.tmpdir / "sudo.log"
         (self.fakebin / "sudo").write_text(
             f"""#!/usr/bin/env bash
@@ -3293,6 +3324,11 @@ for a in "$@"; do
   rewritten="${{rewritten//\\/var\\/backups\\/isadoraair/{self.fake_var_backups_isadoraair}}}"
   args+=("$rewritten")
 done
+# systemd-tmpfiles would otherwise create the station's runtime tree (/run/isadoraair,
+# ...) on the real root; give it this fixture's own.
+if [ "${{args[0]}}" = systemd-tmpfiles ]; then
+  args=("${{args[0]}}" "--root={self.tmpdir / 'tmpfiles-root'}" "${{args[@]:1}}")
+fi
 exec "${{args[@]}}"
 """,
             encoding="utf-8",

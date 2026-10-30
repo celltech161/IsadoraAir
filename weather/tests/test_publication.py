@@ -20,7 +20,6 @@ from weather import provenance as provenance_mod
 from weather.publication import PublicationError, publish_weather_asset
 
 
-@override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0057-test-waveforms")
 class PublicationTestCase(TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -32,6 +31,7 @@ class PublicationTestCase(TestCase):
 
         self.settings_patcher = override_settings(
             LIBRARY_ROOT=str(self.library_root), WEATHER_DATA_DIR=str(self.data_dir),
+            WAVEFORMS_DIR=str(Path(self.temporary.name) / "waveforms"),
         )
         self.settings_patcher.enable()
         self.addCleanup(self.settings_patcher.disable)
@@ -336,7 +336,6 @@ class MissingScratchWaveformTests(PublicationTestCase):
         self.assertEqual(track.waveform_path, str(real_waveform_path))
 
 
-@override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0057-test-waveforms-lock")
 class DestinationLockTests(TransactionTestCase):
     """P1 2.4 Pass G correction: two publish_weather_asset() calls
     targeting the SAME final destination (e.g. wx_alert.py and
@@ -365,6 +364,7 @@ class DestinationLockTests(TransactionTestCase):
 
         self.settings_patcher = override_settings(
             LIBRARY_ROOT=str(self.library_root), WEATHER_DATA_DIR=str(self.data_dir),
+            WAVEFORMS_DIR=str(Path(self.temporary.name) / "waveforms"),
         )
         self.settings_patcher.enable()
         self.addCleanup(self.settings_patcher.disable)

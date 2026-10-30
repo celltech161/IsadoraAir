@@ -13,6 +13,7 @@ failed against the old bare-import version.
 import json
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from django.core.management import call_command
 
@@ -44,7 +45,11 @@ class MaintainAircheckBufferCommandTests(AircheckRecorderTestBase):
 
     def test_rolled_heartbeat_reflects_post_rollover_size(self):
         self.write_working_file(2000)
-        self.run_command("--max-bytes", "1000")
+        # The idle rollover asks Liquidsoap's telnet server (127.0.0.1:1234, the
+        # station's live encoder) to reopen its output; nothing here may reach it.
+        with patch.object(recorder, "_send_telnet") as telnet:
+            self.run_command("--max-bytes", "1000")
+        telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
         state = self._read_heartbeat()
         self.assertEqual(state["result"], "idle_rolled")
         self.assertIsNotNone(state["last_rollover_at"])

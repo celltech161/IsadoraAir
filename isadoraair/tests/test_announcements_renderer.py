@@ -1,5 +1,6 @@
 """Focused contracts for the three generated-announcement artifact modes."""
 
+import functools
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +19,15 @@ from isadoraair.announcements import (
 from isadoraair.announcements import renderer as renderer_module
 from library.models import AnalysisConfig, Artist, Category, CategoryKind, Track
 
+
+def private_waveforms_dir(test):
+    """WAVEFORMS_DIR in this test's own temporary root (not a fixed /tmp path shared
+    between runs, which in the test sandbox is also another filesystem)."""
+    @functools.wraps(test)
+    def wrapper(self, *args, **kwargs):
+        with override_settings(WAVEFORMS_DIR=str(self.root / "published-waveforms")):
+            return test(self, *args, **kwargs)
+    return wrapper
 
 class AnnouncementRendererTests(TestCase):
     def setUp(self):
@@ -144,7 +154,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertEqual(destination.read_bytes(), b"LAST-GOOD")
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_speech_splice_publishes_track_and_reasserts_cues_after_analysis(self):
         destination = self.root / "speech.flac"
 
@@ -334,7 +344,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertFalse(Track.objects.filter(filepath=str(destination)).exists())
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_rotation_asset_has_stable_identity_and_analysis_owned_cues(self):
         destination = self.root / "rotation.flac"
         payload = {"bytes": b"ROTATION-ONE", "cue": 1.25, "next": 7.0}
@@ -371,7 +381,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertTrue(second.analysis_succeeded)
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_failed_rotation_regeneration_restores_last_known_good(self):
         destination = self.root / "rotation.flac"
         track = self._existing_track(destination)
@@ -402,7 +412,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertEqual(track.next_start_seconds, 8.0)
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_rotation_asset_analysis_uses_category_threshold_overrides(self):
         """Rotation Asset must resolve cue thresholds the same way an
         ordinary Track in the same Category would: global AnalysisConfig
@@ -454,7 +464,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertEqual(cue_in_min, global_cfg.cue_in_min_seconds)
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_speech_splice_analysis_ignores_category_overrides(self):
         """The Category-override path is specific to Rotation Asset --
         Speech Splice reasserts cue=0/next_start=duration regardless, so
@@ -509,7 +519,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertNotIsInstance(ctx.exception, OSError)
         synthesize.assert_not_called()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_failed_rotation_regeneration_restores_last_known_good_waveform_file(self):
         """The advertised LKG guarantee covers the physical waveform JSON,
         not just the FLAC and DB row -- prove the real file on disk is
@@ -552,7 +562,7 @@ class AnnouncementRendererTests(TestCase):
         self.assertEqual(waveform_path.read_bytes(), b"LAST-GOOD-WAVEFORM")
         self._assert_no_scratch()
 
-    @override_settings(WAVEFORMS_DIR="/tmp/isadoraair-r0055-test-waveforms")
+    @private_waveforms_dir
     def test_failed_rotation_regeneration_for_new_asset_removes_new_waveform(self):
         """A brand-new Rotation Asset has no preexisting waveform. If
         analysis fails after creating one, the renderer must remove that

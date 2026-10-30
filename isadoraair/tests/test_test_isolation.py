@@ -919,3 +919,19 @@ class StationRuntimeRootTests(_Scratch):
         self.assertEqual(iso.fail_on_blocked(0, stream), 1)
         self.assertIn("ISOLATION FAILURE", stream.getvalue())
         self.assertIn("/run/isadoraair/rbds_state.tmp", stream.getvalue())
+
+
+class EngineCommandQueueTests(SimpleTestCase):
+    """A queued engine command from code that does not name a queue (a signal fired while
+    a test database is rebuilt, say) lands in this run's namespace, never the live queue."""
+
+    def test_the_default_queue_is_inside_the_namespace(self):
+        from isadoraair import engine_commands
+        namespace = settings.ISADORAAIR_TEST_ISOLATION["namespace"]
+        for path in (engine_commands.ENGINE_COMMAND_QUEUE_DIR, engine_commands.ENGINE_COMMAND_LOCK_PATH):
+            self.assertTrue(str(path).startswith(namespace + os.sep), path)
+            self.assertIsNone(iso.protected_match(str(path)))
+        committed = engine_commands.enqueue_engine_command({"command": "isolation-probe"})
+        self.addCleanup(lambda: committed.unlink(missing_ok=True))
+        self.assertEqual(committed.parent, engine_commands.ENGINE_COMMAND_QUEUE_DIR)
+        self.assertEqual(iso.blocked_writes(), [])

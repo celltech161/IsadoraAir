@@ -8,6 +8,7 @@ listener widget next to Listeners/Peak.
 fetch_shoutcast_stats is always mocked here -- no live Shoutcast server
 involved, matching monitoring/tests/test_probe_encoder_group.py's own
 approach for the same underlying fetcher."""
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -37,6 +38,19 @@ def _first_of_previous_month(now):
     return now.replace(month=now.month - 1, day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+class PrivateListenerStateMixin:
+    """_poll_shoutcast_listeners() publishes listeners.json (via listeners.tmp) at
+    LISTENER_STATE_PATH, the station's /run/isadoraair; point it at a test directory."""
+
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.object(monitor_module, "LISTENER_STATE_PATH", Path(directory.name) / "listeners.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 class ListenerPeakTlhModelTests(TestCase):
     def test_defaults(self):
         obj = ListenerPeak.load()
@@ -44,8 +58,9 @@ class ListenerPeakTlhModelTests(TestCase):
         self.assertIsNotNone(obj.tlh_since_at)
 
 
-class PollShoutcastListenersTlhTests(TestCase):
+class PollShoutcastListenersTlhTests(PrivateListenerStateMixin, TestCase):
     def setUp(self):
+        super().setUp()
         self.encoder = make_encoder()  # mount "/1" -> shoutcast_sid "1"
         self.manager = monitor_module.MonitorManager()
 
@@ -177,12 +192,13 @@ class MaybeResetTlhForNewMonthTests(TestCase):
         self.assertEqual(peak.tlh_hours, 0.0)
 
 
-class PollShoutcastListenersMonthlyResetTests(TestCase):
+class PollShoutcastListenersMonthlyResetTests(PrivateListenerStateMixin, TestCase):
     """End-to-end: the reset actually fires from within a real
     _poll_shoutcast_listeners() tick, through both call sites (the
     normal path and the no-encoders-configured early return)."""
 
     def setUp(self):
+        super().setUp()
         self.encoder = make_encoder()
         self.manager = monitor_module.MonitorManager()
 

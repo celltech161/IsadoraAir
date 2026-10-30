@@ -1,13 +1,14 @@
 """/updates/ permission + side-effect tests -- [P0] 1.1 Phase A."""
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
 from django.test import Client, TestCase, override_settings
 from django.urls import NoReverseMatch, reverse
 
 from updatecenter import views as uc_views
+from updatecenter.backend_client import BackendTransportError
 from updatecenter.models import UpdateJob, UpdateJobState
 from .gitfixtures import FakeRepo
 
@@ -84,9 +85,24 @@ def _write_bootstrap_manifest(repo):
     return releases_dir
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)  # project-wide prod setting; plain-HTTP test client would otherwise 301
-class PermissionTests(TestCase):
+class UnreachableUpdaterMixin:
+    """The dashboard asks the protected updater whether it is ready; its default
+    socket is the station's root-owned updater, which a test must never contact.
+    The real readiness code runs against a client that cannot reach anything."""
+
     def setUp(self):
+        super().setUp()
+        client = MagicMock()
+        client.ping.side_effect = BackendTransportError("test: the protected updater is not contacted")
+        patcher = patch.object(uc_views, "UpdaterClient", return_value=client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)  # project-wide prod setting; plain-HTTP test client would otherwise 301
+class PermissionTests(UnreachableUpdaterMixin, TestCase):
+    def setUp(self):
+        super().setUp()
         self.anon_client = Client()
         self.plain_user = User.objects.create_user("plainuser", password="x")
         self.staff_user = User.objects.create_user("staffuser", password="x", is_staff=True)
@@ -150,8 +166,9 @@ class NoExecutionEndpointTests(TestCase):
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
-class GetHasNoSideEffectTests(TestCase):
+class GetHasNoSideEffectTests(UnreachableUpdaterMixin, TestCase):
     def setUp(self):
+        super().setUp()
         self.staff_user = User.objects.create_user("staffuser", password="x", is_staff=True)
         self.client_ = Client()
         self.client_.force_login(self.staff_user)

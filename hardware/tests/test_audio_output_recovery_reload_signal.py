@@ -109,7 +109,10 @@ class AudioOutputAdminSaveModelIntegrationTests(TestCase):
         with patch("hardware.signals.enqueue_engine_command", side_effect=published.append), \
              self.captureOnCommitCallbacks(execute=True):
             if mock_subprocess:
-                with patch("hardware.admin.subprocess.run") as mock_run:
+                # A mixer change ends with "alsactl store", which the root-owned updater
+                # performs (UpdaterClient().store_alsa_state()); stand in for both.
+                with patch("hardware.admin.subprocess.run") as mock_run, \
+                        patch("hardware.admin._alsa_store"):
                     mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
                     admin_instance.save_model(request=None, obj=obj, form=form, change=True)
             else:
