@@ -269,6 +269,14 @@ def _isolated_ci_requested():
     return True
 
 
+def _kernel_sandboxed():
+    """True inside production/tests/sandbox_exec.sh (verified kernel facts, see
+    ``test_isolation.sandbox_problems``): no installation is visible there and the only
+    PostgreSQL server that can be reached is the run's disposable one."""
+    from isadoraair import test_isolation
+    return bool(os.environ.get(test_isolation.SANDBOX_ENV)) and not test_isolation.sandbox_problems()
+
+
 def check_alias(alias, installation=None):
     """Raise ``UnsafeTestDatabaseError`` unless ``alias`` is a proven test database."""
     configured = str(connections[alias].settings_dict.get("NAME") or "")
@@ -287,7 +295,8 @@ def check_alias(alias, installation=None):
             rule=f"{ISOLATED_CI_ENV}=1 is refused on a host with an IsadoraAir installation",
             detail="station markers present: " + ", ".join(installation.station_markers),
         )
-    if not installation.roles and not isolated_ci:
+    sandboxed = not installation.station_markers and _kernel_sandboxed()
+    if not installation.roles and not (isolated_ci or sandboxed):
         detail = "; ".join(installation.problems) or "no readable station config or production .env"
         if not installation.station_markers:
             detail += " (no IsadoraAir installation found on this host)"
@@ -322,7 +331,9 @@ def check_alias(alias, installation=None):
             IDENTITY_UNESTABLISHED, alias=alias, database=where, role=role,
             rule="the effective role's attributes could not be read from pg_roles",
         )
-    derived_from = ", ".join(installation.sources) or f"{ISOLATED_CI_ENV}=1 (no installation)"
+    derived_from = ", ".join(installation.sources) or (
+        f"{ISOLATED_CI_ENV}=1 (no installation)" if isolated_ci
+        else "the kernel test sandbox (no installation visible; disposable server)")
     if identity.production_memberships:
         raise UnsafeTestDatabaseError(
             PRODUCTION_ROLE_DETECTED, alias=alias, database=where, role=role,

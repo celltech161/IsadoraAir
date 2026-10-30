@@ -6,6 +6,10 @@ database. Every probe targets a path that does not exist and uses a
 non-creating mode, so even if the write boundary were absent nothing would be
 created or changed; an unrefused probe fails the command.
 
+Inside the kernel sandbox (production/tests/sandbox_exec.sh) the station paths
+the probes name are not even mounted; the probes then show that the Python layer
+refuses them on its own as well.
+
 Exit status: 0 isolated and every probe refused; 2 not isolated / a probe was not refused.
 """
 import json
@@ -36,7 +40,7 @@ class Command(BaseCommand):
             ("open r+  production waveforms", lambda: os.open(f"/srv/isadoraair/waveforms/{probe_name}", os.O_RDWR)),
             ("open w   production music (no O_CREAT)", lambda: os.open(f"/srv/isadoraair/music/{probe_name}", os.O_WRONLY)),
             ("open r+  via symlink alias", lambda: os.open(os.path.join(symlink, probe_name), os.O_RDWR)),
-            ("open r+  via '..' traversal", lambda: os.open(f"{namespace}/../../../srv/isadoraair/waveforms/{probe_name}", os.O_RDWR)),
+            ("open r+  via '..' traversal", lambda: os.open(f"{namespace}{'/..' * namespace.count('/')}/srv/isadoraair/waveforms/{probe_name}", os.O_RDWR)),
             ("open r+  live checkout", lambda: os.open(f"/opt/isadoraair/{probe_name}", os.O_RDWR)),
             ("rename   out of production waveforms", lambda: os.rename(f"/srv/isadoraair/waveforms/{probe_name}", os.path.join(namespace, "x"))),
             ("remove   production reports", lambda: os.remove(f"/var/lib/isadoraair/reports/{probe_name}")),
@@ -61,8 +65,12 @@ class Command(BaseCommand):
 
         ancestor = {path: bool(test_isolation.protected_match(path, ancestors=True))
                     for path in ("/srv", "/srv/isadoraair", "/var/lib", "/opt")}
+        sandbox = test_isolation.sandbox_problems()
+        failed = failed or bool(sandbox)
         report = {
             "isolated": not failed,
+            "kernel_sandbox": {"run_directory": os.environ.get(test_isolation.SANDBOX_ENV),
+                               "problems": sandbox},
             "namespace": namespace,
             "roots": state["roots"],
             "database": state["database"],

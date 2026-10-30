@@ -79,12 +79,19 @@ def _guarded_case():
 
 class _GuardTestBase(SimpleTestCase):
     databases = {"default"}
+    #: The matrix describes an ordinary host; the kernel sandbox the suite runs in is
+    #: covered separately (KernelSandboxIdentityTests).
+    real_kernel_sandbox = False
 
     def setUp(self):
         environment = mock.patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
         os.environ.pop(test_safety.ISOLATED_CI_ENV, None)
+        if not self.real_kernel_sandbox:
+            sandbox = mock.patch.object(test_safety, "_kernel_sandboxed", return_value=False)
+            sandbox.start()
+            self.addCleanup(sandbox.stop)
 
     def _with_database_name(self, name):
         return mock.patch.dict(connections["default"].settings_dict, {"NAME": name})
@@ -107,6 +114,8 @@ class _GuardTestBase(SimpleTestCase):
 
 
 class RealRunnerIdentityTests(_GuardTestBase):
+    real_kernel_sandbox = True
+
     def test_the_runner_database_is_a_proven_test_database(self):
         # Under `manage.py test` Django has already switched to test_<name>,
         # and this asks the real server who we are.
@@ -230,6 +239,32 @@ class IdentityMatrixTests(_GuardTestBase):
             self.assertIn(expected, message)
 
 
+class KernelSandboxIdentityTests(_GuardTestBase):
+    real_kernel_sandbox = True
+
+    def test_the_suite_runs_in_the_kernel_sandbox(self):
+        self.assertTrue(test_safety._kernel_sandboxed())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ISADORAAIR_TEST_SANDBOX")
+            self.assertFalse(test_safety._kernel_sandboxed())
+
+    def test_the_sandbox_stands_in_for_a_host_with_no_installation_and_relaxes_nothing_else(self):
+        with mock.patch.object(test_safety, "_kernel_sandboxed", return_value=True):
+            with self._installation(NO_INSTALLATION), self._session(_identity()):
+                self.assertEqual(check_alias("default").current_user, "isadoraair_dev")
+            with self._installation(NO_INSTALLATION):
+                with self._session(_identity()), self._with_database_name("isadoraair"):
+                    self._refusal(WRONG_DATABASE_NAME)
+                with self._session(_identity(user="postgres", superuser=True)):
+                    self._refusal(PRODUCTION_ROLE_DETECTED)
+                with self._session(side_effect=RuntimeError("down")):
+                    self._refusal(IDENTITY_UNESTABLISHED)
+            # A visible installation means the facts are not those of the sandbox: normal rules.
+            unreadable = ProductionInstallation(("/etc/isadoraair/station.json",), frozenset(), frozenset(), (), ())
+            with self._installation(unreadable), self._session(_identity()):
+                self._refusal(IDENTITY_UNESTABLISHED)
+
+
 class IsolatedCiOverrideTests(_GuardTestBase):
     def _ci(self, value="1"):
         os.environ[test_safety.ISOLATED_CI_ENV] = value
@@ -331,6 +366,10 @@ class ProductionInstallationDerivationTests(SimpleTestCase):
 
 
 class FixtureHookTests(_GuardTestBase):
+    # The real-flush case needs the real installation facts (inside the sandbox: none visible);
+    # every refusal case here mocks a station installation, so host semantics still apply to it.
+    real_kernel_sandbox = True
+
     def test_teardown_refuses_before_any_flush_on_a_non_test_database(self):
         case = _guarded_case()
         with self._with_database_name("isadoraair"), \

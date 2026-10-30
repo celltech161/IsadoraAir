@@ -343,12 +343,18 @@ class EngagementTests(SimpleTestCase):
         self.assertIn("ENGAGED", text)
         self.assertIn("configured WAVEFORMS_DIR=/srv/isadoraair/waveforms was NOT honoured", text)
 
-    def test_the_guarded_runner_script_gives_every_process_the_namespace_and_runs_the_preflight_first(self):
+    def test_the_guarded_runner_sandboxes_every_process_and_runs_the_preflight_first(self):
         script = (BASE / "production" / "tests" / "run_with_validation_service.sh").read_text()
-        self.assertIn('export ISADORAAIR_TEST_DATA_ROOT="$isolation_root"', script)
-        self.assertEqual(script.count('-E "ISADORAAIR_TEST_DATA_ROOT=$isolation_root"'), 2)   # validation + render units
-        self.assertLess(script.index("test_isolation_preflight"), script.index("systemd-run --user --quiet"))
-        self.assertIn("remove_isolation_root", script)
+        self.assertIn('export ISADORAAIR_TEST_SANDBOX="$run" ISADORAAIR_TEST_CONTROL="$ctl" ISADORAAIR_TEST_DATA_ROOT="$data"',
+                      script)
+        self.assertIn('"$sandbox" service -- "$python" "$here/manage.py" "$4"', script)       # validation + render units
+        self.assertIn('-p Delegate=yes "$sandbox" scope -- "$here/production/tests/run_delegated.sh" "$@"', script)
+        self.assertIn('"$sandbox" plain -- "$python" "$here/manage.py" test_isolation_preflight', script)
+        self.assertIn('"$sandbox" plain -- "$pg_bin/postgres" -D', script)
+        self.assertLess(script.index("test_isolation_preflight >"), script.index("systemd-run --user --quiet"))
+        self.assertEqual(script.count("verify_unit \"$1\""), 1)                            # every service is checked
+        self.assertNotIn("systemd-run --user --scope --quiet -p Delegate=yes \"$here/production/tests/run_delegated.sh\"",
+                         script)                                                           # never unsandboxed
 
 
 class FreshProcessControlTests(SimpleTestCase):
@@ -445,3 +451,230 @@ class FreshProcessControlTests(SimpleTestCase):
         self.refused(self.run_preflight(DB_NAME="isadoraair", DB_USER="isadoraair", DB_PASSWORD="not-a-real-password"),
                      iso.CATEGORY_DATABASE)
         self.refused(self.run_preflight(DB_USER="isadoraair"), iso.CATEGORY_DATABASE)
+
+
+class DescriptorRelativeWriteTests(_Scratch):
+    """P1-A: mutations relative to a directory descriptor, or through a descriptor, are judged
+    by the directory or file they really reach. Only the synthetic station directory is aimed at."""
+
+    def setUp(self):
+        super().setUp()
+        self.file = self.station / "1.json"
+        self.file.write_bytes(b"station data")
+        self.scratch = self.tmp / "scratch"
+        self.scratch.mkdir()
+        (self.scratch / "src").write_bytes(b"scratch")
+        self.station_fd = os.open(self.station, os.O_RDONLY | os.O_DIRECTORY)
+        self.scratch_fd = os.open(self.scratch, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.station_fd)
+        self.addCleanup(os.close, self.scratch_fd)
+
+    def assertStationUntouched(self):
+        self.assertEqual(self.file.read_bytes(), b"station data")
+        self.assertEqual(sorted(p.name for p in self.station.iterdir()), ["1.json"])
+
+    def test_descriptor_relative_mutations_of_protected_storage_are_refused(self):
+        with self.protected():
+            attempts = {
+                "os.open create": lambda: os.open("new.json", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=self.station_fd),
+                "os.open truncate": lambda: os.open("1.json", os.O_WRONLY | os.O_TRUNC, dir_fd=self.station_fd),
+                "os.open via '..' from scratch": lambda: os.open("../station/1.json", os.O_RDWR, dir_fd=self.scratch_fd),
+                "os.rename in": lambda: os.rename("src", "1.json", src_dir_fd=self.scratch_fd, dst_dir_fd=self.station_fd),
+                "os.rename out": lambda: os.rename("1.json", "stolen", src_dir_fd=self.station_fd,
+                                                   dst_dir_fd=self.scratch_fd),
+                "os.replace in": lambda: os.replace("src", "1.json", src_dir_fd=self.scratch_fd,
+                                                    dst_dir_fd=self.station_fd),
+                "os.unlink": lambda: os.unlink("1.json", dir_fd=self.station_fd),
+                "os.rmdir via '..'": lambda: os.rmdir("../station", dir_fd=self.scratch_fd),
+                "os.mkdir": lambda: os.mkdir("sub", dir_fd=self.station_fd),
+                "os.symlink": lambda: os.symlink("/etc/hostname", "link", dir_fd=self.station_fd),
+                "os.link out (a second name for the protected inode)":
+                    lambda: os.link("1.json", "hardlink", src_dir_fd=self.station_fd, dst_dir_fd=self.scratch_fd),
+                "os.chmod": lambda: os.chmod("1.json", 0o600, dir_fd=self.station_fd),
+                "opener with dir_fd": lambda: open("1.json", "w", opener=lambda name, flags: os.open(
+                    name, flags, 0o644, dir_fd=self.station_fd)),
+                "shutil.rmtree with dir_fd": lambda: shutil.rmtree("station", dir_fd=os.open(self.tmp, os.O_RDONLY)),
+            }
+            for label, attempt in attempts.items():
+                with self.subTest(label), self.assertRaises(iso.ProtectedPathWriteBlocked) as raised:
+                    attempt()
+                self.assertEqual(raised.exception.root, str(self.station), label)
+        self.assertStationUntouched()
+        self.assertEqual((self.scratch / "src").read_bytes(), b"scratch")
+
+    def test_a_directory_descriptor_opened_through_a_symlink_alias_is_resolved(self):
+        alias = self.tmp / "alias"
+        alias.symlink_to(self.station, target_is_directory=True)
+        alias_fd = os.open(alias, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, alias_fd)
+        with self.protected():
+            with self.assertRaises(iso.ProtectedPathWriteBlocked):
+                os.open("1.json", os.O_WRONLY | os.O_TRUNC, dir_fd=alias_fd)
+            with self.assertRaises(iso.ProtectedPathWriteBlocked):
+                os.unlink("1.json", dir_fd=alias_fd)
+        self.assertStationUntouched()
+
+    def test_descriptor_based_mutations_are_judged_by_the_file_they_change(self):
+        with self.protected():
+            fd = os.open(self.file, os.O_RDONLY)              # reading is allowed
+            self.addCleanup(os.close, fd)
+            for label, attempt in {"fchmod": lambda: os.fchmod(fd, 0o600), "ftruncate": lambda: os.ftruncate(fd, 0),
+                                   "fdopen for writing": lambda: os.fdopen(os.dup(fd), "w")}.items():
+                with self.subTest(label), self.assertRaises(iso.ProtectedPathWriteBlocked):
+                    attempt()
+        self.assertStationUntouched()
+
+    def test_physical_dotdot_after_a_symlink_is_resolved_like_the_kernel_does(self):
+        (self.station / "inner").mkdir()                      # created before protection is registered
+        link = self.scratch / "link"
+        link.symlink_to(self.station / "inner", target_is_directory=True)
+        tricky = f"{link}/../1.json"                           # the kernel reaches station/1.json
+        self.assertEqual(os.path.realpath(tricky), str(self.file))
+        with self.protected():
+            self.assertEqual(iso.protected_match(tricky), str(self.station))
+            with self.assertRaises(iso.ProtectedPathWriteBlocked):
+                open(tricky, "w")
+            with self.assertRaises(iso.ProtectedPathWriteBlocked):
+                os.open("link/../1.json", os.O_WRONLY, dir_fd=self.scratch_fd)
+        self.assertEqual(self.file.read_bytes(), b"station data")
+        self.assertEqual(sorted(p.name for p in self.station.iterdir()), ["1.json", "inner"])
+
+    def test_an_unresolvable_directory_descriptor_is_refused_not_skipped(self):
+        gone = self.scratch / "gone"
+        gone.mkdir()
+        gone_fd = os.open(gone, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, gone_fd)
+        gone.rmdir()                                          # the descriptor now names no path at all
+        with self.protected():
+            with self.assertRaises(iso.ProtectedPathWriteBlocked) as raised:
+                os.open("x", os.O_WRONLY | os.O_CREAT, dir_fd=gone_fd)
+        self.assertEqual(raised.exception.root, iso.UNRESOLVABLE)
+
+    def test_a_relative_os_open_that_bypassed_the_wrapper_is_refused(self):
+        import posix                                          # the unwrapped function, as a stale capture would be
+        with self.assertRaises(iso.ProtectedPathWriteBlocked) as raised:
+            posix.open("never-created", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=self.scratch_fd)
+        self.assertEqual(raised.exception.root, iso.UNRESOLVABLE)
+        self.assertFalse((self.scratch / "never-created").exists())
+
+    def test_descriptor_relative_writes_in_scratch_still_work(self):
+        with self.protected():
+            fd = os.open("made.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.scratch_fd)
+            os.write(fd, b"ok")
+            os.fchmod(fd, 0o644)
+            os.ftruncate(fd, 2)
+            os.close(fd)
+            os.rename("made.json", "moved.json", src_dir_fd=self.scratch_fd, dst_dir_fd=self.scratch_fd)
+            os.mkdir("sub", dir_fd=self.scratch_fd)
+            os.symlink("moved.json", "link", dir_fd=self.scratch_fd)
+            os.link("moved.json", "second", src_dir_fd=self.scratch_fd, dst_dir_fd=self.scratch_fd)
+            os.unlink("second", dir_fd=self.scratch_fd)
+            os.unlink("link", dir_fd=self.scratch_fd)
+            os.rmdir("sub", dir_fd=self.scratch_fd)
+            with open("opened.txt", "w", opener=lambda n, f: os.open(n, f, 0o644, dir_fd=self.scratch_fd)) as handle:
+                handle.write("ok")
+            with os.fdopen(os.open(self.scratch / "fdopen.txt", os.O_WRONLY | os.O_CREAT, 0o644), "w") as handle:
+                handle.write("ok")
+            with tempfile.TemporaryFile(dir=self.scratch) as unnamed:      # O_TMPFILE: no name at all
+                unnamed.write(b"abc")
+                unnamed.truncate(1)
+            subprocess.run([sys.executable, "-c", "print('pipe ok')"], check=True, capture_output=True)
+        self.assertEqual(iso.blocked_writes(), [])
+        self.assertEqual((self.scratch / "moved.json").read_bytes(), b"ok")
+        self.assertEqual((self.scratch / "opened.txt").read_text(), "ok")
+
+    def test_a_swallowed_descriptor_relative_refusal_still_fails_the_run(self):
+        with self.protected():
+            try:
+                os.unlink("1.json", dir_fd=self.station_fd)
+            except BaseException:                                          # noqa: BLE001 -- swallow it entirely
+                pass
+        self.assertEqual(iso.fail_on_blocked(0, StringIO()), 1)
+        self.assertStationUntouched()
+
+    def test_a_descriptor_opened_before_the_guard_saw_it_is_a_documented_residual(self):
+        # os.write has no audit event: a descriptor that was ALREADY writable is beyond the
+        # Python layer (the kernel sandbox is the boundary for it). Shown on a synthetic file.
+        preopened = self.station / "preopened.bin"
+        preopened.write_bytes(b"before")
+        fd = os.open(preopened, os.O_WRONLY)
+        self.addCleanup(os.close, fd)
+        with self.protected():
+            os.write(fd, b"AFTER!")
+            with self.assertRaises(iso.ProtectedPathWriteBlocked):
+                import mmap
+                mmap.mmap(fd, 6, access=mmap.ACCESS_WRITE)               # a writable mapping is checked
+        self.assertEqual(preopened.read_bytes(), b"AFTER!")
+
+
+class KernelSandboxTests(SimpleTestCase):
+    """P1-B: this process, and anything it starts, is inside production/tests/sandbox_exec.sh."""
+
+    def test_this_process_is_inside_the_kernel_sandbox(self):
+        self.assertEqual(iso.sandbox_problems(), [])
+        self.assertIn("isadoraair-test-run.", settings.ISADORAAIR_TEST_ISOLATION["sandbox"])
+
+    def test_station_storage_and_host_service_sockets_are_not_there(self):
+        for path in iso.SANDBOX_HIDDEN_PATHS:
+            with self.subTest(path):
+                self.assertTrue(not os.path.lexists(path) or (os.path.isdir(path) and not os.listdir(path)))
+
+    def test_missing_or_spoofed_sandbox_facts_are_reported(self):
+        run = os.environ[iso.SANDBOX_ENV]
+        self.assertIn("is not set", iso.sandbox_problems({})[0])
+        self.assertTrue(any("canonical sandbox run directory" in p
+                            for p in iso.sandbox_problems(dict(os.environ, **{iso.SANDBOX_ENV: "/tmp/elsewhere"}))))
+        self.assertTrue(any("PGPASSWORD" in p for p in iso.sandbox_problems(dict(os.environ, PGPASSWORD="x"))))
+        self.assertTrue(any("HOME" in p for p in iso.sandbox_problems(dict(os.environ, HOME="/home/someone"))))
+        self.assertEqual(iso.sandbox_problems(dict(os.environ, **{iso.SANDBOX_ENV: run})), [])
+
+    def test_inside_the_sandbox_the_database_must_be_the_disposable_server(self):
+        run = os.environ[iso.SANDBOX_ENV]
+        environ = {iso.SANDBOX_ENV: run, iso.ISOLATED_CI_ENV: "1"}
+        dev = {"NAME": "isadoraair_dev", "USER": "isadoraair_dev"}
+        self.assertIsNone(iso._database_problem({"default": dict(dev, HOST=f"{run}/pgsock")}, environ))
+        for host in ("localhost", "127.0.0.1", "/run/postgresql", "/var/run/postgresql", ""):
+            with self.subTest(host):
+                self.assertIn("disposable", iso._database_problem({"default": dict(dev, HOST=host)}, environ))
+        # The isolated-CI escape never applies inside the sandbox.
+        self.assertTrue(iso._database_problem({"default": {"NAME": "ci", "USER": "ci", "HOST": f"{run}/pgsock"}},
+                                              environ))
+
+    def test_a_fresh_interpreter_without_the_sandbox_refuses_before_any_write(self):
+        env = {k: v for k, v in os.environ.items() if k != iso.SANDBOX_ENV}
+        for extra in ({}, {iso.ISOLATED_CI_ENV: "1"}):          # the CI exemption never applies in here
+            with self.subTest(extra):
+                result = subprocess.run([sys.executable, "manage.py", "test_isolation_preflight"], cwd=BASE,
+                                        env=dict(env, **extra), capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(iso.CATEGORY_SANDBOX, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_shell_and_native_children_cannot_write_the_checkout(self):
+        # The checkout is writable on the host; inside the sandbox it is a read-only mount.
+        target = BASE / f".sandbox-child-probe-{os.getpid()}"
+        self.addCleanup(lambda: target.unlink() if target.exists() else None)
+        shell = subprocess.run(["/bin/sh", "-c", f"echo x > '{target}'"], capture_output=True, text=True)
+        self.assertNotEqual(shell.returncode, 0)
+        self.assertIn("Read-only file system", shell.stderr)
+        if shutil.which("ffmpeg"):
+            ffmpeg = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                     "-i", "sine=frequency=440:duration=0.2", "-f", "mp3", str(target)],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(ffmpeg.returncode, 0)
+            self.assertIn("Read-only file system", ffmpeg.stderr)
+            scratch = Path(settings.WAVEFORMS_DIR) / f"ffmpeg-{os.getpid()}.mp3"
+            ok = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                 "-i", "sine=frequency=440:duration=0.2", "-f", "mp3", str(scratch)],
+                                capture_output=True, text=True, timeout=60)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            scratch.unlink()
+        self.assertFalse(target.exists())
+
+    def test_children_cannot_reach_the_service_manager_or_a_host_database(self):
+        result = subprocess.run(["systemd-run", "--user", "--quiet", "/bin/true"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        for path in ("/run/user", "/run/postgresql", "/var/run/postgresql", "/run/dbus"):
+            self.assertFalse(os.path.lexists(path), path)
+        with open("/proc/self/net/dev", encoding="ascii") as stream:
+            self.assertEqual([line.split(":")[0].strip() for line in stream.readlines()[2:]], ["lo"])

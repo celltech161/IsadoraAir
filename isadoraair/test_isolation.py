@@ -40,9 +40,19 @@ reached only when the process is a test invocation (``manage.py test`` or the
 namespace environment variable is set); a normal station process never
 imports it.
 
+4. **Kernel sandbox attestation.**  A test process must also be running inside
+   the bubblewrap sandbox built by ``production/tests/sandbox_exec.sh`` (no
+   station storage mounted, no host processes, no network, no service-manager
+   or database sockets but the disposable ones).  The Python layers above are
+   defence in depth; the sandbox is what contains ffmpeg, shells and anything
+   else a test starts.
+
 Limits (see docs/TEST_ISOLATION.md): the audit hook sees Python-level
-operations only, not writes made by child processes such as ffmpeg (those are
-covered by the root redirection), hard links or bind mounts.
+operations only.  It does not see writes made by child processes, writes
+through a descriptor that was already open when the guard was installed
+(``os.write`` has no audit event), C extensions, hard links that already
+exist, or a directory replaced between the check and the call.  The kernel
+sandbox is the boundary for all of those.
 """
 from __future__ import annotations
 
@@ -98,6 +108,7 @@ CATEGORY_NAMESPACE = "NAMESPACE_UNSAFE"
 CATEGORY_SETTINGS = "EFFECTIVE_SETTINGS_UNSAFE"
 CATEGORY_DATABASE = "DATABASE_IDENTITY_UNSAFE"
 CATEGORY_CHECKOUT = "PRODUCTION_CHECKOUT"
+CATEGORY_SANDBOX = "KERNEL_SANDBOX_MISSING"
 
 
 class UnsafeTestEnvironmentError(RuntimeError):
@@ -135,21 +146,29 @@ class ProtectedPathWriteBlocked(BaseException):
 # --------------------------------------------------------------------------- paths
 
 
+def _absolute(path):
+    path = os.fsdecode(path)
+    return path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+
+
 def _lexical(path):
-    return os.path.normpath(os.path.abspath(os.fsdecode(path)))
+    return os.path.normpath(_absolute(path))
 
 
 def _real(path):
-    return os.path.realpath(_lexical(path))
+    # Not realpath(normpath(...)): normpath would fold ``link/..`` away before the
+    # link is resolved, while the kernel resolves the link first.
+    return os.path.realpath(_absolute(path))
 
 
 def _forms(path, follow=True):
     """Lexical and symlink-resolved forms. ``follow=False`` leaves a final symlink
     component alone (removing or renaming a link does not touch its target)."""
-    lexical = _lexical(path)
-    if follow:
-        return {lexical, os.path.realpath(lexical)}
-    head, tail = os.path.split(lexical)
+    absolute = _absolute(path)
+    lexical = os.path.normpath(absolute)
+    head, tail = os.path.split(absolute)
+    if follow or tail in ("", ".", ".."):
+        return {lexical, os.path.realpath(absolute)}
     return {lexical, os.path.join(os.path.realpath(head), tail)}
 
 
@@ -320,12 +339,127 @@ DEV_DATABASE_NAMES = (DEV_DATABASE_NAME, "test_" + DEV_DATABASE_NAME)
 def _database_problem(databases, environ):
     default = (databases or {}).get("default") or {}
     name, user = str(default.get("NAME") or ""), str(default.get("USER") or "")
+    sandbox = environ.get(SANDBOX_ENV)
     if name in DEV_DATABASE_NAMES and user == DEV_DATABASE_USER:
+        host = str(default.get("HOST") or "")
+        if sandbox and not (os.path.isabs(host) and _within(_lexical(host), _lexical(sandbox))):
+            return (f"DB_HOST={host!r}: inside the sandbox the database must be the disposable "
+                    f"server whose socket directory is under {sandbox}")
         return None
-    if environ.get(ISOLATED_CI_ENV) == "1" and not _station_markers():
+    if not sandbox and environ.get(ISOLATED_CI_ENV) == "1" and not _station_markers():
         return None  # an isolated CI host: no installation, so no production role to confuse
     return (f"DB_NAME={name!r} DB_USER={user!r}; tests require DB_NAME={DEV_DATABASE_NAME} and "
             f"DB_USER={DEV_DATABASE_USER} (disposable test_{DEV_DATABASE_NAME})")
+
+
+# -------------------------------------------------------------- kernel sandbox
+
+SANDBOX_ENV = "ISADORAAIR_TEST_SANDBOX"
+SANDBOX_RUN_PREFIX = "isadoraair-test-run."
+SANDBOX_WRITABLE_ENV = "ISADORAAIR_SANDBOX_WRITABLE"
+#: Host objects a sandboxed test must not be able to reach. Each must be absent, or an
+#: empty directory (an empty tmpfs mask over a configuration directory).
+SANDBOX_HIDDEN_PATHS = STATIC_PROTECTED_ROOTS + (
+    "/run/user", "/run/dbus", "/var/run/dbus", "/run/systemd", "/run/postgresql", "/var/run/postgresql",
+    "/run/isadoraair", "/run/isadoraair-validation", "/run/isadoraair-render",
+    "/etc/ssl/isadoraair", "/etc/postgresql", "/etc/postgresql-common", "/etc/systemd", "/etc/nginx", "/etc/ssh",
+    "/var/lib/postgresql", "/var/backups",
+)
+#: Ambient database credential locations libpq would otherwise consult.
+SANDBOX_FORBIDDEN_ENV = ("PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE", "PGSYSCONFDIR", "PGHOST",
+                         "PGHOSTADDR", "PGPORT", "PGUSER", "PGDATABASE", "DATABASE_URL")
+#: Mount points that may be writable: private to the sandbox (fresh tmpfs, procfs, /dev).
+_SANDBOX_PRIVATE_WRITABLE = ("/tmp", "/dev", "/run", "/var", "/proc")
+
+
+def _proc_fields(path):
+    fields = {}
+    with open(path, encoding="ascii") as stream:
+        for line in stream:
+            key, _, value = line.partition(":")
+            fields[key] = value.strip()
+    return fields
+
+
+def _in_user_namespace():
+    try:
+        with open("/proc/self/uid_map", encoding="ascii") as stream:
+            return stream.read().split() != ["0", "0", "4294967295"]
+    except OSError:
+        return True
+
+
+def _isolated_ci_host(environ):
+    """An isolated CI host has no installation at all.  Inside the sandbox an installation is
+    only hidden, so a process there that drops the sandbox variable gets no exemption."""
+    return (environ.get(ISOLATED_CI_ENV) == "1" and not environ.get(SANDBOX_ENV) and not _station_markers()
+            and not _in_user_namespace())
+
+
+def sandbox_problems(environ=None):
+    """Every reason this process is NOT inside the kernel sandbox (``sandbox_exec.sh``).
+
+    Facts are read from the kernel (/proc), not trusted from configuration: a user
+    namespace, no capabilities, no-new-privileges, a private network namespace with
+    only loopback, a private PID namespace, station storage and host service sockets
+    invisible, and no writable mount other than the declared scratch paths.
+    """
+    environ = os.environ if environ is None else environ
+    run = environ.get(SANDBOX_ENV)
+    if not run:
+        return [f"{SANDBOX_ENV} is not set: not started by production/tests/sandbox_exec.sh"]
+    problems = []
+    if not os.path.isabs(run) or os.path.realpath(run) != run or \
+            not os.path.basename(run).startswith(SANDBOX_RUN_PREFIX) or not os.path.isdir(run):
+        problems.append(f"{SANDBOX_ENV}={run!r} is not a canonical sandbox run directory")
+    try:
+        status = _proc_fields("/proc/self/status")
+        with open("/proc/self/uid_map", encoding="ascii") as stream:
+            uid_map = stream.read().split()
+        with open("/proc/self/net/dev", encoding="ascii") as stream:
+            interfaces = sorted(line.split(":")[0].strip() for line in stream.readlines()[2:])
+        with open("/proc/1/comm", encoding="ascii") as stream:
+            init = stream.read().strip()
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            mounts = [line.split() for line in stream]
+    except OSError as exc:
+        return problems + [f"cannot read kernel facts from /proc: {exc}"]
+    if uid_map == ["0", "0", "4294967295"]:
+        problems.append("not in a user namespace (the initial uid_map is in effect)")
+    for key in ("CapEff", "CapPrm", "CapAmb"):
+        if int(status.get(key, "1"), 16):
+            problems.append(f"{key}={status.get(key)}: capabilities must be empty")
+    if status.get("NoNewPrivs") != "1":
+        problems.append("no_new_privs is not set")
+    if interfaces != ["lo"]:
+        problems.append(f"network namespace is not private (interfaces {interfaces})")
+    if init != "bwrap":
+        problems.append(f"PID namespace is not private (pid 1 is {init!r})")
+    for path in SANDBOX_HIDDEN_PATHS:
+        try:
+            visible = os.path.lexists(path) and (not os.path.isdir(path) or os.listdir(path))
+        except OSError:
+            visible = True
+        if visible:
+            problems.append(f"host path {path} is visible inside the sandbox")
+    for name in SANDBOX_FORBIDDEN_ENV:
+        if environ.get(name):
+            problems.append(f"ambient database credential variable {name} is set")
+    home = environ.get("HOME", "")
+    if not home or not _within(_lexical(home), run):
+        problems.append(f"HOME={home!r} is not inside the sandbox run directory")
+    writable = {run} | {p for p in environ.get(SANDBOX_WRITABLE_ENV, "").split(":") if p}
+    for fields in mounts:
+        point, options = fields[4].replace("\\040", " "), fields[5].split(",")
+        if "rw" not in options:
+            continue
+        if any(_within(point, base) for base in _SANDBOX_PRIVATE_WRITABLE) and \
+                not any(_within(point, p) for p in STATIC_PROTECTED_ROOTS):
+            continue
+        if any(_within(point, p) for p in writable):
+            continue
+        problems.append(f"writable mount {point} is not a declared scratch path")
+    return problems
 
 
 def effective_problems(get, namespace, databases=None, environ=None):
@@ -373,6 +507,12 @@ def configure_settings(namespace_settings, environ=None):
         raise UnsafeTestEnvironmentError(
             CATEGORY_CHECKOUT, "tests must not run from the production checkout",
             detail=f"{base_dir} is inside protected {root}")
+    if not _isolated_ci_host(environ):
+        problems = sandbox_problems(environ)
+        if problems:
+            raise UnsafeTestEnvironmentError(
+                CATEGORY_SANDBOX, "tests run only inside the kernel sandbox "
+                "(production/tests/run_with_validation_service.sh)", detail="; ".join(problems))
     problem = _database_problem(namespace_settings.get("DATABASES"), environ)
     if problem:
         raise UnsafeTestEnvironmentError(CATEGORY_DATABASE, "development database identity required", detail=problem)
@@ -417,6 +557,7 @@ def configure_settings(namespace_settings, environ=None):
         "stale_configuration": stale,
         "database": {"NAME": database.get("NAME"), "USER": database.get("USER")},
         "created_by_pid": os.getpid() if _created_here else None,
+        "sandbox": environ.get(SANDBOX_ENV) or "isolated CI host (no installation)",
     }
 
 
@@ -428,21 +569,31 @@ _blocked = []
 
 _O_WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
-#: audit event -> (indexes of path arguments that are mutated, index(es) of dir_fd
-#: arguments, indexes whose final symlink component is NOT followed by the operation)
+#: audit event -> ({index of a mutated path argument: index of the dir_fd argument it is
+#: relative to, or None}, indexes whose final symlink component is NOT followed).
+#: A path argument that is an int is a file descriptor (fchmod, ftruncate, ...).
 _MUTATIONS = {
-    "os.mkdir": ((0,), (2,), ()), "os.rmdir": ((0,), (1,), (0,)), "os.remove": ((0,), (1,), (0,)),
-    "os.chmod": ((0,), (2,), ()), "os.chown": ((0,), (3,), ()), "os.utime": ((0,), (3,), ()),
-    "os.truncate": ((0,), (), ()), "os.mkfifo": ((0,), (2,), ()), "os.mknod": ((0,), (3,), ()),
-    "os.rename": ((0, 1), (2, 3), (0, 1)), "os.link": ((1,), (2, 3), (1,)), "os.symlink": ((1,), (2,), (1,)),
-    "os.setxattr": ((0,), (), ()), "os.removexattr": ((0,), (), ()),
-    "shutil.copyfile": ((1,), (), ()), "shutil.copymode": ((1,), (), ()), "shutil.copystat": ((1,), (), ()),
-    "shutil.copytree": ((1,), (), ()), "shutil.move": ((0, 1), (), (0,)), "shutil.chown": ((0,), (), ()),
-    "shutil.rmtree": ((0,), (1,), (0,)), "shutil.unpack_archive": ((1,), (), ()),
-    "tempfile.mkstemp": ((0,), (), ()), "tempfile.mkdtemp": ((0,), (), ()),
+    "os.mkdir": ({0: 2}, ()), "os.rmdir": ({0: 1}, (0,)), "os.remove": ({0: 1}, (0,)),
+    "os.chmod": ({0: 2}, ()), "os.chown": ({0: 3}, ()), "os.utime": ({0: 3}, ()),
+    "os.truncate": ({0: None}, ()), "os.mkfifo": ({0: 2}, ()), "os.mknod": ({0: 3}, ()),
+    "os.rename": ({0: 2, 1: 3}, (0, 1)),
+    # The source too: a hard link is a second, writable name for the protected inode.
+    "os.link": ({0: 2, 1: 3}, (1,)), "os.symlink": ({1: 2}, (1,)),
+    "os.setxattr": ({0: None}, ()), "os.removexattr": ({0: None}, ()),
+    "shutil.copyfile": ({1: None}, ()), "shutil.copymode": ({1: None}, ()), "shutil.copystat": ({1: None}, ()),
+    "shutil.copytree": ({1: None}, ()), "shutil.move": ({0: None, 1: None}, (0,)), "shutil.chown": ({0: None}, ()),
+    "shutil.rmtree": ({0: 1}, (0,)), "shutil.unpack_archive": ({1: None}, ()),
+    "tempfile.mkstemp": ({0: None}, ()), "tempfile.mkdtemp": ({0: None}, ()),
 }
 #: Deleting an ancestor of protected storage is as destructive as deleting inside it.
 _ANCESTOR_SENSITIVE = {"shutil.rmtree", "shutil.move", "os.rename", "os.rmdir", "os.remove"}
+#: Placed in the ``root`` of a refusal whose target could not be proved to be anywhere.
+UNRESOLVABLE = "<unresolvable target>"
+_NOT_A_FILE = ("pipe:", "socket:", "anon_inode:", "/memfd:")
+
+
+class _Unresolvable(Exception):
+    pass
 
 
 def _as_path(value):
@@ -451,7 +602,62 @@ def _as_path(value):
             return os.fsdecode(value)
         except (TypeError, ValueError):
             return None
-    return None  # an int (file descriptor) or None: nothing to resolve
+    return None
+
+
+def _same_object(fd, path):
+    opened, named = os.fstat(fd), os.stat(path)
+    return (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _descriptor_directory(fd):
+    """The canonical directory a ``dir_fd`` names, verified against the descriptor itself."""
+    try:
+        link = os.readlink(f"/proc/self/fd/{fd}")
+        if not link.startswith("/") or link.endswith(" (deleted)") \
+                or not stat.S_ISDIR(os.fstat(fd).st_mode) or not _same_object(fd, link):
+            raise _Unresolvable(f"descriptor {fd} -> {link!r}")
+    except OSError as exc:
+        raise _Unresolvable(f"descriptor {fd}: {exc.strerror}") from None
+    return link
+
+
+def _descriptor_file(fd):
+    """The path an fd-based mutation (fchmod, ftruncate, fdopen for writing) changes,
+    or None for a closed descriptor or one that is not a file (pipe, socket, memfd)."""
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        return None                    # the call itself fails with EBADF
+    try:
+        link = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise _Unresolvable(f"descriptor {fd}: {exc.strerror}") from None
+    if link.startswith(_NOT_A_FILE):
+        return None
+    if link.endswith(" (deleted)") and link.startswith("/") and opened.st_nlink == 0:
+        return link[:-len(" (deleted)")]          # unnamed (O_TMPFILE / unlinked): judge where it lived
+    try:
+        if link.startswith("/") and _same_object(fd, link):
+            return link
+    except OSError:
+        pass
+    raise _Unresolvable(f"descriptor {fd} -> {link!r}")
+
+
+def _event_target(value, dir_fd=None):
+    """The absolute path a mutation acts on (None: nothing on disk); raises _Unresolvable."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _descriptor_file(value)
+    path = _as_path(value)
+    if path is None or os.path.isabs(path):
+        return path
+    if isinstance(dir_fd, int) and dir_fd >= 0:
+        return os.path.join(_descriptor_directory(dir_fd), path)
+    try:
+        return os.path.join(os.getcwd(), path)
+    except OSError as exc:
+        raise _Unresolvable(f"{path!r} relative to an unreadable working directory: {exc.strerror}") from None
 
 
 def _refuse(event, path, root):
@@ -461,31 +667,70 @@ def _refuse(event, path, root):
     raise ProtectedPathWriteBlocked(event, path, root)
 
 
+def _check(event, value, dir_fd=None, *, ancestors=False, follow=True):
+    try:
+        path = _event_target(value, dir_fd)
+    except _Unresolvable as exc:
+        _refuse(event, f"{value!r} ({exc})", UNRESOLVABLE)
+    if path is not None:
+        root = protected_match(path, ancestors=ancestors, follow=follow)
+        if root:
+            _refuse(event, path, root)
+
+
+#: ``os.open`` does not pass its ``dir_fd`` to the "open" audit event, so in a test
+#: process ``os.open`` is wrapped: the wrapper resolves the descriptor and checks the
+#: real target, then marks that one call as checked for the hook.  A relative
+#: ``os.open`` for writing that did not come through the wrapper (``posix.open``
+#: captured earlier, say) cannot be placed and is refused.
+_checked_open = threading.local()
+_unguarded_os_open = os.open
+
+
+def _guarded_os_open(path, flags, mode=0o777, *, dir_fd=None):
+    name = _as_path(path)
+    if not (flags & _O_WRITE) or name is None or os.path.isabs(name):
+        return _unguarded_os_open(path, flags, mode, dir_fd=dir_fd)
+    _check("open", path, dir_fd)
+    _checked_open.call = (path, flags)
+    try:
+        return _unguarded_os_open(path, flags, mode, dir_fd=dir_fd)
+    finally:
+        _checked_open.call = None
+
+
 def _audit(event, args):
     if event == "open":
-        path = _as_path(args[0]) if args else None
-        if path is None:
-            return
+        target = args[0] if args else None
         mode, flags = (args[1] if len(args) > 1 else None), (args[2] if len(args) > 2 else None)
         intent = (isinstance(mode, str) and any(c in mode for c in "wax+")) or \
                  (isinstance(flags, int) and flags & _O_WRITE)
-        if intent:
-            root = protected_match(path)
-            if root:
-                _refuse(event, path, root)
+        if not intent:
+            return
+        name = _as_path(target)
+        if name is not None and not os.path.isabs(name) and mode is None:     # os.open: dir_fd unknown here
+            call = getattr(_checked_open, "call", None)          # os.open adds O_CLOEXEC before auditing
+            if call is not None and call[0] is target and (call[1] | os.O_CLOEXEC) == (flags | os.O_CLOEXEC):
+                _checked_open.call = None
+                return
+            _refuse(event, f"{name!r} (relative os.open whose directory descriptor cannot be checked)",
+                    UNRESOLVABLE)
+        _check(event, target)
+        return
+    if event == "mmap.__new__":
+        fileno, access = args[0], (args[2] if len(args) > 2 else 0)
+        if isinstance(fileno, int) and fileno >= 0 and access in (0, 2):     # ACCESS_DEFAULT, ACCESS_WRITE
+            _check(event, fileno)
         return
     spec = _MUTATIONS.get(event)
     if spec is None:
         return
-    indexes, dir_fds, nofollow = spec
-    relative_to_fd = any(len(args) > i and isinstance(args[i], int) and args[i] >= 0 for i in dir_fds)
-    for index in indexes:
-        path = _as_path(args[index]) if len(args) > index else None
-        if path is None or (relative_to_fd and not os.path.isabs(path)):
+    paths, nofollow = spec
+    for index, fd_index in paths.items():
+        if len(args) <= index or args[index] is None:
             continue
-        root = protected_match(path, ancestors=event in _ANCESTOR_SENSITIVE, follow=index not in nofollow)
-        if root:
-            _refuse(event, path, root)
+        dir_fd = args[fd_index] if fd_index is not None and len(args) > fd_index else None
+        _check(event, args[index], dir_fd, ancestors=event in _ANCESTOR_SENSITIVE, follow=index not in nofollow)
 
 
 def install_write_guard():
@@ -494,6 +739,8 @@ def install_write_guard():
     with _hook_lock:
         if _guard_installed:
             return
+        os.supports_dir_fd.add(_guarded_os_open)
+        os.open = _guarded_os_open
         sys.addaudithook(_audit)
         _guard_installed = True
 
@@ -529,6 +776,11 @@ def assert_engaged(settings=None):
             detail="start tests with `manage.py test <labels>`; never from `manage.py shell` or a bare unittest runner")
     if not guard_installed():
         raise UnsafeTestEnvironmentError(CATEGORY_NOT_ENGAGED, "the write boundary is not installed")
+    if not _isolated_ci_host(os.environ):
+        problems = sandbox_problems()
+        if problems:
+            raise UnsafeTestEnvironmentError(CATEGORY_SANDBOX, "this process is not inside the kernel sandbox",
+                                             detail="; ".join(problems))
     namespace = validate_namespace(state["namespace"])
     problems = effective_problems(lambda n: getattr(settings, n, None), namespace,
                                   getattr(settings, "DATABASES", None))
@@ -555,7 +807,8 @@ def fail_on_blocked(failures, stream=None):
 
 def describe(state):
     """Human-readable preflight summary for the runner banner."""
-    lines = [f"isadoraair test isolation ENGAGED  namespace={state['namespace']}"]
+    lines = [f"isadoraair test isolation ENGAGED  namespace={state['namespace']}",
+             f"  kernel sandbox: {state.get('sandbox')}"]
     for name, value in state["roots"].items():
         lines.append(f"  {name} = {value}")
     db = state["database"]

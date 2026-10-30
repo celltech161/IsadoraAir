@@ -12,6 +12,12 @@
 # Unprivileged: it only uses the invoking user's own systemd user manager.
 set -eu
 own=$(sed -n 's/^0:://p' /proc/self/cgroup)
+# Inside the kernel sandbox (production/tests/sandbox_exec.sh scope) the
+# sandbox's own processes hold <scope>/supervisor, as a service's supervisor
+# does; the delegated subtree is its parent, and "web" is created beside it.
+if [ -n "${ISADORAAIR_TEST_SANDBOX:-}" ] && [ "${own##*/}" = supervisor ]; then
+    own=${own%/supervisor}
+fi
 scope="/sys/fs/cgroup${own}"
 if [ ! -w "${scope}/cgroup.procs" ] || [ ! -w "${scope}/cgroup.subtree_control" ]; then
     echo "run_delegated.sh: ${scope} is not a delegated cgroup; start me with" >&2
