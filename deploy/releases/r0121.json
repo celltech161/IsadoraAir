@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "release_id": "r0121",
+  "previous_release_id": "r0120",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 2.27 r0121 hardening: default-Off Start Next, automatic missing-media skip, and confirmed media-failure evidence; F2-F4 and P1 safety corrections; historical release-test isolation; and iPortal :60 clock correction. Library 0097-0098, with seven reviewed manual constraint operations covered by the immutable trusted r0121 migration companion. Collect static files, then restart Gunicorn and engine; no protected-runtime or infrastructure changes.",
+  "migrations_required": [
+    "library.0097_hour_refill_start_next_cause",
+    "library.0098_hour_refill_automatic_failure_cause"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
