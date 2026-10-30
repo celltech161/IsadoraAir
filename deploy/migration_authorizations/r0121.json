@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "release_id": "r0121",
+  "target_commit": "5eeefa6707b607692ac70a9752a536022ab26378",
+  "manifest_sha256": "00c29d6858abfd27989916eff5f173ca93d22c3a13a9115237caa37befefa193",
+  "authorized_manual_operations": [
+    {
+      "ref": "library.0097_hour_refill_start_next_cause",
+      "migration_file_sha256": "a9efb9a3933b5c11cf53d511d4939f6c4e892c5938d09877bfab62a926cd05e2",
+      "operation_index": 4,
+      "operation": "RemoveConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0097_hour_refill_start_next_cause",
+      "migration_file_sha256": "a9efb9a3933b5c11cf53d511d4939f6c4e892c5938d09877bfab62a926cd05e2",
+      "operation_index": 5,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0097_hour_refill_start_next_cause",
+      "migration_file_sha256": "a9efb9a3933b5c11cf53d511d4939f6c4e892c5938d09877bfab62a926cd05e2",
+      "operation_index": 6,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0098_hour_refill_automatic_failure_cause",
+      "migration_file_sha256": "7963d09dc9185e2864fd2d8270cd18dc866e6cdc855e442615430172cd4d3fe0",
+      "operation_index": 6,
+      "operation": "RemoveConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0098_hour_refill_automatic_failure_cause",
+      "migration_file_sha256": "7963d09dc9185e2864fd2d8270cd18dc866e6cdc855e442615430172cd4d3fe0",
+      "operation_index": 7,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0098_hour_refill_automatic_failure_cause",
+      "migration_file_sha256": "7963d09dc9185e2864fd2d8270cd18dc866e6cdc855e442615430172cd4d3fe0",
+      "operation_index": 8,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0098_hour_refill_automatic_failure_cause",
+      "migration_file_sha256": "7963d09dc9185e2864fd2d8270cd18dc866e6cdc855e442615430172cd4d3fe0",
+      "operation_index": 9,
+      "operation": "AddConstraint",
+      "classification": "manual"
+    }
+  ]
+}
