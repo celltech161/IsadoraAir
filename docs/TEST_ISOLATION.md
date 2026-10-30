@@ -196,13 +196,55 @@ configuration change is needed.
   inside the sandbox the path does not exist.
 * Tests no longer see the developer's `.env` (it is masked) or `HOME`. A test that needs a
   setting must set it, for example with `override_settings`.
+* The isolated test runner defaults `isadoraair.engine_commands`' queue and lock to the
+  run's namespace. A row save can queue an engine command from an `on_commit` hook
+  (`hardware.signals`), including while a serialized test database is rebuilt, before any
+  test can patch anything.
+* Tests that start real tools must keep them off the station too, because a child process
+  is outside the Python guard: point the paths the tool is given at scratch (encoders'
+  classifier scripts, `systemd-tmpfiles --root`), and stub calls to live local services
+  (Liquidsoap telnet, the updater socket).
 
 ### Preflight (no test is run, no database is touched)
 
 `run_with_validation_service.sh` runs `manage.py test_isolation_preflight` inside the
-sandbox. It prints the effective roots, the database identity, the kernel-sandbox facts,
-which stale values were not honoured, and the result of eight non-creating probes against
-station paths, all of which must be `refused`. Run outside the sandbox, it refuses.
+sandbox before anything else starts. It prints the effective roots, the database identity,
+the kernel-sandbox facts, which stale values were not honoured, and the result of eleven
+probes. Each names a path that does not exist and uses a non-creating mode; all must be
+`refused` by the Python layer (inside the sandbox the station paths are not mounted either):
+
+1. open r+ production waveforms (`/srv/isadoraair/waveforms/<probe>`)
+2. open w production music, no `O_CREAT`
+3. open r+ through a symlink alias of the waveform directory
+4. open r+ through a `..` traversal from the namespace
+5. open r+ in the live checkout (`/opt/isadoraair/<probe>`)
+6. rename out of production waveforms
+7. remove under `/var/lib/isadoraair/reports`
+8. chmod under `/var/lib/isadoraair/weather`
+9. open r+ station runtime state (`/run/isadoraair/<probe>`)
+10. rename into station runtime (the write-and-rename pattern state files use)
+11. connect to a socket under `/run/isadoraair-updater`
+
+Run outside the sandbox, it refuses before probing.
+
+### Supported procedure
+
+```bash
+cd <feature worktree>
+umask 0022
+env -u ISADORAAIR_SANDBOX_EVIDENCE -u ISADORAAIR_PREFLIGHT_COPY \
+    production/tests/run_with_validation_service.sh ~/.venvs/isadoraair-dev/bin/python \
+    manage.py test <labels> --noinput -v 2 >run.stdout 2>run.stderr </dev/null
+```
+
+* One run at a time, one app per run (some apps interact when combined in one process).
+* Use explicit labels that leave out the excluded modules and method below and the
+  browser modules; Django has no exclude switch.
+* The runner keeps nothing after the run; keep output by redirecting its own streams.
+* A run is acceptable only when stderr shows `isadoraair test isolation ENGAGED`, the
+  `kernel sandbox:` run directory and `database: DB_NAME=isadoraair_dev
+  DB_USER=isadoraair_dev`, there is no `ISOLATION FAILURE`, and afterwards no
+  `/tmp/isadoraair-test-*` directory, `isadoraair-*-test-*` unit or `bwrap` process remains.
 
 ## Limits (read before trusting it)
 
@@ -224,6 +266,25 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
 
   The other methods of `isadoraair.tests.test_env_config` do not need the user manager and
   can be qualified in the sandbox.
+* **Not qualified here: browser tests.** 336 tests in 12 Playwright modules
+  (`active_messages` board/iportal browser, `library` console/Remote DJ/schedule/start-next/
+  clock/voicetrack/hour-refill browser, `produced_content.tests.test_browser`,
+  `production.tests.test_recorder_browser`). No browser exists inside the sandbox and the
+  host cache is deliberately not mounted.
+* **Sandbox limits found by the qualification (not containment defects):**
+  1. *Media validation across sandboxes.* The test process and the validation service are
+     separate bubblewrap instances. The service's Landlock-confined `ffprobe` cannot reopen a
+     media descriptor from the other mount namespace (`/proc/self/fd/N: Permission
+     denied`), so every real validation is `unreadable_container`. Tests that need a valid
+     upload cannot pass here.
+  2. *Runner umask.* The runner's `umask 077` (for its scratch) is inherited by the test
+     process, so files tests create are 0600/0700 where tests expect 0644/0750.
+  3. *Read-only checkout.* Tests that write into the checkout (`media/`, `__pycache__`) fail.
+  4. *Attestation cascade.* A test that runs the real `systemd-analyze` leaves
+     `/run/systemd/systemd-units-load` in the sandbox's private `/run`; every later
+     isolation proof in that process then (correctly) refuses. Found in
+     `active_messages.tests.test_managed_worker` and
+     `isadoraair.tests.test_restore_resume_ledger` (fixed in `test_restore_tooling`).
 * **Python-layer residuals, covered only by the sandbox:**
   * writes through a descriptor that was already writable before the guard saw it
     (`os.write`, `sendfile` and `copy_file_range` have no audit event);
@@ -247,15 +308,27 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
 * A rare legitimate test write into a protected path will now fail loudly. That is
   intended; fix the test to use scratch.
 
-## What has run inside the kernel sandbox
+## Qualification inside the kernel sandbox (2026-10-30, test HEAD `928cc37`)
 
-Only `isadoraair.tests.test_test_isolation` and `isadoraair.tests.test_test_safety` have
-run inside the kernel sandbox. The earlier focused results at `4c1e5bd`
-(`library.tests.test_sync_track_file` 12, `library.tests.test_analyze_waveform_move_recovery`
-5, `library.tests.test_related_artists` 79, `aircheck.tests.test_recorder` 41 and
-`aircheck.tests.test_recovery` 30, all OK) came from the runner *before* it had a kernel
-sandbox. They do not qualify these modules under the sandbox. No broad per-app suite has run
-under it.
+Every app, one run each, through the procedure above. Containment held for every run:
+attestation present, no escape, cleanup complete, station files and the repaired waveforms
+unchanged. "Selected" leaves out the exclusions below.
+
+| App | Selected | Passed | Not passed | Cause of the rest |
+|---|---|---|---|---|
+| authz, rbds, encoders, road_conditions, weather, weather_ingest, aircheck, webrequests | 2,556 | 2,556 | 0 | qualified |
+| updatecenter | 1,496 | 1,495 | 1 skip | the production release-trust fixture is not installed on this host |
+| monitoring | 557 | 556 | 1 | pre-existing (`probe_encoder_group` restart-stale) |
+| hardware | 101 | 85 | 16 | pre-existing (audio input/output binding readiness) |
+| spoken | 228 | 196 | 32 | media validation (limit 1) |
+| produced_content | 120 | 85 | 35 | media validation (limit 1) |
+| production | 454 | 238 | 216 | 206 media validation; 9 validation-infrastructure and nested-confinement assertions; 1 runner umask |
+| active_messages | 709 | 442 | 267 incl. 77 not run | 170 media validation; 16 classes refused by the attestation cascade (limit 4); 4 scratch roots outside the namespace |
+| library | 2,509 | 2,433 | 76 | 64 media validation; 8 branding tests write the checkout's `media/` (read-only here); 4 unpatched station paths (track delete under `/srv/isadoraair/music`, Remote DJ `/run/isadoraair/remote_dj_first_1s.pcm`) |
+| isadoraair | 1,691 | 1,588 | 103 incl. 2 not run | runner umask (limit 2), attestation cascade (limit 4), pre-existing (TTS, venv link, comment-text checks), read-only checkout, other sandbox interactions; 9 opt-in skips |
+
+The browser and systemd-dependent tests are not qualified (see Limits). Results from before
+the kernel sandbox existed (focused runs at `4c1e5bd`) do not count.
 
 ## Read-only integrity check
 
