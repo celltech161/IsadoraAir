@@ -385,3 +385,21 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='isadoraair@localhost'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# --- Test-run isolation (must stay LAST: it rewrites the roots defined above) ---
+# `manage.py test`, or any process handed ISADORAAIR_TEST_DATA_ROOT by
+# production/tests/run_with_validation_service.sh (its transient validation and
+# render services), gets a per-run disposable namespace for every writable station
+# root and a process-wide refusal to mutate protected station storage. This runs
+# while settings are still being imported so module-level captures of these paths
+# (library.storage, weather.services, encoders.services.lkg, ...) bind to scratch.
+# A normal station process (gunicorn, the engine, timers) never takes this branch,
+# so no runtime default changes. See isadoraair/test_isolation.py, docs/TEST_ISOLATION.md.
+import os as _os  # noqa: E402
+import sys as _sys  # noqa: E402
+
+TEST_RUNNER = 'isadoraair.test_runner.IsolatedDiscoverRunner'
+if _os.environ.get('ISADORAAIR_TEST_DATA_ROOT') or _sys.argv[1:2] == ['test']:
+    from isadoraair import test_isolation as _test_isolation  # noqa: E402
+
+    ISADORAAIR_TEST_ISOLATION = _test_isolation.configure_settings(globals())

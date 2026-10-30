@@ -21,11 +21,35 @@
 set -u
 python="${VALIDATION_SERVICE_PYTHON:-$1}"
 here=$(cd "$(dirname "$0")/../.." && pwd -P)
+
+# Per-run disposable data-root namespace (isadoraair/test_isolation.py). Every
+# writable station root -- LIBRARY_ROOT, WAVEFORMS_DIR, PRODUCTION_MEDIA_ROOT,
+# REPORTS_ROOT, WEATHER_DATA_DIR, ENCODER_STATE_ROOT -- is pointed here by
+# isadoraair/settings.py in EVERY process that is handed this variable: the
+# preflight, the transient validation and render services, and the delegated
+# test child. A stale development .env (or the settings defaults) can therefore
+# never route a test or a service to station storage.
+isolation_root=$(mktemp -d "${TMPDIR:-/tmp}/isadoraair-test-data.XXXXXX") || exit 98
+isolation_root=$(cd "$isolation_root" && pwd -P)
+chmod 700 "$isolation_root"
+case "$(basename "$isolation_root")" in isadoraair-test-data.*) ;; *) echo "run_with_validation_service.sh: unexpected namespace $isolation_root" >&2; exit 98 ;; esac
+remove_isolation_root() { rm -rf -- "$isolation_root"; }
+trap remove_isolation_root EXIT
+export ISADORAAIR_TEST_DATA_ROOT="$isolation_root"
+# Fail closed BEFORE any service starts: prove the effective settings and the
+# write boundary with side-effect-free probes (see the command's docstring).
+"$python" "$here/manage.py" test_isolation_preflight >"$isolation_root/preflight.json" || {
+    echo "run_with_validation_service.sh: test isolation preflight FAILED -- nothing was started" >&2
+    cat "$isolation_root/preflight.json" >&2
+    exit 98
+}
+if [ -n "${ISADORAAIR_PREFLIGHT_COPY:-}" ]; then cp "$isolation_root/preflight.json" "$ISADORAAIR_PREFLIGHT_COPY"; fi
+
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/isadoraair-validation-test.XXXXXX")
 chmod 700 "$runtime"
 unit="isadoraair-validation-test-$$-${RANDOM}"
 socket_path="$runtime/validator.sock"
-env_args=(-E "PRODUCTION_VALIDATION_SOCKET=$socket_path" -E "PATH=$PATH" -E "HOME=$HOME")
+env_args=(-E "PRODUCTION_VALIDATION_SOCKET=$socket_path" -E "ISADORAAIR_TEST_DATA_ROOT=$isolation_root" -E "PATH=$PATH" -E "HOME=$HOME")
 while IFS='=' read -r name _; do
     case "$name" in GST_*) env_args+=(-E "$name=${!name}") ;; esac
 done < <(env)
@@ -35,7 +59,7 @@ stop_service() {
         org.freedesktop.systemd1.Manager StopUnit ss "$unit.service" replace >/dev/null 2>&1 || true
     rm -rf "$runtime"
 }
-trap stop_service EXIT
+trap 'stop_service; remove_isolation_root' EXIT
 
 systemd-run --user --quiet --collect --unit="$unit" \
     -p Delegate="cpu memory pids" -p DelegateSubgroup=supervisor -p KillMode=control-group \
@@ -64,11 +88,11 @@ stop_render() {
         org.freedesktop.systemd1.Manager StopUnit ss "$render_unit.service" replace >/dev/null 2>&1 || true
     rm -rf "$render_runtime"
 }
-trap 'stop_render; stop_service' EXIT
+trap 'stop_render; stop_service; remove_isolation_root' EXIT
 systemd-run --user --quiet --collect --unit="$render_unit" \
     -p Delegate="cpu memory pids" -p DelegateSubgroup=supervisor -p KillMode=control-group \
     -p Restart=always -p RestartSec=1 -p UMask=0077 -p WorkingDirectory="$here" \
-    -E "PRODUCTION_RENDER_SOCKET=$render_socket" -E "PATH=$PATH" -E "HOME=$HOME" \
+    -E "PRODUCTION_RENDER_SOCKET=$render_socket" -E "ISADORAAIR_TEST_DATA_ROOT=$isolation_root" -E "PATH=$PATH" -E "HOME=$HOME" \
     "$python" "$here/manage.py" production_render_service || exit 98
 for _ in $(seq 1 300); do
     [ -S "$render_socket" ] && break

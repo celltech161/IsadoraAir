@@ -352,7 +352,15 @@ def assert_safe_test_databases(aliases=None):
 
 
 def install():
-    """Idempotently guard ``TransactionTestCase`` fixture setup/teardown."""
+    """Idempotently guard ``TransactionTestCase`` fixture setup/teardown.
+
+    Also fails closed unless filesystem test isolation is engaged: every test
+    package imports this, so a test module loaded by anything other than
+    ``manage.py test`` (a shell-driven unittest runner, say) errors at import
+    instead of running against station storage. See isadoraair/test_isolation.py.
+    """
+    from isadoraair import test_isolation
+    test_isolation.assert_engaged()
     case = testcases.TransactionTestCase
     if getattr(case, _INSTALLED_MARK, False):
         return

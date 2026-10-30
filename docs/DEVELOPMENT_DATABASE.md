@@ -124,3 +124,9 @@ DATABASE`, without `FORCE`, refuses if anything is still connected:
 ```bash
 sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d postgres -c 'DROP DATABASE test_isadoraair;'
 ```
+
+## Filesystem isolation
+
+The database guard above is paired with a filesystem guard: every test invocation gets a per-run
+scratch namespace for the library, waveform, production-media, reports, weather and encoder roots,
+and writes to station storage are refused. See [TEST_ISOLATION.md](TEST_ISOLATION.md).
