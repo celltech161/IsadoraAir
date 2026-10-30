@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 
 import encoders.services.encoder_manager as em
+from encoders.services import lkg
 from encoders.models import Encoder
 
 
@@ -417,16 +418,41 @@ class StartupClassifierScriptTests(TestCase):
     always cleaned up, including on failure."""
 
     SAFE_ENCODER_KWARGS = dict(host="127.0.0.1", port=1, mount="/1", station_name="t", genre="t", url="http://example.invalid")
+    #: The generated script stages its atomic state write in the station's runtime
+    #: directory; the real Liquidsoap child is outside the Python write guard.
+    RUNTIME_TEMP_DIR = 'temp_dir="/run/isadoraair"'
+
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state_dir = Path(directory.name)
+        now_playing = self.state_dir / "now_playing.json"
+        for patcher in (patch.object(em, "STATE_DIR", self.state_dir),
+                        patch.object(em, "NOW_PLAYING_PATH", str(now_playing))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The script file.watch()es now_playing.json and stops if it is missing; the
+        # manager seeds the same placeholder before every launch.
+        now_playing.write_text(json.dumps({"title": "", "artist": "", "timestamp": str(time.time())}), encoding="utf-8")
+
+    def _isolated(self, script):
+        """The script with its state write staged in this test's directory; nothing the
+        child can open names the station's runtime directory."""
+        self.assertIn(self.RUNTIME_TEMP_DIR, script, "test fixture assumption broken -- can't redirect the state write")
+        script = script.replace(self.RUNTIME_TEMP_DIR, f"temp_dir={em._liq_string(str(self.state_dir))}")
+        self.assertNotIn("/run/isadoraair", script)
+        return script
 
     def _run(self, input_device, source_expr, generation, timeout=4):
         if shutil.which("liquidsoap") is None:
             self.skipTest("liquidsoap not installed on this box")
         state_path = em._audio_state_path(input_device)
-        self.addCleanup(lambda: state_path.unlink(missing_ok=True))
+        self.assertEqual(state_path.parent, self.state_dir)
         script = em.build_liquidsoap_script(input_device, [make_encoder(**self.SAFE_ENCODER_KWARGS)], generation=generation)
         alsa_line = f'source = input.alsa(buffer_size=1.0, device="{input_device}")'
         self.assertIn(alsa_line, script, "test fixture assumption broken -- can't safely substitute the source")
-        script = script.replace(alsa_line, f"source = {source_expr}", 1)
+        script = self._isolated(script.replace(alsa_line, f"source = {source_expr}", 1))
         with tempfile.TemporaryDirectory() as tmpdir:
             script_path = Path(tmpdir) / "test.liq"
             script_path.write_text(script, encoding="utf-8")
@@ -512,6 +538,7 @@ class StartupClassifierScriptTests(TestCase):
         self.assertIn(blank_detect_line, script, "test fixture assumption broken -- can't safely shorten max_blank")
         script = script.replace(alsa_line, "source = blank(duration=-1.0)", 1)
         script = script.replace(blank_detect_line, blank_detect_line.replace("max_blank=20.0", "max_blank=0.05"), 1)
+        script = self._isolated(script)
         with tempfile.TemporaryDirectory() as tmpdir:
             script_path = Path(tmpdir) / "test.liq"
             script_path.write_text(script, encoding="utf-8")
@@ -562,6 +589,7 @@ class StartupClassifierScriptTests(TestCase):
         script = em.build_liquidsoap_script(input_device, [make_encoder(**self.SAFE_ENCODER_KWARGS)], generation="gen-f-OLD")
         alsa_line = f'source = input.alsa(buffer_size=1.0, device="{input_device}")'
         script = script.replace(alsa_line, "source = sine(440.0)", 1)  # continuous audio -- if the CAS guard fails, this would visibly write "audio_ok" under the OLD generation
+        script = self._isolated(script)
         with tempfile.TemporaryDirectory() as tmpdir:
             script_path = Path(tmpdir) / "test.liq"
             script_path.write_text(script, encoding="utf-8")
@@ -633,6 +661,10 @@ class EncoderManagerFixtureMixin:
             patch.object(em, "STATE_DIR", self.state_dir),
             patch.object(em, "SCRIPT_DIR", self.script_dir),
             patch.object(em, "NOW_PLAYING_PATH", str(self.state_dir / "now_playing.json")),
+            # A launch writes and qualifies a candidate script, and promotion writes
+            # last-known-good; both default to station paths.
+            patch.object(lkg, "CANDIDATE_DIR", self.state_dir / "candidate"),
+            patch.object(lkg, "LKG_DIR", self.state_dir / "lkg"),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
