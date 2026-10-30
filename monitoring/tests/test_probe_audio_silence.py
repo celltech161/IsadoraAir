@@ -1,8 +1,11 @@
 """probe_audio_silence tests -- the null-is_blank three-state fix from
 the 2026-08-05 hardening pass is the headline regression test here."""
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 from django.test import TestCase
 
@@ -16,10 +19,26 @@ def make_check(**overrides):
     return MonitorCheck(**defaults)
 
 
+#: Where the probe looks; probe_audio_silence builds this path inline.
+STATION_STATE = Path("/run/isadoraair/liquidsoap_silence_unittestslug.json")
+
+
 class ProbeAudioSilenceTests(TestCase):
     def setUp(self):
-        self.path = Path("/run/isadoraair/liquidsoap_silence_unittestslug.json")
-        self.addCleanup(lambda: self.path.unlink(missing_ok=True))
+        # The probe reads the live encoder's state file under /run/isadoraair, which a
+        # test must never write. Its two reads of that one path go to a private file.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / STATION_STATE.name
+        is_file, read_text = Path.is_file, Path.read_text
+
+        def redirected(method):
+            return lambda path, *args, **kwargs: method(self.path if path == STATION_STATE else path,
+                                                        *args, **kwargs)
+        for name, method in (("is_file", is_file), ("read_text", read_text)):
+            patcher = mock.patch.object(Path, name, redirected(method))
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def write(self, **fields):
         self.path.write_text(json.dumps(fields), encoding="utf-8")
@@ -87,3 +106,8 @@ class ProbeAudioSilenceTests(TestCase):
         status, detail = probes.probe_audio_silence(make_check())
         self.assertEqual(status, "unknown")
         self.assertIn("implausible", detail["reason"])
+
+    def test_the_probe_reads_the_private_file_not_the_station(self):
+        self.write(is_blank=True, timestamp=time.time(), since=time.time())
+        self.assertEqual(probes.probe_audio_silence(make_check())[0], "critical")
+        self.assertFalse(os.path.lexists(STATION_STATE))         # nothing was ever written there

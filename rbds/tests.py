@@ -23,6 +23,33 @@ from rbds.services.rotation import PSRotation, RTRotation
 from updatecenter.backend_client import BackendTransportError
 
 
+class PrivateRuntimeStateMixin:
+    """Points RBDSManager's /run/isadoraair files at a fresh directory per test.
+
+    _tick() publishes rbds_state.json through ``STATE_PATH.with_suffix(".tmp")``
+    and a rename, and reads now_playing.json and rbds_category_state.json; the
+    module constants name the live station's files, so a test that runs the real
+    _tick() or _write_state() without this would rewrite the running
+    isadoraair-rbds.service's state (the test sandbox refuses it). The reads land in
+    the same empty directory, so these tests see no station state either.
+    """
+
+    RUNTIME_STATE = {"STATE_PATH": "rbds_state.json", "NOW_PLAYING_PATH": "now_playing.json",
+                     "RBDS_CATEGORY_STATE_PATH": "rbds_category_state.json"}
+
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.runtime_dir = Path(directory.name)
+        for name, filename in self.RUNTIME_STATE.items():
+            patcher = mock.patch.object(rbds_manager, name, self.runtime_dir / filename)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Runs before the patches are undone: the atomic publication left no temp file.
+        self.addCleanup(lambda: self.assertEqual(sorted(self.runtime_dir.glob("*.tmp")), []))
+
+
 class FakeClock:
     """Injectable clock for deterministic rotation-timing tests -- call
     advance(seconds) to move time forward instead of real time.sleep()."""
@@ -1666,7 +1693,7 @@ class RtPlusOmitVsGenericTests(SimpleTestCase):
 
 
 @mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
-class RBDSManagerOneShotToggleTests(TestCase):
+class RBDSManagerOneShotToggleTests(PrivateRuntimeStateMixin, TestCase):
     """SPB490 p.31: RT flags bit0 is a ONE-SHOT TOGGLE COMMAND ("0=do
     not toggle, 1=toggle"), not a persistent state bit -- confirmed via
     primary-source review 2026-08-02. rt_changed must be computed fresh
@@ -1683,6 +1710,7 @@ class RBDSManagerOneShotToggleTests(TestCase):
     these tests actually verify."""
 
     def setUp(self):
+        super().setUp()
         self.mgr = RBDSManager()
         self.sent_payloads = []
         self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent_payloads.append(payload))
@@ -1782,7 +1810,7 @@ class RBDSManagerOneShotToggleTests(TestCase):
 
 
 @mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
-class RBDSManagerCtOnOffTests(TestCase):
+class RBDSManagerCtOnOffTests(PrivateRuntimeStateMixin, TestCase):
     """MEC 0x19 (CT On/Off) is distinct from MEC 0x0D (Real time clock,
     value only) -- confirmed via primary-source review 2026-08-02 (see
     uecp.mec_ct_on_off's docstring). RBDSManager must send the explicit
@@ -1800,6 +1828,7 @@ class RBDSManagerCtOnOffTests(TestCase):
     this test class is the regression coverage for that fix."""
 
     def setUp(self):
+        super().setUp()
         self.mgr = RBDSManager()
         self.sent = []
         self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
@@ -3361,7 +3390,7 @@ class RtNormalizationGapTests(SimpleTestCase):
 
 
 @mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
-class RBDSManagerFailedSendPreservesToggleTests(TestCase):
+class RBDSManagerFailedSendPreservesToggleTests(PrivateRuntimeStateMixin, TestCase):
     """A failed transmission must not be recorded as if it succeeded
     -- 2026-08-02 second-opinion fix. The original one-shot A/B fix
     updated _last_sent_ps/_last_sent_rt unconditionally right after
@@ -3373,6 +3402,7 @@ class RBDSManagerFailedSendPreservesToggleTests(TestCase):
     toggle for it."""
 
     def setUp(self):
+        super().setUp()
         self.mgr = RBDSManager()
         self.sent_payloads = []
         self.fail_next = False
@@ -3494,7 +3524,7 @@ class RBDSAfRuntimeBlockTests(SimpleTestCase):
         self.assertIsNotNone(_find_mec(frames, 0x0A))  # RT
 
 
-class EffectiveDynamicPtyTests(TestCase):
+class EffectiveDynamicPtyTests(PrivateRuntimeStateMixin, TestCase):
     """RBDSConfig.di_dynamic_pty was a fully independent static flag,
     never derived from whether Category.rbds_pty_override can actually
     make PTY vary track-to-track -- a station using category overrides
@@ -3504,6 +3534,7 @@ class EffectiveDynamicPtyTests(TestCase):
     (never replacing) the admin's own manual setting."""
 
     def setUp(self):
+        super().setUp()
         self.mgr = RBDSManager()
         from library.models import Category, CategoryKind
         # A real "music" CategoryKind is already seeded by a data
@@ -3589,7 +3620,7 @@ def _slow_label_value(msg, variant):
     return ((msg[2] & 0xF) << 8) | msg[3]
 
 
-class RBDSManagerLicTests(TestCase):
+class RBDSManagerLicTests(PrivateRuntimeStateMixin, TestCase):
     """Legacy Language Identification Code (LIC), MEC 0x1A variant 3 --
     same MEC family as ECC (variant 0), sent as part of the main full
     UECP payload (not a dedicated cadence like CT), so it inherits the
@@ -3599,6 +3630,7 @@ class RBDSManagerLicTests(TestCase):
     having been set -- see rbds_manager.py's _last_sent_language_code."""
 
     def setUp(self):
+        super().setUp()
         # _tick()'s own close_old_connections() call closes the shared
         # connection out from under this TestCase's wrapping atomic
         # block in this environment (autocommit-state mismatch trips
@@ -3747,7 +3779,7 @@ class RBDSManagerLicTests(TestCase):
         self.assertNotEqual(bytes(ecc_frame), bytes(lic_frame))
 
 
-class RBDSManagerReconnectBackoffTests(SimpleTestCase):
+class RBDSManagerReconnectBackoffTests(PrivateRuntimeStateMixin, SimpleTestCase):
     """Covers the 2026-08-04 backoff cap (TCP_RECONNECT_BACKOFF: (1, 2, 5, 10,
     30) -> (1, 2, 5), monotonic-clock-based). _ensure_tcp_connected is
     exercised directly rather than through _tick()/_send() -- every other
@@ -3763,6 +3795,7 @@ class RBDSManagerReconnectBackoffTests(SimpleTestCase):
     full suite run below confirms nothing there regressed."""
 
     def setUp(self):
+        super().setUp()
         self.mgr = RBDSManager()
         self.config = mock.Mock(
             host="127.0.0.1", port=4000, protocol="uecp", transport="tcp", ps_mode="static",
@@ -5084,7 +5117,7 @@ def _long_ps_values_sent(sent_payloads):
     return values
 
 
-class RBDSManagerLongPsTests(TestCase):
+class RBDSManagerLongPsTests(PrivateRuntimeStateMixin, TestCase):
     """MANAGER: Long PS's own dedupe/full-resend/reconnect/disable
     state machine, exercised through the REAL _tick() -- never a
     reimplementation. Modeled on RBDSManagerCtOnOffTests's own
@@ -5099,6 +5132,7 @@ class RBDSManagerLongPsTests(TestCase):
     one that was enabled before and is now explicitly Disabled."""
 
     def setUp(self):
+        super().setUp()
         # Same close_old_connections() patch RBDSManagerLicTests uses --
         # see that class's own setUp comment for why (test-harness-only
         # interaction with this environment's atomic-block wrapping,
@@ -5373,7 +5407,7 @@ class RBDSManagerLongPsTests(TestCase):
         self.assertEqual(bytes(ps_mec), uecp.mec_ps("KOGR-LP "))
 
 
-class RBDSManagerLongPsOwnershipTests(TestCase):
+class RBDSManagerLongPsOwnershipTests(PrivateRuntimeStateMixin, TestCase):
     """MANAGER: long_ps_managed's own ownership-gate behavior --
     [P2] 2.3F2 pre-commit ownership fix (2026-08-20). Exercised
     through the REAL _tick(), same harness style as
@@ -5385,6 +5419,7 @@ class RBDSManagerLongPsOwnershipTests(TestCase):
     assumed."""
 
     def setUp(self):
+        super().setUp()
         patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -5566,13 +5601,14 @@ class RBDSManagerLongPsOwnershipTests(TestCase):
         self.assertIsNotNone(_find_mec(frames, 0x0A))
 
 
-class LongPsRegressionTests(TestCase):
+class LongPsRegressionTests(PrivateRuntimeStateMixin, TestCase):
     """REGRESSION: proves Long PS coexists with every existing RBDS
     field/mode without altering them, and that it never touches MEC
     0x24 (RT+) machinery -- the [P2] 2.3F2 task's own explicit
     non-negotiable ("RT/RT+ 0x24 paths must remain untouched")."""
 
     def setUp(self):
+        super().setUp()
         patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -5648,3 +5684,40 @@ class LongPsRegressionTests(TestCase):
         self.assertIsNotNone(_find_mec(frames, 0x1A, subtype=0))  # ECC
         self.assertIsNotNone(_find_mec(frames, 0x07))  # PTY
         self.assertIsNotNone(_find_mec(frames, 0x21))  # Long PS
+
+
+class RuntimeStateIsolationTests(PrivateRuntimeStateMixin, TestCase):
+    """The fixture above: the real atomic publication lands in the test's own directory."""
+
+    def test_write_state_publishes_into_the_private_directory_and_leaves_no_temp_file(self):
+        RBDSManager()._write_state(RBDSConfig.load(), "TESTPS  ", "some rt", "nowplaying", None)
+        self.assertEqual([p.name for p in self.runtime_dir.iterdir()], ["rbds_state.json"])
+        self.assertEqual(json.loads((self.runtime_dir / "rbds_state.json").read_text())["current_ps"], "TESTPS  ")
+
+
+class RuntimeStateDefaultsTests(SimpleTestCase):
+    def test_the_production_defaults_still_name_the_station_files_and_are_protected(self):
+        from isadoraair import test_isolation
+        for path, name in ((rbds_manager.STATE_PATH, "rbds_state.json"),
+                           (rbds_manager.NOW_PLAYING_PATH, "now_playing.json"),
+                           (rbds_manager.RBDS_CATEGORY_STATE_PATH, "rbds_category_state.json")):
+            self.assertEqual(path, Path("/run/isadoraair") / name)
+            self.assertEqual(test_isolation.protected_match(str(path)), "/run/isadoraair")
+
+    def test_every_class_that_runs_the_manager_is_isolated(self):
+        """A class that runs the real _tick(), _write_state() or start() must use
+        PrivateRuntimeStateMixin or patch STATE_PATH itself."""
+        import ast
+        import inspect
+        import sys
+        source = inspect.getsource(sys.modules[__name__])
+        offenders = []
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.ClassDef) or node.name == "PrivateRuntimeStateMixin":
+                continue
+            text = ast.get_source_segment(source, node)
+            runs = any(call in text for call in ("._tick()", "._write_state(", "mgr.start()"))
+            isolated = "PrivateRuntimeStateMixin" in [ast.unparse(base) for base in node.bases] or "STATE_PATH" in text
+            if runs and not isolated:
+                offenders.append(node.name)
+        self.assertEqual(offenders, [])
