@@ -169,12 +169,12 @@ class ProtectedWaveformCollisionTests(TestCase):
         Category.objects.create(code="Aircheck", name="Aircheck", kind=kind)
         self.clip = self.library / "Aircheck" / "collide.mp3"
         self.clip.write_bytes(b"not really an mp3 -- decode is mocked")
-        # Declare the station directory protected and clear the deliberate refusal
-        # afterwards so the runner does not count it as an isolation failure.
-        guard = test_isolation.protect_for_test(self.protected)
-        guard.__enter__()
-        self.addCleanup(guard.__exit__, None, None, None)
+        # Deliberate refusals below must not be counted as isolation failures by the runner.
         self.addCleanup(test_isolation.clear_blocked_writes)
+
+    def _station_protected(self):
+        """Declare the simulated station directory protected (after the sentinel is planted)."""
+        return test_isolation.protect_for_test(self.protected)
 
     def _sync(self, **overrides):
         settings_override = override_settings(LIBRARY_ROOT=str(self.library), **overrides)
@@ -191,7 +191,8 @@ class ProtectedWaveformCollisionTests(TestCase):
     def test_colliding_id_with_a_scratch_waveform_directory_leaves_the_station_file_untouched(self):
         track, _ = self._sync(WAVEFORMS_DIR=str(self.scratch))
         sentinel = self._plant_sentinel(track.id)            # same file name the incident overwrote
-        track, created = self._sync(WAVEFORMS_DIR=str(self.scratch))   # re-analysis of the same Track id
+        with self._station_protected():
+            track, created = self._sync(WAVEFORMS_DIR=str(self.scratch))   # re-analysis of the same Track id
         self.assertFalse(created)
         self.assertEqual(sentinel.read_bytes(), self.SENTINEL)
         written = self.scratch / f"{track.id}.json"
@@ -203,7 +204,7 @@ class ProtectedWaveformCollisionTests(TestCase):
         track, _ = self._sync(WAVEFORMS_DIR=str(self.scratch))
         sentinel = self._plant_sentinel(track.id)
         # The stale-.env / forgotten-override scenario: analysis is pointed at the station.
-        with self.assertRaises(test_isolation.ProtectedPathWriteBlocked):
+        with self._station_protected(), self.assertRaises(test_isolation.ProtectedPathWriteBlocked):
             self._sync(WAVEFORMS_DIR=str(self.protected))
         self.assertEqual(sentinel.read_bytes(), self.SENTINEL)
         self.assertEqual(sorted(p.name for p in self.protected.iterdir()), [sentinel.name])
@@ -216,6 +217,6 @@ class ProtectedWaveformCollisionTests(TestCase):
         sentinel = self._plant_sentinel(track.id)
         alias = self.scratch.parent / "alias-to-station"
         alias.symlink_to(self.protected, target_is_directory=True)
-        with self.assertRaises(test_isolation.ProtectedPathWriteBlocked):
+        with self._station_protected(), self.assertRaises(test_isolation.ProtectedPathWriteBlocked):
             self._sync(WAVEFORMS_DIR=str(alias))
         self.assertEqual(sentinel.read_bytes(), self.SENTINEL)
