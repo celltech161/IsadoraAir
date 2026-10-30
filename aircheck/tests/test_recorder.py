@@ -527,6 +527,19 @@ class LibrarySyncTests(AircheckRecorderFixtureMixin, TransactionTestCase):
             t = threading.Thread(target=recorder._sync_finalized_recording_to_library, args=(dest,))
             t.start()
             t.join(timeout=10)
+        # Scratch directories are removed by the caller right after this returns, so a
+        # worker still running here could write into a deleted (or, worse, a real) tree.
+        self.assertFalse(t.is_alive(), "library-sync worker thread did not finish")
+
+    def assert_waveform_under(self, track, wave_root):
+        """The analysis-produced waveform exists, and only under this test's scratch root."""
+        track.refresh_from_db()
+        expected = Path(wave_root) / f"{track.id}.json"
+        self.assertEqual(track.waveform_path, str(expected))
+        payload = json.loads(expected.read_text(encoding="utf-8"))
+        self.assertEqual(payload["track_id"], track.id)
+        self.assertGreater(len(payload["samples_left"]), 0)
+        self.assertEqual([p.name for p in Path(wave_root).iterdir()], [expected.name])
 
     def test_dest_outside_library_root_is_silent_noop(self):
         # self.out_dir (a random tempdir) is never under the real,
@@ -542,9 +555,11 @@ class LibrarySyncTests(AircheckRecorderFixtureMixin, TransactionTestCase):
         self.assertEqual(SystemEvent.objects.count(), 0)
 
     def test_dest_under_library_root_with_category_creates_track(self):
-        with tempfile.TemporaryDirectory() as lib_root:
+        with tempfile.TemporaryDirectory() as lib_root, tempfile.TemporaryDirectory() as wave_root:
             lib_root = Path(lib_root)
-            with override_settings(LIBRARY_ROOT=str(lib_root)):
+            # WAVEFORMS_DIR is overridden alongside LIBRARY_ROOT: analysis writes
+            # <track id>.json there and a colliding id would overwrite a station's file.
+            with override_settings(LIBRARY_ROOT=str(lib_root), WAVEFORMS_DIR=wave_root):
                 kind, _ = CategoryKind.objects.get_or_create(code="music", defaults={"name": "Music"})
                 Category.objects.create(code="Aircheck", name="Aircheck", kind=kind)
 
@@ -559,11 +574,12 @@ class LibrarySyncTests(AircheckRecorderFixtureMixin, TransactionTestCase):
                 self.assertFalse(track.ready2air, "Aircheck recordings must not default to ready2air=True")
                 self.assertEqual(track.category.code, "Aircheck")
                 self.assertEqual(SystemEvent.objects.count(), 0)
+                self.assert_waveform_under(track, wave_root)
 
     def test_dest_under_library_root_without_category_warns(self):
-        with tempfile.TemporaryDirectory() as lib_root:
+        with tempfile.TemporaryDirectory() as lib_root, tempfile.TemporaryDirectory() as wave_root:
             lib_root = Path(lib_root)
-            with override_settings(LIBRARY_ROOT=str(lib_root)):
+            with override_settings(LIBRARY_ROOT=str(lib_root), WAVEFORMS_DIR=wave_root):
                 dest_dir = lib_root / "NoSuchCategory"
                 dest_dir.mkdir(parents=True)
                 dest = dest_dir / "aircheck-20260101-000000.mp3"

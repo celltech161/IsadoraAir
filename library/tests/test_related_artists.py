@@ -473,8 +473,10 @@ class FilenameFallbackTests(TestCase):
         kind, _ = CategoryKind.objects.get_or_create(code="music", defaults={"name": "Music"})
         category = Category.objects.create(code="TESTUP", name="Test Upload", kind=kind)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            with override_settings(LIBRARY_ROOT=tmp):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as wave_tmp:
+            # The upload runs analysis, which writes <track id>.json into WAVEFORMS_DIR
+            # (a colliding id would overwrite a station's file), so own that root too.
+            with override_settings(LIBRARY_ROOT=tmp, WAVEFORMS_DIR=wave_tmp):
                 from django.core.files.uploadedfile import SimpleUploadedFile
                 # A minimal-but-valid MP3 isn't needed here since
                 # parse_tags() on unparseable bytes just returns ({},

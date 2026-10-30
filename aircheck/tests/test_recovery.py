@@ -500,7 +500,12 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
         self._lib_root_ctx = tempfile.TemporaryDirectory()
         lib_root = Path(self._lib_root_ctx.name)
         self.addCleanup(self._lib_root_ctx.cleanup)
-        self._override = override_settings(LIBRARY_ROOT=str(lib_root))
+        # Analysis writes <track id>.json into WAVEFORMS_DIR; a colliding id would
+        # overwrite a station's real file, so this suite owns a waveform root too.
+        self._wave_root_ctx = tempfile.TemporaryDirectory()
+        self.wave_root = Path(self._wave_root_ctx.name)
+        self.addCleanup(self._wave_root_ctx.cleanup)
+        self._override = override_settings(LIBRARY_ROOT=str(lib_root), WAVEFORMS_DIR=str(self.wave_root))
         self._override.enable()
         self.addCleanup(self._override.disable)
         kind, _ = CategoryKind.objects.get_or_create(code="music", defaults={"name": "Music"})
@@ -527,6 +532,18 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
             t = threading.Thread(target=recovery.retry_pending_finalizations)
             t.start()
             t.join(timeout=15)
+        # The scratch roots are removed at cleanup; never with a worker still running.
+        self.assertFalse(t.is_alive(), "recovery worker thread did not finish")
+
+    def assert_waveform_under_scratch(self, track):
+        import json
+        track.refresh_from_db()
+        expected = self.wave_root / f"{track.id}.json"
+        self.assertEqual(track.waveform_path, str(expected))
+        payload = json.loads(expected.read_text(encoding="utf-8"))
+        self.assertEqual(payload["track_id"], track.id)
+        self.assertGreater(len(payload["samples_left"]), 0)
+        self.assertEqual([p.name for p in self.wave_root.iterdir()], [expected.name])
 
     def test_35_crash_after_publish_before_bookkeeping_then_retry_converges(self):
         """Simulates a process death between _finalize_segment_set's
@@ -553,6 +570,7 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
         self.assertEqual(session.exit_note, "")
         self.assertEqual(recorder.classify_finalization(session), "complete")
         self.assertEqual(Track.objects.filter(filepath=str(dest)).count(), 1)
+        self.assert_waveform_under_scratch(Track.objects.get(filepath=str(dest)))
 
     def test_36_retry_converges_to_exactly_one_final_file_and_one_library_asset(self):
         """Runs the exact same recovery pass twice against the same
@@ -578,6 +596,7 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
         self.assertEqual(result["candidates"], 0)
         self.assertEqual(Track.objects.filter(filepath=str(dest)).count(), 1)
         self.assertEqual(Track.objects.get(filepath=str(dest)).id, first_track_id)
+        self.assert_waveform_under_scratch(Track.objects.get(filepath=str(dest)))
 
 
 # ======================================================================
