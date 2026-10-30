@@ -129,4 +129,7 @@ sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d postgres -c 'DROP DATABASE test_i
 
 The database guard above is paired with a filesystem guard: every test invocation gets a per-run
 scratch namespace for the library, waveform, production-media, reports, weather and encoder roots,
-and writes to station storage are refused. See [TEST_ISOLATION.md](TEST_ISOLATION.md).
+and writes to station storage are refused. Tests run only inside the kernel sandbox of
+`production/tests/run_with_validation_service.sh`, which gives each run its own disposable
+PostgreSQL cluster (role `isadoraair_dev`, Unix socket in the run directory); the host server,
+including this development database, is not reachable from it. See [TEST_ISOLATION.md](TEST_ISOLATION.md).
