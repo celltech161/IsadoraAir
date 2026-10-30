@@ -23,6 +23,7 @@ from active_messages.models import ActiveBroadcastMessageEvent
 from production.tests.support import ffmpeg_available
 
 from .d3ec_support import Lifecycle
+from library.tests.cue_marker_support import set_markers
 
 try:                                                    # absent from the vulnerable candidate
     from active_messages import quarantine
@@ -746,7 +747,8 @@ class GuardAuthorizationTests(Lifecycle, TestCase):
         execution, publication, _item = self.completed()
         own = Track.objects.get(pk=publication.track_id)
         wave = str(self.wave(publication))
-        Track.objects.filter(id=own.pk).update(waveform_path=wave, cue_in_seconds=0.1)   # re-analysis
+        Track.objects.filter(id=own.pk).update(waveform_path=wave)                       # re-analysis...
+        set_markers(own.pk, cue_in_seconds=0.1)                                          # ...and its cue in
         own.refresh_from_db()
         own.title = "Edited"
         own.save()                                                         # a full save of its own row

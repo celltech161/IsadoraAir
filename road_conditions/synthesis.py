@@ -626,7 +626,8 @@ def _run_full_analysis(track):
         track.id, track.filepath, track.filename, track.duration_seconds,
         track.title, track.artist.name if track.artist_id else "", "",
     )
-    return analyze_one_track(row, cfg_values, get_waveforms_dir(), force=True)
+    # A freshly synthesized report replaced this Track's audio: its markers rebind to it.
+    return analyze_one_track(row, cfg_values, get_waveforms_dir(), force=True, media_replaced=True)
 
 
 def _kandrive_category():

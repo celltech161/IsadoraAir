@@ -18,6 +18,7 @@ from isadoraair.announcements import (
 )
 from isadoraair.announcements import renderer as renderer_module
 from library.models import AnalysisConfig, Artist, Category, CategoryKind, Track
+from library.tests.cue_marker_support import set_markers
 
 
 def private_waveforms_dir(test):
@@ -159,11 +160,8 @@ class AnnouncementRendererTests(TestCase):
         destination = self.root / "speech.flac"
 
         def analyze(track, wave_dir=None):
-            Track.objects.filter(id=track.id).update(
-                cue_in_seconds=0.75,
-                next_start_seconds=1.5,
-                waveform_path=str(self.waveforms / f"{track.id}.json"),
-            )
+            Track.objects.filter(id=track.id).update(waveform_path=str(self.waveforms / f"{track.id}.json"))
+            set_markers(track.id, cue_in_seconds=0.75, next_start_seconds=1.5)
             return True
 
         with patch.object(
@@ -353,9 +351,7 @@ class AnnouncementRendererTests(TestCase):
             Path(output).write_bytes(payload["bytes"])
 
         def analyze(track, wave_dir=None, category=None):
-            Track.objects.filter(id=track.id).update(
-                cue_in_seconds=payload["cue"], next_start_seconds=payload["next"]
-            )
+            set_markers(track.id, cue_in_seconds=payload["cue"], next_start_seconds=payload["next"])
             return True
 
         patches = (
@@ -387,9 +383,8 @@ class AnnouncementRendererTests(TestCase):
         track = self._existing_track(destination)
 
         def failed_analysis(updated_track, wave_dir=None, category=None):
-            Track.objects.filter(id=updated_track.id).update(
-                title="Partially changed", cue_in_seconds=3.0, next_start_seconds=4.0
-            )
+            Track.objects.filter(id=updated_track.id).update(title="Partially changed")
+            set_markers(updated_track.id, cue_in_seconds=3.0, next_start_seconds=4.0)
             return False
 
         with patch.object(
@@ -433,9 +428,9 @@ class AnnouncementRendererTests(TestCase):
 
         captured = {}
 
-        def fake_analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None):
+        def fake_analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, **kwargs):
             captured["cfg_values"] = cfg_values
-            Track.objects.filter(id=row[0]).update(cue_in_seconds=0.5, next_start_seconds=5.0)
+            set_markers(row[0], cue_in_seconds=0.5, next_start_seconds=5.0)
             return True
 
         with patch.object(
@@ -481,9 +476,9 @@ class AnnouncementRendererTests(TestCase):
         destination = self.root / "speech.flac"
         captured = {}
 
-        def fake_analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None):
+        def fake_analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, **kwargs):
             captured["cfg_values"] = cfg_values
-            Track.objects.filter(id=row[0]).update(cue_in_seconds=0, next_start_seconds=6.5)
+            set_markers(row[0], cue_in_seconds=0.0, next_start_seconds=6.5)
             return True
 
         with patch.object(
@@ -536,9 +531,8 @@ class AnnouncementRendererTests(TestCase):
 
         def failing_analysis_overwrites_waveform(updated_track, wave_dir=None, category=None):
             (wave_dir / f"{updated_track.id}.json").write_bytes(b"NEW-WAVEFORM")
-            Track.objects.filter(id=updated_track.id).update(
-                title="Partially changed", cue_in_seconds=3.0, next_start_seconds=4.0
-            )
+            Track.objects.filter(id=updated_track.id).update(title="Partially changed")
+            set_markers(updated_track.id, cue_in_seconds=3.0, next_start_seconds=4.0)
             return False
 
         with patch.object(

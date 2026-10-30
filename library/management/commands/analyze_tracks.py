@@ -6,8 +6,10 @@ import sys
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
+from django.db.models import Q
 
 from library.models import AnalysisConfig, Track
+from library.services import cue_markers
 from library.services.related_artists import extract_credited_artists, merge_related_artists
 from monitoring.models import emit_event
 # Aliased on import: this file uses `existing_artist_names_casefolded`
@@ -40,19 +42,26 @@ def repick_cue_points_from_json(json_path, next_start_db, cue_in_db, cue_in_min)
     a very frustrating bug to track down."""
     import json as _json  # local alias; module imports it at top already
     payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
+    next_start, cue_in = repick_from_payload(payload, next_start_db, cue_in_db, cue_in_min)
+    payload["next_start"] = next_start
+    payload["cue_in_seconds"] = cue_in
+    return next_start, cue_in, payload
+
+
+def repick_from_payload(payload, next_start_db, cue_in_db, cue_in_min):
+    """Cue In and Next Start from an already-validated cache payload's envelope (see
+    library.services.waveform_cache): ``(next_start, cue_in)``. LookupError without envelope."""
     times = payload.get("envelope_times")
     envelope_db = payload.get("envelope_db")
     if not times or not envelope_db:
         raise LookupError(
-            f"waveform JSON at {json_path} has no envelope data -- "
-            f"pre-envelope-persistence file, needs a full re-analyze"
+            "waveform cache has no envelope data -- "
+            "pre-envelope-persistence file, needs a full re-analyze"
         )
     duration = payload.get("analysis_duration")
     next_start = detect_next_start(times, envelope_db, duration, next_start_db)
     cue_in = detect_cue_in(times, envelope_db, duration, cue_in_db, cue_in_min)
-    payload["next_start"] = next_start
-    payload["cue_in_seconds"] = cue_in
-    return next_start, cue_in, payload
+    return next_start, cue_in
 
 
 # Lossless formats without native metadata support -- normalize to
@@ -370,7 +379,23 @@ def get_waveforms_dir():
     return wave_dir
 
 
-def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None):
+class AnalysisOutcome:
+    """What one analysis did: truthy when the Track was analyzed (decode and envelope succeeded),
+    with the cue-marker authority's result for the calculated markers (``markers``)."""
+
+    def __init__(self, analyzed, markers=None, reason=""):
+        self.analyzed, self.markers, self.reason = analyzed, markers, reason
+
+    def __bool__(self):
+        return self.analyzed
+
+    def __repr__(self):
+        return f"AnalysisOutcome(analyzed={self.analyzed!r}, reason={self.reason!r})"
+
+
+def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, *,
+                      media_replaced=False, source=cue_markers.SOURCE_ANALYSIS, requested_by=None,
+                      override=(), override_confirmed=False):
     """Analyze exactly one track (waveform + cue points + related artists),
     writing results directly to the DB and a waveform JSON file. `row` is
     (track_id, filepath, filename, duration, title, artist_name,
@@ -385,31 +410,40 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     bare '&'/'and' split -- pass the bulk-loaded set when calling this
     in a loop (see this command's handle()); a single-track caller
     (api_track_reanalyze, sync_track_file) can leave it None and this
-    loads it itself with one extra query, which is fine off a hot loop."""
+    loads it itself with one extra query, which is fine off a hot loop.
+
+    Cue In and Next Start reach the Track only through the cue-marker authority, checked
+    against the marker revision read here, before the (long) decode: a marker an operator
+    edited meanwhile wins, and a protected (locked or historical) marker is preserved unless
+    ``media_replaced`` (the caller just published new audio at this Track) or an operator's
+    confirmed ``override``. Returns an AnalysisOutcome (truthy when analyzed)."""
     (sample_rate, window_seconds, target_points,
      next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
+    basis = cue_markers.snapshot(track_id)
+    if basis is None:
+        return AnalysisOutcome(False, reason="Track not found")
 
     # Auto-transcode WAV/AIF/AIFF to FLAC before analysis. No-op for
     # already-FLAC/MP3/etc tracks. Failure returns None -- skip this
     # track and let the next analyze pass retry from a clean slate.
     swap = transcode_lossless_to_flac(track_id, filepath, filename)
     if swap is None:
-        return False
+        return AnalysisOutcome(False, reason="transcode failed")
     filepath, filename = swap
     fp = Path(filepath)
 
     if not fp.is_file():
         print(f"  Missing file for track {track_id}: {filepath}")
-        return False
+        return AnalysisOutcome(False, reason="missing file")
 
     raw = decode_audio_to_pcm(fp, sample_rate)
     if not raw:
-        return False
+        return AnalysisOutcome(False, reason="decode failed")
 
     times, envelope_db = compute_envelope(raw, sample_rate, window_seconds)
     if not envelope_db:
-        return False
+        return AnalysisOutcome(False, reason="no envelope")
 
     analysis_duration = times[-1] if times else None
     effective_duration = analysis_duration if analysis_duration else (
@@ -508,13 +542,32 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     else:
         related = existing_related
 
+    if effective_duration and effective_duration != duration:
+        Track.objects.filter(id=track_id).update(duration_seconds=effective_duration)
+
+    # A detector that found nothing writes nothing: a failed detection never nulls a marker.
+    calculated = {name: value for name, value in (("cue_in_seconds", cue_in), ("next_start_seconds", next_start))
+                  if value is not None}
+    marker_result = cue_markers.apply_calculation(
+        track_id, calculated, basis_revision=basis["cue_marker_revision"], source=source,
+        requested_by=requested_by, override=override, override_confirmed=override_confirmed,
+        media_replaced=media_replaced, duration=effective_duration,
+    )
+    if not marker_result.ok:
+        print(f"  Track {track_id}: calculated cue markers not applied: "
+              f"{marker_result.conflict or marker_result.error}")
+    current = cue_markers.snapshot(track_id)
+
     out_path = wave_dir / f"{track_id}.json"
+    # Legacy (unversioned) display cache: it records the Track's markers as they stand after
+    # the authority's decision, never values it did not apply, and is never trusted for a
+    # marker calculation (library.services.waveform_cache).
     payload = {
         "track_id": track_id,
         "samples_left": samples_left,
         "samples_right": samples_right,
-        "next_start": next_start,
-        "cue_in_seconds": cue_in,
+        "next_start": current["next_start_seconds"],
+        "cue_in_seconds": current["cue_in_seconds"],
         "analysis_duration": analysis_duration,
         # Mono envelope in dBFS at `window_seconds` resolution -- the
         # actual signal `detect_next_start`/`detect_cue_in` walk to
@@ -532,22 +585,18 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
         "envelope_times": times,
         "envelope_db": envelope_db,
     }
+    update_fields = {"related_artists": related}
     try:
         out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        update_fields["waveform_path"] = str(out_path)
     except Exception as exc:
         print(f"  Failed to write waveform for track {track_id}: {exc}")
 
-    update_fields = {
-        "next_start_seconds": next_start,
-        "cue_in_seconds": cue_in,
-        "waveform_path": str(out_path),
-        "related_artists": related,
-    }
-    if effective_duration and effective_duration != duration:
-        update_fields["duration_seconds"] = effective_duration
-
     Track.objects.filter(id=track_id).update(**update_fields)
-    return True
+    # The request this run served is done -- unless a newer one arrived while it ran.
+    Track.objects.filter(id=track_id, analysis_requested_at=basis["analysis_requested_at"]).exclude(
+        analysis_requested_at__isnull=True).update(analysis_requested_at=None)
+    return AnalysisOutcome(True, markers=marker_result)
 
 
 class Command(BaseCommand):
@@ -584,7 +633,9 @@ class Command(BaseCommand):
 
         qs = Track.objects.filter(filepath__isnull=False)
         if not force:
-            qs = qs.filter(next_start_seconds__isnull=True)
+            # An explicit request, or a Track without a Next Start (never analyzed, or nothing
+            # detected yet) -- analyzing it cannot destroy a marker it does not have.
+            qs = qs.filter(Q(analysis_requested_at__isnull=False) | Q(next_start_seconds__isnull=True))
         qs = qs.order_by("id")
         if limit:
             qs = qs[:limit]

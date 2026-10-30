@@ -35,6 +35,7 @@ from webrequests.services import (
 import webrequests.services as services_module
 
 from webrequests.tests.test_request_scheduling_lifecycle import WebRequestFixtureMixin
+from library.tests.cue_marker_support import set_markers
 
 REPO = Path(__file__).resolve().parents[2]
 PRIVATE_NAME = "Zelda Privateperson"
@@ -63,10 +64,8 @@ class HourRefillRequestCauseTests(WebRequestFixtureMixin, TransactionTestCase):
 
     def track(self, title, *, duration=300.0, cue_in=0.0, next_start=None, category=None):
         track = self.make_track(title=title)
-        Track.objects.filter(pk=track.pk).update(
-            duration_seconds=duration, cue_in_seconds=cue_in, next_start_seconds=next_start,
-            category=category or self.category,
-        )
+        Track.objects.filter(pk=track.pk).update(duration_seconds=duration, category=category or self.category)
+        set_markers(track.pk, cue_in_seconds=cue_in, next_start_seconds=next_start)
         track.refresh_from_db()
         return track
 

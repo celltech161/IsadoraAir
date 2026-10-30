@@ -60,7 +60,7 @@ class PublicationTestCase(TestCase):
         documented non-fatal case: a waveform WRITE failure that is
         merely logged, with Track fields still updated and True still
         returned -- see this module's MissingScratchWaveformTests."""
-        def fake_analyze(row, cfg_values, wave_dir_arg, force, existing_artist_names_casefolded=None):
+        def fake_analyze(row, cfg_values, wave_dir_arg, force, existing_artist_names_casefolded=None, **kwargs):
             if succeed and write_waveform:
                 track_id = row[0]
                 scratch_path = Path(wave_dir_arg) / f"{track_id}.json"
@@ -417,7 +417,7 @@ class DestinationLockTests(TransactionTestCase):
                 from django.db import connection
                 connection.close()
 
-        def fake_analyze(row, cfg_values, wave_dir_arg, force, existing_artist_names_casefolded=None):
+        def fake_analyze(row, cfg_values, wave_dir_arg, force, existing_artist_names_casefolded=None, **kwargs):
             # Realistic bookkeeping (see PublicationTestCase._patch_
             # analyze's own docstring): writes into the supplied
             # scratch wave_dir and points Track.waveform_path there,

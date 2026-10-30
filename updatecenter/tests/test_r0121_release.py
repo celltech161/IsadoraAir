@@ -270,8 +270,9 @@ class R0121VerifySqlTests(TransactionTestCase):
 
     def tearDown(self):
         # Every case restores the disposable schema to the current leaf, even
-        # if an assertion fails after exercising the genuine 0096 state.
-        self.migrate_library("0098_hour_refill_automatic_failure_cause")
+        # if an assertion fails after exercising the genuine 0096 state (r0123:
+        # whatever the leaf is, so a later library migration is reapplied too).
+        call_command("migrate", verbosity=0)
         super().tearDown()
 
     def execute_script(self):

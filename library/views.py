@@ -768,17 +768,15 @@ def api_category_detail(request, pk):
 
 @require_http_methods(["POST"])
 def api_track_repick_cue_points(request, pk):
-    """Fast cue-point repick for a single track: reads the saved envelope
-    from the track's waveform JSON, applies the track's effective
-    thresholds (category overrides on top of global AnalysisConfig
-    defaults), writes the new cue_in_seconds / next_start_seconds back
-    to both the DB and the JSON. No ffmpeg decode -- seconds instead of
-    minutes.
+    """Fast cue-point repick for a single track from its saved envelope,
+    with the track's effective thresholds (category overrides on top of
+    global AnalysisConfig defaults). No ffmpeg decode.
 
-    Returns 400 when the track's waveform JSON is missing or lacks
-    envelope data (pre-envelope-persistence): the client-side handler
-    surfaces the error message so the operator knows to use "Reanalyze
-    Track" (which does the full decode + envelope pass) instead.
+    Only a waveform cache trusted for the track's current audio is used
+    (library.services.waveform_cache); otherwise 409 with the reason and
+    every marker unchanged. Cue In / Next Start change through the
+    cue-marker authority: protected markers are kept unless the body
+    names them in ``override`` with ``"confirm": true``.
 
     Roadmap 2.5A: requires library.manage_tracks -- previously reachable
     by any Contributor/remote_dj account via their /api/tracks/
@@ -788,65 +786,82 @@ def api_track_repick_cue_points(request, pk):
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
-    from library.management.commands.analyze_tracks import (
-        apply_category_thresholds, repick_cue_points_from_json,
-    )
-    from library.models import AnalysisConfig
     track = get_object_or_404(Track.objects.select_related("category"), pk=pk)
-    if not track.waveform_path or not Path(track.waveform_path).is_file():
-        return JsonResponse({
-            "error": "No waveform data for this track yet -- use \"Reanalyze "
-                     "Track\" to run a full analysis pass first.",
-        }, status=400)
+    body = _optional_json(request)
+    if body is None:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    outcome = _repick_track(track, _category_thresholds(track.category), requested_by=request.user,
+                            override=body.get("override") or (), confirm=body.get("confirm") is True)
+    if not outcome["ok"]:
+        return JsonResponse({"error": outcome["error"], "cue_markers": outcome.get("markers"),
+                             "cue_marker_revision": track.cue_marker_revision}, status=outcome["status"])
+    track.refresh_from_db()
+    return JsonResponse({**_track_to_dict(track), "cue_markers": outcome["markers"]})
+
+
+def _optional_json(request):
+    """The request's JSON object body: {} without one (no body, or not JSON -- the UI posts
+    these actions bare), None when a JSON body is not an object."""
+    if not request.body or request.content_type != "application/json":
+        return {}
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _category_thresholds(category):
+    from library.management.commands.analyze_tracks import apply_category_thresholds
+    from library.models import AnalysisConfig
     cfg = AnalysisConfig.load()
     _sr, _ws, _tp, ns_db, ci_db, ci_min = apply_category_thresholds(
         (cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
          cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds),
-        track.category.next_start_threshold_db_override if track.category_id else None,
-        track.category.cue_in_threshold_db_override if track.category_id else None,
+        category.next_start_threshold_db_override if category else None,
+        category.cue_in_threshold_db_override if category else None,
     )
+    return ns_db, ci_db, ci_min
+
+
+def _repick_track(track, thresholds, *, requested_by, override=(), confirm=False):
+    """Re-pick Cue In / Next Start for one Track from its waveform cache -- only a cache that
+    library.services.waveform_cache trusts for this Track's current media. Otherwise abstain:
+    no marker changes, nothing nulled, nothing queued. Protected markers are preserved unless
+    the operator names them in ``override`` and confirms. Never rewrites the cache file."""
+    from library.management.commands.analyze_tracks import repick_from_payload
+    from library.services import cue_markers, waveform_cache
+    verdict = waveform_cache.validate(track)
+    if not verdict.trusted:
+        return {"ok": False, "status": 409, "reason": verdict.status,
+                "error": f"Cue points unchanged: {verdict.reason}."}
     try:
-        next_start, cue_in, payload = repick_cue_points_from_json(
-            track.waveform_path, ns_db, ci_db, ci_min,
-        )
-    except LookupError:
-        return JsonResponse({
-            "error": "This track's waveform JSON pre-dates envelope "
-                     "persistence -- use \"Reanalyze Track\" first to "
-                     "populate envelope data. Future repicks on it will "
-                     "then be instant.",
-        }, status=400)
-    Track.objects.filter(id=track.id).update(
-        next_start_seconds=next_start, cue_in_seconds=cue_in,
+        next_start, cue_in = repick_from_payload(verdict.payload, *thresholds)
+    except LookupError as exc:
+        return {"ok": False, "status": 409, "reason": "no_envelope", "error": f"Cue points unchanged: {exc}."}
+    calculated = {name: value for name, value in (("cue_in_seconds", cue_in), ("next_start_seconds", next_start))
+                  if value is not None}
+    result = cue_markers.apply_calculation(
+        track.id, calculated, basis_revision=track.cue_marker_revision, requested_by=requested_by,
+        override=tuple(override), override_confirmed=bool(confirm), duration=verdict.payload["analysis_duration"],
     )
-    try:
-        Path(track.waveform_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except Exception as exc:
-        print(f"  [track repick] track {track.id} JSON write failed: {exc}")
-    track.refresh_from_db()
-    return JsonResponse(_track_to_dict(track))
+    if not result.ok:
+        return {"ok": False, "status": 409 if result.conflict else 400, "reason": "refused",
+                "error": result.conflict or result.error, "markers": result.to_dict()}
+    return {"ok": True, "markers": result.to_dict()}
 
 
 @require_http_methods(["POST"])
 def api_category_repick_cue_points(request, pk):
-    """Smart cue-point refresh for every track in this category. For each
-    track, fast-paths against the saved mono envelope in its waveform
-    JSON when present -- reads the envelope, applies the category's
-    effective thresholds (with per-category overrides folded in on top
-    of the global AnalysisConfig defaults), writes the new cue-in /
-    next-start values back to the DB and the JSON. Order of seconds
-    per hundred tracks; no ffmpeg re-decode.
+    """Cue-point refresh for every track in this category from its saved
+    envelope, with the category's effective thresholds. No ffmpeg decode.
 
-    Falls back to the slow path (NULL `next_start_seconds` so the
-    analyze timer re-runs analyze_one_track, which does re-decode) for
-    tracks whose JSON pre-dates envelope persistence, or is missing
-    entirely, or fails to parse. Newly-analyzed tracks after this
-    commit land with envelope data automatically -- backfill happens
-    organically as tracks cycle through the analyzer for other reasons
-    (uploads, edits, previous slow-path repicks).
-
-    Returns a per-path breakdown so the operator sees fast-path coverage
-    grow over time as the library backfills organically.
+    Batch policy: each track stands alone. A track whose waveform cache is
+    not trusted for its current audio is skipped with every marker
+    unchanged (nothing nulled, nothing queued); eligible tracks are
+    re-picked through the cue-marker authority, which keeps protected
+    markers. The response lists skipped tracks by reason and preserved
+    markers by name. No override is offered for a whole category.
 
     Roadmap 2.5A: requires library.manage_categories -- same
     reachability-only gap as api_category_detail (see its comment)."""
@@ -854,91 +869,53 @@ def api_category_repick_cue_points(request, pk):
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="library.manage_categories")
 
-    from library.management.commands.analyze_tracks import (
-        apply_category_thresholds, repick_cue_points_from_json,
-    )
-    from library.models import AnalysisConfig, Track
+    from library.models import Track
     category = get_object_or_404(Category, pk=pk)
-    cfg = AnalysisConfig.load()
-    _sr, _ws, _tp, ns_db, ci_db, ci_min = apply_category_thresholds(
-        (cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
-         cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds),
-        category.next_start_threshold_db_override,
-        category.cue_in_threshold_db_override,
-    )
-    tracks = list(Track.objects.filter(category=category).values_list(
-        "id", "waveform_path",
-    ))
-    repicked = 0
-    queued_full = 0
-    for track_id, waveform_path in tracks:
-        if not waveform_path or not Path(waveform_path).is_file():
-            # No JSON at all -- fall through to full analyze.
-            Track.objects.filter(id=track_id).update(next_start_seconds=None)
-            queued_full += 1
-            continue
+    thresholds = _category_thresholds(category)
+    repicked, unchanged, preserved, skipped = [], [], {}, {}
+    for track in Track.objects.filter(category=category).order_by("id"):
         try:
-            next_start, cue_in, payload = repick_cue_points_from_json(
-                waveform_path, ns_db, ci_db, ci_min,
-            )
-        except LookupError:
-            # Pre-envelope-persistence JSON -- can't fast-path this
-            # track. Queue it for the analyze timer which will land
-            # envelope data on the way through, enabling fast-path
-            # repicks in the future.
-            Track.objects.filter(id=track_id).update(next_start_seconds=None)
-            queued_full += 1
+            outcome = _repick_track(track, thresholds, requested_by=request.user)
+        except Exception as exc:          # one bad Track never stops the batch, and changes nothing
+            outcome = {"ok": False, "reason": "error", "error": f"{type(exc).__name__}: {exc}"}
+        if not outcome["ok"]:
+            skipped.setdefault(outcome["reason"], []).append(track.id)
             continue
-        except Exception as exc:
-            # Corrupt/unreadable JSON -- also fall through to slow path
-            # rather than failing the whole batch on one bad file.
-            print(f"  [repick] track {track_id} JSON error: {exc}; queuing full re-analyze")
-            Track.objects.filter(id=track_id).update(next_start_seconds=None)
-            queued_full += 1
-            continue
-        Track.objects.filter(id=track_id).update(
-            next_start_seconds=next_start, cue_in_seconds=cue_in,
-        )
-        try:
-            Path(waveform_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        except Exception as exc:
-            # DB is authoritative; JSON is display cache. Log and move on.
-            print(f"  [repick] track {track_id} JSON write failed: {exc}")
-        repicked += 1
-    total = repicked + queued_full
-    if queued_full:
-        suffix = (
-            f" {queued_full} track(s) missing envelope data are queued "
-            f"for a full re-analyze (the timer will pick them up in the "
-            f"next minute) -- future repicks on those will be instant."
-        )
-    else:
-        suffix = ""
+        markers = outcome["markers"]
+        (repicked if markers["changed"] else unchanged).append(track.id)
+        for name in markers["preserved"]:
+            preserved.setdefault(name, []).append(track.id)
+    total = len(repicked) + len(unchanged) + sum(len(ids) for ids in skipped.values())
+    skipped_count = sum(len(ids) for ids in skipped.values())
+    message = f"Category '{category.code}': re-picked {len(repicked)} track(s)"
+    if unchanged:
+        message += f", {len(unchanged)} unchanged"
+    if skipped_count:
+        message += (f"; {skipped_count} skipped with cue points untouched (no trusted waveform cache for "
+                    f"their current audio)")
+    if preserved:
+        message += f"; protected markers kept on {len({i for ids in preserved.values() for i in ids})} track(s)"
     return JsonResponse({
         "ok": True,
-        "repicked": repicked,
-        "queued_full_analyze": queued_full,
+        "repicked": len(repicked),
+        "unchanged": len(unchanged),
+        "skipped": skipped_count,
+        "skipped_by_reason": skipped,
+        "preserved_by_marker": preserved,
+        "queued_full_analyze": 0,
         "total": total,
-        "message": (
-            f"Category '{category.code}': repicked {repicked} track(s) "
-            f"instantly from saved envelope data.{suffix}"
-        ),
+        "message": message + ".",
     })
 
 
 @require_http_methods(["POST"])
 def api_category_reset_analysis(request, pk):
-    """Clear the analysis marks (`next_start_seconds` = NULL) on every
-    track in this category so `isadoraair-analyze.timer` re-picks them
-    up within the minute and re-runs the cue-point analysis using the
-    category's current threshold overrides.
-
-    Only touches `next_start_seconds` because that's the field the
-    analyze timer's queryset filters on (`.filter(
-    next_start_seconds__isnull=True)`). analyze_one_track always
-    recomputes both `cue_in_seconds` AND `next_start_seconds` when it
-    runs, so setting one to NULL is enough to get both refreshed --
-    no need to also clear cue_in_seconds separately.
+    """Request re-analysis (`Track.analysis_requested_at`) of every track in
+    this category so `isadoraair-analyze.timer` picks them up within the
+    minute and re-runs the cue-point analysis using the category's current
+    threshold overrides. No marker is cleared or changed here: Next Start
+    stays valid until analysis replaces it, and the analyzer recalculates
+    only markers that are not protected (library.services.cue_markers).
 
     Manual cue-point edits (`intro_until_seconds`, `sweep_start_seconds`,
     `outro_starts_seconds`, `hook_in_seconds`, `hook_out_seconds`) are
@@ -959,7 +936,10 @@ def api_category_reset_analysis(request, pk):
 
     category = get_object_or_404(Category, pk=pk)
     from library.models import Track
-    count = Track.objects.filter(category=category).update(next_start_seconds=None)
+    from library.services import cue_markers
+    # An analysis request, not a marker change: every marker keeps its value, and the analyzer
+    # recalculates only the ones that are not protected.
+    count = cue_markers.request_analysis(Track.objects.filter(category=category))
     return JsonResponse({
         "ok": True,
         "queued": count,
@@ -1862,11 +1842,38 @@ def api_track_detail(request, pk):
     DIRECT_FIELDS = {
         "title", "year", "composer", "publisher", "record_label", "comments",
         "rotation_weight", "ready2air", "energy", "vocal_type", "end_type",
-        "cue_in_seconds", "cue_out_seconds", "next_start_seconds",
-        "intro_until_seconds", "sweep_start_seconds", "outro_starts_seconds",
-        "hook_in_seconds", "hook_out_seconds",
         "alt_send_enabled", "alt_send_text",
     }
+
+    # Cue markers are not direct fields: they change only through the cue-marker
+    # authority, and only those that differ from what is stored count as an edit
+    # (older pages send all eight on every save). A real edit needs the revision
+    # the page loaded, so a stale page cannot overwrite newer markers. Checked
+    # before any side effect below.
+    from library.services import cue_markers
+    marker_edits = {}
+    for name in cue_markers.MARKERS:
+        if name in body:
+            try:
+                value = cue_markers.coerce(name, body[name])
+            except ValueError as exc:
+                return JsonResponse({"error": str(exc)}, status=400)
+            if not cue_markers._same(getattr(track, name), value):
+                marker_edits[name] = value
+    expected_revision = body.get("cue_marker_revision")
+    if marker_edits:
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) \
+                or expected_revision != track.cue_marker_revision:
+            return JsonResponse({
+                "error": ("The cue points changed since this page was loaded. Reload the page, then make "
+                          "the cue-point change again." if isinstance(expected_revision, int)
+                          else "This page is out of date for cue-point editing. Reload it and try again."),
+                "conflict": True, "cue_marker_revision": track.cue_marker_revision,
+            }, status=409)
+        final = {name: marker_edits.get(name, getattr(track, name)) for name in cue_markers.MARKERS}
+        problems = cue_markers.validate(final, set(marker_edits), track.duration_seconds)
+        if problems:
+            return JsonResponse({"error": "; ".join(problems)}, status=400)
 
     # Captured, not applied immediately -- canonicalizing needs the
     # FINAL track.artist (which "artist" in this same request body may
@@ -1995,7 +2002,17 @@ def api_track_detail(request, pk):
                             status=500,
                         )
 
-    track.save()
+    with transaction.atomic():
+        if marker_edits:
+            marker_result = cue_markers.operator_edit(
+                track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits)
+            if not marker_result.ok:
+                transaction.set_rollback(True)
+                return JsonResponse({"error": marker_result.conflict or marker_result.error,
+                                     "conflict": bool(marker_result.conflict),
+                                     "cue_marker_revision": marker_result.revision},
+                                    status=409 if marker_result.conflict else 400)
+        track.save()
 
     # M2M fields have to be set AFTER save() because they need the pk.
     # Not part of DIRECT_FIELDS since setattr on an M2M raises. Both
@@ -2050,6 +2067,7 @@ def _track_to_dict(track):
         "outro_starts_seconds": track.outro_starts_seconds,
         "hook_in_seconds": track.hook_in_seconds,
         "hook_out_seconds": track.hook_out_seconds,
+        "cue_marker_revision": track.cue_marker_revision,
         "rotation_weight": track.rotation_weight,
         "ready2air": track.ready2air,
         "energy": track.energy,
@@ -2076,10 +2094,11 @@ def api_track_reanalyze(request, pk):
     """Force a fresh waveform + cue-point (re)analysis of exactly this
     track -- same analyze_one_track() call api_library_upload uses right
     after a new upload, just targeted at an existing row instead. Only
-    ever touches next_start_seconds/cue_in_seconds/waveform_path/
-    related_artists/duration_seconds -- the manually-set marks (intro,
-    sweep, outro, hooks) are never written by analyze_one_track, so this
-    can't clobber a human's own cue-point edits.
+    ever calculates next_start_seconds/cue_in_seconds, and those reach the
+    Track through the cue-marker authority as an operator request: locked
+    and historical markers are kept unless the body names them in
+    ``override`` with ``"confirm": true``. The manually-set marks (intro,
+    sweep, outro, hooks) are never calculated.
 
     Roadmap 2.5A: requires library.manage_tracks (see api_track_bulk's
     comment for the reachability gap this closes)."""
@@ -2093,6 +2112,9 @@ def api_track_reanalyze(request, pk):
     from library.models import AnalysisConfig
 
     track = get_object_or_404(Track.objects.select_related("artist", "category"), pk=pk)
+    body = _optional_json(request)
+    if body is None:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
 
     cfg = AnalysisConfig.load()
     cfg_values = (
@@ -2112,12 +2134,20 @@ def api_track_reanalyze(request, pk):
     row = (track.id, track.filepath, track.filename, track.duration_seconds,
            track.title, track.artist.name if track.artist_id else "", track.related_artists)
 
-    analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True)
+    override = body.get("override") or ()
+    if isinstance(override, str) or not all(isinstance(name, str) for name in override):
+        return JsonResponse({"error": "override must be a list of marker names"}, status=400)
+    analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True, requested_by=request.user,
+                                 override=tuple(override), override_confirmed=body.get("confirm") is True)
     if not analyzed:
         return JsonResponse({"error": "Analysis failed -- check the file is readable by ffmpeg"}, status=400)
 
     track.refresh_from_db()
-    return JsonResponse(_track_to_dict(track))
+    markers = analyzed.markers.to_dict() if analyzed.markers else None
+    if analyzed.markers and not analyzed.markers.ok and override:
+        return JsonResponse({"error": analyzed.markers.conflict or analyzed.markers.error, "cue_markers": markers,
+                             **_track_to_dict(track)}, status=409)
+    return JsonResponse({**_track_to_dict(track), "cue_markers": markers})
 
 
 @require_http_methods(["POST"])

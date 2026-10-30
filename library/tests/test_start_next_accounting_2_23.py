@@ -21,6 +21,7 @@ from library.tests._transport_harness import (
     write_tone_wav,
 )
 from library.tests.test_engine_playback_accounting_semantics import PlaybackAccountingFixture
+from library.tests.cue_marker_support import set_markers
 
 
 class StartNextLedgerTests(PlaybackAccountingFixture):
@@ -41,10 +42,8 @@ class StartNextLedgerTests(PlaybackAccountingFixture):
             track.filepath = str(path)
             track.filename = path.name
             track.duration_seconds = seconds
-            track.next_start_seconds = seconds
-            track.cue_in_seconds = 0.0
-            track.save(update_fields=["filepath", "filename", "duration_seconds",
-                                      "next_start_seconds", "cue_in_seconds"])
+            track.save(update_fields=["filepath", "filename", "duration_seconds"])
+            set_markers(track, next_start_seconds=seconds, cue_in_seconds=0.0)
             item.refresh_from_db()
             items.append(item)
         self.engine.log_items = items

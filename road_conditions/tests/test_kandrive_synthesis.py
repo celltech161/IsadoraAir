@@ -18,6 +18,7 @@ from road_conditions.synthesis import (
     road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
 from weather.models import WeatherConfig, WeatherVoicePersona
+from library.tests.cue_marker_support import set_markers
 
 
 def ensure_default_weather_voice_personas():
@@ -223,7 +224,7 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
         analysis -- and, unlike dedication intros, this module must
         NOT re-assert next_start_seconds/cue_in_seconds afterward."""
         def fake_analysis(track):
-            Track.objects.filter(id=track.id).update(next_start_seconds=42.0, cue_in_seconds=3.5)
+            set_markers(track.id, next_start_seconds=42.0, cue_in_seconds=3.5)
             return True
 
         with patch.object(synthesis_module, "_run_full_analysis", side_effect=fake_analysis):

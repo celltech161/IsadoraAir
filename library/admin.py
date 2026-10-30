@@ -461,7 +461,13 @@ class TrackAdmin(admin.ModelAdmin):
     # here than Django's plain multi-select for a field with this many options.
     filter_horizontal = ["additional_categories"]
     actions = [mark_ready2air, mark_not_ready2air]
-    readonly_fields = ["audio_preview"]
+    # Cue points are shown, never edited, here: they change only through the cue-marker
+    # authority (Track Detail, which checks the marker revision), so this form can neither
+    # bypass marker protection nor overwrite newer cue points from a stale admin page.
+    readonly_fields = ["audio_preview", "cue_in_seconds", "cue_out_seconds", "next_start_seconds",
+                       "intro_until_seconds", "sweep_start_seconds", "outro_starts_seconds",
+                       "hook_in_seconds", "hook_out_seconds", "cue_marker_state", "cue_marker_revision",
+                       "analysis_requested_at"]
 
     @admin.display(description="Preview")
     def audio_preview(self, obj):

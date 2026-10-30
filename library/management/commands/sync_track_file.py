@@ -162,7 +162,9 @@ def sync_track_file(filepath, ready2air=True, wave_dir=None):
         track.id, track.filepath, track.filename, track.duration_seconds,
         track.title, artist_obj.name, "",
     )
-    analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True)
+    # New content at this path: the calculated markers rebind to it (protection that applied to
+    # the replaced audio is superseded and audited by the cue-marker authority).
+    analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True, media_replaced=True)
 
     if not analyzed:
         raise CommandError(

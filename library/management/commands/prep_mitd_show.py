@@ -21,6 +21,7 @@ from pathlib import Path
 from django.core.management.base import BaseCommand, CommandError
 
 from library.models import Album, Artist, Category, Track
+from library.services import cue_markers
 
 
 ARCHIVE_ROOT = Path("/srv/isadoraair/mitd_artbell")
@@ -314,21 +315,22 @@ class Command(BaseCommand):
                 # the log builder would skip them and category-fill would
                 # pull stale content instead.
                 "ready2air": True,
-                # Reset analysis marks — the running isadoraair-analyze.timer
-                # will pick these up within a minute and recompute cue
-                # points and waveform for the new content.
-                "next_start_seconds": None,
-                "cue_in_seconds": 0,
-                "cue_out_seconds": None,
-                "intro_until_seconds": None,
-                "sweep_start_seconds": None,
-                "outro_starts_seconds": None,
-                "hook_in_seconds": None,
-                "hook_out_seconds": None,
             }
             track, created = Track.objects.update_or_create(
                 filepath=str(path), defaults=defaults,
             )
+            # New content for this week: every cue point of last week's audio is cleared for it
+            # (generated, new media -- the cue-marker authority supersedes and audits any
+            # protection that applied to the old audio), and the running isadoraair-analyze.timer
+            # recomputes cue points and waveform within a minute.
+            cleared = {name: None for name in cue_markers.MARKERS} | {"cue_in_seconds": 0.0}
+            result = cue_markers.apply_calculation(
+                track.id, cleared, basis_revision=track.cue_marker_revision,
+                source=cue_markers.SOURCE_GENERATED, media_replaced=True, duration=duration,
+            )
+            if not result.ok:
+                raise CommandError(f"cue points of {track.title} not reset: {result.conflict or result.error}")
+            cue_markers.request_analysis(Track.objects.filter(pk=track.pk))
             verb = "created" if created else "updated"
             self.stdout.write(f"  DB {verb}: {track.title}")
 

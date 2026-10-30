@@ -298,18 +298,25 @@ def register_track_write_guard(save, update, bulk_update) -> None:
 
 class TrackQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        from library.services import cue_markers
+        cue_markers.guard_columns(kwargs)
         for _save, update, _bulk in TRACK_WRITE_GUARDS:
             update(self, kwargs)
         return super().update(**kwargs)
 
     def bulk_update(self, objs, fields, batch_size=None):
+        from library.services import cue_markers
+        cue_markers.guard_columns(fields)
         objs = list(objs)
         for _save, _update, bulk in TRACK_WRITE_GUARDS:
             bulk(objs, fields)
         return super().bulk_update(objs, fields, batch_size=batch_size)
 
     def bulk_create(self, objs, *args, **kwargs):
+        from library.services import cue_markers
         objs = list(objs)
+        for obj in objs:
+            cue_markers.guard_new_track(obj)
         # Creation at a projection-reserved path must pass the same guards as
         # Model.save()/objects.create().  Projection's exact grant deliberately
         # uses Django's base QuerySet primitive and therefore remains the only
@@ -380,6 +387,16 @@ class Track(models.Model):
     outro_starts_seconds = models.FloatField(null=True, blank=True)
     hook_in_seconds = models.FloatField(null=True, blank=True)
     hook_out_seconds = models.FloatField(null=True, blank=True)
+    # The eight markers above change only through library.services.cue_markers,
+    # which keeps each marker's protection and provenance here and bumps the
+    # revision on every change of a value or its protection (optimistic
+    # concurrency for Track Detail and stale analyzers). An absent entry for a
+    # marker with a value means historical, unknown provenance.
+    cue_marker_state = models.JSONField(default=dict, db_default={}, blank=True)
+    cue_marker_revision = models.PositiveBigIntegerField(default=0, db_default=0)
+    # A pending (re)analysis request -- separate from the markers, so asking for
+    # analysis never destroys a valid Next Start.
+    analysis_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # --- Scheduling ---
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True, related_name="tracks")
@@ -493,10 +510,27 @@ class Track(models.Model):
                 update_only = True
         return update_only
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        instance = super().from_db(db, field_names, values)
+        from library.services import cue_markers
+        cue_markers.remember_loaded(instance)
+        return instance
+
+    def refresh_from_db(self, *args, **kwargs):
+        super().refresh_from_db(*args, **kwargs)
+        from library.services import cue_markers
+        cue_markers.remember_loaded(self)
+
     def save(self, *args, **kwargs):
+        from library.services import cue_markers
+        kwargs = cue_markers.guard_track_save(self, kwargs)
+        if kwargs.get("update_fields") is not None and not kwargs["update_fields"]:
+            return              # nothing but marker columns, which this save may not write
         if self.check_write_guards(kwargs.get("update_fields")):
             kwargs["force_update"] = True
         super().save(*args, **kwargs)
+        cue_markers.remember_loaded(self)
 
 
 # ---------------------------------------------------------------

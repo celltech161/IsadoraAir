@@ -662,6 +662,10 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # r0121 automatic causes: and library.0098 (five additive AddFields, a
             # choices-only AlterField, the known-type CHECK swap and two field
             # CHECKs -- RemoveConstraint + three AddConstraint, manual).
+            # r0123 Package A: and library.0099 (cue-marker state/revision and the
+            # analysis request timestamp -- three AddFields, no data migration). The two
+            # NOT NULL fields carry a database default so pre-restart processes can still
+            # insert Tracks; the probe classifies a database default as manual.
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -675,6 +679,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0096_hour_refill_install_gate",
                               "library.0097_hour_refill_start_next_cause",
                               "library.0098_hour_refill_automatic_failure_cause",
+                              "library.0099_track_cue_marker_authority",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
@@ -701,6 +706,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
                               ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
                               ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                              ("library.0099_track_cue_marker_authority", "AddField"),
+                              ("library.0099_track_cue_marker_authority", "AddField"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),

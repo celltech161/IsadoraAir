@@ -138,7 +138,7 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  "active_messages.0005_execution_history_indexes",
                                                  # library's chain is linear from 0089, so every later
                                                  # library migration is pending too: r0117 (0091, 0092),
-                                                 # r0120 (0093-0096), r0121 (0097, 0098)
+                                                 # r0120 (0093-0096), r0121 (0097, 0098), r0123 (0099)
                                                  "library.0091_playouttransportconfig",
                                                  "library.0092_remote_dj_start_next_access",
                                                  "library.0093_hour_refill_cause_policy",
@@ -146,7 +146,8 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  "library.0095_hour_refill_install",
                                                  "library.0096_hour_refill_install_gate",
                                                  "library.0097_hour_refill_start_next_cause",
-                                                 "library.0098_hour_refill_automatic_failure_cause"})
+                                                 "library.0098_hour_refill_automatic_failure_cause",
+                                                 "library.0099_track_cue_marker_authority"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(sorted((entry["ref"], entry["operation"])
                                     for entry in probe.extract_manual_operations(payload["plan"])),
@@ -175,7 +176,10 @@ class LivePlanClassificationTests(TransactionTestCase):
                                      ("library.0098_hour_refill_automatic_failure_cause", "RemoveConstraint"),
                                      ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
                                      ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
-                                     ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint")]))
+                                     ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                                     # r0123: two NOT NULL cue-marker columns with database defaults
+                                     ("library.0099_track_cue_marker_authority", "AddField"),
+                                     ("library.0099_track_cue_marker_authority", "AddField")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

@@ -105,7 +105,23 @@ def _analyze_track(
         track.artist.name if track.artist_id else "",
         track.related_artists,
     )
-    return bool(analyze_one_track(row, cfg_values, wave_dir or get_waveforms_dir(), force=True))
+    # Every caller has just published this Track's audio: its markers rebind to it.
+    return bool(analyze_one_track(row, cfg_values, wave_dir or get_waveforms_dir(), force=True,
+                                  media_replaced=True))
+
+
+def _set_speech_markers(track_id: int, duration: float) -> None:
+    """A speech splice airs whole: Cue In 0 and Next Start at its end, set as generated markers
+    for the audio just published (through the cue-marker authority)."""
+    from library.services import cue_markers
+
+    revision = Track.objects.filter(pk=track_id).values_list("cue_marker_revision", flat=True).get()
+    result = cue_markers.apply_calculation(
+        track_id, {"cue_in_seconds": 0.0, "next_start_seconds": duration}, basis_revision=revision,
+        source=cue_markers.SOURCE_GENERATED, media_replaced=True, duration=duration,
+    )
+    if not result.ok:
+        raise AnnouncementRenderError("track", f"speech cue points not set: {result.conflict or result.error}")
 
 
 def _validate_common(spec: AnnouncementSpec) -> Path:
@@ -252,12 +268,11 @@ class AnnouncementRenderer:
                             "category": category,
                             "ready2air": spec.metadata.ready2air,
                         }
-                        if isinstance(spec, SpeechSpliceAnnouncement):
-                            defaults.update(cue_in_seconds=0, next_start_seconds=duration)
-
                         track, _ = Track.objects.update_or_create(
                             filepath=str(destination), defaults=defaults
                         )
+                        if isinstance(spec, SpeechSpliceAnnouncement):
+                            _set_speech_markers(track.id, duration)
 
                         if isinstance(spec, RotationAssetAnnouncement):
                             from library.management.commands.analyze_tracks import get_waveforms_dir
@@ -304,9 +319,7 @@ class AnnouncementRenderer:
                     try:
                         with transaction.atomic():
                             analysis_succeeded = _analyze_track(track)
-                            Track.objects.filter(id=track.id).update(
-                                cue_in_seconds=0, next_start_seconds=duration
-                            )
+                            _set_speech_markers(track.id, duration)
                         if not analysis_succeeded:
                             analysis_error = "analysis did not complete"
                     except Exception as exc:

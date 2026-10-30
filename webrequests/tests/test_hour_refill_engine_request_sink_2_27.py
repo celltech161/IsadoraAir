@@ -22,6 +22,7 @@ from webrequests.services import maybe_schedule_song_request
 import webrequests.services as services_module
 
 from webrequests.tests.test_request_scheduling_lifecycle import WebRequestFixtureMixin
+from library.tests.cue_marker_support import set_markers
 
 QUEUE_RELATED = ("track", "track__artist", "track__category", "track__category__kind", "category", "category__kind")
 
@@ -38,7 +39,9 @@ class EngineRequestSinkTests(WebRequestFixtureMixin, TransactionTestCase):
 
     def track(self, title, duration, next_start=None):
         track = self.make_track(title=title)
-        Track.objects.filter(pk=track.pk).update(duration_seconds=duration, next_start_seconds=next_start)
+        Track.objects.filter(pk=track.pk).update(duration_seconds=duration)
+        if next_start is not None:
+            set_markers(track.pk, next_start_seconds=next_start)
         track.refresh_from_db()
         return track
 

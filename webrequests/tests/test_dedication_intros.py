@@ -42,6 +42,7 @@ from library.models import (
     Artist, Category, CategoryKind, LogItem, PlayEvent, PlaylistLog, Track, VoiceTrack, VoiceTrackConfig,
 )
 from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
+from library.tests.cue_marker_support import set_markers
 from webrequests.admin import SongRequestAdmin
 from webrequests.management.commands.generate_dedication_intros import DEDICATION_LOCK_KEY
 from webrequests.management.commands.refresh_song_request_statuses import Command as RefreshCommand
@@ -280,14 +281,14 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item)
 
-        def fake_analyze_one_track(row, cfg_values, wave_dir, force):
+        def fake_analyze_one_track(row, cfg_values, wave_dir, force, **kwargs):
             track_id = row[0]
             # Simulate what the real envelope detector would wrongly
             # guess for speech -- something short of the full duration.
             Track.objects.filter(id=track_id).update(
                 waveform_path=f"/srv/isadoraair/waveforms/{track_id}.json",
-                next_start_seconds=1.0, cue_in_seconds=0.5,
             )
+            set_markers(track_id, next_start_seconds=1.0, cue_in_seconds=0.5)
             return True
 
         with patch(

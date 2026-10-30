@@ -5,6 +5,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from library.models import Artist, Track
+from library.services import cue_markers
 # parse_artist_title used to be defined here; it's now the single
 # shared implementation in related_artists.py (also used by the
 # upload/import fallback-metadata path) -- re-imported under the same
@@ -222,19 +223,18 @@ class Command(BaseCommand):
                                 vocal_type=track.vocal_type,
                                 end_type=track.end_type,
                                 blocked_slots=list(track.blocked_slots),
-                                # Carry manual playout edits forward:
-                                # audio content is byte-equivalent, so
-                                # operator-set intro/sweep/outro/hook
-                                # offsets stay valid. Auto-detected
-                                # cue_in / cue_out / next_start are left
-                                # for analyze_tracks to recompute.
-                                intro_until_seconds=track.intro_until_seconds,
-                                sweep_start_seconds=track.sweep_start_seconds,
-                                outro_starts_seconds=track.outro_starts_seconds,
-                                hook_in_seconds=track.hook_in_seconds,
-                                hook_out_seconds=track.hook_out_seconds,
-                                cue_out_seconds=track.cue_out_seconds,
                             )
+                            # Carry manual playout edits forward, with
+                            # their protection and provenance: audio
+                            # content is byte-equivalent, so operator-set
+                            # intro/sweep/outro/hook/cue-out offsets stay
+                            # valid. Auto-detected cue_in / next_start are
+                            # left for analyze_tracks to recompute.
+                            copied = cue_markers.copy_for_equivalent_media(track.pk, new_track.pk, (
+                                "intro_until_seconds", "sweep_start_seconds", "outro_starts_seconds",
+                                "hook_in_seconds", "hook_out_seconds", "cue_out_seconds"))
+                            if not copied.ok:
+                                raise RuntimeError(f"cue points not carried over: {copied.error}")
                             # M2M copied after save.
                             new_track.additional_categories.set(
                                 track.additional_categories.all()

@@ -746,6 +746,38 @@
 <script>
 const TRACK_ID = {{ track.id }};
 
+// Cue points change only through the server's cue-marker authority: a save
+// sends just the markers edited since they were loaded, with the revision
+// they were loaded at, so a stale page cannot overwrite newer cue points and
+// a metadata-only save touches none of them.
+const CUE_MARKER_INPUTS = {
+  cue_in_seconds: 'f_cue_in_seconds', cue_out_seconds: 'f_cue_out_seconds',
+  next_start_seconds: 'f_next_start_seconds', intro_until_seconds: 'f_intro_until_seconds',
+  sweep_start_seconds: 'f_sweep_start_seconds', outro_starts_seconds: 'f_outro_starts_seconds',
+  hook_in_seconds: 'f_hook_in_seconds', hook_out_seconds: 'f_hook_out_seconds',
+};
+let cueMarkerRevision = {{ track.cue_marker_revision }};
+let cueMarkerBaseline = {};
+function snapshotCueMarkers() {
+  for (const [key, id] of Object.entries(CUE_MARKER_INPUTS)) cueMarkerBaseline[key] = getVal(id);
+}
+function editedCueMarkers() {
+  const edited = {};
+  for (const [key, id] of Object.entries(CUE_MARKER_INPUTS)) {
+    const value = getVal(id);
+    if (value !== cueMarkerBaseline[key]) edited[key] = value;
+  }
+  return edited;
+}
+function adoptCueMarkers(data) {
+  for (const [key, id] of Object.entries(CUE_MARKER_INPUTS)) {
+    if (key in data) document.getElementById(id).value = data[key] ?? '';
+  }
+  if (data.cue_marker_revision != null) cueMarkerRevision = data.cue_marker_revision;
+  snapshotCueMarkers();
+}
+document.addEventListener('DOMContentLoaded', snapshotCueMarkers);
+
 // ============================================================
 // Voice tracks (2.22B): recording, editing, saving and removal happen in
 // the shared iPortal recorder/editor. This page only previews the current
@@ -911,14 +943,8 @@ async function saveTrack() {
     // case-insensitive dedupe, primary-artist exclusion) -- sent as
     // raw text here, same as every other free-text field on this form.
     related_artists: getVal('f_related_artists') || '',
-    cue_in_seconds: getVal('f_cue_in_seconds'),
-    cue_out_seconds: getVal('f_cue_out_seconds'),
-    next_start_seconds: getVal('f_next_start_seconds'),
-    intro_until_seconds: getVal('f_intro_until_seconds'),
-    sweep_start_seconds: getVal('f_sweep_start_seconds'),
-    outro_starts_seconds: getVal('f_outro_starts_seconds'),
-    hook_in_seconds: getVal('f_hook_in_seconds'),
-    hook_out_seconds: getVal('f_hook_out_seconds'),
+    ...editedCueMarkers(),
+    cue_marker_revision: cueMarkerRevision,
     // M2M pickers in the "Additional Rotation" card. Always sent
     // (even when empty) so the API treats them as authoritative --
     // an unchecked-all state clears the M2M rather than leaving it
@@ -946,9 +972,10 @@ async function saveTrack() {
     msg.textContent = err.error || 'Save failed';
     msg.style.color = 'var(--danger)';
     msg.classList.add('show');
-    setTimeout(() => msg.classList.remove('show'), 2000);
+    setTimeout(() => msg.classList.remove('show'), err.conflict ? 8000 : 2000);
     return;
   }
+  adoptCueMarkers(await resp.clone().json());
 
   // DB is the source of truth for playout, so a file-tag write failure
   // after a successful DB save is a warning, not a blocking error --
@@ -1346,10 +1373,10 @@ async function reanalyzeTrack() {
       msg.textContent = data.error || 'Reanalyze failed';
       msg.style.color = 'var(--danger)';
     } else {
-      // Only the auto-detected fields change -- manual marks (intro,
-      // sweep, outro, hooks) are never touched by analyze_one_track.
-      document.getElementById('f_cue_in_seconds').value = data.cue_in_seconds ?? '';
-      document.getElementById('f_next_start_seconds').value = data.next_start_seconds ?? '';
+      // Only the auto-detected fields can change -- manual marks (intro,
+      // sweep, outro, hooks) are never touched by analyze_one_track, and
+      // protected markers keep their values.
+      adoptCueMarkers(data);
       const durEl = document.getElementById('displayDuration');
       if (data.duration_seconds != null) {
         const total = Math.round(data.duration_seconds);   // round first, then split
@@ -1391,8 +1418,7 @@ async function repickCuePoints() {
       msg.textContent = data.error || 'Repick failed';
       msg.style.color = 'var(--danger)';
     } else {
-      document.getElementById('f_cue_in_seconds').value = data.cue_in_seconds ?? '';
-      document.getElementById('f_next_start_seconds').value = data.next_start_seconds ?? '';
+      adoptCueMarkers(data);
       await loadWaveform();
       msg.textContent = 'Cue points updated';
       msg.style.color = 'var(--accent)';

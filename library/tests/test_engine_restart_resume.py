@@ -23,6 +23,7 @@ from library.services.engine import Deck, PlaybackEngine
 from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.tests.test_continuation_hour_orchestration import make_stand_in
 from library.tests.test_engine_runtime_commit import make_minimal_stand_in
+from library.tests.cue_marker_support import set_markers
 
 
 class RestartResumeFixture(TransactionTestCase):
@@ -337,8 +338,8 @@ class ResumePositionPolicyTests(RestartResumeFixture):
 
     def test_end_to_end_late_position_survives_a_snapshot_read(self):
         self.track_n.duration_seconds = 240.0
-        self.track_n.next_start_seconds = 180.0
-        self.track_n.save(update_fields=["duration_seconds", "next_start_seconds"])
+        self.track_n.save(update_fields=["duration_seconds"])
+        set_markers(self.track_n, next_start_seconds=180.0)
         self.write_resume_state(saved_position=205.0, transport="PLAYING")
         engine = self.engine()
         engine._read_resume_hint()
