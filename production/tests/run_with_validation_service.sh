@@ -37,6 +37,13 @@ python="${VALIDATION_SERVICE_PYTHON:-$1}"
 here=$(cd "$(dirname "$0")/../.." && pwd -P)
 sandbox="$here/production/tests/sandbox_exec.sh"
 fail() { echo "run_with_validation_service.sh: $*" >&2; exit 98; }
+# This runner is outside the sandbox and has the user's full access, so it never
+# writes to a caller-chosen path. The former ISADORAAIR_SANDBOX_EVIDENCE and
+# ISADORAAIR_PREFLIGHT_COPY copy hooks are gone; refuse them before anything is
+# created rather than silently ignore a caller who expects a copy.
+for hook in ISADORAAIR_SANDBOX_EVIDENCE ISADORAAIR_PREFLIGHT_COPY; do
+    [ -z "${!hook:-}" ] || fail "$hook is no longer supported (unsafe evidence destination: the runner never copies output to a caller-chosen path); unset it -- nothing was started"
+done
 umask 077
 
 [ -x /usr/bin/bwrap ] || fail "bubblewrap (/usr/bin/bwrap) is required: tests run only inside the kernel sandbox"
@@ -80,9 +87,6 @@ cleanup() {
     stop_unit "$render_unit"
     stop_unit "$unit"
     if [ -n "$pg_pid" ]; then kill "$pg_pid" 2>/dev/null; wait "$pg_pid" 2>/dev/null; fi
-    if [ -n "${ISADORAAIR_SANDBOX_EVIDENCE:-}" ] && [ -d "$ISADORAAIR_SANDBOX_EVIDENCE" ]; then
-        cp -- "$ctl"/*.txt "$ctl"/*.log "$ctl"/*.json "$ISADORAAIR_SANDBOX_EVIDENCE"/ 2>/dev/null
-    fi
     rm -rf -- "$run" "$data" "$pg" "$ctl"
 }
 trap cleanup EXIT
@@ -100,7 +104,11 @@ printf 'DB_NAME=isadoraair_dev\nDB_USER=isadoraair_dev\nDB_PASSWORD=%s\nDB_HOST=
 ISADORAAIR_SANDBOX_EXTRA_RW="$pg" "$sandbox" plain -- "$pg_bin/initdb" -D "$pg/data" -U isadoraair_bootstrap \
     --auth=reject -E UTF8 --locale=C.UTF-8 --no-sync --no-instructions >"$ctl/initdb.log" 2>&1 \
     || { cat "$ctl/initdb.log" >&2; fail "could not create the disposable database cluster"; }
-printf 'local\tpostgres,isadoraair_dev,test_isadoraair_dev\tisadoraair_dev\tscram-sha-256\n' >"$pg/data/pg_hba.conf"
+# $pg is writable by the database sandbox, so the runner does not write into it
+# itself: pg_hba.conf is replaced from inside that sandbox.
+printf 'local\tpostgres,isadoraair_dev,test_isadoraair_dev\tisadoraair_dev\tscram-sha-256\n' \
+    | ISADORAAIR_SANDBOX_EXTRA_RW="$pg" "$sandbox" plain -- /bin/sh -c 'cat >"$1"' sh "$pg/data/pg_hba.conf" \
+    >"$ctl/pg_hba.log" 2>&1 || { cat "$ctl/pg_hba.log" >&2; fail "could not write the disposable cluster's pg_hba.conf"; }
 printf "CREATE ROLE isadoraair_dev LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD '%s';\nCREATE DATABASE isadoraair_dev OWNER isadoraair_dev;\n" "$password" \
     | ISADORAAIR_SANDBOX_EXTRA_RW="$pg" "$sandbox" plain -- "$pg_bin/postgres" --single -D "$pg/data" postgres \
     >"$ctl/bootstrap.log" 2>&1 || { cat "$ctl/bootstrap.log" >&2; fail "could not create the development role"; }
@@ -122,7 +130,6 @@ done
     cat "$ctl/preflight.json" >&2
     exit 98
 }
-if [ -n "${ISADORAAIR_PREFLIGHT_COPY:-}" ]; then cp "$ctl/preflight.json" "$ISADORAAIR_PREFLIGHT_COPY"; fi
 
 # Every process in a unit must be the sandbox's outer bwrap or inside the
 # sandbox's mount, network and PID namespaces; anything else fails the run.

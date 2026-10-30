@@ -8,8 +8,10 @@ deliberately unsafe configuration (the stale-.env scenario) and prove they are
 neutralised or refused before any test could write; they never connect to a
 database and never run a test.
 """
+import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -678,3 +680,113 @@ class KernelSandboxTests(SimpleTestCase):
             self.assertFalse(os.path.lexists(path), path)
         with open("/proc/self/net/dev", encoding="ascii") as stream:
             self.assertEqual([line.split(":")[0].strip() for line in stream.readlines()[2:]], ["lo"])
+
+
+class HostRunnerWriteTests(_Scratch):
+    """The outer runner is not sandboxed and has the user's full access, so it must never write
+    to a caller-chosen path. The former ISADORAAIR_SANDBOX_EVIDENCE / ISADORAAIR_PREFLIGHT_COPY
+    copy hooks are refused before anything is created. Only a synthetic station tree is aimed at;
+    the runner is started inside this test's sandbox, where /srv does not exist."""
+
+    RUNNER = BASE / "production" / "tests" / "run_with_validation_service.sh"
+    HOOKS = ("ISADORAAIR_SANDBOX_EVIDENCE", "ISADORAAIR_PREFLIGHT_COPY")
+
+    def code(self, *, strip_strings):
+        lines = []
+        for line in self.RUNNER.read_text().splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            line = re.sub(r"'[^']*'", "''", line)
+            if strip_strings:
+                line = re.sub(r'"[^"]*"', '""', line)
+            lines.append(line)
+        return "\n".join(lines)
+
+    def test_the_runner_writes_only_to_its_own_control_directory(self):
+        code = self.code(strip_strings=False)
+        targets = re.findall(r"(?<![<&])\d?>>?\s*(&\d|\"[^\"]*\"|[^\s;|)]+)", code)
+        self.assertTrue(targets)
+        for target in targets:
+            with self.subTest(target):
+                self.assertTrue(target in ("&1", "&2", "/dev/null") or target.startswith('"$ctl/')
+                                or target == '"/proc/$pid/root$probe"', target)
+        bare = self.code(strip_strings=True)
+        self.assertEqual(re.findall(r"(?:^|[\s;|&(])(cp|mv|install|tee|rsync|ln|dd|touch|truncate)\s", bare), [])
+        self.assertEqual(re.findall(r"\bmkdir\b.*", code), ['mkdir -m 700 "$run/home" "$run/tmp" "$run/xdg" '
+                                                            '"$run/pgsock" "$run/validation" "$run/render"'])
+        self.assertEqual(sorted(re.findall(r"\brm\b.*", code)), ['rm -f -- "$probe"', 'rm -rf -- "$run" "$data" "$pg" "$ctl"'])
+        # The one write into sandbox-writable scratch ($pg) happens inside the database sandbox.
+        self.assertIn('"$sandbox" plain -- /bin/sh -c \'cat >"$1"\' sh "$pg/data/pg_hba.conf"', self.RUNNER.read_text())
+
+    def test_the_former_copy_hooks_are_only_refused_and_before_any_work(self):
+        code = self.code(strip_strings=False)
+        for hook in self.HOOKS:
+            self.assertEqual(code.count(hook), 1, hook)
+        refusal = code.index("for hook in ISADORAAIR_SANDBOX_EVIDENCE ISADORAAIR_PREFLIGHT_COPY")
+        for first in ("mktemp", '"$sandbox"', "systemd-run", "initdb", "umask", "bwrap"):
+            self.assertLess(refusal, code.index(first), first)
+
+    def snapshot(self):
+        state = {}
+        for root, dirs, files in os.walk(self.station):
+            for name in dirs + files:
+                path = os.path.join(root, name)
+                info = os.lstat(path)
+                entry = (stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns, info.st_ino)
+                if stat.S_ISREG(info.st_mode):
+                    entry += (hashlib.sha256(Path(path).read_bytes()).hexdigest(),)
+                elif stat.S_ISLNK(info.st_mode):
+                    entry += (os.readlink(path),)
+                state[os.path.relpath(path, self.station)] = entry
+        return state
+
+    def run_runner(self, python, **hooks):
+        env = {k: v for k, v in os.environ.items() if k not in self.HOOKS + ("VALIDATION_SERVICE_PYTHON",)}
+        env.update(hooks)
+        return subprocess.run(["/bin/bash", str(self.RUNNER), python, "manage.py", "test", "nothing"], cwd=BASE,
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_a_copy_hook_aimed_anywhere_is_refused_before_anything_is_created(self):
+        waveforms = self.station / "waveforms"
+        waveforms.mkdir()
+        (waveforms / "983.json").write_text('{"synthetic": true}\n')
+        (self.station / "evidence").mkdir()
+        (self.tmp / "alias").symlink_to(waveforms / "983.json")
+        (self.tmp / "dir-alias").symlink_to(self.station / "evidence", target_is_directory=True)
+        ordinary = self.tmp / "ordinary"
+        ordinary.mkdir()
+        destinations = {
+            "station file": str(waveforms / "983.json"),
+            "station directory": str(self.station / "evidence"),
+            "symlink to a station file": str(self.tmp / "alias"),
+            "symlink to a station directory": str(self.tmp / "dir-alias"),
+            "traversal": f"{self.tmp}/ordinary/../station/waveforms/983.json",
+            "relative traversal": "../station/waveforms/983.json",
+            "sandbox-writable scratch": os.environ[iso.SANDBOX_ENV],
+            "ordinary absolute directory": str(ordinary),
+            "ordinary absolute file": str(ordinary / "preflight.json"),
+            "literal production path (absent in this sandbox)": "/srv/isadoraair/waveforms/983.json",
+        }
+        before, tmp_before = self.snapshot(), sorted(os.listdir("/tmp"))
+        for label, destination in destinations.items():
+            for hooks in ({self.HOOKS[0]: destination}, {self.HOOKS[1]: destination},
+                          {self.HOOKS[0]: destination, self.HOOKS[1]: destination}):
+                with self.subTest(label, hooks=sorted(hooks)):
+                    result = self.run_runner(sys.executable, **hooks)
+                    self.assertEqual(result.returncode, 98, result.stderr)
+                    self.assertIn("is no longer supported (unsafe evidence destination", result.stderr)
+                    self.assertIn("nothing was started", result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(os.listdir(ordinary), [])
+                    self.assertEqual(sorted(os.listdir("/tmp")), tmp_before)
+
+    def test_blank_or_absent_hooks_do_not_change_an_ordinary_invocation(self):
+        # A relative interpreter is refused by the runner's next check, still before any work,
+        # so a blank hook is shown to pass the refusal without starting anything.
+        for hooks in ({}, {self.HOOKS[0]: "", self.HOOKS[1]: ""}):
+            with self.subTest(hooks=hooks):
+                result = self.run_runner("relative-python", **hooks)
+                self.assertEqual(result.returncode, 98, result.stderr)
+                self.assertIn("the interpreter must be an absolute path", result.stderr)
+                self.assertNotIn("no longer supported", result.stderr)

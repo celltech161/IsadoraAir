@@ -68,6 +68,17 @@ scope. The sandbox's own processes hold `<scope>/supervisor`, as a service's
 `DelegateSubgroup=supervisor` does, and `run_delegated.sh` creates `web` beside it, so the
 executors' cgroup tests keep their layout.
 
+The runner itself is not sandboxed and has the user's full access, so it never writes to a
+path the caller chooses. It writes only into its own control directory (`mktemp`, 0700,
+never mounted in any sandbox), creates the run directory's subdirectories before any
+sandbox starts, and has the disposable cluster's `pg_hba.conf` replaced from inside the
+database sandbox. It keeps no logs after the run. The former `ISADORAAIR_SANDBOX_EVIDENCE`
+and `ISADORAAIR_PREFLIGHT_COPY` hooks, which copied logs and the preflight report to a
+caller-chosen path from outside the sandbox, have been removed. A non-empty value for either
+is refused (exit 98) before any directory, database, service or test exists; a blank or
+unset one changes nothing. A caller who wants output redirects the runner's own stdout and
+stderr. Keeping more evidence has to be designed as a separate, deliberate step.
+
 ```
 run_with_validation_service.sh  (host, trusted; creates ctl/run/data/pg in /tmp, never runs test code)
  |- sandbox_exec.sh plain -> bwrap -> initdb / postgres --single / postgres   (data dir + run dir rw)
@@ -181,16 +192,24 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
 
 ## Limits (read before trusting it)
 
-* **Not containable here: tests that drive the systemd user manager themselves.**
-  `production/tests/validation_service_support.py` (`TransientValidationService`) and its
-  users start their own transient units with `systemd-run --user` and read host cgroup
-  paths. A unit started that way would run *outside* any sandbox with the user's full
-  access, so the sandbox has no user-manager socket and these tests fail loudly
-  ("Failed to connect to user scope bus"). They are not skipped. They need a disposable VM
-  or host with no station data. The modules are
-  `production.tests.test_validation_service`, `test_validation_topology`, `test_gst_taxonomy`
-  and `test_validation_admission_config`, `monitoring.tests.test_validation_service_check`,
-  and `active_messages.tests.test_managed_worker_unit`.
+* **Excluded here: tests that drive the systemd user manager themselves.** A transient unit
+  they start with `systemd-run --user` would run *outside* any sandbox with the user's full
+  access, so the sandbox has no user-manager socket. They are excluded from every same-host
+  run and are qualified only on a disposable VM or host with no station data. A skip or a
+  failure here is not a pass, and none of them counts towards containment or qualification.
+
+  | Excluded | What it does inside the sandbox |
+  |---|---|
+  | `production.tests.test_validation_service` (whole module) | fails (`TransientValidationService` cannot start its unit) |
+  | `production.tests.test_validation_topology` (whole module) | fails (same helper) |
+  | `production.tests.test_gst_taxonomy` (whole module) | fails (same helper) |
+  | `production.tests.test_validation_admission_config` (whole module) | fails (same helper) |
+  | `monitoring.tests.test_validation_service_check` (whole module) | fails (same helper) |
+  | `active_messages.tests.test_managed_worker_unit` (whole module) | **skipped** (`SkipTest("no systemd user manager")`) |
+  | `isadoraair.tests.test_env_config.RoundTripEncodingTests.test_representative_values_round_trip_through_real_systemd_environment_file` (one method) | **skipped** (`skipUnless(_HAS_USER_SYSTEMD)`) |
+
+  The other methods of `isadoraair.tests.test_env_config` do not need the user manager and
+  can be qualified in the sandbox.
 * **Python-layer residuals, covered only by the sandbox:**
   * writes through a descriptor that was already writable before the guard saw it
     (`os.write`, `sendfile` and `copy_file_range` have no audit event);
@@ -202,8 +221,8 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
     and station-storage files are refused.
   * The services' streams go to the user journal.
   * The run's scratch is shared by the run's own sandboxes. The runner writes nothing into
-    it after untrusted code starts, and removes it with `rm -rf`, which does not follow
-    symlinks.
+    it once any sandbox has started (`pg_hba.conf` is written from inside the database
+    sandbox), and removes it with `rm -rf`, which does not follow symlinks.
   * A SIGKILLed runner leaves its 0700 `/tmp/isadoraair-test-*` directories and possibly
     the disposable `postgres` behind.
   * The sandbox shares the host's cgroup namespace (cgroup paths stay as on a station),
@@ -212,6 +231,16 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
   validation/render sockets are never used.
 * A rare legitimate test write into a protected path will now fail loudly. That is
   intended; fix the test to use scratch.
+
+## What has run inside the kernel sandbox
+
+Only `isadoraair.tests.test_test_isolation` and `isadoraair.tests.test_test_safety` have
+run inside the kernel sandbox. The earlier focused results at `4c1e5bd`
+(`library.tests.test_sync_track_file` 12, `library.tests.test_analyze_waveform_move_recovery`
+5, `library.tests.test_related_artists` 79, `aircheck.tests.test_recorder` 41 and
+`aircheck.tests.test_recovery` 30, all OK) came from the runner *before* it had a kernel
+sandbox. They do not qualify these modules under the sandbox. No broad per-app suite has run
+under it.
 
 ## Read-only integrity check
 
