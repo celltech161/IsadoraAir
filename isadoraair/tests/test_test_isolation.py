@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -790,3 +791,131 @@ class HostRunnerWriteTests(_Scratch):
                 self.assertEqual(result.returncode, 98, result.stderr)
                 self.assertIn("the interpreter must be an absolute path", result.stderr)
                 self.assertNotIn("no longer supported", result.stderr)
+
+
+class StationRuntimeRootTests(_Scratch):
+    """The station's /run trees (live state files, the engine command queue, service
+    sockets) are protected like station storage. Inside the sandbox they are absent and
+    every attempt is refused before the call; the "exists" cases use the synthetic
+    station directory. Nothing here is aimed at a host path that exists."""
+
+    LIVE_STATE = "/run/isadoraair/rbds_state.json"
+
+    def test_every_runtime_root_and_its_var_run_alias_is_protected_and_absent(self):
+        for suffix in ("", "-validation", "-render", "-updater", "-updater-bootstrap"):
+            for base in ("/run", "/var/run"):
+                root = f"{base}/isadoraair{suffix}"
+                with self.subTest(root):
+                    self.assertIn(iso.protected_match(f"{root}/state.json"), {root, root.replace("/var/run", "/run")})
+                    self.assertIn(root, iso.SANDBOX_HIDDEN_PATHS)
+                    self.assertFalse(os.path.lexists(root))
+        self.assertIsNone(iso.protected_match("/run/isadoraair2/state.json"))
+        self.assertIsNone(iso.protected_match("/run/user/1000/x"))
+
+    def test_writes_into_an_absent_runtime_root_are_refused_before_anything_is_created(self):
+        run_fd = os.open("/run", os.O_RDONLY | os.O_DIRECTORY)      # the sandbox's own private /run
+        self.addCleanup(os.close, run_fd)
+        staged = self.tmp / "staged.json"
+        staged.write_text("{}")
+        attempts = {
+            "open w": lambda: open(self.LIVE_STATE, "w"),
+            "atomic .tmp": lambda: Path(self.LIVE_STATE).with_suffix(".tmp").write_text("{}"),
+            "rename into": lambda: os.rename(staged, self.LIVE_STATE),
+            "os.replace into": lambda: os.replace(staged, self.LIVE_STATE),
+            "os.open O_CREAT": lambda: os.open(self.LIVE_STATE, os.O_CREAT | os.O_WRONLY, 0o644),
+            "mkdir parents": lambda: Path("/run/isadoraair/engine_cmd.d").mkdir(parents=True),
+            "mkdir root": lambda: os.mkdir("/run/isadoraair-updater"),
+            "dir_fd os.open": lambda: os.open("isadoraair/rbds_state.json", os.O_CREAT | os.O_WRONLY, 0o644,
+                                              dir_fd=run_fd),
+            "dir_fd mkdir": lambda: os.mkdir("isadoraair", dir_fd=run_fd),
+            "/var/run alias": lambda: open("/var/run/isadoraair/rbds_state.json", "w"),
+            "'..' traversal": lambda: open(f"{self.tmp}{'/..' * str(self.tmp).count('/')}/run/isadoraair/x", "w"),
+            "mkstemp": lambda: tempfile.mkstemp(dir="/run/isadoraair"),
+        }
+        for label, attempt in attempts.items():
+            with self.subTest(label), self.assertRaises(iso.ProtectedPathWriteBlocked):
+                attempt()
+        self.assertEqual(len(iso.blocked_writes()), len(attempts))
+        self.assertFalse(os.path.lexists("/run/isadoraair"))
+        self.assertFalse(os.path.lexists("/run/isadoraair-updater"))
+        self.assertEqual(staged.read_text(), "{}")
+
+    def test_a_symlink_to_a_runtime_root_cannot_be_written_through(self):
+        alias = self.tmp / "runtime-alias"
+        alias.symlink_to("/run/isadoraair", target_is_directory=True)      # dangling here; the link itself is scratch
+        with self.assertRaises(iso.ProtectedPathWriteBlocked):
+            (alias / "rbds_state.json").write_text("{}")
+        self.assertFalse(os.path.lexists("/run/isadoraair"))
+
+    def test_atomic_publication_into_an_existing_protected_directory_is_refused(self):
+        state = self.station / "rbds_state.json"
+        state.write_text("live")
+        staged = self.tmp / "staged.json"
+        staged.write_text("{}")
+        alias = self.tmp / "alias"
+        alias.symlink_to(self.station, target_is_directory=True)
+        station_fd = os.open(self.station, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, station_fd)
+        with self.protected():
+            attempts = {
+                "write .tmp": lambda: state.with_suffix(".tmp").write_text("{}"),
+                "rename over": lambda: os.rename(staged, state),
+                "replace over": lambda: os.replace(staged, state),
+                "dir_fd .tmp": lambda: os.open("rbds_state.tmp", os.O_CREAT | os.O_WRONLY, 0o644, dir_fd=station_fd),
+                "symlink alias": lambda: (alias / "rbds_state.json").write_text("{}"),
+                "'..' traversal": lambda: open(self.tmp / "elsewhere" / ".." / "station" / "rbds_state.json", "w"),
+            }
+            for label, attempt in attempts.items():
+                with self.subTest(label), self.assertRaises(iso.ProtectedPathWriteBlocked):
+                    attempt()
+        self.assertEqual(state.read_text(), "live")
+        self.assertEqual(sorted(p.name for p in self.station.iterdir()), ["rbds_state.json"])
+
+    def test_unix_sockets_under_runtime_roots_are_refused_and_scratch_sockets_work(self):
+        def connect(path):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(path)
+
+        def bind(path):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.bind(path)
+
+        def sendto(path):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+                sock.sendto(b"x", path)
+
+        attempts = (("connect updater", connect, "/run/isadoraair-updater/updater.sock"),
+                    ("connect validator", connect, "/run/isadoraair-validation/validator.sock"),
+                    ("connect bootstrap", connect, "/run/isadoraair-updater-bootstrap/control.sock"),
+                    ("bind runtime", bind, "/run/isadoraair/probe.sock"),
+                    ("sendto runtime", sendto, "/var/run/isadoraair-render/render.sock"))
+        for label, call, path in attempts:
+            with self.subTest(label), self.assertRaises(iso.ProtectedPathWriteBlocked):
+                call(path)
+        self.assertEqual(len(iso.blocked_writes()), len(attempts))
+        iso.clear_blocked_writes()
+        scratch = str(self.tmp / "scratch.sock")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(scratch)
+            server.listen(1)
+            connect(scratch)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as abstract:
+            abstract.bind(f"\0isadoraair-test-{os.getpid()}")
+        self.assertEqual(iso.blocked_writes(), [])
+
+    def test_reads_of_runtime_state_are_not_refused(self):
+        self.assertFalse(os.path.exists(self.LIVE_STATE))
+        self.assertFalse(Path(self.LIVE_STATE).is_file())
+        with self.assertRaises(FileNotFoundError):
+            open(self.LIVE_STATE, encoding="utf-8").read()
+        self.assertEqual(iso.blocked_writes(), [])
+
+    def test_a_swallowed_runtime_refusal_still_fails_the_run(self):
+        try:
+            Path(self.LIVE_STATE).with_suffix(".tmp").write_text("{}")
+        except BaseException:                                              # noqa: BLE001 -- swallow it entirely
+            pass
+        stream = StringIO()
+        self.assertEqual(iso.fail_on_blocked(0, stream), 1)
+        self.assertIn("ISOLATION FAILURE", stream.getvalue())
+        self.assertIn("/run/isadoraair/rbds_state.tmp", stream.getvalue())

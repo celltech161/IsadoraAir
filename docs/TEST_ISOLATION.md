@@ -111,7 +111,9 @@ are replaced by unreachable namespace paths unless the guarded runner supplies i
 A process-wide audit hook refuses any mutation whose target is inside a protected root,
 whatever any setting or `override_settings` says. That covers open for write or create,
 remove, rename, mkdir, chmod, link, symlink, copy, move, rmtree, truncate and writable
-`mmap`.
+`mmap`. It also refuses a Unix-socket `connect`, `bind` or `sendto` to a path under a
+protected root: the station's runtime trees hold the service sockets, and the root-owned
+updater accepts this user. Abstract socket addresses have no path and are not checked.
 
 * **Resolution.** Symlinks are resolved the way the kernel resolves them: `link/..` is the
   link target's parent, not a lexical no-op. Deleting an *ancestor* of station storage is
@@ -151,8 +153,20 @@ such a host: no installation is visible, and the only reachable server is the di
 one. The test-name, superuser and identity-query checks still apply.
 
 Protected roots: `/srv/isadoraair`, `/var/lib/isadoraair`, `/opt/isadoraair` (and the
-checkout it resolves to), `/opt/isadoraair-runtime`, `/etc/isadoraair`, plus any path the
-production environment file names for the six root settings.
+checkout it resolves to), `/opt/isadoraair-runtime`, `/etc/isadoraair`, the station's runtime
+trees `/run/isadoraair`, `/run/isadoraair-validation`, `/run/isadoraair-render`,
+`/run/isadoraair-updater` and `/run/isadoraair-updater-bootstrap` (each also as
+`/var/run/...`), plus any path the production environment file names for the six root
+settings.
+
+The runtime trees hold live state the running services publish and read
+(`rbds_state.json`, `engine_state.json`, `now_playing.json`, ...), the engine command
+queue and locks, and the service sockets. Many modules name these files as module
+constants, so a test that runs a real writer must point the constant at its own scratch
+(for example `rbds.tests.PrivateRuntimeStateMixin`, `aircheck`'s
+`AircheckRecorderFixtureMixin`, `encoders`' `EncoderManagerFixtureMixin`). Inside the
+sandbox `/run` is private and these trees are absent; a writer that creates the directory
+itself would otherwise succeed there silently, which is why the guard refuses them too.
 
 ### Entry points
 
@@ -214,6 +228,7 @@ station paths, all of which must be `refused`. Run outside the sandbox, it refus
   * writes through a descriptor that was already writable before the guard saw it
     (`os.write`, `sendfile` and `copy_file_range` have no audit event);
   * C extensions and `ctypes`;
+  * socket calls other than `connect`, `bind` and `sendto` (`sendmsg` with an address);
   * a directory replaced between the check and the call;
   * a hard link that existed before the run.
 * **Sandbox residuals:**

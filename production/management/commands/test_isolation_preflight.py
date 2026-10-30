@@ -14,12 +14,18 @@ Exit status: 0 isolated and every probe refused; 2 not isolated / a probe was no
 """
 import json
 import os
+import socket
 import sys
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from isadoraair import test_isolation
+
+
+def _connect(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(path)
 
 
 class Command(BaseCommand):
@@ -45,6 +51,10 @@ class Command(BaseCommand):
             ("rename   out of production waveforms", lambda: os.rename(f"/srv/isadoraair/waveforms/{probe_name}", os.path.join(namespace, "x"))),
             ("remove   production reports", lambda: os.remove(f"/var/lib/isadoraair/reports/{probe_name}")),
             ("chmod    production weather", lambda: os.chmod(f"/var/lib/isadoraair/weather/{probe_name}", 0o600)),
+            ("open r+  station runtime state", lambda: os.open(f"/run/isadoraair/{probe_name}", os.O_RDWR)),
+            ("rename   into station runtime (write-and-rename)",
+             lambda: os.rename(os.path.join(namespace, probe_name), f"/run/isadoraair/{probe_name}")),
+            ("connect  station updater socket directory", lambda: _connect(f"/run/isadoraair-updater/{probe_name}.sock")),
         ]
         results, failed = [], False
         try:
@@ -64,7 +74,7 @@ class Command(BaseCommand):
         test_isolation.clear_blocked_writes()                    # these refusals were deliberate
 
         ancestor = {path: bool(test_isolation.protected_match(path, ancestors=True))
-                    for path in ("/srv", "/srv/isadoraair", "/var/lib", "/opt")}
+                    for path in ("/srv", "/srv/isadoraair", "/var/lib", "/opt", "/run")}
         sandbox = test_isolation.sandbox_problems()
         failed = failed or bool(sandbox)
         report = {

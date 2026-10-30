@@ -60,6 +60,7 @@ import atexit
 import contextlib
 import os
 import shutil
+import socket
 import stat
 import sys
 import tempfile
@@ -90,6 +91,14 @@ SOCKET_SETTINGS = {
 PRODUCTION_SOCKET_DIRS = ("/run/isadoraair", "/run/isadoraair-validation", "/run/isadoraair-render")
 BLANK_SETTINGS = ("WEB_REQUESTS_INGEST_URL", "WEB_REQUESTS_INGEST_API_KEY")
 
+#: The station's runtime trees (tmpfs): live state files the running services publish
+#: (rbds_state.json, engine_state.json, ...), the engine command queue and locks, and the
+#: validation, render and updater sockets. ``/var/run`` is the same directory on a station.
+STATION_RUNTIME_ROOTS = tuple(
+    f"{base}/isadoraair{suffix}"
+    for base in ("/run", "/var/run")
+    for suffix in ("", "-validation", "-render", "-updater", "-updater-bootstrap")
+)
 #: Fixed protected roots (plus the live checkout reached through /opt/isadoraair
 #: and any path the production environment file names; see ``protected_roots``).
 STATIC_PROTECTED_ROOTS = (
@@ -98,7 +107,7 @@ STATIC_PROTECTED_ROOTS = (
     "/opt/isadoraair",
     "/opt/isadoraair-runtime",
     "/etc/isadoraair",
-)
+) + STATION_RUNTIME_ROOTS
 PRODUCTION_APP_ROOT = "/opt/isadoraair"
 PRODUCTION_ENVIRONMENT_FILE = PRODUCTION_APP_ROOT + "/.env"
 STATION_CONFIG_PATH = "/etc/isadoraair/station.json"
@@ -361,7 +370,6 @@ SANDBOX_WRITABLE_ENV = "ISADORAAIR_SANDBOX_WRITABLE"
 #: empty directory (an empty tmpfs mask over a configuration directory).
 SANDBOX_HIDDEN_PATHS = STATIC_PROTECTED_ROOTS + (
     "/run/user", "/run/dbus", "/var/run/dbus", "/run/systemd", "/run/postgresql", "/var/run/postgresql",
-    "/run/isadoraair", "/run/isadoraair-validation", "/run/isadoraair-render",
     "/etc/ssl/isadoraair", "/etc/postgresql", "/etc/postgresql-common", "/etc/systemd", "/etc/nginx", "/etc/ssh",
     "/var/lib/postgresql", "/var/backups",
 )
@@ -716,6 +724,14 @@ def _audit(event, args):
             _refuse(event, f"{name!r} (relative os.open whose directory descriptor cannot be checked)",
                     UNRESOLVABLE)
         _check(event, target)
+        return
+    if event in ("socket.connect", "socket.bind", "socket.sendto"):
+        # A Unix socket under a runtime root is a live station service (the root-owned
+        # updater accepts this user). Abstract addresses (leading NUL) have no path.
+        sock, address = args[0], (args[1] if len(args) > 1 else None)
+        name = _as_path(address)
+        if getattr(sock, "family", None) == socket.AF_UNIX and name and not name.startswith("\0"):
+            _check(event, address)
         return
     if event == "mmap.__new__":
         fileno, access = args[0], (args[2] if len(args) > 2 else 0)
