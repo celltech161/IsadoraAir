@@ -312,10 +312,15 @@ def _station_markers():
             if os.path.lexists(p)]
 
 
+#: Once Django creates the disposable test database it renames the live connection
+#: settings to ``test_<NAME>``, so the same development identity also appears under that name.
+DEV_DATABASE_NAMES = (DEV_DATABASE_NAME, "test_" + DEV_DATABASE_NAME)
+
+
 def _database_problem(databases, environ):
     default = (databases or {}).get("default") or {}
     name, user = str(default.get("NAME") or ""), str(default.get("USER") or "")
-    if name == DEV_DATABASE_NAME and user == DEV_DATABASE_USER:
+    if name in DEV_DATABASE_NAMES and user == DEV_DATABASE_USER:
         return None
     if environ.get(ISOLATED_CI_ENV) == "1" and not _station_markers():
         return None  # an isolated CI host: no installation, so no production role to confuse

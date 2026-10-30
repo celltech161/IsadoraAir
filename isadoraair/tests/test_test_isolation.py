@@ -239,10 +239,18 @@ class EffectiveSettingsTests(_Scratch):
         for database in ({"NAME": "isadoraair", "USER": "isadoraair"},
                          {"NAME": "isadoraair_dev", "USER": "isadoraair"},
                          {"NAME": "isadoraair", "USER": "isadoraair_dev"},
-                         {"NAME": "test_isadoraair_dev", "USER": "isadoraair_dev"}, {}):
+                         {"NAME": "test_isadoraair", "USER": "isadoraair_dev"},
+                         {"NAME": "test_isadoraair_dev", "USER": "isadoraair"}, {}):
             with self.subTest(database):
                 values = dict(self.safe)
                 self.assertTrue(iso.effective_problems(values.get, self.namespace, {"default": database}, {}))
+
+    def test_the_runtime_name_of_the_disposable_test_database_is_accepted(self):
+        # Django renames the live connection to test_<NAME> when it creates the test database.
+        values = dict(self.safe)
+        for name in ("isadoraair_dev", "test_isadoraair_dev"):
+            self.assertEqual(iso.effective_problems(values.get, self.namespace,
+                                                    {"default": {"NAME": name, "USER": "isadoraair_dev"}}, {}), [])
 
     def test_the_isolated_ci_escape_is_refused_on_a_station_host(self):
         other = {"default": {"NAME": "ci_db", "USER": "ci_user"}}
