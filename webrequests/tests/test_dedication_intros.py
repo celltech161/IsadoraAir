@@ -39,8 +39,9 @@ import library.services.engine as eng_module
 from isadoraair.announcements import renderer as announcement_renderer_module
 from isadoraair.tts.models import StationTTSVoice
 from library.models import (
-    Artist, Category, CategoryKind, LogItem, PlaylistLog, Track, VoiceTrack, VoiceTrackConfig,
+    Artist, Category, CategoryKind, LogItem, PlayEvent, PlaylistLog, Track, VoiceTrack, VoiceTrackConfig,
 )
+from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from webrequests.admin import SongRequestAdmin
 from webrequests.management.commands.generate_dedication_intros import DEDICATION_LOCK_KEY
 from webrequests.management.commands.refresh_song_request_statuses import Command as RefreshCommand
@@ -1162,36 +1163,164 @@ class DedicationTransactionalityTests(DedicationFixtureMixin, TransactionTestCas
 # request is still "scheduled"
 # ---------------------------------------------------------------------
 class DedicationRolloverTests(DedicationFixtureMixin, TransactionTestCase):
-    def test_rollover_preview_peek_and_reconciliation_agree_still_scheduled(self):
-        old_log = self.make_log(date(2027, 5, 3), 5)
-        track = self.make_track()
-        song_item = self.make_item(old_log, 1, track=track, scheduled_time=timezone.now() + timedelta(seconds=5))
-        intro_track = self.make_dedication_track()
-        intro_item = self.make_dedication_item(old_log, 0, intro_track, scheduled_time=timezone.now())
-        req = self.make_request(track, status="scheduled", log_item=song_item, scheduled_at=timezone.now(),
-                                 intro_track=intro_track, intro_log_item=intro_item)
+    """The old hour's intro was on air when rollover emptied the active
+    queue; its scheduled song survives only as the forced follow-up. Peek,
+    the preview and the engine's own engine_state.json queue export must all
+    show that exact song, and the reconciler must leave the request
+    "scheduled" -- never fulfilled -- until the song itself airs.
 
+    With the active queue empty, the preview consults _peek_next_hour, which
+    resolves the schedule authority. A TransactionTestCase flush removes the
+    migration-seeded ScheduleProfileState singleton, and production code
+    deliberately refuses to recreate it, so the fixture restores exactly what
+    the migration provides (same as library's restart/resume fixtures).
+    Without it the test depended on running before any other
+    TransactionTestCase."""
+
+    def setUp(self):
+        super().setUp()
+        ensure_schedule_profile_state()
+        self.old_log = self.make_log(date(2027, 5, 3), 5)
+        self.song_track = self.make_track()
+        self.song_item = self.make_item(self.old_log, 1, track=self.song_track,
+                                        scheduled_time=timezone.now() + timedelta(seconds=5))
+        self.intro_track = self.make_dedication_track()
+        self.intro_item = self.make_dedication_item(self.old_log, 0, self.intro_track,
+                                                    scheduled_time=timezone.now(),
+                                                    played_at=timezone.now() - timedelta(seconds=3))
+        self.req = self.make_request(self.song_track, status="scheduled", log_item=self.song_item,
+                                     scheduled_at=timezone.now(), intro_track=self.intro_track,
+                                     intro_log_item=self.intro_item)
+
+    def rolled_over_engine(self, forced):
         stand_in = make_engine_stand_in()
         stand_in.current_log = None  # rollover already emptied the old hour
         stand_in.log_items = []
         stand_in._queue_cursor = 0
-        stand_in._forced_next_items = [song_item]
+        stand_in._forced_next_items = list(forced)
+        stand_in._leading_deck_eta_seconds = lambda snapshot=None: 0.0
+        return stand_in
+
+    def export_and_reconcile(self, stand_in, **state):
+        """Write the engine's OWN queue export (what _write_state publishes),
+        then run the reconciler against it."""
+        queue = eng_module.PlaybackEngine._compute_queue_eta_state(stand_in, None)
+        self.write_state(decks={"A": None, "B": None}, queue=queue, date_str="2027-05-03", hour=6, **state)
+        out = StringIO()
+        RefreshCommand(stdout=out).handle()
+        self.req.refresh_from_db()
+        return queue, json.loads(out.getvalue())
+
+    def assert_no_false_air(self):
+        self.song_item.refresh_from_db()
+        self.assertIsNone(self.song_item.played_at)
+        self.assertFalse(PlayEvent.objects.exists())
+        self.assertNotEqual(self.req.status, "fulfilled")
+        self.assertIsNone(self.req.fulfilled_at)
+
+    def test_rollover_preview_peek_and_reconciliation_agree_still_scheduled(self):
+        stand_in = self.rolled_over_engine([self.song_item])
 
         peeked = eng_module.PlaybackEngine._peek_playable_at_cursor(stand_in)
-        self.assertEqual(peeked.id, song_item.id)
-
+        self.assertEqual(peeked.id, self.song_item.id)
         preview = eng_module.PlaybackEngine._get_upcoming_preview(stand_in)
-        self.assertIn(song_item.id, [it.id for it in preview])
+        self.assertEqual([it.id for it in preview], [self.song_item.id])  # once, first
+        self.assertEqual(stand_in._forced_next_items, [self.song_item])     # read-only views
 
-        self.write_state(
-            decks={"A": None, "B": None}, queue=[{"item_id": song_item.id}],
-            date_str="2027-05-03", hour=6,
-        )
-        RefreshCommand().handle()
+        queue, summary = self.export_and_reconcile(stand_in)
 
-        req.refresh_from_db()
-        self.assertEqual(req.status, "scheduled")
-        self.assertEqual(req.log_item_id, song_item.id)
+        self.assertEqual([entry["item_id"] for entry in queue], [self.song_item.id])
+        self.assertEqual(self.req.status, "scheduled")
+        self.assertEqual(self.req.log_item_id, self.song_item.id)
+        self.assertEqual(self.req.intro_log_item_id, self.intro_item.id)
+        self.assertEqual((summary["requeued_stranded"], summary["aired"]), (0, 0))
+        self.assert_no_false_air()
+
+    def test_the_forced_follow_up_is_handed_out_once_without_a_second_dedication(self):
+        stand_in = self.rolled_over_engine([self.song_item])
+        stand_in._roll_over_to_next_hour = lambda: False  # no next hour in this fixture
+
+        self.assertEqual(eng_module.PlaybackEngine._next_queue_item(stand_in), (self.song_item, True))
+        self.assertEqual(eng_module.PlaybackEngine._next_queue_item(stand_in), (None, False))
+        self.assertEqual(stand_in._forced_next_items, [])
+        # is_forced=True is what makes _start_next_track skip request
+        # scheduling and dedication splicing (DedicationStartNextTrackTests).
+
+    def test_without_the_forced_follow_up_the_request_is_requeued_not_fulfilled(self):
+        stand_in = self.rolled_over_engine([])
+
+        self.assertIsNone(eng_module.PlaybackEngine._peek_playable_at_cursor(stand_in))
+        self.assertEqual(eng_module.PlaybackEngine._get_upcoming_preview(stand_in), [])
+        queue, summary = self.export_and_reconcile(stand_in)
+
+        self.assertEqual(queue, [])
+        self.assertEqual(summary["requeued_stranded"], 1)
+        self.assertIn(self.req.status, SongRequest.WAITING_STATUSES)   # back to waiting, not stranded
+        self.assertIsNone(self.req.log_item_id)
+        self.assertIsNone(self.req.intro_log_item_id)
+        self.assertEqual(self.req.intro_track_id, self.intro_track.id)
+        self.assert_no_false_air()
+
+    def test_a_poison_guarded_follow_up_is_never_shown_or_kept_as_next(self):
+        stand_in = self.rolled_over_engine([self.song_item])
+        stand_in._poison_skip_identities = {(self.old_log.id, self.song_item.id)}
+
+        self.assertIsNone(eng_module.PlaybackEngine._peek_playable_at_cursor(stand_in))
+        self.assertEqual(eng_module.PlaybackEngine._get_upcoming_preview(stand_in), [])
+        queue, _summary = self.export_and_reconcile(stand_in)
+
+        self.assertEqual(queue, [])
+        self.assertIn(self.req.status, SongRequest.WAITING_STATUSES)
+        self.assertIsNone(self.req.log_item_id)
+        self.assert_no_false_air()
+
+    def test_an_unplayable_follow_up_is_never_shown_and_the_request_resolves_unavailable(self):
+        Path(self.song_track.filepath).unlink()
+        stand_in = self.rolled_over_engine([self.song_item])
+
+        self.assertIsNone(eng_module.PlaybackEngine._peek_playable_at_cursor(stand_in))
+        self.assertEqual(eng_module.PlaybackEngine._get_upcoming_preview(stand_in), [])
+        self.export_and_reconcile(stand_in)
+
+        self.assertEqual(self.req.status, "unavailable")
+        self.assertIsNone(self.req.log_item_id)
+        self.assert_no_false_air()
+
+    def test_a_retracked_follow_up_is_not_credited_to_the_request(self):
+        other = self.make_track(title="Something Else")
+        LogItem.objects.filter(id=self.song_item.id).update(track=other)
+        self.song_item.refresh_from_db()
+        stand_in = self.rolled_over_engine([self.song_item])
+
+        _queue, summary = self.export_and_reconcile(stand_in)
+
+        self.assertEqual(summary["requeued_stranded"], 1)
+        self.assertIn(self.req.status, SongRequest.WAITING_STATUSES)
+        self.assertIsNone(self.req.log_item_id)
+        self.assert_no_false_air()
+
+    def test_stale_engine_state_changes_nothing(self):
+        stand_in = self.rolled_over_engine([])
+        stale = time.time() - 3600
+
+        _queue, summary = self.export_and_reconcile(stand_in, timestamp=stale)
+
+        self.assertEqual(summary["requeued_stranded"], 0)
+        self.assertEqual(self.req.status, "scheduled")
+        self.assertEqual(self.req.log_item_id, self.song_item.id)
+        self.assert_no_false_air()
+
+    def test_only_the_songs_own_air_start_fulfills_the_request(self):
+        aired_at = timezone.now() - timedelta(seconds=1)
+        LogItem.objects.filter(id=self.song_item.id).update(played_at=aired_at)
+        stand_in = self.rolled_over_engine([])
+
+        _queue, summary = self.export_and_reconcile(stand_in)
+
+        self.assertEqual(summary["aired"], 1)
+        self.assertEqual(self.req.status, "fulfilled")
+        self.assertEqual(self.req.fulfilled_at, aired_at)
+        self.assertEqual(self.req.log_item_id, self.song_item.id)
 
 
 # ---------------------------------------------------------------------
@@ -1496,59 +1625,235 @@ class DedicationLockContentionTests(DedicationFixtureMixin, TransactionTestCase)
 
 
 # ---------------------------------------------------------------------
-# 14. Resume-hint selection -- Dedications deck beats an older/longer
-# outgoing music deck, and clears the 5s position floor
+# 14. Resume-hint selection for a dedication intro
 # ---------------------------------------------------------------------
-class DedicationResumeHintTests(TransactionTestCase):
+class DedicationResumeHintTests(DedicationFixtureMixin, TransactionTestCase):
+    """A dedication intro under the accepted r0099 resume contract (41cbbeb,
+    pinned by library/tests/test_engine_restart_resume.py). An interrupted
+    occurrence is resumable only when the database proves it: approved
+    PlaylistLog, matching LogItem/Track, LogItem.played_at and playable
+    media. Among genuinely aired decks the NEWEST air start wins. There is no
+    position floor and no Dedications-first exception, and a deck's
+    "category" string never makes an occurrence eligible or preferred.
+
+    These tests previously wrote invented track/log-item ids against the
+    pre-r0099 rules (a 5 s floor that Dedications bypassed, Dedications
+    sorted first); database validation rejects such ids, so the two positive
+    cases could not pass and the 5 s exclusion passed without testing
+    anything. The r0098 legacy deck format is what they exercised and stays
+    the main subject here; the current "resume" record is covered too."""
+
     def setUp(self):
         super().setUp()
-        self._state_tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._state_tmpdir.cleanup)
-        self.engine_state_path = Path(self._state_tmpdir.name) / "engine_state.json"
+        self.engine_state_path = Path(self._tmpdir.name) / "engine_resume_state.json"
         patcher = patch.object(eng_module, "STATE_PATH", self.engine_state_path)
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _write_engine_state(self, decks, age_seconds=1.0):
-        self.engine_state_path.write_text(json.dumps({"decks": decks}), encoding="utf-8")
-        mtime = time.time() - age_seconds
-        os.utime(self.engine_state_path, (mtime, mtime))
+        now = timezone.now()
+        self.log = self.make_log(date(2027, 5, 3), 5)
+        self.music_item = self.make_item(self.log, 0, track=self.make_track(title="Older Music"),
+                                         played_at=now - timedelta(seconds=180))
+        self.intro_track = self.make_dedication_track(duration=6.0)
+        self.intro_item = self.make_dedication_item(self.log, 1, self.intro_track,
+                                                    played_at=now - timedelta(seconds=2))
+        self.song_track = self.make_track(title="Requested Song")
+        self.song_item = self.make_item(self.log, 2, track=self.song_track)
+        self.req = self.make_request(self.song_track, status="scheduled", log_item=self.song_item,
+                                     scheduled_at=now, intro_track=self.intro_track,
+                                     intro_log_item=self.intro_item)
 
-    def test_dedication_deck_wins_over_older_longer_music_deck(self):
-        self._write_engine_state({
-            "A": {"track_id": 101, "log_item_id": 5000, "position": 180.0, "category": "Music"},
-            "B": {"track_id": 202, "log_item_id": 5001, "position": 2.0, "category": "Dedications"},
-        })
+    @staticmethod
+    def deck(item, position, category, **extra):
+        return {"track_id": item.track_id, "log_item_id": item.id, "position": position,
+                "category": category, "paused": False, **extra}
+
+    def write_legacy_state(self, decks, *, age=1.0, session_id="previous-engine-session"):
+        """r0098 deck fields, no "resume" record -- the format these tests
+        always exercised."""
+        self.engine_state_path.write_text(json.dumps({
+            "transport": "STOPPED", "timestamp": time.time() - age,
+            "engine_session_id": session_id, "log_id": self.log.id, "decks": decks,
+        }), encoding="utf-8")
+
+    def write_resume_record(self, item, saved_position, *, actually_playing=True, playlist_log_id=None):
+        self.engine_state_path.write_text(json.dumps({
+            "transport": "PLAYING", "timestamp": time.time() - 0.5,
+            "engine_session_id": "previous-engine-session", "log_id": self.log.id,
+            "queue_resume_cursor": item.position + 1, "queue_resume_next_log_item_id": self.song_item.id,
+            "decks": {},
+            "resume": {
+                "version": eng_module.RESUME_STATE_VERSION, "session_id": "previous-engine-session",
+                "actually_playing": actually_playing,
+                "playlist_log_id": playlist_log_id if playlist_log_id is not None else item.playlist_log_id,
+                "log_item_id": item.id, "log_position": item.position, "track_id": item.track_id,
+                "slot": "B", "deck_generation": 3, "saved_position": saved_position,
+            },
+        }), encoding="utf-8")
+
+    def read_hint(self):
         stand_in = make_engine_stand_in()
-
+        stand_in._engine_session_id = "new-engine-session"
         eng_module.PlaybackEngine._read_resume_hint(stand_in)
-
-        self.assertIsNotNone(stand_in._resume_hint)
-        self.assertEqual(stand_in._resume_hint["track_id"], 202)
-        self.assertEqual(stand_in._resume_hint["log_item_id"], 5001)
+        return stand_in
 
     def test_dedication_deck_below_five_seconds_still_considered(self):
-        self._write_engine_state({
-            "A": None,
-            "B": {"track_id": 303, "log_item_id": 6000, "position": 1.2, "category": "Dedications"},
+        self.write_legacy_state({"A": None, "B": self.deck(self.intro_item, 1.2, "Dedications")})
+
+        hint = self.read_hint()._resume_hint
+
+        self.assertIsNotNone(hint)
+        self.assertEqual((hint["log_item_id"], hint["track_id"], hint["playlist_log_id"]),
+                         (self.intro_item.id, self.intro_track.id, self.log.id))
+        self.assertEqual((hint["saved_position"], hint["position"]), (1.2, 0.95))  # 0.25 s replay overlap
+        self.assertEqual(hint["slot"], "B")
+        self.assertEqual((hint["queue"]["playlist_log_id"], hint["queue"]["source"]),
+                         (self.log.id, "legacy_r0098"))
+
+    def test_dedication_deck_wins_over_older_longer_music_deck(self):
+        self.write_legacy_state({
+            "A": self.deck(self.music_item, 180.0, "Music"),
+            "B": self.deck(self.intro_item, 2.0, "Dedications"),
         })
-        stand_in = make_engine_stand_in()
 
-        eng_module.PlaybackEngine._read_resume_hint(stand_in)
+        hint = self.read_hint()._resume_hint
 
-        self.assertIsNotNone(stand_in._resume_hint)
-        self.assertEqual(stand_in._resume_hint["track_id"], 303)
+        self.assertIsNotNone(hint)
+        self.assertEqual((hint["log_item_id"], hint["track_id"]), (self.intro_item.id, self.intro_track.id))
+        self.assertEqual(hint["position"], 1.75)
 
-    def test_non_dedication_deck_under_five_seconds_still_excluded(self):
-        self._write_engine_state({
-            "A": {"track_id": 404, "log_item_id": 7000, "position": 3.0, "category": "Music"},
-            "B": None,
+    def test_the_category_label_never_promotes_an_older_dedication_deck(self):
+        # The intro handed off to its song: the newer song wins, as pinned by
+        # test_a_dedication_intro_outgoing_does_not_beat_its_incoming_song.
+        LogItem.objects.filter(id=self.song_item.id).update(played_at=timezone.now() - timedelta(seconds=1))
+        self.write_legacy_state({
+            "A": self.deck(self.intro_item, 5.5, "Dedications"),
+            "B": self.deck(self.song_item, 1.0, "Music"),
         })
-        stand_in = make_engine_stand_in()
 
-        eng_module.PlaybackEngine._read_resume_hint(stand_in)
+        self.assertEqual(self.read_hint()._resume_hint["log_item_id"], self.song_item.id)
 
-        self.assertIsNone(stand_in._resume_hint)
+    def test_an_unaired_dedication_deck_never_wins_on_its_category_label(self):
+        LogItem.objects.filter(id=self.intro_item.id).update(played_at=None)
+        self.write_legacy_state({
+            "A": self.deck(self.music_item, 180.0, "Music"),
+            "B": self.deck(self.intro_item, 1.0, "Dedications"),
+        })
+
+        self.assertEqual(self.read_hint()._resume_hint["log_item_id"], self.music_item.id)
+
+    def test_a_music_deck_below_five_seconds_is_resumed_on_the_same_evidence(self):
+        # Replaces the pre-r0099 "non-dedication under 5 s is excluded" rule:
+        # no floor exists for any category (see
+        # test_r0098_legacy_under_five_second_snapshot_bootstraps_upgrade).
+        LogItem.objects.filter(id=self.music_item.id).update(played_at=timezone.now() - timedelta(seconds=3))
+        LogItem.objects.filter(id=self.intro_item.id).update(played_at=None)
+        self.write_legacy_state({"A": self.deck(self.music_item, 3.0, "Music"), "B": None})
+
+        hint = self.read_hint()._resume_hint
+
+        self.assertEqual(hint["log_item_id"], self.music_item.id)
+        self.assertEqual(hint["position"], 2.75)
+
+    def test_a_music_deck_below_five_seconds_without_air_evidence_is_refused(self):
+        LogItem.objects.filter(id=self.music_item.id).update(played_at=None)
+        LogItem.objects.filter(id=self.intro_item.id).update(played_at=None)
+        self.write_legacy_state({"A": self.deck(self.music_item, 3.0, "Music"), "B": None})
+
+        self.assertIsNone(self.read_hint()._resume_hint)
+
+    def test_the_former_invented_ids_are_refused(self):
+        # The exact snapshot these tests used to write: nothing in the
+        # database backs it, so it can never authorize a resume.
+        self.write_legacy_state({
+            "A": None, "B": {"track_id": 303, "log_item_id": 6000, "position": 1.2, "category": "Dedications"},
+        })
+
+        self.assertIsNone(self.read_hint()._resume_hint)
+
+    def test_a_dedication_intro_without_database_proof_is_refused(self):
+        intro_deck = self.deck(self.intro_item, 1.2, "Dedications")
+        intro_path = Path(self.intro_track.filepath)
+        cases = [
+            ("no played_at", lambda: LogItem.objects.filter(id=self.intro_item.id).update(played_at=None),
+             lambda: LogItem.objects.filter(id=self.intro_item.id).update(played_at=self.intro_item.played_at),
+             {}),
+            ("log not approved", lambda: PlaylistLog.objects.filter(id=self.log.id).update(status="draft"),
+             lambda: PlaylistLog.objects.filter(id=self.log.id).update(status="approved"), {}),
+            ("media missing", intro_path.unlink, intro_path.touch, {}),
+            ("track mismatch", None, None, {"deck": {**intro_deck, "track_id": self.song_track.id}}),
+            ("paused deck", None, None, {"deck": {**intro_deck, "paused": True}}),
+            ("stale snapshot", None, None, {"age": eng_module.RESUME_STATE_MAX_AGE_SECONDS + 5}),
+            ("future snapshot", None, None, {"age": -10.0}),
+            ("same session", None, None, {"session_id": "new-engine-session"}),
+        ]
+        for label, break_it, restore, options in cases:
+            with self.subTest(label):
+                if break_it:
+                    break_it()
+                try:
+                    self.write_legacy_state({"A": None, "B": options.get("deck", intro_deck)},
+                                            age=options.get("age", 1.0),
+                                            session_id=options.get("session_id", "previous-engine-session"))
+                    self.assertIsNone(self.read_hint()._resume_hint)
+                finally:
+                    if restore:
+                        restore()
+        # Control: the restored fixture is accepted again.
+        self.write_legacy_state({"A": None, "B": intro_deck})
+        self.assertEqual(self.read_hint()._resume_hint["log_item_id"], self.intro_item.id)
+
+    def test_the_current_resume_record_gets_the_same_validation(self):
+        self.write_resume_record(self.intro_item, 1.2)
+        hint = self.read_hint()._resume_hint
+        self.assertEqual((hint["log_item_id"], hint["position"]), (self.intro_item.id, 0.95))
+        self.assertEqual(hint["queue"]["source"], "snapshot")
+
+        self.write_resume_record(self.intro_item, 1.2, actually_playing=False)
+        self.assertIsNone(self.read_hint()._resume_hint)
+        self.write_resume_record(self.intro_item, 1.2, playlist_log_id=self.log.id + 1000)
+        self.assertIsNone(self.read_hint()._resume_hint)
+        LogItem.objects.filter(id=self.intro_item.id).update(played_at=None)
+        self.write_resume_record(self.intro_item, 1.2)
+        self.assertIsNone(self.read_hint()._resume_hint)
+
+    def resumed_engine(self):
+        """The real startup order after the hint: install the occurrence,
+        then restore the dedication pairing (PlaybackEngine.start)."""
+        self.write_legacy_state({"A": None, "B": self.deck(self.intro_item, 1.2, "Dedications")})
+        stand_in = self.read_hint()
+        stand_in.current_log = self.log
+        stand_in.log_items = list(LogItem.objects.filter(playlist_log=self.log).order_by("position"))
+        stand_in._queue_cursor = 2  # the loader's first-unplayed cursor: the song
+        stand_in._roll_over_to_next_hour = lambda: False
+        eng_module.PlaybackEngine._install_resume_occurrence(stand_in)
+        eng_module.PlaybackEngine._restore_dedication_sequence_from_resume_hint(stand_in)
+        return stand_in
+
+    def handed_out(self, stand_in, count=3):
+        return [eng_module.PlaybackEngine._next_queue_item(stand_in) for _ in range(count)]
+
+    def test_the_resumed_intro_and_its_song_each_air_exactly_once(self):
+        stand_in = self.resumed_engine()
+        self.assertEqual(stand_in._resume_item.id, self.intro_item.id)
+        self.assertEqual([i.id for i in stand_in._forced_next_items], [self.intro_item.id, self.song_item.id])
+
+        handed = self.handed_out(stand_in)
+
+        self.assertEqual([(item.id if item else None, forced) for item, forced in handed],
+                         [(self.intro_item.id, True), (self.song_item.id, True), (None, False)])
+        self.req.refresh_from_db()
+        self.assertEqual(self.req.status, "scheduled")  # air start, not hand-out, fulfills
+        self.assertFalse(PlayEvent.objects.exists())
+
+    def test_a_poison_guarded_resumed_intro_is_dropped_and_its_song_still_plays_once(self):
+        stand_in = self.resumed_engine()
+        stand_in._poison_skip_identities = {(self.log.id, self.intro_item.id)}
+
+        handed = self.handed_out(stand_in)
+
+        self.assertEqual([(item.id if item else None, forced) for item, forced in handed],
+                         [(self.song_item.id, True), (None, False), (None, False)])
 
 
 # ---------------------------------------------------------------------

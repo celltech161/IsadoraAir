@@ -656,6 +656,12 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # 2.27 Phase D: and library.0096, the hour-refill install gate
             # (RemoveConstraint + an editable/label AlterField) -- deliberately
             # manual, so a station needs a reviewed approval to apply it.
+            # r0121 Start Next cause: and library.0097 (three additive AddFields, a
+            # choices-only AlterField, and the known-type/start_next CHECK swap --
+            # RemoveConstraint + two AddConstraint, manual).
+            # r0121 automatic causes: and library.0098 (five additive AddFields, a
+            # choices-only AlterField, the known-type CHECK swap and two field
+            # CHECKs -- RemoveConstraint + three AddConstraint, manual).
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -667,6 +673,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0093_hour_refill_cause_policy", "library.0094_logitem_origin",
                               "library.0095_hour_refill_install",
                               "library.0096_hour_refill_install_gate",
+                              "library.0097_hour_refill_start_next_cause",
+                              "library.0098_hour_refill_automatic_failure_cause",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
@@ -686,6 +694,13 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("library.0092_remote_dj_start_next_access", "RunPython"),
                               ("library.0096_hour_refill_install_gate", "RemoveConstraint"),
                               ("library.0096_hour_refill_install_gate", "AlterField"),
+                              ("library.0097_hour_refill_start_next_cause", "RemoveConstraint"),
+                              ("library.0097_hour_refill_start_next_cause", "AddConstraint"),
+                              ("library.0097_hour_refill_start_next_cause", "AddConstraint"),
+                              ("library.0098_hour_refill_automatic_failure_cause", "RemoveConstraint"),
+                              ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                              ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                              ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),

@@ -861,7 +861,8 @@ class LogFillConfigAdmin(admin.ModelAdmin):
 
 
 _HOUR_REFILL_POLICY_AUDIT_FIELDS = (
-    "enabled", "capture_request_substitution", "capture_operator_eject", "dry_run_only",
+    "enabled", "capture_request_substitution", "capture_operator_eject", "capture_start_next",
+    "capture_automatic_skip", "capture_media_failure", "dry_run_only",
 )
 _HOUR_REFILL_APPLY_MODES = {
     # The engine's runner re-reads the row every 15 s; evidence capture
@@ -870,6 +871,9 @@ _HOUR_REFILL_APPLY_MODES = {
     "enabled": "next_hour_refill_runner_check",
     "capture_request_substitution": "next_hour_refill_runner_check",
     "capture_operator_eject": "next_hour_refill_runner_check",
+    "capture_start_next": "next_hour_refill_runner_check",
+    "capture_automatic_skip": "next_hour_refill_runner_check",
+    "capture_media_failure": "next_hour_refill_runner_check",
     "dry_run_only": "next_hour_refill_runner_check_and_every_install_transaction",
 }
 
@@ -882,6 +886,19 @@ class HourRefillPolicyForm(forms.ModelForm):
             "enabled": "Hour refill enabled (master switch)",
             "capture_request_substitution": "Request-substitution cause",
             "capture_operator_eject": "Operator Eject cause",
+            "capture_start_next": "Start Next cause",
+            "capture_automatic_skip": "Automatic skip cause",
+            "capture_media_failure": "Media failure cause",
+        }
+        help_texts = {
+            "capture_start_next": "A completed Start Next fade that cut a scheduled music song short and "
+                                  "started the next item. Overlap, start-only, fade to silence, Manual, "
+                                  "Remote DJ and mic transitions are never causes.",
+            "capture_automatic_skip": "A scheduled music song skipped because its media file is missing. Poison "
+                                      "guards, deleted tracks and other refusals are never causes.",
+            "capture_media_failure": "A specific media/decoder error that ended a scheduled music song before or "
+                                     "after it started. Watchdog stalls, early ends and transport errors are "
+                                     "never causes.",
         }
 
     def clean(self):
@@ -901,11 +918,13 @@ class HourRefillPolicyAdmin(admin.ModelAdmin):
     """Roadmap 2.27 Phase D: the hour-refill switches plus a read-only
     status panel. Model view/change permissions apply, as for other config."""
     form = HourRefillPolicyForm
+    change_list_template = "admin/library/hourrefillpolicy/change_list.html"
     readonly_fields = ("mode_display", "gates_display", "rules_display", "runner_display",
                        "last_outcome_display", "counters_display", "recent_installs_display")
     fieldsets = [
         ("Switches", {
-            "fields": ["enabled", "capture_request_substitution", "capture_operator_eject", "dry_run_only"],
+            "fields": ["enabled", "capture_request_substitution", "capture_operator_eject", "capture_start_next",
+                       "capture_automatic_skip", "capture_media_failure", "dry_run_only"],
             "description": "Off by default. The master switch also controls cause evidence capture. A cause set "
                            "drives a refill only if every cause type in it is switched on. Observation only "
                            "(dry run) shows advisory proposals and never writes to a log.",
@@ -931,9 +950,23 @@ class HourRefillPolicyAdmin(admin.ModelAdmin):
         if not self.has_view_or_change_permission(request):
             raise PermissionDenied
         obj = HourRefillPolicy.objects.filter(pk=1).first()
-        if obj is None:
-            return HttpResponseRedirect(reverse("admin:library_hourrefillpolicy_add"))
-        return HttpResponseRedirect(reverse("admin:library_hourrefillpolicy_change", args=[obj.pk]))
+        if obj is not None:
+            return HttpResponseRedirect(reverse("admin:library_hourrefillpolicy_change", args=[obj.pk]))
+        context = {
+            **(extra_context or {}),
+            "title": "Hour Refill Policy — Off: no policy row",
+            "hour_refill_no_policy": True,
+            "hour_refill_status_sections": (
+                ("Mode (saved settings)", self.mode_display(None)),
+                ("Install gates", self.gates_display(None)),
+                ("Runner", self.runner_display(None)),
+                ("Last outcome", self.last_outcome_display(None)),
+                ("Counters since engine start", self.counters_display(None)),
+                ("Fixed rules (v1)", self.rules_display(None)),
+                ("Recent committed installs", self.recent_installs_display(None)),
+            ),
+        }
+        return super().changelist_view(request, extra_context=context)
 
     def save_model(self, request, obj, form, change):
         before = (_persisted_singleton_config_snapshot(HourRefillPolicy, obj, _HOUR_REFILL_POLICY_AUDIT_FIELDS)
@@ -977,6 +1010,9 @@ class HourRefillPolicyAdmin(admin.ModelAdmin):
             ("Observation only (dry run)", dry_run),
             ("Request-substitution cause", "on" if saved and saved.capture_request_substitution else "off"),
             ("Operator Eject cause", "on" if saved and saved.capture_operator_eject else "off"),
+            ("Start Next cause", "on" if saved and saved.capture_start_next else "off"),
+            ("Automatic skip cause", "on" if saved and saved.capture_automatic_skip else "off"),
+            ("Media failure cause", "on" if saved and saved.capture_media_failure else "off"),
         ])
 
     @admin.display(description="Install gates")
@@ -1001,12 +1037,22 @@ class HourRefillPolicyAdmin(admin.ModelAdmin):
         from library.services.hour_refill_install import (
             INSERTION_LEAD_SECONDS, SAFETY_BUDGET_BASE_SECONDS, SAFETY_BUDGET_PER_ITEM_SECONDS,
         )
-        from library.services.hour_refill_projection import EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS
+        from library.services.hour_refill_projection import (
+            AUTOMATIC_SKIP_MUSIC_TRIGGER_THRESHOLD_SECONDS, EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+            MEDIA_FAILURE_MUSIC_TRIGGER_THRESHOLD_SECONDS, START_NEXT_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+        )
 
         return self._rows([
             ("Request or mixed causes", f"net shortage greater than {REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS} s"),
             ("Eject causes only", f"net shortage greater than {EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS} s "
                                   "(operator-approved, provisional)"),
+            ("Start Next causes, alone or with Eject",
+             f"net shortage greater than {START_NEXT_MUSIC_TRIGGER_THRESHOLD_SECONDS} s "
+             "(provisional; not yet operator-approved)"),
+            ("Any automatic skip or media failure cause",
+             f"net shortage greater than "
+             f"{max(AUTOMATIC_SKIP_MUSIC_TRIGGER_THRESHOLD_SECONDS, MEDIA_FAILURE_MUSIC_TRIGGER_THRESHOLD_SECONDS)} s "
+             "(proposed; not yet operator-approved)"),
             ("Insertion lead", f"{INSERTION_LEAD_SECONDS:g} s: provisional engineering margin, not measured"),
             ("Reserve after the install", f"{SAFETY_BUDGET_BASE_SECONDS:g} s + {SAFETY_BUDGET_PER_ITEM_SECONDS:g} s "
                                           "per item: provisional engineering margin, not measured"),

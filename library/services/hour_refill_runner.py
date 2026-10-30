@@ -28,7 +28,13 @@ from django.conf import settings
 from django.db import close_old_connections, connection
 from django.utils import timezone
 
-from library.services.hour_refill_causality import CAUSE_OPERATOR_EJECT, CAUSE_REQUEST_SUBSTITUTION
+from library.services.hour_refill_causality import (
+    CAUSE_AUTOMATIC_SKIP,
+    CAUSE_MEDIA_FAILURE,
+    CAUSE_OPERATOR_EJECT,
+    CAUSE_REQUEST_SUBSTITUTION,
+    CAUSE_START_NEXT,
+)
 from library.services.hour_refill_install import (
     STATUS_INSTALLED,
     STATUS_LIVE_FILL_PENDING,
@@ -91,15 +97,23 @@ class PolicyState:
     request_cause: bool = False
     eject_cause: bool = False
     host_armed: bool = False
+    start_next_cause: bool = False
+    automatic_skip_cause: bool = False
+    media_failure_cause: bool = False
 
     def allows(self, cause_types):
-        switches = {CAUSE_REQUEST_SUBSTITUTION: self.request_cause, CAUSE_OPERATOR_EJECT: self.eject_cause}
+        """Every type has its own switch on; an unknown type never does."""
+        switches = {CAUSE_REQUEST_SUBSTITUTION: self.request_cause, CAUSE_OPERATOR_EJECT: self.eject_cause,
+                    CAUSE_START_NEXT: self.start_next_cause, CAUSE_AUTOMATIC_SKIP: self.automatic_skip_cause,
+                    CAUSE_MEDIA_FAILURE: self.media_failure_cause}
         return all(switches.get(cause_type, False) for cause_type in cause_types)
 
     def as_dict(self):
         return {"mode": self.mode, "reason": self.reason, "enabled": self.enabled,
                 "dry_run_only": self.dry_run_only, "request_cause": self.request_cause,
-                "eject_cause": self.eject_cause, "host_armed": self.host_armed}
+                "eject_cause": self.eject_cause, "start_next_cause": self.start_next_cause,
+                "automatic_skip_cause": self.automatic_skip_cause,
+                "media_failure_cause": self.media_failure_cause, "host_armed": self.host_armed}
 
 
 def host_armed():
@@ -114,14 +128,17 @@ def read_policy_state():
     armed = host_armed()
     try:
         row = (HourRefillPolicy.objects.filter(pk=1)
-               .values_list("enabled", "dry_run_only", "capture_request_substitution", "capture_operator_eject")
+               .values_list("enabled", "dry_run_only", "capture_request_substitution", "capture_operator_eject",
+                            "capture_start_next", "capture_automatic_skip", "capture_media_failure")
                .first())
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- includes a database without the r0121 columns
         return PolicyState(MODE_OFF, "policy_unreadable", host_armed=armed)
     if row is None:
         return PolicyState(MODE_OFF, "no_policy_row", host_armed=armed)
-    enabled, dry_run, request, eject = (bool(v) for v in row)
-    common = dict(enabled=enabled, dry_run_only=dry_run, request_cause=request, eject_cause=eject, host_armed=armed)
+    enabled, dry_run, request, eject, start_next, automatic_skip, media_failure = (bool(v) for v in row)
+    common = dict(enabled=enabled, dry_run_only=dry_run, request_cause=request, eject_cause=eject,
+                  start_next_cause=start_next, automatic_skip_cause=automatic_skip,
+                  media_failure_cause=media_failure, host_armed=armed)
     if not enabled:
         return PolicyState(MODE_OFF, "policy_disabled", **common)
     if dry_run:

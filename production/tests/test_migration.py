@@ -7,7 +7,10 @@ the migration unapplied.
 """
 import ast
 import json
+import re
+import sys
 from pathlib import Path
+from unittest import mock
 
 from django.core.management import call_command
 from django.db.migrations.loader import MigrationLoader
@@ -97,7 +100,17 @@ class LivePlanClassificationTests(TransactionTestCase):
     def test_the_pending_plan_is_one_additive_migration_and_no_manual_operations(self):
         call_command("migrate", "production", "zero", verbosity=0)
         try:
-            payload = probe.build_probe_payload()
+            # The protected updater probes in a fresh process. In this one, an
+            # earlier makemigrations (MigrationDriftTests) has Django's
+            # ProjectState.resolve_fields_and_relations name the cached
+            # migration modules' field instances, and the classifier's
+            # deconstruct() comparison then reads a choices-only AlterField
+            # (library.0095, 0098) as manual. Probe freshly imported
+            # migration modules, exactly as the updater does.
+            with mock.patch.dict(sys.modules):
+                for name in [name for name in sys.modules if re.search(r"\.migrations\.\d{4}_", name)]:
+                    del sys.modules[name]
+                payload = probe.build_probe_payload()
             refs = [item["ref"] for item in payload["plan"]]
             # 2.22B: library.0089 (VoiceTrack.media) depends on production.0001,
             # so unapplying production also unapplies it; production.0001 is
@@ -122,7 +135,18 @@ class LivePlanClassificationTests(TransactionTestCase):
                                                  # r0113: the NO-AIR provenance column
                                                  "production.0003_media_airing_prohibited",
                                                  # 2.22D3D: the operator board's history indexes
-                                                 "active_messages.0005_execution_history_indexes"})
+                                                 "active_messages.0005_execution_history_indexes",
+                                                 # library's chain is linear from 0089, so every later
+                                                 # library migration is pending too: r0117 (0091, 0092),
+                                                 # r0120 (0093-0096), r0121 (0097, 0098)
+                                                 "library.0091_playouttransportconfig",
+                                                 "library.0092_remote_dj_start_next_access",
+                                                 "library.0093_hour_refill_cause_policy",
+                                                 "library.0094_logitem_origin",
+                                                 "library.0095_hour_refill_install",
+                                                 "library.0096_hour_refill_install_gate",
+                                                 "library.0097_hour_refill_start_next_cause",
+                                                 "library.0098_hour_refill_automatic_failure_cause"})
             self.assertEqual(payload["conflicts"], {})
             self.assertEqual(sorted((entry["ref"], entry["operation"])
                                     for entry in probe.extract_manual_operations(payload["plan"])),
@@ -139,7 +163,19 @@ class LivePlanClassificationTests(TransactionTestCase):
                                      ("production.0003_media_airing_prohibited", "AddField"),
                                      # 2.22D3D: index operations are outside the automatic allowlist
                                      ("active_messages.0005_execution_history_indexes", "AddIndex"),
-                                     ("active_messages.0005_execution_history_indexes", "AddIndex")]))
+                                     ("active_messages.0005_execution_history_indexes", "AddIndex"),
+                                     # each authorized by its own release's companion (r0117, r0120)
+                                     # or, for 0097/0098, pending r0121's exact authorization
+                                     ("library.0092_remote_dj_start_next_access", "RunPython"),
+                                     ("library.0096_hour_refill_install_gate", "RemoveConstraint"),
+                                     ("library.0096_hour_refill_install_gate", "AlterField"),
+                                     ("library.0097_hour_refill_start_next_cause", "RemoveConstraint"),
+                                     ("library.0097_hour_refill_start_next_cause", "AddConstraint"),
+                                     ("library.0097_hour_refill_start_next_cause", "AddConstraint"),
+                                     ("library.0098_hour_refill_automatic_failure_cause", "RemoveConstraint"),
+                                     ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                                     ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
+                                     ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint")]))
             self.assertEqual([op["classification"] for op in payload["plan"][0]["operations"]], ["additive"])
             self.assertTrue(all(dep.startswith("auth.") for dep in payload["plan"][0]["dependencies"]))
         finally:

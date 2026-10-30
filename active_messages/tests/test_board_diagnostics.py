@@ -1038,7 +1038,9 @@ class WorkerProducerContractTests(MonitoringStateFixture, Domain, TestCase):
         finally:
             for patcher in patches:
                 patcher.stop()
-        poller = SimpleNamespace(_since={}, _cooldowns={}, _runtime_commit=None)
+        # The real MonitorManager's state shape (its __init__): _write_state also
+        # persists the notification incidents since 46244a3.
+        poller = SimpleNamespace(_since={}, _cooldowns={}, _notification_incidents={}, _runtime_commit=None)
         with mock.patch.object(monitor_module, "STATE_PATH", self.state):
             monitor_module.MonitorManager._write_state(
                 poller, [monitor_module.MonitorManager._build_result(poller, self.check, status, detail)])

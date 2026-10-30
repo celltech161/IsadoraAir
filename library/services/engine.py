@@ -67,7 +67,12 @@ from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
 from library.services import remote_dj_admin_identity
-from library.services.hour_refill_causality import eject_evidence_from_engine
+from library.services.hour_refill_causality import (
+    automatic_skip_evidence_from_engine,
+    eject_evidence_from_engine,
+    media_failure_evidence_from_engine,
+    start_next_evidence_from_engine,
+)
 from library.services.hour_refill_evidence import HourRefillEvidenceRecorder
 from library.services.hour_refill_install import RefillCoordinator
 from library.services.hour_refill_runner import HourRefillRunner
@@ -6622,6 +6627,7 @@ class PlaybackEngine:
                 dedupe_key=f"engine|skip|item={item.id}",
             )
             self._queue_cursor += 1
+            self._offer_automatic_skip_evidence(item, reason)
             self._note_active_message_discard(item)
         return None
 
@@ -6727,7 +6733,24 @@ class PlaybackEngine:
                 },
                 dedupe_key=f"engine|skip|item={item.id}",
             )
+            self._offer_automatic_skip_evidence(item, reason)
             self._note_active_message_discard(item)
+
+    def _offer_automatic_skip_evidence(self, item, reason):
+        """Roadmap 2.27 (r0121), evidence only: the cursor has just moved past
+        an unplayable scheduled row (a committed skip). Hand an eligible one
+        to the evidence worker: loaded-field reads plus one bounded
+        put_nowait -- no query, file check, lock or wait -- and it can never
+        affect the skip. Off (the default) costs one attribute read."""
+        recorder = getattr(self, "_hour_refill_evidence", None)
+        if recorder is None or not getattr(recorder, "capture_automatic_skip", False):
+            return
+        try:
+            evidence, _reason = automatic_skip_evidence_from_engine(item, reason, occurred_at=timezone.now())
+            if evidence is not None:
+                recorder.offer(evidence)
+        except Exception:  # noqa: BLE001 -- evidence must never touch playout
+            recorder.note_snapshot_error()
 
     def _get_upcoming_preview(self):
         """Every remaining item in the current hour's log — however many
@@ -9755,6 +9778,10 @@ class PlaybackEngine:
             "fade_anchored": False,
             "timers": [],
             "paused_deck": paused[0] if (mode == "start_only" and paused) else None,
+            # Roadmap 2.27 (r0121), evidence only: who owned the program at
+            # acceptance. Read by the refill-cause snapshot, never by the
+            # transition itself.
+            "ownership_at_accept": self._start_next_ownership(),
         }
         self._start_next_active = active
         token = request_id
@@ -9934,6 +9961,7 @@ class PlaybackEngine:
             # EOS/error already owns this generation; _handle_deck_finished
             # routes it to _start_next_outgoing_ended.
             return False
+        self._snapshot_start_next_refill_evidence(active, deck)
         # The pad stays at the curve's final 0.0 while it is unlinked and
         # released; its binding goes with it (deck_fade module docstring).
         active["fade_owned"] = False
@@ -10015,6 +10043,9 @@ class PlaybackEngine:
             "completed_to_silence" if to_silence else "completed",
             manual_released=manual_released,
         )
+        evidence = active.pop("refill_evidence", None)
+        if evidence is not None and not to_silence:
+            self._offer_start_next_refill_evidence(evidence)
         if self._live_decks():
             return
         if self.manual_mode:
@@ -10029,6 +10060,46 @@ class PlaybackEngine:
         else:
             # The incoming item already finished during the fade.
             self._start_next_track()
+
+    def _start_next_ownership(self):
+        """Plain Manual / Remote DJ / mic flags for the refill-cause snapshot
+        (roadmap 2.27, r0121). None if unreadable; never raises."""
+        try:
+            return {
+                "manual": bool(self.manual_mode),
+                "remote_dj": getattr(self, "remote_dj_session", None) is not None,
+                "mic": bool(self._any_mic_live()),
+            }
+        except Exception:  # noqa: BLE001 -- evidence must never touch playout
+            return None
+
+    def _snapshot_start_next_refill_evidence(self, active, deck):
+        """Roadmap 2.27 (r0121), evidence only: right after this transition's
+        exact outgoing generation claimed completion("start_next"), snapshot
+        an eligible cut into the transition record. In-memory reads plus one
+        position read -- no query, lock or wait -- and it can never affect
+        the fade, the retirement or the outcome. Off (the default) costs one
+        attribute read. _start_next_finish offers it only on "completed"."""
+        recorder = getattr(self, "_hour_refill_evidence", None)
+        if recorder is None or not getattr(recorder, "capture_start_next", False):
+            return
+        try:
+            evidence, _reason = start_next_evidence_from_engine(
+                self, deck, active, occurred_at=timezone.now(),
+            )
+            if evidence is not None:
+                active["refill_evidence"] = evidence
+        except Exception:  # noqa: BLE001 -- evidence must never touch playout
+            recorder.note_snapshot_error()
+
+    def _offer_start_next_refill_evidence(self, evidence):
+        recorder = getattr(self, "_hour_refill_evidence", None)
+        if recorder is None:
+            return
+        try:
+            recorder.offer(evidence)
+        except Exception:  # noqa: BLE001 -- offer() never raises; belt and braces
+            pass
 
     def _start_next_fail(self, token, reason, *, restore):
         active = self._start_next_current(token)
@@ -15522,6 +15593,7 @@ class PlaybackEngine:
             return True
         err, debug = message.parse_error()
         deck.mark_milestone("ERROR_OBSERVED", state=err)
+        self._offer_media_failure_evidence(deck, err)
         incident_evidence = capture_deck_evidence(
             deck,
             trigger="deck_pipeline_error",
@@ -15546,6 +15618,26 @@ class PlaybackEngine:
         )
         GLib.idle_add(self._retire_deck_error_and_record, deck, incident_evidence)
         return True
+
+    def _offer_media_failure_evidence(self, deck, err):
+        """Roadmap 2.27 (r0121), evidence only: this generation has just won
+        claim_completion("error") -- the occurrence is over. Hand an
+        eligible media failure to the evidence worker: in-memory reads, the
+        existing position read for a post-air case, one bounded put_nowait.
+        It can never affect the retirement or the advance. Off (the
+        default) costs one attribute read."""
+        recorder = getattr(self, "_hour_refill_evidence", None)
+        if recorder is None or not getattr(recorder, "capture_media_failure", False):
+            return
+        try:
+            evidence, _reason = media_failure_evidence_from_engine(
+                self, deck, getattr(err, "domain", None), getattr(err, "code", None),
+                occurred_at=timezone.now(),
+            )
+            if evidence is not None:
+                recorder.offer(evidence)
+        except Exception:  # noqa: BLE001 -- evidence must never touch playout
+            recorder.note_snapshot_error()
 
     @_glib_safe(default_return=False)
     def _retire_deck_error_and_record(self, deck, incident_evidence):

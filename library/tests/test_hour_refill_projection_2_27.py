@@ -308,7 +308,8 @@ class NetDeficitTests(SimpleTestCase):
             eject(6, 404),                                                     # LogItem deleted
             eject(7, 5),                                                       # still ahead in the queue
             swap(8, 5, 78),                                                    # slot changed since
-            replace(eject(9, 1), cause_type="start_next"),                     # not a v1 type
+            replace(eject(9, 1), cause_type="operator_skip"),                  # unknown type (r0121:
+                                                                               # start_next is known)
             replace(eject(10, 3), scheduled_category_kind_code="spot"),        # not a music slot
         ]
         p = self.project(snap, causes)

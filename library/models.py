@@ -1205,6 +1205,14 @@ class HourRefillPolicy(models.Model):
     enabled = models.BooleanField(default=False)
     capture_request_substitution = models.BooleanField(default=False)
     capture_operator_eject = models.BooleanField(default=False)
+    # r0121: a completed fade_and_start Start Next cut (its own switch; see
+    # docs/roadmap/2_27_START_NEXT_CAUSALITY_EXTENSION.md).
+    capture_start_next = models.BooleanField(default=False)
+    # r0121: a committed automatic skip of missing media, and a whitelisted
+    # media error before/after air (own switches; see
+    # docs/roadmap/2_27_AUTOMATIC_FAILURE_CAUSALITY_EXTENSION.md).
+    capture_automatic_skip = models.BooleanField(default=False)
+    capture_media_failure = models.BooleanField(default=False)
     dry_run_only = models.BooleanField(
         default=True, verbose_name="Observation only (dry run)",
         help_text="While checked, the hour-refill runner only reports advisory proposals and never "
@@ -1238,6 +1246,20 @@ class HourRefillPolicy(models.Model):
             return False, False
         return bool(row[1]), bool(row[2])
 
+    @classmethod
+    def capture_switches(cls, *, include_automatic=False):
+        """(request_substitution, operator_eject, start_next) capture
+        switches, read like capture_flags(); with include_automatic also
+        (automatic_skip, media_failure). On a database without a named
+        column this raises; callers fail closed."""
+        columns = ["enabled", "capture_request_substitution", "capture_operator_eject", "capture_start_next"]
+        if include_automatic:
+            columns += ["capture_automatic_skip", "capture_media_failure"]
+        row = cls.objects.filter(pk=1).values_list(*columns).first()
+        if row is None or not row[0]:
+            return (False,) * (len(columns) - 1)
+        return tuple(bool(v) for v in row[1:])
+
 
 class HourRefillCause(models.Model):
     """Append-only evidence that one positively identified event shortened
@@ -1253,10 +1275,18 @@ class HourRefillCause(models.Model):
 
     CAUSE_REQUEST_SUBSTITUTION = "request_substitution"
     CAUSE_OPERATOR_EJECT = "operator_eject"
+    CAUSE_START_NEXT = "start_next"
+    CAUSE_AUTOMATIC_SKIP = "automatic_skip"
+    CAUSE_MEDIA_FAILURE = "media_failure"
     CAUSE_CHOICES = [
         (CAUSE_REQUEST_SUBSTITUTION, "Shorter web-request substitution"),
         (CAUSE_OPERATOR_EJECT, "Completed operator Eject"),
+        (CAUSE_START_NEXT, "Completed Start Next fade (r0121)"),
+        (CAUSE_AUTOMATIC_SKIP, "Automatic skip: scheduled media missing (r0121)"),
+        (CAUSE_MEDIA_FAILURE, "Media error ended a scheduled song (r0121)"),
     ]
+    PHASE_PRE_AIR = "pre_air"
+    PHASE_POST_AIR = "post_air"
     STATE_RECORDED = "recorded"
     STATE_CHOICES = [
         (STATE_RECORDED, "Recorded (evidence only; nothing installed)"),
@@ -1295,6 +1325,17 @@ class HourRefillCause(models.Model):
     deck_slot = models.CharField(max_length=1, blank=True, default="")
     deck_generation = models.BigIntegerField(null=True, blank=True)
     eject_position_seconds = models.FloatField(null=True, blank=True)
+
+    # start_next evidence (r0121): the engine's accepted request id (server
+    # derived, no user data) and the source position at the completed cut.
+    start_next_request_id = models.CharField(max_length=64, blank=True, default="")
+    start_next_position_seconds = models.FloatField(null=True, blank=True)
+
+    # automatic_skip / media_failure evidence (r0121). failure_reason is an
+    # internal code (e.g. "file_missing", "stream_decode"), never a path.
+    failure_phase = models.CharField(max_length=16, blank=True, default="")
+    failure_reason = models.CharField(max_length=32, blank=True, default="")
+    failure_position_seconds = models.FloatField(null=True, blank=True)
 
     class Meta:
         ordering = ["occurred_at", "id"]
@@ -1336,7 +1377,49 @@ class HourRefillCause(models.Model):
                 name="hour_refill_cause_eject_fields",
             ),
             models.CheckConstraint(
-                condition=models.Q(cause_type__in=["request_substitution", "operator_eject"]),
+                condition=(
+                    ~models.Q(cause_type="start_next")
+                    | (
+                        models.Q(
+                            deck_generation__isnull=False,
+                            start_next_position_seconds__isnull=False,
+                            original_track_id_snapshot__isnull=False,
+                        )
+                        & ~models.Q(engine_instance="")
+                        & ~models.Q(deck_slot="")
+                        & ~models.Q(start_next_request_id="")
+                    )
+                ),
+                name="hour_refill_cause_start_next_fields",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(cause_type="automatic_skip")
+                    | (
+                        models.Q(original_track_id_snapshot__isnull=False, failure_phase="pre_air")
+                        & ~models.Q(failure_reason="")
+                    )
+                ),
+                name="hour_refill_cause_automatic_skip_fields",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(cause_type="media_failure")
+                    | (
+                        models.Q(original_track_id_snapshot__isnull=False, deck_generation__isnull=False,
+                                 failure_phase__in=["pre_air", "post_air"])
+                        & ~models.Q(engine_instance="")
+                        & ~models.Q(deck_slot="")
+                        & ~models.Q(failure_reason="")
+                        & (~models.Q(failure_phase="post_air")
+                           | models.Q(failure_position_seconds__isnull=False))
+                    )
+                ),
+                name="hour_refill_cause_media_failure_fields",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(cause_type__in=["request_substitution", "operator_eject", "start_next",
+                                                   "automatic_skip", "media_failure"]),
                 name="hour_refill_cause_known_type",
             ),
         ]

@@ -50,6 +50,11 @@ D3A_CONSTRAINTS = {"active_message_one_active_per_producer_type"}
 D3D_REF = "active_messages.0005_execution_history_indexes"
 D3D_INDEXES = {"active_execution_recent", "active_execution_members"}
 D3D_MANUAL = [(D3D_REF, "AddIndex"), (D3D_REF, "AddIndex")]
+# authz is a linear chain, so migrating it back to 0007 also leaves its later
+# capability seeds pending: 0009 (r0117) and 0010 (r0118), each a RunPython
+# authorized by its own release's companion.
+LATER_SEED_REFS = ["authz.0009_playout_start_next_capability", "authz.0010_remote_dj_admin_capabilities"]
+LATER_SEED_MANUAL = [(ref, "RunPython") for ref in LATER_SEED_REFS]
 
 
 def _migration_calls(path):
@@ -170,11 +175,13 @@ class LivePlanClassificationTests(TransactionTestCase):
             payload = probe.build_probe_payload()
             # 2.22D3C: produced_content's later migrations (its own classifier test).
             self.assertEqual(sorted(item["ref"] for item in payload["plan"]),
-                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF] + D3C_REFS + [D3D_REF]))
+                             sorted(REFS + D3A_REFS + [PRODUCED_REF, SEED_REF] + D3C_REFS + [D3D_REF]
+                                    + LATER_SEED_REFS))
             self.assertEqual(payload["conflicts"], {})
             manual = probe.extract_manual_operations(payload["plan"])
             self.assertEqual(sorted((entry["ref"], entry["operation"]) for entry in manual),
-                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL + D3C_MANUAL + D3D_MANUAL))
+                             sorted([(SEED_REF, "RunPython")] + D3A_MANUAL + D3C_MANUAL + D3D_MANUAL
+                                    + LATER_SEED_MANUAL))
         finally:
             call_command("migrate", verbosity=0)
         self.assertEqual(Capability.objects.filter(slug__startswith="active_message.").count(), 2)

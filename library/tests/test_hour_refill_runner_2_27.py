@@ -238,7 +238,12 @@ class GateMigrationTests(TransactionTestCase):
     def test_forward_keeps_rows_and_reverse_needs_dry_run(self):
         call_command("migrate", "library", "0095", verbosity=0)
         self.assertTrue(status_mod.dry_run_gate_present())
-        HourRefillPolicy(enabled=True, capture_request_substitution=True, capture_operator_eject=False).save()
+        # r0121: the current model has a column (0097) this schema lacks; write
+        # the r0120-shaped row directly.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO library_hourrefillpolicy (id, enabled, capture_request_substitution, "
+                "capture_operator_eject, dry_run_only, updated_at) VALUES (1, true, true, false, true, now())")
         with self.assertRaises(IntegrityError), transaction.atomic():
             HourRefillPolicy.objects.filter(pk=1).update(dry_run_only=False)
         with ARMED:  # new code, old schema: still refuses
@@ -697,6 +702,52 @@ class InstallPathTests(RunnerFixtures, TestCase):
                          ("stale_discarded", ["queue_or_deck_changed"]))
         self.assert_no_writes(before)
 
+    def test_shutdown_before_evaluation_never_requests_a_snapshot(self):
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        before = self.rows()
+        self.set_policy(dry_run=False)
+        engine._stop_started = True
+        engine.running = False
+        runner = self.make_runner(engine)
+        runner.run_once()
+        self.assertEqual(self.outcome(runner)["status"], runner_mod.OUTCOME_ENGINE_STOPPED)
+        self.assertEqual(self.glib.calls, 0)
+        self.assert_no_writes(before)
+
+    def test_shutdown_before_transaction_refuses_the_install(self):
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        before = self.rows()
+        self.set_policy(dry_run=False)
+
+        def begin_shutdown(*_args):
+            engine._stop_started = True
+            engine.running = False
+
+        runner = self.make_runner(engine, installer_hooks={"before_transaction": begin_shutdown})
+        runner.run_once()
+        self.assertEqual((self.outcome(runner)["status"], self.outcome(runner)["reasons"]),
+                         ("stale_discarded", ["engine_stopping_before_transaction"]))
+        self.assertIsNone(engine._refill_coordinator.refill_owner)
+        self.assert_no_writes(before)
+
+    def test_shutdown_after_transaction_lock_may_finish_the_inflight_commit(self):
+        engine = self.eject_engine()
+        self.track(200.0), self.track(180.0)
+        self.set_policy(dry_run=False)
+
+        def begin_shutdown():
+            engine._stop_started = True
+            engine.running = False
+
+        runner = self.make_runner(engine, installer_hooks={"locked": begin_shutdown})
+        runner.run_once()
+        self.assertEqual((self.outcome(runner)["status"], self.outcome(runner)["reasons"]),
+                         ("installed", ["committed"]))
+        self.assertTrue(HourRefillInstall.objects.exists())
+        self.assertIsNone(engine._refill_coordinator.refill_owner)
+
     def test_policy_turned_off_inside_the_install_transaction_writes_nothing(self):
         engine = self.eject_engine()
         self.track(200.0), self.track(180.0)
@@ -769,6 +820,31 @@ class BackoffAndIsolationTests(RunnerFixtures, TestCase):
         self.assertEqual(runner.counters["capture_coalesced"], 1)
         self.glib.flush()  # the late callback lands in an abandoned mailbox
         self.assertFalse(runner._capture_outstanding)
+        self.assertEqual(self.outcome(runner)["status"], "snapshot_unavailable")
+
+    def test_late_capture_from_an_old_generation_cannot_feed_the_new_generation(self):
+        engine = self.eject_engine()
+        self.set_policy()
+        runner = self.make_runner(engine)
+        self.glib.deferred = True
+        with patch.object(inst.request_snapshot, "__kwdefaults__", {"timeout": 0.05, "wall_clock": None}):
+            runner.run_once()
+            old_outcome = dict(self.outcome(runner))
+
+            # start() advances this token. The still-queued old capture keeps
+            # single-flight ownership, so the new generation cannot enqueue a
+            # second GLib snapshot behind it.
+            runner._generation += 1
+            self.advance(runner_mod.RETRY_SECONDS)
+            runner.run_once(runner._generation)
+            new_outcome = dict(self.outcome(runner))
+
+        self.assertEqual((self.glib.calls, len(self.glib.queued)), (1, 1))
+        self.assertEqual(runner.counters["capture_coalesced"], 1)
+        self.glib.flush()
+        self.assertFalse(runner._capture_outstanding)
+        self.assertEqual(old_outcome["status"], "snapshot_unavailable")
+        self.assertEqual(self.outcome(runner), new_outcome)
 
     def test_idle_add_failure_is_contained(self):
         engine = self.eject_engine()
@@ -1088,11 +1164,34 @@ class AdminSurfaceTests(RunnerFixtures, TestCase):
         self.assertEqual(self.client.post(change, {"enabled": "on", "dry_run_only": "on"}).status_code, 403)
         self.assertFalse(HourRefillPolicy.objects.get().enabled)
 
-    def test_get_never_creates_the_policy_row(self):
+    def test_no_row_page_never_creates_policy_and_keeps_an_explicit_add_path(self):
         self.client.force_login(self.admin)
         response = self.client.get(self.url)
-        self.assertRedirects(response, reverse("admin:library_hourrefillpolicy_add"), fetch_redirect_response=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Off: no policy row")
+        self.assertContains(response, reverse("admin:library_hourrefillpolicy_add"))
+        self.assertFalse(HourRefillPolicy.objects.exists())
         self.client.get(reverse("admin:library_hourrefillpolicy_add"))
+        self.assertFalse(HourRefillPolicy.objects.exists())
+
+    def test_view_only_operator_can_see_off_no_row_but_cannot_create(self):
+        viewer = User.objects.create_user("refill-viewer", password="pw", is_staff=True)
+        viewer.user_permissions.add(Permission.objects.get(codename="view_hourrefillpolicy"))
+        self.client.force_login(User.objects.get(pk=viewer.pk))
+        add_url = reverse("admin:library_hourrefillpolicy_add")
+
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        for text in ("Off: no policy row", "Master switch", "unknown (missing status)",
+                     "Host armed (this web process)"):
+            self.assertContains(response, text)
+        self.assertNotContains(response, f'href="{add_url}"')
+        self.assertFalse(HourRefillPolicy.objects.exists())
+
+        self.assertEqual(self.client.post(add_url, {
+            "enabled": "on", "capture_request_substitution": "on",
+            "capture_operator_eject": "on", "dry_run_only": "on",
+        }).status_code, 403)
         self.assertFalse(HourRefillPolicy.objects.exists())
 
     def test_page_shows_enabled_and_dry_run_separately_and_unknown_runner(self):

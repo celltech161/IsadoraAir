@@ -13,7 +13,9 @@ tree, so the test stays true after publication and after later releases
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -54,6 +56,7 @@ ENGINEERING_SURFACE = {
     "library/templates/library/dashboard.html",
 }
 PROTECTED_PREFIXES = ("deploy/updater_runtime/", "deploy/updater_bootstrap/", "deploy/updater_attestations/")
+HISTORY_PATHS = ("deploy/releases", "deploy/migration_authorizations", "docs/releases", "updatecenter/tests")
 
 
 def _git(*args) -> str:
@@ -75,8 +78,17 @@ def _release_commit() -> str:
     return commits[0]
 
 
+def _diff_args(base: str, commit: str, *filters: str) -> list[str]:
+    """``git diff --name-only`` arguments from base to commit. Any ``--``
+    pathspec in ``filters`` goes after both revisions: placed before them,
+    git reads the revisions as paths and the diff is silently empty."""
+    options = list(filters)
+    paths = options[options.index("--"):] if "--" in options else []
+    return ["diff", "--name-only", "--no-renames", *options[:len(options) - len(paths)], base, commit, *paths]
+
+
 def _changed(base: str, commit: str, *filters: str) -> set[str]:
-    return set(_git("diff", "--name-only", "--no-renames", *filters, base, commit).split())
+    return set(_git(*_diff_args(base, commit, *filters)).split())
 
 
 def _repository() -> TrustedRepository:
@@ -143,8 +155,7 @@ class R0119AncestryTests(SimpleTestCase):
 
     def test_historical_release_artifacts_are_untouched(self):
         release = _release_commit()
-        history = _changed(R0118_TIP, release, "--diff-filter=MDR", "--", "deploy/releases",
-                           "deploy/migration_authorizations", "docs/releases", "updatecenter/tests")
+        history = _changed(R0118_TIP, release, "--diff-filter=MDR", "--", *HISTORY_PATHS)
         self.assertEqual(history, set())
 
 
@@ -181,6 +192,93 @@ class R0119MigrationTests(SimpleTestCase):
         repository = _repository()
         entry = {item.manifest.release_id: item for item in load_chain(repository, release)}["r0119"]
         self.assertIsNone(validate_release_companion(repository, release, entry))
+
+
+class R0119DiffNegativeControlTests(SimpleTestCase):
+    """The pathspec-filtered diffs above must see a real change. A throwaway
+    bare repository (objects borrowed from this one by alternates) holds one
+    plumbing-only commit on top of the REAL r0119 release commit that alters a
+    historical migration and a protected-runtime file, edits historical
+    release notes and deletes a historical manifest. Every form used above
+    has to report it; the original argument order (pathspec before the
+    revisions) reported nothing."""
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.git_dir = root / "control.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.git_dir)], check=True)
+        common = Path(_git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        (self.git_dir / "objects" / "info" / "alternates").write_text(str(common / "objects") + "\n")
+        self.env = {**os.environ, "GIT_INDEX_FILE": str(root / "index"),
+                    "GIT_AUTHOR_NAME": "r0119 control", "GIT_AUTHOR_EMAIL": "control@example.invalid",
+                    "GIT_COMMITTER_NAME": "r0119 control", "GIT_COMMITTER_EMAIL": "control@example.invalid"}
+        self.release = _release_commit()
+        self.migration = sorted(path for path in _migration_blobs(self.release)
+                                if path.startswith("library/migrations/"))[-1]
+        self.protected = sorted(path for path in _git("ls-tree", "-r", "--name-only", self.release,
+                                                      "--", "deploy/updater_runtime").split())[0]
+        self.control = self._commit(self.release, {
+            self.migration: _show(self.release, self.migration) + b"\n# altered\n",
+            self.protected: _show(self.release, self.protected) + b"\n# altered\n",
+            "docs/releases/r0118.md": _show(self.release, "docs/releases/r0118.md") + b"\naltered\n",
+            "deploy/releases/r0118.json": None,
+        })
+
+    def _git(self, *args, data: bytes | None = None) -> str:
+        return subprocess.run(["git", f"--git-dir={self.git_dir}", *args], check=True, capture_output=True,
+                              input=data, env=self.env).stdout.decode().strip()
+
+    def _commit(self, parent: str, files: dict[str, bytes | None]) -> str:
+        self._git("read-tree", parent)
+        for path, data in files.items():
+            if data is None:   # mode 0 removes the entry; works without a work tree
+                self._git("update-index", "--index-info", data=f"0 {'0' * 40}\t{path}\n".encode())
+            else:
+                blob = self._git("hash-object", "-w", "--stdin", data=data)
+                self._git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        return self._git("commit-tree", self._git("write-tree"), "-p", parent, "-m", "negative control")
+
+    def _changed(self, base: str, *filters: str) -> set[str]:
+        return set(self._git(*_diff_args(base, self.control, *filters)).split())
+
+    def test_an_altered_historical_migration_is_reported(self):
+        self.assertTrue(self.migration.endswith(".py"))
+        for base in (self.release, R0118_TIP, R0118_RELEASE):
+            self.assertEqual(self._changed(base, "--", "*/migrations/*"), {self.migration})
+        blob = self._git("rev-parse", f"{self.control}:{self.migration}")
+        self.assertNotEqual(blob, _migration_blobs(self.release)[self.migration])
+
+    def test_altered_or_deleted_historical_release_artifacts_are_reported(self):
+        self.assertEqual(self._changed(R0118_TIP, "--diff-filter=MDR", "--", *HISTORY_PATHS),
+                         {"docs/releases/r0118.md", "deploy/releases/r0118.json"})
+        self.assertEqual(self._changed(R0118_TIP, "--diff-filter=D", "--", *HISTORY_PATHS),
+                         {"deploy/releases/r0118.json"})
+
+    def test_an_altered_protected_runtime_file_is_reported(self):
+        self.assertTrue(self.protected.startswith(PROTECTED_PREFIXES))
+        changed = self._changed(R0118_RELEASE)
+        self.assertIn(self.protected, changed)
+        self.assertEqual({path for path in changed if path.startswith(PROTECTED_PREFIXES)}, {self.protected})
+        self.assertEqual(self._changed(self.release, "--", "deploy/updater_runtime"), {self.protected})
+
+    def test_revisions_always_precede_the_pathspec(self):
+        self.assertEqual(_diff_args("a", "b", "--diff-filter=MDR", "--", "x", "y"),
+                         ["diff", "--name-only", "--no-renames", "--diff-filter=MDR", "a", "b", "--", "x", "y"])
+        self.assertEqual(_diff_args("a", "b", "--diff-filter=A"),
+                         ["diff", "--name-only", "--no-renames", "--diff-filter=A", "a", "b"])
+
+    def test_the_original_argument_order_was_vacuous_on_real_history(self):
+        # r0118's metadata-only companion is the one real change between its
+        # release commit and tip. The pre-correction order (pathspec before
+        # the revisions) diffed the work tree against the index for two
+        # "paths" named like commits, and so reported nothing.
+        def original(base, commit, *filters):
+            return set(_git("diff", "--name-only", "--no-renames", *filters, base, commit).split())
+        companion = {"deploy/migration_authorizations/r0118.json"}
+        self.assertEqual(original(R0118_RELEASE, R0118_TIP, "--", "deploy/migration_authorizations"), set())
+        self.assertEqual(_changed(R0118_RELEASE, R0118_TIP, "--", "deploy/migration_authorizations"), companion)
+        self.assertEqual(_changed(R0118_RELEASE, R0118_TIP, "--", *HISTORY_PATHS), companion)
+        self.assertEqual(_changed(R0118_RELEASE, R0118_TIP, "--", "*/migrations/*"), set())
 
 
 class R0119SurfaceTests(SimpleTestCase):

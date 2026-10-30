@@ -23,11 +23,17 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from django.db import IntegrityError, OperationalError, close_old_connections, connection, transaction
+from django.db import IntegrityError, OperationalError, ProgrammingError, close_old_connections, connection, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from library.services.hour_refill_causality import CAUSE_OPERATOR_EJECT, CAUSE_REQUEST_SUBSTITUTION
+from library.services.hour_refill_causality import (
+    CAUSE_AUTOMATIC_SKIP,
+    CAUSE_MEDIA_FAILURE,
+    CAUSE_OPERATOR_EJECT,
+    CAUSE_REQUEST_SUBSTITUTION,
+    CAUSE_START_NEXT,
+)
 from library.services.hour_refill_projection import EVIDENCE_NOTE, project_refill
 from library.services.hour_refill_proposal import (
     PSA_CATEGORY_KIND,
@@ -79,11 +85,22 @@ def install_permitted(*, cause_types=(), lock=False):
     rows = HourRefillPolicy.objects.filter(pk=1)
     if lock:
         rows = rows.select_for_update()
-    row = rows.values_list("enabled", "dry_run_only", "capture_request_substitution",
-                           "capture_operator_eject").first()
+    try:
+        row = rows.values_list("enabled", "dry_run_only", "capture_request_substitution",
+                               "capture_operator_eject", "capture_start_next", "capture_automatic_skip",
+                               "capture_media_failure").first()
+    except ProgrammingError:
+        # A database without the r0121 columns (0097/0098): refuse. Inside a
+        # transaction the error must propagate (it aborts the transaction,
+        # so nothing is written either way). Lock timeouts and other
+        # OperationalErrors are not caught here: callers report them.
+        if connection.in_atomic_block:
+            raise
+        return False
     if not (row and row[0] and not row[1] and getattr(settings, "HOUR_REFILL_INSTALL_ARMED", False) is True):
         return False
-    switches = {CAUSE_REQUEST_SUBSTITUTION: row[2], CAUSE_OPERATOR_EJECT: row[3]}
+    switches = {CAUSE_REQUEST_SUBSTITUTION: row[2], CAUSE_OPERATOR_EJECT: row[3], CAUSE_START_NEXT: row[4],
+                CAUSE_AUTOMATIC_SKIP: row[5], CAUSE_MEDIA_FAILURE: row[6]}
     return all(switches.get(cause_type, False) for cause_type in cause_types)
 
 
@@ -332,6 +349,8 @@ class HourRefillInstaller:
                 raise _Abort(STATUS_STALE, "media_missing")
             frame, lead = self._cas_one(s1, s2, proposal, planned)
             self._hook("before_transaction", s2)
+            if getattr(self.engine, "_stop_started", False):
+                raise _Abort(STATUS_STALE, "engine_stopping_before_transaction")
             return self._commit(s2, proposal, planned, frame, lead, received)
         except _Abort as abort:
             return InstallResult(abort.status, abort.reasons, log_id=s2.active_log_id,

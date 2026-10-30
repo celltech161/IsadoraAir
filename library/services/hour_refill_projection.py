@@ -22,20 +22,34 @@ from datetime import datetime, time as dtime, timedelta, timezone as dt_timezone
 from django.utils import timezone
 
 from library.services.hour_refill_causality import (
+    CAUSE_AUTOMATIC_SKIP,
+    CAUSE_MEDIA_FAILURE,
     CAUSE_OPERATOR_EJECT,
     CAUSE_REQUEST_SUBSTITUTION,
+    CAUSE_START_NEXT,
+    PHASE_PRE_AIR,
     REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS,
     _MISSING,
     _cached,
+    _causal_order,
     _loaded,
     _ms,
-    build_causality_trace,
+    occurrence_family,
 )
 
 # Draft Phase B policy (not a roadmap requirement): an Eject-only cause set
 # proposes music only for a net shortage strictly greater than 30 s, the
 # ordinary fit margin. Web-request rule stays strictly > 60 s.
 EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS = 30
+# r0121, PROVISIONAL and not operator-approved: a Start Next-only cause set
+# uses the same 30 s ordinary fit margin. Its own constant so an operator
+# decision can move it without touching the Eject rule.
+START_NEXT_MUSIC_TRIGGER_THRESHOLD_SECONDS = 30
+# r0121, PROPOSED for operator review (not approved): automatic causes are a
+# station failure, not an operator decision; a strict 60 s (the request rule's
+# strictness), deliberately not the Eject rule.
+AUTOMATIC_SKIP_MUSIC_TRIGGER_THRESHOLD_SECONDS = 60
+MEDIA_FAILURE_MUSIC_TRIGGER_THRESHOLD_SECONDS = 60
 
 # Engine timing facts (engine._poll_position), mirrored here as constants.
 TRIGGER_CLAMP_SECONDS = 10.0       # trigger = next_start - next_cue_in, or next_start when < 10
@@ -457,43 +471,83 @@ class QualifiedCause:
     replacement_track_id: int | None
 
 
+def _qualification_problem(record, snapshot, by_id, pending_ids, deck_ids):
+    """Why `record` does not (or no longer) describe its occurrence in THIS
+    snapshot, else None. Pure; judged per record, before any dedup."""
+    if record.log_id != snapshot.active_log_id:
+        return "stale_log"
+    if record.scheduled_category_kind_code != "music" or record.scheduled_category_id is None:
+        return "not_music_slot"
+    occurrence = by_id.get(record.log_item_id)
+    if occurrence is None:
+        return "missing_occurrence"
+    if record.cause_type == CAUSE_REQUEST_SUBSTITUTION:
+        if occurrence.track_id != record.replacement_track_id:
+            return "superseded"
+    elif record.cause_type == CAUSE_OPERATOR_EJECT:
+        if record.log_item_id in pending_ids or record.log_item_id in deck_ids:
+            return "occurrence_still_pending"
+    elif record.cause_type == CAUSE_START_NEXT:
+        # The cut occurrence must be over AND still the exact Track that
+        # was cut (a later swap or restore is a different occurrence).
+        if record.log_item_id in pending_ids or record.log_item_id in deck_ids:
+            return "occurrence_still_pending"
+        if record.original_track_id is None or occurrence.track_id != record.original_track_id:
+            return "superseded"
+    elif record.cause_type in (CAUSE_AUTOMATIC_SKIP, CAUSE_MEDIA_FAILURE):
+        # Over, still the same Track, and -- for a never-aired loss --
+        # still never aired (a reload can revisit a skipped row whose
+        # file came back; it then plays and the skip is void).
+        if record.log_item_id in pending_ids or record.log_item_id in deck_ids:
+            return "occurrence_still_pending"
+        if record.original_track_id is None or occurrence.track_id != record.original_track_id:
+            return "superseded"
+        if record.cause_type == CAUSE_AUTOMATIC_SKIP and (occurrence.claimed or occurrence.played):
+            return "occurrence_aired"
+        if record.failure_phase == PHASE_PRE_AIR and occurrence.played:
+            return "occurrence_aired"
+    else:
+        return "unknown_cause_type"
+    return None
+
+
 def partition_causes(snapshot, records):
-    """(qualified, excluded): Phase A's trace ordering/dedup, then only
-    causes for THIS active log whose occurrence is still provably what the
-    cause describes. Excluded causes are listed, never deleted."""
-    trace = build_causality_trace(
-        records, active_log_date=snapshot.active_log_date, active_log_hour=snapshot.active_log_hour,
-    )
-    excluded = [(key, reason) for key, reason in trace.duplicates]
-    excluded += [(r.source_key, "other_hour") for r in trace.other_hour_causes]
+    """(qualified, excluded) for THIS active hour. In causal order: drop a
+    repeated source_key and other hours, qualify EACH record against the
+    current occurrence, and only then keep the first QUALIFYING cause per
+    occurrence family (termination types share one family). An earlier
+    cause that no longer holds -- e.g. a skip whose occurrence later aired --
+    therefore never suppresses a later valid one (r0121 P1), and two valid
+    causes for one occurrence never both count ("duplicate_occurrence_cause",
+    now assigned among qualifying causes only). Selection is by causal
+    order, never by policy, so no subset can be chosen to evade a switch.
+    Excluded causes are listed with their reason, never deleted."""
     deck_ids = {d.item.log_item_id for d in snapshot.decks if d.item is not None}
     pending_ids = {it.log_item_id for it in snapshot.forced}
     pending_ids |= {it.log_item_id for it in snapshot.queue[snapshot.cursor:]}
     by_id = {it.log_item_id: it for it in snapshot.queue}
     by_id.update({it.log_item_id: it for it in snapshot.forced})
-    qualified = []
-    for record in trace.causes:
-        if record.log_id != snapshot.active_log_id:
-            excluded.append((record.source_key, "stale_log"))
+    excluded, candidates, seen_keys = [], [], set()
+    for record in sorted(records, key=_causal_order):
+        if record.source_key in seen_keys:
+            excluded.append((record.source_key, "duplicate_source_key"))
             continue
-        if record.scheduled_category_kind_code != "music" or record.scheduled_category_id is None:
-            excluded.append((record.source_key, "not_music_slot"))
+        seen_keys.add(record.source_key)
+        if (record.log_date, record.log_hour) != (snapshot.active_log_date, snapshot.active_log_hour):
+            excluded.append((record.source_key, "other_hour"))
             continue
-        occurrence = by_id.get(record.log_item_id)
-        if occurrence is None:
-            excluded.append((record.source_key, "missing_occurrence"))
+        problem = _qualification_problem(record, snapshot, by_id, pending_ids, deck_ids)
+        if problem:
+            excluded.append((record.source_key, problem))
             continue
-        if record.cause_type == CAUSE_REQUEST_SUBSTITUTION:
-            if occurrence.track_id != record.replacement_track_id:
-                excluded.append((record.source_key, "superseded"))
-                continue
-        elif record.cause_type == CAUSE_OPERATOR_EJECT:
-            if record.log_item_id in pending_ids or record.log_item_id in deck_ids:
-                excluded.append((record.source_key, "occurrence_still_pending"))
-                continue
-        else:
-            excluded.append((record.source_key, "unknown_cause_type"))
+        candidates.append(record)
+    qualified, seen_occurrence = [], set()
+    for record in candidates:
+        occurrence = (occurrence_family(record.cause_type), record.log_item_id)
+        if occurrence in seen_occurrence:
+            excluded.append((record.source_key, "duplicate_occurrence_cause"))
             continue
+        seen_occurrence.add(occurrence)
         qualified.append(QualifiedCause(
             cause_id=record.id, source_key=record.source_key, cause_type=record.cause_type,
             occurred_at=record.occurred_at, log_item_id=record.log_item_id,
@@ -506,12 +560,34 @@ def partition_causes(snapshot, records):
     return tuple(qualified), tuple(excluded)
 
 
+_CUT_THRESHOLDS = {
+    CAUSE_OPERATOR_EJECT: EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+    CAUSE_START_NEXT: START_NEXT_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+    CAUSE_AUTOMATIC_SKIP: AUTOMATIC_SKIP_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+    CAUSE_MEDIA_FAILURE: MEDIA_FAILURE_MUSIC_TRIGGER_THRESHOLD_SECONDS,
+}
+
+
 def threshold_for(qualified):
     """(seconds, basis). Any web substitution => the strict 60 s web rule
-    for the combined net deficit; Eject-only => the provisional 30 s gate."""
-    if any(c.cause_type == CAUSE_REQUEST_SUBSTITUTION for c in qualified):
+    for the combined net deficit; Eject-only => the provisional 30 s gate
+    (r0120, unchanged); otherwise the STRICTEST threshold of the operator
+    cut types present (r0121). An unknown type never reaches here
+    (partition_causes excludes it); if one did, the strictest known rule
+    applies."""
+    types = {c.cause_type for c in qualified}
+    if CAUSE_REQUEST_SUBSTITUTION in types:
         return float(REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS), "request_substitution_present"
-    return float(EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS), "operator_eject_only_provisional"
+    if types <= {CAUSE_OPERATOR_EJECT}:
+        return float(EJECT_MUSIC_TRIGGER_THRESHOLD_SECONDS), "operator_eject_only_provisional"
+    if not types <= set(_CUT_THRESHOLDS):
+        return float(max(REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS, *_CUT_THRESHOLDS.values())), "unknown_cause_strictest"
+    seconds = float(max(_CUT_THRESHOLDS[t] for t in types))
+    if types == {CAUSE_START_NEXT}:
+        return seconds, "start_next_only_provisional"
+    if types & {CAUSE_AUTOMATIC_SKIP, CAUSE_MEDIA_FAILURE}:
+        return seconds, "automatic_failure_proposed"
+    return seconds, "operator_cuts_provisional"
 
 
 # ---------------------------------------------------------------------------

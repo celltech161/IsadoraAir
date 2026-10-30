@@ -1,0 +1,25 @@
+{% extends "admin/change_list.html" %}
+
+{% block content %}
+  {% if hour_refill_no_policy %}
+    <div id="content-main">
+      <p class="help">
+        <strong>Off: no policy row.</strong>
+        Nothing is captured, evaluated, or installed. This page does not create a default row.
+      </p>
+      {% if not has_add_permission %}
+        <p class="help">This is a read-only status view. An administrator with Add permission can create the policy.</p>
+      {% endif %}
+      {% for heading, value in hour_refill_status_sections %}
+        <div class="module aligned">
+          <h2>{{ heading }}</h2>
+          <div class="form-row">
+            <div class="readonly">{{ value }}</div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    {{ block.super }}
+  {% endif %}
+{% endblock %}

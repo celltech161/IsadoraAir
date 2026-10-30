@@ -26,15 +26,18 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tarfile
 import tempfile
 import uuid
 from pathlib import Path
 
+from django.apps import apps
 from django.core.management import call_command
 from django.db import IntegrityError, connection
 from django.db.migrations.loader import MigrationLoader
 from django.db.models import NOT_PROVIDED
-from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
 from .phase_b_helpers import RUNTIME_ROOT, config_dict  # noqa: F401  (puts the protected runtime on sys.path)
 from isadoraair_updater.config import validate_config_dict
@@ -693,13 +696,56 @@ class R0120TrustedPlanTests(SimpleTestCase):
                          {"r0120": _expected_identities()})          # r0119 has no companion
 
 
+def _materialize_release_target(commit: str, root: Path) -> tuple[Path, dict[str, str | None]]:
+    """r0120's exact migration target, independent of later working-tree
+    migrations (r0121 review): every in-repository app's migrations package
+    and the release manifest, extracted from the immutable `commit` with
+    `git archive` under a unique top-level package in `root`.
+
+    Returns (tree, MIGRATION_MODULES). With those modules the UNCHANGED
+    updatecenter_probe builds its graph, plan, file hashes, classifications
+    and digest from the commit's own migration files, and reads the commit's
+    own manifest from `tree`. An app without a migrations package at the
+    commit is unmigrated there (None). Django's own and third-party apps are
+    not release-tree content and keep their installed migrations."""
+    package = f"_r0120_target_{uuid.uuid4().hex}"
+    tree = root / package
+    tracked = set(_git("ls-tree", "-r", "--name-only", commit).splitlines())
+    modules, paths = {}, []
+    for config in apps.get_app_configs():
+        app_dir = Path(config.path).resolve()
+        if not app_dir.is_relative_to(PROJECT_ROOT):
+            continue
+        rel = app_dir.relative_to(PROJECT_ROOT)
+        if f"{(rel / 'migrations').as_posix()}/__init__.py" in tracked:
+            modules[config.label] = ".".join((package, *rel.parts, "migrations"))
+            paths.append((rel / "migrations").as_posix())
+        else:
+            modules[config.label] = None
+    archive = subprocess.run(["git", "-C", str(PROJECT_ROOT), "archive", "--format=tar", commit, "--",
+                              *paths, MANIFEST_PATH], check=True, capture_output=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(tree, filter="data")
+    for path in paths:                       # plain packages above each migrations package
+        for parent in (tree / path).parents:
+            if parent == root:
+                break
+            (parent / "__init__.py").touch(exist_ok=True)
+    return tree, modules
+
+
 class R0120ProtectedExecutorTests(TransactionTestCase):
     """The protected executor's own _validate_target_schema, fed the REAL
     updatecenter_probe payload of a development test database rolled back to
     the r0119 schema (library at 0092), with the REAL trusted repository and
-    plan. Limit: the current-schema probe is modelled as the r0119 graph
-    (this graph without the four r0120 nodes) rather than produced by r0119
-    source; the target probe, classifier, digest and authorization are real."""
+    plan. The target probe runs on r0120's own migration graph and manifest,
+    materialized from the release commit (_materialize_release_target), so a
+    later development tree's migrations never enter r0120's target; anything
+    the target graph itself contains beyond the declared closure still fails
+    closed in the real executor. Limit: the current-schema probe is modelled
+    as the r0119 graph (r0120's graph without the four r0120 nodes) rather
+    than produced by r0119 source; the target probe, classifier, digest and
+    authorization are real."""
 
     def setUp(self):
         self.tip = _companion_commit()
@@ -708,14 +754,30 @@ class R0120ProtectedExecutorTests(TransactionTestCase):
         self.release = _release_commit()
         self.repository = _repository()
         self.plan = derive_plan(self.repository, self.tip, R0119, "r0120", known_units=_known_units())
-        self.assertEqual(MANIFEST.read_bytes(), _show(self.release, MANIFEST_PATH))  # probe hashes the working copy
+        self.assertEqual(MANIFEST.read_bytes(), _show(self.release, MANIFEST_PATH))
         self.addCleanup(call_command, "migrate", verbosity=0)    # registered first, so it always runs last
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.target_tree, modules = self.materialize_target(Path(temp.name))
+        sys.path.insert(0, temp.name)
+        self.addCleanup(self._forget_target, temp.name, self.target_tree.name)
+        with override_settings(MIGRATION_MODULES=modules):
+            historical_graph = MigrationLoader(None, ignore_no_migrations=True).graph
+        historical = self.historical_nodes = set(historical_graph.nodes)
+        current = MigrationLoader(None, ignore_no_migrations=True).graph
+        self.assertEqual(historical - set(current.nodes), set(), "r0120 migrations missing from this tree")
+        # Roll back every later node (any app) to that app's r0120 leaf, so
+        # the database holds no applied migration the r0120 graph lacks.
+        for app in sorted({app for app, _name in set(current.nodes) - historical}):
+            leaves = historical_graph.leaf_nodes(app)
+            call_command("migrate", app, leaves[0][1] if leaves else "zero", verbosity=0)
         call_command("migrate", "library", "0092", verbosity=0)
         cwd = os.getcwd()
-        os.chdir(PROJECT_ROOT)
+        os.chdir(self.target_tree)                               # the probe reads deploy/releases/ from here
         try:
-            raw = json.dumps(probe.build_probe_payload(release_id="r0120", target_commit=self.release),
-                             sort_keys=True, separators=(",", ":")).encode()
+            with override_settings(MIGRATION_MODULES=modules):
+                raw = json.dumps(probe.build_probe_payload(release_id="r0120", target_commit=self.release),
+                                 sort_keys=True, separators=(",", ":")).encode()
         finally:
             os.chdir(cwd)
         self.payload = _strict_probe(raw, review_context=True)
@@ -730,6 +792,16 @@ class R0120ProtectedExecutorTests(TransactionTestCase):
         self.executor = Executor(config, self.store, CommandRunner())
         self.executor.repository = self.repository
 
+    def materialize_target(self, root):
+        return _materialize_release_target(self.release, root)
+
+    @staticmethod
+    def _forget_target(path, package):
+        if path in sys.path:
+            sys.path.remove(path)
+        for name in [name for name in sys.modules if name == package or name.startswith(package + ".")]:
+            del sys.modules[name]
+
     def validate(self, trusted_tip, plan=None):
         plan = plan or self.plan
         job_id = str(uuid.uuid4())
@@ -739,6 +811,13 @@ class R0120ProtectedExecutorTests(TransactionTestCase):
         return actual, job_id
 
     def test_the_real_probe_plan_is_exactly_the_reviewed_plan(self):
+        # Provenance: the probed graph is the release commit's own, and each
+        # planned file's bytes are its blob at the release commit.
+        self.assertEqual(set(self.payload["nodes"]), {f"{app}.{name}" for app, name in self.historical_nodes})
+        for item in self.payload["plan"]:
+            app, name = item["ref"].split(".", 1)
+            self.assertEqual(item["migration_file_sha256"], hashlib.sha256(
+                _show(self.release, f"{app}/migrations/{name}.py")).hexdigest())
         self.assertEqual([item["ref"] for item in self.payload["plan"]], PLAN)
         self.assertEqual({item["ref"]: item["migration_file_sha256"] for item in self.payload["plan"]},
                          MIGRATION_SHA256)

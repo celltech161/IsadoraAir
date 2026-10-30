@@ -1,10 +1,10 @@
 """Roadmap 2.27 Phase A -- the in-process hour-refill evidence writer.
 
 One daemon thread per PlaybackEngine owns every database operation for
-evidence captured on the engine thread (completed Ejects, engine-path
-request swaps). The engine side only reads two cached booleans and calls
-offer(), a bounded put_nowait. It never waits, queries, locks or logs per
-event.
+evidence captured on the engine thread (completed Ejects, completed Start
+Next cuts, engine-path request swaps). The engine side only reads cached
+booleans and calls offer(), a bounded put_nowait. It never waits, queries,
+locks or logs per event.
 
 Best effort by design (operator decision): an event is dropped -- counted,
 never retried -- when capture is Off, the worker isn't running, the queue is
@@ -30,7 +30,7 @@ _STOP = object()
 def _read_capture_flags():
     from library.models import HourRefillPolicy
 
-    return HourRefillPolicy.capture_flags()
+    return HourRefillPolicy.capture_switches(include_automatic=True)
 
 
 def _insert_cause(evidence):
@@ -61,10 +61,13 @@ class HourRefillEvidenceRecorder:
         # successful policy read and after any failed one (fail closed).
         self.capture_requests = False
         self.capture_eject = False
+        self.capture_start_next = False
+        self.capture_automatic_skip = False
+        self.capture_media_failure = False
         self.counters = {
             "recorded": 0, "duplicate": 0, "dropped_full": 0, "dropped_not_running": 0,
             "dropped_policy_off": 0, "dropped_error": 0, "dropped_shutdown": 0,
-            "snapshot_error": 0,
+            "dropped_unknown_type": 0, "snapshot_error": 0,
         }
 
     # -- engine thread -------------------------------------------------------
@@ -105,6 +108,9 @@ class HourRefillEvidenceRecorder:
         thread = self._thread
         self.capture_requests = False
         self.capture_eject = False
+        self.capture_start_next = False
+        self.capture_automatic_skip = False
+        self.capture_media_failure = False
         self._stopping.set()
         if thread is None:
             return
@@ -133,20 +139,48 @@ class HourRefillEvidenceRecorder:
                 print(f"  Hour-refill evidence {name} (count={total}); playout unaffected")
 
     def _refresh_policy(self):
+        """(requests, eject) as r0120; the r0121 switches (Start Next,
+        automatic skip, media failure) are cached on their attributes. A
+        shorter reader leaves the missing ones Off."""
         try:
             close_old_connections()
-            requests, eject = self._read_flags()
+            flags = tuple(self._read_flags()) + (False,) * 5
+            requests, eject, start_next, automatic_skip, media_failure = flags[:5]
         except Exception:  # noqa: BLE001 -- fail closed
-            requests, eject = False, False
+            requests = eject = start_next = automatic_skip = media_failure = False
         self.capture_requests, self.capture_eject = bool(requests), bool(eject)
+        self.capture_start_next = bool(start_next)
+        self.capture_automatic_skip = bool(automatic_skip)
+        self.capture_media_failure = bool(media_failure)
         self._policy_loaded.set()
         return self.capture_requests, self.capture_eject
 
-    def _write(self, evidence):
-        from library.services.hour_refill_causality import CAUSE_OPERATOR_EJECT
+    def _enabled_for(self, cause_type):
+        """The switch for exactly this cause type; None for an unknown type
+        (never another type's switch)."""
+        from library.services.hour_refill_causality import (
+            CAUSE_AUTOMATIC_SKIP, CAUSE_MEDIA_FAILURE, CAUSE_OPERATOR_EJECT, CAUSE_REQUEST_SUBSTITUTION,
+            CAUSE_START_NEXT,
+        )
 
-        requests, eject = self._refresh_policy()  # authoritative per event
-        enabled = eject if evidence.cause_fields()["cause_type"] == CAUSE_OPERATOR_EJECT else requests
+        return {
+            CAUSE_REQUEST_SUBSTITUTION: self.capture_requests,
+            CAUSE_OPERATOR_EJECT: self.capture_eject,
+            CAUSE_START_NEXT: self.capture_start_next,
+            CAUSE_AUTOMATIC_SKIP: self.capture_automatic_skip,
+            CAUSE_MEDIA_FAILURE: self.capture_media_failure,
+        }.get(cause_type)
+
+    def _write(self, evidence):
+        self._refresh_policy()  # authoritative per event
+        try:
+            cause_type = evidence.cause_fields()["cause_type"]
+        except Exception:  # noqa: BLE001
+            cause_type = None
+        enabled = self._enabled_for(cause_type)
+        if enabled is None:
+            self._count("dropped_unknown_type")
+            return
         if not enabled:
             self._count("dropped_policy_off")
             return
@@ -188,6 +222,9 @@ class HourRefillEvidenceRecorder:
         finally:
             self.capture_requests = False
             self.capture_eject = False
+            self.capture_start_next = False
+            self.capture_automatic_skip = False
+            self.capture_media_failure = False
             while True:
                 try:
                     if self._queue.get_nowait() is not _STOP:

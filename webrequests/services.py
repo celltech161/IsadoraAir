@@ -486,14 +486,18 @@ def maybe_schedule_song_request(log_item, *, capture_refill_evidence=False, refi
                         if not is_track_eligible_at(track, eligibility_time, recency_cfg):
                             continue  # ineligible or recency-blocked right now -- leave waiting for a later slot
 
-                        # Roadmap 2.27 Phase A (evidence only). The engine's
-                        # time-sensitive last-second caller deliberately keeps
-                        # the default False: it gets the exact r0119 SQL/lock
-                        # path with no policy read, savepoint, displaced-Track
-                        # lookup or cause insert. The periodic reconciler opts
-                        # in explicitly; a cause missed because only the engine
-                        # performed the swap is preferable to adding optional
-                        # telemetry work to the playback-control thread.
+                        # Roadmap 2.27 Phase A evidence remains opt-in. With
+                        # neither capture argument, default-Off callers retain
+                        # the r0119 SQL/lock path and do no evidence work. The
+                        # periodic reconciler sets capture_refill_evidence and
+                        # writes its durable cause inside this transaction.
+                        # When request capture is On, the engine instead passes
+                        # refill_evidence_sink: evidence is built only from
+                        # already-loaded objects and offered by a robust
+                        # transaction.on_commit callback after the swap commits.
+                        # A rollback offers nothing; the sink is the accepted
+                        # bounded put_nowait handoff, with no cause query or
+                        # insert added to the GLib timing thread.
                         commit_refill_cause = None
                         if capture_refill_evidence:
                             commit_refill_cause = record_request_substitution_cause(

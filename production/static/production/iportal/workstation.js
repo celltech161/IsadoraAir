@@ -25,9 +25,13 @@
     return match ? decodeURIComponent(match.slice(name.length + 1)) : "";
   }
   function fmt(seconds) {
+    seconds = Number(seconds);
     if (!isFinite(seconds) || seconds < 0) seconds = 0;
-    var m = Math.floor(seconds / 60), s = seconds - m * 60;
-    return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+    // Round to tenths first (toFixed's own rounding, as before), then split:
+    // 59.95 reads 1:00.0 and 9.96 reads 0:10.0, never 0:60.0 or 0:010.0.
+    var tenths = Math.round(Number(seconds.toFixed(1)) * 10);
+    var m = Math.floor(tenths / 600), rest = tenths - m * 600, s = Math.floor(rest / 10);
+    return m + ":" + (s < 10 ? "0" : "") + s + "." + (rest % 10);
   }
   function query(params) {
     return Object.keys(params).map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); }).join("&");
