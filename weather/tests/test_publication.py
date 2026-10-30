@@ -4,6 +4,7 @@ Rotation Asset LKG test shape (isadoraair/tests/test_announcements_
 renderer.py) without touching that module at all -- this command is a
 narrow, Weather-specific bridge, not an extension of the generic
 renderer's contract."""
+import json
 import shutil
 import threading
 from pathlib import Path
@@ -16,6 +17,14 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from library.management.commands.analyze_tracks import get_waveforms_dir
 from library.management.commands.sync_track_file import sync_track_file as real_sync_track_file
 from library.models import Artist, Category, CategoryKind, Track
+
+
+def _generated_waveform(track_id):
+    """What the faked analysis "writes": a minimal, structurally valid waveform cache of this Track
+    (the shared cache writer validates what it installs, r0123), marked so a test can find it."""
+    return json.dumps({"marker": "GENERATED-WAVEFORM", "track_id": track_id, "samples_left": [1, 2],
+                       "samples_right": [1, 2], "envelope_times": [0.5, 1.0], "envelope_db": [-30.0, -30.0],
+                       "analysis_duration": 1.0})
 from weather import provenance as provenance_mod
 from weather.publication import PublicationError, publish_weather_asset
 
@@ -64,7 +73,7 @@ class PublicationTestCase(TestCase):
             if succeed and write_waveform:
                 track_id = row[0]
                 scratch_path = Path(wave_dir_arg) / f"{track_id}.json"
-                scratch_path.write_text('{"marker": "GENERATED-WAVEFORM"}')
+                scratch_path.write_text(_generated_waveform(track_id))
                 Track.objects.filter(id=track_id).update(waveform_path=str(scratch_path))
             return succeed
         return patch(
@@ -139,7 +148,7 @@ class FirstGenerationTests(PublicationTestCase):
         real_waveform_path = real_wave_dir / f"{result.track.id}.json"
 
         self.assertTrue(real_waveform_path.is_file(), "the real waveform file must exist")
-        self.assertEqual(real_waveform_path.read_text(), '{"marker": "GENERATED-WAVEFORM"}')
+        self.assertEqual(real_waveform_path.read_text(), _generated_waveform(result.track.id))
         self.assertEqual(
             result.track.waveform_path, str(real_waveform_path),
             "the returned Track object must already reflect the REAL path",
@@ -424,7 +433,7 @@ class DestinationLockTests(TransactionTestCase):
             # exactly like the real analyze_one_track().
             track_id = row[0]
             scratch_path = Path(wave_dir_arg) / f"{track_id}.json"
-            scratch_path.write_text('{"marker": "GENERATED-WAVEFORM"}')
+            scratch_path.write_text(_generated_waveform(track_id))
             Track.objects.filter(id=track_id).update(waveform_path=str(scratch_path))
             return True
 

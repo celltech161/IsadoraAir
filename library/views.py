@@ -799,6 +799,37 @@ def api_track_repick_cue_points(request, pk):
     return JsonResponse({**_track_to_dict(track), "cue_markers": outcome["markers"]})
 
 
+@require_http_methods(["POST"])
+def api_track_refresh_waveform(request, pk):
+    """Refresh Waveform Only (r0123 Package B): regenerate the Track's waveform cache from its
+    current audio as a trusted version-2 cache, changing no Track column and no source byte, tag
+    or format (library.services.waveform_generation). Requires library.manage_tracks.
+
+    A Track up to waveform_generation.SYNC_MAX_SECONDS long is refreshed in the request: 200
+    (replaced), 409 (busy, source changed while decoding, superseded by a newer cache), 404/422
+    (no such Track / cannot be refreshed). A longer Track is refreshed by one detached, niced
+    process: 202 (started), or 409 when another long refresh or this Track's refresh is running.
+    Every failure keeps the previous cache."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
+    from library.services import waveform_generation as wg
+    track = get_object_or_404(Track.objects.only("id", "duration_seconds"), pk=pk)
+    long_form = (track.duration_seconds or 0) > wg.SYNC_MAX_SECONDS
+    outcome = wg.start_background(track.pk) if long_form else wg.refresh(track.pk)
+    if outcome.status == wg.STARTED:
+        status = 202
+    elif outcome.ok:
+        status = 200
+    elif outcome.conflict:
+        status = 409
+    elif outcome.status == wg.NOT_FOUND:
+        status = 404
+    else:
+        status = 422
+    return JsonResponse(outcome.to_dict(), status=status)
+
+
 def _optional_json(request):
     """The request's JSON object body: {} without one (no body, or not JSON -- the UI posts
     these actions bare), None when a JSON body is not an object."""
@@ -828,7 +859,12 @@ def _repick_track(track, thresholds, *, requested_by, override=(), confirm=False
     """Re-pick Cue In / Next Start for one Track from its waveform cache -- only a cache that
     library.services.waveform_cache trusts for this Track's current media. Otherwise abstain:
     no marker changes, nothing nulled, nothing queued. Protected markers are preserved unless
-    the operator names them in ``override`` and confirms. Never rewrites the cache file."""
+    the operator names them in ``override`` and confirms. Never rewrites the cache file.
+
+    Trust is re-verified without decoding (the cache's source witness against the Track's file),
+    so a Category Repick costs one cache read and one stat per Track. A trusted cache whose
+    marker snapshot is older than the Track's markers is still used: Repick reads only its
+    envelope and checks the calculation against the Track's *current* marker revision."""
     from library.management.commands.analyze_tracks import repick_from_payload
     from library.services import cue_markers, waveform_cache
     verdict = waveform_cache.validate(track)
@@ -841,9 +877,11 @@ def _repick_track(track, thresholds, *, requested_by, override=(), confirm=False
         return {"ok": False, "status": 409, "reason": "no_envelope", "error": f"Cue points unchanged: {exc}."}
     calculated = {name: value for name, value in (("cue_in_seconds", cue_in), ("next_start_seconds", next_start))
                   if value is not None}
+    from library.services import audio_identity
     result = cue_markers.apply_calculation(
         track.id, calculated, basis_revision=track.cue_marker_revision, requested_by=requested_by,
         override=tuple(override), override_confirmed=bool(confirm), duration=verdict.payload["analysis_duration"],
+        audio_revision=audio_identity.revision(verdict.payload["audio_identity"]),
     )
     if not result.ok:
         return {"ok": False, "status": 409 if result.conflict else 400, "reason": "refused",
@@ -1723,6 +1761,7 @@ def _delete_track_and_file(track):
     from library.models import PlaylistItem, RotationSlot
     filepath = track.filepath
     waveform_path = track.waveform_path
+    track_id = track.pk
     try:
         track.delete()
     except ProtectedError as exc:
@@ -1764,9 +1803,12 @@ def _delete_track_and_file(track):
     # Only clean up on-disk artifacts after the DB delete succeeded --
     # a failed track.delete() means nothing on disk should change.
     if waveform_path:
+        from library.services import waveform_cache
         try:
-            Path(waveform_path).unlink(missing_ok=True)
-        except OSError as e:
+            # Under the Track's cache lock (r0123), after the row is gone: a concurrent refresh
+            # either finished first or finds the Track missing and promotes nothing.
+            waveform_cache.remove(track_id, path=waveform_path)
+        except (OSError, waveform_cache.WaveformBusy) as e:
             # Best-effort -- the Track row is already gone, so a
             # stranded waveform cache is a cosmetic issue at worst.
             print(f"  [delete_track] could not remove waveform {waveform_path}: {e}")
@@ -1874,6 +1916,10 @@ def api_track_detail(request, pk):
         problems = cue_markers.validate(final, set(marker_edits), track.duration_seconds)
         if problems:
             return JsonResponse({"error": "; ".join(problems)}, status=400)
+    # The decoded audio the operator is editing, when a trusted waveform cache establishes it --
+    # read before a recategorization below moves the file (a move keeps the audio, not the witness).
+    from library.services import waveform_cache
+    edited_audio_revision = waveform_cache.current_audio_revision(track) if marker_edits else None
 
     # Captured, not applied immediately -- canonicalizing needs the
     # FINAL track.artist (which "artist" in this same request body may
@@ -2005,7 +2051,8 @@ def api_track_detail(request, pk):
     with transaction.atomic():
         if marker_edits:
             marker_result = cue_markers.operator_edit(
-                track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits)
+                track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits,
+                audio_revision=edited_audio_revision)
             if not marker_result.ok:
                 transaction.set_rollback(True)
                 return JsonResponse({"error": marker_result.conflict or marker_result.error,
@@ -3544,7 +3591,13 @@ def api_remote_dj_token(request):
 
 @require_http_methods(["GET"])
 def api_waveform(request, track_id):
+    """The Track's waveform cache for display. Any readable cache is shown (a legacy one too), but
+    its marker fields are never authoritative: ``cue_in_seconds``/``next_start``/``markers`` are the
+    Track's current markers from the database, and ``trust`` says whether the waveform is verified
+    for the current audio (r0123 Package B). The source witness (path, inode) is not exposed."""
     from django.conf import settings as django_settings
+
+    from library.services import audio_identity, cue_markers, waveform_cache
     wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
     wave_file = wave_dir / f"{track_id}.json"
 
@@ -3555,7 +3608,23 @@ def api_waveform(request, track_id):
         data = json.loads(wave_file.read_text(encoding="utf-8"))
     except Exception:
         return JsonResponse({"error": "Failed to read waveform"}, status=500)
+    if not isinstance(data, dict):
+        return JsonResponse({"error": "Failed to read waveform"}, status=500)
 
+    track = Track.objects.filter(pk=track_id).first()
+    data.pop("source", None)
+    if track is not None:
+        verdict = waveform_cache.validate(track, wave_file)
+        current_revision = (audio_identity.revision(verdict.payload["audio_identity"]) if verdict.trusted else None)
+        row = cue_markers.snapshot(track.pk)
+        data.update({
+            "cue_in_seconds": track.cue_in_seconds, "next_start": track.next_start_seconds,
+            "markers": {name: getattr(track, name) for name in cue_markers.MARKERS},
+            "marker_revision": track.cue_marker_revision,
+            "trust": {"status": verdict.status, "reason": verdict.reason, "trusted": verdict.trusted,
+                      "markers_current": verdict.markers_current, "audio_revision": current_revision},
+            "cue_marker_review": cue_markers.review(row, current_revision) if row else {},
+        })
     return JsonResponse(data)
 
 

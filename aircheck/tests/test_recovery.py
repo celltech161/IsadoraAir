@@ -543,7 +543,8 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
         payload = json.loads(expected.read_text(encoding="utf-8"))
         self.assertEqual(payload["track_id"], track.id)
         self.assertGreater(len(payload["samples_left"]), 0)
-        self.assertEqual([p.name for p in self.wave_root.iterdir()], [expected.name])
+        # .locks: the station's per-Track waveform-cache locks live in WAVEFORMS_DIR (r0123).
+        self.assertEqual([p.name for p in self.wave_root.iterdir() if p.name != ".locks"], [expected.name])
 
     def test_35_crash_after_publish_before_bookkeeping_then_retry_converges(self):
         """Simulates a process death between _finalize_segment_set's

@@ -75,7 +75,8 @@ class SyncTrackFileTests(TestCase):
         self.assertGreater(len(payload["samples_left"]), 0)
         self.assertEqual(len(payload["samples_left"]), len(payload["samples_right"]))
         self.assertEqual(len(payload["envelope_times"]), len(payload["envelope_db"]))
-        self.assertEqual(sorted(p.name for p in self.waveforms.iterdir()), [expected.name])
+        # .locks: the station's per-Track waveform-cache locks live in WAVEFORMS_DIR (r0123).
+        self.assertEqual(sorted(p.name for p in self.waveforms.iterdir() if p.name != ".locks"), [expected.name])
 
     def _sync(self, path, **kwargs):
         with patch.object(analyze_tracks, "decode_audio_to_pcm", return_value=_fake_mono_pcm()), \

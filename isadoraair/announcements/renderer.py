@@ -298,13 +298,13 @@ class AnnouncementRenderer:
                         _restore_published_file(destination, backup)
                         published = False
                         if rotation_waveform is not None:
+                            # Through the shared cache writer (r0123): atomic, under the Track's cache lock.
+                            from library.services import waveform_cache
+
                             if waveform_existed and waveform_backup is not None:
-                                os.replace(waveform_backup, rotation_waveform)
+                                waveform_cache.restore_file(track.id, waveform_backup, rotation_waveform.parent)
                             elif not waveform_existed:
-                                try:
-                                    rotation_waveform.unlink()
-                                except FileNotFoundError:
-                                    pass
+                                waveform_cache.remove(track.id, rotation_waveform.parent)
                     except Exception as rollback_exc:
                         raise AnnouncementRenderError(
                             "rollback",

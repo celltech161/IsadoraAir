@@ -77,7 +77,6 @@ import fcntl
 import hashlib
 import os
 import re
-import shutil
 import stat
 import tempfile
 import threading
@@ -336,6 +335,7 @@ def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublicat
     from library.management.commands.analyze_tracks import get_waveforms_dir
     from library.management.commands.sync_track_file import sync_track_file
     from library.models import Artist, Track
+    from library.services import waveform_cache
 
     with _destination_lock(dest):
         existing = ActiveBroadcastPublication.objects.filter(execution=row).first()
@@ -372,20 +372,22 @@ def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublicat
                     scratch_wave = wave_scratch / f"{track.id}.json"
                     if not scratch_wave.is_file():
                         raise PlayoutError("analysis wrote no waveform", code=ANALYSIS_FAILED)
-                    real_wave = Path(get_waveforms_dir()) / f"{track.id}.json"
-                    shutil.move(str(scratch_wave), str(real_wave))
+                    # The shared cache writer (r0123): validated, atomic, under the Track's cache lock.
+                    real_wave = waveform_cache.install_file(track.id, scratch_wave, Path(get_waveforms_dir()),
+                                                            keep_previous=True)
                     artist, _ = Artist.get_or_create_ci(TRACK_ARTIST)
                     Track.objects.filter(pk=track.pk).update(
-                        waveform_path=str(real_wave), title=TRACK_TITLE, artist=artist, ready2air=False)
+                        waveform_path=str(real_wave.path), title=TRACK_TITLE, artist=artist, ready2air=False)
                     publication = _store.insert(
                         ActiveBroadcastPublication, id=uuid.uuid4(), execution=row, media=media,
                         library_relpath=relpath, sha256=media.sha256, track=track, track_id_snapshot=track.pk,
                         published_at=now)
                     _event("published", row, actor_kind=ActorKind.WORKER,
                            detail={"track": track.pk, "library_relpath": relpath, "sha256": media.sha256})
+                real_wave.discard()
             except BaseException as exc:
                 if real_wave is not None:
-                    real_wave.unlink(missing_ok=True)
+                    real_wave.undo()
                 if placed:
                     dest.unlink(missing_ok=True)
                 if isinstance(exc, PlayoutError) or not isinstance(exc, Exception):

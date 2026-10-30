@@ -24,13 +24,17 @@ class Command(BaseCommand):
         track = Track.objects.filter(filepath=str(filepath)).first()
         track_id = track.id if track is not None else None
         if track is not None:
-            if track.waveform_path:
-                wf = Path(track.waveform_path)
-                try:
-                    wf.unlink(missing_ok=True)
-                except OSError as e:
-                    self.stderr.write(f"Could not remove waveform {wf}: {e}")
+            waveform_path = track.waveform_path
             track.delete()
+            if waveform_path:
+                # Under the Track's cache lock (r0123), after the row is gone, so a concurrent
+                # waveform refresh cannot leave a cache behind for the deleted Track.
+                from library.services import waveform_cache
+                wf = Path(waveform_path)
+                try:
+                    waveform_cache.remove(track_id, path=wf)
+                except (OSError, waveform_cache.WaveformBusy) as e:
+                    self.stderr.write(f"Could not remove waveform {wf}: {e}")
 
         try:
             filepath.unlink(missing_ok=True)

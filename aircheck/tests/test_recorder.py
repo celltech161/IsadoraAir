@@ -539,7 +539,8 @@ class LibrarySyncTests(AircheckRecorderFixtureMixin, TransactionTestCase):
         payload = json.loads(expected.read_text(encoding="utf-8"))
         self.assertEqual(payload["track_id"], track.id)
         self.assertGreater(len(payload["samples_left"]), 0)
-        self.assertEqual([p.name for p in Path(wave_root).iterdir()], [expected.name])
+        # .locks: the station's per-Track waveform-cache locks live in WAVEFORMS_DIR (r0123).
+        self.assertEqual([p.name for p in Path(wave_root).iterdir() if p.name != ".locks"], [expected.name])
 
     def test_dest_outside_library_root_is_silent_noop(self):
         # self.out_dir (a random tempdir) is never under the real,

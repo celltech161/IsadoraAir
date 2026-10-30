@@ -14,6 +14,7 @@ filepath from the DB when the decode returns empty and retrying once
 with the new path.
 """
 import json
+import os
 import struct
 import tempfile
 from pathlib import Path
@@ -59,14 +60,14 @@ class WaveformMoveRecoveryTests(TestCase):
             new_path = tmp / "new_category" / "track.flac"
             old_path.parent.mkdir()
             new_path.parent.mkdir()
-            # Both files exist -- in the real race the old path still
-            # exists when analyze_one_track starts (mono decode uses
-            # it), then the operator's UI-driven category change
-            # atomically shutil.move's it to the new path in the
-            # microsecond gap between mono and stereo. Simulating both
-            # present is the closest deterministic proxy.
+            # In the real race the old path still exists when
+            # analyze_one_track starts (mono decode uses it), then the
+            # operator's UI-driven category change atomically
+            # shutil.move's (renames) it to the new path in the gap
+            # between mono and stereo -- simulated exactly below, so the
+            # analyzer's source-continuity check (r0123: same inode,
+            # size and mtime across the decodes) sees the real thing.
             old_path.write_bytes(b"pretend flac before move")
-            new_path.write_bytes(b"pretend flac after move")
             wave_dir = tmp / "waveforms"
             wave_dir.mkdir()
 
@@ -84,6 +85,7 @@ class WaveformMoveRecoveryTests(TestCase):
                 # (new path) succeeds. Matches how the real ffmpeg
                 # subprocess wrapper degrades on ENOENT.
                 if len(calls) == 1:
+                    os.rename(old_path, new_path)      # the recategorization's move
                     return b""
                 return _fake_stereo_pcm()
 

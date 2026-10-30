@@ -1,35 +1,58 @@
-"""Fail-closed validation of a Track's waveform cache (roadmap 1.21, r0123 Package A).
+"""Trusted waveform caches: format, validation and the only writer (roadmap 1.21, r0123).
 
-A waveform cache (``Track.waveform_path``, ``<track id>.json``) may be *displayed* when it is
-well formed; it may feed a *marker calculation* (Repick Cue Points) only when it is **trusted**:
-the version-2 contract below, whose audio identity equals the authoritative identity of the
-Track's current media. Anything else -- missing, unreadable, truncated, malformed, another
-Track's, inconsistent with the Track, a legacy (unversioned) cache, or a cache whose audio cannot
-be proven current -- is refused, and the caller leaves every marker unchanged.
+A waveform cache (``<WAVEFORMS_DIR>/<track id>.json``, recorded as ``Track.waveform_path``) may be
+*displayed* when it is readable; it may feed a *marker calculation* (Repick) only when it is
+**trusted**: the version-2 format below, computed from audio whose decoded identity
+(library.services.audio_identity) was established for the very file the Track names now.
 
-Version-2 contract (written by Package B's atomic cache promotion)::
+Version 2::
 
-    {"schema": "isadoraair.waveform", "schema_version": 2,
-     "track_id": <int>,
-     "audio_identity": {...},            # equals current_audio_identity(track), never inferred
-     "analysis": {"sample_rate": <int>, "window_seconds": <float>, "waveform_points": <int>},
+    {"schema": "isadoraair.waveform", "schema_version": 2, "track_id": <int>,
+     "audio_identity": {algorithm, sha256, sample_rate, channels, sample_format, frames, decoder} | null,
+     "source": {path, dev, ino, size, mtime_ns, ctime_ns},     # the file the identity was taken from
+     "analysis": {"sample_rate", "window_seconds", "waveform_points"},
+     "generation": {"writer", "started_ns"},                  # decode start; a later decode wins
      "analysis_duration": <float > 0>,
-     "envelope_times": [...], "envelope_db": [...],     # same length >= 1, finite, times ascending
-     "samples_left": [...], "samples_right": [...],     # same length >= 1, integers 0..255
-     "marker_revision": <int>, "markers": {<the eight markers>}}
+     "envelope_times": [...], "envelope_db": [...],         # same length >= 1, finite, ascending
+     "samples_left": [...], "samples_right": [...],         # same length >= 1, integers 0..255
+     "marker_revision": <int>, "markers": {<the eight markers>},   # the Track's markers at promotion
+     "cue_in_seconds": ..., "next_start": ...}              # legacy reader fields (same snapshot)
 
-Temporary restriction (until Package B): nothing can establish the authoritative audio identity
-of a Track's media (``AUDIO_IDENTITY_PROVIDER`` is unset; ``Track.file_hash`` is opportunistic and
-never trusted), so no cache is trusted and Repick abstains for every Track. Validation is not
-relaxed to keep Repick available.
+Trust re-verification is bounded: the cache's identity is current while the Track's file still
+has the recorded source witness (path, device, inode, size, mtime and the kernel-maintained ctime,
+which no ordinary write, rename or metadata change leaves untouched). Any difference -- a tag
+edit, a replacement, a move -- makes the cache *unverified* until a decode (Refresh Waveform Only
+or analysis) re-establishes the identity; no request ever trusts a cache on path or time alone,
+and none decodes audio merely to check trust.
+
+Waveform trust and marker freshness are separate: a trusted cache whose marker snapshot predates
+the Track's current marker revision is ``trusted_stale_markers`` -- its samples and envelope
+remain good, and readers take the markers from the database. A snapshot that claims a newer
+revision than the database, or different values at the same revision, is ``inconsistent``.
+
+Every replacement of a cache file goes through this module (``promote``, ``install_file``,
+``restore_file``, ``remove``): under a per-Track lock (``flock`` on
+``<WAVEFORMS_DIR>/.locks/<id>.lock`` -- one location per station whatever directory is written,
+so a publisher's scratch analysis and the real cache serialize too; bounded wait), staged in
+the destination directory, validated,
+renamed atomically over the old file and made durable (file and directory ``fsync``). A failure
+at any point leaves the previous cache in place. Lock order: a holder of a cache lock never waits
+for a database row lock (it only reads), so a writer may take the cache lock while it holds a
+Track row lock and nothing can deadlock; nobody decodes audio while holding the cache lock.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import math
 import os
+import secrets
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from library.services import audio_identity
 
 SCHEMA = "isadoraair.waveform"
 SCHEMA_VERSION = 2
@@ -38,15 +61,15 @@ MAX_BYTES = 64 * 1024 * 1024
 DURATION_TOLERANCE_SECONDS = 1.0
 DURATION_TOLERANCE_RATIO = 0.02
 ENVELOPE_DB_FLOOR, ENVELOPE_DB_CEILING = -120.0, 0.5
-
-#: Package B installs ``callable(track) -> dict | None`` returning the authoritative identity of the
-#: Track's current decoded audio. Until then there is none, and no cache is trusted.
-AUDIO_IDENTITY_PROVIDER = None
+LOCK_DIRNAME = ".locks"
+LOCK_TIMEOUT_SECONDS = 15.0
+PREVIOUS_SUFFIX = ".prev"
 
 # Verdicts
 MISSING, UNREADABLE, MALFORMED, WRONG_TRACK, INCONSISTENT = "missing", "unreadable", "malformed", "wrong_track", \
     "inconsistent"
-LEGACY, UNVERIFIED_AUDIO, TRUSTED = "legacy", "unverified_audio", "trusted"
+UNSUPPORTED, LEGACY, UNVERIFIED_AUDIO, INCOMPLETE = "unsupported", "legacy", "unverified_audio", "incomplete"
+TRUSTED, TRUSTED_STALE_MARKERS = "trusted", "trusted_stale_markers"
 
 
 @dataclass
@@ -57,20 +80,38 @@ class Verdict:
 
     @property
     def trusted(self) -> bool:
+        """Derived from the Track's current audio: may feed a marker calculation."""
+        return self.status in (TRUSTED, TRUSTED_STALE_MARKERS)
+
+    @property
+    def markers_current(self) -> bool:
         return self.status == TRUSTED
 
     @property
     def displayable(self) -> bool:
-        return self.status in (TRUSTED, UNVERIFIED_AUDIO, LEGACY)
+        return self.status in (TRUSTED, TRUSTED_STALE_MARKERS, UNVERIFIED_AUDIO, LEGACY)
 
 
-def current_audio_identity(track):
-    provider = AUDIO_IDENTITY_PROVIDER
-    return provider(track) if provider is not None else None
+class WaveformBusy(Exception):
+    """Another writer holds this Track's cache lock (or operation lock)."""
 
+
+class PromotionRefused(Exception):
+    """A staged cache was not promoted; the previous cache is untouched. ``code`` says why."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+# ------------------------------------------------------------------ reading and validation
 
 def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _int(value, minimum=0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
 def _structure_problem(payload: dict, *, versioned: bool) -> str | None:
@@ -95,10 +136,33 @@ def _structure_problem(payload: dict, *, versioned: bool) -> str | None:
     left, right = payload.get("samples_left"), payload.get("samples_right")
     if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
         return "samples_left/samples_right missing or of different lengths"
-    if versioned and not left:
-        return "stereo samples are empty"
     if not all(isinstance(s, int) and not isinstance(s, bool) and 0 <= s <= 255 for s in left + right):
         return "stereo samples are not integers 0..255"
+    return None
+
+
+def _v2_metadata_problem(payload: dict) -> str | None:
+    analysis = payload.get("analysis")
+    if not isinstance(analysis, dict) or not _int(analysis.get("sample_rate"), 1) \
+            or not _number(analysis.get("window_seconds")) or analysis["window_seconds"] <= 0 \
+            or not _int(analysis.get("waveform_points"), 1):
+        return "invalid analysis metadata"
+    generation = payload.get("generation")
+    if not isinstance(generation, dict) or not _int(generation.get("started_ns"), 1) \
+            or not isinstance(generation.get("writer"), str):
+        return "invalid generation metadata"
+    source = payload.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("path"), str) or not all(
+            _int(source.get(name)) for name in audio_identity.WITNESS_FIELDS if name != "path"):
+        return "invalid source metadata"
+    identity = payload.get("audio_identity")
+    if identity is not None and not audio_identity.well_formed(identity):
+        return "malformed audio identity"
+    from library.services import cue_markers
+    revision, markers = payload.get("marker_revision"), payload.get("markers")
+    if not _int(revision) or not isinstance(markers, dict) or set(markers) != set(cue_markers.MARKERS) \
+            or not all(value is None or _number(value) for value in markers.values()):
+        return "incomplete marker snapshot"
     return None
 
 
@@ -137,39 +201,301 @@ def read(path) -> tuple[dict | None, Verdict | None]:
     return payload, None
 
 
+def identity_consistent(identity, analysis_duration, window_seconds) -> bool:
+    """The identified audio lasts as long as the envelope says (within two analysis windows)."""
+    return abs(identity["frames"] / identity["sample_rate"] - analysis_duration) <= 2 * window_seconds + 0.05
+
+
+def check_payload(payload: dict, track_id: int) -> Verdict | None:
+    """Track-independent checks of a parsed payload: a failing verdict, or None (well formed)."""
+    found = payload.get("track_id")
+    if not _int(found) or found != track_id:
+        return Verdict(WRONG_TRACK, f"the cache names Track {found!r}, not {track_id}")
+    if "schema" in payload or "schema_version" in payload:
+        if payload.get("schema") != SCHEMA or payload.get("schema_version") != SCHEMA_VERSION:
+            return Verdict(UNSUPPORTED, f"unsupported cache schema {payload.get('schema')!r} "
+                                        f"version {payload.get('schema_version')!r}")
+        versioned = True
+    else:
+        versioned = False
+    problem = _structure_problem(payload, versioned=versioned) or (_v2_metadata_problem(payload) if versioned else None)
+    if problem:
+        return Verdict(MALFORMED, problem)
+    if versioned:
+        identity, window = payload["audio_identity"], payload["analysis"]["window_seconds"]
+        if identity is not None and not identity_consistent(identity, payload["analysis_duration"], window):
+            return Verdict(INCONSISTENT, f"the identified audio lasts "
+                                         f"{identity['frames'] / identity['sample_rate']:.3f}s but the envelope "
+                                         f"{payload['analysis_duration']:.3f}s")
+    return None
+
+
 def validate(track, path=None) -> Verdict:
-    """The cache's verdict for ``track`` (default path: ``track.waveform_path``)."""
+    """The cache's verdict for ``track`` (default path: ``track.waveform_path``). Reads the cache and
+    stats the Track's file; never decodes audio."""
     from library.services import cue_markers
     payload, failure = read(path if path is not None else track.waveform_path)
     if failure:
         return failure
-    track_id = payload.get("track_id")
-    if not isinstance(track_id, int) or isinstance(track_id, bool) or track_id != track.pk:
-        return Verdict(WRONG_TRACK, f"the cache names Track {track_id!r}, not {track.pk}")
-    versioned = payload.get("schema") == SCHEMA and payload.get("schema_version") == SCHEMA_VERSION
-    problem = _structure_problem(payload, versioned=versioned)
-    if problem:
-        return Verdict(MALFORMED, problem)
+    failure = check_payload(payload, track.pk)
+    if failure:
+        return failure
     if _duration_mismatch(track.duration_seconds, payload["analysis_duration"]):
         return Verdict(INCONSISTENT, f"the cache's analysed duration {payload['analysis_duration']:.3f}s does not "
                                      f"match the Track's {track.duration_seconds:.3f}s")
-    if not versioned:
+    if "schema" not in payload:
         return Verdict(LEGACY, "legacy waveform cache (no version-2 identity): display only", payload)
-    revision, markers = payload.get("marker_revision"), payload.get("markers")
-    if not isinstance(revision, int) or isinstance(revision, bool) or not isinstance(markers, dict) \
-            or set(markers) != set(cue_markers.MARKERS):
-        return Verdict(MALFORMED, "version-2 cache without a complete marker snapshot")
+    if not payload["samples_left"]:
+        return Verdict(INCOMPLETE, "the cache has no stereo waveform samples (the stereo decode failed)", payload)
+    revision, markers = payload["marker_revision"], payload["markers"]
     if revision > track.cue_marker_revision or (
             revision == track.cue_marker_revision
             and any(not cue_markers._same(markers[name], getattr(track, name)) for name in cue_markers.MARKERS)):
-        return Verdict(INCONSISTENT, f"the cache's marker snapshot (revision {revision}) does not match the "
+        return Verdict(INCONSISTENT, f"the cache's marker snapshot (revision {revision}) contradicts the "
                                      f"Track's markers (revision {track.cue_marker_revision})")
-    identity = payload.get("audio_identity")
-    current = current_audio_identity(track)
-    if current is None:
-        return Verdict(UNVERIFIED_AUDIO, "the current audio identity cannot be established yet (Package B)",
+    if payload["audio_identity"] is None:
+        return Verdict(UNVERIFIED_AUDIO, "the audio could not be identified when this cache was made", payload)
+    if payload["audio_identity"]["algorithm"] != audio_identity.ALGORITHM:
+        return Verdict(UNVERIFIED_AUDIO, "the cache's audio identity uses an unsupported algorithm", payload)
+    source = payload["source"]
+    if source["path"] != str(track.filepath):
+        return Verdict(UNVERIFIED_AUDIO, "the cache was made from a different file path", payload)
+    if not audio_identity.same_witness(source, audio_identity.stat_source(track.filepath)):
+        return Verdict(UNVERIFIED_AUDIO, "the Track's file changed since the cache was made (refresh the waveform)",
                        payload)
-    if not isinstance(identity, dict) or identity != current:
-        return Verdict(UNVERIFIED_AUDIO, "the cache was computed from different audio than the Track's current media",
-                       payload)
+    if revision < track.cue_marker_revision:
+        return Verdict(TRUSTED_STALE_MARKERS, f"trusted waveform; its marker snapshot (revision {revision}) "
+                                              f"predates the Track's (revision {track.cue_marker_revision})", payload)
     return Verdict(TRUSTED, "trusted", payload)
+
+
+def current_audio_revision(track) -> str | None:
+    """The decoded-audio revision of the Track's file, when a trusted cache establishes it (no decode)."""
+    verdict = validate(track)
+    return audio_identity.revision(verdict.payload["audio_identity"]) if verdict.trusted else None
+
+
+# ------------------------------------------------------------------ building
+
+def build_payload(track_id, *, identity, source, analysis, writer, started_ns, analysis_duration, times,
+                  envelope_db, samples_left, samples_right) -> dict:
+    """A version-2 payload; the marker snapshot is added at promotion (``promote``)."""
+    return {"schema": SCHEMA, "schema_version": SCHEMA_VERSION, "track_id": int(track_id),
+            "audio_identity": identity, "source": dict(source), "analysis": dict(analysis),
+            "generation": {"writer": writer, "started_ns": int(started_ns)},
+            "analysis_duration": analysis_duration, "envelope_times": times, "envelope_db": envelope_db,
+            "samples_left": samples_left, "samples_right": samples_right}
+
+
+# ------------------------------------------------------------------ locking and promotion
+
+def canonical_path(wave_dir, track_id) -> Path:
+    return Path(wave_dir) / f"{int(track_id)}.json"
+
+
+def lock_dir() -> Path:
+    """The station's waveform lock directory: ``<WAVEFORMS_DIR>/.locks``."""
+    from django.conf import settings
+    path = Path(getattr(settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms")) / LOCK_DIRNAME
+    os.makedirs(path, 0o755, exist_ok=True)
+    return path
+
+
+def _open_lock(name):
+    # Read-only is enough for flock, so a lock file another service user created still opens.
+    return os.open(lock_dir() / name, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+
+
+@contextlib.contextmanager
+def track_lock(wave_dir, track_id, *, timeout=LOCK_TIMEOUT_SECONDS):
+    """The per-Track cache lock (cross-process ``flock``); WaveformBusy after ``timeout`` seconds.
+    ``wave_dir`` names the directory being written; the lock itself is per Track, station-wide."""
+    fd = _open_lock(f"{int(track_id)}.lock")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise WaveformBusy(f"the waveform cache of Track {track_id} is locked by another writer") \
+                        from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def try_operation_lock(wave_dir, name) -> int:
+    """A non-blocking exclusive operation lock (e.g. one refresh per Track): its fd (close to release,
+    or pass to a child process), or WaveformBusy."""
+    fd = _open_lock(name)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise WaveformBusy(f"{name} is held by another operation") from None
+    return fd
+
+
+def _fsync_dir(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _stage(directory, track_id, data: bytes) -> Path:
+    staged = Path(directory) / f".{int(track_id)}.json.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        staged.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+    return staged
+
+
+@dataclass
+class Promotion:
+    """A completed replacement. ``previous`` is the same-filesystem copy of the cache it replaced
+    (None if there was none), kept only when the caller asked to be able to ``undo``."""
+    track_id: int
+    path: Path
+    previous_existed: bool
+    previous: Path | None = None
+
+    def undo(self):
+        """Put back exactly what was there before (under the lock)."""
+        with track_lock(self.path.parent, self.track_id):
+            if self.previous is not None and self.previous.exists():
+                os.replace(self.previous, self.path)
+            elif not self.previous_existed:
+                self.path.unlink(missing_ok=True)
+            _fsync_dir(self.path.parent)
+        self.previous = None
+
+    def discard(self):
+        """Keep the new cache; drop the rollback copy."""
+        if self.previous is not None:
+            self.previous.unlink(missing_ok=True)
+            self.previous = None
+
+
+def _replace(track_id, final: Path, data: bytes, *, keep_previous: bool) -> Promotion:
+    staged = _stage(final.parent, track_id, data)
+    previous = final.with_name(f".{final.name}{PREVIOUS_SUFFIX}")
+    existed = final.exists()
+    try:
+        payload, failure = read(staged)
+        if failure is None:
+            failure = check_payload(payload, int(track_id))
+        if failure is not None:
+            raise PromotionRefused("invalid", f"the staged cache failed validation: {failure.reason}")
+        previous.unlink(missing_ok=True)
+        if existed:
+            os.link(final, previous)             # the same-filesystem rollback copy
+        os.replace(staged, final)
+        _fsync_dir(final.parent)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        if existed:
+            previous.unlink(missing_ok=True)
+        raise
+    promotion = Promotion(int(track_id), final, existed, previous if existed else None)
+    if not keep_previous:
+        promotion.discard()
+    return promotion
+
+
+def _newer_existing(final: Path, track_id, started_ns) -> bool:
+    payload, failure = read(final)
+    if failure or check_payload(payload, int(track_id)) or "schema" not in payload:
+        return False
+    return payload["generation"]["started_ns"] > started_ns
+
+
+def _marker_snapshot(track_id) -> dict | None:
+    from library.services import cue_markers
+    row = cue_markers.snapshot(track_id)
+    if row is None:
+        return None
+    return {"marker_revision": row["cue_marker_revision"], "markers": {name: row[name] for name in cue_markers.MARKERS},
+            "cue_in_seconds": row["cue_in_seconds"], "next_start": row["next_start_seconds"]}
+
+
+def promote(track_id, payload: dict, wave_dir, *, expected_source=None, keep_previous=False,
+            lock_timeout=LOCK_TIMEOUT_SECONDS) -> Promotion:
+    """Make ``payload`` (``build_payload``) the Track's cache in ``wave_dir``, atomically.
+
+    Under the Track's cache lock: the Track must still exist and, with ``expected_source``, the file
+    that was decoded must still be exactly that file (else ``source_changed``; whether it is still
+    the Track's file is the validator's question -- a cache of another path is never trusted); a
+    cache whose decode started later is
+    never replaced by this older one (``superseded``); the Track's *current* markers are embedded
+    as the snapshot. PromotionRefused / WaveformBusy / OSError leave the previous cache untouched."""
+    from library.models import Track
+    final = canonical_path(wave_dir, track_id)
+    with track_lock(wave_dir, track_id, timeout=lock_timeout):
+        filepath = Track.objects.filter(pk=track_id).values_list("filepath", flat=True).first()
+        snapshot = _marker_snapshot(track_id)
+        if filepath is None or snapshot is None:
+            raise PromotionRefused("track_missing", f"Track {track_id} no longer exists")
+        if expected_source is not None and not audio_identity.same_witness(
+                expected_source, audio_identity.stat_source(expected_source.get("path"))):
+            raise PromotionRefused("source_changed", "the Track's file changed while the waveform was generated")
+        if _newer_existing(final, track_id, payload["generation"]["started_ns"]):
+            raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
+        data = json.dumps({**payload, **snapshot}, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return _replace(track_id, final, data, keep_previous=keep_previous)
+
+
+def install_file(track_id, staged_file, wave_dir, *, keep_previous=False,
+                 lock_timeout=LOCK_TIMEOUT_SECONDS) -> Promotion:
+    """Install a cache another directory holds (a publisher's scratch analysis), validated, atomically."""
+    payload, failure = read(staged_file)
+    if failure is None:
+        failure = check_payload(payload, int(track_id))
+    if failure is not None:
+        raise PromotionRefused("invalid", f"the cache to install failed validation: {failure.reason}")
+    final = canonical_path(wave_dir, track_id)
+    with track_lock(wave_dir, track_id, timeout=lock_timeout):
+        if "schema" in payload and _newer_existing(final, track_id, payload["generation"]["started_ns"]):
+            raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
+        return _replace(track_id, final, Path(staged_file).read_bytes(), keep_previous=keep_previous)
+
+
+def restore_file(track_id, backup_file, wave_dir, *, lock_timeout=LOCK_TIMEOUT_SECONDS) -> None:
+    """Put a publisher's copy of the previous cache back, verbatim and atomically (its rollback)."""
+    final = canonical_path(wave_dir, track_id)
+    data = Path(backup_file).read_bytes()
+    with track_lock(wave_dir, track_id, timeout=lock_timeout):
+        staged = _stage(final.parent, track_id, data)
+        try:
+            os.replace(staged, final)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+        _fsync_dir(final.parent)
+
+
+def remove(track_id, wave_dir=None, *, path=None, lock_timeout=LOCK_TIMEOUT_SECONDS) -> bool:
+    """Remove a Track's cache (default: the canonical one in ``wave_dir``) under its lock."""
+    target = Path(path) if path is not None else canonical_path(wave_dir, track_id)
+    if not target.parent.is_dir():
+        return False
+    with track_lock(target.parent, track_id, timeout=lock_timeout):
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            return False
+        with contextlib.suppress(OSError):
+            _fsync_dir(target.parent)
+        return True

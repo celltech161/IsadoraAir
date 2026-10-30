@@ -21,7 +21,7 @@ from django.test import Client, RequestFactory, TestCase, TransactionTestCase, o
 from library.admin import TrackAdmin
 from library.management.commands import analyze_tracks
 from library.models import Artist, Category, CategoryKind, PlayEvent, Track, TrackWriteRefused
-from library.services import cue_markers, waveform_cache
+from library.services import audio_identity, cue_markers, waveform_cache
 from monitoring.models import SystemEvent
 
 M = cue_markers.MARKERS
@@ -247,9 +247,12 @@ class CalculationTests(_Fixture):
         self.assertTrue(SystemEvent.objects.filter(title="Cue-marker protection superseded by new media").exists())
 
     def test_copy_to_equivalent_media_keeps_values_and_provenance(self):
+        # r0123 Package B: provenance (the approval) travels only with proven-identical decoded audio.
         twin = _make_track(self.dir)
+        same = _identity("c" * 64)
         result = cue_markers.copy_for_equivalent_media(self.legacy.pk, twin.pk,
-                                                       ("intro_until_seconds", "hook_in_seconds"))
+                                                       ("intro_until_seconds", "hook_in_seconds"),
+                                                       source_identity=same, target_identity=dict(same))
         self.assertTrue(result.ok)
         row = _row(twin)
         self.assertEqual((row["intro_until_seconds"], row["hook_in_seconds"]), (9.0, 60.0))
@@ -326,7 +329,9 @@ class AnalyzerTests(_Fixture):
         self.assertEqual({name: row[name] for name in M}, before)
         payload = json.loads((wave_dir / f"{self.legacy.pk}.json").read_text())
         self.assertEqual((payload["cue_in_seconds"], payload["next_start"]), (1.0, 190.0))
-        self.assertEqual(waveform_cache.validate(Track.objects.get(pk=self.legacy.pk)).status, waveform_cache.LEGACY)
+        # r0123 Package B: a version-2 cache, untrusted here because the fixture file is not audio.
+        self.assertEqual(waveform_cache.validate(Track.objects.get(pk=self.legacy.pk)).status,
+                         waveform_cache.UNVERIFIED_AUDIO)
 
     def test_a_new_track_gets_its_markers_and_its_request_is_cleared(self):
         fresh = _make_track(self.dir, duration=None)
@@ -375,17 +380,28 @@ class AnalyzerTests(_Fixture):
 
 # ------------------------------------------------------------------ waveform cache
 
-def _v2(track, *, duration=None, times=None, levels=None, identity=None, **extra):
+def _identity(sha="a" * 64, *, seconds=200.0, rate=8000):
+    return {"algorithm": audio_identity.ALGORITHM, "sha256": sha, "sample_rate": rate, "channels": 2,
+            "sample_format": "s32le", "frames": max(1, int(seconds * rate)), "decoder": "test"}
+
+
+_DEFAULT = object()
+
+
+def _v2(track, *, duration=None, times=None, levels=None, identity=_DEFAULT, **extra):
+    """A version-2 cache of ``track``'s current file (its real source witness); ``identity=None`` makes
+    an unidentified one."""
     duration = duration if duration is not None else track.duration_seconds
     times = times if times is not None else [i * 0.5 for i in range(int(duration / 0.5))]
     levels = levels if levels is not None else [-60.0] * len(times)
-    payload = {"schema": waveform_cache.SCHEMA, "schema_version": 2, "track_id": track.pk,
-               "audio_identity": identity or {"sha256": "a" * 64},
-               "analysis": {"sample_rate": 8000, "window_seconds": 0.5, "waveform_points": 4},
-               "analysis_duration": duration, "envelope_times": times, "envelope_db": levels,
-               "samples_left": [0, 10, 200, 255], "samples_right": [0, 12, 199, 250],
-               "marker_revision": track.cue_marker_revision,
-               "markers": {name: getattr(track, name) for name in M}}
+    payload = waveform_cache.build_payload(
+        track.pk, identity=_identity(seconds=duration) if identity is _DEFAULT else identity,
+        source=audio_identity.stat_source(track.filepath),
+        analysis={"sample_rate": 8000, "window_seconds": 0.5, "waveform_points": 4}, writer="test",
+        started_ns=1, analysis_duration=duration, times=times, envelope_db=levels,
+        samples_left=[0, 10, 200, 255], samples_right=[0, 12, 199, 250])
+    payload.update({"marker_revision": track.cue_marker_revision,
+                    "markers": {name: getattr(track, name) for name in M}})
     payload.update(extra)
     return payload
 
@@ -397,10 +413,6 @@ def _write(directory, name, payload):
 
 
 class WaveformCacheTests(_Fixture):
-    def setUp(self):
-        super().setUp()
-        self.identity = patch.object(waveform_cache, "AUDIO_IDENTITY_PROVIDER", lambda _t: {"sha256": "a" * 64})
-
     def verdict(self, payload, track=None):
         track = track or Track.objects.get(pk=self.legacy.pk)
         return waveform_cache.validate(track, _write(self.dir, "cache.json", payload))
@@ -424,12 +436,11 @@ class WaveformCacheTests(_Fixture):
             "snapshot mismatch": (_v2(self.legacy) | {"markers": {name: 0.0 for name in M}},
                                   waveform_cache.INCONSISTENT),
         }
-        with self.identity:
-            for label, (payload, status) in cases.items():
-                with self.subTest(label):
-                    verdict = self.verdict(payload)
-                    self.assertEqual(verdict.status, status, verdict.reason)
-                    self.assertFalse(verdict.trusted)
+        for label, (payload, status) in cases.items():
+            with self.subTest(label):
+                verdict = self.verdict(payload)
+                self.assertEqual(verdict.status, status, verdict.reason)
+                self.assertFalse(verdict.trusted)
         self.assertEqual(waveform_cache.validate(self.legacy, self.dir / "absent.json").status, waveform_cache.MISSING)
 
     def test_legacy_and_unidentified_caches_are_displayable_but_never_trusted(self):
@@ -438,19 +449,18 @@ class WaveformCacheTests(_Fixture):
                                  "markers")}
         verdict = self.verdict(legacy)
         self.assertEqual((verdict.status, verdict.displayable, verdict.trusted), (waveform_cache.LEGACY, True, False))
-        # Version 2 is not enough: without an authoritative identity of the current audio (Package B)
-        # nothing is trusted -- and Track.file_hash is never consulted.
+        # Version 2 is not enough: the identity must exist and belong to the Track's file as it is
+        # now (Package B: its source witness) -- and Track.file_hash is never consulted.
         Track.objects.filter(pk=self.legacy.pk).update(file_hash="a" * 64)
-        self.assertEqual(self.verdict(_v2(self.legacy)).status, waveform_cache.UNVERIFIED_AUDIO)
-        with self.identity:
-            self.assertEqual(self.verdict(_v2(self.legacy, identity={"sha256": "b" * 64})).status,
-                             waveform_cache.UNVERIFIED_AUDIO)
-            self.assertTrue(self.verdict(_v2(self.legacy)).trusted)
+        self.assertEqual(self.verdict(_v2(self.legacy, identity=None)).status, waveform_cache.UNVERIFIED_AUDIO)
+        self.assertTrue(self.verdict(_v2(self.legacy)).trusted)
+        stale = _v2(self.legacy)
+        Path(self.legacy.filepath).write_bytes(b"replaced audio bytes " * 64)
+        self.assertEqual(self.verdict(stale).status, waveform_cache.UNVERIFIED_AUDIO)
 
     def test_a_legitimately_short_clip_is_trusted(self):
         short = _make_track(self.dir, duration=0.3)
-        with self.identity:
-            verdict = self.verdict(_v2(short, duration=0.3, times=[0.0], levels=[-20.0]), track=short)
+        verdict = self.verdict(_v2(short, duration=0.3, times=[0.0], levels=[-20.0]), track=short)
         self.assertTrue(verdict.trusted, verdict.reason)
 
 
@@ -513,7 +523,7 @@ class EndpointTests(_Fixture):
         self.assertEqual((row["next_start_seconds"], row["cue_marker_revision"]), (190.0, 0))
 
     def test_repick_abstains_on_any_untrusted_cache(self):
-        _write(self.dir, "old.json", _v2(Track.objects.get(pk=self.legacy.pk)))      # v2 but unidentifiable audio
+        _write(self.dir, "old.json", _v2(Track.objects.get(pk=self.legacy.pk), identity=None))   # v2, unidentified
         response = self.client.post(f"/api/tracks/{self.legacy.pk}/repick-cue-points/")
         self.assertEqual(response.status_code, 409)
         self.assertIn("unchanged", response.json()["error"])
@@ -535,8 +545,7 @@ class EndpointTests(_Fixture):
         broken = _make_track(self.dir, category=self.category, next_start_seconds=130.0)
         Track.objects.filter(pk=broken.pk).update(waveform_path=str(_write(self.dir, "broken.json", "{\"track_id")))
         others = {t.pk: _row(t) for t in (legacy_cache, missing, broken)}
-        with patch.object(waveform_cache, "AUDIO_IDENTITY_PROVIDER", lambda _t: {"sha256": "a" * 64}):
-            response = self.client.post(f"/api/categories/{self.category.pk}/repick-cue-points/")
+        response = self.client.post(f"/api/categories/{self.category.pk}/repick-cue-points/")
         self.assertEqual(response.status_code, 200, response.content)
         body = response.json()
         self.assertEqual((body["repicked"], body["skipped"], body["queued_full_analyze"]), (1, 3, 0))

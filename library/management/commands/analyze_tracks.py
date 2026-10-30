@@ -3,13 +3,14 @@ import math
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
 from django.db.models import Q
 
 from library.models import AnalysisConfig, Track
-from library.services import cue_markers
+from library.services import audio_identity, cue_markers, waveform_cache
 from library.services.related_artists import extract_credited_artists, merge_related_artists
 from monitoring.models import emit_event
 # Aliased on import: this file uses `existing_artist_names_casefolded`
@@ -416,7 +417,17 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     against the marker revision read here, before the (long) decode: a marker an operator
     edited meanwhile wins, and a protected (locked or historical) marker is preserved unless
     ``media_replaced`` (the caller just published new audio at this Track) or an operator's
-    confirmed ``override``. Returns an AnalysisOutcome (truthy when analyzed)."""
+    confirmed ``override``. Returns an AnalysisOutcome (truthy when analyzed).
+
+    r0123 Package B: the decodes are bracketed by the file's source witness and followed by its
+    decoded-audio identity; a file that changes while it is analyzed yields nothing (no markers,
+    no cache). The markers are applied with that audio revision, then the version-2 cache is
+    promoted through library.services.waveform_cache (lock, staged validation, atomic rename,
+    the Track's markers *at promotion* as its snapshot). If promotion fails after the markers were
+    applied, the database stays authoritative and the previous cache stays in place: it is either
+    untrusted for the new audio (its source witness no longer matches) or a trusted cache of the
+    same audio whose marker snapshot is merely stale -- detectable, never a basis for Repick of
+    other audio, and repaired by Refresh Waveform Only or the next analysis."""
     (sample_rate, window_seconds, target_points,
      next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
@@ -436,6 +447,8 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     if not fp.is_file():
         print(f"  Missing file for track {track_id}: {filepath}")
         return AnalysisOutcome(False, reason="missing file")
+    started_ns = time.time_ns()
+    witness_before = audio_identity.stat_source(fp)
 
     raw = decode_audio_to_pcm(fp, sample_rate)
     if not raw:
@@ -517,6 +530,17 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     except Exception as exc:
         print(f"  Stereo waveform failed for track {track_id} (non-fatal): {exc}")
 
+    identity, identity_problem = audio_identity.compute_or_none(fp)
+    witness = audio_identity.stat_source(fp)
+    if not audio_identity.same_content_witness(witness_before, witness):
+        print(f"  Track {track_id}: the audio file changed while it was analyzed; nothing applied")
+        return AnalysisOutcome(False, reason="source changed during analysis")
+    if identity is not None and analysis_duration and not waveform_cache.identity_consistent(
+            identity, analysis_duration, window_seconds):
+        identity, identity_problem = None, "the identified audio's length disagrees with the decoded envelope"
+    if identity is None:
+        print(f"  Track {track_id}: audio identity unavailable ({identity_problem}); the cache will not be trusted")
+
     # Deliberately no filename-based extraction here -- once a track
     # has human-readable title/artist (either genuinely tagged, or
     # already backfilled by the upload/import fallback-metadata path;
@@ -551,46 +575,27 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     marker_result = cue_markers.apply_calculation(
         track_id, calculated, basis_revision=basis["cue_marker_revision"], source=source,
         requested_by=requested_by, override=override, override_confirmed=override_confirmed,
-        media_replaced=media_replaced, duration=effective_duration,
+        media_replaced=media_replaced, audio_revision=audio_identity.revision(identity), duration=effective_duration,
     )
     if not marker_result.ok:
         print(f"  Track {track_id}: calculated cue markers not applied: "
               f"{marker_result.conflict or marker_result.error}")
-    current = cue_markers.snapshot(track_id)
-
-    out_path = wave_dir / f"{track_id}.json"
-    # Legacy (unversioned) display cache: it records the Track's markers as they stand after
-    # the authority's decision, never values it did not apply, and is never trusted for a
-    # marker calculation (library.services.waveform_cache).
-    payload = {
-        "track_id": track_id,
-        "samples_left": samples_left,
-        "samples_right": samples_right,
-        "next_start": current["next_start_seconds"],
-        "cue_in_seconds": current["cue_in_seconds"],
-        "analysis_duration": analysis_duration,
-        # Mono envelope in dBFS at `window_seconds` resolution -- the
-        # actual signal `detect_next_start`/`detect_cue_in` walk to
-        # pick the two cue points. Persisting it means we can re-pick
-        # cue points against fresh thresholds later WITHOUT another
-        # ffmpeg decode + envelope compute pass -- the expensive parts
-        # of analysis. Consumed by `repick_cue_points_from_json` (used
-        # by /api/categories/<pk>/repick-cue-points/) to let the operator
-        # iterate on category threshold tuning in seconds instead of
-        # minutes. Roughly doubles JSON size (order of ~50 kB per typical
-        # 4-min track); acceptable trade for the workflow improvement.
-        # Existing tracks lack these fields until their next real analyze
-        # pass; the repick endpoint falls back to a full re-analyze on
-        # those (organic backfill).
-        "envelope_times": times,
-        "envelope_db": envelope_db,
-    }
+    # Version-2 cache (library.services.waveform_cache): the stereo display samples, the mono
+    # envelope (detect_next_start/detect_cue_in walk it; Repick re-picks from it without another
+    # decode once the cache is trusted), the audio identity and source witness, and -- added at
+    # promotion -- the Track's markers as they stand then, never values the authority did not apply.
+    payload = waveform_cache.build_payload(
+        track_id, identity=identity, source=witness, analysis={
+            "sample_rate": int(sample_rate), "window_seconds": float(window_seconds),
+            "waveform_points": int(target_points)},
+        writer="analysis", started_ns=started_ns, analysis_duration=analysis_duration, times=times,
+        envelope_db=envelope_db, samples_left=samples_left, samples_right=samples_right)
     update_fields = {"related_artists": related}
     try:
-        out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        update_fields["waveform_path"] = str(out_path)
-    except Exception as exc:
-        print(f"  Failed to write waveform for track {track_id}: {exc}")
+        promotion = waveform_cache.promote(track_id, payload, wave_dir, expected_source=witness)
+        update_fields["waveform_path"] = str(promotion.path)
+    except (waveform_cache.PromotionRefused, waveform_cache.WaveformBusy, OSError) as exc:
+        print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
 
     Track.objects.filter(id=track_id).update(**update_fields)
     # The request this run served is done -- unless a newer one arrived while it ran.

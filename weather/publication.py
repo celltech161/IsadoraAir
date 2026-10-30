@@ -60,8 +60,10 @@ Publish sequence:
 
      Once that scratch waveform is confirmed to exist, it is published
      to the real WAVEFORMS_DIR under that exact <track_id>.json name --
-     still inside the same transaction, after backing up any real
-     waveform this regeneration is about to replace -- and
+     still inside the same transaction, through the shared cache writer
+     (library.services.waveform_cache.install_file, r0123: validated,
+     atomic, under the Track's cache lock, keeping a same-filesystem
+     copy of the waveform it replaces until the publication commits) -- and
      Track.waveform_path (which analyze_one_track persisted pointing at
      the SCRATCH copy, since it has no idea this caller will relocate
      it) is corrected to that same real path, with the in-memory Track
@@ -119,6 +121,7 @@ from django.utils import timezone
 
 from library.management.commands.analyze_tracks import get_waveforms_dir
 from library.management.commands.sync_track_file import sync_track_file
+from library.services import waveform_cache
 from library.models import Category, Track
 
 from . import provenance as provenance_mod
@@ -233,10 +236,7 @@ def publish_weather_asset(
             backup: Path | None = None
             published = False
             track_committed = False
-            real_waveform_committed = False
-            real_waveform_existed = False
-            real_waveform_backup: Path | None = None
-            real_waveform_path: Path | None = None
+            real_waveform_promotion = None
 
             try:
                 if dest_path.exists():
@@ -268,18 +268,18 @@ def publish_weather_asset(
                                 f"publication requires a real persisted waveform, not merely a "
                                 f"successful analysis return value"
                             )
-                        real_waveform_path = real_wave_dir / f"{track.id}.json"
-                        real_waveform_existed = real_waveform_path.exists()
-                        if real_waveform_existed:
-                            real_waveform_backup = scratch / "previous-waveform.json"
-                            shutil.copy2(real_waveform_path, real_waveform_backup)
                         # Publish exactly the known track-id waveform,
                         # still inside the transaction -- nothing was
                         # ever written to the real WAVEFORMS_DIR before
                         # this line, so a failure anywhere ABOVE this
-                        # point leaves it completely untouched.
-                        scratch_waveform_path.replace(real_waveform_path)
-                        real_waveform_committed = True
+                        # point leaves it completely untouched. The shared
+                        # cache writer (r0123) validates it, replaces the
+                        # real cache atomically under the Track's cache
+                        # lock and keeps a same-filesystem copy of the
+                        # previous one until this publication commits.
+                        real_waveform_promotion = waveform_cache.install_file(
+                            track.id, scratch_waveform_path, real_wave_dir, keep_previous=True)
+                        real_waveform_path = real_waveform_promotion.path
                         # analyze_one_track() persisted Track.waveform_path
                         # pointing at the SCRATCH copy (now relocated) --
                         # correct it to the REAL path just published, and
@@ -290,14 +290,13 @@ def publish_weather_asset(
                         Track.objects.filter(id=track.id).update(waveform_path=str(real_waveform_path))
                         track.refresh_from_db()
                     track_committed = True
+                    if real_waveform_promotion is not None:
+                        real_waveform_promotion.discard()
                 except Exception as exc:
                     _restore_final_file(dest_path, backup)
                     published = False
-                    if real_waveform_committed:
-                        if real_waveform_existed and real_waveform_backup is not None:
-                            Path(real_waveform_backup).replace(real_waveform_path)
-                        elif not real_waveform_existed:
-                            real_waveform_path.unlink(missing_ok=True)
+                    if real_waveform_promotion is not None:
+                        real_waveform_promotion.undo()
                     raise PublicationError(f"publish failed for {dest_path}: {exc}") from exc
 
             except PublicationError:

@@ -52,6 +52,7 @@ urlpatterns = [
     path('api/tracks/<int:pk>/download/', views.api_track_download, name='api-track-download'),
     path('api/tracks/<int:pk>/reanalyze/', views.api_track_reanalyze, name='api-track-reanalyze'),
     path('api/tracks/<int:pk>/repick-cue-points/', views.api_track_repick_cue_points, name='api-track-repick-cue-points'),
+    path('api/tracks/<int:pk>/refresh-waveform/', views.api_track_refresh_waveform, name='api-track-refresh-waveform'),
     path('api/tracks/<int:pk>/read-metadata/', views.api_track_read_metadata, name='api-track-read-metadata'),
     path('api/tracks/<int:pk>/write-metadata/', views.api_track_write_metadata, name='api-track-write-metadata'),
     path('api/tracks/<int:pk>/blocked-slots/toggle/', views.api_track_blocked_slot_toggle, name='api-track-blocked-slot-toggle'),
