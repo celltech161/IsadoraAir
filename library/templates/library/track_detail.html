@@ -946,15 +946,17 @@ function renderCueDetail(key, info) {
     add('Approved', `${fmtWhen(info.approved_at)}${info.approved_by_name ? ' by ' + info.approved_by_name : ''}`);
   if (info.unlocked_at) add('Unlocked', `${fmtWhen(info.unlocked_at)}${info.unlocked_by_name ? ' by ' + info.unlocked_by_name : ''}`);
   if (info.review_reason) add('Review', info.review_reason);
-  const prev = info.previous_approval;
-  if (prev) {
+  // Every retired approval, newest first (the server keeps them all, oldest first).
+  const history = (info.approval_history || (info.previous_approval ? [info.previous_approval] : [])).slice().reverse();
+  history.forEach((prev, i) => {
     const why = {new_media: 'audio replaced', replaced_by_operator: 'replaced by a new value', unlocked: 'unlocked',
-                 recalculated: 'recalculated', unverified_copy: 'copied without verified audio'}[prev.retired_reason]
-                || prev.retired_reason || '';
-    add('Earlier approval', `${fmtSec(prev.value)}${prev.approved_by_name ? ' by ' + prev.approved_by_name : ''}` +
+                 recalculated: 'recalculated', unverified_copy: 'copied without verified audio',
+                 reapproved: 'approved again'}[prev.retired_reason] || prev.retired_reason || '';
+    add(i === 0 ? 'Earlier approval' : 'Older approval',
+        `${fmtSec(prev.value)}${prev.approved_by_name ? ' by ' + prev.approved_by_name : ''}` +
         `${prev.approved_at ? ', ' + fmtWhen(prev.approved_at) : ''}${why ? ' — no longer applies: ' + why : ''}` +
         `${prev.audio_revision ? ' (audio ' + String(prev.audio_revision).slice(0, 8) + ')' : ''}`);
-  }
+  });
   if (info.replaced_historical_value) add('Replaced historical value', fmtSec(info.replaced_historical_value.value));
   detail.hidden = !items.length;
   if (!items.length) return;

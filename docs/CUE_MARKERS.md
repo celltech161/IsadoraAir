@@ -51,10 +51,21 @@ Nothing infers authorship.
   * Each carried value is stamped `audio_changed_at`.
   * Ready-to-Air is never touched. The event is still audited, but the durable record is the
     state, not the SystemEvent.
-* An operator edit, approval or unlock of a marker resolves its review. Package C: none of them
-  drops `previous_approval`, which is permanent history. Replacing a locked value retires its
-  approval there (`replaced_by_operator`), an unlock retires it as `unlocked`, and replacing a
-  historical value records `replaced_historical_value`.
+* An operator edit, approval or unlock of a marker resolves its review. Approval history is
+  **append-only** (r0123 A1): each marker entry's `approval_history` lists every retired
+  approval, oldest first. `previous_approval` is only that list's last record, kept for
+  readers, and is always rewritten together with it so the two cannot disagree.
+  * An entry written before the list existed holds a single `previous_approval`. It is read as a
+    one-record history and becomes the first record on its next transition.
+  * Retirement reasons: `replaced_by_operator` (a locked value replaced), `unlocked`,
+    `reapproved` (an approval for other or unverified audio replaced by a new approval),
+    `new_media`, `recalculated` (an operator-confirmed override) and `unverified_copy`.
+  * Each record is flat (it never contains another record), and `overridden_from` holds the
+    replaced entry without its history.
+  * Records are appended inside the authority's row-locked transaction. A conflict, refusal or
+    invalid edit appends nothing, and a review approval (already retired) is never retired
+    twice. Unknown audio stays `null`.
+  * Replacing a historical value records `replaced_historical_value`.
 * `cue_markers.review(row, current_audio_revision)` reports, per marker: the protection, the
   status of its approval (`current`, `other`, `previous` or `unknown` audio) and any retired
   approval. This is for Package C's screens, and `/api/waveform/<id>/` returns it as

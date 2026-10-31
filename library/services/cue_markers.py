@@ -42,11 +42,13 @@ waveform cache established it -- otherwise None ("unknown", never assumed to mat
 
 New media (``media_replaced=True``) rebinds the markers it supplies: protection that applied to the
 replaced audio is superseded, and that is audited. An operator approval is never silently
-dropped or carried over: it is retired into the marker's ``previous_approval`` (with its value,
+dropped or carried over: it is retired into the marker's ``approval_history`` (with its value,
 approver, time and audio revision). A locked marker the new media does not supply keeps its
 value but becomes ``review``. Only an approval recorded for exactly the new audio revision (the
 "new" media is the same decoded sound, e.g. a tag-only change) stays locked. Operator actions on a
-marker (edit, approve, unlock) resolve its review and drop ``previous_approval``.
+marker (edit, approve, unlock) resolve its review. Approval history is append-only (r0123 A1):
+``approval_history`` lists every retired approval oldest first, and ``previous_approval`` is only
+its last record (an entry written before the list existed is read as a one-record history).
 """
 from __future__ import annotations
 
@@ -282,24 +284,57 @@ def _approved_for(entry, audio_revision) -> bool:
 
 
 def _retired_approval(entry, value, now, reason, new_audio_revision) -> dict | None:
-    """The durable record of an operator approval that no longer applies (None if there was none)."""
-    if not isinstance(entry, dict):
+    """The record of the entry's *current* operator approval as it is retired now -- None when the
+    entry holds no current approval (no entry, unlocked, historical, or a review whose approval was
+    already retired). The record is flat: it never contains another record."""
+    if not isinstance(entry, dict) or entry.get("protection") != LOCKED:
         return None
-    if entry.get("protection") == REVIEW:
-        return entry.get("previous_approval")          # already retired; keep the original record
-    if entry.get("protection") != LOCKED:
-        return entry.get("previous_approval")          # carried until an operator resolves it
     record = {key: entry.get(key) for key in ("source", "set_at", "set_by", "approved_at", "approved_by",
                                                "audio_revision")}
     return {**record, "value": value, "retired_at": _now_iso(now), "retired_reason": reason,
             "retired_for_audio_revision": new_audio_revision}
 
 
+_HISTORY_KEYS = ("approval_history", "previous_approval")
+
+
+def approval_history(entry) -> list:
+    """Every retired approval of a marker entry, oldest first (r0123 A1). An entry written before the
+    list existed carries at most one ``previous_approval``; it is the history's first record."""
+    if not isinstance(entry, dict):
+        return []
+    history = [dict(record) for record in entry.get("approval_history") or [] if isinstance(record, dict)]
+    previous = entry.get("previous_approval")
+    if isinstance(previous, dict) and (not history or history[-1] != previous):
+        history.append(dict(previous))
+    return history
+
+
+def _with_history(new_entry: dict, previous_entry, retired=None) -> dict:
+    """``new_entry`` carrying all of ``previous_entry``'s retired approvals plus ``retired`` (appended,
+    never replacing). ``previous_approval`` is kept only as the list's last record, so the two can
+    never disagree."""
+    entry = {key: value for key, value in new_entry.items() if key not in _HISTORY_KEYS}
+    history = approval_history(previous_entry)
+    if retired:
+        history.append(retired)
+    if history:
+        entry["approval_history"] = history
+        entry["previous_approval"] = history[-1]
+    return entry
+
+
+def _without_history(entry) -> dict:
+    """A snapshot of an entry for ``overridden_from`` -- its history lives on the new entry, not in here."""
+    return {key: value for key, value in (entry or {}).items() if key not in _HISTORY_KEYS}
+
+
 #: Operator-facing marker states (``review()``'s ``display``), from most to least protected.
 DISPLAY_STATES = ("approved", "locked_unverified", "locked_other_audio", "review", "historical",
                   "unlocked_operator", "auto", "default_zero", "unset")
 _PROVENANCE_KEYS = ("source", "set_at", "set_by", "approved_at", "approved_by", "unlocked_at", "unlocked_by",
-                    "review_reason", "audio_changed_at", "previous_approval", "replaced_historical_value",
+                    "review_reason", "audio_changed_at", "previous_approval", "approval_history",
+                    "replaced_historical_value",
                     "overridden_from", "copied_from_track", "equivalence")
 
 
@@ -444,11 +479,10 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
         new_values = {}
         for name, value in values.items():
             previous = state.get(name) if isinstance(state.get(name), dict) else None
-            entry = {"protection": LOCKED, "source": SOURCE_OPERATOR, "set_at": _now_iso(now), "set_by": who,
-                     "approved_at": _now_iso(now), "approved_by": who, "audio_revision": audio_revision}
-            retired = _retired_approval(previous, row[name], now, "replaced_by_operator", audio_revision)
-            if retired:
-                entry["previous_approval"] = retired
+            entry = _with_history(
+                {"protection": LOCKED, "source": SOURCE_OPERATOR, "set_at": _now_iso(now), "set_by": who,
+                 "approved_at": _now_iso(now), "approved_by": who, "audio_revision": audio_revision},
+                previous, _retired_approval(previous, row[name], now, "replaced_by_operator", audio_revision))
             if protection_of(name, row) == LEGACY and row[name] is not None:
                 entry["replaced_historical_value"] = {"value": row[name], "replaced_at": _now_iso(now)}
             if _same(row[name], value):
@@ -472,8 +506,10 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
                     and (audio_revision is None or previous.get("audio_revision") == audio_revision):
                 result.skipped[name] = "already approved and locked"
                 continue
-            state[name] = {**_resolved(previous), "protection": LOCKED, "approved_at": _now_iso(now),
-                           "approved_by": who, "audio_revision": audio_revision}
+            state[name] = _with_history(
+                {**_resolved(previous), "protection": LOCKED, "approved_at": _now_iso(now), "approved_by": who,
+                 "audio_revision": audio_revision},
+                previous, _retired_approval(previous, row[name], now, "reapproved", audio_revision))
             result.approved.append(name)
         for name in unlock:
             previous = state.get(name) or {"source": SOURCE_UNKNOWN}
@@ -483,11 +519,9 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
             if previous.get("protection") == UNLOCKED:
                 result.skipped[name] = "already unlocked"
                 continue
-            entry = {**_resolved(previous), "protection": UNLOCKED, "unlocked_at": _now_iso(now), "unlocked_by": who}
-            retired = _retired_approval(previous, row[name], now, "unlocked", None)
-            if retired:
-                entry["previous_approval"] = retired
-            state[name] = entry
+            state[name] = _with_history(
+                {**_resolved(previous), "protection": UNLOCKED, "unlocked_at": _now_iso(now), "unlocked_by": who},
+                previous, _retired_approval(previous, row[name], now, "unlocked", None))
             result.unlocked.append(name)
         final = {name: new_values.get(name, row[name]) for name in MARKERS}
         problems = validate(final, set(new_values), row["duration_seconds"])
@@ -560,11 +594,9 @@ def apply_calculation(track_id, values: dict, *, basis_revision, source=SOURCE_A
             entry = {"protection": UNLOCKED, "source": source, "set_at": _now_iso(now), "set_by": who,
                      "audio_revision": audio_revision}
             if name in override:
-                entry["overridden_from"] = state.get(name) or {"source": SOURCE_UNKNOWN}
-            retired = _retired_approval(previous, row[name], now, "new_media" if replacing else "recalculated",
-                                        audio_revision)
-            if retired:
-                entry["previous_approval"] = retired
+                entry["overridden_from"] = _without_history(state.get(name)) or {"source": SOURCE_UNKNOWN}
+            entry = _with_history(entry, previous, _retired_approval(
+                previous, row[name], now, "new_media" if replacing else "recalculated", audio_revision))
             if replacing and protection == LEGACY and not _same(row[name], value):
                 entry["replaced_historical_value"] = {"value": row[name], "replaced_at": _now_iso(now)}
             state[name] = entry
@@ -580,12 +612,12 @@ def apply_calculation(track_id, values: dict, *, basis_revision, source=SOURCE_A
                     continue
                 protection = protection_of(name, row)
                 if protection == LOCKED:
-                    state[name] = {"protection": REVIEW, "source": previous.get("source", SOURCE_UNKNOWN),
-                                   "set_at": previous.get("set_at"), "set_by": previous.get("set_by"),
-                                   "previous_approval": _retired_approval(previous, row[name], now, "new_media",
-                                                                          audio_revision),
-                                   "review_reason": "the audio was replaced after this marker was approved",
-                                   "audio_changed_at": _now_iso(now)}
+                    state[name] = _with_history(
+                        {"protection": REVIEW, "source": previous.get("source", SOURCE_UNKNOWN),
+                         "set_at": previous.get("set_at"), "set_by": previous.get("set_by"),
+                         "review_reason": "the audio was replaced after this marker was approved",
+                         "audio_changed_at": _now_iso(now)},
+                        previous, _retired_approval(previous, row[name], now, "new_media", audio_revision))
                     result.review.append(name)
                 else:
                     state[name] = {**(previous or {}), "audio_changed_at": _now_iso(now)}
@@ -652,10 +684,8 @@ def copy_for_equivalent_media(source_id, target_id, names, *, source_identity=No
                 state[name] = copy.deepcopy(entry) if entry else {"source": SOURCE_UNKNOWN}
                 state[name]["equivalence"] = {"verified": True, "audio_revision": revision}
             else:
-                state[name] = {"source": SOURCE_UNKNOWN, "equivalence": {"verified": False}}
-                retired = _retired_approval(entry, source[name], now, "unverified_copy", None)
-                if retired:
-                    state[name]["previous_approval"] = retired
+                state[name] = _with_history({"source": SOURCE_UNKNOWN, "equivalence": {"verified": False}},
+                                            entry, _retired_approval(entry, source[name], now, "unverified_copy", None))
             state[name]["copied_from_track"] = source_id
             if not _same(row[name], values[name]):
                 result.changed[name] = [row[name], values[name]]

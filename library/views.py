@@ -911,18 +911,24 @@ def _cue_marker_state(track):
     row = cue_markers.snapshot(track.pk)
     review = cue_markers.review(row, current_revision)
     ids = {info.get(key) for info in review.values() for key in ("set_by", "approved_by", "unlocked_by")}
+    ids |= {record.get("approved_by") for info in review.values() for record in info.get("approval_history") or []}
     ids |= {(info.get("previous_approval") or {}).get("approved_by") for info in review.values()}
     names = dict(get_user_model().objects.filter(pk__in={i for i in ids if isinstance(i, int)})
                  .values_list("pk", "username"))
+
+    def named(record):
+        if isinstance(record, dict) and isinstance(record.get("approved_by"), int):
+            return {**record, "approved_by_name": names.get(record["approved_by"], f"user {record['approved_by']}")}
+        return record
     for info in review.values():
         for key in ("set_by", "approved_by", "unlocked_by"):
             if isinstance(info.get(key), int):
                 info[key + "_name"] = names.get(info[key], f"user {info[key]}")
-        previous = info.get("previous_approval")
-        if isinstance(previous, dict) and isinstance(previous.get("approved_by"), int):
-            info["previous_approval"] = {**previous,
-                                         "approved_by_name": names.get(previous["approved_by"],
-                                                                       f"user {previous['approved_by']}")}
+        # The whole retired-approval history, oldest first; previous_approval is its latest record.
+        history = cue_markers.approval_history(info)
+        if history:
+            info["approval_history"] = [named(record) for record in history]
+            info["previous_approval"] = info["approval_history"][-1]
     explanations = {
         waveform_cache.TRUSTED: "Verified for the current audio.",
         waveform_cache.TRUSTED_STALE_MARKERS: "Verified for the current audio (cue points shown are current).",
