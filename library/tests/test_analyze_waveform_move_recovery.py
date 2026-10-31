@@ -146,13 +146,12 @@ class WaveformMoveRecoveryTests(TestCase):
                  patch.object(analyze_tracks, "decode_audio_to_pcm", return_value=_fake_mono_pcm()), \
                  patch.object(analyze_tracks, "decode_audio_to_pcm_stereo", side_effect=stereo_side_effect), \
                  patch.object(analyze_tracks, "emit_event") as emit_mock:
-                ok = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
+                outcome = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
 
-            self.assertTrue(ok)  # mono side succeeded so overall analyze counts as done
+            self.assertTrue(outcome)  # mono side succeeded so overall analyze counts as done
             self.assertEqual(len(calls), 1, "no retry should occur when the DB filepath matches")
-            payload = json.loads((wave_dir / f"{track.id}.json").read_text())
-            self.assertEqual(payload["samples_left"], [])
-            self.assertEqual(payload["samples_right"], [])
+            self.assertFalse((wave_dir / f"{track.id}.json").exists())
+            self.assertIn("stereo audio did not decode", outcome.waveform_error)
             emit_mock.assert_not_called()
 
     def test_db_filepath_changed_but_new_file_missing_no_retry(self):
@@ -182,15 +181,17 @@ class WaveformMoveRecoveryTests(TestCase):
                  patch.object(analyze_tracks, "decode_audio_to_pcm", return_value=_fake_mono_pcm()), \
                  patch.object(analyze_tracks, "decode_audio_to_pcm_stereo", side_effect=stereo_side_effect), \
                  patch.object(analyze_tracks, "emit_event") as emit_mock:
-                ok = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
+                outcome = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
 
-            self.assertTrue(ok)
+            self.assertTrue(outcome)
             self.assertEqual(len(calls), 1, "no retry when new path isn't a file")
+            self.assertFalse((wave_dir / f"{track.id}.json").exists())
+            self.assertIn("stereo audio did not decode", outcome.waveform_error)
             emit_mock.assert_not_called()
 
     def test_retry_also_fails_no_recovery_event(self):
         """If the second decode also returns empty (e.g. the file at
-        the new path is itself broken), the waveform stays empty and
+        the new path is itself broken), no incomplete waveform is published and
         no "recovered" event is emitted -- we mustn't claim success
         we didn't actually achieve."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -216,13 +217,12 @@ class WaveformMoveRecoveryTests(TestCase):
                  patch.object(analyze_tracks, "decode_audio_to_pcm", return_value=_fake_mono_pcm()), \
                  patch.object(analyze_tracks, "decode_audio_to_pcm_stereo", side_effect=stereo_side_effect), \
                  patch.object(analyze_tracks, "emit_event") as emit_mock:
-                ok = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
+                outcome = analyze_tracks.analyze_one_track(row, self.CFG, wave_dir, force=True)
 
-            self.assertTrue(ok)
+            self.assertTrue(outcome)
             self.assertEqual(len(calls), 2, "retry attempted once")
-            payload = json.loads((wave_dir / f"{track.id}.json").read_text())
-            self.assertEqual(payload["samples_left"], [])
-            self.assertEqual(payload["samples_right"], [])
+            self.assertFalse((wave_dir / f"{track.id}.json").exists())
+            self.assertIn("stereo audio did not decode", outcome.waveform_error)
             # We did not recover; do not emit a false-positive event.
             emit_mock.assert_not_called()
 

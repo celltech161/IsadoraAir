@@ -257,6 +257,7 @@ _EVENT_LEVEL_FILTERS = {
     "error+": ("error", "critical"),
 }
 _EVENT_LIMIT = 100
+_RECENT_EVENTS_HIDDEN_DEDUPE_PREFIX = "library|cue-markers|"
 
 
 @require_http_methods(["GET"])
@@ -276,7 +277,15 @@ def api_recent_events(request):
     category = request.GET.get("category", "").strip()
 
     cutoff = django_tz.now() - window
-    qs = SystemEvent.objects.filter(created_at__gte=cutoff, level__in=levels)
+    # Cue-marker authority events remain durable and visible in Django
+    # Admin, but are routine Library audit activity rather than station
+    # health. Exclude their stable producer-owned key before every feed
+    # filter and before the result limit so they cannot crowd out genuine
+    # operational events (including other Library warnings/errors).
+    visible = SystemEvent.objects.exclude(
+        dedupe_key__startswith=_RECENT_EVENTS_HIDDEN_DEDUPE_PREFIX,
+    ).filter(created_at__gte=cutoff)
+    qs = visible.filter(level__in=levels)
     if category:
         qs = qs.filter(category=category)
 
@@ -301,8 +310,7 @@ def api_recent_events(request):
         # of hard-coding a list that goes stale as subsystems start
         # emitting.
         "categories": sorted(
-            SystemEvent.objects
-            .filter(created_at__gte=cutoff)
+            visible
             .values_list("category", flat=True)
             .distinct()
         ),

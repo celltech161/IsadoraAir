@@ -1768,6 +1768,7 @@ const REANALYZE_WAVEFORM_TEXT = {
   verified: 'Waveform regenerated and verified for the current audio.',
   unverified: 'Waveform regenerated and shown, but this file\'s audio could not be verified, so Reset Cue Points stays unavailable. Locked cue points are unaffected.',
   not_regenerated: 'The new waveform could not be installed; the previous waveform is kept.',
+  queued: 'Reanalysis queued. The background analyzer will regenerate this Track\'s waveform. Locked cue markers will be preserved.',
 };
 
 function reanalyzeStatus(text, tone) {
@@ -1812,6 +1813,10 @@ async function reanalyzeTrack() {
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok && !data.waveform) {
       reanalyzeStatus(data.error || 'Reanalyze failed; nothing was changed.', 'error');
+    } else if (resp.status === 202 && data.outcome === 'queued') {
+      // Queued is not a completion result. Do not redraw the waveform or
+      // adopt marker values until the background analyzer has actually run.
+      reanalyzeStatus(data.message || REANALYZE_WAVEFORM_TEXT.queued, 'ok');
     } else {
       // Only Cue In and Next Start can change -- the other six cue points
       // are never calculated, and protected markers keep their values.
@@ -1827,7 +1832,11 @@ async function reanalyzeTrack() {
       loadCueState();
       const waveText = REANALYZE_WAVEFORM_TEXT[data.outcome] || '';
       const tone = data.outcome === 'verified' ? 'ok' : data.outcome === 'unverified' ? 'warn' : 'error';
-      reanalyzeStatus([waveText, describeMarkerResult(data.cue_markers), resp.ok ? '' : (data.error || '')]
+      const waveformError = data.outcome === 'not_regenerated' && data.waveform && data.waveform.error
+        ? 'Reason: ' + String(data.waveform.error).slice(0, 300) + '.' : '';
+      // reanalyzeStatus assigns textContent, so even a server-supplied reason
+      // can never become markup.
+      reanalyzeStatus([waveText, waveformError, describeMarkerResult(data.cue_markers), resp.ok ? '' : (data.error || '')]
                         .filter(Boolean).join(' '), tone);
     }
   } catch (e) {

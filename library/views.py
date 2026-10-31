@@ -2492,6 +2492,18 @@ def _track_to_dict(track):
     }
 
 
+REANALYZE_SYNC_MAX_SECONDS = 15 * 60
+REANALYZE_ERROR_MAX_CHARS = 300
+_REANALYZE_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/(?:[^\s\"'<>]+)")
+
+
+def _reanalyze_error_for_operator(value):
+    """One bounded, single-line, path-redacted reason for Track Detail."""
+    text = " ".join(str(value or "").split())
+    text = _REANALYZE_ABSOLUTE_PATH.sub("[path]", text)
+    return text[:REANALYZE_ERROR_MAX_CHARS]
+
+
 @require_http_methods(["POST"])
 def api_track_reanalyze(request, pk):
     """Force a fresh waveform + cue-point (re)analysis of exactly this
@@ -2503,12 +2515,12 @@ def api_track_reanalyze(request, pk):
     ``override`` with ``"confirm": true``. The manually-set marks (intro,
     sweep, outro, hooks) are never calculated.
 
-    r0124: this is the one waveform action (Refresh Waveform Only was retired). The response says
-    what actually happened, never inferred from the HTTP status: ``outcome`` is ``verified`` (new
-    waveform installed, its decoded audio identified), ``unverified`` (new waveform installed and
-    displayable, audio not identified -- trusted-cache features such as Reset Cue Points stay
-    unavailable) or ``not_regenerated`` (analysis ran but the new cache was not installed; the
-    previous one is kept). ``waveform`` carries the details and the cache's resulting trust state;
+    r0124: this is the one waveform action (Refresh Waveform Only was retired). Tracks up to 15
+    minutes run here; longer Tracks return 202/``queued`` after setting ``analysis_requested_at``
+    for the existing analyzer timer. A completed response says what actually happened, never
+    inferred from HTTP 200: ``verified`` (new displayable waveform, identified audio),
+    ``unverified`` (new displayable waveform, audio not identified) or ``not_regenerated`` (no new
+    usable cache; previous cache kept). ``waveform`` carries details and resulting cache trust;
     ``cue_markers`` reports applied, preserved and refused markers.
 
     Roadmap 2.5A: requires library.manage_tracks (see api_track_bulk's
@@ -2526,6 +2538,29 @@ def api_track_reanalyze(request, pk):
     body = _optional_json(request)
     if body is None:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    override = body.get("override") or ()
+    if isinstance(override, str) or not all(isinstance(name, str) for name in override):
+        return JsonResponse({"error": "override must be a list of marker names"}, status=400)
+    if (track.duration_seconds or 0) > REANALYZE_SYNC_MAX_SECONDS:
+        # The timer's ordinary analysis deliberately has no operator override:
+        # protected markers stay protected. Never accept a body whose requested
+        # semantics cannot be carried by analysis_requested_at.
+        if override:
+            return JsonResponse({
+                "error": "A queued long-form reanalysis cannot override protected cue markers; unlock them first."
+            }, status=400)
+        from library.services import cue_markers
+        cue_markers.request_analysis(Track.objects.filter(pk=track.pk))
+        return JsonResponse({
+            "track_id": track.pk,
+            "outcome": "queued",
+            "queued": True,
+            "message": (
+                "Reanalysis queued. The background analyzer will regenerate this Track's waveform. "
+                "Locked cue markers will be preserved."
+            ),
+        }, status=202)
 
     cfg = AnalysisConfig.load()
     cfg_values = (
@@ -2545,9 +2580,6 @@ def api_track_reanalyze(request, pk):
     row = (track.id, track.filepath, track.filename, track.duration_seconds,
            track.title, track.artist.name if track.artist_id else "", track.related_artists)
 
-    override = body.get("override") or ()
-    if isinstance(override, str) or not all(isinstance(name, str) for name in override):
-        return JsonResponse({"error": "override must be a list of marker names"}, status=400)
     analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True, requested_by=request.user,
                                  override=tuple(override), override_confirmed=body.get("confirm") is True)
     if not analyzed:
@@ -2558,8 +2590,11 @@ def api_track_reanalyze(request, pk):
     from library.services import waveform_cache
     track.refresh_from_db()
     verdict = waveform_cache.validate(track)
-    installed = analyzed.waveform_installed
-    waveform = {"regenerated": installed, "error": analyzed.waveform_error,
+    installed = analyzed.waveform_installed and verdict.displayable
+    waveform_error = _reanalyze_error_for_operator(analyzed.waveform_error)
+    if analyzed.waveform_installed and not verdict.displayable and not waveform_error:
+        waveform_error = "the generated waveform was not displayable; the previous waveform was kept"
+    waveform = {"regenerated": installed, "error": waveform_error,
                 "audio_verified": installed and not analyzed.audio_problem and verdict.trusted,
                 "audio_problem": analyzed.audio_problem, "status": verdict.status, "trusted": verdict.trusted,
                 "displayable": verdict.displayable}

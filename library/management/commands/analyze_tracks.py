@@ -401,6 +401,22 @@ class AnalysisOutcome:
         return f"AnalysisOutcome(analyzed={self.analyzed!r}, reason={self.reason!r})"
 
 
+def _clear_processed_analysis_request(track_id, basis):
+    """Clear only the explicit request this analysis actually observed.
+
+    A newer click while this run is decoding writes a different timestamp and
+    therefore survives for the next timer pass.  Terminal decode/publication
+    outcomes clear their own request so a permanently unreadable Track is not
+    retried every minute; an interrupted process never reaches this helper, so
+    its request remains retryable.
+    """
+    requested_at = basis.get("analysis_requested_at")
+    if requested_at is not None:
+        Track.objects.filter(
+            id=track_id, analysis_requested_at=requested_at,
+        ).update(analysis_requested_at=None)
+
+
 def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, *,
                       media_replaced=False, source=cue_markers.SOURCE_ANALYSIS, requested_by=None,
                       override=(), override_confirmed=False, keep_previous_waveform=False):
@@ -447,22 +463,26 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     # track and let the next analyze pass retry from a clean slate.
     swap = transcode_lossless_to_flac(track_id, filepath, filename)
     if swap is None:
+        _clear_processed_analysis_request(track_id, basis)
         return AnalysisOutcome(False, reason="transcode failed")
     filepath, filename = swap
     fp = Path(filepath)
 
     if not fp.is_file():
         print(f"  Missing file for track {track_id}: {filepath}")
+        _clear_processed_analysis_request(track_id, basis)
         return AnalysisOutcome(False, reason="missing file")
     started_ns = time.time_ns()
     witness_before = audio_identity.stat_source(fp)
 
     raw = decode_audio_to_pcm(fp, sample_rate)
     if not raw:
+        _clear_processed_analysis_request(track_id, basis)
         return AnalysisOutcome(False, reason="decode failed")
 
     times, envelope_db = compute_envelope(raw, sample_rate, window_seconds)
     if not envelope_db:
+        _clear_processed_analysis_request(track_id, basis)
         return AnalysisOutcome(False, reason="no envelope")
 
     analysis_duration = times[-1] if times else None
@@ -541,6 +561,7 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     witness = audio_identity.stat_source(fp)
     if not audio_identity.same_content_witness(witness_before, witness):
         print(f"  Track {track_id}: the audio file changed while it was analyzed; nothing applied")
+        _clear_processed_analysis_request(track_id, basis)
         return AnalysisOutcome(False, reason="source changed during analysis")
     if identity is not None and analysis_duration and not waveform_cache.identity_consistent(
             identity, analysis_duration, window_seconds):
@@ -591,29 +612,35 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     # envelope (detect_next_start/detect_cue_in walk it; Repick re-picks from it without another
     # decode once the cache is trusted), the audio identity and source witness, and -- added at
     # promotion -- the Track's markers as they stand then, never values the authority did not apply.
-    payload = waveform_cache.build_payload(
-        track_id, identity=identity, source=witness, analysis={
-            "sample_rate": int(sample_rate), "window_seconds": float(window_seconds),
-            "waveform_points": int(target_points)},
-        writer="analysis", started_ns=started_ns, analysis_duration=analysis_duration, times=times,
-        envelope_db=envelope_db, samples_left=samples_left, samples_right=samples_right)
     update_fields = {"related_artists": related}
     promotion, waveform_error = None, ""
-    try:
-        promotion = waveform_cache.promote(
-            track_id, payload, wave_dir, expected_source=witness,
-            keep_previous=keep_previous_waveform,
-        )
-        update_fields["waveform_path"] = str(promotion.path)
-    except (waveform_cache.PromotionRefused, waveform_cache.WaveformBusy, OSError) as exc:
-        waveform_error = str(exc) or type(exc).__name__
-        print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
+    # The mono envelope remains useful for eligible cue-marker calculations,
+    # but a cache without stereo samples cannot be drawn.  Keep successful
+    # marker/metadata work separate while refusing to replace a previously
+    # displayable cache with an incomplete payload.
+    if not samples_left or not samples_right:
+        waveform_error = "stereo audio did not decode into a displayable waveform"
+        print(f"  Waveform cache for track {track_id} not replaced: {waveform_error}")
+    else:
+        payload = waveform_cache.build_payload(
+            track_id, identity=identity, source=witness, analysis={
+                "sample_rate": int(sample_rate), "window_seconds": float(window_seconds),
+                "waveform_points": int(target_points)},
+            writer="analysis", started_ns=started_ns, analysis_duration=analysis_duration, times=times,
+            envelope_db=envelope_db, samples_left=samples_left, samples_right=samples_right)
+        try:
+            promotion = waveform_cache.promote(
+                track_id, payload, wave_dir, expected_source=witness,
+                keep_previous=keep_previous_waveform,
+            )
+            update_fields["waveform_path"] = str(promotion.path)
+        except (waveform_cache.PromotionRefused, waveform_cache.WaveformBusy, OSError) as exc:
+            waveform_error = str(exc) or type(exc).__name__
+            print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
 
     try:
         Track.objects.filter(id=track_id).update(**update_fields)
-        # The request this run served is done -- unless a newer one arrived while it ran.
-        Track.objects.filter(id=track_id, analysis_requested_at=basis["analysis_requested_at"]).exclude(
-            analysis_requested_at__isnull=True).update(analysis_requested_at=None)
+        _clear_processed_analysis_request(track_id, basis)
     except BaseException:
         if keep_previous_waveform and promotion is not None:
             promotion.undo()

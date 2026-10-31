@@ -273,10 +273,11 @@ untrusted for the new audio (its witness no longer matches) or a trusted cache o
 audio whose marker snapshot is merely stale. Both are detectable, neither authorizes Repick on
 other audio, and the next analysis (Reanalyze Track) repairs it. Analysis applies
 nothing if the source file changes while it decodes; a rename between its decodes (a
-recategorization) keeps the same inode, size and mtime, so it counts as the same source. No
-trusted cache can result without an identity, with an identity whose length disagrees with
-the envelope, or with empty stereo samples: those are stored as untrusted v2 caches
-(`unverified_audio` or `incomplete`).
+recategorization) keeps the same inode, size and mtime, so it counts as the same source. A
+displayable cache without an identity is stored as `unverified_audio`; it can be shown but never
+trusted. Empty stereo samples are not promoted at all, so the previous cache remains rather than
+being replaced by an `incomplete` cache. An identity whose length disagrees with the envelope is
+discarded and the resulting displayable cache is likewise unverified.
 
 ## Reanalyze Track: the one waveform action (r0124)
 
@@ -293,6 +294,14 @@ operator workflow is now:
 **What Reanalyze Track does.** It is the existing analyzer (`analyze_one_track`), with its ffmpeg
 commands, decoding tolerance, category thresholds, related-artist discovery, duration update and
 established lossless (WAV/AIF→FLAC) conversion all unchanged.
+
+Tracks up to 15 minutes are analyzed in the web request. Longer Tracks return **queued** immediately:
+the existing `analysis_requested_at` request and `isadoraair-analyze.timer` run the same analyzer
+outside Gunicorn. The timer normally begins within one minute. A queued response is only an
+acknowledgement, never proof that decoding or cache publication succeeded. Repeated clicks replace
+the pending request generation; an analysis clears only the generation it observed, so a newer
+request survives an older run. The analyzer service has a bounded 30-minute start timeout, sufficient
+for the supported one- and two-hour programme workflow without making a stuck process unbounded.
 
 * It regenerates the waveform and recalculates only Cue In and Next Start.
 * The calculated values reach the Track only through the cue-marker authority:
@@ -313,6 +322,8 @@ the facts:
     identified;
   * `not_regenerated`: the analysis ran but the new cache was not installed, and the previous
     waveform is kept. A file that does not decode at all gets 400 with the same outcome.
+  * `queued`: a long-form reanalysis request was recorded for the existing background analyzer;
+    no completion claim is made and the page does not redraw the waveform.
 * `waveform`: `regenerated`, `error`, `audio_verified`, `audio_problem`, and the cache's
   resulting `status` / `trusted` / `displayable`.
 * `cue_markers`: the markers changed, the markers kept with the protection that kept them, and
@@ -320,6 +331,10 @@ the facts:
 
 The page shows the waveform result and the cue-point result separately, so a safely refused
 calculation is not reported as a failed reanalysis.
+
+A mono envelope can still produce eligible Cue In and Next Start calculations when the display-only
+stereo decode fails, but an empty stereo waveform is never published. The previous cache remains in
+place and the completed request reports `not_regenerated` with a bounded, path-redacted reason.
 
 **Displayable vs verified.** Some playable files cannot be verified: the analyzer decodes them,
 but the stricter decoded-audio identity cannot be established (KOGR Track 35884 is one, with
@@ -395,6 +410,13 @@ The button sits with the analysis controls, with a one-line explanation. Its sta
 the waveform result (regenerated and verified, regenerated but not verified, or not regenerated)
 and the cue-point result (updated, kept with the reason, or not applied because of a concurrent
 change). See *Reanalyze Track: the one waveform action* above.
+
+### Monitoring Recent Events
+
+Routine cue-marker authority events remain stored as `SystemEvent` audit records and marker approval
+history remains unchanged, but records in the stable `library|cue-markers|...` namespace are omitted
+from `/monitoring/` Recent Events and its category choices. Other Library warnings and errors remain
+visible. Administrators can still inspect the retained rows in Django Admin.
 
 ## Field acceptance checklist (KOGR and WRJE, after r0124 installation)
 

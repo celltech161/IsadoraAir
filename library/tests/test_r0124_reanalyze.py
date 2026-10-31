@@ -8,9 +8,12 @@ Real audio is generated into per-test temporary directories; Track 35884's file 
 station media, waveform, database or service is touched."""
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone as datetime_timezone
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.test import Client
 
 from library.management.commands import analyze_tracks
@@ -173,6 +176,37 @@ class MarkerProtectionTests(_Reanalyze):
         self.assertEqual(_row(track.pk)[CUE_IN], 0.4)
         self.assertEqual(body["cue_markers"]["preserved"], {CUE_IN: "locked"})
 
+    def test_g2_a_failed_stereo_decode_never_replaces_or_claims_the_waveform(self):
+        track = self.track()
+        self.lock(track, **{CUE_IN: 0.4, NEXT: 2.2})
+        old, source_sha = self.cache(track).read_bytes(), _sha(track.filepath)
+        before = _row(track.pk)
+        with patch.object(analyze_tracks, "decode_audio_to_pcm_stereo", return_value=b""):
+            status, body = self.post(track)
+        self.assertEqual(status, 200, body)
+        self.assertEqual((body["outcome"], body["waveform"]["regenerated"]),
+                         ("not_regenerated", False))
+        self.assertIn("displayable waveform", body["waveform"]["error"])
+        self.assertEqual(self.cache(track).read_bytes(), old)
+        self.assertEqual(_sha(track.filepath), source_sha)
+        after = _row(track.pk)
+        self.assertEqual((after[CUE_IN], after[NEXT], after["cue_marker_state"]),
+                         (before[CUE_IN], before[NEXT], before["cue_marker_state"]))
+        self.assertNotEqual(waveform_cache.validate(Track.objects.get(pk=track.pk)).status,
+                            waveform_cache.INCOMPLETE)
+
+    def test_g3_operator_error_is_single_line_bounded_and_redacts_absolute_paths(self):
+        track = self.track()
+        reason = "publication failed at /srv/private/waves/1.json\n" + "x" * 500
+        with patch.object(waveform_cache, "promote",
+                          side_effect=waveform_cache.PromotionRefused("failed", reason)):
+            status, body = self.post(track)
+        error = body["waveform"]["error"]
+        self.assertEqual((status, body["outcome"]), (200, "not_regenerated"))
+        self.assertNotIn("/srv/private", error)
+        self.assertNotIn("\n", error)
+        self.assertLessEqual(len(error), 300)
+
     def test_h_repeated_reanalysis_is_idempotent_for_protection_and_history(self):
         track = self.track()
         self.lock(track, **{CUE_IN: 0.4})
@@ -225,3 +259,122 @@ class PreservationTests(_Reanalyze):
         handler = source[source.index("async function reanalyzeTrack"):source.index("// --- Fast cue-point repick")]
         self.assertIn("editedCueMarkers()", handler)
         self.assertIn("before reanalyzing", handler)
+
+    def test_the_page_treats_queued_as_pending_and_displays_safe_failure_detail(self):
+        source = (Path(__file__).resolve().parents[2] / "library/templates/library/track_detail.html").read_text()
+        handler = source[source.index("async function reanalyzeTrack"):source.index("// --- Fast cue-point repick")]
+        self.assertIn("resp.status === 202 && data.outcome === 'queued'", handler)
+        queued = handler.index("data.outcome === 'queued'")
+        redraw = handler.index("loadWaveform()")
+        self.assertLess(queued, redraw)
+        self.assertIn("data.waveform.error", handler)
+        self.assertIn("slice(0, 300)", handler)
+        self.assertIn("textContent", source[source.index("function reanalyzeStatus"):handler.index("async function")
+                                            + source.index("async function reanalyzeTrack")])
+
+
+class LongFormQueueTests(_Reanalyze):
+    LONG_SECONDS = 15 * 60 + 1
+
+    def long_track(self, **kwargs):
+        track = self.track(**kwargs)
+        Track.objects.filter(pk=track.pk).update(duration_seconds=self.LONG_SECONDS)
+        return Track.objects.get(pk=track.pk)
+
+    def test_short_track_still_reanalyzes_synchronously(self):
+        track = self.track()
+        with patch.object(cue_markers, "request_analysis", wraps=cue_markers.request_analysis) as queued:
+            status, body = self.post(track)
+        self.assertEqual((status, body["outcome"]), (200, "verified"))
+        queued.assert_not_called()
+
+    def test_long_track_queues_promptly_without_decode_and_changes_no_media_or_markers(self):
+        track = self.long_track()
+        before, old_cache, source_sha = _row(track.pk), self.cache(track).read_bytes(), _sha(track.filepath)
+        with patch.object(analyze_tracks, "analyze_one_track", side_effect=AssertionError("decoded in request")):
+            status, body = self.post(track)
+        self.assertEqual((status, body["outcome"], body["queued"]), (202, "queued", True))
+        self.assertIn("background analyzer", body["message"])
+        after = _row(track.pk)
+        self.assertIsNotNone(after["analysis_requested_at"])
+        for name in (*cue_markers.MARKERS, "cue_marker_state", "cue_marker_revision"):
+            self.assertEqual(after[name], before[name], name)
+        self.assertEqual((self.cache(track).read_bytes(), _sha(track.filepath)), (old_cache, source_sha))
+
+    def test_repeated_click_refreshes_the_request_generation_without_claiming_success(self):
+        track = self.long_track()
+        one = self.post(track)
+        first = _row(track.pk)["analysis_requested_at"]
+        # Give the second click a deliberately older stored generation so
+        # the assertion does not depend on wall-clock or database precision.
+        Track.objects.filter(pk=track.pk).update(
+            analysis_requested_at=first - timedelta(seconds=1),
+        )
+        two = self.post(track)
+        second = _row(track.pk)["analysis_requested_at"]
+        self.assertEqual((one[0], one[1]["outcome"], two[0], two[1]["outcome"]),
+                         (202, "queued", 202, "queued"))
+        self.assertGreater(second, first)
+
+    def test_queued_standard_analysis_regenerates_and_preserves_locked_markers(self):
+        track = self.long_track()
+        self.lock(track, **{NEXT: 2.2})
+        released = cue_markers.operator_edit(
+            track.pk, expected_revision=_row(track.pk)["cue_marker_revision"], user=self.user, unlock=[CUE_IN],
+        )
+        self.assertTrue(released.ok, released.error)
+        old_cache = self.cache(track).read_bytes()
+        self.assertEqual(self.post(track)[0], 202)
+        call_command("analyze_tracks", stdout=StringIO())
+        row = _row(track.pk)
+        self.assertIsNone(row["analysis_requested_at"])
+        self.assertEqual(row[NEXT], 2.2)
+        self.assertEqual(row["cue_marker_state"][NEXT]["protection"], cue_markers.LOCKED)
+        self.assertEqual(row["cue_marker_state"][CUE_IN]["source"], cue_markers.SOURCE_ANALYSIS)
+        self.assertNotEqual(self.cache(track).read_bytes(), old_cache)
+        self.assertTrue(waveform_cache.validate(Track.objects.get(pk=track.pk)).trusted)
+
+    def test_a_newer_request_survives_an_older_background_analysis(self):
+        track = self.long_track()
+        first = datetime(2026, 10, 31, 12, 0, tzinfo=datetime_timezone.utc)
+        second = first + timedelta(seconds=1)
+        with patch.object(cue_markers.timezone, "now", return_value=first):
+            self.assertEqual(self.post(track)[0], 202)
+        real_decode = analyze_tracks.decode_audio_to_pcm
+        requested = False
+
+        def decode_and_request_again(path, rate):
+            nonlocal requested
+            if not requested:
+                requested = True
+                with patch.object(cue_markers.timezone, "now", return_value=second):
+                    cue_markers.request_analysis(Track.objects.filter(pk=track.pk))
+            return real_decode(path, rate)
+
+        with patch.object(analyze_tracks, "decode_audio_to_pcm", side_effect=decode_and_request_again):
+            call_command("analyze_tracks", stdout=StringIO())
+        self.assertEqual(_row(track.pk)["analysis_requested_at"], second)
+
+    def test_terminal_background_decode_failure_keeps_cache_and_does_not_retry_forever(self):
+        track = self.long_track()
+        before, old_cache = _row(track.pk), self.cache(track).read_bytes()
+        status, body = self.post(track)
+        self.assertEqual((status, body["outcome"]), (202, "queued"))
+        with patch.object(analyze_tracks, "decode_audio_to_pcm", return_value=b""):
+            call_command("analyze_tracks", stdout=StringIO())
+        after = _row(track.pk)
+        self.assertIsNone(after["analysis_requested_at"])
+        self.assertEqual(self.cache(track).read_bytes(), old_cache)
+        for name in (*cue_markers.MARKERS, "cue_marker_state", "cue_marker_revision"):
+            self.assertEqual(after[name], before[name], name)
+
+    def test_queued_override_is_rejected_instead_of_silently_ignored(self):
+        track = self.long_track()
+        status, body = self.post(track, override=[NEXT], confirm=True)
+        self.assertEqual(status, 400)
+        self.assertIn("cannot override", body["error"])
+        self.assertIsNone(_row(track.pk)["analysis_requested_at"])
+
+    def test_background_service_has_a_bounded_long_form_timeout(self):
+        unit = (Path(__file__).resolve().parents[2] / "deploy/isadoraair-analyze.service").read_text()
+        self.assertIn("TimeoutStartSec=1800", unit)
