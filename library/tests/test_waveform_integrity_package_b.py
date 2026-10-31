@@ -556,8 +556,9 @@ class ApprovalRevisionTests(_Base):
         cue_markers.operator_edit(track.pk, expected_revision=2, user=self.user, approve=["hook_in_seconds"],
                                   audio_revision="b" * 64)
         hook = _row(track.pk)["cue_marker_state"]["hook_in_seconds"]
-        self.assertEqual((hook["protection"], hook["audio_revision"], "previous_approval" in hook),
-                         ("locked", "b" * 64, False))
+        # Package C: the retired approval stays as history after the operator resolves the review.
+        self.assertEqual((hook["protection"], hook["audio_revision"], "review_reason" in hook,
+                          hook["previous_approval"]["value"]), ("locked", "b" * 64, False, 1.0))
 
     def test_the_same_decoded_audio_republished_keeps_its_approvals(self):
         track, revision = self.approved()

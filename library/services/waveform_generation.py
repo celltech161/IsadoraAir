@@ -67,6 +67,7 @@ class RefreshResult:
     replaced: bool = False
     previous_cache_retained: bool = True
     old: dict = field(default_factory=dict)       # {"status", "audio_revision", "started_ns"}
+    requested_ns: int | None = None               # a background refresh's request token (status polling)
     new: dict = field(default_factory=dict)       # {"status", "audio_revision", "started_ns", "trusted"}
 
     @property
@@ -201,11 +202,12 @@ def start_background(track_id, *, wave_dir=None) -> RefreshResult:
             return RefreshResult(track_id, BUSY, "a refresh of this Track is already running")
         except OSError as exc:
             return RefreshResult(track_id, FAILED, f"the waveform lock cannot be opened: {exc.strerror or exc}")
+        requested_ns = time.time_ns()
         try:
             subprocess.Popen(
                 [sys.executable, str(Path(django_settings.BASE_DIR) / "manage.py"), "refresh_waveform",
                  str(int(track_id)), "--background", "--operation-lock-fd", str(operation),
-                 "--slot-lock-fd", str(slot)],
+                 "--slot-lock-fd", str(slot), "--requested-ns", str(requested_ns)],
                 pass_fds=(operation, slot), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
         except OSError as exc:
@@ -215,4 +217,46 @@ def start_background(track_id, *, wave_dir=None) -> RefreshResult:
     finally:
         os.close(slot)
     return RefreshResult(track_id, STARTED, "the waveform is being regenerated in the background",
-                         old=_describe(waveform_cache.validate(track)))
+                         old=_describe(waveform_cache.validate(track)), requested_ns=requested_ns)
+
+
+def outcome_key(track_id, requested_ns) -> str:
+    """The SystemEvent dedupe key a background refresh records its outcome under."""
+    return f"library|waveform-refresh|{int(track_id)}|{int(requested_ns)}"
+
+
+# Background status (Package C): what a browser polling a 202 "started" may be told.
+RUNNING, COMPLETED, FAILED_STATE, UNKNOWN = "running", "completed", "failed", "unknown"
+
+
+def background_status(track_id, requested_ns, *, wave_dir=None) -> dict:
+    """The state of the background refresh started with ``requested_ns`` -- never inferred from the
+    launch alone. ``completed``/``failed`` come from the outcome the process recorded (or, if that
+    record is missing, a cache this very refresh demonstrably promoted); ``running`` while the
+    process holds the Track's refresh lock; otherwise ``unknown`` (it ended without a result --
+    e.g. killed by a restart), and the previous cache is still in place."""
+    from library.management.commands.analyze_tracks import get_waveforms_dir
+    from monitoring.models import SystemEvent
+    wave_dir = Path(wave_dir) if wave_dir is not None else get_waveforms_dir()
+    event = (SystemEvent.objects.filter(dedupe_key=outcome_key(track_id, requested_ns))
+             .order_by("-created_at").values("detail").first())
+    if event is not None:
+        detail = event["detail"] or {}
+        status = detail.get("status")
+        return {"state": COMPLETED if status == REPLACED else FAILED_STATE, "status": status,
+                "detail": detail.get("detail", ""), "new": detail.get("new") or {}}
+    try:
+        os.close(waveform_cache.try_operation_lock(wave_dir, f"{int(track_id)}.refresh.lock"))
+    except waveform_cache.WaveformBusy:
+        return {"state": RUNNING, "status": STARTED, "detail": "the waveform is being regenerated", "new": {}}
+    except OSError as exc:
+        return {"state": UNKNOWN, "status": None, "detail": f"the refresh lock cannot be read: {exc}", "new": {}}
+    track = _track(track_id)
+    if track is not None:
+        verdict = waveform_cache.validate(track)
+        generation = (verdict.payload or {}).get("generation") or {}
+        if generation.get("writer") == "refresh" and (generation.get("started_ns") or 0) >= int(requested_ns):
+            return {"state": COMPLETED, "status": REPLACED, "detail": "waveform regenerated",
+                    "new": _describe(verdict)}
+    return {"state": UNKNOWN, "status": None, "new": {},
+            "detail": "the background refresh ended without recording a result; the previous waveform is kept"}

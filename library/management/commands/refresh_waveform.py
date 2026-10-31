@@ -24,6 +24,7 @@ class Command(BaseCommand):
         parser.add_argument("--background", action="store_true", help=argparse_suppress())
         parser.add_argument("--operation-lock-fd", type=int, help=argparse_suppress())
         parser.add_argument("--slot-lock-fd", type=int, help=argparse_suppress())
+        parser.add_argument("--requested-ns", type=int, help=argparse_suppress())
 
     def handle(self, *args, **options):
         from library.services import waveform_generation
@@ -31,15 +32,26 @@ class Command(BaseCommand):
 
         if options["background"]:
             os.nice(10)              # long-form decoding yields to the station's real-time work
+        # Keep the Track's refresh lock held (a duplicate of the same open file description) until
+        # the outcome is recorded, so a status poll never sees "not running" without a result.
+        held = os.dup(options["operation_lock_fd"]) if options["operation_lock_fd"] is not None else None
         try:
-            result = waveform_generation.refresh(options["track_id"], operation_lock_fd=options["operation_lock_fd"])
+            try:
+                result = waveform_generation.refresh(options["track_id"],
+                                                     operation_lock_fd=options["operation_lock_fd"])
+            finally:
+                if options["slot_lock_fd"] is not None:
+                    os.close(options["slot_lock_fd"])
+            if options["background"]:
+                requested = options["requested_ns"]
+                emit_event(category="library", level="info" if result.ok else "warning",
+                           title="Waveform refreshed" if result.ok else "Waveform refresh did not complete",
+                           detail={**result.to_dict(), "requested_ns": requested},
+                           dedupe_key=(waveform_generation.outcome_key(result.track_id, requested) if requested
+                                       else f"library|waveform-refresh|{result.track_id}|{result.status}"))
         finally:
-            if options["slot_lock_fd"] is not None:
-                os.close(options["slot_lock_fd"])
-        if options["background"]:
-            emit_event(category="library", level="info" if result.ok else "warning",
-                       title="Waveform refreshed" if result.ok else "Waveform refresh did not complete",
-                       detail=result.to_dict(), dedupe_key=f"library|waveform-refresh|{result.track_id}|{result.status}")
+            if held is not None:
+                os.close(held)
         if options["json"]:
             self.stdout.write(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:

@@ -497,7 +497,11 @@ class EndpointTests(_Fixture):
                 self.assertEqual(response.json()["cue_marker_revision"], 0)
 
     def test_an_edit_with_the_current_revision_locks_only_the_edited_marker(self):
-        response = self.patch({"title": "Edited", "hook_out_seconds": 75.0, "cue_marker_revision": 0})
+        # r0123 Package C: the historical value is replaced only with explicit confirmation.
+        self.assertEqual(self.patch({"title": "Edited", "hook_out_seconds": 75.0, "cue_marker_revision": 0}).status_code,
+                         409)
+        response = self.patch({"title": "Edited", "hook_out_seconds": 75.0, "cue_marker_revision": 0,
+                               "confirm_override": ["hook_out_seconds"]})
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["cue_marker_revision"], 1)
         row = _row(self.legacy)

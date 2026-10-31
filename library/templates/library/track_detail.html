@@ -386,6 +386,52 @@
   @keyframes vtBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
   .vt-modal-actions { display: flex; gap: 0.5rem; justify-content: center; margin: 0.75rem 0; }
   .vt-modal-hint { color: var(--text-muted); font-size: 0.75rem; text-align: center; }
+
+  /* --- Cue-point protection (r0123 Package C) --- */
+  .cue-row { flex-wrap: wrap; }
+  .cue-row input[type="number"] { flex: 1 1 6.5rem; min-width: 6rem; }
+  .cue-badge {
+    display: inline-flex; align-items: center; gap: 0.25rem;
+    font-size: 0.68rem; line-height: 1.2; padding: 0.15rem 0.45rem;
+    border-radius: 999px; border: 1px solid var(--border-subtle);
+    color: var(--text-muted); white-space: nowrap; max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .cue-badge[data-state="approved"] { color: var(--accent); border-color: var(--accent); }
+  .cue-badge[data-state="locked_unverified"] { color: var(--text-main); border-style: dashed; }
+  .cue-badge[data-review="true"] { color: #f59e0b; border-color: #f59e0b; font-weight: 600; }
+  .cue-badge[data-state="historical"] { color: var(--text-main); }
+  .cue-btn {
+    background: transparent; color: var(--text-main);
+    border: 1px solid var(--border-subtle); border-radius: 6px;
+    font-size: 0.7rem; padding: 0.2rem 0.5rem; cursor: pointer; white-space: nowrap;
+  }
+  .cue-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .cue-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .cue-btn:focus-visible, .cue-bulk button:focus-visible, .cue-detail summary:focus-visible,
+  #refreshWaveformBtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cue-detail {
+    margin: -0.25rem 0 0.5rem 118px; font-size: 0.72rem; color: var(--text-muted);
+  }
+  .cue-detail summary { cursor: pointer; }
+  .cue-detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.1rem 0.6rem; margin: 0.3rem 0 0; }
+  .cue-detail dt { color: var(--text-muted); }
+  .cue-detail dd { margin: 0; color: var(--text-main); overflow-wrap: anywhere; }
+  .cue-bulk {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+    margin: -0.25rem 0 0.75rem; font-size: 0.74rem; color: var(--text-muted);
+  }
+  .cue-bulk .cue-bulk-actions { margin-left: auto; display: flex; gap: 0.4rem; }
+  .cue-notice { font-size: 0.74rem; margin: 0 0 0.6rem; color: var(--text-main); }
+  .cue-notice[data-tone="error"] { color: var(--danger); }
+  .cue-notice[data-tone="warn"] { color: #f59e0b; }
+  .cue-notice button { margin-left: 0.4rem; }
+  .action-row { flex-wrap: wrap; row-gap: 0.4rem; }   /* the analysis buttons wrap on narrow screens */
+  .refresh-hint { display: block; width: 100%; margin: 0.35rem 0 0 118px; font-size: 0.7rem; color: var(--text-muted); }
+  @media (max-width: 700px) {
+    .cue-detail, .refresh-hint { margin-left: 0; }
+    .cue-bulk .cue-bulk-actions { margin-left: 0; }
+  }
 </style>
 {% endblock %}
 
@@ -532,38 +578,48 @@
   </div>
 
   <!-- Cue Points -->
-  <div class="detail-section">
+  <div class="detail-section" id="cuePointsSection">
     <h2>Cue Points</h2>
-    <div class="field-row">
-      <label>Cue In</label>
+    <div class="cue-bulk">
+      <span id="waveTrust">Waveform: checking…</span>
+      {% if not is_library_read_only %}
+      <span class="cue-bulk-actions" role="group" aria-label="Protect all cue points">
+        <button type="button" class="cue-btn" id="lockAllBtn" onclick="lockAllCues()">Lock All…</button>
+        <button type="button" class="cue-btn" id="unlockAllBtn" onclick="unlockAllCues()">Unlock All…</button>
+      </span>
+      {% endif %}
+    </div>
+    <p class="cue-notice" id="cueNotice" role="status" aria-live="polite" hidden></p>
+    <div class="field-row cue-row" data-marker="cue_in_seconds">
+      <label for="f_cue_in_seconds">Cue In</label>
       <input type="number" step="0.001" id="f_cue_in_seconds" value="{{ track.cue_in_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Cue Out</label>
+    <div class="field-row cue-row" data-marker="cue_out_seconds">
+      <label for="f_cue_out_seconds">Cue Out</label>
       <input type="number" step="0.001" id="f_cue_out_seconds" value="{{ track.cue_out_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Next Start</label>
+    <div class="field-row cue-row" data-marker="next_start_seconds">
+      <label for="f_next_start_seconds">Next Start</label>
       <input type="number" step="0.001" id="f_next_start_seconds" value="{{ track.next_start_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Intro Until</label>
+    <div class="field-row cue-row" data-marker="intro_until_seconds">
+      <label for="f_intro_until_seconds">Intro Until</label>
       <input type="number" step="0.001" id="f_intro_until_seconds" value="{{ track.intro_until_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Sweep Start</label>
+    <div class="field-row cue-row" data-marker="sweep_start_seconds">
+      <label for="f_sweep_start_seconds">Sweep Start</label>
       <input type="number" step="0.001" id="f_sweep_start_seconds" value="{{ track.sweep_start_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Outro Starts</label>
+    <div class="field-row cue-row" data-marker="outro_starts_seconds">
+      <label for="f_outro_starts_seconds">Outro Starts</label>
       <input type="number" step="0.001" id="f_outro_starts_seconds" value="{{ track.outro_starts_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Hook In</label>
+    <div class="field-row cue-row" data-marker="hook_in_seconds">
+      <label for="f_hook_in_seconds">Hook In</label>
       <input type="number" step="0.001" id="f_hook_in_seconds" value="{{ track.hook_in_seconds|default_if_none:'' }}">
     </div>
-    <div class="field-row">
-      <label>Hook Out</label>
+    <div class="field-row cue-row" data-marker="hook_out_seconds">
+      <label for="f_hook_out_seconds">Hook Out</label>
       <input type="number" step="0.001" id="f_hook_out_seconds" value="{{ track.hook_out_seconds|default_if_none:'' }}">
     </div>
   </div>
@@ -679,14 +735,17 @@
         <span>Download Audio</span>
       </a>
     </div>
-    <div class="field-row">
+    <div class="field-row action-row">
       <label></label>
       <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="repickCuePoints()" id="repickCueBtn" title="Fast re-pick of cue-in and next-start using saved envelope data + this track's category threshold overrides (or global defaults). No audio decode.">Reset Cue Points</button>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="refreshWaveformOnly()" id="refreshWaveformBtn" aria-describedby="refreshWaveformHint">Refresh Waveform Only</button>
       <button type="button" class="save-btn danger" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="deleteTrack()" id="deleteTrackBtn" title="Permanently delete this track's DB row AND remove the audio file from disk. Cannot be undone.">Delete Track</button>
       <span class="save-msg" id="saveMsg" style="margin-left:0.6rem;">Saved</span>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
+      <span class="refresh-hint" id="refreshWaveformHint">Refresh Waveform Only rebuilds the waveform display and envelope without changing cue points, Track metadata, or the source audio. Reanalyze Track also re-detects cue points.</span>
+      <span class="refresh-hint" id="refreshWaveformStatus" role="status" aria-live="polite"></span>
     </div>
     {% else %}
     <div class="field-row">
@@ -777,6 +836,300 @@ function adoptCueMarkers(data) {
   snapshotCueMarkers();
 }
 document.addEventListener('DOMContentLoaded', snapshotCueMarkers);
+
+// ============================================================
+// Cue-point protection (r0123 Package C). The server's cue-marker
+// authority owns every protection change; this page renders its state
+// (GET /api/tracks/<id>/cue-markers/) and asks it for one operation at
+// a time, always with the revision the page last adopted. Nothing here
+// derives provenance or audio identity on its own.
+// ============================================================
+const CAN_MANAGE_CUES = {% if is_library_read_only %}false{% else %}true{% endif %};
+const CUE_LABELS = {
+  cue_in_seconds: 'Cue In', cue_out_seconds: 'Cue Out', next_start_seconds: 'Next Start',
+  intro_until_seconds: 'Intro Until', sweep_start_seconds: 'Sweep Start',
+  outro_starts_seconds: 'Outro Starts', hook_in_seconds: 'Hook In', hook_out_seconds: 'Hook Out',
+};
+// display state -> [badge text, explanation]; review states also carry a warning sign in text.
+const CUE_STATE_TEXT = {
+  approved: ['Approved', 'Locked by an operator for the current audio. Analysis never replaces it.'],
+  locked_unverified: ['Locked · audio unverified', 'Locked by an operator. The audio it was approved for could not be verified (no trusted waveform yet). Analysis never replaces it.'],
+  locked_other_audio: ['⚠ Needs review · other audio', 'Approved for a different recording than the current file. Still protected; re-approve or change it.'],
+  review: ['⚠ Needs review · audio replaced', 'Approved before the audio was replaced. Still protected, but not approved for this recording.'],
+  historical: ['Historical · protected', 'Existing value of unknown origin, kept from before cue-point protection. Analysis never replaces it.'],
+  unlocked_operator: ['Unlocked', 'An operator allowed analysis to recalculate this value. It has not necessarily been recalculated yet.'],
+  auto: ['Auto', 'Set by analysis or by the generator. Analysis may update it.'],
+  default_zero: ['Default · not set', 'Cue In 0 is the default of a never-analyzed Track, not a decision.'],
+  unset: ['Not set', 'No value.'],
+};
+const PROTECTED_DISPLAY = ['approved', 'locked_unverified', 'locked_other_audio', 'review', 'historical'];
+const LOCKED_DISPLAY = ['approved', 'locked_unverified', 'locked_other_audio', 'review'];
+let cueState = null;
+let cueActionBusy = false;
+
+function cueNotice(text, tone, withReload) {
+  const el = document.getElementById('cueNotice');
+  if (!el) return;
+  el.textContent = text || '';
+  el.dataset.tone = tone || '';
+  el.hidden = !text;
+  if (text && withReload) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cue-btn';
+    btn.textContent = 'Load current cue points';
+    btn.addEventListener('click', reloadAuthoritativeCues);
+    el.appendChild(btn);
+  }
+}
+
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
+}
+function fmtSec(v) { return v == null ? 'not set' : Number(v).toFixed(3) + ' s'; }
+
+function buildCueRows() {
+  for (const key of Object.keys(CUE_MARKER_INPUTS)) {
+    const input = document.getElementById(CUE_MARKER_INPUTS[key]);
+    const row = input && input.closest('.cue-row');
+    if (!row || row.querySelector('.cue-badge')) continue;
+    const badge = document.createElement('span');
+    badge.className = 'cue-badge';
+    badge.id = 'cueBadge_' + key;
+    row.appendChild(badge);
+    input.setAttribute('aria-describedby', badge.id);
+    if (CAN_MANAGE_CUES) {
+      const lock = document.createElement('button');
+      lock.type = 'button';
+      lock.className = 'cue-btn';
+      lock.id = 'cueLock_' + key;
+      lock.setAttribute('aria-label', 'Lock ' + CUE_LABELS[key]);
+      lock.addEventListener('click', () => toggleCueLock(key));
+      row.appendChild(lock);
+      const approve = document.createElement('button');
+      approve.type = 'button';
+      approve.className = 'cue-btn';
+      approve.id = 'cueApprove_' + key;
+      approve.textContent = 'Re-approve';
+      approve.setAttribute('aria-label', 'Re-approve ' + CUE_LABELS[key] + ' for the current audio');
+      approve.hidden = true;
+      approve.addEventListener('click', () => cueAction({approve: [key]}, 'approve', key));
+      row.appendChild(approve);
+      const release = document.createElement('button');
+      release.type = 'button';
+      release.className = 'cue-btn';
+      release.id = 'cueRelease_' + key;
+      release.textContent = 'Unlock';
+      release.setAttribute('aria-label', 'Unlock ' + CUE_LABELS[key] + ' for recalculation');
+      release.hidden = true;
+      release.addEventListener('click', () => cueAction({unlock: [key]}, 'unlock', key));
+      row.appendChild(release);
+    }
+    const detail = document.createElement('details');
+    detail.className = 'cue-detail';
+    detail.id = 'cueDetail_' + key;
+    detail.hidden = true;
+    row.after(detail);
+  }
+}
+
+function renderCueDetail(key, info) {
+  const detail = document.getElementById('cueDetail_' + key);
+  if (!detail) return;
+  const items = [];
+  const add = (term, text) => { if (text) items.push([term, text]); };
+  add('Origin', info.source);
+  if (info.set_at) add('Set', `${fmtWhen(info.set_at)}${info.set_by_name ? ' by ' + info.set_by_name : ''}`);
+  if (LOCKED_DISPLAY.includes(info.display) && info.approved_at && info.display !== 'review')
+    add('Approved', `${fmtWhen(info.approved_at)}${info.approved_by_name ? ' by ' + info.approved_by_name : ''}`);
+  if (info.unlocked_at) add('Unlocked', `${fmtWhen(info.unlocked_at)}${info.unlocked_by_name ? ' by ' + info.unlocked_by_name : ''}`);
+  if (info.review_reason) add('Review', info.review_reason);
+  const prev = info.previous_approval;
+  if (prev) {
+    const why = {new_media: 'audio replaced', replaced_by_operator: 'replaced by a new value', unlocked: 'unlocked',
+                 recalculated: 'recalculated', unverified_copy: 'copied without verified audio'}[prev.retired_reason]
+                || prev.retired_reason || '';
+    add('Earlier approval', `${fmtSec(prev.value)}${prev.approved_by_name ? ' by ' + prev.approved_by_name : ''}` +
+        `${prev.approved_at ? ', ' + fmtWhen(prev.approved_at) : ''}${why ? ' — no longer applies: ' + why : ''}` +
+        `${prev.audio_revision ? ' (audio ' + String(prev.audio_revision).slice(0, 8) + ')' : ''}`);
+  }
+  if (info.replaced_historical_value) add('Replaced historical value', fmtSec(info.replaced_historical_value.value));
+  detail.hidden = !items.length;
+  if (!items.length) return;
+  const open = detail.open;
+  detail.innerHTML = '';
+  const summary = document.createElement('summary');
+  summary.textContent = info.needs_review ? `${CUE_LABELS[key]}: why review?` : `${CUE_LABELS[key]}: history`;
+  detail.appendChild(summary);
+  const dl = document.createElement('dl');
+  for (const [term, text] of items) {
+    const dt = document.createElement('dt'); dt.textContent = term;
+    const dd = document.createElement('dd'); dd.textContent = text;
+    dl.append(dt, dd);
+  }
+  detail.appendChild(dl);
+  detail.open = open;
+}
+
+function renderCueState(data) {
+  cueState = data;
+  const review = data.cue_marker_review || {};
+  for (const key of Object.keys(CUE_MARKER_INPUTS)) {
+    const info = review[key] || {display: 'unset'};
+    const [text, help] = CUE_STATE_TEXT[info.display] || [info.display, ''];
+    const badge = document.getElementById('cueBadge_' + key);
+    if (badge) {
+      badge.textContent = text;
+      badge.title = help;
+      badge.dataset.state = info.display;
+      badge.dataset.review = info.needs_review ? 'true' : 'false';
+    }
+    const lock = document.getElementById('cueLock_' + key);
+    if (lock) {
+      const locked = LOCKED_DISPLAY.includes(info.display);
+      lock.setAttribute('aria-pressed', locked ? 'true' : 'false');
+      lock.textContent = locked ? '🔒 Locked' : '🔓 Lock';
+      lock.title = locked ? `Unlock ${CUE_LABELS[key]} (allow recalculation)` : `Lock ${CUE_LABELS[key]} at its current value`;
+      lock.disabled = info.display === 'unset' || cueActionBusy;
+      if (info.display === 'unset') lock.title = 'No value to lock';
+    }
+    const approve = document.getElementById('cueApprove_' + key);
+    if (approve) {
+      approve.hidden = !(info.display === 'review' || (data.audio_verified &&
+                         ['locked_unverified', 'locked_other_audio'].includes(info.display)));
+      approve.disabled = cueActionBusy;
+    }
+    const release = document.getElementById('cueRelease_' + key);
+    if (release) {
+      release.hidden = info.display !== 'historical';
+      release.disabled = cueActionBusy;
+    }
+    renderCueDetail(key, info);
+  }
+  const wave = data.waveform || {};
+  const trust = document.getElementById('waveTrust');
+  if (trust) trust.textContent = 'Waveform: ' + (wave.explanation || wave.status || 'unknown');
+  const repick = document.getElementById('repickCueBtn');
+  if (repick) {
+    repick.disabled = !data.repick_available;
+    repick.title = data.repick_available
+      ? "Re-pick cue-in and next-start from this track's verified waveform with its category thresholds. Protected cue points are kept. No audio decode."
+      : 'Unavailable: ' + (wave.explanation || 'no verified waveform for the current audio.');
+  }
+  for (const id of ['lockAllBtn', 'unlockAllBtn']) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = cueActionBusy;
+  }
+}
+
+async function loadCueState() {
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/cue-markers/`, {headers: {'Accept': 'application/json'}});
+    if (!resp.ok) throw new Error(String(resp.status));
+    const data = await resp.json();
+    renderCueState(data);
+    return data;
+  } catch (e) {
+    const trust = document.getElementById('waveTrust');
+    if (trust) trust.textContent = 'Cue-point protection status is unavailable right now.';
+    return null;
+  }
+}
+
+// After a conflict: adopt the server's values and revision, but only once
+// the operator agrees to drop their own unsaved cue-point edits.
+async function reloadAuthoritativeCues() {
+  const edited = Object.keys(editedCueMarkers());
+  if (edited.length && !confirm('Discard your unsaved changes to ' + edited.map(k => CUE_LABELS[k]).join(', ') +
+                                ' and load the current cue points?')) return;
+  const data = await loadCueState();
+  if (!data) { cueNotice('Could not load the current cue points. Try again.', 'error'); return; }
+  adoptCueMarkers({...data.markers, cue_marker_revision: data.cue_marker_revision});
+  drawWaveform();
+  cueNotice('Current cue points loaded.', '');
+}
+
+function setCueBusy(busy) {
+  cueActionBusy = busy;
+  if (cueState) renderCueState(cueState);
+}
+
+// One authority operation: approve/unlock named markers or lock_all/unlock_all.
+async function cueAction(payload, verb, focusKey) {
+  if (cueActionBusy) return;
+  const edited = Object.keys(editedCueMarkers());
+  if (edited.length) {
+    cueNotice('Save or revert your changes to ' + edited.map(k => CUE_LABELS[k]).join(', ') +
+              ' before changing protection.', 'warn');
+    return;
+  }
+  setCueBusy(true);
+  cueNotice('Working…', '');
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/cue-markers/`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify({...payload, cue_marker_revision: cueMarkerRevision}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 403) { cueNotice(data.error || 'You do not have permission to change cue-point protection.', 'error'); return; }
+    if (data.conflict) {
+      cueNotice('Someone changed these cue points since this page loaded; nothing was changed.', 'error', true);
+      return;
+    }
+    if (!resp.ok) { cueNotice(data.error || 'The change was not made.', 'error'); return; }
+    // Protection changes never move a value: adopt the new revision with the unchanged values.
+    adoptCueMarkers({...data.markers, cue_marker_revision: data.cue_marker_revision});
+    renderCueState(data);
+    const r = data.result || {};
+    const names = list => (list || []).map(k => CUE_LABELS[k]).join(', ');
+    const parts = [];
+    if (r.approved && r.approved.length) parts.push('Locked: ' + names(r.approved) +
+      (data.audio_verified ? ' (for the current audio)' : ' (audio not verified — refresh the waveform to verify)'));
+    if (r.unlocked && r.unlocked.length) parts.push('Unlocked: ' + names(r.unlocked) + ' — analysis may now recalculate them');
+    const skipped = Object.entries(r.skipped || {});
+    if (skipped.length) parts.push('Unchanged: ' + skipped.map(([k, why]) => `${CUE_LABELS[k]} (${why})`).join(', '));
+    cueNotice(parts.join('. ') + '.', '');
+  } catch (e) {
+    cueNotice('No response from the server. The change may not have been made — reload the cue points to check.', 'error', true);
+  } finally {
+    setCueBusy(false);
+    const f = focusKey && document.getElementById((verb === 'unlock' && !document.getElementById('cueRelease_' + focusKey)?.hidden
+      ? 'cueRelease_' : 'cueLock_') + focusKey);
+    if (f && !f.hidden && !f.disabled) f.focus();
+  }
+}
+
+function toggleCueLock(key) {
+  const info = (cueState && cueState.cue_marker_review || {})[key];
+  if (!info) { cueNotice('Cue-point status is not loaded yet.', 'warn'); return; }
+  if (LOCKED_DISPLAY.includes(info.display)) {
+    cueAction({unlock: [key]}, 'unlock', key);
+  } else {
+    if (info.display === 'default_zero' &&
+        !confirm('Lock Cue In at 0.000 s? It is currently only the default of a never-analyzed Track.')) return;
+    cueAction({approve: [key]}, 'approve', key);
+  }
+}
+
+function lockAllCues() {
+  const verified = cueState && cueState.audio_verified;
+  if (!confirm('Lock every cue point that has a value at its current position?\n\n' +
+               'Unset cue points stay unset. ' + (verified
+                 ? 'Approvals will be recorded for the current audio.'
+                 : 'The current audio is not verified, so these locks will not be marked as approved for it.'))) return;
+  cueAction({action: 'lock_all'}, 'approve', null);
+}
+
+function unlockAllCues() {
+  if (!confirm('Unlock every cue point?\n\nAnalysis will then be allowed to recalculate Cue In and Next Start. ' +
+               'No value changes now, and earlier approvals stay in each cue point\'s history.')) return;
+  cueAction({action: 'unlock_all'}, 'unlock', null);
+}
+
+document.addEventListener('DOMContentLoaded', () => { buildCueRows(); loadCueState(); });
 
 // ============================================================
 // Voice tracks (2.22B): recording, editing, saving and removal happen in
@@ -958,24 +1311,65 @@ async function saveTrack() {
   };
 
   const msg = document.getElementById('saveMsg');
-  const resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
-    method: 'PATCH',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-CSRFToken': getCookie('csrftoken'),
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const err = await resp.json();
-    msg.textContent = err.error || 'Save failed';
+  const fail = (text, ms) => {
+    msg.textContent = text;
     msg.style.color = 'var(--danger)';
     msg.classList.add('show');
-    setTimeout(() => msg.classList.remove('show'), err.conflict ? 8000 : 2000);
+    setTimeout(() => msg.classList.remove('show'), ms || 2000);
+  };
+  // Package C: replacing a protected cue point (locked, needs-review or
+  // historical) is an explicit decision. Ask before sending; the server
+  // refuses the edit without "confirm_override" naming the marker anyway.
+  const review = (cueState && cueState.cue_marker_review) || {};
+  const protectedEdits = Object.keys(editedCueMarkers()).filter(
+    k => PROTECTED_DISPLAY.includes((review[k] || {}).display));
+  if (protectedEdits.length) {
+    if (!confirmProtectedReplacement(protectedEdits, review)) { fail('Not saved: protected cue points unchanged', 4000); return; }
+    body.confirm_override = protectedEdits;
+  }
+
+  let resp, err;
+  try {
+    resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    if (resp.status === 409) {
+      err = await resp.json().catch(() => ({}));
+      // The server knows of a protected value this page did not (state not loaded or changed).
+      if (err.confirmation_required && err.confirmation_required.length && !err.conflict) {
+        await loadCueState();
+        if (!confirmProtectedReplacement(err.confirmation_required, (cueState && cueState.cue_marker_review) || {})) {
+          fail('Not saved: protected cue points unchanged', 4000);
+          return;
+        }
+        body.confirm_override = err.confirmation_required;
+        err = undefined;
+        resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+          body: JSON.stringify(body),
+        });
+      }
+    }
+  } catch (e) {
+    fail('Save failed: no response from the server. Nothing on this page was changed; try again.', 6000);
+    return;
+  }
+
+  if (!resp.ok) {
+    if (err === undefined) err = await resp.json().catch(() => ({}));   // a 409 body was already read above
+    if (err.conflict) {
+      cueNotice('These cue points were changed elsewhere since this page loaded, so nothing was saved. ' +
+                'Your edits are still in the form.', 'error', true);
+    }
+    fail(err.error || 'Save failed', err.conflict ? 8000 : 4000);
     return;
   }
   adoptCueMarkers(await resp.clone().json());
+  loadCueState();
+  drawWaveform();
 
   // DB is the source of truth for playout, so a file-tag write failure
   // after a successful DB save is a warning, not a blocking error --
@@ -1028,6 +1422,16 @@ async function saveTrack() {
   msg.style.color = fileOk ? 'var(--accent)' : 'var(--danger)';
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), fileOk ? 2000 : 4000);
+}
+
+function confirmProtectedReplacement(keys, review) {
+  const lines = keys.map(k => {
+    const info = review[k] || {};
+    const [text] = CUE_STATE_TEXT[info.display] || ['protected'];
+    return `  • ${CUE_LABELS[k]}: ${fmtSec(info.value)} → ${fmtSec(getVal(CUE_MARKER_INPUTS[k]))}  (${text})`;
+  });
+  return confirm('Replace protected cue point' + (keys.length > 1 ? 's' : '') + '?\n\n' + lines.join('\n') +
+                 '\n\nThe new value will be locked as your approval; the replaced approval stays in the history.');
 }
 
 // --- File tag metadata (Read Track Metadata) ---
@@ -1385,6 +1789,7 @@ async function reanalyzeTrack() {
         durEl.textContent = m + ':' + String(s).padStart(2, '0');
       }
       await loadWaveform();
+      loadCueState();
       msg.textContent = 'Reanalyzed';
       msg.style.color = 'var(--accent)';
     }
@@ -1420,6 +1825,7 @@ async function repickCuePoints() {
     } else {
       adoptCueMarkers(data);
       await loadWaveform();
+      loadCueState();
       msg.textContent = 'Cue points updated';
       msg.style.color = 'var(--accent)';
     }
@@ -1433,6 +1839,116 @@ async function repickCuePoints() {
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), 2500);
 }
+
+// --- Refresh Waveform Only (r0123 Packages B/C) ---
+// Rebuilds the waveform cache through POST /refresh-waveform/ and never
+// falls back to full reanalysis. 200 = done; 202 = a long Track started in
+// the background: poll /refresh-waveform/status/ with the request token
+// until a terminal state, across reloads (sessionStorage). "started" is
+// never reported as success.
+const REFRESH_MESSAGES = {
+  replaced: 'Waveform rebuilt.',
+  busy: 'A waveform refresh for this Track (or another long one) is already running. Wait for it to finish.',
+  source_changed: 'The audio file changed while the waveform was being built; nothing was replaced. Try again once the file is stable.',
+  superseded: 'A newer analysis finished first; its waveform was kept.',
+  not_analyzed: 'This Track has never been analyzed. Use Reanalyze Track first.',
+  noncanonical_cache_path: 'This Track\'s waveform is stored outside the standard location; refresh is not available for it.',
+  source_missing: 'The audio file is missing, so the waveform was not rebuilt.',
+  decode_failed: 'The audio could not be decoded; the previous waveform is kept.',
+  audio_unidentifiable: 'The audio could not be identified reliably; the previous waveform is kept.',
+  not_found: 'This Track no longer exists.',
+  failed: 'The waveform could not be rebuilt; the previous waveform is kept.',
+};
+const REFRESH_KEY = `refreshWaveform:${TRACK_ID}`;
+const REFRESH_POLL_MS = 3000, REFRESH_POLL_LIMIT_MS = 20 * 60 * 1000;
+let refreshInFlight = false;
+
+function refreshStatus(text, tone) {
+  const el = document.getElementById('refreshWaveformStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = tone === 'error' ? 'var(--danger)' : tone === 'ok' ? 'var(--accent)' : '';
+}
+function setRefreshBusy(busy) {
+  refreshInFlight = busy;
+  const btn = document.getElementById('refreshWaveformBtn');
+  if (btn) { btn.disabled = busy; btn.setAttribute('aria-busy', busy ? 'true' : 'false'); }
+}
+async function afterRefreshCompleted(newInfo) {
+  await loadWaveform();          // redraws samples only; marker inputs (and unsaved edits) are untouched
+  await loadCueState();
+  const verified = newInfo && newInfo.trusted;
+  refreshStatus('Waveform rebuilt' + (verified ? ' and verified for the current audio.' : '.'), 'ok');
+}
+
+async function refreshWaveformOnly() {
+  if (refreshInFlight) return;
+  setRefreshBusy(true);
+  refreshStatus('Rebuilding the waveform…');
+  let resp, data;
+  try {
+    resp = await fetch(`/api/tracks/${TRACK_ID}/refresh-waveform/`, {
+      method: 'POST', headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) {
+    setRefreshBusy(false);
+    refreshStatus('No response from the server: the result is unknown. Reload the page later to see the waveform status.', 'error');
+    return;
+  }
+  if (resp.status === 202 && data.requested_ns) {
+    try { sessionStorage.setItem(REFRESH_KEY, String(data.requested_ns)); } catch (e) {}
+    refreshStatus('Started in the background (long Track). This can take a few minutes; you can leave this page.');
+    pollRefresh(String(data.requested_ns), Date.now());
+    return;
+  }
+  setRefreshBusy(false);
+  if (resp.status === 403) { refreshStatus(data.error || 'You do not have permission to refresh waveforms.', 'error'); return; }
+  if (resp.ok && data.status === 'replaced') { await afterRefreshCompleted(data.new); return; }
+  refreshStatus(REFRESH_MESSAGES[data.status] || data.detail || data.error || 'The waveform was not rebuilt.', 'error');
+}
+
+async function pollRefresh(requestedNs, startedAt) {
+  setRefreshBusy(true);
+  if (Date.now() - startedAt > REFRESH_POLL_LIMIT_MS) {
+    setRefreshBusy(false);
+    refreshStatus('Still running after 20 minutes. Reload this page later to see whether it finished.', 'error');
+    return;
+  }
+  let data;
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/refresh-waveform/status/?requested_ns=${encodeURIComponent(requestedNs)}`);
+    data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || String(resp.status));
+  } catch (e) {
+    refreshStatus('Waiting for the background refresh (status temporarily unavailable)…');
+    setTimeout(() => pollRefresh(requestedNs, startedAt), REFRESH_POLL_MS * 2);
+    return;
+  }
+  if (data.state === 'running') {
+    refreshStatus('Rebuilding the waveform in the background…');
+    setTimeout(() => pollRefresh(requestedNs, startedAt), REFRESH_POLL_MS);
+    return;
+  }
+  try { sessionStorage.removeItem(REFRESH_KEY); } catch (e) {}
+  setRefreshBusy(false);
+  if (data.state === 'completed') { await afterRefreshCompleted(data.new); return; }
+  if (data.state === 'failed') {
+    refreshStatus(REFRESH_MESSAGES[data.status] || data.detail || 'The background refresh did not complete.', 'error');
+    return;
+  }
+  refreshStatus('The background refresh ended without reporting a result (for example after a service restart). ' +
+                'The previous waveform is kept; you can try again.', 'error');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  let pending = null;
+  try { pending = sessionStorage.getItem(REFRESH_KEY); } catch (e) {}
+  if (pending) {
+    refreshStatus('Checking a background waveform refresh started earlier…');
+    pollRefresh(pending, Date.now());
+  }
+});
 
 // --- Delete track (row + file + waveform) ---
 const TRACK_FILEPATH = "{{ track.filepath|escapejs }}";

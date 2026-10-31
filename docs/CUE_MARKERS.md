@@ -1,4 +1,4 @@
-# Cue markers: authority, protection and waveform-cache trust (r0123 Packages A and B)
+# Cue markers: authority, protection and waveform-cache trust (r0123 Packages A–C)
 
 Roadmap 1.21. A Track's eight cue markers -- Cue In, Cue Out, Next Start, Intro, Outro,
 Hook In, Hook Out and Segue -- are changed in one place, `library/services/cue_markers.py`.
@@ -51,8 +51,10 @@ Nothing infers authorship.
   * Each carried value is stamped `audio_changed_at`.
   * Ready-to-Air is never touched. The event is still audited, but the durable record is the
     state, not the SystemEvent.
-* An operator edit, approval or unlock of a marker resolves its review and drops
-  `previous_approval`.
+* An operator edit, approval or unlock of a marker resolves its review. Package C: none of them
+  drops `previous_approval`, which is permanent history. Replacing a locked value retires its
+  approval there (`replaced_by_operator`), an unlock retires it as `unlocked`, and replacing a
+  historical value records `replaced_historical_value`.
 * `cue_markers.review(row, current_audio_revision)` reports, per marker: the protection, the
   status of its approval (`current`, `other`, `previous` or `unknown` audio) and any retired
   approval. This is for Package C's screens, and `/api/waveform/<id>/` returns it as
@@ -318,3 +320,104 @@ Every failure keeps the previous cache.
 The 165 repaired Track caches and 7 retained orphans are legacy, unversioned files. They stay
 displayable and untrusted until an operator chooses to refresh selected Tracks. Nothing in
 r0123 regenerates, migrates or deletes caches on its own.
+
+## Track Detail controls (Package C)
+
+### State shown per marker
+
+Track Detail renders the authority's state from `GET /api/tracks/<id>/cue-markers/`, and never
+derives provenance or audio identity in the browser. Each marker shows its value, a text badge
+(never color alone), a lock toggle (`aria-pressed`), and a collapsible history:
+
+| Badge | Meaning (`review()` `display`) |
+|---|---|
+| Approved | Locked for the current, verified audio (`approved`) |
+| Locked · audio unverified | Locked, but the current audio could not be verified (`locked_unverified`) |
+| ⚠ Needs review · other audio | Approved for a different recording than the current file (`locked_other_audio`) |
+| ⚠ Needs review · audio replaced | Approved before new media replaced the audio (`review`) |
+| Historical · protected | Pre-r0123 value of unknown origin (`historical`) |
+| Unlocked | An operator allowed recalculation; it has not necessarily happened yet (`unlocked_operator`) |
+| Auto | Written by analysis or a generator (`auto`) |
+| Default · not set | Cue In 0 on a never-analyzed Track (`default_zero`) |
+| Not set | NULL (`unset`) |
+
+The history shows origin, who set, approved or unlocked the marker and when, the review reason,
+the earlier approval (value, approver, time, why it no longer applies, and a shortened audio
+revision) and any replaced historical value. The waveform line states the cache's trust.
+**Reset Cue Points** (Repick) is enabled only when the backend reports a trusted cache, and
+otherwise explains why.
+
+### Protection actions: `POST /api/tracks/<id>/cue-markers/`
+
+Requires `library.manage_tracks`; session and CSRF apply as usual. Each request is one
+authority transaction, conditional on `cue_marker_revision`:
+
+* `approve: [names]`: lock or approve the current values, with no numeric change.
+* `unlock: [names]`: allow recalculation. History is kept.
+* `action: "lock_all"`: every marker with a meaningful value. Unset markers and the
+  never-analyzed Cue In default are skipped.
+* `action: "unlock_all"`: every marker with a value.
+
+No value ever changes, and a marker without a value is never approved or unlocked. Approvals
+record the current audio revision only when a trusted cache establishes it, as reported in
+`audio_verified`. A stale revision returns 409 and changes nothing. The page then offers to load
+the current values, discarding unsaved edits only after the operator confirms.
+
+### Editing
+
+The page sends only the markers the operator changed, with the revision it loaded.
+
+* **Replacing a protected value** (locked, needs-review or historical) needs explicit
+  confirmation: a dialog that names each marker, its old and new value, and its state. The
+  server enforces it too: `PATCH /api/tracks/<id>/` refuses with 409 `confirmation_required`
+  (before any side effect) unless `confirm_override` names the marker, and the authority checks
+  again under its row lock.
+* **Refused confirmations, conflicts and network errors** keep the operator's input.
+* **Waveform clicks** in *Seek only* mode only seek. Selecting a cue name and clicking only fills
+  that input. Nothing is sent until Save Changes.
+
+### Refresh Waveform Only
+
+The button sits beside Reanalyze, with an explanation of the difference.
+
+* **200:** the waveform and the cue state are reloaded. Unsaved marker edits are untouched.
+* **202 `started` (long-form):** the page polls
+  `GET /api/tracks/<id>/refresh-waveform/status/?requested_ns=<token>` every 3 s, for up to
+  20 minutes. The pending token survives a reload (`sessionStorage`).
+
+The status endpoint reports, and is never "completed" merely because the process launched:
+
+* `running`: the background process still holds the Track's refresh lock. It keeps the lock
+  until it has recorded its outcome.
+* `completed` / `failed` (with Package B's status): from the outcome the process recorded,
+  under a SystemEvent dedupe key unique to the request. If that record is missing, a cache this
+  refresh demonstrably promoted also counts as completed.
+* `unknown`: the process ended without a result, for example after a restart. The previous
+  waveform is kept.
+
+## Field acceptance checklist (KOGR and WRJE, after r0123 installation)
+
+Use controlled, non-airing test assets wherever a step changes anything. Never refresh the
+repaired incident caches in bulk, and leave the seven orphan files untouched.
+
+1. Open representative Tracks (music, a generated asset, a long-form programme). Check all eight
+   badges and the history entries.
+2. Open several of the 165 repaired-cache Tracks, including **Track 1343**. Each waveform should
+   display and show "Older waveform format…", and Reset Cue Points should be unavailable with
+   an explanation. Do not refresh them in bulk.
+3. Open a legitimate short recording (a few seconds): the waveform displays correctly.
+4. On a controlled test asset: Refresh Waveform Only, then lock one marker. It should show
+   **Approved**.
+5. Unlock Cue In and keep Next Start locked, then use Reset Cue Points. Cue In is recalculated
+   and Next Start survives.
+6. Change only the title and save. No badge, history entry or cue value changes.
+7. On a controlled test Track, record the file's checksum and modification time and the Track
+   row, then use Refresh Waveform Only. All of them should be unchanged.
+8. On a controlled test asset with an approved marker, replace the media through its normal
+   publishing path. The marker should show **⚠ Needs review · audio replaced** with its earlier
+   approval, and Ready-to-Air should be unchanged.
+9. On an authorized non-airing long-form asset over 15 minutes: Refresh Waveform Only should
+   report "Started in the background", then the progress state, then "Waveform rebuilt". Reload
+   mid-way and confirm polling resumes without claiming success.
+10. Check Track Detail on a desktop browser and on a phone: readable rows, no clipped controls,
+    and keyboard operation of the lock buttons and dialogs.

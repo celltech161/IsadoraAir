@@ -830,6 +830,123 @@ def api_track_refresh_waveform(request, pk):
     return JsonResponse(outcome.to_dict(), status=status)
 
 
+def _cue_marker_state(track):
+    """Track Detail's authoritative cue-marker view (Package C): current values and revision, each
+    marker's protection/provenance/review state (cue_markers.review) with actor names, and the
+    waveform cache's trust -- which decides whether Repick is available."""
+    from django.contrib.auth import get_user_model
+
+    from library.services import audio_identity, cue_markers, waveform_cache
+    verdict = waveform_cache.validate(track)
+    current_revision = audio_identity.revision(verdict.payload["audio_identity"]) if verdict.trusted else None
+    row = cue_markers.snapshot(track.pk)
+    review = cue_markers.review(row, current_revision)
+    ids = {info.get(key) for info in review.values() for key in ("set_by", "approved_by", "unlocked_by")}
+    ids |= {(info.get("previous_approval") or {}).get("approved_by") for info in review.values()}
+    names = dict(get_user_model().objects.filter(pk__in={i for i in ids if isinstance(i, int)})
+                 .values_list("pk", "username"))
+    for info in review.values():
+        for key in ("set_by", "approved_by", "unlocked_by"):
+            if isinstance(info.get(key), int):
+                info[key + "_name"] = names.get(info[key], f"user {info[key]}")
+        previous = info.get("previous_approval")
+        if isinstance(previous, dict) and isinstance(previous.get("approved_by"), int):
+            info["previous_approval"] = {**previous,
+                                         "approved_by_name": names.get(previous["approved_by"],
+                                                                       f"user {previous['approved_by']}")}
+    explanations = {
+        waveform_cache.TRUSTED: "Verified for the current audio.",
+        waveform_cache.TRUSTED_STALE_MARKERS: "Verified for the current audio (cue points shown are current).",
+        waveform_cache.LEGACY: "Older waveform format: shown for display only. Refresh Waveform Only to enable "
+                               "Reset Cue Points.",
+        waveform_cache.UNVERIFIED_AUDIO: "Not verified for the current audio (the file changed, moved, or could "
+                                         "not be identified). Refresh Waveform Only to re-verify.",
+        waveform_cache.INCOMPLETE: "Incomplete waveform (no stereo samples). Refresh Waveform Only to rebuild it.",
+        waveform_cache.MISSING: "No waveform yet.",
+    }
+    return {
+        "track_id": track.pk,
+        "markers": {name: row[name] for name in cue_markers.MARKERS},
+        "cue_marker_revision": row["cue_marker_revision"],
+        "cue_marker_review": review,
+        "audio_verified": current_revision is not None,
+        "waveform": {"status": verdict.status, "trusted": verdict.trusted, "markers_current": verdict.markers_current,
+                     "displayable": verdict.displayable, "reason": verdict.reason,
+                     "explanation": explanations.get(verdict.status, "Waveform cache is unusable "
+                                                                     "(Refresh Waveform Only rebuilds it).")},
+        "repick_available": verdict.trusted,
+    }
+
+
+@require_http_methods(["GET", "POST"])
+def api_track_cue_markers(request, pk):
+    """Track Detail's cue-marker controls (r0123 Package C).
+
+    GET: the authoritative state (``_cue_marker_state``). POST (library.manage_tracks), one coherent
+    authority operation per request, conditional on ``cue_marker_revision``::
+
+        {"cue_marker_revision": N, "approve": [names]}     lock/approve current values
+        {"cue_marker_revision": N, "unlock": [names]}      allow authorized recalculation
+        {"cue_marker_revision": N, "action": "lock_all"}   every marker with a meaningful value
+        {"cue_marker_revision": N, "action": "unlock_all"} every marker with a value
+
+    No value ever changes here. Approvals record the current audio revision only when a trusted
+    waveform cache establishes it (``audio_verified``); otherwise they are locked but unverified.
+    409 on a stale revision, 400 on an invalid request; the response always carries the state."""
+    from library.services import cue_markers, waveform_cache
+    track = get_object_or_404(Track, pk=pk)
+    if request.method == "GET":
+        return JsonResponse(_cue_marker_state(track))
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
+    body = _optional_json(request)
+    if not body:
+        return JsonResponse({"error": "a JSON body is required"}, status=400)
+    action = body.get("action")
+    approve, unlock = body.get("approve") or [], body.get("unlock") or []
+    if not all(isinstance(v, list) and all(isinstance(n, str) for n in v) for v in (approve, unlock)):
+        return JsonResponse({"error": "approve/unlock must be lists of cue-marker names"}, status=400)
+    row = cue_markers.snapshot(track.pk)
+    if action == "lock_all":
+        # Meaningful values only: an unset marker and the never-analyzed Cue In default stay as they are.
+        approve = [n for n in cue_markers.MARKERS if cue_markers.meaningful(n, row)]
+    elif action == "unlock_all":
+        unlock = [n for n in cue_markers.MARKERS if row[n] is not None]
+    elif action is not None:
+        return JsonResponse({"error": f"unknown action {action!r}"}, status=400)
+    if not approve and not unlock:
+        return JsonResponse({"error": "nothing to approve or unlock", **_cue_marker_state(track)}, status=400)
+    audio_revision = waveform_cache.current_audio_revision(track)
+    outcome = cue_markers.operator_edit(track.pk, expected_revision=body.get("cue_marker_revision"),
+                                        user=request.user, approve=approve, unlock=unlock,
+                                        audio_revision=audio_revision)
+    track.refresh_from_db()
+    payload = {"ok": outcome.ok, "result": outcome.to_dict(), "error": outcome.conflict or outcome.error,
+               "conflict": bool(outcome.conflict), **_cue_marker_state(track)}
+    if not outcome.ok:
+        return JsonResponse(payload, status=409 if outcome.conflict else 400)
+    return JsonResponse(payload)
+
+
+@require_http_methods(["GET"])
+def api_track_refresh_waveform_status(request, pk):
+    """The state of a background Refresh Waveform Only started with ``requested_ns`` (the token the
+    202 response returned): running, completed, failed (with Package B's status) or unknown --
+    never "completed" merely because the process was launched. Requires library.manage_tracks."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
+    from library.services import waveform_generation as wg
+    track = get_object_or_404(Track.objects.only("id"), pk=pk)
+    try:
+        requested_ns = int(request.GET.get("requested_ns", ""))
+    except ValueError:
+        return JsonResponse({"error": "requested_ns is required"}, status=400)
+    return JsonResponse({"track_id": track.pk, "requested_ns": requested_ns,
+                         **wg.background_status(track.pk, requested_ns)})
+
+
 def _optional_json(request):
     """The request's JSON object body: {} without one (no body, or not JSON -- the UI posts
     these actions bare), None when a JSON body is not an object."""
@@ -1916,6 +2033,24 @@ def api_track_detail(request, pk):
         problems = cue_markers.validate(final, set(marker_edits), track.duration_seconds)
         if problems:
             return JsonResponse({"error": "; ".join(problems)}, status=400)
+    # Package C: replacing a protected value (locked, review or historical) needs the operator's
+    # explicit confirmation, named per marker in "confirm_override" -- refused here before any
+    # side effect, and again by the authority under its row lock.
+    confirm_override = body.get("confirm_override") or []
+    if not isinstance(confirm_override, list) or not all(isinstance(n, str) for n in confirm_override):
+        return JsonResponse({"error": "confirm_override must be a list of cue-marker names"}, status=400)
+    if marker_edits:
+        row = {name: getattr(track, name) for name in cue_markers.MARKERS} | {
+            "cue_marker_state": track.cue_marker_state, "waveform_path": track.waveform_path}
+        unconfirmed = sorted(name for name in marker_edits
+                             if cue_markers.protection_of(name, row) in cue_markers.PROTECTED
+                             and name not in confirm_override)
+        if unconfirmed:
+            return JsonResponse({
+                "error": "Replacing a protected cue point needs explicit confirmation: "
+                         + ", ".join(cue_markers.LABELS[name] for name in unconfirmed) + ".",
+                "confirmation_required": unconfirmed, "cue_marker_revision": track.cue_marker_revision,
+            }, status=409)
     # The decoded audio the operator is editing, when a trusted waveform cache establishes it --
     # read before a recategorization below moves the file (a move keeps the audio, not the witness).
     from library.services import waveform_cache
@@ -2052,13 +2187,15 @@ def api_track_detail(request, pk):
         if marker_edits:
             marker_result = cue_markers.operator_edit(
                 track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits,
-                audio_revision=edited_audio_revision)
+                audio_revision=edited_audio_revision, confirm_protected=confirm_override)
             if not marker_result.ok:
                 transaction.set_rollback(True)
                 return JsonResponse({"error": marker_result.conflict or marker_result.error,
                                      "conflict": bool(marker_result.conflict),
+                                     "confirmation_required": marker_result.confirmation_required,
                                      "cue_marker_revision": marker_result.revision},
-                                    status=409 if marker_result.conflict else 400)
+                                    status=409 if marker_result.conflict or marker_result.confirmation_required
+                                    else 400)
         track.save()
 
     # M2M fields have to be set AFTER save() because they need the pk.

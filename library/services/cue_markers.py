@@ -70,8 +70,9 @@ DEFAULTS = {name: None for name in MARKERS} | {"cue_in_seconds": 0.0}
 LOCKED, UNLOCKED, REVIEW = "locked", "unlocked", "review"
 LEGACY, UNSET = "legacy", "unset"            # effective protection of a marker without an entry
 PROTECTED = (LOCKED, REVIEW, LEGACY)          # never replaced by automatic analysis
-#: Entry keys an operator action on the marker resolves.
-_REVIEW_KEYS = ("previous_approval", "review_reason", "audio_changed_at")
+#: Entry keys an operator action on the marker resolves. A retired approval (``previous_approval``)
+#: is history and is never dropped (r0123 Package C).
+_REVIEW_KEYS = ("review_reason", "audio_changed_at")
 SOURCE_OPERATOR, SOURCE_ANALYSIS, SOURCE_GENERATED, SOURCE_UNKNOWN = "operator", "analysis", "generated", "unknown"
 SOURCES = (SOURCE_OPERATOR, SOURCE_ANALYSIS, SOURCE_GENERATED, SOURCE_UNKNOWN)
 
@@ -168,6 +169,13 @@ def _same(a, b) -> bool:
         return a == b
 
 
+def meaningful(name, row) -> bool:
+    """A marker value that represents a position: set, and not Cue In's never-analyzed default 0
+    (even after that default was explicitly unlocked) -- what Lock All may lock."""
+    value = row.get(name)
+    return value is not None and not (name == "cue_in_seconds" and _same(value, 0.0) and never_analyzed(row))
+
+
 def never_analyzed(row) -> bool:
     return not (row.get("waveform_path") or "")
 
@@ -246,6 +254,7 @@ class Result:
     review: list = field(default_factory=list)        # locked markers kept for review after new media
     overridden: list = field(default_factory=list)
     skipped: dict = field(default_factory=dict)       # name -> reason (e.g. unchanged)
+    confirmation_required: list = field(default_factory=list)   # protected markers an edit would replace
     conflict: str | None = None                       # stale revision
     error: str | None = None                          # refused or invalid
 
@@ -262,7 +271,7 @@ def _user_id(user):
 
 
 def _resolved(entry) -> dict:
-    """An entry with its review (and retired approval) resolved by an operator action."""
+    """An entry with its review resolved by an operator action (its approval history is kept)."""
     return {key: value for key, value in (entry or {}).items() if key not in _REVIEW_KEYS}
 
 
@@ -286,26 +295,48 @@ def _retired_approval(entry, value, now, reason, new_audio_revision) -> dict | N
             "retired_for_audio_revision": new_audio_revision}
 
 
+#: Operator-facing marker states (``review()``'s ``display``), from most to least protected.
+DISPLAY_STATES = ("approved", "locked_unverified", "locked_other_audio", "review", "historical",
+                  "unlocked_operator", "auto", "default_zero", "unset")
+_PROVENANCE_KEYS = ("source", "set_at", "set_by", "approved_at", "approved_by", "unlocked_at", "unlocked_by",
+                    "review_reason", "audio_changed_at", "previous_approval", "replaced_historical_value",
+                    "overridden_from", "copied_from_track", "equivalence")
+
+
 def review(row, current_audio_revision=None) -> dict:
-    """Per marker, for review screens (Package C): its protection and, for an approval, whether it
-    was given for the current decoded audio (``current``), other audio (``other``), audio replaced
-    since (``previous``) or audio never identified (``unknown``), plus any retired approval."""
+    """Per marker, for review screens (Package C): its protection, an operator-facing ``display``
+    state, whether it ``needs_review``, and for an approval whether it was given for the current
+    decoded audio (``current``), other audio (``other``), audio replaced since (``previous``) or
+    audio never identified (``unknown``) -- plus its provenance, including any retired approval.
+    ``current_audio_revision`` comes from a trusted waveform cache (None: unknown); nothing here
+    decodes audio or assumes a match."""
     state = row.get("cue_marker_state") or {}
     out = {}
     for name in MARKERS:
         entry = state.get(name) if isinstance(state.get(name), dict) else {}
         protection = protection_of(name, row)
-        info = {"protection": protection, "value": row.get(name)}
+        value = row.get(name)
+        info = {"protection": protection, "value": value}
         if protection == LOCKED:
             recorded = entry.get("audio_revision")
             info["audio"] = ("current" if recorded and recorded == current_audio_revision
                              else "other" if recorded and current_audio_revision else "unknown")
+            display = {"current": "approved", "other": "locked_other_audio", "unknown": "locked_unverified"}[
+                info["audio"]]
         elif protection == REVIEW:
             info["audio"] = "previous"
-        if entry.get("previous_approval"):
-            info["previous_approval"] = entry["previous_approval"]
-        if entry.get("audio_changed_at"):
-            info["audio_changed_at"] = entry["audio_changed_at"]
+            display = "review"
+        elif protection == LEGACY:
+            display = "historical"
+        elif protection == UNLOCKED:
+            display = "unlocked_operator" if entry.get("unlocked_at") else "auto"
+        else:
+            display = "unset" if value is None else "default_zero"
+        info["display"] = display
+        info["needs_review"] = display in ("review", "locked_other_audio")
+        for key in _PROVENANCE_KEYS:
+            if entry.get(key) is not None:
+                info[key] = entry[key]
         out[name] = info
     return out
 
@@ -357,11 +388,18 @@ def _commit(result: Result, row, values: dict, state: dict, audit=None) -> Resul
 # ------------------------------------------------------------------ operator edits
 
 def operator_edit(track_id, *, expected_revision, user, values=None, approve=(), unlock=(),
-                  audio_revision=None) -> Result:
+                  audio_revision=None, confirm_protected=None) -> Result:
     """Set (and lock) markers, approve unchanged ones (lock without editing) or unlock them, for
     the operator who saw ``expected_revision``. Only the named markers are touched.
     ``audio_revision``: the decoded-audio revision the operator is working on, when a trusted
-    waveform cache establishes it (``waveform_cache.current_audio_revision``); else None."""
+    waveform cache establishes it (``waveform_cache.current_audio_revision``); else None.
+
+    ``confirm_protected`` (Package C): when given, an edit that would replace a protected value
+    (locked, review or historical) is refused -- nothing written, ``confirmation_required`` names
+    them -- unless the marker is listed, i.e. the operator explicitly confirmed replacing it. The
+    check runs under the row lock, against exactly the protection the revision guarantees.
+    Replacing, unlocking or re-approving never discards an earlier approval: it is kept as
+    ``previous_approval``. A marker without a value can be neither approved nor unlocked."""
     result = Result(track_id=track_id)
     values = dict(values or {})
     approve, unlock = tuple(approve), tuple(unlock)
@@ -394,10 +432,25 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
                                f"{expected_revision} -> {row['cue_marker_revision']}); reload before editing")
             return result
         state = copy.deepcopy(row["cue_marker_state"] or {})
+        if confirm_protected is not None:
+            unconfirmed = sorted(name for name, value in values.items()
+                                 if not _same(row[name], value) and protection_of(name, row) in PROTECTED
+                                 and name not in set(confirm_protected))
+            if unconfirmed:
+                result.ok, result.revision, result.confirmation_required = False, row["cue_marker_revision"], unconfirmed
+                result.error = ("replacing a protected cue point needs explicit confirmation: "
+                                + ", ".join(LABELS[name] for name in unconfirmed))
+                return result
         new_values = {}
         for name, value in values.items():
+            previous = state.get(name) if isinstance(state.get(name), dict) else None
             entry = {"protection": LOCKED, "source": SOURCE_OPERATOR, "set_at": _now_iso(now), "set_by": who,
                      "approved_at": _now_iso(now), "approved_by": who, "audio_revision": audio_revision}
+            retired = _retired_approval(previous, row[name], now, "replaced_by_operator", audio_revision)
+            if retired:
+                entry["previous_approval"] = retired
+            if protection_of(name, row) == LEGACY and row[name] is not None:
+                entry["replaced_historical_value"] = {"value": row[name], "replaced_at": _now_iso(now)}
             if _same(row[name], value):
                 if (state.get(name) or {}).get("protection") == LOCKED:
                     result.skipped[name] = "unchanged and already locked"
@@ -412,6 +465,9 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
             result.changed[name] = [row[name], value]
         for name in approve:
             previous = state.get(name) or {"source": SOURCE_UNKNOWN}
+            if row[name] is None:
+                result.skipped[name] = "no value to approve"
+                continue
             if previous.get("protection") == LOCKED and previous.get("approved_by") is not None \
                     and (audio_revision is None or previous.get("audio_revision") == audio_revision):
                 result.skipped[name] = "already approved and locked"
@@ -421,11 +477,17 @@ def operator_edit(track_id, *, expected_revision, user, values=None, approve=(),
             result.approved.append(name)
         for name in unlock:
             previous = state.get(name) or {"source": SOURCE_UNKNOWN}
+            if row[name] is None:
+                result.skipped[name] = "no value to unlock"
+                continue
             if previous.get("protection") == UNLOCKED:
                 result.skipped[name] = "already unlocked"
                 continue
-            state[name] = {**_resolved(previous), "protection": UNLOCKED, "unlocked_at": _now_iso(now),
-                           "unlocked_by": who}
+            entry = {**_resolved(previous), "protection": UNLOCKED, "unlocked_at": _now_iso(now), "unlocked_by": who}
+            retired = _retired_approval(previous, row[name], now, "unlocked", None)
+            if retired:
+                entry["previous_approval"] = retired
+            state[name] = entry
             result.unlocked.append(name)
         final = {name: new_values.get(name, row[name]) for name in MARKERS}
         problems = validate(final, set(new_values), row["duration_seconds"])
