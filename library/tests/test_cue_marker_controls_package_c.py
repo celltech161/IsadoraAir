@@ -394,8 +394,11 @@ class TrustAndRefreshTests(_Controls):
 
     def test_a_started_refresh_is_never_reported_complete_until_it_is(self):
         track, requested = self.long_form()
-        # The child would hold the Track's refresh lock while it works.
-        fd = waveform_cache.try_operation_lock(self.waves, f"{track.pk}.refresh.lock")
+        # The child would hold this request's own lock while it works (r0123 B2: the Track's
+        # shared refresh lock no longer stands for any particular request).
+        import fcntl
+        fd = os.open(waveform_cache.lock_dir() / wg.request_lock_name(track.pk, requested), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             self.assertEqual(self.status(track, requested)["state"], "running")
         finally:
@@ -427,9 +430,12 @@ class TrustAndRefreshTests(_Controls):
 
     def test_a_lost_outcome_record_falls_back_to_the_cache_this_refresh_promoted(self):
         track, requested = self.long_form()
-        self.assertEqual(wg.refresh(track.pk).status, wg.REPLACED)    # promoted after the request, no event
+        # r0123 B2: only a cache carrying exactly this request's token completes it.
+        self.assertEqual(wg.refresh(track.pk).status, wg.REPLACED)    # some other refresh, no token
+        self.assertEqual(self.status(track, requested)["state"], "unknown")
+        self.assertEqual(wg.refresh(track.pk, request_token=requested).status, wg.REPLACED)   # this one, no event
         self.assertEqual(self.status(track, requested)["state"], "completed")
-        self.assertEqual(self.status(track, 10 ** 19)["state"], "unknown")   # a request after that cache
+        self.assertEqual(self.status(track, requested + 1)["state"], "unknown")
 
     def test_the_ui_uses_only_the_waveform_only_endpoint_and_never_reanalyzes_as_a_fallback(self):
         source = (REPO / "library/templates/library/track_detail.html").read_text()

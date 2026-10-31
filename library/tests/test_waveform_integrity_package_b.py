@@ -549,7 +549,7 @@ class RefreshTests(_Base):
         command = popen.call_args.args[0]
         self.assertEqual(command[2:5], ["refresh_waveform", str(long_form.pk), "--background"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 2)
+        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 3)   # operation, slot and request locks (B2)
         slot = waveform_cache.try_operation_lock(self.waves, wg.BACKGROUND_SLOT_LOCK)   # one long refresh at a time
         try:
             with patch.object(wg.subprocess, "Popen") as popen:
