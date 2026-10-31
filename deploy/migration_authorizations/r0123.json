@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0123",
+  "target_commit": "1a7c5b113a31f619ab20a7361be3eecf2f285559",
+  "manifest_sha256": "34a7f28fdd8694f90de0c6178aaf8d267a0f92c080b78608e77628eb8506bb9d",
+  "authorized_manual_operations": [
+    {
+      "ref": "library.0099_track_cue_marker_authority",
+      "migration_file_sha256": "2a806488920d88f4ece07af1a8d796453fd521fae4bb28f6fe7c5bde1d90db95",
+      "operation_index": 0,
+      "operation": "AddField",
+      "classification": "manual"
+    },
+    {
+      "ref": "library.0099_track_cue_marker_authority",
+      "migration_file_sha256": "2a806488920d88f4ece07af1a8d796453fd521fae4bb28f6fe7c5bde1d90db95",
+      "operation_index": 1,
+      "operation": "AddField",
+      "classification": "manual"
+    }
+  ]
+}
