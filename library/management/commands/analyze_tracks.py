@@ -384,8 +384,8 @@ class AnalysisOutcome:
     """What one analysis did: truthy when the Track was analyzed (decode and envelope succeeded),
     with the cue-marker authority's result for the calculated markers (``markers``)."""
 
-    def __init__(self, analyzed, markers=None, reason=""):
-        self.analyzed, self.markers, self.reason = analyzed, markers, reason
+    def __init__(self, analyzed, markers=None, reason="", promotion=None):
+        self.analyzed, self.markers, self.reason, self.promotion = analyzed, markers, reason, promotion
 
     def __bool__(self):
         return self.analyzed
@@ -396,7 +396,7 @@ class AnalysisOutcome:
 
 def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, *,
                       media_replaced=False, source=cue_markers.SOURCE_ANALYSIS, requested_by=None,
-                      override=(), override_confirmed=False):
+                      override=(), override_confirmed=False, keep_previous_waveform=False):
     """Analyze exactly one track (waveform + cue points + related artists),
     writing results directly to the DB and a waveform JSON file. `row` is
     (track_id, filepath, filename, duration, title, artist_name,
@@ -591,17 +591,26 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
         writer="analysis", started_ns=started_ns, analysis_duration=analysis_duration, times=times,
         envelope_db=envelope_db, samples_left=samples_left, samples_right=samples_right)
     update_fields = {"related_artists": related}
+    promotion = None
     try:
-        promotion = waveform_cache.promote(track_id, payload, wave_dir, expected_source=witness)
+        promotion = waveform_cache.promote(
+            track_id, payload, wave_dir, expected_source=witness,
+            keep_previous=keep_previous_waveform,
+        )
         update_fields["waveform_path"] = str(promotion.path)
     except (waveform_cache.PromotionRefused, waveform_cache.WaveformBusy, OSError) as exc:
         print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
 
-    Track.objects.filter(id=track_id).update(**update_fields)
-    # The request this run served is done -- unless a newer one arrived while it ran.
-    Track.objects.filter(id=track_id, analysis_requested_at=basis["analysis_requested_at"]).exclude(
-        analysis_requested_at__isnull=True).update(analysis_requested_at=None)
-    return AnalysisOutcome(True, markers=marker_result)
+    try:
+        Track.objects.filter(id=track_id).update(**update_fields)
+        # The request this run served is done -- unless a newer one arrived while it ran.
+        Track.objects.filter(id=track_id, analysis_requested_at=basis["analysis_requested_at"]).exclude(
+            analysis_requested_at__isnull=True).update(analysis_requested_at=None)
+    except BaseException:
+        if keep_previous_waveform and promotion is not None:
+            promotion.undo()
+        raise
+    return AnalysisOutcome(True, markers=marker_result, promotion=promotion)
 
 
 class Command(BaseCommand):

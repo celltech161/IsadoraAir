@@ -306,22 +306,31 @@ def _open_lock(name):
     return os.open(lock_dir() / name, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
 
 
-@contextlib.contextmanager
-def track_lock(wave_dir, track_id, *, timeout=LOCK_TIMEOUT_SECONDS):
-    """The per-Track cache lock (cross-process ``flock``); WaveformBusy after ``timeout`` seconds.
-    ``wave_dir`` names the directory being written; the lock itself is per Track, station-wide."""
+def _acquire_track_lock(track_id, timeout):
+    """Acquire and return the per-Track flock fd; the caller owns and closes it."""
     fd = _open_lock(f"{int(track_id)}.lock")
     try:
         deadline = time.monotonic() + timeout
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                return fd
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise WaveformBusy(f"the waveform cache of Track {track_id} is locked by another writer") \
                         from None
                 time.sleep(0.05)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def track_lock(wave_dir, track_id, *, timeout=LOCK_TIMEOUT_SECONDS):
+    """The per-Track cache lock (cross-process ``flock``); WaveformBusy after ``timeout`` seconds.
+    ``wave_dir`` names the directory being written; the lock itself is per Track, station-wide."""
+    fd = _acquire_track_lock(track_id, timeout)
+    try:
         yield
     finally:
         os.close(fd)
@@ -371,47 +380,108 @@ class Promotion:
     path: Path
     previous_existed: bool
     previous: Path | None = None
+    lock_fd: int | None = None
+    installed_witness: tuple | None = None
+
+    def _verify_owner(self):
+        if self.lock_fd is None:
+            raise PromotionRefused("finalized", "this waveform promotion has already been finalized")
+        try:
+            current = _file_witness(self.path)
+        except FileNotFoundError:
+            current = None
+        if current != self.installed_witness:
+            raise PromotionRefused(
+                "ownership_lost",
+                "the installed waveform no longer belongs to this promotion; rollback state was retained",
+            )
+
+    def _release(self):
+        fd, self.lock_fd = self.lock_fd, None
+        if fd is not None:
+            os.close(fd)
 
     def undo(self):
-        """Put back exactly what was there before (under the lock)."""
-        with track_lock(self.path.parent, self.track_id):
+        """Put back exactly what was there before while retaining this promotion's lock lease."""
+        try:
+            self._verify_owner()
             if self.previous is not None and self.previous.exists():
                 os.replace(self.previous, self.path)
             elif not self.previous_existed:
                 self.path.unlink(missing_ok=True)
+            else:
+                raise PromotionRefused("rollback_missing", "this promotion's rollback cache is missing")
             _fsync_dir(self.path.parent)
-        self.previous = None
+            self.previous = None
+        finally:
+            self._release()
 
     def discard(self):
-        """Keep the new cache; drop the rollback copy."""
-        if self.previous is not None:
-            self.previous.unlink(missing_ok=True)
-            self.previous = None
+        """Keep the new cache and drop only this promotion's uniquely owned rollback copy."""
+        try:
+            self._verify_owner()
+            if self.previous is not None:
+                self.previous.unlink(missing_ok=True)
+                self.previous = None
+                _fsync_dir(self.path.parent)
+        finally:
+            self._release()
 
 
-def _replace(track_id, final: Path, data: bytes, *, keep_previous: bool) -> Promotion:
+def _file_witness(path: Path):
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _replace(track_id, final: Path, data: bytes, *, keep_previous: bool, lock_fd=None) -> Promotion:
     staged = _stage(final.parent, track_id, data)
-    previous = final.with_name(f".{final.name}{PREVIOUS_SUFFIX}")
+    previous = final.with_name(
+        f".{final.name}{PREVIOUS_SUFFIX}.{os.getpid()}.{secrets.token_hex(8)}"
+    )
     existed = final.exists()
+    replaced = False
     try:
         payload, failure = read(staged)
         if failure is None:
             failure = check_payload(payload, int(track_id))
         if failure is not None:
             raise PromotionRefused("invalid", f"the staged cache failed validation: {failure.reason}")
-        previous.unlink(missing_ok=True)
         if existed:
             os.link(final, previous)             # the same-filesystem rollback copy
         os.replace(staged, final)
+        replaced = True
         _fsync_dir(final.parent)
-    except BaseException:
+        installed_witness = _file_witness(final)
+    except BaseException as exc:
         staged.unlink(missing_ok=True)
-        if existed:
+        if replaced:
+            try:
+                if existed and previous.exists():
+                    os.replace(previous, final)
+                elif not existed:
+                    final.unlink(missing_ok=True)
+                _fsync_dir(final.parent)
+            except BaseException as restore_exc:
+                raise OSError(
+                    f"waveform replacement failed and its previous cache could not be restored: {restore_exc}"
+                ) from exc
+        elif existed:
             previous.unlink(missing_ok=True)
         raise
-    promotion = Promotion(int(track_id), final, existed, previous if existed else None)
+    promotion = Promotion(
+        int(track_id), final, existed, previous if existed else None,
+        lock_fd=lock_fd if keep_previous else None,
+        installed_witness=installed_witness,
+    )
     if not keep_previous:
-        promotion.discard()
+        if existed:
+            try:
+                previous.unlink(missing_ok=True)
+            except OSError:
+                # The new canonical cache was already renamed and directory-fsynced. A failure to
+                # remove this operation's unique recovery link must not falsely report that the
+                # old cache is still canonical; leaving the uniquely named link is safe debris.
+                pass
     return promotion
 
 
@@ -443,7 +513,8 @@ def promote(track_id, payload: dict, wave_dir, *, expected_source=None, keep_pre
     as the snapshot. PromotionRefused / WaveformBusy / OSError leave the previous cache untouched."""
     from library.models import Track
     final = canonical_path(wave_dir, track_id)
-    with track_lock(wave_dir, track_id, timeout=lock_timeout):
+    lock_fd = _acquire_track_lock(track_id, lock_timeout)
+    try:
         filepath = Track.objects.filter(pk=track_id).values_list("filepath", flat=True).first()
         snapshot = _marker_snapshot(track_id)
         if filepath is None or snapshot is None:
@@ -454,7 +525,16 @@ def promote(track_id, payload: dict, wave_dir, *, expected_source=None, keep_pre
         if _newer_existing(final, track_id, payload["generation"]["started_ns"]):
             raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
         data = json.dumps({**payload, **snapshot}, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        return _replace(track_id, final, data, keep_previous=keep_previous)
+        promotion = _replace(
+            track_id, final, data, keep_previous=keep_previous,
+            lock_fd=lock_fd if keep_previous else None,
+        )
+        if keep_previous:
+            lock_fd = None                 # the Promotion owns the transaction-scoped lease
+        return promotion
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def install_file(track_id, staged_file, wave_dir, *, keep_previous=False,
@@ -466,10 +546,20 @@ def install_file(track_id, staged_file, wave_dir, *, keep_previous=False,
     if failure is not None:
         raise PromotionRefused("invalid", f"the cache to install failed validation: {failure.reason}")
     final = canonical_path(wave_dir, track_id)
-    with track_lock(wave_dir, track_id, timeout=lock_timeout):
+    lock_fd = _acquire_track_lock(track_id, lock_timeout)
+    try:
         if "schema" in payload and _newer_existing(final, track_id, payload["generation"]["started_ns"]):
             raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
-        return _replace(track_id, final, Path(staged_file).read_bytes(), keep_previous=keep_previous)
+        promotion = _replace(
+            track_id, final, Path(staged_file).read_bytes(), keep_previous=keep_previous,
+            lock_fd=lock_fd if keep_previous else None,
+        )
+        if keep_previous:
+            lock_fd = None                 # the Promotion owns the transaction-scoped lease
+        return promotion
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def restore_file(track_id, backup_file, wave_dir, *, lock_timeout=LOCK_TIMEOUT_SECONDS) -> None:

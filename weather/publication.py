@@ -293,9 +293,10 @@ def publish_weather_asset(
                     if real_waveform_promotion is not None:
                         real_waveform_promotion.discard()
                 except Exception as exc:
-                    _restore_final_file(dest_path, backup)
-                    published = False
-                    if real_waveform_promotion is not None:
+                    if not track_committed:
+                        _restore_final_file(dest_path, backup)
+                        published = False
+                    if real_waveform_promotion is not None and not track_committed:
                         real_waveform_promotion.undo()
                     raise PublicationError(f"publish failed for {dest_path}: {exc}") from exc
 

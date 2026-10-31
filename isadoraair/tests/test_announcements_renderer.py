@@ -2,6 +2,7 @@
 
 import functools
 import shutil
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -18,6 +19,8 @@ from isadoraair.announcements import (
 )
 from isadoraair.announcements import renderer as renderer_module
 from library.models import AnalysisConfig, Artist, Category, CategoryKind, Track
+from library.management.commands.analyze_tracks import AnalysisOutcome
+from library.services import audio_identity, waveform_cache
 from library.tests.cue_marker_support import set_markers
 
 
@@ -79,6 +82,27 @@ class AnnouncementRendererTests(TestCase):
             timeout_seconds=29,
             metadata=self._metadata(**metadata),
         )
+
+    @staticmethod
+    def _failed_waveform_analysis(track, wave_dir):
+        times = [0.25, 0.75, 1.25]
+        payload = waveform_cache.build_payload(
+            track.pk,
+            identity=None,
+            source=audio_identity.stat_source(track.filepath),
+            analysis={"sample_rate": 4410, "window_seconds": 0.5, "waveform_points": 1000},
+            writer="announcement-test",
+            started_ns=time.time_ns(),
+            analysis_duration=1.5,
+            times=times,
+            envelope_db=[-30.0] * len(times),
+            samples_left=[10] * len(times),
+            samples_right=[12] * len(times),
+        )
+        promotion = waveform_cache.promote(
+            track.pk, payload, wave_dir, keep_previous=True,
+        )
+        return AnalysisOutcome(False, reason="injected analysis failure", promotion=promotion)
 
     def _assert_no_scratch(self):
         self.assertEqual(
@@ -350,7 +374,7 @@ class AnnouncementRendererTests(TestCase):
         def convert(_source, output):
             Path(output).write_bytes(payload["bytes"])
 
-        def analyze(track, wave_dir=None, category=None):
+        def analyze(track, wave_dir=None, category=None, **_kwargs):
             set_markers(track.id, cue_in_seconds=payload["cue"], next_start_seconds=payload["next"])
             return True
 
@@ -382,7 +406,7 @@ class AnnouncementRendererTests(TestCase):
         destination = self.root / "rotation.flac"
         track = self._existing_track(destination)
 
-        def failed_analysis(updated_track, wave_dir=None, category=None):
+        def failed_analysis(updated_track, wave_dir=None, category=None, **_kwargs):
             Track.objects.filter(id=updated_track.id).update(title="Partially changed")
             set_markers(updated_track.id, cue_in_seconds=3.0, next_start_seconds=4.0)
             return False
@@ -529,11 +553,10 @@ class AnnouncementRendererTests(TestCase):
         waveform_path = wave_dir / f"{track.id}.json"
         waveform_path.write_bytes(b"LAST-GOOD-WAVEFORM")
 
-        def failing_analysis_overwrites_waveform(updated_track, wave_dir=None, category=None):
-            (wave_dir / f"{updated_track.id}.json").write_bytes(b"NEW-WAVEFORM")
+        def failing_analysis_overwrites_waveform(updated_track, wave_dir=None, category=None, **_kwargs):
             Track.objects.filter(id=updated_track.id).update(title="Partially changed")
             set_markers(updated_track.id, cue_in_seconds=3.0, next_start_seconds=4.0)
-            return False
+            return self._failed_waveform_analysis(updated_track, wave_dir)
 
         with patch.object(
             renderer_module, "synthesize_station_voice", side_effect=self._synthesize
@@ -570,11 +593,9 @@ class AnnouncementRendererTests(TestCase):
 
         created_waveform_path = {}
 
-        def failing_analysis_creates_waveform(updated_track, wave_dir=None, category=None):
-            path = wave_dir / f"{updated_track.id}.json"
-            path.write_bytes(b"NEW-WAVEFORM")
-            created_waveform_path["path"] = path
-            return False
+        def failing_analysis_creates_waveform(updated_track, wave_dir=None, category=None, **_kwargs):
+            created_waveform_path["path"] = wave_dir / f"{updated_track.id}.json"
+            return self._failed_waveform_analysis(updated_track, wave_dir)
 
         with patch.object(
             renderer_module, "synthesize_station_voice", side_effect=self._synthesize

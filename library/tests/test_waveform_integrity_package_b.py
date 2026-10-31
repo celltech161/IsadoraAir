@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -332,6 +333,98 @@ class PromotionTests(_Base):
         fresh = self.track(name="fresh.flac", analyzed=False)
         waveform_cache.promote(fresh.pk, self.payload(fresh), self.waves, keep_previous=True).undo()
         self.assertFalse(self.cache(fresh).exists())
+
+    def _staged_cache(self, track, payload, name):
+        scratch = self.dir / name
+        scratch.mkdir()
+        return waveform_cache.promote(track.pk, payload, scratch).path
+
+    def _pending_writer(self, track, staged, *, attempted, finished, errors):
+        try:
+            attempted.set()
+            waveform_cache.install_file(track.pk, staged, self.waves, lock_timeout=2)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    def test_rollback_capable_promotions_fence_pending_writers_for_commit_and_rollback(self):
+        for finalize in ("discard", "undo"):
+            with self.subTest(finalize=finalize):
+                track = self.track(name=f"{finalize}.flac")
+                old = self.cache(track).read_bytes()
+                staged = self._staged_cache(
+                    track, self.payload(track, started_ns=2_000), f"staged-{finalize}")
+                first = waveform_cache.promote(
+                    track.pk, self.payload(track, started_ns=1_000), self.waves, keep_previous=True)
+                first_bytes = self.cache(track).read_bytes()
+                attempted, finished, errors = threading.Event(), threading.Event(), []
+                worker = threading.Thread(
+                    target=self._pending_writer,
+                    args=(track, staged),
+                    kwargs={"attempted": attempted, "finished": finished, "errors": errors},
+                    daemon=True,
+                )
+                worker.start()
+                self.assertTrue(attempted.wait(1))
+                self.assertFalse(finished.is_set())
+                getattr(first, finalize)()
+                self.assertTrue(finished.wait(3))
+                worker.join()
+                self.assertEqual(errors, [])
+                self.assertNotEqual(self.cache(track).read_bytes(), old)
+                self.assertNotEqual(self.cache(track).read_bytes(), first_bytes)
+
+    def test_pending_writer_cannot_steal_or_delete_an_earlier_unique_rollback(self):
+        track = self.track()
+        staged = self._staged_cache(track, self.payload(track, started_ns=2_000), "staged-pending")
+        first = waveform_cache.promote(track.pk, self.payload(track, started_ns=1_000), self.waves,
+                                       keep_previous=True)
+        rollback = first.previous
+        attempted, finished, errors = threading.Event(), threading.Event(), []
+        worker = threading.Thread(
+            target=self._pending_writer,
+            args=(track, staged),
+            kwargs={"attempted": attempted, "finished": finished, "errors": errors},
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(attempted.wait(1))
+        self.assertTrue(rollback.is_file())
+        first.discard()
+        self.assertTrue(finished.wait(3))
+        worker.join()
+        self.assertEqual(errors, [])
+        self.assertFalse(rollback.exists())
+
+    def test_directory_fsync_failure_after_replace_restores_the_previous_cache(self):
+        track = self.track()
+        old = self.cache(track).read_bytes()
+        real_fsync = waveform_cache._fsync_dir
+        calls = []
+
+        def fail_once(directory):
+            calls.append(directory)
+            if len(calls) == 1:
+                raise OSError(5, "injected directory fsync failure")
+            return real_fsync(directory)
+
+        with patch.object(waveform_cache, "_fsync_dir", side_effect=fail_once):
+            with self.assertRaises(OSError):
+                waveform_cache.promote(track.pk, self.payload(track), self.waves)
+        self.assertEqual(self.cache(track).read_bytes(), old)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_lost_ownership_is_reported_without_deleting_the_promotions_rollback(self):
+        track = self.track()
+        promotion = waveform_cache.promote(track.pk, self.payload(track), self.waves, keep_previous=True)
+        rollback = promotion.previous
+        self.cache(track).write_bytes(b"an out-of-contract writer bypassed the lock")
+        with self.assertRaises(waveform_cache.PromotionRefused) as refused:
+            promotion.discard()
+        self.assertEqual(refused.exception.code, "ownership_lost")
+        self.assertTrue(rollback.is_file())
+        rollback.unlink()
 
 
 # ------------------------------------------------------------------ Refresh Waveform Only

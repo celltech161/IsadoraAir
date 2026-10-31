@@ -341,7 +341,7 @@ def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublicat
         existing = ActiveBroadcastPublication.objects.filter(execution=row).first()
         if existing is not None:
             return existing
-        placed, real_wave = False, None
+        placed, real_wave, publication_committed = False, None, False
         with tempfile.TemporaryDirectory(prefix=".am-publish-", dir=dest.parent) as scratch_name:
             scratch = Path(scratch_name)
             wave_scratch = scratch / "waveforms"
@@ -384,11 +384,12 @@ def _place_and_ingest(row, media, dest, relpath, now) -> ActiveBroadcastPublicat
                         published_at=now)
                     _event("published", row, actor_kind=ActorKind.WORKER,
                            detail={"track": track.pk, "library_relpath": relpath, "sha256": media.sha256})
+                publication_committed = True
                 real_wave.discard()
             except BaseException as exc:
-                if real_wave is not None:
+                if real_wave is not None and not publication_committed:
                     real_wave.undo()
-                if placed:
+                if placed and not publication_committed:
                     dest.unlink(missing_ok=True)
                 if isinstance(exc, PlayoutError) or not isinstance(exc, Exception):
                     raise

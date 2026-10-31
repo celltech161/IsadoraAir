@@ -64,8 +64,9 @@ def _convert_wav_to_flac(source: Path, destination: Path) -> None:
 
 
 def _analyze_track(
-    track: Track, wave_dir: Path | None = None, category: Category | None = None
-) -> bool:
+    track: Track, wave_dir: Path | None = None, category: Category | None = None,
+    *, keep_previous_waveform: bool = False,
+):
     """Run ordinary library analysis on `track`. When `category` is given,
     overlays that Category's threshold overrides on top of the global
     AnalysisConfig first -- via the same `apply_category_thresholds()`
@@ -106,8 +107,11 @@ def _analyze_track(
         track.related_artists,
     )
     # Every caller has just published this Track's audio: its markers rebind to it.
-    return bool(analyze_one_track(row, cfg_values, wave_dir or get_waveforms_dir(), force=True,
-                                  media_replaced=True))
+    outcome = analyze_one_track(
+        row, cfg_values, wave_dir or get_waveforms_dir(), force=True,
+        media_replaced=True, keep_previous_waveform=keep_previous_waveform,
+    )
+    return outcome if keep_previous_waveform else bool(outcome)
 
 
 def _set_speech_markers(track_id: int, duration: float) -> None:
@@ -226,10 +230,8 @@ class AnnouncementRenderer:
 
         backup: Path | None = None
         published = False
-        rotation_waveform: Path | None = None
         track_committed = False
-        waveform_backup: Path | None = None
-        waveform_existed = False
+        waveform_promotion = None
         analysis_attempted = False
         analysis_succeeded = False
         analysis_error: str | None = None
@@ -278,33 +280,28 @@ class AnnouncementRenderer:
                             from library.management.commands.analyze_tracks import get_waveforms_dir
 
                             wave_dir = get_waveforms_dir()
-                            rotation_waveform = wave_dir / f"{track.id}.json"
-                            waveform_existed = rotation_waveform.exists()
-                            if waveform_existed:
-                                waveform_backup = scratch / "previous-waveform.json"
-                                shutil.copy2(rotation_waveform, waveform_backup)
                             analysis_attempted = True
-                            analysis_succeeded = _analyze_track(
-                                track, wave_dir=wave_dir, category=category
+                            analysis_outcome = _analyze_track(
+                                track, wave_dir=wave_dir, category=category,
+                                keep_previous_waveform=True,
                             )
+                            analysis_succeeded = bool(analysis_outcome)
+                            waveform_promotion = getattr(analysis_outcome, "promotion", None)
                             if not analysis_succeeded:
                                 raise AnnouncementRenderError(
                                     "analysis", "rotation Track analysis did not complete"
                                 )
                             track.refresh_from_db()
                     track_committed = True
+                    if waveform_promotion is not None:
+                        waveform_promotion.discard()
                 except Exception as exc:
                     try:
-                        _restore_published_file(destination, backup)
-                        published = False
-                        if rotation_waveform is not None:
-                            # Through the shared cache writer (r0123): atomic, under the Track's cache lock.
-                            from library.services import waveform_cache
-
-                            if waveform_existed and waveform_backup is not None:
-                                waveform_cache.restore_file(track.id, waveform_backup, rotation_waveform.parent)
-                            elif not waveform_existed:
-                                waveform_cache.remove(track.id, rotation_waveform.parent)
+                        if not track_committed:
+                            _restore_published_file(destination, backup)
+                            published = False
+                            if waveform_promotion is not None:
+                                waveform_promotion.undo()
                     except Exception as rollback_exc:
                         raise AnnouncementRenderError(
                             "rollback",
