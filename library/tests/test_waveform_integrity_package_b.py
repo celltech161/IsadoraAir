@@ -480,8 +480,8 @@ class RefreshTests(_Base):
     def during_measure(self, action):
         real = wg.measure
 
-        def measure(path, settings):
-            values = real(path, settings)
+        def measure(path, settings, *limits):            # limits: r0123 B3's bounded decoding
+            values = real(path, settings, *limits)
             action()
             return values
         return patch.object(wg, "measure", side_effect=measure)
