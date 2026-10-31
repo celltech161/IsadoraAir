@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0123",
+  "previous_release_id": "r0122",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 1.21 cue-marker and waveform integrity: eight protected markers with durable provenance, trusted v2 waveform caches, bounded waveform-only refresh, and guarded category relocation; roadmap 2.24 Monitoring layout improvements. Library 0099 adds marker state, revision and analysis-request fields; its two reviewed manual AddField operations require the immutable r0123 companion. Restart Gunicorn and the active-message worker; no static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [
+    "library.0099_track_cue_marker_authority"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-active-message-worker"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
