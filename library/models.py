@@ -1,3 +1,4 @@
+import os
 import uuid
 
 from django.conf import settings
@@ -40,6 +41,30 @@ HOSTED_ART_SOURCES = {"oakgrove", "hosted"}
 # deezer/itunes are excluded -- those results don't depend on the
 # hosted config at all and remain valid regardless.
 HOSTED_ART_INVALIDATION_SOURCES = HOSTED_ART_SOURCES | {"none"}
+
+
+def validate_category_storage_component(value):
+    """Require a Category code used as a media directory to be one component.
+
+    This validation gives operator-facing forms and APIs a useful error, but it
+    is not the filesystem security boundary: relocation repeats the check and
+    uses descriptor-relative, no-follow operations so a legacy database value
+    cannot bypass confinement.
+    """
+    invalid = (
+        not isinstance(value, str)
+        or not value
+        or value in (".", "..")
+        or "\x00" in value
+        or os.path.isabs(value)
+        or os.sep in value
+        or (os.altsep is not None and os.altsep in value)
+    )
+    if invalid:
+        raise ValidationError(
+            "Category code must be one directory name, not an absolute or nested path."
+        )
+    return value
 
 
 # ---------------------------------------------------------------
@@ -226,6 +251,10 @@ class Category(models.Model):
                    "back to UECP doesn't lose it). The PTY override above "
                    "still applies in both protocols.",
     )
+
+    def clean(self):
+        super().clean()
+        validate_category_storage_component(self.code)
 
     class Meta:
         ordering = ["sort_order", "code"]

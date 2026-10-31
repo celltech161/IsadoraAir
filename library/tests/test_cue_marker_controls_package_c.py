@@ -5,18 +5,21 @@ Refresh Waveform Only status protocol.
 Server-side behaviour only: the page's JavaScript is exercised in a browser at field acceptance
 (no browser is available inside the test sandbox). Real audio is generated into per-test
 temporary directories; no station media, waveform, database or service is touched."""
+import errno
 import json
 import os
 import re
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.test import Client, override_settings
 
-from library.models import Category, Track
+from library.models import Category, Track, validate_category_storage_component
 from library.services import audio_identity, cue_markers, waveform_cache, waveform_generation as wg
 from library.tests.test_waveform_integrity_package_b import _audio, _Base, _row
 from monitoring.models import SystemEvent, emit_event
@@ -256,6 +259,19 @@ class RelocationConsistencyTests(_Controls):
     def destination(self, track):
         return self.dir / self.destination_category.code / Path(track.filepath).name
 
+    def assert_rejected_without_change(self, track, category, *, escaped=None):
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        old_category = track.category_id
+        response = self.patch_track(track, {"category_id": category.pk})
+        self.assertIn(response.status_code, (409, 500), response.content)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (old_category, str(source)))
+        self.assertEqual(source.read_bytes(), original)
+        if escaped is not None:
+            self.assertFalse(Path(escaped).exists())
+        return response
+
     def test_late_revision_conflict_occurs_before_media_relocation(self):
         track = self.track()
         source = Path(track.filepath)
@@ -342,6 +358,117 @@ class RelocationConsistencyTests(_Controls):
             (after["cue_marker_revision"], after["cue_marker_state"]),
             (before["cue_marker_revision"], before["cue_marker_state"]),
         )
+
+    def test_category_storage_component_validation_preserves_station_conventions(self):
+        for valid in ("Aircheck", "FSN Weekend", "B_GOLD", "3MinCenter", "Rock & Roll"):
+            with self.subTest(valid=valid):
+                self.assertEqual(validate_category_storage_component(valid), valid)
+        self.destination_category.full_clean()                 # the model/application boundary accepts valid codes
+        for invalid in ("", ".", "..", "../outside", "/tmp/outside", "nested/child", "bad\x00name"):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(ValidationError):
+                validate_category_storage_component(invalid)
+        invalid_model = Category(code="../outside", name="Invalid", kind=self.category.kind)
+        with self.assertRaises(ValidationError):
+            invalid_model.full_clean()
+
+    def test_unsafe_legacy_category_codes_cannot_escape_or_create_directories(self):
+        cases = (
+            ("../escape", self.dir.parent / "escape"),
+            ("nested/child", self.dir / "nested" / "child"),
+            ("", None),
+        )
+        for index, (code, escaped_parent) in enumerate(cases):
+            with self.subTest(code=repr(code)):
+                track = self.track(name=f"unsafe-{index}.flac")
+                category = Category.objects.create(
+                    code=code, name=f"Unsafe {index}", kind=self.category.kind,
+                )
+                escaped = escaped_parent / Path(track.filepath).name if escaped_parent else None
+                self.assert_rejected_without_change(track, category, escaped=escaped)
+                if escaped_parent is not None:
+                    self.assertFalse(escaped_parent.exists())
+
+    def test_an_absolute_legacy_category_code_is_rejected_without_touching_it(self):
+        track = self.track(name="absolute.flac")
+        # Category.code is varchar(20); use a short root-absolute value that a legacy row can hold.
+        absolute_parent = Path(f"/r12a{os.getpid()}")
+        self.assertFalse(absolute_parent.exists())
+        category = Category.objects.create(
+            code=str(absolute_parent), name="Absolute", kind=self.category.kind,
+        )
+        self.assert_rejected_without_change(
+            track, category, escaped=absolute_parent / Path(track.filepath).name,
+        )
+        self.assertFalse(absolute_parent.exists())
+
+    def test_destination_category_symlink_cannot_escape_the_library_root(self):
+        track = self.track(name="destination-symlink.flac")
+        with TemporaryDirectory(dir=self.dir.parent) as outside_name:
+            outside = Path(outside_name)
+            category = Category.objects.create(code="SYMLINKDEST", name="Symlink", kind=self.category.kind)
+            (self.dir / category.code).symlink_to(outside, target_is_directory=True)
+            escaped = outside / Path(track.filepath).name
+            self.assert_rejected_without_change(track, category, escaped=escaped)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_source_media_symlink_is_rejected_without_modifying_its_target(self):
+        track = self.track(name="source-symlink.flac")
+        source = Path(track.filepath)
+        target = source.with_name("source-symlink-target.flac")
+        original = source.read_bytes()
+        source.rename(target)
+        source.symlink_to(target.name)
+
+        response = self.patch_track(track, {"category_id": self.destination_category.pk})
+
+        self.assertEqual(response.status_code, 500, response.content)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.category.pk, str(source)))
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(self.destination(track).exists())
+
+    def test_directory_substitution_between_open_and_link_fails_closed(self):
+        track = self.track(name="directory-race.flac")
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        category = Category.objects.create(code="DIRRACE", name="Directory Race", kind=self.category.kind)
+        destination_dir = self.dir / category.code
+        parked = self.dir / "DIRRACE-parked"
+        real_link = os.link
+
+        with TemporaryDirectory(dir=self.dir.parent) as outside_name:
+            outside = Path(outside_name)
+
+            def substitute(*args, **kwargs):
+                destination_dir.rename(parked)
+                destination_dir.symlink_to(outside, target_is_directory=True)
+                return real_link(*args, **kwargs)
+
+            with patch("library.views.os.link", side_effect=substitute):
+                response = self.patch_track(track, {"category_id": category.pk})
+
+            self.assertEqual(response.status_code, 500, response.content)
+            row = Track.objects.get(pk=track.pk)
+            self.assertEqual((row.category_id, row.filepath), (self.category.pk, str(source)))
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(list(parked.iterdir()), [])
+
+    def test_cross_filesystem_copy_fallback_obeys_the_same_confinement_and_commits(self):
+        track = self.track(name="cross-filesystem.flac")
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        destination = self.destination(track)
+
+        with patch("library.views.os.link", side_effect=OSError(errno.EXDEV, "cross-device link")):
+            response = self.patch_track(track, {"category_id": self.destination_category.pk})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.destination_category.pk, str(destination)))
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), original)
 
 
 # ------------------------------------------------------------------ waveform trust and refresh
