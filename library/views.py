@@ -991,37 +991,6 @@ def api_track_repick_cue_points(request, pk):
     return JsonResponse({**_track_to_dict(track), "cue_markers": outcome["markers"]})
 
 
-@require_http_methods(["POST"])
-def api_track_refresh_waveform(request, pk):
-    """Refresh Waveform Only (r0123 Package B): regenerate the Track's waveform cache from its
-    current audio as a trusted version-2 cache, changing no Track column and no source byte, tag
-    or format (library.services.waveform_generation). Requires library.manage_tracks.
-
-    A Track up to waveform_generation.SYNC_MAX_SECONDS long is refreshed in the request: 200
-    (replaced), 409 (busy, source changed while decoding, superseded by a newer cache), 404/422
-    (no such Track / cannot be refreshed). A longer Track is refreshed by one detached, niced
-    process: 202 (started), or 409 when another long refresh or this Track's refresh is running.
-    Every failure keeps the previous cache."""
-    result = authorize(request.user, "library.manage_tracks")
-    if not result:
-        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
-    from library.services import waveform_generation as wg
-    track = get_object_or_404(Track.objects.only("id", "duration_seconds"), pk=pk)
-    long_form = (track.duration_seconds or 0) > wg.SYNC_MAX_SECONDS
-    outcome = wg.start_background(track.pk) if long_form else wg.refresh(track.pk)
-    if outcome.status == wg.STARTED:
-        status = 202
-    elif outcome.ok:
-        status = 200
-    elif outcome.conflict:
-        status = 409
-    elif outcome.status == wg.NOT_FOUND:
-        status = 404
-    else:
-        status = 422
-    return JsonResponse(outcome.to_dict(), status=status)
-
-
 def _cue_marker_state(track):
     """Track Detail's authoritative cue-marker view (Package C): current values and revision, each
     marker's protection/provenance/review state (cue_markers.review) with actor names, and the
@@ -1055,11 +1024,16 @@ def _cue_marker_state(track):
     explanations = {
         waveform_cache.TRUSTED: "Verified for the current audio.",
         waveform_cache.TRUSTED_STALE_MARKERS: "Verified for the current audio (cue points shown are current).",
-        waveform_cache.LEGACY: "Older waveform format: shown for display only. Refresh Waveform Only to enable "
-                               "Reset Cue Points.",
-        waveform_cache.UNVERIFIED_AUDIO: "Not verified for the current audio (the file changed, moved, or could "
-                                         "not be identified). Refresh Waveform Only to re-verify.",
-        waveform_cache.INCOMPLETE: "Incomplete waveform (no stereo samples). Refresh Waveform Only to rebuild it.",
+        waveform_cache.LEGACY: "Older waveform format: shown for display only. Reanalyze Track to rebuild and "
+                               "verify it (locked cue points are kept).",
+        waveform_cache.UNVERIFIED_AUDIO: (
+            "Shown for display, not verified: this file's decoded audio could not be identified (for example a "
+            "damaged or nonstandard stream), so Reanalyze Track cannot verify it. Locked cue points are unaffected; "
+            "Reset Cue Points stays unavailable."
+            if verdict.payload and verdict.payload.get("audio_identity") is None else
+            "Shown for display, not verified: the file changed or moved since this waveform was made. Reanalyze "
+            "Track to re-verify it (locked cue points are kept)."),
+        waveform_cache.INCOMPLETE: "Incomplete waveform (no stereo samples). Reanalyze Track to rebuild it.",
         waveform_cache.MISSING: "No waveform yet.",
     }
     return {
@@ -1071,7 +1045,7 @@ def _cue_marker_state(track):
         "waveform": {"status": verdict.status, "trusted": verdict.trusted, "markers_current": verdict.markers_current,
                      "displayable": verdict.displayable, "reason": verdict.reason,
                      "explanation": explanations.get(verdict.status, "Waveform cache is unusable "
-                                                                     "(Refresh Waveform Only rebuilds it).")},
+                                                                     "(Reanalyze Track rebuilds it).")},
         "repick_available": verdict.trusted,
     }
 
@@ -1125,25 +1099,6 @@ def api_track_cue_markers(request, pk):
     if not outcome.ok:
         return JsonResponse(payload, status=409 if outcome.conflict else 400)
     return JsonResponse(payload)
-
-
-@require_http_methods(["GET"])
-def api_track_refresh_waveform_status(request, pk):
-    """The state of a background Refresh Waveform Only started with ``requested_ns`` (the token the
-    202 response returned): running, completed, failed (with Package B's status) or unknown --
-    never "completed" merely because the process was launched. Requires library.manage_tracks."""
-    result = authorize(request.user, "library.manage_tracks")
-    if not result:
-        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
-    from library.services import waveform_generation as wg
-    track = get_object_or_404(Track.objects.only("id"), pk=pk)
-    requested_ns = wg.valid_request_token(request.GET.get("requested_ns", ""))
-    if requested_ns is None:
-        # Malformed, negative or future tokens never match an operation (r0123 B2).
-        return JsonResponse({"error": "requested_ns must be the token a refresh request returned",
-                             "state": wg.UNKNOWN}, status=400)
-    return JsonResponse({"track_id": track.pk, "requested_ns": requested_ns,
-                         **wg.background_status(track.pk, requested_ns)})
 
 
 def _optional_json(request):
@@ -2548,6 +2503,14 @@ def api_track_reanalyze(request, pk):
     ``override`` with ``"confirm": true``. The manually-set marks (intro,
     sweep, outro, hooks) are never calculated.
 
+    r0124: this is the one waveform action (Refresh Waveform Only was retired). The response says
+    what actually happened, never inferred from the HTTP status: ``outcome`` is ``verified`` (new
+    waveform installed, its decoded audio identified), ``unverified`` (new waveform installed and
+    displayable, audio not identified -- trusted-cache features such as Reset Cue Points stay
+    unavailable) or ``not_regenerated`` (analysis ran but the new cache was not installed; the
+    previous one is kept). ``waveform`` carries the details and the cache's resulting trust state;
+    ``cue_markers`` reports applied, preserved and refused markers.
+
     Roadmap 2.5A: requires library.manage_tracks (see api_track_bulk's
     comment for the reachability gap this closes)."""
     result = authorize(request.user, "library.manage_tracks")
@@ -2588,14 +2551,25 @@ def api_track_reanalyze(request, pk):
     analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True, requested_by=request.user,
                                  override=tuple(override), override_confirmed=body.get("confirm") is True)
     if not analyzed:
-        return JsonResponse({"error": "Analysis failed -- check the file is readable by ffmpeg"}, status=400)
+        return JsonResponse({"error": "Analysis failed -- check the file is readable by ffmpeg"
+                                      + (f" ({analyzed.reason})" if analyzed.reason else ""),
+                             "outcome": "not_regenerated"}, status=400)
 
+    from library.services import waveform_cache
     track.refresh_from_db()
+    verdict = waveform_cache.validate(track)
+    installed = analyzed.waveform_installed
+    waveform = {"regenerated": installed, "error": analyzed.waveform_error,
+                "audio_verified": installed and not analyzed.audio_problem and verdict.trusted,
+                "audio_problem": analyzed.audio_problem, "status": verdict.status, "trusted": verdict.trusted,
+                "displayable": verdict.displayable}
+    outcome = ("not_regenerated" if not installed else "verified" if waveform["audio_verified"] else "unverified")
     markers = analyzed.markers.to_dict() if analyzed.markers else None
     if analyzed.markers and not analyzed.markers.ok and override:
         return JsonResponse({"error": analyzed.markers.conflict or analyzed.markers.error, "cue_markers": markers,
-                             **_track_to_dict(track)}, status=409)
-    return JsonResponse({**_track_to_dict(track), "cue_markers": markers})
+                             "outcome": outcome, "waveform": waveform, **_track_to_dict(track)}, status=409)
+    return JsonResponse({**_track_to_dict(track), "cue_markers": markers, "outcome": outcome,
+                         "waveform": waveform})
 
 
 @require_http_methods(["POST"])

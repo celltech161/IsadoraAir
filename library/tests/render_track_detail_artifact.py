@@ -8,7 +8,7 @@ from these payloads -- no server, database or station data involved.
 import json
 
 from library.models import Track
-from library.services import cue_markers, waveform_generation as wg
+from library.services import cue_markers
 from library.tests.test_waveform_integrity_package_b import _Base
 
 
@@ -20,21 +20,22 @@ class RenderArtifact(_Base):
         client = Client()
         client.force_login(self.user)
         track = self.track(name="Representative Song.flac")
-        wg.refresh(track.pk)                                               # trusted v2 cache
+        self.reanalyze(track)                                              # trusted v2 cache
         current = waveform_cache.current_audio_revision(Track.objects.get(pk=track.pk))
         edit = cue_markers.operator_edit
-        edit(track.pk, expected_revision=0, user=self.user, values={"sweep_start_seconds": 0.6})
-        cue_markers.apply_calculation(track.pk, {"cue_out_seconds": 2.9}, basis_revision=1, media_replaced=True,
+        base = Track.objects.get(pk=track.pk).cue_marker_revision
+        edit(track.pk, expected_revision=base, user=self.user, values={"sweep_start_seconds": 0.6})
+        cue_markers.apply_calculation(track.pk, {"cue_out_seconds": 2.9}, basis_revision=base + 1, media_replaced=True,
                                       audio_revision="f" * 64, source=cue_markers.SOURCE_GENERATED)  # sweep -> review
-        edit(track.pk, expected_revision=2, user=self.user, values={"next_start_seconds": 2.4})      # unverified
-        edit(track.pk, expected_revision=3, user=self.user, values={"intro_until_seconds": 0.9},
+        edit(track.pk, expected_revision=base + 2, user=self.user, values={"next_start_seconds": 2.4})      # unverified
+        edit(track.pk, expected_revision=base + 3, user=self.user, values={"intro_until_seconds": 0.9},
              audio_revision=current)                                                                  # approved
-        edit(track.pk, expected_revision=4, user=self.user, values={"outro_starts_seconds": 2.2},
+        edit(track.pk, expected_revision=base + 4, user=self.user, values={"outro_starts_seconds": 2.2},
              audio_revision="e" * 64)                                                                 # other audio
-        cue_markers.apply_calculation(track.pk, {"hook_in_seconds": 1.0, "hook_out_seconds": 1.6}, basis_revision=5,
+        cue_markers.apply_calculation(track.pk, {"hook_in_seconds": 1.0, "hook_out_seconds": 1.6}, basis_revision=base + 5,
                                       source=cue_markers.SOURCE_GENERATED)                           # auto
-        edit(track.pk, expected_revision=6, user=self.user, approve=["hook_out_seconds"])
-        edit(track.pk, expected_revision=7, user=self.user, unlock=["hook_out_seconds"])              # unlocked
+        edit(track.pk, expected_revision=base + 6, user=self.user, approve=["hook_out_seconds"])
+        edit(track.pk, expected_revision=base + 7, user=self.user, unlock=["hook_out_seconds"])              # unlocked
         page = client.get(f"/track/{track.pk}/").content.decode()
         state = client.get(f"/api/tracks/{track.pk}/cue-markers/").content.decode()
         wave = client.get(f"/api/waveform/{track.pk}/").content.decode()

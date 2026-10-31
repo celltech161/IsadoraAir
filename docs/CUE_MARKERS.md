@@ -1,4 +1,4 @@
-# Cue markers: authority, protection and waveform-cache trust (r0123 Packages A–C)
+# Cue markers: authority, protection and waveform-cache trust (r0123, simplified in r0124)
 
 Roadmap 1.21. A Track's eight cue markers -- Cue In, Cue Out, Next Start, Intro, Outro,
 Hook In, Hook Out and Segue -- are changed in one place, `library/services/cue_markers.py`.
@@ -157,7 +157,7 @@ An audio revision is the SHA-256 of a file's **decoded** audio in one canonical 
   at the same size and path.
 * **Never used as identity:** file names, sizes, times, Track ids and `Track.file_hash`.
 * **ffmpeg upgrades:** an upgrade that alters a decoder's output changes identities. Caches
-  then fail closed and need a refresh.
+  then fail closed until the Track is reanalyzed.
 
 Cost:
 
@@ -212,9 +212,9 @@ Version 2 adds the following to the legacy fields, which are kept for existing r
 Short clips are valid. **Trust re-verification** costs one `stat`: the identity was computed
 from the file the witness describes. The kernel-maintained `ctime` changes on every write,
 rename, tag edit or metadata change, and no ordinary tool can set it back. Any difference
-makes the cache `unverified_audio` until a decode re-establishes the identity: a refresh or
-an analysis. A recategorization moves the file, so it also needs a refresh before the next
-Repick. That's a deliberate, fail-closed cost.
+makes the cache `unverified_audio` until a decode re-establishes the identity: Reanalyze Track
+or automatic analysis. A recategorization moves the file, so it also needs a reanalysis before
+the next Repick. That's a deliberate, fail-closed cost.
 
 Readers: `/api/waveform/<id>/` serves any readable cache for display, as before. Its marker
 fields (`cue_in_seconds`, `next_start`, `markers`, `marker_revision`) are always the
@@ -228,7 +228,7 @@ its incident checks and short-clip exclusions are kept.
 Every replacement or removal of a cache file goes through `waveform_cache`:
 
 * `promote(track_id, payload, dir, expected_source=…)`: used by analysis (every
-  `analyze_one_track` path) and by Refresh Waveform Only.
+  `analyze_one_track` path, including Reanalyze Track).
 * `install_file`: weather publication and Active Messages playout, which analyze into a
   private scratch directory first.
 * `restore_file` and `remove`: the announcement renderer's rotation-asset rollback, plus
@@ -271,92 +271,68 @@ promotes.
 fails, the database stays authoritative and the previous cache remains. That cache is either
 untrusted for the new audio (its witness no longer matches) or a trusted cache of the same
 audio whose marker snapshot is merely stale. Both are detectable, neither authorizes Repick on
-other audio, and Refresh Waveform Only or the next analysis repairs it. Analysis applies
+other audio, and the next analysis (Reanalyze Track) repairs it. Analysis applies
 nothing if the source file changes while it decodes; a rename between its decodes (a
 recategorization) keeps the same inode, size and mtime, so it counts as the same source. No
 trusted cache can result without an identity, with an identity whose length disagrees with
 the envelope, or with empty stereo samples: those are stored as untrusted v2 caches
 (`unverified_audio` or `incomplete`).
 
-## Refresh Waveform Only (Package B)
+## Reanalyze Track: the one waveform action (r0124)
 
-`POST /api/tracks/<id>/refresh-waveform/` requires `library.manage_tracks` (normal session and
-CSRF conventions). `manage.py refresh_waveform <id>` does the same for operators, one Track at
-a time; there is no bulk mode, and nothing runs at installation. Both regenerate the cache
-from the Track's current file with the analyzer's own decode and compute primitives and the
-current AnalysisConfig, and promote it as a trusted v2 cache.
+r0123 also shipped a separate **Refresh Waveform Only** action. r0124 retired it, along with its
+API, its background process, the `refresh_waveform` command and its status polling. The
+operator workflow is now:
 
-**What it never changes:**
+1. Set or adjust cue markers (typed values or waveform clicks), then **Save Changes**.
+2. **Lock** the markers whose values must be preserved.
+3. Run **Reanalyze Track**.
+4. Review the regenerated waveform and any recalculated, unlocked markers.
+5. Approve, lock or unlock markers as needed.
 
-* any Track column: markers, their state and revision, `waveform_path`, duration,
-  Ready-to-Air, artist, category or relations;
-* play, schedule or as-run records;
-* the source file's bytes, tags or format. A WAV or AIF stays WAV or AIF, because the refresh
-  never calls `analyze_one_track` or `transcode_lossless_to_flac`.
+**What Reanalyze Track does.** It is the existing analyzer (`analyze_one_track`), with its ffmpeg
+commands, decoding tolerance, category thresholds, related-artist discovery, duration update and
+established lossless (WAV/AIF→FLAC) conversion all unchanged.
 
-It performs no database write at all.
+* It regenerates the waveform and recalculates only Cue In and Next Start.
+* The calculated values reach the Track only through the cue-marker authority:
+  * locked, needs-review and historical markers keep their values, and their approvals and
+    history are untouched;
+  * the other six markers are never calculated;
+  * a marker edited while the analysis runs wins, and the stale calculation is discarded.
+* Ordinary Reanalyze never overrides a locked marker. To let analysis recalculate one, unlock
+  it first; there is no need to unlock anything just to regenerate the waveform.
+* The page refuses to reanalyze while the form holds unsaved cue-point edits.
 
-**Races:**
+**What it reports.** A 200 response is not itself proof of a new waveform. The response states
+the facts:
 
-* The source witness is taken before decoding and must be unchanged afterwards and at
-  promotion. If it changes, the result is `source_changed` (409).
-* A marker edit made during the refresh is never overwritten; the cache simply snapshots the
-  current markers at promotion.
-* A refresh already running for the Track gives `busy` (409).
-* A newer analysis that promoted first wins, giving `superseded` (409).
+* `outcome` is one of:
+  * `verified`: the new waveform is installed and its decoded audio is identified;
+  * `unverified`: the new waveform is installed and displayed, but the audio could not be
+    identified;
+  * `not_regenerated`: the analysis ran but the new cache was not installed, and the previous
+    waveform is kept. A file that does not decode at all gets 400 with the same outcome.
+* `waveform`: `regenerated`, `error`, `audio_verified`, `audio_problem`, and the cache's
+  resulting `status` / `trusted` / `displayable`.
+* `cue_markers`: the markers changed, the markers kept with the protection that kept them, and
+  any conflict or refusal.
 
-Every failure keeps the previous cache.
+The page shows the waveform result and the cue-point result separately, so a safely refused
+calculation is not reported as a failed reanalysis.
 
-**Response:** `track_id`, `status`, `detail`, `replaced`, `previous_cache_retained`, `ok`,
-`conflict`, and `old`/`new` objects, each with `status`, `audio_revision`, `started_ns` and
-`trusted`.
-
-**Statuses:** 200 `replaced`; 409 `busy`, `source_changed` or `superseded`; 404
-`not_found`; 422 `not_analyzed`, `noncanonical_cache_path`, `source_missing`, `decode_failed`,
-`audio_unidentifiable`, `too_long`, `resource_limit` or `failed`.
-
-**Resource limits (r0123 B3).** These apply to Refresh Waveform Only; ordinary analysis is
-unchanged. They are enforced while decoding:
-
-* **Duration:** up to **6 hours**, `MAX_REFRESH_SECONDS`, which is above the stations' longest
-  syndicated or specialty programmes. A longer Track is refused with `too_long` before anything
-  is decoded or spawned.
-* **Memory:** each ffmpeg decode is read through a byte cap.
-  * The cap is the PCM the Track's recorded duration can produce, plus 5 % and 60 s of slack,
-    at the configured analysis rate. A Track with no recorded duration is capped at the 6-hour
-    bound.
-  * No single decode may exceed the **512 MiB** budget (`PCM_BUDGET_BYTES`).
-  * The mono buffer is released before the stereo decode, so peak PCM is one stereo buffer:
-    about 61 MiB per hour at the default 4410 Hz, or about 0.36 GiB for 6 hours.
-  * A Track whose recorded duration would need more than the budget at the current rate (for
-    example 2 hours at 22050 Hz) is refused with `resource_limit` before decoding.
-  * Media that decodes to more than its cap (misleading or missing duration metadata, malformed
-    files) is stopped at the cap with `resource_limit`.
-* **Time:** each decode, including the audio-identity decode, is killed after
-  120 s + 0.1 s per second of audio: 144 s for 4 minutes, about 38 minutes for 6 hours. The
-  result is `resource_limit`.
-* **On failure:** any limit failure kills and reaps the decoder and promotes nothing. It leaves
-  the previous cache, every Track column and the source untouched, releases the locks, and is
-  recorded as the request's outcome.
-* **Residual exposure:** the Python envelope computation over an already-capped buffer. It is
-  bounded in size, but not separately time-limited.
-
-**Bounded execution:**
-
-* **Up to 900 s of audio:** refreshed within the request, about 3 s per 4-minute song on the
-  development host. That keeps it well inside gunicorn's 30 s sync-worker timeout.
-* **Longer Tracks (long-form programmes):** return 202 `started`. One detached,
-  `nice`-ed `manage.py refresh_waveform --background` process does the work. It inherits two
-  locks: the station-wide background slot (one long refresh at a time) and the Track's
-  refresh lock. A second request gets 409. The process records its outcome as a SystemEvent.
-  It can't block the engine (a separate process), and a service restart that kills it leaves
-  the previous cache, because promotion is atomic.
+**Displayable vs verified.** Some playable files cannot be verified: the analyzer decodes them,
+but the stricter decoded-audio identity cannot be established (KOGR Track 35884 is one, with
+"invalid sync code"). Their waveform is regenerated and shown, labelled as not verified.
+Protected cue points are unaffected, and trusted-cache features (Reset Cue Points) stay
+unavailable. Reanalyzing again does not change that. The identity rule is deliberately not
+relaxed, and `Track.file_hash` is never used in its place.
 
 ## The incident caches (2026-10-29)
 
 The 165 repaired Track caches and 7 retained orphans are legacy, unversioned files. They stay
-displayable and untrusted until an operator chooses to refresh selected Tracks. Nothing in
-r0123 regenerates, migrates or deletes caches on its own.
+displayable and untrusted until an operator chooses to reanalyze selected Tracks (locked cue
+points are kept). Nothing in r0123/r0124 regenerates, migrates or deletes caches on its own.
 
 ## Track Detail controls (Package C)
 
@@ -413,57 +389,36 @@ The page sends only the markers the operator changed, with the revision it loade
 * **Waveform clicks** in *Seek only* mode only seek. Selecting a cue name and clicking only fills
   that input. Nothing is sent until Save Changes.
 
-### Refresh Waveform Only
+### Reanalyze Track
 
-The button sits beside Reanalyze, with an explanation of the difference.
+The button sits with the analysis controls, with a one-line explanation. Its status line reports
+the waveform result (regenerated and verified, regenerated but not verified, or not regenerated)
+and the cue-point result (updated, kept with the reason, or not applied because of a concurrent
+change). See *Reanalyze Track: the one waveform action* above.
 
-* **200:** the waveform and the cue state are reloaded. Unsaved marker edits are untouched.
-* **202 `started` (long-form):** the page polls
-  `GET /api/tracks/<id>/refresh-waveform/status/?requested_ns=<token>` every 3 s, for up to
-  20 minutes. The pending token survives a reload (`sessionStorage`).
+## Field acceptance checklist (KOGR and WRJE, after r0124 installation)
 
-The status endpoint reports, and is never "completed" merely because the process launched:
-
-Every status answer is about exactly one request, identified by its token (r0123 B2):
-
-* `running`: this request's own lock (`<WAVEFORMS_DIR>/.locks/<id>.refresh.<token>.lock`) is
-  held by a live process. The parent creates the lock; the child holds it until it has recorded
-  its outcome, then removes it. Another refresh of the same Track never makes this request
-  "running".
-* `completed` / `failed` (with Package B's status): from the outcome this request's process
-  recorded, under a SystemEvent dedupe key unique to the Track and the token. If the process died
-  after promotion but before recording, the cache counts as completion evidence only when its
-  `generation.request` equals this token *exactly*. A later refresh, another Track's refresh, or
-  any timestamp comparison can never complete it.
-* `unknown`: none of that is true, for example after a restart. The previous waveform is kept.
-
-Tokens are positive integers that are not from the future. Anything else (malformed, negative,
-future or padded) gets 400 with `state: unknown`, and the page stops polling and says the
-result is unknown.
-
-## Field acceptance checklist (KOGR and WRJE, after r0123 installation)
-
-Use controlled, non-airing test assets wherever a step changes anything. Never refresh the
+Use controlled, non-airing test assets wherever a step changes anything. Never reanalyze the
 repaired incident caches in bulk, and leave the seven orphan files untouched.
 
 1. Open representative Tracks (music, a generated asset, a long-form programme). Check all eight
-   badges and the history entries.
+   badges and the history entries, and that Track Detail offers no Refresh Waveform Only button.
 2. Open several of the 165 repaired-cache Tracks, including **Track 1343**. Each waveform should
    display and show "Older waveform format…", and Reset Cue Points should be unavailable with
-   an explanation. Do not refresh them in bulk.
+   an explanation. Do not reanalyze them in bulk.
 3. Open a legitimate short recording (a few seconds): the waveform displays correctly.
-4. On a controlled test asset: Refresh Waveform Only, then lock one marker. It should show
-   **Approved**.
-5. Unlock Cue In and keep Next Start locked, then use Reset Cue Points. Cue In is recalculated
-   and Next Start survives.
+4. On a controlled test asset: lock Cue In and Next Start, then Reanalyze Track. The waveform
+   regenerates, the status line says whether it is verified, and both values are unchanged.
+5. Unlock Cue In and keep Next Start locked, then Reanalyze Track (or use Reset Cue Points on a
+   verified waveform). Cue In is recalculated and Next Start survives.
 6. Change only the title and save. No badge, history entry or cue value changes.
-7. On a controlled test Track, record the file's checksum and modification time and the Track
-   row, then use Refresh Waveform Only. All of them should be unchanged.
+7. On a controlled test asset whose audio cannot be verified (KOGR Track 35884 is the known
+   example; inspect it read-only, do not modify it), Reanalyze Track should report "regenerated
+   … could not be verified" and leave locked cue points unchanged.
 8. On a controlled test asset with an approved marker, replace the media through its normal
    publishing path. The marker should show **⚠ Needs review · audio replaced** with its earlier
    approval, and Ready-to-Air should be unchanged.
-9. On an authorized non-airing long-form asset over 15 minutes: Refresh Waveform Only should
-   report "Started in the background", then the progress state, then "Waveform rebuilt". Reload
-   mid-way and confirm polling resumes without claiming success.
+9. Reanalyze Track twice on the same test asset: locks, values and history do not change the
+   second time.
 10. Check Track Detail on a desktop browser and on a phone: readable rows, no clipped controls,
     and keyboard operation of the lock buttons and dialogs.

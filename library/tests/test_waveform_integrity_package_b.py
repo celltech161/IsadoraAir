@@ -1,5 +1,6 @@
 """r0123 Package B: decoded-audio identity, trusted version-2 waveform caches, the shared atomic
-cache writer, Refresh Waveform Only, approvals across audio revisions and trusted Repick.
+cache writer, approvals across audio revisions and trusted Repick. (r0124: Refresh Waveform Only was
+retired; trusted caches come from reanalysis, as on a station.)
 
 Real audio is generated with ffmpeg into per-test temporary directories, and WAVEFORMS_DIR points
 at one of them; no station media, waveform, database or service is touched (the suite runs only
@@ -19,8 +20,8 @@ from django.contrib.auth.models import User
 from django.test import Client, TestCase, override_settings
 
 from library.management.commands import analyze_tracks, check_waveform_integrity
-from library.models import Artist, Category, CategoryKind, PlayEvent, Track
-from library.services import audio_identity, cue_markers, waveform_cache, waveform_generation as wg
+from library.models import Artist, Category, CategoryKind, Track
+from library.services import audio_identity, cue_markers, waveform_cache
 
 M = cue_markers.MARKERS
 #: quiet 0-0.5 s, a tone to 2.5 s, quiet to 3 s: Cue In ~0.5 s and Next Start ~2.5 s by detection
@@ -72,6 +73,19 @@ class _Base(TestCase):
             (self.waves / f"{track.pk}.json").write_text(json.dumps(legacy))
             Track.objects.filter(pk=track.pk).update(waveform_path=str(self.waves / f"{track.pk}.json"))
         return Track.objects.get(pk=track.pk)
+
+    CFG = (4410, 0.05, 1000, -26.0, -45.0, 0.1)
+
+    def reanalyze(self, track, **kwargs):
+        """Reanalyze the Track's real file as the station does (r0124: the one way to rebuild a
+        waveform), producing a version-2 cache; trusted when its decoded audio is identified."""
+        track = Track.objects.get(pk=track.pk)
+        row = (track.pk, track.filepath, track.filename, track.duration_seconds, track.title, "A",
+               track.related_artists)
+        with patch.object(analyze_tracks, "emit_event"):
+            outcome = analyze_tracks.analyze_one_track(row, self.CFG, self.waves, force=True, **kwargs)
+        self.assertTrue(outcome, outcome.reason)
+        return outcome
 
     def cache(self, track):
         return self.waves / f"{track.pk}.json"
@@ -144,10 +158,9 @@ class AudioIdentityTests(_Base):
 # ------------------------------------------------------------------ cache format
 
 class CacheFormatTests(_Base):
-    def refreshed(self, **audio):
+    def reanalyzed(self, **audio):
         track = self.track(**audio)
-        result = wg.refresh(track.pk)
-        self.assertEqual(result.status, wg.REPLACED, result.detail)
+        self.assertTrue(self.reanalyze(track).waveform_installed)
         return Track.objects.get(pk=track.pk), json.loads(self.cache(track).read_text())
 
     def check(self, track, payload):
@@ -155,8 +168,8 @@ class CacheFormatTests(_Base):
         path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
         return waveform_cache.validate(track, path)
 
-    def test_a_refreshed_cache_is_a_valid_trusted_version_2_cache(self):
-        track, payload = self.refreshed()
+    def test_a_reanalyzed_cache_is_a_valid_trusted_version_2_cache(self):
+        track, payload = self.reanalyzed()
         self.assertEqual((payload["schema"], payload["schema_version"], payload["track_id"]),
                          (waveform_cache.SCHEMA, 2, track.pk))
         for key in ("audio_identity", "source", "analysis", "generation", "markers", "marker_revision",
@@ -167,7 +180,7 @@ class CacheFormatTests(_Base):
                          [])                                       # the incident checker accepts it as is
 
     def test_every_invalid_variant_is_refused_trust(self):
-        track, good = self.refreshed()
+        track, good = self.reanalyzed()
         variants = {
             "wrong track": (good | {"track_id": track.pk + 1}, waveform_cache.WRONG_TRACK),
             "unsupported version": (good | {"schema_version": 3}, waveform_cache.UNSUPPORTED),
@@ -205,11 +218,11 @@ class CacheFormatTests(_Base):
                 self.assertFalse(verdict.trusted)
 
     def test_a_legitimately_short_recording_is_trusted(self):
-        track, _ = self.refreshed(name="short.flac", seconds=0.4, shaped=False)
+        track, _ = self.reanalyzed(name="short.flac", seconds=0.4, shaped=False)
         self.assertTrue(self.verdict(track).trusted)
 
     def test_a_stale_marker_snapshot_keeps_the_waveform_trusted_and_readers_get_database_markers(self):
-        track, _ = self.refreshed()
+        track, _ = self.reanalyzed()
         cue_markers.operator_edit(track.pk, expected_revision=track.cue_marker_revision, user=self.user,
                                   values={"hook_in_seconds": 1.0})
         self.assertEqual(self.verdict(track).status, waveform_cache.TRUSTED_STALE_MARKERS)
@@ -217,12 +230,13 @@ class CacheFormatTests(_Base):
         client = Client()
         client.force_login(self.user)
         body = client.get(f"/api/waveform/{track.pk}/").json()
-        self.assertEqual((body["markers"]["hook_in_seconds"], body["marker_revision"]), (1.0, 1))
+        self.assertEqual((body["markers"]["hook_in_seconds"], body["marker_revision"]),
+                         (1.0, track.cue_marker_revision + 1))
         self.assertEqual((body["trust"]["trusted"], body["trust"]["markers_current"]), (True, False))
         self.assertNotIn("source", body)
 
     def test_older_or_unverified_audio_is_distinguished_from_stale_markers(self):
-        track, _ = self.refreshed()
+        track, _ = self.reanalyzed()
         os.utime(track.filepath, ns=(time.time_ns(), time.time_ns()))      # touched: needs re-verification
         self.assertEqual(self.verdict(track).status, waveform_cache.UNVERIFIED_AUDIO)
         legacy = self.track(name="legacy.flac")
@@ -427,156 +441,9 @@ class PromotionTests(_Base):
         rollback.unlink()
 
 
-# ------------------------------------------------------------------ Refresh Waveform Only
-
-class RefreshTests(_Base):
-    def test_refresh_changes_no_track_column_and_no_source_byte_tag_or_format(self):
-        from mutagen.flac import FLAC
-        track = self.track()
-        tags = FLAC(track.filepath)
-        tags["title"] = "Keep My Tag"
-        tags.save()
-        cue_markers.operator_edit(track.pk, expected_revision=0, user=self.user,
-                                  values={"intro_until_seconds": 1.0, "hook_in_seconds": 1.5, "hook_out_seconds": 2.0})
-        cue_markers.operator_edit(track.pk, expected_revision=1, user=self.user, unlock=["hook_out_seconds"])
-        track.additional_categories.add(self.category)
-        PlayEvent_count = PlayEvent.objects.count()
-        before_row, before_sha = self.full_row(track), _sha(track.filepath)
-        before_stat = os.stat(track.filepath)
-        before_tags = dict(FLAC(track.filepath).tags)
-        result = wg.refresh(track.pk)
-        self.assertEqual(result.status, wg.REPLACED, result.detail)
-        self.assertEqual(self.full_row(track), before_row)                  # the WHOLE row, not just markers
-        self.assertEqual(_sha(track.filepath), before_sha)
-        after_stat = os.stat(track.filepath)
-        self.assertEqual((after_stat.st_mtime_ns, after_stat.st_ino), (before_stat.st_mtime_ns, before_stat.st_ino))
-        self.assertEqual(dict(FLAC(track.filepath).tags), before_tags)
-        self.assertEqual(PlayEvent.objects.count(), PlayEvent_count)
-        self.assertEqual(self.verdict(track).status, waveform_cache.TRUSTED)
-
-    def test_wav_and_aif_sources_stay_unconverted(self):
-        for name in ("plain.wav", "plain.aif"):
-            with self.subTest(name):
-                track = self.track(name=name)
-                before = (self.full_row(track), _sha(track.filepath), sorted(os.listdir(self.media)))
-                result = wg.refresh(track.pk)
-                self.assertEqual(result.status, wg.REPLACED, result.detail)
-                self.assertEqual((self.full_row(track), _sha(track.filepath), sorted(os.listdir(self.media))), before)
-                self.assertTrue(Path(track.filepath).exists())
-                self.assertTrue(self.verdict(track).trusted)
-
-    def test_a_failed_refresh_keeps_the_previous_cache(self):
-        track = self.track()
-        old = self.cache(track).read_bytes()
-        Path(track.filepath).write_bytes(b"no longer audio " * 200)
-        self.assertEqual(wg.refresh(track.pk).status, wg.DECODE_FAILED)
-        Path(track.filepath).unlink()
-        self.assertEqual(wg.refresh(track.pk).status, wg.SOURCE_MISSING)
-        self.assertEqual(self.cache(track).read_bytes(), old)
-        never = self.track(name="never.flac", analyzed=False)
-        self.assertEqual(wg.refresh(never.pk).status, wg.NOT_ANALYZED)
-        self.assertFalse(self.cache(never).exists())
-
-    def during_measure(self, action):
-        real = wg.measure
-
-        def measure(path, settings, *limits):            # limits: r0123 B3's bounded decoding
-            values = real(path, settings, *limits)
-            action()
-            return values
-        return patch.object(wg, "measure", side_effect=measure)
-
-    def test_a_marker_edit_during_refresh_is_kept_and_the_cache_snapshot_is_current(self):
-        track = self.track()
-        with self.during_measure(lambda: cue_markers.operator_edit(
-                track.pk, expected_revision=0, user=self.user, values={"hook_in_seconds": 0.9})):
-            result = wg.refresh(track.pk)
-        self.assertEqual(result.status, wg.REPLACED, result.detail)
-        row = _row(track.pk)
-        self.assertEqual((row["hook_in_seconds"], row["cue_marker_revision"]), (0.9, 1))
-        payload = json.loads(self.cache(track).read_text())
-        self.assertEqual((payload["markers"]["hook_in_seconds"], payload["marker_revision"]), (0.9, 1))
-        self.assertEqual(self.verdict(track).status, waveform_cache.TRUSTED)
-
-    def test_a_source_replaced_during_refresh_aborts_and_keeps_the_previous_cache(self):
-        track = self.track()
-        old = self.cache(track).read_bytes()
-        with self.during_measure(lambda: _audio(Path(track.filepath), freq=880)):
-            result = wg.refresh(track.pk)
-        self.assertEqual((result.status, result.conflict, result.previous_cache_retained),
-                         (wg.SOURCE_CHANGED, True, True))
-        self.assertEqual(self.cache(track).read_bytes(), old)
-
-    def test_concurrent_refreshes_and_a_newer_analysis_never_promote_stale_data(self):
-        track = self.track()
-        fd = waveform_cache.try_operation_lock(self.waves, f"{track.pk}.refresh.lock")
-        try:
-            self.assertEqual(wg.refresh(track.pk).status, wg.BUSY)            # a second refresh of the Track
-        finally:
-            os.close(fd)
-
-        def analyze_meanwhile():
-            row = (track.pk, track.filepath, track.filename, 3.0, track.title, "A", "")
-            cfg = (4410, 0.05, 1000, -26.0, -45.0, 0.1)
-            with patch.object(analyze_tracks, "emit_event"):
-                self.assertTrue(analyze_tracks.analyze_one_track(row, cfg, self.waves, force=True))
-        with self.during_measure(analyze_meanwhile):
-            result = wg.refresh(track.pk)
-        self.assertEqual((result.status, result.conflict), (wg.SUPERSEDED, True))
-        self.assertEqual(json.loads(self.cache(track).read_text())["generation"]["writer"], "analysis")
-        self.assertTrue(self.verdict(track).trusted)
-
-    def test_the_endpoint_contract_capability_and_bounded_long_form_path(self):
-        track = self.track()
-        client = Client()
-        client.force_login(User.objects.create_user("listener", password="pw"))
-        self.assertEqual(client.post(f"/api/tracks/{track.pk}/refresh-waveform/").status_code, 403)
-        client.force_login(self.user)
-        response = client.post(f"/api/tracks/{track.pk}/refresh-waveform/")
-        self.assertEqual(response.status_code, 200, response.content)
-        body = response.json()
-        self.assertEqual((body["track_id"], body["status"], body["replaced"], body["previous_cache_retained"]),
-                         (track.pk, "replaced", True, False))
-        self.assertEqual((body["old"]["status"], body["new"]["status"], body["new"]["trusted"]),
-                         ("legacy", "trusted", True))
-        self.assertEqual(client.get(f"/api/tracks/{track.pk}/refresh-waveform/").status_code, 405)
-
-        long_form = self.track(name="programme.flac")
-        Track.objects.filter(pk=long_form.pk).update(duration_seconds=wg.SYNC_MAX_SECONDS + 1)
-        with patch.object(wg.subprocess, "Popen") as popen:
-            response = client.post(f"/api/tracks/{long_form.pk}/refresh-waveform/")
-        self.assertEqual(response.status_code, 202, response.content)
-        command = popen.call_args.args[0]
-        self.assertEqual(command[2:5], ["refresh_waveform", str(long_form.pk), "--background"])
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 3)   # operation, slot and request locks (B2)
-        slot = waveform_cache.try_operation_lock(self.waves, wg.BACKGROUND_SLOT_LOCK)   # one long refresh at a time
-        try:
-            with patch.object(wg.subprocess, "Popen") as popen:
-                self.assertEqual(client.post(f"/api/tracks/{long_form.pk}/refresh-waveform/").status_code, 409)
-            popen.assert_not_called()
-        finally:
-            os.close(slot)
-
-    def test_the_background_command_runs_one_track_and_releases_its_locks(self):
-        from django.core.management import call_command
-        track = self.track()
-        operation = waveform_cache.try_operation_lock(self.waves, f"{track.pk}.refresh.lock")
-        slot = waveform_cache.try_operation_lock(self.waves, wg.BACKGROUND_SLOT_LOCK)
-        from io import StringIO
-        with patch("os.nice"):
-            call_command("refresh_waveform", str(track.pk), "--background", "--operation-lock-fd", str(operation),
-                         "--slot-lock-fd", str(slot), stdout=StringIO())
-        self.assertTrue(self.verdict(track).trusted)
-        os.close(waveform_cache.try_operation_lock(self.waves, wg.BACKGROUND_SLOT_LOCK))     # released
-        os.close(waveform_cache.try_operation_lock(self.waves, f"{track.pk}.refresh.lock"))
-
-
 # ------------------------------------------------------------------ analysis
 
 class AnalyzerTests(_Base):
-    CFG = (4410, 0.05, 1000, -26.0, -45.0, 0.1)
-
     def analyze(self, track, **kwargs):
         row = (track.pk, track.filepath, track.filename, track.duration_seconds, track.title, "A", "")
         with patch.object(analyze_tracks, "emit_event"):
@@ -611,11 +478,12 @@ class AnalyzerTests(_Base):
 class ApprovalRevisionTests(_Base):
     def approved(self):
         track = self.track()
-        wg.refresh(track.pk)
+        self.reanalyze(track)
         track = Track.objects.get(pk=track.pk)
         revision = waveform_cache.current_audio_revision(track)
         self.assertIsNotNone(revision)
-        result = cue_markers.operator_edit(track.pk, expected_revision=0, user=self.user, audio_revision=revision,
+        result = cue_markers.operator_edit(track.pk, expected_revision=track.cue_marker_revision, user=self.user,
+                                           audio_revision=revision,
                                            values={"next_start_seconds": 2.0, "hook_in_seconds": 1.0})
         self.assertTrue(result.ok)
         return Track.objects.get(pk=track.pk), revision
@@ -629,7 +497,8 @@ class ApprovalRevisionTests(_Base):
 
     def test_new_audio_retires_approvals_durably_without_touching_readiness(self):
         track, revision = self.approved()
-        result = cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.4}, basis_revision=1,
+        rev = track.cue_marker_revision
+        result = cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.4}, basis_revision=rev,
                                                media_replaced=True, audio_revision="b" * 64)
         self.assertEqual((result.superseded, result.review), ({"next_start_seconds": "locked"}, ["hook_in_seconds"]))
         state = _row(track.pk)["cue_marker_state"]
@@ -643,10 +512,10 @@ class ApprovalRevisionTests(_Base):
         self.assertEqual(cue_markers.review(row, "b" * 64)["hook_in_seconds"]["audio"], "previous")
         self.assertTrue(Track.objects.get(pk=track.pk).ready2air)
         # A review marker is still protected from automatic analysis ...
-        later = cue_markers.apply_calculation(track.pk, {"hook_in_seconds": 0.2}, basis_revision=2)
+        later = cue_markers.apply_calculation(track.pk, {"hook_in_seconds": 0.2}, basis_revision=rev + 1)
         self.assertEqual(later.preserved, {"hook_in_seconds": "review"})
         # ... and an operator's approval of the current audio resolves it.
-        cue_markers.operator_edit(track.pk, expected_revision=2, user=self.user, approve=["hook_in_seconds"],
+        cue_markers.operator_edit(track.pk, expected_revision=rev + 1, user=self.user, approve=["hook_in_seconds"],
                                   audio_revision="b" * 64)
         hook = _row(track.pk)["cue_marker_state"]["hook_in_seconds"]
         # Package C: the retired approval stays as history after the operator resolves the review.
@@ -655,7 +524,8 @@ class ApprovalRevisionTests(_Base):
 
     def test_the_same_decoded_audio_republished_keeps_its_approvals(self):
         track, revision = self.approved()
-        result = cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.4}, basis_revision=1,
+        result = cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.4},
+                                               basis_revision=track.cue_marker_revision,
                                                media_replaced=True, audio_revision=revision)
         self.assertEqual((result.superseded, result.review, result.preserved),
                          ({}, [], {"next_start_seconds": "locked"}))
@@ -703,12 +573,17 @@ class TrustedRepickTests(_Base):
         self.client = Client()
         self.client.force_login(self.user)
 
-    def test_refresh_then_repick_recalculates_eligible_markers_and_keeps_protected_ones(self):
+    def test_reanalyze_then_repick_recalculates_eligible_markers_and_keeps_protected_ones(self):
         track = self.track()
         cue_markers.operator_edit(track.pk, expected_revision=0, user=self.user, unlock=["cue_in_seconds"],
                                   values={"next_start_seconds": 2.0})                     # locked by the operator
         self.assertEqual(self.client.post(f"/api/tracks/{track.pk}/repick-cue-points/").status_code, 409)  # legacy
-        self.assertEqual(self.client.post(f"/api/tracks/{track.pk}/refresh-waveform/").status_code, 200)
+        reanalyzed = self.client.post(f"/api/tracks/{track.pk}/reanalyze/")       # r0124: the one waveform action
+        self.assertEqual((reanalyzed.status_code, reanalyzed.json()["outcome"]), (200, "verified"))
+        self.assertEqual(_row(track.pk)["next_start_seconds"], 2.0)                # kept by reanalysis too
+        rev = _row(track.pk)["cue_marker_revision"]
+        cue_markers.apply_calculation(track.pk, {"cue_in_seconds": 0.0}, basis_revision=rev,
+                                      source=cue_markers.SOURCE_GENERATED)      # give Repick something to do
         response = self.client.post(f"/api/tracks/{track.pk}/repick-cue-points/")
         self.assertEqual(response.status_code, 200, response.content)
         markers = response.json()["cue_markers"]
@@ -721,10 +596,13 @@ class TrustedRepickTests(_Base):
     def test_category_repick_uses_trusted_members_and_reports_the_rest(self):
         trusted = self.track(name="trusted.flac")
         cue_markers.operator_edit(trusted.pk, expected_revision=0, user=self.user, unlock=["cue_in_seconds"])
-        wg.refresh(trusted.pk)
+        self.reanalyze(trusted)
+        cue_markers.apply_calculation(trusted.pk, {"cue_in_seconds": 0.0},
+                                      basis_revision=_row(trusted.pk)["cue_marker_revision"],
+                                      source=cue_markers.SOURCE_GENERATED)
         legacy = self.track(name="legacy.flac")                          # Next Start NULL, legacy cache
         touched = self.track(name="touched.flac")
-        wg.refresh(touched.pk)
+        self.reanalyze(touched)
         os.utime(touched.filepath, ns=(1, 1))
         before = {t.pk: _row(t.pk) for t in (legacy, touched)}
         body = self.client.post(f"/api/categories/{self.category.pk}/repick-cue-points/").json()
@@ -737,9 +615,10 @@ class TrustedRepickTests(_Base):
     def test_a_stale_revision_conflicts_safely(self):
         from library.views import _category_thresholds, _repick_track
         track = self.track()
-        wg.refresh(track.pk)
+        self.reanalyze(track)
         stale = Track.objects.get(pk=track.pk)
-        cue_markers.operator_edit(track.pk, expected_revision=0, user=self.user, values={"hook_in_seconds": 1.0})
+        cue_markers.operator_edit(track.pk, expected_revision=stale.cue_marker_revision, user=self.user,
+                                  values={"hook_in_seconds": 1.0})
         outcome = _repick_track(stale, _category_thresholds(self.category), requested_by=self.user)
         self.assertEqual((outcome["ok"], outcome["status"]), (False, 409))
-        self.assertEqual(_row(track.pk)["cue_marker_revision"], 1)
+        self.assertEqual(_row(track.pk)["cue_marker_revision"], stale.cue_marker_revision + 1)

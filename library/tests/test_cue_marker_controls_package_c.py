@@ -1,6 +1,6 @@
 """r0123 Package C: Track Detail cue-marker controls -- the state/action endpoint, server-side
-confirmation of protected replacements, approval history, waveform trust presentation, and the
-Refresh Waveform Only status protocol.
+confirmation of protected replacements, approval history and waveform trust presentation (r0124:
+Refresh Waveform Only was retired; Reanalyze Track is the one waveform action).
 
 Server-side behaviour only: the page's JavaScript is exercised in a browser at field acceptance
 (no browser is available inside the test sandbox). Real audio is generated into per-test
@@ -9,20 +9,17 @@ import errno
 import json
 import os
 import re
-from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
-from django.core.management import call_command
 from django.test import Client, override_settings
 
 from library.models import Category, Track, validate_category_storage_component
-from library.services import audio_identity, cue_markers, waveform_cache, waveform_generation as wg
+from library.services import cue_markers, waveform_cache
 from library.tests.test_waveform_integrity_package_b import _audio, _Base, _row
-from monitoring.models import SystemEvent, emit_event
 
 M = cue_markers.MARKERS
 REPO = Path(__file__).resolve().parents[2]
@@ -61,9 +58,11 @@ class PresentationTests(_Controls):
         self.assertEqual(re.findall(r'data-marker="([a-z_]+)"', html), list(M))
         for name in M:
             self.assertIn(f'<label for="f_{name}">', html)
-        for element in ('id="lockAllBtn"', 'id="unlockAllBtn"', 'id="refreshWaveformBtn"', 'id="cueNotice"',
-                        'role="status"', "without changing cue points, Track metadata, or the source audio"):
+        for element in ('id="lockAllBtn"', 'id="unlockAllBtn"', 'id="reanalyzeBtn"', 'id="reanalyzeStatus"',
+                        'id="cueNotice"', 'role="status"', "Locked and historical cue points keep their values"):
             self.assertIn(element, html)
+        for retired in ("refreshWaveformBtn", "refresh-waveform", "Refresh Waveform Only"):   # r0124
+            self.assertNotIn(retired, html)
 
     def test_every_display_state_is_reported_truthfully(self):
         track = self.track()                                          # historical values, legacy cache
@@ -86,16 +85,18 @@ class PresentationTests(_Controls):
 
     def test_current_other_and_replaced_audio_approvals_do_not_look_alike(self):
         track = self.track()
-        wg.refresh(track.pk)
-        state = self.act(track, {"cue_marker_revision": 0, "approve": ["cue_in_seconds"]})
+        self.reanalyze(track)
+        state = self.act(track, {"cue_marker_revision": _row(track.pk)["cue_marker_revision"],
+                                 "approve": ["cue_in_seconds"]})
         self.assertTrue(state["audio_verified"])
         self.assertEqual(state["cue_marker_review"]["cue_in_seconds"]["display"], "approved")
         self.assertEqual(state["cue_marker_review"]["cue_in_seconds"]["approved_by_name"], self.user.username)
         _audio(Path(track.filepath), freq=500)                        # replaced outside any writer...
-        wg.refresh(track.pk)                                           # ...and re-identified
+        self.reanalyze(track)                                          # ...and re-identified by reanalysis
         info = self.state(track)["cue_marker_review"]["cue_in_seconds"]
         self.assertEqual((info["display"], info["needs_review"]), ("locked_other_audio", True))
-        cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.0}, basis_revision=1, media_replaced=True,
+        cue_markers.apply_calculation(track.pk, {"next_start_seconds": 2.0},
+                                      basis_revision=_row(track.pk)["cue_marker_revision"], media_replaced=True,
                                       audio_revision="d" * 64)       # a writer publishing new media
         info = self.state(track)["cue_marker_review"]["cue_in_seconds"]
         self.assertEqual((info["display"], info["needs_review"]), ("review", True))
@@ -163,17 +164,15 @@ class ActionTests(_Controls):
         self.assertEqual(self.act(track, {"cue_marker_revision": 0, "unlock": ["cue_in_seconds"]}, 409)["conflict"],
                          True)
 
-    def test_unauthorized_users_cannot_change_protection_or_refresh(self):
+    def test_unauthorized_users_cannot_change_protection_or_reanalyze(self):
         track = self.track()
         listener = Client()
         listener.force_login(User.objects.create_user("listener-c", password="pw"))
         for url, body in ((f"/api/tracks/{track.pk}/cue-markers/", {"cue_marker_revision": 0, "action": "lock_all"}),
-                          (f"/api/tracks/{track.pk}/refresh-waveform/", {})):
+                          (f"/api/tracks/{track.pk}/reanalyze/", {})):
             with self.subTest(url):
                 response = listener.post(url, data=json.dumps(body), content_type="application/json")
                 self.assertEqual(response.status_code, 403)
-        self.assertEqual(listener.get(f"/api/tracks/{track.pk}/refresh-waveform/status/?requested_ns=1").status_code,
-                         403)
         self.assertEqual(_row(track.pk)["cue_marker_revision"], 0)
 
 
@@ -471,103 +470,41 @@ class RelocationConsistencyTests(_Controls):
         self.assertEqual(destination.read_bytes(), original)
 
 
-# ------------------------------------------------------------------ waveform trust and refresh
+# ------------------------------------------------------------------ waveform trust and reanalysis
 
-class TrustAndRefreshTests(_Controls):
+class TrustAndReanalyzeTests(_Controls):
     def test_trust_states_and_repick_availability_follow_the_backend(self):
         track = self.track()
         self.assertEqual((self.state(track)["waveform"]["status"], self.state(track)["repick_available"]),
                          ("legacy", False))
-        wg.refresh(track.pk)
+        self.assertIn("Reanalyze Track", self.state(track)["waveform"]["explanation"])
+        self.reanalyze(track)
         self.assertEqual((self.state(track)["waveform"]["status"], self.state(track)["repick_available"]),
                          ("trusted", True))
-        self.act(track, {"cue_marker_revision": 0, "unlock": ["cue_in_seconds"]})
+        self.act(track, {"cue_marker_revision": _row(track.pk)["cue_marker_revision"], "unlock": ["cue_in_seconds"]})
         self.assertEqual((self.state(track)["waveform"]["status"], self.state(track)["repick_available"]),
                          ("trusted_stale_markers", True))
         moved = Path(track.filepath).with_name("moved.flac")
         os.rename(track.filepath, moved)
         Track.objects.filter(pk=track.pk).update(filepath=str(moved), filename=moved.name)
-        self.assertEqual((self.state(track)["waveform"]["status"], self.state(track)["repick_available"]),
-                         ("unverified_audio", False))
+        state = self.state(track)
+        self.assertEqual((state["waveform"]["status"], state["repick_available"]), ("unverified_audio", False))
+        self.assertIn("changed or moved", state["waveform"]["explanation"])
         self.cache(track).write_text("{\"track_id\"")
         state = self.state(track)
         self.assertEqual((state["waveform"]["status"], state["repick_available"]), ("malformed", False))
-        self.assertIn("Refresh Waveform Only", state["waveform"]["explanation"])
+        self.assertIn("Reanalyze Track", state["waveform"]["explanation"])
 
-    def test_a_short_refresh_reports_completion_and_changes_no_marker_state(self):
+    def test_the_refresh_waveform_workflow_is_retired(self):
         track = self.track()
-        cue_markers.operator_edit(track.pk, expected_revision=0, user=self.user, approve=["cue_in_seconds"])
-        before = _row(track.pk)
-        response = self.client.post(f"/api/tracks/{track.pk}/refresh-waveform/")
-        self.assertEqual((response.status_code, response.json()["status"]), (200, "replaced"))
-        self.assertEqual(_row(track.pk), before)
-        self.assertTrue(self.state(track)["repick_available"])
-
-    def long_form(self):
-        track = self.track(name="programme.flac")
-        Track.objects.filter(pk=track.pk).update(duration_seconds=wg.SYNC_MAX_SECONDS + 1)
-        with patch.object(wg.subprocess, "Popen") as popen:
-            response = self.client.post(f"/api/tracks/{track.pk}/refresh-waveform/")
-        self.assertEqual((response.status_code, response.json()["status"]), (202, "started"))
-        requested = response.json()["requested_ns"]
-        self.assertIn(str(requested), popen.call_args.args[0])
-        Track.objects.filter(pk=track.pk).update(duration_seconds=3.0)
-        return track, requested
-
-    def status(self, track, requested):
-        response = self.client.get(f"/api/tracks/{track.pk}/refresh-waveform/status/?requested_ns={requested}")
-        self.assertEqual(response.status_code, 200, response.content)
-        return response.json()
-
-    def test_a_started_refresh_is_never_reported_complete_until_it_is(self):
-        track, requested = self.long_form()
-        # The child would hold this request's own lock while it works (r0123 B2: the Track's
-        # shared refresh lock no longer stands for any particular request).
-        import fcntl
-        fd = os.open(waveform_cache.lock_dir() / wg.request_lock_name(track.pk, requested), os.O_RDONLY)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            self.assertEqual(self.status(track, requested)["state"], "running")
-        finally:
-            os.close(fd)
-        # It ended without recording anything (killed by a restart): uncertain, not success.
-        unknown = self.status(track, requested)
-        self.assertEqual((unknown["state"], unknown["status"]), ("unknown", None))
-        self.assertEqual(self.client.get(f"/api/tracks/{track.pk}/refresh-waveform/status/").status_code, 400)
-
-    def test_the_background_process_records_completion_failure_and_supersession(self):
-        track, requested = self.long_form()
-        operation = waveform_cache.try_operation_lock(self.waves, f"{track.pk}.refresh.lock")
-        slot = waveform_cache.try_operation_lock(self.waves, wg.BACKGROUND_SLOT_LOCK)
-        with patch("os.nice"):
-            call_command("refresh_waveform", str(track.pk), "--background", "--operation-lock-fd", str(operation),
-                         "--slot-lock-fd", str(slot), "--requested-ns", str(requested), stdout=StringIO())
-        done = self.status(track, requested)
-        self.assertEqual((done["state"], done["status"], done["new"]["trusted"]), ("completed", "replaced", True))
-        self.assertTrue(SystemEvent.objects.filter(dedupe_key=wg.outcome_key(track.pk, requested)).exists())
-
-        for status in ("superseded", "source_changed", "failed"):
-            with self.subTest(status):
-                token = requested + {"superseded": 1, "source_changed": 2, "failed": 3}[status]
-                emit_event(category="library", level="warning", title="Waveform refresh did not complete",
-                           dedupe_key=wg.outcome_key(track.pk, token),
-                           detail={"status": status, "detail": "x", "requested_ns": token})
-                outcome = self.status(track, token)
-                self.assertEqual((outcome["state"], outcome["status"]), ("failed", status))
-
-    def test_a_lost_outcome_record_falls_back_to_the_cache_this_refresh_promoted(self):
-        track, requested = self.long_form()
-        # r0123 B2: only a cache carrying exactly this request's token completes it.
-        self.assertEqual(wg.refresh(track.pk).status, wg.REPLACED)    # some other refresh, no token
-        self.assertEqual(self.status(track, requested)["state"], "unknown")
-        self.assertEqual(wg.refresh(track.pk, request_token=requested).status, wg.REPLACED)   # this one, no event
-        self.assertEqual(self.status(track, requested)["state"], "completed")
-        self.assertEqual(self.status(track, requested + 1)["state"], "unknown")
-
-    def test_the_ui_uses_only_the_waveform_only_endpoint_and_never_reanalyzes_as_a_fallback(self):
+        for url in (f"/api/tracks/{track.pk}/refresh-waveform/", f"/api/tracks/{track.pk}/refresh-waveform/status/"):
+            with self.subTest(url):
+                self.assertEqual(self.client.post(url).status_code, 404)
         source = (REPO / "library/templates/library/track_detail.html").read_text()
-        refresh = source[source.index("async function refreshWaveformOnly"):source.index("async function pollRefresh")]
-        self.assertIn("/refresh-waveform/", refresh)
-        self.assertNotIn("reanalyze", refresh)
+        for retired in ("refreshWaveformOnly", "pollRefresh", "REFRESH_KEY", "/refresh-waveform/", "sessionStorage"):
+            self.assertNotIn(retired, source)
+        reanalyze = source[source.index("async function reanalyzeTrack"):source.index("// --- Fast cue-point repick")]
+        self.assertIn("data.outcome", reanalyze)                         # reports what actually happened
+        self.assertIn("data.waveform.regenerated", reanalyze)            # reloads only an installed waveform
         click = source[source.index("function onWaveformClick"):source.index("async function loadWaveform")]
         self.assertNotIn("fetch(", click)                              # a click seeks/places; it never approves

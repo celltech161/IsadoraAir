@@ -409,7 +409,7 @@
   .cue-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
   .cue-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .cue-btn:focus-visible, .cue-bulk button:focus-visible, .cue-detail summary:focus-visible,
-  #refreshWaveformBtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #reanalyzeBtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .cue-detail {
     margin: -0.25rem 0 0.5rem 118px; font-size: 0.72rem; color: var(--text-muted);
   }
@@ -427,9 +427,9 @@
   .cue-notice[data-tone="warn"] { color: #f59e0b; }
   .cue-notice button { margin-left: 0.4rem; }
   .action-row { flex-wrap: wrap; row-gap: 0.4rem; }   /* the analysis buttons wrap on narrow screens */
-  .refresh-hint { display: block; width: 100%; margin: 0.35rem 0 0 118px; font-size: 0.7rem; color: var(--text-muted); }
+  .reanalyze-hint { display: block; width: 100%; margin: 0.35rem 0 0 118px; font-size: 0.7rem; color: var(--text-muted); }
   @media (max-width: 700px) {
-    .cue-detail, .refresh-hint { margin-left: 0; }
+    .cue-detail, .reanalyze-hint { margin-left: 0; }
     .cue-bulk .cue-bulk-actions { margin-left: 0; }
   }
 </style>
@@ -738,14 +738,13 @@
     <div class="field-row action-row">
       <label></label>
       <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>
-      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn" aria-describedby="reanalyzeHint">Reanalyze Track</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="repickCuePoints()" id="repickCueBtn" title="Fast re-pick of cue-in and next-start using saved envelope data + this track's category threshold overrides (or global defaults). No audio decode.">Reset Cue Points</button>
-      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="refreshWaveformOnly()" id="refreshWaveformBtn" aria-describedby="refreshWaveformHint">Refresh Waveform Only</button>
       <button type="button" class="save-btn danger" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="deleteTrack()" id="deleteTrackBtn" title="Permanently delete this track's DB row AND remove the audio file from disk. Cannot be undone.">Delete Track</button>
       <span class="save-msg" id="saveMsg" style="margin-left:0.6rem;">Saved</span>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
-      <span class="refresh-hint" id="refreshWaveformHint">Refresh Waveform Only rebuilds the waveform display and envelope without changing cue points, Track metadata, or the source audio. Reanalyze Track also re-detects cue points.</span>
-      <span class="refresh-hint" id="refreshWaveformStatus" role="status" aria-live="polite"></span>
+      <span class="reanalyze-hint" id="reanalyzeHint">Reanalyze Track regenerates the waveform and re-detects Cue In and Next Start. Locked and historical cue points keep their values, and the other six cue points are never changed.</span>
+      <span class="reanalyze-hint" id="reanalyzeStatus" role="status" aria-live="polite"></span>
     </div>
     {% else %}
     <div class="field-row">
@@ -1089,7 +1088,7 @@ async function cueAction(payload, verb, focusKey) {
     const names = list => (list || []).map(k => CUE_LABELS[k]).join(', ');
     const parts = [];
     if (r.approved && r.approved.length) parts.push('Locked: ' + names(r.approved) +
-      (data.audio_verified ? ' (for the current audio)' : ' (audio not verified — refresh the waveform to verify)'));
+      (data.audio_verified ? ' (for the current audio)' : ' (audio not verified)'));
     if (r.unlocked && r.unlocked.length) parts.push('Unlocked: ' + names(r.unlocked) + ' — analysis may now recalculate them');
     const skipped = Object.entries(r.skipped || {});
     if (skipped.length) parts.push('Unchanged: ' + skipped.map(([k, why]) => `${CUE_LABELS[k]} (${why})`).join(', '));
@@ -1761,27 +1760,61 @@ if (audioEl) {
 loadWaveform();
 
 // --- Reanalyze ---
+// Reanalyze Track (r0124: the one waveform action). The server says what
+// actually happened -- a 200 alone does not mean a new waveform was
+// installed -- and the result line reports the waveform and the cue points
+// separately: a refused cue-point calculation is not a failed reanalysis.
+const REANALYZE_WAVEFORM_TEXT = {
+  verified: 'Waveform regenerated and verified for the current audio.',
+  unverified: 'Waveform regenerated and shown, but this file\'s audio could not be verified, so Reset Cue Points stays unavailable. Locked cue points are unaffected.',
+  not_regenerated: 'The new waveform could not be installed; the previous waveform is kept.',
+};
+
+function reanalyzeStatus(text, tone) {
+  const el = document.getElementById('reanalyzeStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = tone === 'error' ? 'var(--danger)' : tone === 'warn' ? '#f59e0b' : tone === 'ok' ? 'var(--accent)' : '';
+}
+
+function describeMarkerResult(markers) {
+  if (!markers) return '';
+  const names = list => list.map(k => CUE_LABELS[k] || k).join(', ');
+  if (markers.conflict) return 'Cue points changed while the Track was analyzed, so the calculated values were not applied.';
+  if (markers.error) return 'The calculated cue points were not applied: ' + markers.error;
+  const parts = [];
+  const changed = Object.keys(markers.changed || {});
+  const kept = Object.entries(markers.preserved || {});
+  if (changed.length) parts.push('Updated ' + names(changed) + '.');
+  if (kept.length) parts.push('Kept ' + kept.map(([k, why]) => `${CUE_LABELS[k] || k} (${why === 'legacy' ? 'historical' : why})`).join(', ') + '.');
+  if (!changed.length && !kept.length) parts.push('Cue In and Next Start are unchanged.');
+  return parts.join(' ');
+}
+
 async function reanalyzeTrack() {
   const btn = document.getElementById('reanalyzeBtn');
-  const msg = document.getElementById('reanalyzeMsg');
+  if (btn.disabled) return;
+  const edited = Object.keys(editedCueMarkers());
+  if (edited.length) {
+    reanalyzeStatus('Save or revert your changes to ' + edited.map(k => CUE_LABELS[k]).join(', ') +
+                    ' before reanalyzing.', 'warn');
+    return;
+  }
   btn.disabled = true;
   const prevLabel = btn.textContent;
   btn.textContent = 'Analyzing…';
-
+  reanalyzeStatus('Analyzing the audio…');
   try {
     const resp = await fetch(`/api/tracks/${TRACK_ID}/reanalyze/`, {
       method: 'POST',
       headers: { 'X-CSRFToken': getCookie('csrftoken') },
     });
-    const data = await resp.json();
-
-    if (!resp.ok) {
-      msg.textContent = data.error || 'Reanalyze failed';
-      msg.style.color = 'var(--danger)';
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok && !data.waveform) {
+      reanalyzeStatus(data.error || 'Reanalyze failed; nothing was changed.', 'error');
     } else {
-      // Only the auto-detected fields can change -- manual marks (intro,
-      // sweep, outro, hooks) are never touched by analyze_one_track, and
-      // protected markers keep their values.
+      // Only Cue In and Next Start can change -- the other six cue points
+      // are never calculated, and protected markers keep their values.
       adoptCueMarkers(data);
       const durEl = document.getElementById('displayDuration');
       if (data.duration_seconds != null) {
@@ -1790,20 +1823,18 @@ async function reanalyzeTrack() {
         const s = total - m * 60;
         durEl.textContent = m + ':' + String(s).padStart(2, '0');
       }
-      await loadWaveform();
+      if (data.waveform && data.waveform.regenerated) await loadWaveform();
       loadCueState();
-      msg.textContent = 'Reanalyzed';
-      msg.style.color = 'var(--accent)';
+      const waveText = REANALYZE_WAVEFORM_TEXT[data.outcome] || '';
+      const tone = data.outcome === 'verified' ? 'ok' : data.outcome === 'unverified' ? 'warn' : 'error';
+      reanalyzeStatus([waveText, describeMarkerResult(data.cue_markers), resp.ok ? '' : (data.error || '')]
+                        .filter(Boolean).join(' '), tone);
     }
   } catch (e) {
-    msg.textContent = 'Reanalyze failed';
-    msg.style.color = 'var(--danger)';
+    reanalyzeStatus('No response from the server; the result is unknown. Reload the page to see the current waveform and cue points.', 'error');
   }
-
   btn.disabled = false;
   btn.textContent = prevLabel;
-  msg.classList.add('show');
-  setTimeout(() => msg.classList.remove('show'), 2500);
 }
 
 // --- Fast cue-point repick (no audio decode) ---
@@ -1841,125 +1872,6 @@ async function repickCuePoints() {
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), 2500);
 }
-
-// --- Refresh Waveform Only (r0123 Packages B/C) ---
-// Rebuilds the waveform cache through POST /refresh-waveform/ and never
-// falls back to full reanalysis. 200 = done; 202 = a long Track started in
-// the background: poll /refresh-waveform/status/ with the request token
-// until a terminal state, across reloads (sessionStorage). "started" is
-// never reported as success.
-const REFRESH_MESSAGES = {
-  replaced: 'Waveform rebuilt.',
-  busy: 'A waveform refresh for this Track (or another long one) is already running. Wait for it to finish.',
-  source_changed: 'The audio file changed while the waveform was being built; nothing was replaced. Try again once the file is stable.',
-  superseded: 'A newer analysis finished first; its waveform was kept.',
-  not_analyzed: 'This Track has never been analyzed. Use Reanalyze Track first.',
-  noncanonical_cache_path: 'This Track\'s waveform is stored outside the standard location; refresh is not available for it.',
-  source_missing: 'The audio file is missing, so the waveform was not rebuilt.',
-  decode_failed: 'The audio could not be decoded; the previous waveform is kept.',
-  audio_unidentifiable: 'The audio could not be identified reliably; the previous waveform is kept.',
-  not_found: 'This Track no longer exists.',
-  failed: 'The waveform could not be rebuilt; the previous waveform is kept.',
-  too_long: 'This Track is longer than Refresh Waveform Only supports (6 hours); the previous waveform is kept.',
-  resource_limit: 'The waveform could not be rebuilt within its time or memory limits (the audio may be damaged or longer than recorded); the previous waveform is kept.',
-};
-const REFRESH_KEY = `refreshWaveform:${TRACK_ID}`;
-const REFRESH_POLL_MS = 3000, REFRESH_POLL_LIMIT_MS = 20 * 60 * 1000;
-let refreshInFlight = false;
-
-function refreshStatus(text, tone) {
-  const el = document.getElementById('refreshWaveformStatus');
-  if (!el) return;
-  el.textContent = text;
-  el.style.color = tone === 'error' ? 'var(--danger)' : tone === 'ok' ? 'var(--accent)' : '';
-}
-function setRefreshBusy(busy) {
-  refreshInFlight = busy;
-  const btn = document.getElementById('refreshWaveformBtn');
-  if (btn) { btn.disabled = busy; btn.setAttribute('aria-busy', busy ? 'true' : 'false'); }
-}
-async function afterRefreshCompleted(newInfo) {
-  await loadWaveform();          // redraws samples only; marker inputs (and unsaved edits) are untouched
-  await loadCueState();
-  const verified = newInfo && newInfo.trusted;
-  refreshStatus('Waveform rebuilt' + (verified ? ' and verified for the current audio.' : '.'), 'ok');
-}
-
-async function refreshWaveformOnly() {
-  if (refreshInFlight) return;
-  setRefreshBusy(true);
-  refreshStatus('Rebuilding the waveform…');
-  let resp, data;
-  try {
-    resp = await fetch(`/api/tracks/${TRACK_ID}/refresh-waveform/`, {
-      method: 'POST', headers: {'X-CSRFToken': getCookie('csrftoken')},
-    });
-    data = await resp.json().catch(() => ({}));
-  } catch (e) {
-    setRefreshBusy(false);
-    refreshStatus('No response from the server: the result is unknown. Reload the page later to see the waveform status.', 'error');
-    return;
-  }
-  if (resp.status === 202 && data.requested_ns) {
-    try { sessionStorage.setItem(REFRESH_KEY, String(data.requested_ns)); } catch (e) {}
-    refreshStatus('Started in the background (long Track). This can take a few minutes; you can leave this page.');
-    pollRefresh(String(data.requested_ns), Date.now());
-    return;
-  }
-  setRefreshBusy(false);
-  if (resp.status === 403) { refreshStatus(data.error || 'You do not have permission to refresh waveforms.', 'error'); return; }
-  if (resp.ok && data.status === 'replaced') { await afterRefreshCompleted(data.new); return; }
-  refreshStatus(REFRESH_MESSAGES[data.status] || data.detail || data.error || 'The waveform was not rebuilt.', 'error');
-}
-
-async function pollRefresh(requestedNs, startedAt) {
-  setRefreshBusy(true);
-  if (Date.now() - startedAt > REFRESH_POLL_LIMIT_MS) {
-    setRefreshBusy(false);
-    refreshStatus('Still running after 20 minutes. Reload this page later to see whether it finished.', 'error');
-    return;
-  }
-  let data;
-  try {
-    const resp = await fetch(`/api/tracks/${TRACK_ID}/refresh-waveform/status/?requested_ns=${encodeURIComponent(requestedNs)}`);
-    data = await resp.json().catch(() => ({}));
-    if (resp.status === 400) {
-      // Not a token this server issued (e.g. damaged session storage): never guess an outcome.
-      try { sessionStorage.removeItem(REFRESH_KEY); } catch (e) {}
-      setRefreshBusy(false);
-      refreshStatus('The earlier background refresh could not be identified; its result is unknown.', 'error');
-      return;
-    }
-    if (!resp.ok) throw new Error(data.error || String(resp.status));
-  } catch (e) {
-    refreshStatus('Waiting for the background refresh (status temporarily unavailable)…');
-    setTimeout(() => pollRefresh(requestedNs, startedAt), REFRESH_POLL_MS * 2);
-    return;
-  }
-  if (data.state === 'running') {
-    refreshStatus('Rebuilding the waveform in the background…');
-    setTimeout(() => pollRefresh(requestedNs, startedAt), REFRESH_POLL_MS);
-    return;
-  }
-  try { sessionStorage.removeItem(REFRESH_KEY); } catch (e) {}
-  setRefreshBusy(false);
-  if (data.state === 'completed') { await afterRefreshCompleted(data.new); return; }
-  if (data.state === 'failed') {
-    refreshStatus(REFRESH_MESSAGES[data.status] || data.detail || 'The background refresh did not complete.', 'error');
-    return;
-  }
-  refreshStatus('The background refresh ended without reporting a result (for example after a service restart). ' +
-                'The previous waveform is kept; you can try again.', 'error');
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  let pending = null;
-  try { pending = sessionStorage.getItem(REFRESH_KEY); } catch (e) {}
-  if (pending) {
-    refreshStatus('Checking a background waveform refresh started earlier…');
-    pollRefresh(pending, Date.now());
-  }
-});
 
 // --- Delete track (row + file + waveform) ---
 const TRACK_FILEPATH = "{{ track.filepath|escapejs }}";

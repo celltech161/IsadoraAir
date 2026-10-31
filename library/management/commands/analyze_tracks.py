@@ -180,8 +180,7 @@ def apply_category_thresholds(base_cfg_values, next_start_override, cue_in_overr
 
 
 def pcm_command(filepath, sample_rate, channels):
-    """The ffmpeg command both decoders below run (and the bounded waveform-refresh decoder,
-    library.services.waveform_generation, so its PCM is byte-identical): s16le at sample_rate."""
+    """The ffmpeg command both decoders below run: s16le at sample_rate (unchanged since r0122)."""
     return [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
@@ -380,10 +379,20 @@ def get_waveforms_dir():
 
 class AnalysisOutcome:
     """What one analysis did: truthy when the Track was analyzed (decode and envelope succeeded),
-    with the cue-marker authority's result for the calculated markers (``markers``)."""
+    with the cue-marker authority's result for the calculated markers (``markers``).
 
-    def __init__(self, analyzed, markers=None, reason="", promotion=None):
+    r0124: being analyzed does not mean a new waveform was installed. ``promotion`` is set only when
+    the new cache was promoted (``waveform_installed``); otherwise ``waveform_error`` says why the
+    previous cache was kept. ``audio_problem`` says why the decoded audio could not be identified
+    (the new cache is then displayable but never trusted); empty when it was identified."""
+
+    def __init__(self, analyzed, markers=None, reason="", promotion=None, waveform_error="", audio_problem=""):
         self.analyzed, self.markers, self.reason, self.promotion = analyzed, markers, reason, promotion
+        self.waveform_error, self.audio_problem = waveform_error, audio_problem
+
+    @property
+    def waveform_installed(self) -> bool:
+        return self.promotion is not None
 
     def __bool__(self):
         return self.analyzed
@@ -425,7 +434,7 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     applied, the database stays authoritative and the previous cache stays in place: it is either
     untrusted for the new audio (its source witness no longer matches) or a trusted cache of the
     same audio whose marker snapshot is merely stale -- detectable, never a basis for Repick of
-    other audio, and repaired by Refresh Waveform Only or the next analysis."""
+    other audio, and repaired by the next analysis (Reanalyze Track)."""
     (sample_rate, window_seconds, target_points,
      next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
@@ -589,7 +598,7 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
         writer="analysis", started_ns=started_ns, analysis_duration=analysis_duration, times=times,
         envelope_db=envelope_db, samples_left=samples_left, samples_right=samples_right)
     update_fields = {"related_artists": related}
-    promotion = None
+    promotion, waveform_error = None, ""
     try:
         promotion = waveform_cache.promote(
             track_id, payload, wave_dir, expected_source=witness,
@@ -597,6 +606,7 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
         )
         update_fields["waveform_path"] = str(promotion.path)
     except (waveform_cache.PromotionRefused, waveform_cache.WaveformBusy, OSError) as exc:
+        waveform_error = str(exc) or type(exc).__name__
         print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
 
     try:
@@ -608,7 +618,8 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
         if keep_previous_waveform and promotion is not None:
             promotion.undo()
         raise
-    return AnalysisOutcome(True, markers=marker_result, promotion=promotion)
+    return AnalysisOutcome(True, markers=marker_result, promotion=promotion, waveform_error=waveform_error,
+                           audio_problem="" if identity is not None else (identity_problem or "unidentified"))
 
 
 class Command(BaseCommand):
