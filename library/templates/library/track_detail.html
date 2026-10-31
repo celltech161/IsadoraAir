@@ -1921,6 +1921,13 @@ async function pollRefresh(requestedNs, startedAt) {
   try {
     const resp = await fetch(`/api/tracks/${TRACK_ID}/refresh-waveform/status/?requested_ns=${encodeURIComponent(requestedNs)}`);
     data = await resp.json().catch(() => ({}));
+    if (resp.status === 400) {
+      // Not a token this server issued (e.g. damaged session storage): never guess an outcome.
+      try { sessionStorage.removeItem(REFRESH_KEY); } catch (e) {}
+      setRefreshBusy(false);
+      refreshStatus('The earlier background refresh could not be identified; its result is unknown.', 'error');
+      return;
+    }
     if (!resp.ok) throw new Error(data.error || String(resp.status));
   } catch (e) {
     refreshStatus('Waiting for the background refresh (status temporarily unavailable)…');

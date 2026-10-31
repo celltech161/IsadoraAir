@@ -113,8 +113,10 @@ def _settings():
     return analysis_settings((cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points))
 
 
-def refresh(track_id, *, wave_dir=None, operation_lock_fd=None) -> RefreshResult:
-    """Regenerate one Track's waveform cache from its current file (see the module docstring)."""
+def refresh(track_id, *, wave_dir=None, operation_lock_fd=None, request_token=None) -> RefreshResult:
+    """Regenerate one Track's waveform cache from its current file (see the module docstring).
+    ``request_token``: a background request's exact token, recorded in the promoted cache's
+    generation metadata so the status service can attribute that cache to this request only."""
     from library.management.commands.analyze_tracks import get_waveforms_dir
     wave_dir = Path(wave_dir) if wave_dir is not None else get_waveforms_dir()
     track, refused = _preflight(track_id, wave_dir)
@@ -130,12 +132,12 @@ def refresh(track_id, *, wave_dir=None, operation_lock_fd=None) -> RefreshResult
     except OSError as exc:
         return RefreshResult(track_id, FAILED, f"the waveform lock cannot be opened: {exc.strerror or exc}")
     try:
-        return _refresh_locked(track, wave_dir)
+        return _refresh_locked(track, wave_dir, request_token)
     finally:
         os.close(fd)
 
 
-def _refresh_locked(track, wave_dir) -> RefreshResult:
+def _refresh_locked(track, wave_dir, request_token=None) -> RefreshResult:
     result = RefreshResult(track.pk, FAILED, old=_describe(waveform_cache.validate(track)))
     started_ns = time.time_ns()
     before = audio_identity.stat_source(track.filepath)
@@ -157,7 +159,8 @@ def _refresh_locked(track, wave_dir) -> RefreshResult:
         return result
     payload = waveform_cache.build_payload(
         track.pk, identity=identity, source=after, analysis=settings, writer="refresh", started_ns=started_ns,
-        analysis_duration=times[-1], times=times, envelope_db=envelope_db, samples_left=left, samples_right=right)
+        analysis_duration=times[-1], times=times, envelope_db=envelope_db, samples_left=left, samples_right=right,
+        request=request_token)
     try:
         waveform_cache.promote(track.pk, payload, wave_dir, expected_source=after)
     except waveform_cache.PromotionRefused as exc:
@@ -204,16 +207,26 @@ def start_background(track_id, *, wave_dir=None) -> RefreshResult:
             return RefreshResult(track_id, FAILED, f"the waveform lock cannot be opened: {exc.strerror or exc}")
         requested_ns = time.time_ns()
         try:
+            # This request's own lock: held by the child until it has recorded its outcome, so
+            # "running" is a fact about this request, not about whichever refresh holds the Track.
+            request_lock = waveform_cache.create_request_lock(request_lock_name(track_id, requested_ns))
+        except OSError as exc:
+            os.close(operation)
+            return RefreshResult(track_id, FAILED, f"the waveform lock cannot be opened: {exc.strerror or exc}")
+        try:
             subprocess.Popen(
                 [sys.executable, str(Path(django_settings.BASE_DIR) / "manage.py"), "refresh_waveform",
                  str(int(track_id)), "--background", "--operation-lock-fd", str(operation),
-                 "--slot-lock-fd", str(slot), "--requested-ns", str(requested_ns)],
-                pass_fds=(operation, slot), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 "--slot-lock-fd", str(slot), "--requested-ns", str(requested_ns),
+                 "--request-lock-fd", str(request_lock)],
+                pass_fds=(operation, slot, request_lock), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
         except OSError as exc:
+            (waveform_cache.lock_dir() / request_lock_name(track_id, requested_ns)).unlink(missing_ok=True)
             return RefreshResult(track_id, FAILED, f"the background refresh could not start: {exc.strerror or exc}")
         finally:
             os.close(operation)
+            os.close(request_lock)
     finally:
         os.close(slot)
     return RefreshResult(track_id, STARTED, "the waveform is being regenerated in the background",
@@ -225,20 +238,47 @@ def outcome_key(track_id, requested_ns) -> str:
     return f"library|waveform-refresh|{int(track_id)}|{int(requested_ns)}"
 
 
+def request_lock_name(track_id, requested_ns) -> str:
+    return f"{int(track_id)}.refresh.{int(requested_ns)}.lock"
+
+
+#: How far in the future a request token may claim to be (clock skew allowance).
+TOKEN_FUTURE_SLACK_NS = 300 * 10 ** 9
+
+
+def valid_request_token(value) -> int | None:
+    """A background refresh request token as issued by ``start_background`` (a positive integer
+    nanosecond timestamp, not from the future), or None for anything else."""
+    if isinstance(value, bool):
+        return None
+    try:
+        token = int(value)
+    except (TypeError, ValueError):
+        return None
+    if str(value) != str(token) or token <= 0 or token > time.time_ns() + TOKEN_FUTURE_SLACK_NS:
+        return None
+    return token
+
+
 # Background status (Package C): what a browser polling a 202 "started" may be told.
 RUNNING, COMPLETED, FAILED_STATE, UNKNOWN = "running", "completed", "failed", "unknown"
 
 
 def background_status(track_id, requested_ns, *, wave_dir=None) -> dict:
-    """The state of the background refresh started with ``requested_ns`` -- never inferred from the
-    launch alone. ``completed``/``failed`` come from the outcome the process recorded (or, if that
-    record is missing, a cache this very refresh demonstrably promoted); ``running`` while the
-    process holds the Track's refresh lock; otherwise ``unknown`` (it ended without a result --
-    e.g. killed by a restart), and the previous cache is still in place."""
-    from library.management.commands.analyze_tracks import get_waveforms_dir
+    """The state of exactly the background refresh started with ``requested_ns`` (r0123 B2) -- never
+    inferred from the launch, from another request, or from timing:
+
+    * ``completed``/``failed``: the outcome this request's process recorded (its own SystemEvent
+      key), or -- if the process died after promoting but before recording -- a cache whose
+      generation metadata carries exactly this request's token;
+    * ``running``: this request's own lock is still held by a live process;
+    * ``unknown``: none of that -- the process ended without a result (or never ran), and the
+      previous cache is still in place. A later refresh can never complete an earlier request."""
     from monitoring.models import SystemEvent
-    wave_dir = Path(wave_dir) if wave_dir is not None else get_waveforms_dir()
-    event = (SystemEvent.objects.filter(dedupe_key=outcome_key(track_id, requested_ns))
+    token = valid_request_token(requested_ns)
+    if token is None:
+        return {"state": UNKNOWN, "status": None, "new": {}, "detail": "not a refresh request token"}
+    event = (SystemEvent.objects.filter(dedupe_key=outcome_key(track_id, token))
              .order_by("-created_at").values("detail").first())
     if event is not None:
         detail = event["detail"] or {}
@@ -246,16 +286,15 @@ def background_status(track_id, requested_ns, *, wave_dir=None) -> dict:
         return {"state": COMPLETED if status == REPLACED else FAILED_STATE, "status": status,
                 "detail": detail.get("detail", ""), "new": detail.get("new") or {}}
     try:
-        os.close(waveform_cache.try_operation_lock(wave_dir, f"{int(track_id)}.refresh.lock"))
-    except waveform_cache.WaveformBusy:
-        return {"state": RUNNING, "status": STARTED, "detail": "the waveform is being regenerated", "new": {}}
+        if waveform_cache.request_lock_held(request_lock_name(track_id, token)):
+            return {"state": RUNNING, "status": STARTED, "detail": "the waveform is being regenerated", "new": {}}
     except OSError as exc:
         return {"state": UNKNOWN, "status": None, "detail": f"the refresh lock cannot be read: {exc}", "new": {}}
     track = _track(track_id)
     if track is not None:
         verdict = waveform_cache.validate(track)
         generation = (verdict.payload or {}).get("generation") or {}
-        if generation.get("writer") == "refresh" and (generation.get("started_ns") or 0) >= int(requested_ns):
+        if generation.get("writer") == "refresh" and generation.get("request") == token:
             return {"state": COMPLETED, "status": REPLACED, "detail": "waveform regenerated",
                     "new": _describe(verdict)}
     return {"state": UNKNOWN, "status": None, "new": {},

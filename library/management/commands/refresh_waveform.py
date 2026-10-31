@@ -25,6 +25,7 @@ class Command(BaseCommand):
         parser.add_argument("--operation-lock-fd", type=int, help=argparse_suppress())
         parser.add_argument("--slot-lock-fd", type=int, help=argparse_suppress())
         parser.add_argument("--requested-ns", type=int, help=argparse_suppress())
+        parser.add_argument("--request-lock-fd", type=int, help=argparse_suppress())
 
     def handle(self, *args, **options):
         from library.services import waveform_generation
@@ -38,7 +39,8 @@ class Command(BaseCommand):
         try:
             try:
                 result = waveform_generation.refresh(options["track_id"],
-                                                     operation_lock_fd=options["operation_lock_fd"])
+                                                     operation_lock_fd=options["operation_lock_fd"],
+                                                     request_token=options["requested_ns"])
             finally:
                 if options["slot_lock_fd"] is not None:
                     os.close(options["slot_lock_fd"])
@@ -52,6 +54,15 @@ class Command(BaseCommand):
         finally:
             if held is not None:
                 os.close(held)
+            # This request's own lock (r0123 B2): released only now, after its outcome is recorded.
+            # A process that dies earlier releases it too, leaving the file, which then reads as
+            # "not running" -- and, without an outcome, as "unknown".
+            if options["request_lock_fd"] is not None:
+                if options["requested_ns"]:
+                    from library.services import waveform_cache
+                    (waveform_cache.lock_dir() / waveform_generation.request_lock_name(
+                        options["track_id"], options["requested_ns"])).unlink(missing_ok=True)
+                os.close(options["request_lock_fd"])
         if options["json"]:
             self.stdout.write(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:

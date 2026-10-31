@@ -1014,10 +1014,11 @@ def api_track_refresh_waveform_status(request, pk):
         return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
     from library.services import waveform_generation as wg
     track = get_object_or_404(Track.objects.only("id"), pk=pk)
-    try:
-        requested_ns = int(request.GET.get("requested_ns", ""))
-    except ValueError:
-        return JsonResponse({"error": "requested_ns is required"}, status=400)
+    requested_ns = wg.valid_request_token(request.GET.get("requested_ns", ""))
+    if requested_ns is None:
+        # Malformed, negative or future tokens never match an operation (r0123 B2).
+        return JsonResponse({"error": "requested_ns must be the token a refresh request returned",
+                             "state": wg.UNKNOWN}, status=400)
     return JsonResponse({"track_id": track.pk, "requested_ns": requested_ns,
                          **wg.background_status(track.pk, requested_ns)})
 

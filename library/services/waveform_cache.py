@@ -11,7 +11,8 @@ Version 2::
      "audio_identity": {algorithm, sha256, sample_rate, channels, sample_format, frames, decoder} | null,
      "source": {path, dev, ino, size, mtime_ns, ctime_ns},     # the file the identity was taken from
      "analysis": {"sample_rate", "window_seconds", "waveform_points"},
-     "generation": {"writer", "started_ns"},                  # decode start; a later decode wins
+     "generation": {"writer", "started_ns", "request"?},      # decode start (a later decode wins);
+                                                              # a background refresh's exact request token
      "analysis_duration": <float > 0>,
      "envelope_times": [...], "envelope_db": [...],         # same length >= 1, finite, ascending
      "samples_left": [...], "samples_right": [...],         # same length >= 1, integers 0..255
@@ -278,11 +279,15 @@ def current_audio_revision(track) -> str | None:
 # ------------------------------------------------------------------ building
 
 def build_payload(track_id, *, identity, source, analysis, writer, started_ns, analysis_duration, times,
-                  envelope_db, samples_left, samples_right) -> dict:
-    """A version-2 payload; the marker snapshot is added at promotion (``promote``)."""
+                  envelope_db, samples_left, samples_right, request=None) -> dict:
+    """A version-2 payload; the marker snapshot is added at promotion (``promote``). ``request``: the
+    exact token of the background refresh request that produced it (r0123 B2), if any."""
+    generation = {"writer": writer, "started_ns": int(started_ns)}
+    if request is not None:
+        generation["request"] = int(request)
     return {"schema": SCHEMA, "schema_version": SCHEMA_VERSION, "track_id": int(track_id),
             "audio_identity": identity, "source": dict(source), "analysis": dict(analysis),
-            "generation": {"writer": writer, "started_ns": int(started_ns)},
+            "generation": generation,
             "analysis_duration": analysis_duration, "envelope_times": times, "envelope_db": envelope_db,
             "samples_left": samples_left, "samples_right": samples_right}
 
@@ -346,6 +351,33 @@ def try_operation_lock(wave_dir, name) -> int:
         os.close(fd)
         raise WaveformBusy(f"{name} is held by another operation") from None
     return fd
+
+
+def create_request_lock(name) -> int:
+    """Create and exclusively lock a new request lock file (refused if it already exists): the fd is
+    handed to the process doing the request, which holds it until its outcome is recorded."""
+    fd = os.open(lock_dir() / name, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def request_lock_held(name) -> bool:
+    """Whether a live process still holds that request lock. Never creates the file."""
+    try:
+        fd = os.open(lock_dir() / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 def _fsync_dir(directory):

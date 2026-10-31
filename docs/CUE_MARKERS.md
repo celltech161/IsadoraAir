@@ -398,13 +398,22 @@ The button sits beside Reanalyze, with an explanation of the difference.
 
 The status endpoint reports, and is never "completed" merely because the process launched:
 
-* `running`: the background process still holds the Track's refresh lock. It keeps the lock
-  until it has recorded its outcome.
-* `completed` / `failed` (with Package B's status): from the outcome the process recorded,
-  under a SystemEvent dedupe key unique to the request. If that record is missing, a cache this
-  refresh demonstrably promoted also counts as completed.
-* `unknown`: the process ended without a result, for example after a restart. The previous
-  waveform is kept.
+Every status answer is about exactly one request, identified by its token (r0123 B2):
+
+* `running`: this request's own lock (`<WAVEFORMS_DIR>/.locks/<id>.refresh.<token>.lock`) is
+  held by a live process. The parent creates the lock; the child holds it until it has recorded
+  its outcome, then removes it. Another refresh of the same Track never makes this request
+  "running".
+* `completed` / `failed` (with Package B's status): from the outcome this request's process
+  recorded, under a SystemEvent dedupe key unique to the Track and the token. If the process died
+  after promotion but before recording, the cache counts as completion evidence only when its
+  `generation.request` equals this token *exactly*. A later refresh, another Track's refresh, or
+  any timestamp comparison can never complete it.
+* `unknown`: none of that is true, for example after a restart. The previous waveform is kept.
+
+Tokens are positive integers that are not from the future. Anything else (malformed, negative,
+future or padded) gets 400 with `state: unknown`, and the page stops polling and says the
+result is unknown.
 
 ## Field acceptance checklist (KOGR and WRJE, after r0123 installation)
 
