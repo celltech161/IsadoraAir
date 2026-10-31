@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core.management import call_command
-from django.test import Client
+from django.test import Client, override_settings
 
-from library.models import Track
+from library.models import Category, Track
 from library.services import audio_identity, cue_markers, waveform_cache, waveform_generation as wg
 from library.tests.test_waveform_integrity_package_b import _audio, _Base, _row
 from monitoring.models import SystemEvent, emit_event
@@ -241,6 +241,107 @@ class EditTests(_Controls):
         response = self.patch_track(track, {"cue_in_seconds": 0.7, "cue_marker_revision": 0})
         self.assertEqual((response.status_code, response.json()["conflict"]), (409, True))
         self.assertEqual(_row(track.pk)["cue_in_seconds"], 0.0)
+
+
+class RelocationConsistencyTests(_Controls):
+    def setUp(self):
+        super().setUp()
+        settings = override_settings(LIBRARY_ROOT=str(self.dir))
+        settings.enable()
+        self.addCleanup(settings.disable)
+        self.destination_category = Category.objects.create(
+            code="RELOCATED", name="Relocated", kind=self.category.kind,
+        )
+
+    def destination(self, track):
+        return self.dir / self.destination_category.code / Path(track.filepath).name
+
+    def test_late_revision_conflict_occurs_before_media_relocation(self):
+        track = self.track()
+        source = Path(track.filepath)
+        original = source.read_bytes()
+
+        def concurrent_operator(_track):
+            result = cue_markers.operator_edit(
+                track.pk, expected_revision=0, user=self.user, values={"hook_in_seconds": 0.25},
+            )
+            self.assertTrue(result.ok)
+            return None
+
+        with patch.object(waveform_cache, "current_audio_revision", side_effect=concurrent_operator):
+            response = self.patch_track(track, {
+                "category_id": self.destination_category.pk,
+                "hook_in_seconds": 0.75,
+                "cue_marker_revision": 0,
+            })
+
+        self.assertEqual((response.status_code, response.json()["conflict"]), (409, True))
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.category.pk, str(source)))
+        self.assertEqual((row.hook_in_seconds, row.cue_marker_revision), (0.25, 1))
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(self.destination(track).exists())
+
+    def test_successful_combined_marker_and_category_edit_keeps_db_and_media_consistent(self):
+        track = self.track()
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        destination = self.destination(track)
+
+        response = self.patch_track(track, {
+            "category_id": self.destination_category.pk,
+            "hook_in_seconds": 0.75,
+            "cue_marker_revision": 0,
+        })
+
+        self.assertEqual(response.status_code, 200, response.content)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.destination_category.pk, str(destination)))
+        self.assertEqual((row.hook_in_seconds, row.cue_marker_revision), (0.75, 1))
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), original)
+
+    def test_database_failure_after_move_restores_original_media_location(self):
+        track = self.track()
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        destination = self.destination(track)
+
+        with patch.object(Track, "save", autospec=True, side_effect=RuntimeError("injected save failure")):
+            response = self.patch_track(track, {"category_id": self.destination_category.pk})
+
+        self.assertEqual(response.status_code, 500)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.category.pk, str(source)))
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(destination.exists())
+
+    def test_destination_collision_is_never_overwritten(self):
+        track = self.track()
+        source = Path(track.filepath)
+        original = source.read_bytes()
+        destination = self.destination(track)
+        destination.parent.mkdir()
+        destination.write_bytes(b"OTHER TRACK")
+
+        response = self.patch_track(track, {"category_id": self.destination_category.pk})
+
+        self.assertEqual(response.status_code, 409)
+        row = Track.objects.get(pk=track.pk)
+        self.assertEqual((row.category_id, row.filepath), (self.category.pk, str(source)))
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(destination.read_bytes(), b"OTHER TRACK")
+
+    def test_metadata_only_category_move_does_not_touch_marker_authority(self):
+        track = self.track()
+        before = _row(track.pk)
+        response = self.patch_track(track, {"category_id": self.destination_category.pk})
+        self.assertEqual(response.status_code, 200, response.content)
+        after = _row(track.pk)
+        self.assertEqual(
+            (after["cue_marker_revision"], after["cue_marker_state"]),
+            (before["cue_marker_revision"], before["cue_marker_state"]),
+        )
 
 
 # ------------------------------------------------------------------ waveform trust and refresh

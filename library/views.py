@@ -1,8 +1,8 @@
+import errno
 import hashlib
 import json
 import os
 import re
-import shutil
 import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
@@ -59,6 +59,75 @@ from .services.schedule_profiles import (
 # of this codebase avoids. No circularity: webrequests.services imports
 # from library.models/library.services.*, never from library.views.
 from webrequests.services import _read_engine_state
+
+
+def _path_witness(path: Path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _stage_media_relocation_no_replace(source: Path, destination: Path):
+    """Create the proposed destination without replacing anything; keep ``source`` for rollback.
+
+    A same-filesystem category change uses an atomic hard link. The exclusive-copy fallback keeps
+    the old path intact for an unusual cross-filesystem category mount. The caller removes one of
+    the two owned paths only after the database transaction's outcome is known.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise OSError(
+                f"cannot safely relocate {source.name!r} without overwriting another file: {exc}"
+            ) from exc
+        source_info = source.stat()
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            source_info.st_mode & 0o777,
+        )
+        try:
+            source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(destination_fd, view):]
+                os.fsync(destination_fd)
+            finally:
+                os.close(source_fd)
+        except BaseException:
+            os.close(destination_fd)
+            destination.unlink(missing_ok=True)
+            raise
+        os.close(destination_fd)
+        try:
+            os.utime(destination, ns=(source_info.st_atime_ns, source_info.st_mtime_ns), follow_symlinks=False)
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+    try:
+        return _path_witness(source), _path_witness(destination)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _remove_owned_relocation_path(path: Path, witness) -> None:
+    """Remove only the exact path created/retained by this relocation attempt."""
+    try:
+        current = _path_witness(path)
+    except FileNotFoundError:
+        return
+    if current != witness:
+        raise OSError(f"refusing to remove {path}: it changed during the Track update")
+    path.unlink()
 
 
 def _enqueue_engine_command_response(payload):
@@ -2154,49 +2223,97 @@ def api_track_detail(request, pk):
         track.check_write_guards()
     except TrackWriteRefused as exc:
         return JsonResponse({"error": str(exc)}, status=409)
-    if track.pk and track.category_id:
-        old_track = Track.objects.filter(pk=track.pk).only("filepath", "category_id").first()
-        if old_track and old_track.category_id != track.category_id:
-            library_root = Path(getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music")).resolve()
-            old_path = Path(track.filepath) if track.filepath else None
-            if old_path and old_path.is_file():
-                try:
-                    old_path.resolve().relative_to(library_root)
-                    inside_root = True
-                except ValueError:
-                    inside_root = False
-                if inside_root:
-                    new_dir = library_root / track.category.code
-                    new_path = new_dir / old_path.name
-                    if new_path.exists() and new_path != old_path:
-                        return JsonResponse(
-                            {"error": f"Cannot relocate: destination already exists ({new_path.name} in {track.category.code}). Rename the existing file first."},
-                            status=409,
-                        )
-                    try:
-                        new_dir.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(old_path), str(new_path))
-                        track.filepath = str(new_path)
-                    except OSError as exc:
-                        return JsonResponse(
-                            {"error": f"Failed to relocate file: {exc}"},
-                            status=500,
-                        )
+    moved_paths = None
+    commit_reached = [False]
 
-    with transaction.atomic():
-        if marker_edits:
-            marker_result = cue_markers.operator_edit(
-                track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits,
-                audio_revision=edited_audio_revision, confirm_protected=confirm_override)
-            if not marker_result.ok:
-                transaction.set_rollback(True)
-                return JsonResponse({"error": marker_result.conflict or marker_result.error,
-                                     "conflict": bool(marker_result.conflict),
-                                     "confirmation_required": marker_result.confirmation_required,
-                                     "cue_marker_revision": marker_result.revision},
-                                    status=409 if marker_result.conflict or marker_result.confirmation_required
-                                    else 400)
-        track.save()
+    def _committed():
+        # Registered before cue-marker audit callbacks: an exception in a later on_commit callback
+        # must not make us move a file back after the database transaction already committed.
+        commit_reached[0] = True
+
+    try:
+        with transaction.atomic(durable=True):
+            locked_track = Track.objects.select_for_update().only("filepath", "category_id").get(pk=track.pk)
+            transaction.on_commit(_committed)
+
+            # The locked row, not the preliminary request snapshot, owns the current source path.
+            track.filepath = locked_track.filepath
+            relocation = None
+            if track.category_id and locked_track.category_id != track.category_id:
+                library_root = Path(
+                    getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music")
+                ).resolve()
+                old_path = Path(locked_track.filepath) if locked_track.filepath else None
+                if old_path and old_path.is_file():
+                    try:
+                        old_path.resolve().relative_to(library_root)
+                        inside_root = True
+                    except ValueError:
+                        inside_root = False
+                    if inside_root:
+                        new_path = library_root / track.category.code / old_path.name
+                        if new_path.exists() and new_path != old_path:
+                            return JsonResponse(
+                                {"error": f"Cannot relocate: destination already exists ({new_path.name} in {track.category.code}). Rename the existing file first."},
+                                status=409,
+                            )
+                        relocation = (old_path, new_path)
+
+            # This authority call takes the same row lock re-entrantly and performs the definitive
+            # revision/confirmation checks before the first filesystem side effect.
+            if marker_edits:
+                marker_result = cue_markers.operator_edit(
+                    track.pk, expected_revision=expected_revision, user=request.user, values=marker_edits,
+                    audio_revision=edited_audio_revision, confirm_protected=confirm_override)
+                if not marker_result.ok:
+                    transaction.set_rollback(True)
+                    return JsonResponse({"error": marker_result.conflict or marker_result.error,
+                                         "conflict": bool(marker_result.conflict),
+                                         "confirmation_required": marker_result.confirmation_required,
+                                         "cue_marker_revision": marker_result.revision},
+                                        status=409 if marker_result.conflict or marker_result.confirmation_required
+                                        else 400)
+
+            if relocation is not None:
+                old_path, new_path = relocation
+                source_witness, destination_witness = _stage_media_relocation_no_replace(old_path, new_path)
+                moved_paths = (old_path, new_path, source_witness, destination_witness)
+                track.filepath = str(new_path)
+            track.save()
+    except BaseException as exc:
+        if moved_paths is not None and not commit_reached[0]:
+            old_path, new_path, _source_witness, destination_witness = moved_paths
+            try:
+                _remove_owned_relocation_path(new_path, destination_witness)
+                moved_paths = None
+            except BaseException as restore_exc:
+                return JsonResponse({
+                    "error": (
+                        "Track update failed and its staged media destination could not be removed safely; "
+                        f"the original remains at {old_path}. Database error: {exc}. "
+                        f"Cleanup error: {restore_exc}"
+                    )
+                }, status=500)
+        if not isinstance(exc, Exception):
+            raise
+        if isinstance(exc, FileExistsError):
+            return JsonResponse({
+                "error": "Cannot relocate: the destination was created by another operation. Try again."
+            }, status=409)
+        stage = "post-commit processing" if commit_reached[0] else "track update"
+        return JsonResponse({"error": f"Failed during {stage}: {exc}"}, status=500)
+
+    if moved_paths is not None:
+        old_path, _new_path, source_witness, _destination_witness = moved_paths
+        try:
+            _remove_owned_relocation_path(old_path, source_witness)
+        except Exception as exc:
+            return JsonResponse({
+                "error": (
+                    "Track update committed, but the old media link could not be removed safely; "
+                    f"the database and new path are valid, and operator cleanup is required for {old_path}: {exc}"
+                )
+            }, status=500)
 
     # M2M fields have to be set AFTER save() because they need the pk.
     # Not part of DIRECT_FIELDS since setattr on an M2M raises. Both
