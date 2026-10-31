@@ -38,8 +38,11 @@
   .mon-version.stale { color: #f59e0b; }
   .mon-version.unknown { color: var(--text-muted); }
 
+  /* r0123 (roadmap 2.24): a moderately denser layout -- narrower card
+     minimums, tighter padding/gaps and no routine "for 3d" line -- while
+     status pills, readings and diagnostic text keep their sizes. */
   .mon-group {
-    margin-bottom: 1.15rem;
+    margin-bottom: 0.95rem;
   }
   .mon-group h2 {
     font-size: 0.95rem;
@@ -47,36 +50,50 @@
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    margin-bottom: 0.4rem;
+    margin-bottom: 0.35rem;
   }
+  /* min(..., 100%): a card never forces its column wider than a narrow screen. */
   .mon-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-    gap: 0.55rem;
+    grid-template-columns: repeat(auto-fill, minmax(min(198px, 100%), 1fr));
+    gap: 0.45rem;
   }
   /* These dense operational rows use the narrower card minimum while
-     other Monitoring groups retain the shared 210px default. */
+     other Monitoring groups retain the shared 198px default. */
   .mon-group-services .mon-cards,
   .mon-group-system .mon-cards,
   .mon-group-transmitter .mon-cards {
-    grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(168px, 100%), 1fr));
   }
   .mon-card {
     background: var(--panel-bg);
     border: 1px solid var(--border-subtle);
     border-radius: 10px;
-    padding: 0.6rem 0.8rem;
+    padding: 0.5rem 0.65rem;
+    min-width: 0;
   }
   .mon-card-top {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 0.5rem;
-    margin-bottom: 0.35rem;
+    gap: 0.2rem 0.5rem;
+    margin-bottom: 0.3rem;
   }
+  /* Long names (a disk path, a long unit name) wrap at their natural
+     break points; when even a single word cannot sit beside the status
+     pill, the pill moves under the name instead of clipping either. */
   .mon-card-name {
-    font-size: 0.9rem;
+    font-size: 0.88rem;
     font-weight: 600;
+    line-height: 1.25;
+    min-width: 0;
+    overflow-wrap: break-word;
+  }
+  .mon-card-top .mon-pill { flex-shrink: 0; }
+  .mon-sr {                      /* read by screen readers, not shown */
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
   }
   .mon-pill {
     font-size: 0.72rem;
@@ -91,12 +108,6 @@
   .mon-pill.warning { background: rgba(245, 158, 11, 0.18); color: #f59e0b; }
   .mon-pill.critical { background: rgba(249, 115, 115, 0.18); color: var(--danger); }
   .mon-pill.unknown { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
-
-  .mon-card-since {
-    font-size: 0.72rem;
-    color: var(--text-muted);
-    margin-bottom: 0.5rem;
-  }
 
   /* --- LED + caption, for systemd services --- */
   .mon-led-row {
@@ -155,6 +166,8 @@
   }
   .mon-bar-label {
     display: flex;
+    flex-wrap: wrap;
+    column-gap: 0.4rem;           /* "82.8%" and "248.37 watts" never run together */
     justify-content: space-between;
     font-size: 0.78rem;
     color: var(--text-muted);
@@ -238,7 +251,8 @@
   .mon-card-detail {
     font-size: 0.78rem;
     color: var(--text-muted);
-    line-height: 1.5;
+    line-height: 1.45;
+    overflow-wrap: anywhere;   /* long error text and URLs wrap, never truncated */
   }
 
   /* --- RBDS section (not MonitorCheck-driven -- its own live JSON
@@ -1052,12 +1066,15 @@ function renderGroups(checks) {
       const card = document.createElement("div");
       card.className = "mon-card";
       const showPill = check.kind !== "systemd" && check.kind !== "temperature";
+      // r0123 (2.24): no routine "for 3d" line on the card face. How long a
+      // card has held its status stays available on the pill itself (tooltip
+      // and accessible name); the API's `since` is unchanged.
+      const heldFor = check.since ? ` for ${formatSince(check.since)}` : "";
       card.innerHTML = `
         <div class="mon-card-top">
-          <span class="mon-card-name">${check.name}</span>
-          ${showPill ? `<span class="mon-pill ${check.status}">${check.status}</span>` : ""}
+          <span class="mon-card-name">${String(check.name).replace(/\//g, "/<wbr>")}</span>
+          ${showPill ? `<span class="mon-pill ${check.status}" title="${check.status}${heldFor}">${check.status}${heldFor ? `<span class="mon-sr">${heldFor}</span>` : ""}</span>` : ""}
         </div>
-        ${check.kind !== "systemd" ? `<div class="mon-card-since">${check.since ? "for " + formatSince(check.since) : ""}</div>` : ""}
         ${renderCardBody(check, byTxRef)}
       `;
       cardsEl.appendChild(card);

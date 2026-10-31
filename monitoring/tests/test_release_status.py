@@ -381,7 +381,8 @@ class DashboardTemplateSanityTests(TestCase):
 
         self.assertIn(".mon-group-system .mon-cards", body)
         self.assertIn(".mon-group-transmitter .mon-cards", body)
-        self.assertIn("minmax(175px, 1fr)", body)
+        # r0123 (2.24): the dense groups' minimum is 168px, capped by the column width.
+        self.assertIn("minmax(min(168px, 100%), 1fr)", body)
         self.assertIn(".mon-group-transmitter .mon-value-text", body)
 
         self.assertNotIn('id="aircheckLed"', body)
