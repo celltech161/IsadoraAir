@@ -313,7 +313,33 @@ Every failure keeps the previous cache.
 
 **Statuses:** 200 `replaced`; 409 `busy`, `source_changed` or `superseded`; 404
 `not_found`; 422 `not_analyzed`, `noncanonical_cache_path`, `source_missing`, `decode_failed`,
-`audio_unidentifiable` or `failed`.
+`audio_unidentifiable`, `too_long`, `resource_limit` or `failed`.
+
+**Resource limits (r0123 B3).** These apply to Refresh Waveform Only; ordinary analysis is
+unchanged. They are enforced while decoding:
+
+* **Duration:** up to **6 hours**, `MAX_REFRESH_SECONDS`, which is above the stations' longest
+  syndicated or specialty programmes. A longer Track is refused with `too_long` before anything
+  is decoded or spawned.
+* **Memory:** each ffmpeg decode is read through a byte cap.
+  * The cap is the PCM the Track's recorded duration can produce, plus 5 % and 60 s of slack,
+    at the configured analysis rate. A Track with no recorded duration is capped at the 6-hour
+    bound.
+  * No single decode may exceed the **512 MiB** budget (`PCM_BUDGET_BYTES`).
+  * The mono buffer is released before the stereo decode, so peak PCM is one stereo buffer:
+    about 61 MiB per hour at the default 4410 Hz, or about 0.36 GiB for 6 hours.
+  * A Track whose recorded duration would need more than the budget at the current rate (for
+    example 2 hours at 22050 Hz) is refused with `resource_limit` before decoding.
+  * Media that decodes to more than its cap (misleading or missing duration metadata, malformed
+    files) is stopped at the cap with `resource_limit`.
+* **Time:** each decode, including the audio-identity decode, is killed after
+  120 s + 0.1 s per second of audio: 144 s for 4 minutes, about 38 minutes for 6 hours. The
+  result is `resource_limit`.
+* **On failure:** any limit failure kills and reaps the decoder and promotes nothing. It leaves
+  the previous cache, every Track column and the source untouched, releases the locks, and is
+  recorded as the request's outcome.
+* **Residual exposure:** the Python envelope computation over an already-capped buffer. It is
+  bounded in size, but not separately time-limited.
 
 **Bounded execution:**
 

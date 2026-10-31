@@ -18,6 +18,25 @@ Bounded execution: a Track up to ``SYNC_MAX_SECONDS`` long is refreshed within t
 in one detached, niced ``manage.py refresh_waveform`` process: at most one such process station-
 wide (a slot lock handed to the child), and at most one refresh per Track (an operation lock, also
 handed over). No queue, no bulk refresh, nothing scheduled.
+
+Resource limits (r0123 B3, waveform-only refresh; ordinary analysis is unchanged), enforced while
+decoding, not just before:
+
+* duration: up to ``MAX_REFRESH_SECONDS`` (6 hours -- above any syndicated or specialty
+  programme the stations carry); a longer Track is refused (``too_long``) without decoding;
+* memory: each decode is read through a byte cap -- the PCM the Track's recorded duration can
+  produce (+5 % and 60 s of slack) at the configured analysis rate, and never more than
+  ``PCM_BUDGET_BYTES`` (512 MiB, the largest single buffer). The mono buffer is released before the
+  stereo decode, so peak PCM is one stereo buffer: about 0.06 GiB per hour at the default 4410 Hz
+  (6 hours: about 0.36 GiB). A Track whose duration would need more than the budget at the current
+  rate is refused before decoding, and media that decodes to more than its recorded duration (or
+  without one, more than the 6-hour bound) is stopped at the cap (``resource_limit``);
+* time: each ffmpeg decode is killed after ``decode_timeout`` (120 s + 0.1 s per second of audio:
+  4 minutes -> 144 s, 6 hours -> 38 minutes), as is the identity decode (``resource_limit``).
+
+Any limit failure kills and reaps the decoder, writes nothing, keeps the previous cache and every
+Track column, and releases the locks (they are held by ``refresh``'s own ``finally``). The
+remaining exposure is the Python-side envelope computation over an already-capped buffer.
 """
 from __future__ import annotations
 
@@ -38,6 +57,7 @@ REPLACED, NOT_FOUND, NOT_ANALYZED, NONCANONICAL, BUSY, SOURCE_MISSING, DECODE_FA
     SOURCE_CHANGED, SUPERSEDED, FAILED, STARTED = (
         "replaced", "not_found", "not_analyzed", "noncanonical_cache_path", "busy", "source_missing",
         "decode_failed", "audio_unidentifiable", "source_changed", "superseded", "failed", "started")
+TOO_LONG, RESOURCE_LIMIT = "too_long", "resource_limit"
 CONFLICTS = {BUSY, SOURCE_CHANGED, SUPERSEDED}
 
 
@@ -47,14 +67,98 @@ def analysis_settings(cfg_values) -> dict:
             "waveform_points": int(target_points)}
 
 
-def measure(path, settings) -> tuple[list, list, list, list]:
+MAX_REFRESH_SECONDS = 6 * 3600
+PCM_BUDGET_BYTES = 512 * 1024 * 1024
+DURATION_SLACK_RATIO, DURATION_SLACK_SECONDS = 1.05, 60.0
+_READ_CHUNK = 1 << 20
+
+
+class ResourceLimit(Exception):
+    """A waveform-refresh decode exceeded its time or memory bound (the message says which)."""
+
+
+@dataclass
+class Limits:
+    max_mono_bytes: int
+    max_stereo_bytes: int
+    timeout: float
+
+
+def decode_timeout(seconds) -> float:
+    return 120.0 + 0.1 * max(0.0, float(seconds or 0.0))
+
+
+def refresh_limits(declared_seconds, settings) -> tuple[Limits | None, str, str]:
+    """``(limits, "", "")``, or ``(None, status, reason)`` when the Track cannot be refreshed within them."""
+    rate = int(settings["sample_rate"])
+    declared = float(declared_seconds) if declared_seconds and float(declared_seconds) > 0 else None
+    if declared is not None and declared > MAX_REFRESH_SECONDS:
+        return None, TOO_LONG, (f"the Track is {declared / 3600:.1f} h long; Refresh Waveform Only supports up to "
+                                f"{MAX_REFRESH_SECONDS // 3600} h")
+    bound = (declared * DURATION_SLACK_RATIO + DURATION_SLACK_SECONDS) if declared else MAX_REFRESH_SECONDS
+    bound = min(bound, MAX_REFRESH_SECONDS * DURATION_SLACK_RATIO + DURATION_SLACK_SECONDS)
+    stereo = int(bound * rate * 2 * 2)
+    if declared is not None and int(declared * rate * 2 * 2) > PCM_BUDGET_BYTES:
+        return None, RESOURCE_LIMIT, (f"decoding {declared / 3600:.1f} h at {rate} Hz needs more than the "
+                                      f"{PCM_BUDGET_BYTES // (1024 * 1024)} MiB waveform-refresh memory budget")
+    return Limits(max_mono_bytes=min(stereo // 2, PCM_BUDGET_BYTES), max_stereo_bytes=min(stereo, PCM_BUDGET_BYTES),
+                  timeout=decode_timeout(bound)), "", ""
+
+
+def decode_bounded(cmd, max_bytes, timeout) -> bytes:
+    """Run a PCM decoder, reading at most ``max_bytes`` within ``timeout`` seconds; on either limit
+    the process is killed and reaped and ResourceLimit raised. A decoder failure returns b"" (as the
+    analyzer's own decoders do)."""
+    import threading
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return b""
+    timed_out = threading.Event()
+    watchdog = threading.Timer(timeout, lambda: (timed_out.set(), proc.kill()))
+    watchdog.start()
+    data = bytearray()
+    exceeded = False
+    try:
+        for chunk in iter(lambda: proc.stdout.read(_READ_CHUNK), b""):
+            if len(data) + len(chunk) > max_bytes:
+                exceeded = True
+                proc.kill()
+                break
+            data.extend(chunk)
+        proc.wait()
+    finally:
+        watchdog.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+    if timed_out.is_set():
+        raise ResourceLimit(f"decoding took longer than {timeout:.0f} s")
+    if exceeded:
+        raise ResourceLimit(f"the audio decodes to more than {max_bytes // (1024 * 1024)} MiB "
+                            "(longer than its recorded duration, or beyond the memory budget)")
+    return bytes(data) if proc.returncode == 0 else b""
+
+
+def measure(path, settings, limits=None) -> tuple[list, list, list, list]:
     """``(envelope_times, envelope_db, samples_left, samples_right)`` of the file (empty lists when it
-    does not decode), computed by the analyzer's primitives."""
+    does not decode), computed by the analyzer's primitives. With ``limits`` the decodes are bounded
+    (``decode_bounded``; ResourceLimit) and produce the same PCM as the analyzer's decoders."""
     from library.management.commands import analyze_tracks as at
     rate, window, points = settings["sample_rate"], settings["window_seconds"], settings["waveform_points"]
-    raw = at.decode_audio_to_pcm(path, rate)
+    if limits is None:
+        raw = at.decode_audio_to_pcm(path, rate)
+    else:
+        raw = decode_bounded(at.pcm_command(path, rate, 1), limits.max_mono_bytes, limits.timeout)
     times, envelope_db = at.compute_envelope(raw, rate, window) if raw else ([], [])
-    raw_stereo = at.decode_audio_to_pcm_stereo(path, rate) if envelope_db else b""
+    del raw                                   # peak memory: one buffer at a time
+    if not envelope_db:
+        raw_stereo = b""
+    elif limits is None:
+        raw_stereo = at.decode_audio_to_pcm_stereo(path, rate)
+    else:
+        raw_stereo = decode_bounded(at.pcm_command(path, rate, 2), limits.max_stereo_bytes, limits.timeout)
     left, right = at.compute_stereo_waveform(raw_stereo, rate, window, points) if raw_stereo else ([], [])
     return times, envelope_db, left, right
 
@@ -145,11 +249,22 @@ def _refresh_locked(track, wave_dir, request_token=None) -> RefreshResult:
         result.status, result.detail = SOURCE_MISSING, "the Track's audio file is missing or not a regular file"
         return result
     settings = _settings()
-    times, envelope_db, left, right = measure(track.filepath, settings)
+    limits, refused, why = refresh_limits(track.duration_seconds, settings)
+    if limits is None:
+        result.status, result.detail = refused, why
+        return result
+    try:
+        times, envelope_db, left, right = measure(track.filepath, settings, limits)
+    except ResourceLimit as exc:
+        result.status, result.detail = RESOURCE_LIMIT, f"waveform not rebuilt: {exc}; the previous waveform is kept"
+        return result
     if not envelope_db or not left:
         result.status, result.detail = DECODE_FAILED, "the audio did not decode into a waveform"
         return result
-    identity, why = audio_identity.compute_or_none(track.filepath)
+    identity, why = audio_identity.compute_or_none(track.filepath, timeout=limits.timeout)
+    if identity is None and why.startswith("decoding took longer"):
+        result.status, result.detail = RESOURCE_LIMIT, f"waveform not rebuilt: {why}; the previous waveform is kept"
+        return result
     if identity is None:
         result.status, result.detail = UNIDENTIFIABLE, f"the decoded audio cannot be identified: {why}"
         return result
@@ -192,6 +307,9 @@ def start_background(track_id, *, wave_dir=None) -> RefreshResult:
     track, refused = _preflight(track_id, wave_dir)
     if refused:
         return refused
+    limits, status, why = refresh_limits(track.duration_seconds, _settings())
+    if limits is None:
+        return RefreshResult(track_id, status, why)
     try:
         slot = waveform_cache.try_operation_lock(wave_dir, BACKGROUND_SLOT_LOCK)
     except waveform_cache.WaveformBusy:

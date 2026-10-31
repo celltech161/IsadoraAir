@@ -1860,6 +1860,8 @@ const REFRESH_MESSAGES = {
   audio_unidentifiable: 'The audio could not be identified reliably; the previous waveform is kept.',
   not_found: 'This Track no longer exists.',
   failed: 'The waveform could not be rebuilt; the previous waveform is kept.',
+  too_long: 'This Track is longer than Refresh Waveform Only supports (6 hours); the previous waveform is kept.',
+  resource_limit: 'The waveform could not be rebuilt within its time or memory limits (the audio may be damaged or longer than recorded); the previous waveform is kept.',
 };
 const REFRESH_KEY = `refreshWaveform:${TRACK_ID}`;
 const REFRESH_POLL_MS = 3000, REFRESH_POLL_LIMIT_MS = 20 * 60 * 1000;

@@ -179,16 +179,22 @@ def apply_category_thresholds(base_cfg_values, next_start_override, cue_in_overr
             next_start_db, cue_in_db, cue_in_min)
 
 
-def decode_audio_to_pcm(filepath, sample_rate):
-    cmd = [
+def pcm_command(filepath, sample_rate, channels):
+    """The ffmpeg command both decoders below run (and the bounded waveform-refresh decoder,
+    library.services.waveform_generation, so its PCM is byte-identical): s16le at sample_rate."""
+    return [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error",
         "-i", str(filepath),
-        "-ac", "1",
+        "-ac", str(channels),
         "-ar", str(sample_rate),
         "-f", "s16le",
         "-",
     ]
+
+
+def decode_audio_to_pcm(filepath, sample_rate):
+    cmd = pcm_command(filepath, sample_rate, 1)
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
@@ -206,15 +212,7 @@ def decode_audio_to_pcm_stereo(filepath, sample_rate):
     (that stays on the mono path, unchanged). A genuinely mono source
     file just comes back with identical L/R here, which is the correct
     behavior, not a bug."""
-    cmd = [
-        "ffmpeg",
-        "-hide_banner", "-loglevel", "error",
-        "-i", str(filepath),
-        "-ac", "2",
-        "-ar", str(sample_rate),
-        "-f", "s16le",
-        "-",
-    ]
+    cmd = pcm_command(filepath, sample_rate, 2)
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
