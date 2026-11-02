@@ -13,18 +13,43 @@ from __future__ import annotations
 
 import logging
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from django.apps import apps
 from django.conf import settings
-from django.db import DEFAULT_DB_ALIAS, transaction
+from django.db import DEFAULT_DB_ALIAS, OperationalError, transaction
 from django.db.models.signals import post_delete, pre_delete
 
-from library.services import waveform_cache
+from library.services import source_paths, waveform_cache
 
 log = logging.getLogger(__name__)
 _WITNESS_UNAVAILABLE = object()
+
+#: Source audio changed this recently is kept, not unlinked.  An outside program (the syndicated ingest
+#: scripts) exposes a delivered file at its final path seconds before ``sync_track_file`` registers its
+#: Track; nothing in this application can coordinate with that interval, so a recently changed file is
+#: treated as possibly mid-delivery and left for reconciliation.  An orphaned file is recoverable media
+#: clutter; an unlinked delivery is not.  Callers that created the file themselves opt out.
+SOURCE_FRESHNESS_GRACE_SECONDS = 60
+
+
+def _now_ns() -> int:
+    return time.time_ns()
+
+
+def _log_cleanup(level, *, track_id, operation, outcome, name, error=None) -> None:
+    """One actionable line per skipped or failed post-commit cleanup.
+
+    The Track row is gone by now (``db_deleted=true`` always), so the line carries what an operator needs
+    to find the file: the Track id, the operation, the base name (not the full path), the outcome
+    (``failed`` or an intentional ``retained_*``) and the exception category.  Names are repr-quoted."""
+    log.log(
+        level,
+        "track_cleanup track_id=%s operation=%s db_deleted=true outcome=%s file=%r error=%s",
+        track_id, operation, outcome, name, error or "-",
+    )
 
 
 @dataclass
@@ -118,10 +143,9 @@ def _remove_waveform_after_commit(
             using=using,
         )
     except Exception as exc:
-        log.error(
-            "Track %s waveform cleanup failed after database deletion (%s)",
-            track_id,
-            type(exc).__name__,
+        _log_cleanup(
+            logging.ERROR, track_id=track_id, operation="waveform_remove", outcome="failed",
+            name=target.name, error=type(exc).__name__,
         )
 
 
@@ -155,19 +179,15 @@ def schedule_waveform_cleanup(sender, instance, using, **kwargs) -> None:
     canonical = _canonical_waveform(track_id)
     recorded = getattr(instance, "_deletion_waveform_path", instance.__dict__.get("waveform_path"))
     if recorded is None:
-        log.error(
-            "Track %s was deleted without a captured waveform_path; refusing filesystem cleanup",
-            track_id,
-        )
+        _log_cleanup(logging.ERROR, track_id=track_id, operation="waveform_remove",
+                     outcome="retained_unverified", name=canonical.name, error="waveform_path_not_captured")
         preserve_file = True
     elif recorded and Path(recorded) != canonical:
         # Never follow an unexpected database pathname during deletion.  The
         # canonical cache is also retained: the inconsistency needs operator
         # review rather than a guess about which file belongs to this Track.
-        log.error(
-            "Track %s was deleted with an unexpected waveform_path; refusing filesystem cleanup",
-            track_id,
-        )
+        _log_cleanup(logging.ERROR, track_id=track_id, operation="waveform_remove",
+                     outcome="retained_unexpected_path", name=canonical.name, error="waveform_path_not_canonical")
         preserve_file = True
     else:
         preserve_file = False
@@ -201,6 +221,10 @@ def register_signals() -> None:
     )
 
 
+class _PathBusy(Exception):
+    """The source path's registration lock was not obtained within the cleanup's bounded wait."""
+
+
 def _schedule_source_cleanup(
     path: Path | None,
     result: SourceCleanup,
@@ -208,6 +232,7 @@ def _schedule_source_cleanup(
     *,
     track_id: int,
     on_error=None,
+    grace: bool = True,
 ) -> None:
     if path is None:
         return
@@ -215,78 +240,71 @@ def _schedule_source_cleanup(
     scheduled_witness = _source_witness(path)
     result.status = "pending"
 
+    name = path.name
+
+    def retain(status: str, reason: str) -> None:
+        result.status = status
+        _log_cleanup(logging.WARNING, track_id=track_id, operation="source_unlink",
+                     outcome=status, name=name, error=reason)
+
+    def decide_and_unlink() -> None:
+        """Runs holding the path's registration lock: no Track registration of this path is in flight."""
+        current_witness = _source_witness(path)
+        if current_witness is _WITNESS_UNAVAILABLE or scheduled_witness is _WITNESS_UNAVAILABLE:
+            return retain("retained_unverified", "identity_unavailable")
+        if current_witness is None:
+            result.status = "missing"
+            return
+        if scheduled_witness is None or current_witness != scheduled_witness:
+            return retain("retained_replaced", "changed_since_delete")
+        if grace and _now_ns() - current_witness[4] < SOURCE_FRESHNESS_GRACE_SECONDS * 1_000_000_000:
+            return retain("retained_recent", "changed_within_grace")
+        from library.models import Track
+
+        # Under the path lock a registration either committed (visible here) or has not begun (it waits
+        # for this transaction, then finds the file gone or decides for itself).
+        if Track._base_manager.using(using).filter(filepath=str(canonical)).exists():
+            return retain("retained_live_owner", "path_owned_by_track")
+        if _source_witness(path) != scheduled_witness:
+            return retain("retained_replaced", "changed_before_unlink")
+        path.unlink()
+        result.status = "removed"
+
     def remove() -> None:
         try:
             if canonical is None:
-                result.status = "retained_invalid_path"
-                log.error(
-                    "Track %s source cleanup retained an unvalidated path after database deletion",
-                    track_id,
-                )
-                return
-
-            current_witness = _source_witness(path)
-            if current_witness is _WITNESS_UNAVAILABLE or scheduled_witness is _WITNESS_UNAVAILABLE:
-                result.status = "retained_unverified"
-                log.error(
-                    "Track %s source cleanup retained media because file identity could not be verified",
-                    track_id,
-                )
-                return
-            if current_witness is None:
-                result.status = "missing"
-                return
-            if scheduled_witness is None or current_witness != scheduled_witness:
-                result.status = "retained_replaced"
-                return
-
-            # This indexed equality check is intentionally immediately before
-            # unlink.  Canonical ingestion paths make it an exact identity
-            # comparison, not a prefix match.  The final witness prevents a
-            # replacement between the first stat and this ownership query from
-            # being mistaken for the deleted Track's file.
-            from library.models import Track
-
-            if Track._base_manager.using(using).filter(filepath=str(canonical)).exists():
-                result.status = "retained_live_owner"
-                return
-            if _source_witness(path) != scheduled_witness:
-                result.status = "retained_replaced"
-                return
-
-            # A transaction that creates a new Track after the equality query
-            # but before unlink is the remaining narrow race.  Closing it
-            # absolutely would require every Track-file writer to participate
-            # in a new shared source-path lease.  The two immediate identity
-            # checks prevent this cleanup from deleting a replaced file, but
-            # do not claim to provide that broader write-side protocol.
-            path.unlink()
-            result.status = "removed"
+                return retain("retained_invalid_path", "not_canonical_absolute")
+            try:
+                with transaction.atomic(using=using):
+                    try:
+                        source_paths.acquire(canonical, using, timeout_ms=source_paths.CLEANUP_LOCK_TIMEOUT_MS)
+                    except OperationalError as exc:
+                        raise _PathBusy from exc
+                    decide_and_unlink()
+            except _PathBusy:
+                retain("retained_busy", "path_lock_timeout")
         except FileNotFoundError:
             result.status = "missing"
         except Exception as exc:
             result.status = "failed"
             result.error = type(exc).__name__
-            log.error(
-                "Track %s source cleanup failed after database deletion (%s)",
-                track_id,
-                result.error,
-            )
+            _log_cleanup(logging.ERROR, track_id=track_id, operation="source_unlink", outcome="failed",
+                         name=name, error=result.error)
             if on_error is not None:
                 try:
                     on_error(path, exc)
                 except Exception as reporter_exc:
-                    log.error(
-                        "Track %s source-cleanup failure reporter failed (%s)",
-                        track_id,
-                        type(reporter_exc).__name__,
-                    )
+                    _log_cleanup(logging.ERROR, track_id=track_id, operation="source_failure_report",
+                                 outcome="failed", name=name, error=type(reporter_exc).__name__)
 
     transaction.on_commit(remove, using=using, robust=True)
 
 
-def delete_track(track, *, remove_source: bool, on_source_error=None) -> SourceCleanup:
-    """Delete one Track and register intended source cleanup after commit."""
+def delete_track(track, *, remove_source: bool, on_source_error=None, source_grace: bool = True) -> SourceCleanup:
+    """Delete one Track and register intended source cleanup after commit.
+
+    ``source_grace=False`` is for a caller that itself created the source file moments ago and owns its
+    path (the dedication render's abandoned audio); everyone else keeps recently changed audio."""
     using = track._state.db or DEFAULT_DB_ALIAS
     track_id = track.pk
     source = Path(track.filepath) if remove_source and track.filepath else None
@@ -301,11 +319,12 @@ def delete_track(track, *, remove_source: bool, on_source_error=None) -> SourceC
                 using,
                 track_id=track_id,
                 on_error=on_source_error,
+                grace=source_grace,
             )
     return result
 
 
-def delete_tracks(queryset, *, remove_sources: bool, on_source_error=None) -> list[SourceCleanup]:
+def delete_tracks(queryset, *, remove_sources: bool, on_source_error=None, source_grace: bool = True) -> list[SourceCleanup]:
     """Delete a queryset as one transaction, with per-row after-commit cleanup."""
     using = queryset.db
     rows = list(queryset.values_list("pk", "filepath"))
@@ -332,5 +351,6 @@ def delete_tracks(queryset, *, remove_sources: bool, on_source_error=None) -> li
                     using,
                     track_id=track_id,
                     on_error=on_source_error,
+                    grace=source_grace,
                 )
     return results

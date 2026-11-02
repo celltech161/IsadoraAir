@@ -2127,6 +2127,16 @@ def _delete_track_and_file(track, *, include_cleanup=False):
             "Track database deletion committed, but source media was retained because "
             "its file identity could not be verified."
         )
+    elif cleanup.status == "retained_recent":
+        warning = (
+            "Track database deletion committed, but the source file was changed within the last minute "
+            "and was kept in case it is a delivery in progress; remove it manually if it is not needed."
+        )
+    elif cleanup.status == "retained_busy":
+        warning = (
+            "Track database deletion committed, but the source file was kept because another operation "
+            "was registering the same path; remove it manually if it is not needed."
+        )
     result = (True, warning)
     return (*result, cleanup.status) if include_cleanup else result
 

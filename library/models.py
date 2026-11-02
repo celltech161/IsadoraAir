@@ -4,7 +4,7 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, URLValidator
-from django.db import models, transaction
+from django.db import models, router, transaction
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 
@@ -325,12 +325,25 @@ def register_track_write_guard(save, update, bulk_update) -> None:
         TRACK_WRITE_GUARDS.append((save, update, bulk_update))
 
 
+def _claim_source_paths(paths, using) -> None:
+    """Take the per-path registration lock (library.services.source_paths) for every path, in a stable
+    order, inside the caller's transaction.  Cleanup of a deleted Track's audio takes the same lock."""
+    from library.services import source_paths
+    for path in sorted({p for p in paths if p}):
+        source_paths.acquire(path, using, timeout_ms=source_paths.REGISTRATION_LOCK_TIMEOUT_MS)
+
+
 class TrackQuerySet(models.QuerySet):
     def update(self, **kwargs):
         from library.services import cue_markers
         cue_markers.guard_columns(kwargs)
         for _save, update, _bulk in TRACK_WRITE_GUARDS:
             update(self, kwargs)
+        target = kwargs.get("filepath")
+        if isinstance(target, str) and target:
+            with transaction.atomic(using=self.db):
+                _claim_source_paths([target], self.db)
+                return super().update(**kwargs)
         return super().update(**kwargs)
 
     def bulk_update(self, objs, fields, batch_size=None):
@@ -339,6 +352,10 @@ class TrackQuerySet(models.QuerySet):
         objs = list(objs)
         for _save, _update, bulk in TRACK_WRITE_GUARDS:
             bulk(objs, fields)
+        if "filepath" in fields:
+            with transaction.atomic(using=self.db):
+                _claim_source_paths([o.filepath for o in objs], self.db)
+                return super().bulk_update(objs, fields, batch_size=batch_size)
         return super().bulk_update(objs, fields, batch_size=batch_size)
 
     def bulk_create(self, objs, *args, **kwargs):
@@ -353,7 +370,9 @@ class TrackQuerySet(models.QuerySet):
         for obj in objs:
             for save, _update, _bulk in TRACK_WRITE_GUARDS:
                 save(obj, None)
-        return super().bulk_create(objs, *args, **kwargs)
+        with transaction.atomic(using=self.db):
+            _claim_source_paths([o.filepath for o in objs], self.db)
+            return super().bulk_create(objs, *args, **kwargs)
 
 
 class Track(models.Model):
@@ -544,12 +563,28 @@ class Track(models.Model):
         instance = super().from_db(db, field_names, values)
         from library.services import cue_markers
         cue_markers.remember_loaded(instance)
+        instance._remember_loaded_filepath()
         return instance
 
     def refresh_from_db(self, *args, **kwargs):
         super().refresh_from_db(*args, **kwargs)
         from library.services import cue_markers
         cue_markers.remember_loaded(self)
+        self._remember_loaded_filepath()
+
+    def _remember_loaded_filepath(self) -> None:
+        if "filepath" in self.__dict__:
+            self.__dict__["_loaded_filepath"] = self.__dict__["filepath"]
+
+    def _filepath_to_claim(self, update_fields):
+        """The path this save newly registers (a creation, or a changed ``filepath``), else None."""
+        if "filepath" not in self.__dict__:
+            return None
+        if update_fields is not None and "filepath" not in update_fields:
+            return None
+        if self._state.adding or self.__dict__["filepath"] != self.__dict__.get("_loaded_filepath"):
+            return self.filepath or None
+        return None
 
     def save(self, *args, **kwargs):
         from library.services import cue_markers
@@ -558,8 +593,18 @@ class Track(models.Model):
             return              # nothing but marker columns, which this save may not write
         if self.check_write_guards(kwargs.get("update_fields")):
             kwargs["force_update"] = True
-        super().save(*args, **kwargs)
+        claim = self._filepath_to_claim(kwargs.get("update_fields"))
+        if claim is None:
+            super().save(*args, **kwargs)
+        else:
+            # Registering a source path: hold its advisory lock for this write's transaction so a concurrent
+            # post-delete cleanup of the same path cannot unlink the audio before this row is visible.
+            using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+            with transaction.atomic(using=using):
+                _claim_source_paths([claim], using)
+                super().save(*args, **kwargs)
         cue_markers.remember_loaded(self)
+        self._remember_loaded_filepath()
 
 
 # ---------------------------------------------------------------

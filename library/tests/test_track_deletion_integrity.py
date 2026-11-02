@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -9,7 +10,7 @@ from unittest import mock
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth.models import User
 from django.core.management import call_command
-from django.db import close_old_connections, transaction
+from django.db import close_old_connections, connections, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -24,7 +25,7 @@ from library.models import (
     PlaylistItem,
     Track,
 )
-from library.services import waveform_cache
+from library.services import source_paths, track_deletion, waveform_cache
 from library.services.track_deletion import delete_track, delete_tracks
 from library.views import _delete_track_and_file
 
@@ -57,6 +58,11 @@ class _DeletionFixture:
         )
         settings.enable()
         self.addCleanup(settings.disable)
+        # Fixture files are written moments before they are deleted; the freshness rule is exercised
+        # explicitly (RealClockFreshnessTests stops this patch).
+        self.clock = mock.patch.object(track_deletion, "_now_ns", lambda: time.time_ns() + 86_400 * 10**9)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
         kind, _ = CategoryKind.objects.get_or_create(code="music", defaults={"name": "Music"})
         self.category = Category.objects.create(code="DELETE", name="Delete", kind=kind)
         self.artist = Artist.objects.create(name="Deletion Test Artist")
@@ -563,3 +569,294 @@ class BulkDeletionReportingTests(_DeletionFixture, TransactionTestCase):
         self.assertEqual(len(body["blocked"]), 1)
         self.assertEqual(body["blocked"][0]["id"], blocked_id)
         self.assertTrue(Track.objects.filter(pk=blocked_id).exists())
+
+
+def _wait_for(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _waiting_backends(kind):
+    """Backends currently blocked: on a transaction id (the unique index) or on an advisory lock."""
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        if kind == "advisory":
+            cursor.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+        else:
+            cursor.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted")
+        return cursor.fetchone()[0]
+
+
+class SourcePathRaceTests(_DeletionFixture, TransactionTestCase):
+    """L1: a Track registered at the deleted Track's path, in flight when the cleanup runs.
+
+    The creator runs in a second connection.  Every interleaving is forced by waiting on the database's
+    own lock state (pg_locks), never on sleeps."""
+
+    def _creator(self, path, *, hold=None, fail=False):
+        results = {}
+        taking = threading.Event()
+
+        def run():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    taking.set()
+                    Track.objects.create(
+                        filepath=path, filename=Path(path).name, title="new owner", artist=self.artist,
+                        category=self.category, duration_seconds=2.0, format="flac",
+                    )
+                    results["inserted"] = True
+                    if hold is not None:
+                        hold.wait(20)
+                    if fail:
+                        raise RuntimeError("ingest failed after registering")
+            except Exception as exc:
+                results["error"] = repr(exc)
+            finally:
+                connections.close_all()
+
+        return threading.Thread(target=run), taking, results
+
+    def _delete_while_creator_waits(self, track, creator, taking, **delete_kwargs):
+        """Delete ``track``; once the creator is provably blocked behind the uncommitted delete, commit."""
+        original = track_deletion._schedule_source_cleanup
+
+        def after_row_delete(*args, **kwargs):
+            creator.start()
+            self.assertTrue(taking.wait(10))
+            self.assertTrue(_wait_for(lambda: _waiting_backends("transactionid") >= 1),
+                            "creator never blocked behind the uncommitted delete")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(track_deletion, "_schedule_source_cleanup", after_row_delete):
+            return delete_track(track, remove_source=True, **delete_kwargs)
+
+    def _release_when_cleanup_waits(self, hold):
+        def watch():
+            try:
+                _wait_for(lambda: _waiting_backends("advisory") >= 1)
+                hold.set()
+            finally:
+                connections.close_all()          # this thread's own connection
+        thread = threading.Thread(target=watch)
+        thread.start()
+        return thread
+
+    def test_creator_still_uncommitted_when_the_delete_commits_keeps_its_file(self):
+        old = self.track("shared.flac", cache=False)
+        path = old.filepath
+        hold = threading.Event()
+        creator, taking, results = self._creator(path, hold=hold)
+        releaser = self._release_when_cleanup_waits(hold)
+        cleanup = self._delete_while_creator_waits(old, creator, taking)
+        creator.join(20)
+        releaser.join(20)
+        self.assertEqual(results.get("error"), None)
+        self.assertEqual(cleanup.status, "retained_live_owner")
+        self.assertTrue(Track.objects.filter(filepath=path).exists())
+        self.assertTrue(Path(path).exists())
+
+    def test_creator_that_commits_immediately_keeps_its_file(self):
+        old = self.track("shared2.flac", cache=False)
+        path = old.filepath
+        creator, taking, results = self._creator(path)
+        cleanup = self._delete_while_creator_waits(old, creator, taking)
+        creator.join(20)
+        self.assertEqual(results.get("error"), None)
+        self.assertEqual(cleanup.status, "retained_live_owner")
+        self.assertTrue(Track.objects.filter(filepath=path).exists())
+        self.assertTrue(Path(path).exists())
+
+    def test_creator_that_fails_after_registering_leaves_the_path_free_for_the_delete(self):
+        old = self.track("shared3.flac", cache=False)
+        path = old.filepath
+        hold = threading.Event()
+        creator, taking, results = self._creator(path, hold=hold, fail=True)
+        releaser = self._release_when_cleanup_waits(hold)
+        cleanup = self._delete_while_creator_waits(old, creator, taking)
+        creator.join(20)
+        releaser.join(20)
+        self.assertIn("ingest failed", results["error"])
+        self.assertEqual(cleanup.status, "removed")
+        self.assertFalse(Track.objects.filter(filepath=path).exists())
+        self.assertFalse(Path(path).exists())
+
+    def test_cleanup_that_cannot_get_the_path_retains_the_file_and_says_so(self):
+        old = self.track("shared4.flac", cache=False)
+        path = old.filepath
+        hold = threading.Event()
+        creator, taking, results = self._creator(path, hold=hold)
+        with mock.patch.object(source_paths, "CLEANUP_LOCK_TIMEOUT_MS", 300), \
+             self.assertLogs("library.services.track_deletion", level="WARNING") as logs:
+            cleanup = self._delete_while_creator_waits(old, creator, taking)
+        hold.set()
+        creator.join(20)
+        self.assertEqual(cleanup.status, "retained_busy")
+        self.assertTrue(Path(path).exists())
+        self.assertTrue(any("outcome=retained_busy" in line and "shared4.flac" in line for line in logs.output))
+
+    def test_unrelated_path_is_not_blocked_by_a_registration_in_flight(self):
+        other = self.track("other.flac", cache=False)
+        other_path = Path(other.filepath)
+        hold = threading.Event()
+        creator, taking, results = self._creator(str(self.media / "busy.flac"), hold=hold)
+        creator.start()
+        self.assertTrue(taking.wait(10))
+        self.assertTrue(_wait_for(lambda: results.get("inserted")), "the creator never registered its path")
+        started = time.monotonic()
+        cleanup = delete_track(other, remove_source=True)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(cleanup.status, "removed")
+        self.assertFalse(other_path.exists())
+        hold.set()
+        creator.join(20)
+
+    def test_ordinary_delete_still_removes_unreferenced_audio(self):
+        track = self.track("plain.flac", cache=False)
+        path = Path(track.filepath)
+        self.assertEqual(delete_track(track, remove_source=True).status, "removed")
+        self.assertFalse(path.exists())
+
+    def test_two_bulk_creators_registering_the_same_paths_in_opposite_order_cannot_deadlock(self):
+        paths = [str(self.media / "x.flac"), str(self.media / "y.flac")]
+        for path in paths:
+            Path(path).write_bytes(b"audio")
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def bulk(order):
+            close_old_connections()
+            try:
+                barrier.wait(10)
+                Track.objects.bulk_create([
+                    Track(filepath=p, filename=Path(p).name, title=Path(p).name, artist=self.artist,
+                          category=self.category, duration_seconds=1.0, format="flac")
+                    for p in order
+                ], ignore_conflicts=True)
+            except Exception as exc:
+                errors.append(repr(exc))
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=bulk, args=(paths,)), threading.Thread(target=bulk, args=(paths[::-1],))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(Track.objects.filter(filepath__in=paths).count(), 2)
+
+
+class RegistrationClaimTests(_DeletionFixture, TestCase):
+    def test_only_a_creation_or_a_changed_filepath_claims_a_path(self):
+        track = self.track(cache=False)
+        with mock.patch.object(source_paths, "acquire") as acquire:
+            Track.objects.get(pk=track.pk).save()
+            Track.objects.get(pk=track.pk).save(update_fields=["title"])
+            self.assertFalse(acquire.called)
+            moved = Track.objects.get(pk=track.pk)
+            moved.filepath = str(self.media / "moved.flac")
+            moved.save()
+            self.assertEqual([call.args[0] for call in acquire.call_args_list], [moved.filepath])
+            acquire.reset_mock()
+            Track.objects.filter(pk=track.pk).update(play_count=3)
+            self.assertFalse(acquire.called)
+            Track.objects.filter(pk=track.pk).update(filepath=str(self.media / "again.flac"))
+            self.assertEqual([call.args[0] for call in acquire.call_args_list], [str(self.media / "again.flac")])
+
+    def test_creation_claims_its_path_inside_the_writing_transaction(self):
+        seen = []
+        real = source_paths.acquire
+
+        def spy(path, using, *, timeout_ms):
+            seen.append((path, transaction.get_connection(using).in_atomic_block))
+            return real(path, using, timeout_ms=timeout_ms)
+
+        with mock.patch.object(source_paths, "acquire", spy):
+            track = self.track("claimed.flac", cache=False)
+        self.assertEqual(seen, [(track.filepath, True)])
+
+    def test_lock_key_is_stable_per_path_and_distinct_between_paths(self):
+        self.assertEqual(source_paths.lock_key("/a/b.flac"), source_paths.lock_key("/a//b.flac"))
+        self.assertNotEqual(source_paths.lock_key("/a/b.flac"), source_paths.lock_key("/a/c.flac"))
+
+
+class RealClockFreshnessTests(_DeletionFixture, TestCase):
+    """The freshness rule with the real clock (the fixture's advanced clock is stopped)."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock.stop()
+        self.addCleanup(self.clock.start)       # keeps the fixture's own stop() balanced
+
+    def test_recently_changed_audio_is_kept_and_reported(self):
+        track = self.track("fresh.flac", cache=False)
+        track_id = track.pk
+        path = Path(track.filepath)
+        with self.assertLogs("library.services.track_deletion", level="WARNING") as logs, \
+             self.captureOnCommitCallbacks(execute=True):
+            cleanup = delete_track(track, remove_source=True)
+        self.assertEqual(cleanup.status, "retained_recent")
+        self.assertTrue(path.exists())
+        self.assertFalse(Track.objects.filter(pk=track_id).exists())
+        self.assertTrue(any("operation=source_unlink" in line and "outcome=retained_recent" in line
+                            and f"track_id={track_id} " in line and "db_deleted=true" in line
+                            and "fresh.flac" in line and str(self.media) not in line for line in logs.output))
+
+    def test_a_delivery_exposed_before_its_track_is_registered_survives_the_old_tracks_delete(self):
+        old = self.track("episode.flac", cache=False)
+        path = Path(old.filepath)
+        delivery = path.with_name("episode.flac.incoming")
+        delivery.write_bytes(b"new episode")
+        os.replace(delivery, path)                                       # the outside ingest exposes it
+        with self.captureOnCommitCallbacks(execute=True):
+            cleanup = delete_track(old, remove_source=True)
+        self.assertEqual(cleanup.status, "retained_recent")
+        self.assertEqual(path.read_bytes(), b"new episode")
+        Track.objects.create(filepath=str(path), filename=path.name, title="new", artist=self.artist,
+                             category=self.category, duration_seconds=1.0, format="flac")
+        self.assertTrue(path.exists())
+
+    def test_caller_that_owns_a_fresh_file_can_remove_it(self):
+        track = self.track("mine.flac", cache=False)
+        path = Path(track.filepath)
+        with self.captureOnCommitCallbacks(execute=True):
+            cleanup = delete_track(track, remove_source=True, source_grace=False)
+        self.assertEqual(cleanup.status, "removed")
+        self.assertFalse(path.exists())
+
+
+class CleanupEvidenceTests(_DeletionFixture, TestCase):
+    def test_failed_source_cleanup_log_identifies_the_file_without_its_directory(self):
+        track = self.track("stuck.flac", cache=False)
+        track_id = track.pk
+        with mock.patch("pathlib.Path.unlink", side_effect=PermissionError("denied")), \
+             self.assertLogs("library.services.track_deletion", level="ERROR") as logs, \
+             self.captureOnCommitCallbacks(execute=True):
+            cleanup = delete_track(track, remove_source=True)
+        self.assertEqual(cleanup.status, "failed")
+        line = next(entry for entry in logs.output if "operation=source_unlink" in entry)
+        for fragment in (f"track_id={track_id} ", "db_deleted=true", "outcome=failed", "'stuck.flac'",
+                         "error=PermissionError"):
+            self.assertIn(fragment, line)
+        self.assertNotIn(str(self.media), line)
+
+    def test_failed_waveform_cleanup_log_names_the_cache_file(self):
+        track = self.track("cache.flac")
+        track_id = track.pk
+        with mock.patch.object(waveform_cache, "remove", side_effect=OSError("disk gone")), \
+             self.assertLogs("library.services.track_deletion", level="ERROR") as logs, \
+             self.captureOnCommitCallbacks(execute=True):
+            delete_track(track, remove_source=False)
+        line = next(entry for entry in logs.output if "operation=waveform_remove" in entry)
+        for fragment in (f"track_id={track_id} ", "db_deleted=true", "outcome=failed", f"'{track_id}.json'",
+                         "error=OSError"):
+            self.assertIn(fragment, line)
+        self.assertNotIn(str(self.waves), line)

@@ -26,11 +26,17 @@ class Command(BaseCommand):
         if track is not None:
             from library.services.track_deletion import delete_track
 
-            cleanup = delete_track(track, remove_source=True)
+            # The caller names this exact file: no freshness grace, but registration of the path is still coordinated.
+            cleanup = delete_track(track, remove_source=True, source_grace=False)
             if cleanup.status == "failed":
                 raise CommandError(
                     f"Track {track_id} was deleted, but source file {filepath} could not be removed: "
                     f"{cleanup.error}"
+                )
+            if cleanup.status.startswith("retained"):
+                raise CommandError(
+                    f"Track {track_id} was deleted, but source file {filepath} was kept ({cleanup.status}); "
+                    "it needs manual review"
                 )
         else:
             try:

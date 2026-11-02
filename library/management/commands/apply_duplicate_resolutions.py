@@ -78,6 +78,11 @@ class Command(BaseCommand):
                     self.stderr.write(
                         f"    [WARN] Track row was deleted, but source file {fp} remains: {cleanup.error}"
                     )
+                elif cleanup.status.startswith("retained"):
+                    self.stderr.write(
+                        f"    [WARN] Track row was deleted; source file {fp} was kept ({cleanup.status}) "
+                        "and needs manual review"
+                    )
 
         if not apply:
             self.stdout.write(self.style.WARNING("\nNothing was actually deleted -- re-run with --apply to act on this."))

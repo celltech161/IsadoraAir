@@ -713,7 +713,8 @@ def synthesize_dedication_intro(req):
             if not still_referenced:
                 from library.services.track_deletion import delete_track
 
-                cleanup = delete_track(intro_track, remove_source=True)
+                # This process rendered final_path moments ago and owns it (advisory-locked per request).
+                cleanup = delete_track(intro_track, remove_source=True, source_grace=False)
                 if cleanup.status == "failed":
                     print(
                         f"  Dedication intro Track was deleted, but source file {final_path} "
