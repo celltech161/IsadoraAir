@@ -483,28 +483,31 @@ class TrackAdmin(admin.ModelAdmin):
 
     def delete_model(self, request, obj):
         # Single-object delete (after Django's own confirmation page).
-        self._delete_file(request, obj)
-        super().delete_model(request, obj)
+        from library.services.track_deletion import delete_track
+
+        delete_track(
+            obj,
+            remove_source=True,
+            on_source_error=lambda path, exc: messages.error(
+                request,
+                f"Track was deleted, but its source file '{path}' could not be removed: {exc}",
+            ),
+        )
 
     def delete_queryset(self, request, queryset):
         # Bulk "Delete selected" action (after Django's own confirmation
         # page, which already blocks the whole batch if anything in it is
-        # PROTECTed -- e.g. still referenced by an active Playlist). Same
-        # file-then-row order as apply_duplicate_resolutions.
-        for obj in queryset:
-            self._delete_file(request, obj)
-        super().delete_queryset(request, queryset)
+        # PROTECTed -- e.g. still referenced by an active Playlist).
+        from library.services.track_deletion import delete_tracks
 
-    def _delete_file(self, request, obj):
-        if not obj.filepath:
-            return
-        fp = Path(obj.filepath)
-        if not fp.is_file():
-            return
-        try:
-            fp.unlink()
-        except OSError as exc:
-            messages.error(request, f"Failed to delete file for '{obj}': {exc}")
+        delete_tracks(
+            queryset,
+            remove_sources=True,
+            on_source_error=lambda path, exc: messages.error(
+                request,
+                f"Track was deleted, but its source file '{path}' could not be removed: {exc}",
+            ),
+        )
 
 
 @admin.register(DuplicateCandidate)

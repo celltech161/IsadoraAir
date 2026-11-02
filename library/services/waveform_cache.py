@@ -48,6 +48,7 @@ import json
 import math
 import os
 import secrets
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +65,7 @@ ENVELOPE_DB_FLOOR, ENVELOPE_DB_CEILING = -120.0, 0.5
 LOCK_DIRNAME = ".locks"
 LOCK_TIMEOUT_SECONDS = 15.0
 PREVIOUS_SUFFIX = ".prev"
+DELETED_SUFFIX = ".deleted"
 
 # Verdicts
 MISSING, UNREADABLE, MALFORMED, WRONG_TRACK, INCONSISTENT = "missing", "unreadable", "malformed", "wrong_track", \
@@ -325,6 +327,42 @@ def _acquire_track_lock(track_id, timeout):
         raise
 
 
+def _deleted_marker(track_id) -> Path:
+    return lock_dir() / f"{int(track_id)}{DELETED_SUFFIX}"
+
+
+def _mark_track_deleted(track_id) -> None:
+    """Persist the deletion fence while the caller holds this Track's lock."""
+    marker = _deleted_marker(track_id)
+    try:
+        fd = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+        )
+    except FileExistsError:
+        # An earlier committed delete already fenced this id.  Do not require
+        # write access to a marker another service user may have created.
+        if not stat.S_ISREG(marker.lstat().st_mode):
+            raise OSError(f"waveform deletion fence is not a regular file: {marker}")
+        return
+    try:
+        os.write(fd, b"deleted\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_dir(marker.parent)
+
+
+def _clear_deleted_marker(track_id) -> None:
+    marker = _deleted_marker(track_id)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_dir(marker.parent)
+
+
 @contextlib.contextmanager
 def track_lock(wave_dir, track_id, *, timeout=LOCK_TIMEOUT_SECONDS):
     """The per-Track cache lock (cross-process ``flock``); WaveformBusy after ``timeout`` seconds.
@@ -512,6 +550,9 @@ def promote(track_id, payload: dict, wave_dir, *, expected_source=None, keep_pre
             raise PromotionRefused("source_changed", "the Track's file changed while the waveform was generated")
         if _newer_existing(final, track_id, payload["generation"]["started_ns"]):
             raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
+        # A primary key may be reused after a deliberate import/restore.  Its
+        # visible live row is the authority to clear an older deletion fence.
+        _clear_deleted_marker(track_id)
         data = json.dumps({**payload, **snapshot}, ensure_ascii=False, allow_nan=False).encode("utf-8")
         promotion = _replace(
             track_id, final, data, keep_previous=keep_previous,
@@ -536,6 +577,16 @@ def install_file(track_id, staged_file, wave_dir, *, keep_previous=False,
     final = canonical_path(wave_dir, track_id)
     lock_fd = _acquire_track_lock(track_id, lock_timeout)
     try:
+        marker = _deleted_marker(track_id)
+        if marker.exists():
+            # Unlike promote(), install_file is intentionally usable by a
+            # worker that cannot see its caller's still-uncommitted new Track
+            # row.  Only a committed deletion fence requires a database
+            # recheck; a genuine new/recreated row clears that older fence.
+            from library.models import Track
+            if not Track.objects.filter(pk=track_id).exists():
+                raise PromotionRefused("track_missing", f"Track {track_id} no longer exists")
+            _clear_deleted_marker(track_id)
         if "schema" in payload and _newer_existing(final, track_id, payload["generation"]["started_ns"]):
             raise PromotionRefused("superseded", "a newer waveform was promoted meanwhile")
         promotion = _replace(
@@ -564,12 +615,22 @@ def restore_file(track_id, backup_file, wave_dir, *, lock_timeout=LOCK_TIMEOUT_S
         _fsync_dir(final.parent)
 
 
-def remove(track_id, wave_dir=None, *, path=None, lock_timeout=LOCK_TIMEOUT_SECONDS) -> bool:
-    """Remove a Track's cache (default: the canonical one in ``wave_dir``) under its lock."""
+def remove(track_id, wave_dir=None, *, path=None, lock_timeout=LOCK_TIMEOUT_SECONDS,
+           track_deleted=False, preserve_file=False) -> bool:
+    """Remove a Track's cache (default: canonical) under its lock.
+
+    ``track_deleted`` writes a durable publisher fence before touching the
+    cache.  ``preserve_file`` is the fail-closed malformed-path case: fence
+    future writers without guessing that the canonical file is safe to unlink.
+    """
     target = Path(path) if path is not None else canonical_path(wave_dir, track_id)
     if not target.parent.is_dir():
         return False
     with track_lock(target.parent, track_id, timeout=lock_timeout):
+        if track_deleted:
+            _mark_track_deleted(track_id)
+        if preserve_file:
+            return False
         try:
             target.unlink()
         except FileNotFoundError:

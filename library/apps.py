@@ -14,6 +14,8 @@ class LibraryConfig(AppConfig):
         # with weak=False plus the same receiver identity.
         # 2.22B: VoiceTrack and ProductionMedia must share one database (B22).
         from library import checks  # noqa: F401 -- registers the system check
+        from library.services import track_deletion
+        track_deletion.register_signals()
 
         # 2.22B: evergreen VoiceTrack is the first iPortal recorder consumer.
         from production.recorder import registry as recorder_registry

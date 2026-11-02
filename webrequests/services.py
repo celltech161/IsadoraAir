@@ -711,11 +711,14 @@ def synthesize_dedication_intro(req):
                 or LogItem.objects.filter(track=intro_track).exists()
             )
             if not still_referenced:
-                intro_track.delete()
-                try:
-                    final_path.unlink()
-                except FileNotFoundError:
-                    pass
+                from library.services.track_deletion import delete_track
+
+                cleanup = delete_track(intro_track, remove_source=True)
+                if cleanup.status == "failed":
+                    print(
+                        f"  Dedication intro Track was deleted, but source file {final_path} "
+                        f"could not be removed: {cleanup.error}"
+                    )
             return DedicationSynthesisOutcome.FAILED
         if rendered.analysis_attempted and not rendered.analysis_succeeded:
             print(

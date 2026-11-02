@@ -54,7 +54,8 @@ class Command(BaseCommand):
             self.stdout.write(f"  {label} -- file missing: {track.filepath}")
             if apply:
                 try:
-                    track.delete()
+                    from library.services.track_deletion import delete_track
+                    delete_track(track, remove_source=False)
                     deleted += 1
                 except ProtectedError:
                     blocked += 1

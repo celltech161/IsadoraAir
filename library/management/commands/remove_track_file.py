@@ -24,22 +24,19 @@ class Command(BaseCommand):
         track = Track.objects.filter(filepath=str(filepath)).first()
         track_id = track.id if track is not None else None
         if track is not None:
-            waveform_path = track.waveform_path
-            track.delete()
-            if waveform_path:
-                # Under the Track's cache lock (r0123), after the row is gone, so a concurrent
-                # waveform refresh cannot leave a cache behind for the deleted Track.
-                from library.services import waveform_cache
-                wf = Path(waveform_path)
-                try:
-                    waveform_cache.remove(track_id, path=wf)
-                except (OSError, waveform_cache.WaveformBusy) as e:
-                    self.stderr.write(f"Could not remove waveform {wf}: {e}")
+            from library.services.track_deletion import delete_track
 
-        try:
-            filepath.unlink(missing_ok=True)
-        except OSError as e:
-            raise CommandError(f"Could not remove {filepath}: {e}")
+            cleanup = delete_track(track, remove_source=True)
+            if cleanup.status == "failed":
+                raise CommandError(
+                    f"Track {track_id} was deleted, but source file {filepath} could not be removed: "
+                    f"{cleanup.error}"
+                )
+        else:
+            try:
+                filepath.unlink(missing_ok=True)
+            except OSError as e:
+                raise CommandError(f"Could not remove {filepath}: {e}")
 
         self.stdout.write(
             f"Removed {filepath}"

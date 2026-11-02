@@ -2031,11 +2031,16 @@ def _delete_track_and_file(track):
     UI or an ingest pipeline recalls a delivered file."""
     from django.db.models.deletion import ProtectedError
     from library.models import PlaylistItem, RotationSlot
-    filepath = track.filepath
-    waveform_path = track.waveform_path
-    track_id = track.pk
+    from library.services.track_deletion import delete_track
+
     try:
-        track.delete()
+        cleanup = delete_track(
+            track,
+            remove_source=True,
+            on_source_error=lambda path, exc: print(
+                f"  [delete_track] Track row was deleted, but source file {path} could not be removed: {exc}"
+            ),
+        )
     except ProtectedError as exc:
         # Django raises this when a PROTECT FK still points at this
         # Track (Playlist.items.track and RotationSlot.track -- see
@@ -2072,24 +2077,10 @@ def _delete_track_and_file(track):
             parts.append(f"{n} {kind}")
         return False, f"still referenced by {', '.join(parts)} -- remove from those first"
 
-    # Only clean up on-disk artifacts after the DB delete succeeded --
-    # a failed track.delete() means nothing on disk should change.
-    if waveform_path:
-        from library.services import waveform_cache
-        try:
-            # Under the Track's cache lock (r0123), after the row is gone: a concurrent refresh
-            # either finished first or finds the Track missing and promotes nothing.
-            waveform_cache.remove(track_id, path=waveform_path)
-        except (OSError, waveform_cache.WaveformBusy) as e:
-            # Best-effort -- the Track row is already gone, so a
-            # stranded waveform cache is a cosmetic issue at worst.
-            print(f"  [delete_track] could not remove waveform {waveform_path}: {e}")
-    if filepath:
-        try:
-            Path(filepath).unlink(missing_ok=True)
-        except OSError as e:
-            print(f"  [delete_track] could not remove file {filepath}: {e}")
-    return True, None
+    warning = None
+    if cleanup.status == "failed":
+        warning = f"Track was deleted, but source file cleanup failed: {cleanup.error}"
+    return True, warning
 
 
 @require_http_methods(["GET", "PATCH", "DELETE"])
@@ -2146,7 +2137,10 @@ def api_track_detail(request, pk):
         ok, reason = _delete_track_and_file(track)
         if not ok:
             return JsonResponse({"error": f"Cannot delete: {reason}"}, status=409)
-        return JsonResponse({"ok": True})
+        response = {"ok": True}
+        if reason:
+            response["warning"] = reason
+        return JsonResponse(response)
 
     try:
         body = json.loads(request.body)
@@ -4018,6 +4012,7 @@ def api_waveform(request, track_id):
     from django.conf import settings as django_settings
 
     from library.services import audio_identity, cue_markers, waveform_cache
+    track = get_object_or_404(Track, pk=track_id)
     wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
     wave_file = wave_dir / f"{track_id}.json"
 
@@ -4031,20 +4026,18 @@ def api_waveform(request, track_id):
     if not isinstance(data, dict):
         return JsonResponse({"error": "Failed to read waveform"}, status=500)
 
-    track = Track.objects.filter(pk=track_id).first()
     data.pop("source", None)
-    if track is not None:
-        verdict = waveform_cache.validate(track, wave_file)
-        current_revision = (audio_identity.revision(verdict.payload["audio_identity"]) if verdict.trusted else None)
-        row = cue_markers.snapshot(track.pk)
-        data.update({
-            "cue_in_seconds": track.cue_in_seconds, "next_start": track.next_start_seconds,
-            "markers": {name: getattr(track, name) for name in cue_markers.MARKERS},
-            "marker_revision": track.cue_marker_revision,
-            "trust": {"status": verdict.status, "reason": verdict.reason, "trusted": verdict.trusted,
-                      "markers_current": verdict.markers_current, "audio_revision": current_revision},
-            "cue_marker_review": cue_markers.review(row, current_revision) if row else {},
-        })
+    verdict = waveform_cache.validate(track, wave_file)
+    current_revision = (audio_identity.revision(verdict.payload["audio_identity"]) if verdict.trusted else None)
+    row = cue_markers.snapshot(track.pk)
+    data.update({
+        "cue_in_seconds": track.cue_in_seconds, "next_start": track.next_start_seconds,
+        "markers": {name: getattr(track, name) for name in cue_markers.MARKERS},
+        "marker_revision": track.cue_marker_revision,
+        "trust": {"status": verdict.status, "reason": verdict.reason, "trusted": verdict.trusted,
+                  "markers_current": verdict.markers_current, "audio_revision": current_revision},
+        "cue_marker_review": cue_markers.review(row, current_revision) if row else {},
+    })
     return JsonResponse(data)
 
 

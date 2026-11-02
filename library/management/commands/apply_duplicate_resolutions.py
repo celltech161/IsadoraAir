@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
+from django.db import transaction
 from django.utils import timezone
 
 from library.models import DuplicateCandidate
@@ -54,17 +55,10 @@ class Command(BaseCommand):
                 already_tagged = keep.additional_categories.filter(id=drop.category_id).exists()
                 if not already_tagged:
                     self.stdout.write(f"    + tagging {keep} with additional category '{drop.category}' (from the track being dropped)")
-                    if apply:
-                        keep.additional_categories.add(drop.category_id)
 
             fp = Path(drop.filepath) if drop.filepath else None
             if fp and fp.is_file():
-                self.stdout.write(f"    - delete file: {fp}")
-                if apply:
-                    try:
-                        fp.unlink()
-                    except OSError as exc:
-                        self.stderr.write(f"    [WARN] Failed to delete {fp}: {exc}")
+                self.stdout.write(f"    - delete file after Track commit: {fp}")
             elif fp:
                 self.stdout.write(f"    - file already missing on disk: {fp} (will still delete the Track row)")
 
@@ -74,7 +68,16 @@ class Command(BaseCommand):
                 # either track removes this candidate row too, so there's no
                 # separate "mark applied" step here (unlike keep_both, where
                 # neither track is deleted and the row needs its own flag).
-                drop.delete()
+                from library.services.track_deletion import delete_track
+
+                with transaction.atomic():
+                    if drop.category_id and drop.category_id != keep.category_id and not already_tagged:
+                        keep.additional_categories.add(drop.category_id)
+                    cleanup = delete_track(drop, remove_source=True)
+                if cleanup.status == "failed":
+                    self.stderr.write(
+                        f"    [WARN] Track row was deleted, but source file {fp} remains: {cleanup.error}"
+                    )
 
         if not apply:
             self.stdout.write(self.style.WARNING("\nNothing was actually deleted -- re-run with --apply to act on this."))
