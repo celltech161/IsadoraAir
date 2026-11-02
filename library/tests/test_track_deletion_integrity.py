@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import tempfile
@@ -10,6 +11,7 @@ from unittest import mock
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth.models import User
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import close_old_connections, connections, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
@@ -860,3 +862,357 @@ class CleanupEvidenceTests(_DeletionFixture, TestCase):
                          "error=OSError"):
             self.assertIn(fragment, line)
         self.assertNotIn(str(self.waves), line)
+
+
+class _PausedAcquire:
+    """Patch ``source_paths.acquire`` so the named thread stops right after obtaining a path lock.
+
+    ``held`` is set once that thread owns the lock; it keeps it (inside its transaction) until ``release``."""
+
+    def __init__(self, thread_name):
+        self.thread_name = thread_name
+        self.held = threading.Event()
+        self.release = threading.Event()
+        self._real = source_paths.acquire
+
+    def __call__(self, path, using, *, timeout_ms):
+        self._real(path, using, timeout_ms=timeout_ms)
+        if threading.current_thread().name == self.thread_name and not self.held.is_set():
+            self.held.set()
+            if not self.release.wait(20):
+                raise RuntimeError("test never released the paused lock holder")
+
+    @contextlib.contextmanager
+    def patch(self):
+        """Active for the block; always releases the holder on exit, so a failed assertion cannot strand it."""
+        try:
+            with mock.patch.object(source_paths, "acquire", self):
+                yield self
+        finally:
+            self.release.set()
+
+
+def _in_thread(name, target, results):
+    def run():
+        close_old_connections()
+        try:
+            results["value"] = target()
+        except Exception as exc:
+            results["error"] = exc
+        finally:
+            connections.close_all()
+    return threading.Thread(target=run, name=name)
+
+
+class RecallRaceTests(_DeletionFixture, TransactionTestCase):
+    """remove_track_file (an explicit recall) against a concurrent first registration of the same file.
+
+    Every interleaving is forced on the database's own lock state (pg_locks), never on sleeps."""
+
+    def delivered(self, name):
+        folder = self.media / self.category.code
+        folder.mkdir(exist_ok=True)
+        path = folder / name
+        path.write_bytes(b"delivered audio")
+        return path
+
+    def recall(self, path):
+        out = StringIO()
+        call_command("remove_track_file", str(path), stdout=out, stderr=StringIO())
+        return out.getvalue()
+
+    def sync(self, path):
+        from library.management.commands import analyze_tracks, sync_track_file
+
+        # The registration is what races; the analysis that follows it is not under test.
+        with mock.patch.object(sync_track_file, "analyze_one_track",
+                               return_value=analyze_tracks.AnalysisOutcome(True)):
+            return sync_track_file.sync_track_file(str(path))
+
+    def test_review_probe_recall_while_an_uncommitted_creator_holds_the_path_keeps_its_audio(self):
+        # The independent review's reproduction: before 3.11's correction this recall found no visible
+        # Track, unlinked the file, and the creator then committed a Track pointing at nothing.
+        path = self.delivered("probe.flac")
+        paused, results = _PausedAcquire("creator"), {}
+        creator = _in_thread("creator", lambda: Track.objects.create(
+            filepath=str(path), filename=path.name, title="new delivery", artist=self.artist,
+            category=self.category, duration_seconds=1.0, format="flac"), results)
+        with paused.patch(), mock.patch.object(source_paths, "CLEANUP_LOCK_TIMEOUT_MS", 300):
+            creator.start()
+            self.assertTrue(paused.held.wait(10))
+            with self.assertRaisesRegex(CommandError, "being registered by another process.*nothing was removed"):
+                self.recall(path)
+            self.assertTrue(path.exists(), "the recall removed audio a registration in flight owns")
+            paused.release.set()
+            creator.join(20)
+        self.assertNotIn("error", results)
+        self.assertTrue(Track.objects.filter(filepath=str(path)).exists())
+        self.assertTrue(path.exists())
+
+    def test_creator_first_recall_waits_for_the_commit_then_removes_the_registered_track(self):
+        path = self.delivered("creator-first.flac")
+        paused, created, recalled = _PausedAcquire("creator"), {}, {}
+        creator = _in_thread("creator", lambda: self.sync(path), created)
+        recaller = _in_thread("recall", lambda: self.recall(path), recalled)
+        with paused.patch():
+            creator.start()
+            self.assertTrue(paused.held.wait(10))
+            recaller.start()
+            self.assertTrue(_wait_for(lambda: _waiting_backends("advisory") >= 1),
+                            "the recall did not wait for the registration's path lock")
+            self.assertTrue(path.exists())
+            paused.release.set()
+            creator.join(20)
+            recaller.join(20)
+        self.assertNotIn("error", created)
+        track, was_created = created["value"]
+        self.assertTrue(was_created)
+        self.assertNotIn("error", recalled)
+        self.assertEqual(recalled["value"].strip(), f"Removed {path} and Track {track.pk}")
+        self.assertFalse(Track.objects.filter(pk=track.pk).exists())
+        self.assertFalse(path.exists())
+
+    def test_recall_first_creator_fails_visibly_and_registers_nothing(self):
+        path = self.delivered("recall-first.flac")
+        paused, created, recalled = _PausedAcquire("recall"), {}, {}
+        recaller = _in_thread("recall", lambda: self.recall(path), recalled)
+        creator = _in_thread("creator", lambda: self.sync(path), created)
+        with paused.patch():
+            recaller.start()
+            self.assertTrue(paused.held.wait(10))
+            creator.start()
+            self.assertTrue(_wait_for(lambda: _waiting_backends("advisory") >= 1),
+                            "the creator did not wait for the recall's path lock")
+            paused.release.set()
+            recaller.join(20)
+            creator.join(20)
+        self.assertNotIn("error", recalled)
+        self.assertEqual(recalled["value"].strip(), f"Removed {path} (no Track row existed)")
+        self.assertIsInstance(created.get("error"), CommandError)
+        self.assertIn("disappeared before its Track could be registered", str(created["error"]))
+        self.assertFalse(Track.objects.filter(filepath=str(path)).exists())
+        self.assertFalse(path.exists())
+
+    def test_file_replaced_after_its_metadata_was_read_is_not_registered(self):
+        from library.management.commands import import_songs, sync_track_file
+
+        path = self.delivered("replaced.flac")
+        real_parse = import_songs.parse_tags
+
+        def parse_then_replace(filepath):
+            parsed = real_parse(filepath)
+            staged = path.with_name("replacement.part")
+            staged.write_bytes(b"a different delivery")
+            os.replace(staged, path)
+            return parsed
+
+        with mock.patch.object(sync_track_file, "parse_tags", parse_then_replace), \
+             self.assertRaisesRegex(CommandError, "changed while its metadata was being read"):
+            self.sync(path)
+        self.assertFalse(Track.objects.filter(filepath=str(path)).exists())
+        self.assertTrue(path.exists())
+
+    def test_registration_lock_timeout_is_bounded_and_reported(self):
+        path = self.delivered("busy-registration.flac")
+        paused, recalled = _PausedAcquire("recall"), {}
+        recaller = _in_thread("recall", lambda: self.recall(path), recalled)
+        with paused.patch(), mock.patch.object(source_paths, "REGISTRATION_LOCK_TIMEOUT_MS", 300):
+            recaller.start()
+            self.assertTrue(paused.held.wait(10))
+            with self.assertRaisesRegex(CommandError, "locked by a concurrent recall or cleanup.*no Track was registered"):
+                self.sync(path)
+            paused.release.set()
+            recaller.join(20)
+        self.assertFalse(Track.objects.filter(filepath=str(path)).exists())
+
+    def test_existing_track_recall_removes_track_source_and_waveform_after_commit(self):
+        track = self.track("recalled.flac")
+        source, wave = self.paths(track)
+        self.assertEqual(self.recall(source).strip(), f"Removed {source} and Track {track.pk}")
+        self.assertFalse(Track.objects.filter(pk=track.pk).exists())
+        self.assertFalse(source.exists())
+        self.assertFalse(wave.exists())
+
+    def test_rolled_back_recall_preserves_the_track_and_its_media(self):
+        track = self.track("kept.flac")
+        source, wave = self.paths(track)
+        with self.assertRaises(RuntimeError):
+            with transaction.atomic():
+                self.recall(source)
+                raise RuntimeError("caller rolled back")
+        self.assertTrue(Track.objects.filter(pk=track.pk).exists())
+        self.assertTrue(source.exists())
+        self.assertTrue(wave.exists())
+
+    def test_recall_of_an_unregistered_file_removes_it_and_of_a_missing_one_says_so(self):
+        path = self.delivered("loose.flac")
+        self.assertEqual(self.recall(path).strip(), f"Removed {path} (no Track row existed)")
+        self.assertFalse(path.exists())
+        self.assertEqual(self.recall(path).strip(),
+                         f"{path} was already absent and no Track row existed; nothing to remove")
+
+    def test_recall_of_a_registered_track_whose_file_is_already_gone_reports_it(self):
+        track = self.track("gone.flac", cache=False)
+        source = Path(track.filepath)
+        source.unlink()
+        self.assertEqual(self.recall(source).strip(),
+                         f"Removed Track {track.pk}; its source file {source} was already absent")
+        self.assertFalse(Track.objects.filter(pk=track.pk).exists())
+
+    def test_recall_is_not_blocked_by_a_registration_of_an_unrelated_path(self):
+        busy, other = self.delivered("busy.flac"), self.delivered("unrelated.flac")
+        paused, results = _PausedAcquire("creator"), {}
+        creator = _in_thread("creator", lambda: Track.objects.create(
+            filepath=str(busy), filename=busy.name, title="busy", artist=self.artist,
+            category=self.category, duration_seconds=1.0, format="flac"), results)
+        with paused.patch():
+            creator.start()
+            self.assertTrue(paused.held.wait(10))
+            started = time.monotonic()
+            self.assertEqual(self.recall(other).strip(), f"Removed {other} (no Track row existed)")
+            self.assertLess(time.monotonic() - started, 3)
+            paused.release.set()
+            creator.join(20)
+        self.assertNotIn("error", results)
+        self.assertTrue(busy.exists())
+
+
+class TrackLockOrderTests(_DeletionFixture, TransactionTestCase):
+    """Path lock before Track row lock, for every path-registering write (P2)."""
+
+    def test_review_probe_update_or_create_against_queryset_update_does_not_deadlock(self):
+        # The independent review's reproduction, unchanged: "row-first" (update_or_create) is made to enter
+        # its first path claim only after "path-first" (QuerySet.update) holds the path.  Django's
+        # update_or_create used to lock the row before Track.save claimed the path, so the two waited on
+        # each other and PostgreSQL aborted one as a deadlock.
+        track = self.track("old.flac", cache=False)
+        target = str(self.media / "new.flac")
+        row_locked, path_locked = threading.Event(), threading.Event()
+        real_acquire = source_paths.acquire
+
+        def wrapped(path, using, *, timeout_ms):
+            name = threading.current_thread().name
+            if name == "row-first":
+                row_locked.set()
+                if not path_locked.wait(10):
+                    raise RuntimeError("path-first thread did not obtain advisory lock")
+                return real_acquire(path, using, timeout_ms=timeout_ms)
+            if name == "path-first":
+                if not row_locked.wait(10):
+                    raise RuntimeError("row-first thread did not reach save")
+                real_acquire(path, using, timeout_ms=timeout_ms)
+                path_locked.set()
+                return None
+            return real_acquire(path, using, timeout_ms=timeout_ms)
+
+        def row_first():
+            with transaction.atomic():
+                Track.objects.update_or_create(pk=track.pk, defaults={"filepath": target})
+
+        def path_first():
+            with transaction.atomic():
+                Track.objects.filter(pk=track.pk).update(filepath=target)
+
+        results = {"row-first": {}, "path-first": {}}
+        with mock.patch.object(source_paths, "acquire", wrapped):
+            threads = [_in_thread(name, fn, results[name])
+                       for name, fn in (("row-first", row_first), ("path-first", path_first))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(20)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual({name: repr(r.get("error")) for name, r in results.items() if "error" in r}, {})
+        self.assertEqual(Track.objects.get(pk=track.pk).filepath, target)
+
+    def test_update_or_create_waits_for_the_path_before_taking_the_row(self):
+        track = self.track("row.flac", cache=False)
+        target = str(self.media / "claimed.flac")
+        paused, updater, upserter = _PausedAcquire("path-first"), {}, {}
+        first = _in_thread("path-first", lambda: Track.objects.filter(pk=track.pk).update(filepath=target), updater)
+        second = _in_thread("row-first", lambda: Track.objects.update_or_create(
+            pk=track.pk, defaults={"filepath": target, "title": "upserted"}), upserter)
+        with paused.patch():
+            first.start()
+            self.assertTrue(paused.held.wait(10))
+            second.start()
+            self.assertTrue(_wait_for(lambda: _waiting_backends("advisory") >= 1),
+                            "update_or_create did not wait on the path lock")
+            # Waiting on the path, update_or_create holds no row lock: nothing waits on a row.
+            self.assertEqual(_waiting_backends("transactionid"), 0)
+            paused.release.set()
+            first.join(20)
+            second.join(20)
+        self.assertNotIn("error", updater)
+        self.assertNotIn("error", upserter)
+        self.assertEqual(updater["value"], 1)
+        obj, created = upserter["value"]
+        self.assertFalse(created)
+        final = Track.objects.get(pk=track.pk)
+        self.assertEqual((final.filepath, final.title), (target, "upserted"))
+        self.assertTrue(Path(track.filepath).exists())   # no media was touched by either write
+
+    def test_bulk_filepath_updates_in_opposite_object_order_cannot_deadlock(self):
+        one, two = self.track("one.flac", cache=False), self.track("two.flac", cache=False)
+        targets = {one.pk: str(self.media / "a.flac"), two.pk: str(self.media / "b.flac")}
+        barrier, errors = threading.Barrier(2), []
+
+        def bulk(order):
+            close_old_connections()
+            try:
+                objs = list(Track.objects.filter(pk__in=order))
+                objs.sort(key=lambda obj: order.index(obj.pk))
+                for obj in objs:
+                    obj.filepath = targets[obj.pk]
+                barrier.wait(10)
+                Track.objects.bulk_update(objs, ["filepath"])
+            except Exception as exc:
+                errors.append(repr(exc))
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=bulk, args=([one.pk, two.pk],)),
+                   threading.Thread(target=bulk, args=([two.pk, one.pk],))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(dict(Track.objects.filter(pk__in=targets).values_list("pk", "filepath")), targets)
+
+
+class UpdateOrCreateSemanticsTests(_DeletionFixture, TestCase):
+    def test_claims_only_a_literal_filepath_default_before_django_runs(self):
+        track = self.track("semantics.flac", cache=False)
+        target = str(self.media / "renamed.flac")
+        with mock.patch.object(source_paths, "acquire") as acquire:
+            obj, created = Track.objects.update_or_create(pk=track.pk, defaults={"title": "retitled"})
+            self.assertEqual((obj.pk, created, obj.title), (track.pk, False, "retitled"))
+            self.assertFalse(acquire.called)       # no filepath change, no path lock
+            obj, created = Track.objects.using("default").update_or_create(
+                filepath=track.filepath, defaults={"filepath": target})
+            self.assertEqual((created, obj.filepath), (False, target))
+            # The early claim, then Track.save's own re-entrant claim of the same path.
+            self.assertEqual([(c.args[0], c.args[1]) for c in acquire.call_args_list],
+                             [(target, "default"), (target, "default")])
+
+    def test_create_branch_create_defaults_and_callable_defaults_keep_djangos_semantics(self):
+        fresh = str(self.media / "fresh.flac")
+        calls = []
+
+        def title():
+            calls.append("title")
+            return "made"
+
+        obj, created = Track.objects.update_or_create(
+            filepath=fresh,
+            defaults={"title": "updated"},
+            create_defaults={"title": title, "filename": "fresh.flac", "artist": self.artist,
+                             "category": self.category, "duration_seconds": 1.0, "format": "flac"},
+        )
+        self.assertTrue(created)
+        self.assertEqual((obj.title, calls), ("made", ["title"]))
+        obj, created = Track.objects.update_or_create(filepath=fresh, defaults={"title": title})
+        self.assertFalse(created)
+        self.assertEqual((obj.title, calls), ("made", ["title", "title"]))

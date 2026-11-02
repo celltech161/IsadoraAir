@@ -374,6 +374,25 @@ class TrackQuerySet(models.QuerySet):
             _claim_source_paths([o.filepath for o in objs], self.db)
             return super().bulk_create(objs, *args, **kwargs)
 
+    def update_or_create(self, defaults=None, create_defaults=None, **kwargs):
+        """Django's update_or_create, with the path lock taken before its row lock (3.11).
+
+        Django locks the matched row (``select_for_update``) and only then saves ``defaults``; a
+        ``filepath`` there makes ``Track.save`` claim the new path while holding that row, the reverse of
+        ``update(filepath=...)``, which claims the path before writing the row -- a lock-order cycle
+        PostgreSQL aborts as a deadlock.  Claiming a literal ``defaults["filepath"]`` first, in the same
+        transaction and on the same connection, makes every path-registering write path-then-row (the
+        save's own claim is then re-entrant).  The lookup and ``create_defaults`` need no early claim: the
+        creating branch holds no row lock when ``save`` claims its path.  A callable ``filepath`` default
+        is not evaluated early, so it keeps Django's row-then-path order (no caller passes one)."""
+        target = (defaults or {}).get("filepath")
+        if not (isinstance(target, str) and target):
+            return super().update_or_create(defaults, create_defaults, **kwargs)
+        self._for_write = True
+        with transaction.atomic(using=self.db):
+            _claim_source_paths([target], self.db)
+            return super().update_or_create(defaults, create_defaults, **kwargs)
+
 
 class Track(models.Model):
     ENERGY_CHOICES = [

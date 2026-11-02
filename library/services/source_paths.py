@@ -13,9 +13,22 @@ take the same PostgreSQL *transaction-scoped* advisory lock, keyed by the path:
   live owner and unlinks.  A registration that holds the lock makes the cleanup wait until it has
   committed (the owner is then visible) or rolled back (the path is genuinely free).
 
-The lock is per path (64-bit hash), never global, and is taken after a caller's row locks and before any
-waveform-cache lock; cleanup holds no database row lock, so there is no cycle with registration.  A wait is
-always bounded (``lock_timeout``): the cleanup retains the file, a registration fails visibly.
+The lock is per path (64-bit hash), never global.  **Order: path lock(s), then the Track row, then any
+waveform-cache lock.**  Every path-registering write claims its path before it writes (and so locks) the
+row: ``save``/``update``/``bulk_update``/``bulk_create`` claim before their statement, several paths are
+claimed in sorted order, and ``TrackQuerySet.update_or_create`` claims a literal ``defaults["filepath"]``
+before Django's ``select_for_update``.  Cleanup and ``remove_track_file`` take the lock before their
+ownership lookup and lock no Track row.  Known exception, deliberately left as is (3.11): Track Detail's
+category relocation (``api_track_update``) locks the row first and then claims the destination.  A cycle
+needs a second transaction that already holds that same destination path and then waits for the same
+Track's row; PostgreSQL detects it and aborts one side.  An aborted relocation rolls back, removes its
+staged destination link and keeps the original file, and Track Detail reports the error.  A wait is always bounded (``lock_timeout``): the cleanup retains the file, a registration fails
+visibly.
+
+``remove_track_file`` (an explicit recall) and ``sync_track_file`` (registration of a file that already
+exists) are the two ends of a recall race.  The recall looks up the Track and unlinks only while holding the
+lock.  The registration re-checks, under the lock, that the file is still there and still the file whose
+tags it read.  Whichever is first, no committed Track points at recalled audio.
 
 It does not cover a file an outside program exposes at the final path before it registers a Track (the
 syndicated ingest scripts copy the file, then start ``sync_track_file``).  That interval is covered by the

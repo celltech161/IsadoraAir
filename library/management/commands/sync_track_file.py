@@ -2,12 +2,14 @@ from pathlib import Path
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import OperationalError, router, transaction
 
 from library.management.commands.analyze_tracks import (
     analyze_one_track, apply_category_thresholds, get_waveforms_dir,
 )
 from library.management.commands.import_songs import parse_tags
 from library.models import AnalysisConfig, Album, Artist, Category, Genre, Track
+from library.services import audio_identity, source_paths
 from library.services.related_artists import resolve_fallback_metadata
 
 
@@ -49,12 +51,24 @@ def sync_track_file(filepath, ready2air=True, wave_dir=None):
     context -- callers that aren't a Command themselves should just
     catch it like any other exception) on: not a file, not under
     LIBRARY_ROOT, LIBRARY_ROOT/<category_code>/... folder has no
-    matching Category, or analysis failure. Returns (track, created)
-    on success."""
+    matching Category, the file vanishing or changing before its Track
+    is registered (see below), or analysis failure. Returns (track,
+    created) on success.
+
+    3.11: the Track is registered inside a transaction that holds the
+    path's registration lock (library.services.source_paths), and the
+    file is re-checked under that lock: a recall (remove_track_file)
+    that removed it first makes this fail with nothing registered, and
+    a file replaced since its tags were read is not registered with the
+    previous file's metadata. The lock is released when that write
+    commits -- before analysis -- unless the caller wraps this call in
+    its own transaction."""
     filepath = Path(filepath).resolve()
 
     if not filepath.is_file():
         raise CommandError(f"Not a file: {filepath}")
+    # Identity of the file whose tags are read below; re-checked under the path lock before registering.
+    witness = audio_identity.stat_source(filepath)
 
     root = Path(getattr(settings, "LIBRARY_ROOT", "/srv/isadoraair/music")).resolve()
     try:
@@ -128,10 +142,7 @@ def sync_track_file(filepath, ready2air=True, wave_dir=None):
         "ready2air": ready2air,
     }
 
-    track, created = Track.objects.update_or_create(
-        filepath=str(filepath),
-        defaults=defaults,
-    )
+    track, created = _register(filepath, witness, defaults)
 
     cfg = AnalysisConfig.load()
     cfg_values = (
@@ -173,6 +184,38 @@ def sync_track_file(filepath, ready2air=True, wave_dir=None):
         )
 
     return track, created
+
+
+class _PathBusy(Exception):
+    """The path's registration lock was not obtained within the bounded wait."""
+
+
+def _register(filepath, witness, defaults):
+    """update_or_create the path's Track holding its registration lock, if the file is still the one read."""
+    using = router.db_for_write(Track)
+    try:
+        with transaction.atomic(using=using):
+            try:
+                source_paths.acquire(filepath, using, timeout_ms=source_paths.REGISTRATION_LOCK_TIMEOUT_MS)
+            except OperationalError as exc:
+                raise _PathBusy from exc
+            current = audio_identity.stat_source(filepath)
+            if current is None:
+                raise CommandError(
+                    f"{filepath} disappeared before its Track could be registered (recalled or removed); "
+                    f"no Track was registered or updated"
+                )
+            if not audio_identity.same_content_witness(witness, current):
+                raise CommandError(
+                    f"{filepath} changed while its metadata was being read; no Track was registered or "
+                    f"updated -- sync it again"
+                )
+            return Track.objects.update_or_create(filepath=str(filepath), defaults=defaults)
+    except _PathBusy as exc:
+        raise CommandError(
+            f"{filepath} is locked by a concurrent recall or cleanup (not obtained within "
+            f"{source_paths.REGISTRATION_LOCK_TIMEOUT_MS} ms); no Track was registered or updated -- sync it again"
+        ) from exc.__cause__
 
 
 class Command(BaseCommand):
