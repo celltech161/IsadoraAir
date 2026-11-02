@@ -13,13 +13,22 @@ previews it, then applies exactly what was previewed:
   the Library filter (minus ``exclude_ids``), which the operator chooses explicitly.  Both are resolved on
   the server and capped at ``MAX_TRACKS``.  Tracks removed since the list was loaded are reported as
   missing, never guessed.
-* **Preview and token.**  The preview writes nothing.  It reports the resolved count, what each field would
-  change, the Tracks a write guard would refuse, warnings and a sample, plus a token over the resolved
-  Track ids and the normalized change set.  Apply recomputes the token and refuses (409) when the selection
-  or the change set no longer matches what was previewed.
-* **Apply.**  Each Track is applied in its own short transaction under its row lock, so one refused or
-  failing Track neither blocks nor rolls back the others, and every outcome is reported.  Shared lookup
-  rows (a new artist, album or genre) are created once, before the Tracks are written.
+* **Preview and token.**  The preview writes nothing to the library.  It reports the resolved count, what
+  each field would change, the Tracks a write guard would refuse, warnings and a sample.  It records, in the
+  operator's server-side session, each selected Track's *edit state* (a fingerprint of every column and
+  membership a bulk edit reads or writes, plus the file path) and what the preview decided for it, and
+  returns a token signed with ``django.core.signing`` that names that record, the operator, the resolved
+  Track ids and the normalized change set.  The token cannot be made without the server's key, expires
+  after ``TOKEN_MAX_AGE_SECONDS``, is good for one apply only and only in the session and for the operator
+  it was issued to.
+* **Apply.**  Refused (409) when the token is expired or used, or the selection or the change set no longer
+  matches the preview.  Otherwise each Track is applied in its own short transaction under its row lock: its
+  edit state is recomputed under that lock, and a Track that changed since the preview is reported
+  ``stale`` and left alone, never overwritten.  One refused, stale or failing Track neither blocks nor rolls
+  back the others; the selection as a whole is therefore *not* all-or-nothing, and the result reports
+  every Track as updated, unchanged, refused, stale, missing or failed.  Changes that a bulk edit neither
+  reads nor writes (play counts, logs, PlayEvents, cue markers, waveforms) do not make a Track stale.
+  Shared lookup rows (a new artist, album or genre) are created once, before the Tracks are written.
 
 Deliberately not done here: audio-file tags are never written (that stays a separate Track Detail
 action), cue markers are never written (they are not editable fields), waveform caches, source audio,
@@ -35,7 +44,11 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import secrets
+import time
+
 from django.conf import settings
+from django.core import signing
 from django.core.exceptions import ValidationError
 from django.db import DatabaseError, transaction
 
@@ -46,6 +59,12 @@ log = logging.getLogger(__name__)
 MAX_TRACKS = 1000
 #: Tracks shown with before/after values in a preview.
 SAMPLE_SIZE = 10
+#: How long a preview's token may be applied.
+TOKEN_MAX_AGE_SECONDS = 15 * 60
+#: Previews kept per session (the oldest unused one is dropped); each holds one entry per selected Track.
+PENDING_PREVIEWS = 3
+SESSION_KEY = "library_bulk_edit_previews"
+_TOKEN_SALT = "library.track_bulk_edit.preview.v2"
 
 LEAVE, SET, CLEAR = "leave", "set", "clear"
 SELECTION_IDS, SELECTION_FILTER = "ids", "filter"
@@ -281,11 +300,70 @@ def resolve_selection(raw) -> Selection:
     raise BulkEditError("selection.mode must be 'ids' or 'filter'")
 
 
-def token_for(ids, ops) -> str:
-    """Binds an apply to exactly the Tracks and the normalized changes that were previewed."""
-    payload = json.dumps({"v": 1, "ids": list(ids), "ops": [[o.field, o.op, o.value] for o in ops]},
-                         sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+def _digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def ops_digest(ops) -> str:
+    return _digest([[o.field, o.op, o.value] for o in ops])
+
+
+def ids_digest(ids) -> str:
+    return _digest(list(ids))
+
+
+def edit_state(track, additional, holidays) -> str:
+    """Fingerprint of everything a bulk edit reads or writes for this Track (and its file path): a change to
+    any of it between preview and apply makes the Track stale.  Play counts, timestamps, cue markers and
+    other columns are deliberately excluded."""
+    return _digest([
+        track.filepath, track.artist_id, track.album_id, track.album.album_artist if track.album_id else None,
+        track.genre_id, track.year, track.composer, track.publisher, track.record_label, track.energy,
+        track.vocal_type, track.end_type, track.rotation_weight, track.ready2air, track.category_id,
+        sorted(additional), sorted(holidays),
+    ])[:32]
+
+
+def _issue_token(store, user, selection, ops, tracks: dict) -> str:
+    """Record a preview in the operator's session and return the signed token naming it."""
+    nonce = secrets.token_urlsafe(16)
+    pending = dict(store.get(SESSION_KEY) or {})
+    pending[nonce] = {"user": user.pk, "ids": ids_digest(selection.ids), "ops": ops_digest(ops),
+                      "issued": int(time.time()), "tracks": tracks}
+    for stale in sorted(pending, key=lambda key: pending[key]["issued"])[:-PENDING_PREVIEWS]:
+        del pending[stale]
+    store[SESSION_KEY] = pending
+    return signing.dumps({"n": nonce, "u": user.pk, "s": ids_digest(selection.ids), "o": ops_digest(ops)},
+                         salt=_TOKEN_SALT)
+
+
+def _redeem_token(store, user, token, selection, ops) -> dict:
+    """The preview a token names, removed from the session (one use).  Raises BulkEditError."""
+    if not isinstance(token, str) or not token:
+        raise BulkEditError("Preview the edit first: apply needs the preview's token")
+    try:
+        claims = signing.loads(token, salt=_TOKEN_SALT, max_age=TOKEN_MAX_AGE_SECONDS)
+    except signing.SignatureExpired:
+        raise BulkEditError("This preview has expired. Preview again before applying.", status=409) from None
+    except signing.BadSignature:
+        raise BulkEditError("This is not a valid preview token. Preview the edit first.") from None
+    if not isinstance(claims, dict) or claims.get("u") != user.pk:
+        raise BulkEditError("This preview was made by another operator.", status=403)
+    pending = dict(store.get(SESSION_KEY) or {})
+    record = pending.pop(claims.get("n"), None)
+    store[SESSION_KEY] = pending
+    if record is None or record.get("user") != user.pk:
+        raise BulkEditError("This preview was already applied or is no longer available. Preview again.",
+                            status=409)
+    if time.time() - record["issued"] > TOKEN_MAX_AGE_SECONDS:
+        raise BulkEditError("This preview has expired. Preview again before applying.", status=409)
+    if claims.get("s") != ids_digest(selection.ids) or record["ids"] != claims.get("s"):
+        raise BulkEditError(
+            "The selection differs from the preview (Tracks were added or removed since it was made). "
+            "Preview again before applying.", status=409, count=len(selection.ids), missing=selection.missing)
+    if claims.get("o") != ops_digest(ops) or record["ops"] != claims.get("o"):
+        raise BulkEditError("The changes differ from the preview. Preview again before applying.", status=409)
+    return record
 
 
 # --------------------------------------------------------------------------- per-Track planning
@@ -525,8 +603,9 @@ def _track_rows(ids):
     return Track.objects.select_related("artist", "album", "genre", "category").filter(pk__in=ids).order_by("pk")
 
 
-def preview(selection: Selection, ops) -> dict:
-    """What applying ``ops`` to ``selection`` would do.  Reads only."""
+def preview(selection: Selection, ops, *, user, store) -> dict:
+    """What applying ``ops`` to ``selection`` would do, and the token to apply exactly that.  Writes nothing to
+    the library; ``store`` (the operator's session) records the preview."""
     targets = _Targets(create=False)
     additional, holidays = _memberships(selection.ids)
     summary = {}
@@ -534,8 +613,9 @@ def preview(selection: Selection, ops) -> dict:
         summary.setdefault(op.field, {"label": FIELDS[op.field].label if op.field in FIELDS
                                       else MEMBERSHIPS[op.field], "change": 0, "unchanged": 0})
     changing, unchanged, folder_stays = 0, 0, 0
-    refusals, samples = [], []
+    refusals, samples, tracks = [], [], {}
     for track in _track_rows(selection.ids):
+        state = edit_state(track, additional.get(track.pk, set()), holidays.get(track.pk, set()))
         plan = _plan(track, ops, targets, current_additional=additional.get(track.pk, set()),
                      current_holidays=holidays.get(track.pk, set()))
         changed_fields = {c["field"] for c in plan.changes}
@@ -543,12 +623,15 @@ def preview(selection: Selection, ops) -> dict:
             counts["change" if name in changed_fields else "unchanged"] += 1
         if plan.empty:
             unchanged += 1
+            tracks[str(track.pk)] = [state, "unchanged"]
             continue
         title, artist = track.title, track.artist.name if track.artist_id else ""
         refusal = _guard_refusal(track, plan)
         if refusal:
             refusals.append({"id": track.pk, "title": title, "artist": artist, "reason": refusal})
+            tracks[str(track.pk)] = [state, "refused", refusal[:300]]
             continue
+        tracks[str(track.pk)] = [state, "change"]
         changing += 1
         folder_stays += plan.folder_stays
         if len(samples) < SAMPLE_SIZE:
@@ -573,7 +656,8 @@ def preview(selection: Selection, ops) -> dict:
         "refusals": refusals,
         "warnings": warnings,
         "samples": samples,
-        "token": token_for(selection.ids, ops),
+        "token": _issue_token(store, user, selection, ops, tracks),
+        "token_expires_in": TOKEN_MAX_AGE_SECONDS,
         "max_tracks": MAX_TRACKS,
     }
 
@@ -597,24 +681,22 @@ def _prepare_targets(ops, ids) -> _Targets:
     return targets
 
 
-def apply(selection: Selection, ops, token, *, user=None) -> dict:
-    """Apply exactly the previewed edit.  Each Track is its own transaction; every outcome is reported."""
+def apply(selection: Selection, ops, token, *, user, store) -> dict:
+    """Apply exactly the previewed edit (see the module docstring).  Each Track is its own transaction under its
+    row lock; every outcome is reported."""
     from library.models import Track, TrackWriteRefused
 
-    current = token_for(selection.ids, ops)
-    if token != current:
-        raise BulkEditError(
-            "The selection or the changes differ from the preview (Tracks were added, removed or changed "
-            "since it was made). Preview again before applying.",
-            status=409, count=len(selection.ids), missing=selection.missing)
+    record = _redeem_token(store, user, token, selection, ops)
+    previewed = record["tracks"]
     with transaction.atomic():
         targets = _prepare_targets(ops, selection.ids)
     through_categories = Track.additional_categories.through
     through_holidays = Track.holidays.through
     updated, unchanged, folder_stays = [], 0, 0
-    failed, missing = [], list(selection.missing)
+    refused, stale, failed, missing = [], [], [], list(selection.missing)
     for track_id in selection.ids:
         title = artist = ""
+        state_then, disposition, *reason = previewed.get(str(track_id), [None, None])
         try:
             with transaction.atomic():
                 track = (Track.objects.select_related("artist", "album", "genre", "category")
@@ -624,8 +706,17 @@ def apply(selection: Selection, ops, token, *, user=None) -> dict:
                     continue
                 title, artist = track.title, track.artist.name if track.artist_id else ""
                 additional, holidays = _memberships([track_id])
-                plan = _plan(track, ops, targets, current_additional=additional.get(track_id, set()),
-                             current_holidays=holidays.get(track_id, set()))
+                current_additional, current_holidays = additional.get(track_id, set()), holidays.get(track_id, set())
+                if state_then is None or edit_state(track, current_additional, current_holidays) != state_then:
+                    stale.append({"id": track_id, "title": title, "artist": artist,
+                                  "reason": "changed since the preview; left as it is"})
+                    continue
+                if disposition == "refused":
+                    refused.append({"id": track_id, "title": title, "artist": artist,
+                                    "reason": reason[0] if reason else "refused at preview"})
+                    continue
+                plan = _plan(track, ops, targets, current_additional=current_additional,
+                             current_holidays=current_holidays)
                 if plan.empty:
                     unchanged += 1
                     continue
@@ -649,24 +740,27 @@ def apply(selection: Selection, ops, token, *, user=None) -> dict:
                 updated.append(track_id)
                 folder_stays += plan.folder_stays
         except TrackWriteRefused as exc:
-            failed.append({"id": track_id, "title": title, "artist": artist, "reason": str(exc)})
+            refused.append({"id": track_id, "title": title, "artist": artist, "reason": str(exc)})
         except (ValidationError, DatabaseError) as exc:
             failed.append({"id": track_id, "title": title, "artist": artist,
-                           "reason": f"not saved ({type(exc).__name__})"})
+                           "reason": f"not saved ({type(exc).__name__}); this Track was not changed"})
             log.warning("bulk_edit track_id=%s failed: %s", track_id, type(exc).__name__)
         except Exception as exc:                      # report it, keep going: the other Tracks are independent
             failed.append({"id": track_id, "title": title, "artist": artist,
                            "reason": f"unexpected error ({type(exc).__name__}); this Track was not changed"})
             log.exception("bulk_edit track_id=%s unexpected failure", track_id)
-    log.info("bulk_edit user=%s selection=%s requested=%d updated=%d unchanged=%d failed=%d missing=%d",
-             getattr(user, "pk", None), selection.mode, len(selection.ids) + len(selection.missing),
-             len(updated), unchanged, len(failed), len(missing))
+    log.info("bulk_edit user=%s selection=%s requested=%d updated=%d unchanged=%d refused=%d stale=%d "
+             "failed=%d missing=%d", getattr(user, "pk", None), selection.mode,
+             len(selection.ids) + len(selection.missing), len(updated), unchanged, len(refused), len(stale),
+             len(failed), len(missing))
     return {
         "ok": True,
         "requested": len(selection.ids) + len(selection.missing),
         "updated": len(updated),
         "updated_ids": updated,
         "unchanged": unchanged,
+        "refused": refused,
+        "stale": stale,
         "failed": failed,
         "missing": sorted(set(missing)),
         "files_left_in_previous_category_folder": folder_stays,

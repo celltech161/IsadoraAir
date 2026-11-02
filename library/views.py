@@ -1827,12 +1827,22 @@ def api_track_list(request):
     })
 
 
+#: r0125: the direct bulk edits /api/tracks/bulk/ used to apply without review (now 410 Gone).
+RETIRED_BULK_EDIT_ACTIONS = frozenset({
+    "ready2air_on", "ready2air_off", "set_category", "add_additional_category", "add_holiday",
+})
+
+
 @require_http_methods(["POST"])
 def api_track_bulk(request):
     """Roadmap 2.5A: requires library.manage_tracks -- includes a bulk
     "delete" action, previously reachable by any Contributor/remote_dj
     account via their /api/tracks/ GroupAccess prefix with zero other
-    check. See PROJECT_NOTES.md's "Roadmap 2.5" section."""
+    check. See PROJECT_NOTES.md's "Roadmap 2.5" section.
+
+    r0125: only "delete" remains (its accepted 3.11 deletion-integrity path is unchanged); the former
+    direct edit actions answer 410 Gone and are replaced by the previewed bulk editor
+    (api_track_bulk_edit_preview / api_track_bulk_edit_apply)."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
@@ -1850,73 +1860,15 @@ def api_track_bulk(request):
 
     qs = Track.objects.filter(id__in=ids)
 
-    if action == "ready2air_on":
-        updated = qs.update(ready2air=True)
-    elif action == "ready2air_off":
-        updated = qs.update(ready2air=False)
-    elif action == "set_category":
-        cat_id = body.get("category_id")
-        if cat_id:
-            try:
-                Category.objects.get(id=cat_id)
-            except Category.DoesNotExist:
-                return JsonResponse({"error": "Category not found"}, status=404)
-        updated = qs.update(category_id=cat_id)
-    elif action == "add_additional_category":
-        # ADD (not replace) the category to each selected track's
-        # additional_categories M2M -- same non-destructive semantics
-        # as add_holiday. A track that's already tagged with this cat
-        # as an additional (or has it as primary) is skipped silently
-        # via ignore_conflicts + the same-as-primary guard used in
-        # track_update. Bulk replace would be a foot-gun; if that's
-        # ever wanted it needs its own action.
-        cat_id = body.get("category_id")
-        if not cat_id:
-            return JsonResponse({"error": "category_id required"}, status=400)
-        try:
-            Category.objects.get(id=cat_id)
-        except Category.DoesNotExist:
-            return JsonResponse({"error": "Category not found"}, status=404)
-        # Exclude tracks whose PRIMARY category is already this cat --
-        # M2M row for (track, cat) makes no sense when the FK already
-        # points there, and the track_update path guards the same way.
-        target_ids = list(qs.exclude(category_id=cat_id).values_list("id", flat=True))
-        through = Track.additional_categories.through
-        existing = set(
-            through.objects.filter(track_id__in=target_ids, category_id=cat_id)
-            .values_list("track_id", flat=True)
-        )
-        rows = [through(track_id=tid, category_id=cat_id)
-                for tid in target_ids if tid not in existing]
-        through.objects.bulk_create(rows, ignore_conflicts=True)
-        updated = len(rows)
-    elif action == "add_holiday":
-        # ADD the holiday to each selected track's holidays M2M --
-        # doesn't clobber existing tags, so a Halloween-tagged track
-        # can also pick up a Christmas tag in a later bulk operation.
-        code = body.get("holiday_code")
-        if not code:
-            return JsonResponse({"error": "holiday_code required"}, status=400)
-        try:
-            holiday = Holiday.objects.get(code=code)
-        except Holiday.DoesNotExist:
-            return JsonResponse({"error": "Holiday not found"}, status=404)
-        # Bulk-add through the M2M via the through model, ignoring
-        # rows that already have the pair. Django's .add(*iterable)
-        # is per-object and would issue N INSERTs; going through
-        # bulk_create with ignore_conflicts=True lets us do one
-        # INSERT and skip existing rows silently.
-        through = Track.holidays.through
-        existing = set(
-            through.objects.filter(track_id__in=list(qs.values_list("id", flat=True)),
-                                    holiday_id=code)
-            .values_list("track_id", flat=True)
-        )
-        rows = [through(track_id=tid, holiday_id=code)
-                for tid in qs.values_list("id", flat=True) if tid not in existing]
-        through.objects.bulk_create(rows, ignore_conflicts=True)
-        updated = len(rows)
-    elif action == "delete":
+    if action in RETIRED_BULK_EDIT_ACTIONS:
+        # r0125: every bulk metadata/category edit is previewed first; these direct, unreviewed edits were
+        # used only by /library/'s own bar, which now goes through preview/apply.
+        return JsonResponse({
+            "error": (f"'{action}' is retired: bulk edits are previewed first. Use "
+                      "/api/tracks/bulk/preview/ and then /api/tracks/bulk/apply/ with the preview's token."),
+            "retired": True,
+        }, status=410)
+    if action == "delete":
         # Best-effort per-track: PROTECT-FK blockers on ONE track
         # (still in a Playlist or Rotation slot) shouldn't prevent
         # the rest of the selection from being deleted. Report both
@@ -1965,10 +1917,7 @@ def api_track_bulk(request):
             "cleanup": cleanup,
             "cleanup_warnings": cleanup_warnings,
         })
-    else:
-        return JsonResponse({"error": "Unknown action"}, status=400)
-
-    return JsonResponse({"ok": True, "updated": updated})
+    return JsonResponse({"error": "Unknown action"}, status=400)
 
 
 def _bulk_edit_request(request):
@@ -2003,26 +1952,26 @@ def api_track_bulk_edit_preview(request):
     if error is not None:
         return error
     _body, selection, ops = parsed
-    return JsonResponse(bulk_edit.preview(selection, ops))
+    return JsonResponse(bulk_edit.preview(selection, ops, user=request.user, store=request.session))
 
 
 @require_http_methods(["POST"])
 def api_track_bulk_edit_apply(request):
-    """r0125: apply exactly a previewed bulk edit (its ``token``). 409 when the selection or the change set
-    no longer matches the preview; otherwise each Track is applied on its own and every outcome is
-    reported (updated, unchanged, failed with reason, missing). Never writes audio tags, cue markers,
-    waveforms or source audio, and never relocates a file or requests reanalysis."""
+    """r0125: apply exactly a previewed bulk edit. The ``token`` is the signed, single-use, expiring token the
+    preview issued to this operator in this session (400 if forged, 403 for another operator, 409 if
+    expired, already used, or the selection or change set no longer matches). Each Track is then applied
+    on its own under its row lock and reported as updated, unchanged, refused, stale (changed since the
+    preview: left alone), missing or failed. Never writes audio tags, cue markers, waveforms or source
+    audio, and never relocates a file or requests reanalysis."""
     from library.services import track_bulk_edit as bulk_edit
 
     parsed, error = _bulk_edit_request(request)
     if error is not None:
         return error
     body, selection, ops = parsed
-    token = body.get("token")
-    if not isinstance(token, str) or not token:
-        return JsonResponse({"error": "Preview the edit first: apply needs the preview's token"}, status=400)
     try:
-        return JsonResponse(bulk_edit.apply(selection, ops, token, user=request.user))
+        return JsonResponse(bulk_edit.apply(selection, ops, body.get("token"), user=request.user,
+                                            store=request.session))
     except bulk_edit.BulkEditError as exc:
         return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 

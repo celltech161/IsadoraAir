@@ -2,14 +2,19 @@
 
 Everything runs against the disposable test database; no audio, waveform or station file exists or is
 touched (Track file paths are only strings here)."""
+import hashlib
+import json
 import tempfile
+import threading
 from pathlib import Path
 from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.db import close_old_connections, connection, connections
+from django.db.models import F
 from django.db.models.manager import Manager
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -25,7 +30,7 @@ PREVIEW = "library:api-track-bulk-edit-preview"
 APPLY = "library:api-track-bulk-edit-apply"
 
 
-class _Fixture(TestCase):
+class _FixtureMixin:
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -67,6 +72,10 @@ class _Fixture(TestCase):
     @staticmethod
     def ids(*tracks):
         return {"mode": "ids", "ids": [t.pk for t in tracks]}
+
+
+class _Fixture(_FixtureMixin, TestCase):
+    pass
 
 
 class SelectionTests(_Fixture):
@@ -329,7 +338,8 @@ class MixedOutcomeTests(_Fixture):
             self.assertEqual(preview["tracks_changing"], 1)
             status, body = self.apply(self.ids(ok, refused), changes, token=preview["token"])
         self.assertEqual((status, body["updated"]), (200, 1))
-        self.assertEqual([(f["id"], "projected spoken" in f["reason"]) for f in body["failed"]], [(refused.pk, True)])
+        self.assertEqual([(f["id"], "projected spoken" in f["reason"]) for f in body["refused"]], [(refused.pk, True)])
+        self.assertEqual((body["failed"], body["stale"]), ([], []))
         refused.refresh_from_db()
         self.assertEqual((refused.artist_id, refused.energy), (self.artist.pk, ""))     # the whole Track rolled back
         self.assertEqual(Track.objects.get(pk=ok.pk).artist.name, "Renamed")
@@ -456,3 +466,212 @@ class PageContractTests(_Fixture):
         self.assertNotIn("action: 'set_category'", html)
         self.assertIn("/api/tracks/bulk/preview/", html)
         self.assertIn("token", html[html.index("async function applyBulkEdit"):])
+
+
+class TokenIntegrityTests(_Fixture):
+    """The preview token is server-issued, operator- and session-bound, single-use and expiring, and apply
+    leaves every Track that changed since the preview alone."""
+
+    changes = {"energy": {"op": "set", "value": "upbeat"}}
+
+    def test_a_forged_or_tampered_token_is_refused_and_nothing_is_written(self):
+        one = self.track("forged")
+        # Phase A's token was this deterministic hash, computable without any preview.
+        payload = json.dumps({"v": 1, "ids": [one.pk], "ops": [["energy", "set", "upbeat"]]},
+                             sort_keys=True, separators=(",", ":"))
+        for token in (hashlib.sha256(payload.encode()).hexdigest(), "", None):
+            status, body = self.post(APPLY, {"selection": self.ids(one), "changes": self.changes, "token": token})
+            self.assertEqual(status, 400, body)
+        _status, preview = self.preview(self.ids(one), self.changes)
+        tampered = preview["token"][:-2] + ("AA" if not preview["token"].endswith("AA") else "BB")
+        status, body = self.post(APPLY, {"selection": self.ids(one), "changes": self.changes, "token": tampered})
+        self.assertEqual(status, 400)
+        self.assertIn("not a valid preview token", body["error"])
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "")
+
+    def test_a_token_is_good_for_one_apply_only(self):
+        one = self.track("once")
+        _status, preview = self.preview(self.ids(one), self.changes)
+        status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual((status, body["updated"]), (200, 1))
+        Track.objects.filter(pk=one.pk).update(energy="")
+        status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("already applied", body["error"])
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "")
+
+    def test_an_expired_token_is_refused(self):
+        one = self.track("expired")
+        _status, preview = self.preview(self.ids(one), self.changes)
+        with mock.patch.object(track_bulk_edit, "TOKEN_MAX_AGE_SECONDS", -1):
+            status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("expired", body["error"])
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "")
+
+    def test_a_token_is_bound_to_its_operator_and_session(self):
+        one = self.track("cross")
+        _status, preview = self.preview(self.ids(one), self.changes)
+        other = User.objects.create_superuser("other-admin", "other@example.invalid", "pw")
+        second = Client()
+        second.force_login(other)
+        response = second.post(reverse(APPLY), {"selection": self.ids(one), "changes": self.changes,
+                                                "token": preview["token"]}, content_type="application/json")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("another operator", response.json()["error"])
+        # The same operator in a different session (another browser) does not hold the preview either.
+        elsewhere = Client()
+        elsewhere.force_login(self.admin)
+        response = elsewhere.post(reverse(APPLY), {"selection": self.ids(one), "changes": self.changes,
+                                                   "token": preview["token"]}, content_type="application/json")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "")
+        # The issuing session can still use it.
+        status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual((status, body["updated"]), (200, 1))
+
+    def test_metadata_changed_since_the_preview_makes_that_track_stale_not_overwritten(self):
+        changed, steady = self.track("changed"), self.track("steady")
+        _status, preview = self.preview(self.ids(changed, steady), self.changes)
+        Track.objects.filter(pk=changed.pk).update(composer="Someone else's edit")
+        status, body = self.apply(self.ids(changed, steady), self.changes, token=preview["token"])
+        self.assertEqual((status, body["updated"], body["unchanged"]), (200, 1, 0))
+        self.assertEqual([t["id"] for t in body["stale"]], [changed.pk])
+        self.assertIn("changed since the preview", body["stale"][0]["reason"])
+        changed.refresh_from_db()
+        self.assertEqual((changed.energy, changed.composer), ("", "Someone else's edit"))
+        self.assertEqual(Track.objects.get(pk=steady.pk).energy, "upbeat")
+
+    def test_a_track_previewed_as_already_matching_that_changed_is_stale_too(self):
+        one = self.track("matched", energy="upbeat")
+        _status, preview = self.preview(self.ids(one), self.changes)
+        self.assertEqual(preview["tracks_unchanged"], 1)
+        Track.objects.filter(pk=one.pk).update(energy="slow")
+        status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual(([t["id"] for t in body["stale"]], body["updated"]), ([one.pk], 0))
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "slow")
+
+    def test_membership_changed_since_the_preview_makes_that_track_stale(self):
+        one, two = self.track("member-a"), self.track("member-b")
+        _status, preview = self.preview(self.ids(one, two), {"holidays": {"add": ["xmas"]}})
+        one.additional_categories.add(self.blues)
+        status, body = self.apply(self.ids(one, two), {"holidays": {"add": ["xmas"]}}, token=preview["token"])
+        self.assertEqual(([t["id"] for t in body["stale"]], body["updated"]), ([one.pk], 1))
+        self.assertEqual(list(one.holidays.values_list("code", flat=True)), [])
+        self.assertEqual(list(two.holidays.values_list("code", flat=True)), ["xmas"])
+
+    def test_unrelated_changes_do_not_make_a_track_stale(self):
+        one = self.track("aired")
+        _status, preview = self.preview(self.ids(one), self.changes)
+        Track.objects.filter(pk=one.pk).update(play_count=F("play_count") + 1, last_played_at=timezone.now(),
+                                               updated_at=timezone.now())
+        cue_markers.operator_edit(one.pk, expected_revision=0, user=self.admin, values={"cue_in_seconds": 2.0})
+        PlayEvent.objects.create(track=one, track_title=one.title, started_at=timezone.now())
+        log = PlaylistLog.objects.create(date=timezone.localdate(), hour=7, status="approved")
+        LogItem.objects.create(playlist_log=log, position=0, scheduled_time=timezone.now(), track=one,
+                               track_title=one.title, category=self.rock)
+        status, body = self.apply(self.ids(one), self.changes, token=preview["token"])
+        self.assertEqual((status, body["updated"], body["stale"]), (200, 1, []))
+
+    def test_a_track_refused_at_preview_is_not_written_even_if_the_guard_is_gone(self):
+        one, other = self.track("was-refused"), self.track("fine")
+
+        def guard(track, update_fields):
+            if track.pk == one.pk:
+                raise TrackWriteRefused("projected spoken Track")
+
+        guards = library_models.TRACK_WRITE_GUARDS + [(guard, lambda qs, cols: None, lambda objs, f: None)]
+        with mock.patch.object(library_models, "TRACK_WRITE_GUARDS", guards):
+            _status, preview = self.preview(self.ids(one, other), self.changes)
+        status, body = self.apply(self.ids(one, other), self.changes, token=preview["token"])
+        self.assertEqual(([t["id"] for t in body["refused"]], body["updated"]), ([one.pk], 1))
+        self.assertEqual(Track.objects.get(pk=one.pk).energy, "")
+
+
+class LegacyBulkEndpointTests(_Fixture):
+    def test_direct_edit_actions_are_retired_and_write_nothing(self):
+        one = self.track("legacy")
+        cases = [
+            {"action": "ready2air_on"}, {"action": "ready2air_off"},
+            {"action": "set_category", "category_id": self.pop.pk},
+            {"action": "add_additional_category", "category_id": self.pop.pk},
+            {"action": "add_holiday", "holiday_code": "xmas"},
+        ]
+        before = Track.objects.filter(pk=one.pk).values().get()
+        for payload in cases:
+            with self.subTest(action=payload["action"]):
+                status, body = self.post("library:api-track-bulk", {**payload, "ids": [one.pk]})
+                self.assertEqual(status, 410)
+                self.assertTrue(body["retired"])
+                self.assertIn("/api/tracks/bulk/preview/", body["error"])
+        self.assertEqual(Track.objects.filter(pk=one.pk).values().get(), before)
+        self.assertFalse(one.additional_categories.exists() or one.holidays.exists())
+
+    def test_bulk_delete_keeps_its_path_and_authorization(self):
+        one = self.track("delete-me")
+        with self.captureOnCommitCallbacks(execute=True):
+            status, body = self.post("library:api-track-bulk", {"action": "delete", "ids": [one.pk]})
+        self.assertEqual((status, body["deleted"]), (200, 1))
+        self.assertFalse(Track.objects.filter(pk=one.pk).exists())
+        status, _ = self.post("library:api-track-bulk", {"action": "nonsense", "ids": [1]})
+        self.assertEqual(status, 400)
+
+
+def _row_waiters():
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted")
+        return cursor.fetchone()[0]
+
+
+class ConcurrentModificationTests(_FixtureMixin, TransactionTestCase):
+    """A Track modified by another transaction while apply runs is checked under its row lock."""
+
+    def test_a_track_changed_while_apply_waits_for_its_row_is_stale(self):
+        first, contended, last = self.track("c1"), self.track("c2"), self.track("c3")
+        user = self.admin
+        store = {}
+        changes = track_bulk_edit.parse_changes({"energy": {"op": "set", "value": "upbeat"}})
+        selection = track_bulk_edit.resolve_selection(self.ids(first, contended, last))
+        token = track_bulk_edit.preview(selection, changes, user=user, store=store)["token"]
+        locked, release, results = threading.Event(), threading.Event(), {}
+
+        def editor():                      # another operator's single-Track edit, holding the row
+            close_old_connections()
+            try:
+                from django.db import transaction
+                with transaction.atomic():
+                    row = Track.objects.select_for_update().get(pk=contended.pk)
+                    locked.set()
+                    release.wait(20)
+                    row.composer = "Edited during the bulk apply"
+                    row.save(update_fields=["composer", "updated_at"])
+            finally:
+                connections.close_all()
+
+        def applier():
+            close_old_connections()
+            try:
+                results["value"] = track_bulk_edit.apply(selection, changes, token, user=user, store=store)
+            except Exception as exc:
+                results["error"] = exc
+            finally:
+                connections.close_all()
+
+        edit = threading.Thread(target=editor)
+        edit.start()
+        self.assertTrue(locked.wait(10))
+        run = threading.Thread(target=applier)
+        run.start()
+        deadline = timezone.now().timestamp() + 10
+        while _row_waiters() < 1 and timezone.now().timestamp() < deadline:
+            threading.Event().wait(0.02)
+        self.assertGreaterEqual(_row_waiters(), 1, "apply never waited for the contended Track's row")
+        release.set()
+        edit.join(20)
+        run.join(30)
+        self.assertNotIn("error", results)
+        result = results["value"]
+        self.assertEqual(([t["id"] for t in result["stale"]], result["updated"]), ([contended.pk], 2))
+        contended.refresh_from_db()
+        self.assertEqual((contended.energy, contended.composer), ("", "Edited during the bulk apply"))
+        self.assertEqual(set(Track.objects.filter(energy="upbeat").values_list("pk", flat=True)), {first.pk, last.pk})

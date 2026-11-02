@@ -219,22 +219,38 @@ class LibraryManagementCapabilityTests(TestCase):
     def test_superuser_can_bulk_mutate_tracks_without_a_role(self):
         su = User.objects.create_superuser("tracksu", "tracksu@example.invalid", "pw")
         self.client.force_login(su)
+        # r0125: bulk edits are previewed first; the direct legacy edit is retired (410, not 403).
+        resp = self.client.post(
+            reverse("library:api-track-bulk-edit-preview"),
+            data={"selection": {"mode": "ids", "ids": [self.track.pk]},
+                  "changes": {"ready2air": {"op": "set", "value": True}}},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
         resp = self.client.post(
             reverse("library:api-track-bulk"),
             data={"action": "ready2air_on", "ids": [self.track.pk]},
             content_type="application/json",
         )
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 410)
 
     def test_staff_can_bulk_mutate_tracks_without_a_role(self):
         staff = User.objects.create_user("trackstaff", "trackstaff@example.invalid", "pw", is_staff=True)
         self.client.force_login(staff)
+        # r0125: bulk edits are previewed first; the direct legacy edit is retired (410, not 403).
+        resp = self.client.post(
+            reverse("library:api-track-bulk-edit-preview"),
+            data={"selection": {"mode": "ids", "ids": [self.track.pk]},
+                  "changes": {"ready2air": {"op": "set", "value": True}}},
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
         resp = self.client.post(
             reverse("library:api-track-bulk"),
             data={"action": "ready2air_on", "ids": [self.track.pk]},
             content_type="application/json",
         )
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 410)
 
     # ---- reachability != authority, stated as directly as possible ----
 

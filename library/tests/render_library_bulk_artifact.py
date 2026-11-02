@@ -15,6 +15,9 @@ class RenderArtifact(_Fixture):
     def test_render(self):
         for i in range(120):
             self.track(f"Song {i:03d}", category=self.rock if i % 2 else self.pop, energy="slow" if i % 3 else "")
+        # Hostile titles (sorted first): quotes breaking out of an attribute, and markup.
+        self.track('"A" title" autofocus onfocus="window.__pwned=1" data-x="', category=self.rock)
+        self.track('<img src=x onerror="window.__pwned=2">', category=self.rock)
         page = self.client.get("/library/").content.decode()
         lists = [self.client.get(f"/api/tracks/?sort=title&dir=asc&page={n}&per_page=50").content.decode()
                  for n in (1, 2)]
@@ -28,10 +31,12 @@ class RenderArtifact(_Fixture):
         status, applied = self.post("library:api-track-bulk-edit-apply",
                                     {"selection": selection, "changes": changes, "token": preview["token"]})
         self.assertEqual(status, 200, applied)
-        applied["failed"] = [{"id": first[1]["id"], "title": first[1]["title"], "artist": "Bulk Artist",
-                              "reason": "Track ['artist'] of a projected spoken Track change only through the "
-                                        "spoken projection"}]
+        applied["refused"] = [{"id": first[1]["id"], "title": first[1]["title"], "artist": "Bulk Artist",
+                               "reason": "Track ['artist'] of a projected spoken Track change only through the "
+                                         "spoken projection"}]
+        applied["stale"] = [{"id": first[2]["id"], "title": first[2]["title"], "artist": "Bulk Artist",
+                             "reason": "changed since the preview; left as it is"}]
         for name, blob in (("PAGE", page), ("LIST1", lists[0]), ("LIST2", lists[1]),
                            ("PREVIEW", json.dumps(preview)), ("APPLY", json.dumps(applied))):
             print(f"\n=====BEGIN-{name}=====\n{blob}\n=====END-{name}=====")
-        self.assertEqual(Track.objects.count(), 120)
+        self.assertEqual(Track.objects.count(), 122)

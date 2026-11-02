@@ -450,6 +450,10 @@ let lastTotal = 0;                 // Tracks matching the current filter (last l
 // checkbox.  It remembers the filter it was made for and the rows unticked since.
 let filterSelection = null;        // { filter: {q, category, ready2air}, total, excluded: Set }
 let lastPreview = null;            // { selection, changes, token, data }
+// Every preview request carries the generation it was made in; a change of selection, filter or editor
+// fields starts a new generation, aborts the request in flight, and makes any late answer inert.
+let previewGeneration = 0;
+let previewAbort = null;
 let selectionNote = '';
 const BULK_UI = {% if can_bulk_edit and not is_library_read_only %}true{% else %}false{% endif %};
 const BULK_MAX = {{ bulk_edit_max|default:1000 }};
@@ -576,9 +580,15 @@ function updateBulkBar() {
   renderSelectBanner();
 }
 
-function selectionChanged() {
-  // A preview describes one selection; any change makes it stale.
+function invalidatePreview() {
+  previewGeneration += 1;
+  if (previewAbort) { previewAbort.abort(); previewAbort = null; }
   if (lastPreview) closeBulkPanels();
+}
+
+function selectionChanged() {
+  // A preview describes one selection; any change makes it (and a preview still in flight) stale.
+  invalidatePreview();
   renderRowChecks();
   updateBulkBar();
 }
@@ -617,8 +627,8 @@ function filtersChanged() {
   if (filterSelection) {
     filterSelection = null;
     selectionNote = 'The filter changed, so the "all matching Tracks" selection was cleared.';
-    if (lastPreview) closeBulkPanels();
   }
+  invalidatePreview();
 }
 
 // ---- Bulk edit: editor -> preview -> apply (r0125) -------------------------------------------
@@ -640,6 +650,7 @@ function closeBulkPanels() {
 }
 
 function openBulkEditor() {
+  invalidatePreview();
   document.querySelectorAll('#beGrid .be-op').forEach(sel => { sel.value = 'leave'; syncEditorRow(sel); });
   document.querySelectorAll('#beGrid select[multiple]').forEach(sel =>
     [...sel.options].forEach(o => { o.selected = false; }));
@@ -649,7 +660,7 @@ function openBulkEditor() {
 }
 
 function backToEditor() {
-  lastPreview = null;
+  invalidatePreview();
   showPanel('bulkEditor');
 }
 
@@ -677,11 +688,12 @@ function collectChanges() {
   return changes;
 }
 
-async function postJSON(url, payload) {
+async function postJSON(url, payload, signal) {
   const resp = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
     body: JSON.stringify(payload),
+    signal,
   });
   const data = await resp.json().catch(() => ({}));
   return { resp, data };
@@ -702,13 +714,22 @@ function quickEdit(changes) {
 
 async function runPreview(changes, errorTarget) {
   if (selectionCount() === 0) return;
+  invalidatePreview();
+  const generation = previewGeneration;
+  const controller = new AbortController();
+  previewAbort = controller;
   const selection = buildSelection();
+  const selectionKey = JSON.stringify(selection);
   let result;
   try {
-    result = await postJSON('/api/tracks/bulk/preview/', { selection, changes });
+    result = await postJSON('/api/tracks/bulk/preview/', { selection, changes }, controller.signal);
   } catch (e) {
+    if (controller.signal.aborted) return;
     result = { resp: { ok: false, status: 0 }, data: { error: 'No response from the server.' } };
   }
+  // An answer for an older selection, filter or change set is discarded, never shown or applied.
+  if (generation !== previewGeneration || selectionKey !== JSON.stringify(buildSelection())) return;
+  previewAbort = null;
   const { resp, data } = result;
   if (!resp.ok) {
     const msg = 'Preview failed: ' + (data.error || resp.status);
@@ -781,9 +802,14 @@ function renderPreview(data) {
 
 async function applyBulkEdit() {
   if (!lastPreview) return;
+  const { selection, changes, token } = lastPreview;
+  if (JSON.stringify(selection) !== JSON.stringify(buildSelection())) {
+    // Belt and braces: the reviewed selection is the only one that can be applied.
+    closeBulkPanels();
+    return;
+  }
   const apply = document.getElementById('beApplyBtn');
   apply.disabled = true;
-  const { selection, changes, token } = lastPreview;
   let result;
   try {
     result = await postJSON('/api/tracks/bulk/apply/', { selection, changes, token });
@@ -813,7 +839,8 @@ function renderResult(data) {
   const body = document.getElementById('beResultBody');
   body.replaceChildren();
   body.append(el('p', `Updated ${data.updated.toLocaleString()} of ${data.requested.toLocaleString()} Track(s); ` +
-                       `${data.unchanged.toLocaleString()} already matched.`));
+                       `${data.unchanged.toLocaleString()} already matched. Each Track is applied on its own, ` +
+                       'so the others below were not rolled back.'));
   if (data.files_left_in_previous_category_folder) {
     body.append(el('p', `${data.files_left_in_previous_category_folder} file(s) remain in their previous category folder ` +
                          '(database-only category change; relocate from Track Detail).', 'be-warn'));
@@ -821,12 +848,19 @@ function renderResult(data) {
   if (data.missing.length) {
     body.append(el('p', `${data.missing.length} Track(s) no longer existed: #${data.missing.join(', #')}.`, 'be-warn'));
   }
-  if (data.failed.length) {
-    body.append(el('p', `${data.failed.length} Track(s) were not changed:`, 'be-warn'));
+  const groups = [
+    ['stale', 'changed since the preview and were left as they are (preview again to edit them)'],
+    ['refused', 'were refused'],
+    ['failed', 'failed and were not changed'],
+  ];
+  groups.forEach(([key, text]) => {
+    const rows = data[key] || [];
+    if (!rows.length) return;
+    body.append(el('p', `${rows.length} Track(s) ${text}:`, 'be-warn'));
     const list = el('ul', undefined, 'be-list');
-    data.failed.forEach(f => list.append(el('li', `${trackLabel(f)}: ${f.reason}`)));
+    rows.forEach(f => list.append(el('li', `${trackLabel(f)}: ${f.reason}`)));
     body.append(list);
-  }
+  });
 }
 
 async function bulkDelete() {
@@ -995,7 +1029,7 @@ async function loadTracks() {
       return `<tr class="${sel}" data-id="${t.id}">
         {% if can_bulk_edit and not is_library_read_only %}
         <td class="col-check" onclick="event.stopPropagation()">
-          <input type="checkbox" ${checked} aria-label="Select ${esc(t.title)}"
+          <input type="checkbox" ${checked}
                  onchange="toggleSelect(${t.id}, this)">
         </td>
         {% endif %}
@@ -1010,6 +1044,12 @@ async function loadTracks() {
           : '<span class="ready-no">&mdash;</span>'}</td>
       </tr>`;
     }).join('');
+
+    // Accessible names are set through the DOM, never by interpolating Track text into an attribute.
+    body.querySelectorAll('tr').forEach((tr, i) => {
+      const cb = tr.querySelector('input[type="checkbox"]');
+      if (cb) cb.setAttribute('aria-label', 'Select ' + (data.items[i].title || `Track ${data.items[i].id}`));
+    });
 
     // Row click navigates to detail (unless clicking checkbox)
     body.querySelectorAll('tr').forEach(tr => {
@@ -1062,6 +1102,13 @@ if (BULK_UI) document.getElementById('selectAll').addEventListener('change', fun
   }
   selectionChanged();
 });
+
+// Editing a requested change while a preview is in flight makes that preview's answer obsolete too.
+if (BULK_UI) {
+  ['input', 'change'].forEach(type => document.getElementById('beGrid').addEventListener(type, invalidatePreview));
+  ['bulkCategorySelect', 'bulkAdditionalCategorySelect', 'bulkHolidaySelect'].forEach(id =>
+    document.getElementById(id).addEventListener('change', invalidatePreview));
+}
 
 // Sort on header click
 document.querySelectorAll('th[data-sort]').forEach(th => {
