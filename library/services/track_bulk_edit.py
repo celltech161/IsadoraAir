@@ -20,7 +20,8 @@ previews it, then applies exactly what was previewed:
   returns a token signed with ``django.core.signing`` that names that record, the operator, the resolved
   Track ids and the normalized change set.  The token cannot be made without the server's key, expires
   after ``TOKEN_MAX_AGE_SECONDS``, is good for one apply only and only in the session and for the operator
-  it was issued to.
+  it was issued to.  Issuing and claiming lock the session's database row (``SessionPreviews``), so
+  concurrent applies of one token -- in any worker -- cannot both claim it.
 * **Apply.**  Refused (409) when the token is expired or used, or the selection or the change set no longer
   matches the preview.  Otherwise each Track is applied in its own short transaction under its row lock: its
   edit state is recomputed under that lock, and a Track that changed since the preview is reported
@@ -46,10 +47,11 @@ from pathlib import Path
 
 import secrets
 import time
+from contextlib import contextmanager
 
 from django.conf import settings
 from django.core import signing
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import DatabaseError, transaction
 
 log = logging.getLogger(__name__)
@@ -324,20 +326,65 @@ def edit_state(track, additional, holidays) -> str:
     ])[:32]
 
 
-def _issue_token(store, user, selection, ops, tracks: dict) -> str:
-    """Record a preview in the operator's session and return the signed token naming it."""
+class SessionPreviews:
+    """Pending preview records in the operator's own database session row (r0125).
+
+    Every read-modify-write runs in one transaction holding that row's lock (``SELECT ... FOR UPDATE``), so
+    two requests of the same session -- in different Gunicorn workers, on different connections -- cannot
+    both claim one preview: the second waits for the first to commit, then finds the record gone.  The
+    request's in-memory session is brought in line and left unmodified, so SessionMiddleware does not write
+    an older copy back at the end of the request.  Needs the database session backend (the configured
+    default); anything else is refused rather than silently racing."""
+
+    ENGINE = "django.contrib.sessions.backends.db"
+
+    def __init__(self, session):
+        if getattr(settings, "SESSION_ENGINE", self.ENGINE) != self.ENGINE:
+            raise ImproperlyConfigured("bulk-edit previews need the database session backend")
+        self.session = session
+
+    @contextmanager
+    def _locked(self):
+        from django.contrib.sessions.models import Session
+        key = self.session.session_key
+        with transaction.atomic():
+            row = Session.objects.select_for_update().filter(session_key=key).first() if key else None
+            if row is None:
+                raise BulkEditError("Your session has ended. Sign in again, then preview again.", status=409)
+            data = self.session.decode(row.session_data)
+            pending = dict(data.get(SESSION_KEY) or {})
+            yield pending
+            data[SESSION_KEY] = pending
+            row.session_data = self.session.encode(data)
+            row.save(update_fields=["session_data"])
+        self.session[SESSION_KEY] = pending
+        self.session.modified = False
+
+    def issue(self, nonce, record):
+        with self._locked() as pending:
+            now = time.time()
+            for key in [k for k, r in pending.items() if now - r.get("issued", 0) > TOKEN_MAX_AGE_SECONDS]:
+                del pending[key]
+            pending[nonce] = record
+            for key in sorted(pending, key=lambda k: pending[k]["issued"])[:-PENDING_PREVIEWS]:
+                del pending[key]
+
+    def claim(self, nonce):
+        """The record, removed (exactly one caller gets it), or None."""
+        with self._locked() as pending:
+            return pending.pop(nonce, None)
+
+
+def _issue_token(previews, user, selection, ops, tracks: dict) -> str:
+    """Record a preview for the operator and return the signed token naming it."""
     nonce = secrets.token_urlsafe(16)
-    pending = dict(store.get(SESSION_KEY) or {})
-    pending[nonce] = {"user": user.pk, "ids": ids_digest(selection.ids), "ops": ops_digest(ops),
-                      "issued": int(time.time()), "tracks": tracks}
-    for stale in sorted(pending, key=lambda key: pending[key]["issued"])[:-PENDING_PREVIEWS]:
-        del pending[stale]
-    store[SESSION_KEY] = pending
+    previews.issue(nonce, {"user": user.pk, "ids": ids_digest(selection.ids), "ops": ops_digest(ops),
+                           "issued": int(time.time()), "tracks": tracks})
     return signing.dumps({"n": nonce, "u": user.pk, "s": ids_digest(selection.ids), "o": ops_digest(ops)},
                          salt=_TOKEN_SALT)
 
 
-def _redeem_token(store, user, token, selection, ops) -> dict:
+def _redeem_token(previews, user, token, selection, ops) -> dict:
     """The preview a token names, removed from the session (one use).  Raises BulkEditError."""
     if not isinstance(token, str) or not token:
         raise BulkEditError("Preview the edit first: apply needs the preview's token")
@@ -349,9 +396,7 @@ def _redeem_token(store, user, token, selection, ops) -> dict:
         raise BulkEditError("This is not a valid preview token. Preview the edit first.") from None
     if not isinstance(claims, dict) or claims.get("u") != user.pk:
         raise BulkEditError("This preview was made by another operator.", status=403)
-    pending = dict(store.get(SESSION_KEY) or {})
-    record = pending.pop(claims.get("n"), None)
-    store[SESSION_KEY] = pending
+    record = previews.claim(claims.get("n"))
     if record is None or record.get("user") != user.pk:
         raise BulkEditError("This preview was already applied or is no longer available. Preview again.",
                             status=409)
@@ -603,9 +648,9 @@ def _track_rows(ids):
     return Track.objects.select_related("artist", "album", "genre", "category").filter(pk__in=ids).order_by("pk")
 
 
-def preview(selection: Selection, ops, *, user, store) -> dict:
+def preview(selection: Selection, ops, *, user, previews) -> dict:
     """What applying ``ops`` to ``selection`` would do, and the token to apply exactly that.  Writes nothing to
-    the library; ``store`` (the operator's session) records the preview."""
+    the library; ``previews`` (normally ``SessionPreviews``) records the preview."""
     targets = _Targets(create=False)
     additional, holidays = _memberships(selection.ids)
     summary = {}
@@ -656,7 +701,7 @@ def preview(selection: Selection, ops, *, user, store) -> dict:
         "refusals": refusals,
         "warnings": warnings,
         "samples": samples,
-        "token": _issue_token(store, user, selection, ops, tracks),
+        "token": _issue_token(previews, user, selection, ops, tracks),
         "token_expires_in": TOKEN_MAX_AGE_SECONDS,
         "max_tracks": MAX_TRACKS,
     }
@@ -681,12 +726,12 @@ def _prepare_targets(ops, ids) -> _Targets:
     return targets
 
 
-def apply(selection: Selection, ops, token, *, user, store) -> dict:
+def apply(selection: Selection, ops, token, *, user, previews) -> dict:
     """Apply exactly the previewed edit (see the module docstring).  Each Track is its own transaction under its
     row lock; every outcome is reported."""
     from library.models import Track, TrackWriteRefused
 
-    record = _redeem_token(store, user, token, selection, ops)
+    record = _redeem_token(previews, user, token, selection, ops)
     previewed = record["tracks"]
     with transaction.atomic():
         targets = _prepare_targets(ops, selection.ids)

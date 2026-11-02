@@ -45,6 +45,9 @@ class _FixtureMixin:
         self.xmas = Holiday.objects.create(code="xmas", name="Christmas", month=12, day=25)
         self.halloween = Holiday.objects.create(code="halloween", name="Halloween", month=10, day=31)
         self.artist = Artist.objects.create(name="Bulk Artist")
+        # Migration-seeded; a TransactionTestCase's flush removes it, and authorize() checks the slug exists.
+        from authz.models import Capability
+        Capability.objects.get_or_create(slug="library.manage_tracks", defaults={"label": "Manage tracks"})
         self.admin = User.objects.create_superuser("bulk-admin", "bulk@example.invalid", "pw")
         self.client.force_login(self.admin)
 
@@ -617,6 +620,41 @@ class LegacyBulkEndpointTests(_Fixture):
         self.assertEqual(status, 400)
 
 
+class _MemoryPreviews:
+    """In-process preview records for service-level tests (the endpoints use SessionPreviews)."""
+
+    def __init__(self):
+        self.records = {}
+
+    def issue(self, nonce, record):
+        self.records[nonce] = record
+
+    def claim(self, nonce):
+        return self.records.pop(nonce, None)
+
+
+def _wait_until(predicate, timeout=10.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _in_thread(name, target, results):
+    def run():
+        close_old_connections()
+        try:
+            results["value"] = target()
+        except Exception as exc:
+            results["error"] = exc
+        finally:
+            connections.close_all()
+    return threading.Thread(target=run, name=name)
+
+
 def _row_waiters():
     with connection.cursor() as cursor:
         cursor.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted")
@@ -629,10 +667,10 @@ class ConcurrentModificationTests(_FixtureMixin, TransactionTestCase):
     def test_a_track_changed_while_apply_waits_for_its_row_is_stale(self):
         first, contended, last = self.track("c1"), self.track("c2"), self.track("c3")
         user = self.admin
-        store = {}
+        previews = _MemoryPreviews()
         changes = track_bulk_edit.parse_changes({"energy": {"op": "set", "value": "upbeat"}})
         selection = track_bulk_edit.resolve_selection(self.ids(first, contended, last))
-        token = track_bulk_edit.preview(selection, changes, user=user, store=store)["token"]
+        token = track_bulk_edit.preview(selection, changes, user=user, previews=previews)["token"]
         locked, release, results = threading.Event(), threading.Event(), {}
 
         def editor():                      # another operator's single-Track edit, holding the row
@@ -651,7 +689,7 @@ class ConcurrentModificationTests(_FixtureMixin, TransactionTestCase):
         def applier():
             close_old_connections()
             try:
-                results["value"] = track_bulk_edit.apply(selection, changes, token, user=user, store=store)
+                results["value"] = track_bulk_edit.apply(selection, changes, token, user=user, previews=previews)
             except Exception as exc:
                 results["error"] = exc
             finally:
@@ -675,3 +713,157 @@ class ConcurrentModificationTests(_FixtureMixin, TransactionTestCase):
         contended.refresh_from_db()
         self.assertEqual((contended.energy, contended.composer), ("", "Edited during the bulk apply"))
         self.assertEqual(set(Track.objects.filter(energy="upbeat").values_list("pk", flat=True)), {first.pk, last.pk})
+
+
+class TrackDetailMembershipConcurrencyTests(_FixtureMixin, TransactionTestCase):
+    """Track Detail's membership update and a bulk apply serialize on the Track's row lock; a primary category
+    is never also an additional one, whichever runs first."""
+
+    def setUp(self):
+        super().setUp()
+        self.subject = self.track("contended")
+        self.bulk_client = Client()
+        self.bulk_client.force_login(self.admin)
+        response = self.bulk_client.post(reverse(PREVIEW), {
+            "selection": self.ids(self.subject), "changes": {"category": {"op": "set", "value": self.pop.pk}}},
+            content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.token = response.json()["token"]
+
+    def bulk_apply(self):
+        return self.bulk_client.post(reverse(APPLY), {
+            "selection": self.ids(self.subject), "changes": {"category": {"op": "set", "value": self.pop.pk}},
+            "token": self.token}, content_type="application/json")
+
+    def track_detail_adds_pop(self):
+        client = Client()
+        client.force_login(self.admin)
+        return client.patch(reverse("library:api-track-detail", args=[self.subject.pk]),
+                            {"additional_category_ids": [self.pop.pk]}, content_type="application/json")
+
+    def final(self):
+        track = Track.objects.get(pk=self.subject.pk)
+        return track.category_id, set(track.additional_categories.values_list("pk", flat=True))
+
+    def test_bulk_holds_the_row_first_then_track_detail_rereads_the_new_primary(self):
+        from library import views
+        td_ready, td_go, bulk_locked, bulk_release = (threading.Event() for _ in range(4))
+        real_sync, real_plan = views._sync_track_memberships, track_bulk_edit._plan
+
+        def paused_sync(*args, **kwargs):              # Track Detail: its own row update has committed
+            td_ready.set()
+            td_go.wait(20)
+            return real_sync(*args, **kwargs)
+
+        def paused_plan(*args, **kwargs):              # bulk apply: inside the Track's locked transaction
+            if threading.current_thread().name == "bulk":
+                bulk_locked.set()
+                bulk_release.wait(20)
+            return real_plan(*args, **kwargs)
+
+        td, bulk = {}, {}
+        with mock.patch.object(views, "_sync_track_memberships", paused_sync), \
+             mock.patch.object(track_bulk_edit, "_plan", paused_plan):
+            td_thread = _in_thread("td", self.track_detail_adds_pop, td)
+            td_thread.start()
+            self.assertTrue(td_ready.wait(10))
+            bulk_thread = _in_thread("bulk", self.bulk_apply, bulk)
+            bulk_thread.start()
+            self.assertTrue(bulk_locked.wait(10))
+            td_go.set()
+            self.assertTrue(_wait_until(lambda: _row_waiters() >= 1), "Track Detail did not wait for the row lock")
+            bulk_release.set()
+            bulk_thread.join(30)
+            td_thread.join(30)
+        self.assertNotIn("error", td)
+        self.assertNotIn("error", bulk)
+        self.assertEqual(td["value"].status_code, 200)
+        self.assertEqual((bulk["value"].status_code, bulk["value"].json()["updated"]), (200, 1))
+        self.assertEqual(self.final(), (self.pop.pk, set()))
+
+    def test_track_detail_holds_the_row_first_then_bulk_sees_a_stale_track(self):
+        real_filter = Category.objects.filter
+        td_in_lock, td_release = threading.Event(), threading.Event()
+
+        def paused_filter(*args, **kwargs):            # Track Detail: inside its locked membership update
+            if threading.current_thread().name == "td":
+                td_in_lock.set()
+                td_release.wait(20)
+            return real_filter(*args, **kwargs)
+
+        td, bulk = {}, {}
+        with mock.patch.object(Category.objects, "filter", paused_filter):
+            td_thread = _in_thread("td", self.track_detail_adds_pop, td)
+            td_thread.start()
+            self.assertTrue(td_in_lock.wait(10))
+            bulk_thread = _in_thread("bulk", self.bulk_apply, bulk)
+            bulk_thread.start()
+            self.assertTrue(_wait_until(lambda: _row_waiters() >= 1), "bulk apply did not wait for the row lock")
+            td_release.set()
+            td_thread.join(30)
+            bulk_thread.join(30)
+        self.assertNotIn("error", td)
+        self.assertNotIn("error", bulk)
+        self.assertEqual(td["value"].status_code, 200)
+        body = bulk["value"].json()
+        self.assertEqual(([t["id"] for t in body["stale"]], body["updated"]), ([self.subject.pk], 0))
+        self.assertEqual(self.final(), (self.rock.pk, {self.pop.pk}))
+
+
+class TokenRedemptionConcurrencyTests(_FixtureMixin, TransactionTestCase):
+    """Two simultaneous apply requests of one session (separate connections, as in separate Gunicorn
+    workers) cannot both redeem one preview."""
+
+    def test_exactly_one_concurrent_apply_claims_the_token(self):
+        from django.core import signing
+        tracks = [self.track(f"race-{i}") for i in range(3)]
+        changes = {"energy": {"op": "set", "value": "upbeat"}}
+        status, preview = self.preview(self.ids(*tracks), changes)
+        self.assertEqual(status, 200, preview)
+        payload = {"selection": self.ids(*tracks), "changes": changes, "token": preview["token"]}
+        from django.contrib.sessions.models import Session
+        session_key = self.client.session.session_key
+        pending = Session.objects.get(session_key=session_key).get_decoded()[track_bulk_edit.SESSION_KEY]
+        self.assertEqual(len(pending), 1)                  # the preview is held in the session's own row
+        clients = []
+        for _ in range(2):
+            client = Client()
+            client.cookies = self.client.cookies          # the same browser session, two requests
+            clients.append(client)
+        barrier = threading.Barrier(2, timeout=20)
+        real_loads = signing.loads
+
+        def both_verified_first(*args, **kwargs):          # both requests verify the token together
+            value = real_loads(*args, **kwargs)
+            # Only the preview token: session decoding uses signing.loads too.
+            if (threading.current_thread().name.startswith("apply-")
+                    and kwargs.get("salt") == track_bulk_edit._TOKEN_SALT):
+                barrier.wait()
+            return value
+
+        results = [{}, {}]
+        with mock.patch.object(signing, "loads", both_verified_first):
+            threads = [_in_thread(f"apply-{i}", lambda c=client: c.post(reverse(APPLY), payload,
+                                                                       content_type="application/json"),
+                                  results[i]) for i, client in enumerate(clients)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        self.assertEqual([r.get("error") for r in results], [None, None])
+        statuses = sorted(r["value"].status_code for r in results)
+        self.assertEqual(statuses, [200, 409], [r["value"].json() for r in results])
+        refused = next(r["value"].json() for r in results if r["value"].status_code == 409)
+        self.assertIn("already applied", refused["error"])
+        winner = next(r["value"].json() for r in results if r["value"].status_code == 200)
+        self.assertEqual(winner["updated"], 3)
+        self.assertEqual(Track.objects.filter(energy="upbeat").count(), 3)
+        # And the session keeps no trace of the claimed preview.
+        session = Session.objects.get(session_key=session_key)
+        self.assertEqual(session.get_decoded().get(track_bulk_edit.SESSION_KEY), {})
+
+    def test_previews_refuse_a_non_database_session_backend(self):
+        from django.core.exceptions import ImproperlyConfigured
+        with override_settings(SESSION_ENGINE="django.contrib.sessions.backends.cache"):
+            with self.assertRaises(ImproperlyConfigured):
+                track_bulk_edit.SessionPreviews(self.client.session)

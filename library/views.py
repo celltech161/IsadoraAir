@@ -1952,7 +1952,8 @@ def api_track_bulk_edit_preview(request):
     if error is not None:
         return error
     _body, selection, ops = parsed
-    return JsonResponse(bulk_edit.preview(selection, ops, user=request.user, store=request.session))
+    return JsonResponse(bulk_edit.preview(selection, ops, user=request.user,
+                                          previews=bulk_edit.SessionPreviews(request.session)))
 
 
 @require_http_methods(["POST"])
@@ -1971,7 +1972,7 @@ def api_track_bulk_edit_apply(request):
     body, selection, ops = parsed
     try:
         return JsonResponse(bulk_edit.apply(selection, ops, body.get("token"), user=request.user,
-                                            store=request.session))
+                                            previews=bulk_edit.SessionPreviews(request.session)))
     except bulk_edit.BulkEditError as exc:
         return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 
@@ -2488,27 +2489,44 @@ def api_track_detail(request, pk):
     # accept the same-shaped input the frontend already sends: a list
     # of ids (categories) or codes (holidays). Missing key = no change;
     # explicit empty list = clear the M2M.
-    if "additional_category_ids" in body:
-        ids = body.get("additional_category_ids") or []
-        cats = list(Category.objects.filter(id__in=ids))
-        if len(cats) != len(ids):
-            return JsonResponse({"error": "One or more additional categories not found"}, status=404)
-        # Guard against a track being listed in its own additional_categories
-        # -- that would double-count it in _tracks_for_category's OR
-        # branch. Silently drop the primary category if it snuck in.
-        if track.category_id is not None:
-            cats = [c for c in cats if c.id != track.category_id]
-        track.additional_categories.set(cats)
-
-    if "holiday_codes" in body:
-        codes = body.get("holiday_codes") or []
-        holidays = list(Holiday.objects.filter(code__in=codes))
-        if len(holidays) != len(codes):
-            return JsonResponse({"error": "One or more holidays not found"}, status=404)
-        track.holidays.set(holidays)
+    if "additional_category_ids" in body or "holiday_codes" in body:
+        error = _sync_track_memberships(track.pk, body)
+        if error is not None:
+            return error
 
     track.refresh_from_db()
     return JsonResponse(_track_to_dict(track))
+
+
+def _sync_track_memberships(track_id, body):
+    """Track Detail's additional-category and holiday update, under the Track's row lock (r0125).
+
+    The bulk editor reads and writes these memberships, and the primary category, under the same row lock,
+    so the two serialize. The primary category is re-read here, under the lock: a primary category set by
+    a concurrent edit after this request loaded the Track is never also added as an additional one.
+    Returns an error response, or None."""
+    with transaction.atomic():
+        locked = Track.objects.select_for_update().only("category_id").filter(pk=track_id).first()
+        if locked is None:
+            return JsonResponse({"error": "The Track was deleted meanwhile"}, status=404)
+        if "additional_category_ids" in body:
+            ids = body.get("additional_category_ids") or []
+            cats = list(Category.objects.filter(id__in=ids))
+            if len(cats) != len(ids):
+                return JsonResponse({"error": "One or more additional categories not found"}, status=404)
+            # Guard against a track being listed in its own additional_categories
+            # -- that would double-count it in _tracks_for_category's OR
+            # branch. Silently drop the primary category if it snuck in.
+            if locked.category_id is not None:
+                cats = [c for c in cats if c.id != locked.category_id]
+            locked.additional_categories.set(cats)
+        if "holiday_codes" in body:
+            codes = body.get("holiday_codes") or []
+            holidays = list(Holiday.objects.filter(code__in=codes))
+            if len(holidays) != len(codes):
+                return JsonResponse({"error": "One or more holidays not found"}, status=404)
+            locked.holidays.set(holidays)
+    return None
 
 
 def _track_to_dict(track):
