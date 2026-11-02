@@ -1916,18 +1916,47 @@ def api_track_bulk(request):
         # which ones need manual cleanup first.
         deleted = 0
         blocked = []
+        cleanup = {"completed": 0, "pending": 0, "retained": 0, "failed": 0}
+        cleanup_warnings = []
         for t in qs.select_related("artist"):
-            ok, reason = _delete_track_and_file(t)
+            track_id = t.id
+            title = t.title
+            artist = t.artist.name if t.artist else ""
+            ok, reason, cleanup_status = _delete_track_and_file(t, include_cleanup=True)
             if ok:
                 deleted += 1
+                if cleanup_status in {"removed", "missing"}:
+                    cleanup["completed"] += 1
+                elif cleanup_status == "pending":
+                    cleanup["pending"] += 1
+                elif cleanup_status == "failed":
+                    cleanup["failed"] += 1
+                else:
+                    # No source deletion was requested/owned, or a new live
+                    # owner/replacement made retention the safe completed act.
+                    cleanup["retained"] += 1
+                if reason:
+                    cleanup_warnings.append({
+                        "id": track_id,
+                        "title": title,
+                        "artist": artist,
+                        "status": cleanup_status,
+                        "reason": reason,
+                    })
             else:
                 blocked.append({
-                    "id": t.id,
-                    "title": t.title,
-                    "artist": t.artist.name if t.artist else "",
+                    "id": track_id,
+                    "title": title,
+                    "artist": artist,
                     "reason": reason,
                 })
-        return JsonResponse({"ok": True, "deleted": deleted, "blocked": blocked})
+        return JsonResponse({
+            "ok": True,
+            "deleted": deleted,
+            "blocked": blocked,
+            "cleanup": cleanup,
+            "cleanup_warnings": cleanup_warnings,
+        })
     else:
         return JsonResponse({"error": "Unknown action"}, status=400)
 
@@ -2021,11 +2050,16 @@ def track_detail_page(request, pk):
     })
 
 
-def _delete_track_and_file(track):
-    """Delete a Track's row + on-disk file + waveform cache. Returns
-    (ok, blocked_reason). blocked_reason is populated when the delete
+def _delete_track_and_file(track, *, include_cleanup=False):
+    """Delete a Track's row + on-disk file + waveform cache.
+
+    Returns ``(ok, reason)`` for compatibility, or
+    ``(ok, reason, cleanup_status)`` when ``include_cleanup`` is true.
+    ``reason`` is populated when the delete
     is refused by a PROTECT FK (Track is still in a Playlist or
-    Rotation slot -- user has to remove it from those first). Mirrors
+    Rotation slot -- user has to remove it from those first), or when
+    the database deletion committed but source cleanup is not confirmed.
+    Mirrors
     the standalone `remove_track_file` management command's cleanup
     so the same shape works whether an operator triggers it from the
     UI or an ingest pipeline recalls a delivered file."""
@@ -2034,13 +2068,7 @@ def _delete_track_and_file(track):
     from library.services.track_deletion import delete_track
 
     try:
-        cleanup = delete_track(
-            track,
-            remove_source=True,
-            on_source_error=lambda path, exc: print(
-                f"  [delete_track] Track row was deleted, but source file {path} could not be removed: {exc}"
-            ),
-        )
+        cleanup = delete_track(track, remove_source=True)
     except ProtectedError as exc:
         # Django raises this when a PROTECT FK still points at this
         # Track (Playlist.items.track and RotationSlot.track -- see
@@ -2075,12 +2103,32 @@ def _delete_track_and_file(track):
             parts.append(_joined("playlist", playlists))
         for kind, n in other.items():
             parts.append(f"{n} {kind}")
-        return False, f"still referenced by {', '.join(parts)} -- remove from those first"
+        result = (False, f"still referenced by {', '.join(parts)} -- remove from those first")
+        return (*result, "blocked") if include_cleanup else result
 
     warning = None
     if cleanup.status == "failed":
-        warning = f"Track was deleted, but source file cleanup failed: {cleanup.error}"
-    return True, warning
+        warning = (
+            "Track database deletion committed, but source file cleanup failed "
+            f"({cleanup.error}); operator cleanup is required."
+        )
+    elif cleanup.status == "pending" and include_cleanup:
+        warning = (
+            "Track database deletion committed; source file cleanup is pending "
+            "and will be recorded in application logs."
+        )
+    elif cleanup.status == "retained_invalid_path":
+        warning = (
+            "Track database deletion committed, but source media was retained because "
+            "its stored path was not a canonical absolute path."
+        )
+    elif cleanup.status == "retained_unverified":
+        warning = (
+            "Track database deletion committed, but source media was retained because "
+            "its file identity could not be verified."
+        )
+    result = (True, warning)
+    return (*result, cleanup.status) if include_cleanup else result
 
 
 @require_http_methods(["GET", "PATCH", "DELETE"])

@@ -488,9 +488,10 @@ class TrackAdmin(admin.ModelAdmin):
         delete_track(
             obj,
             remove_source=True,
-            on_source_error=lambda path, exc: messages.error(
+            on_source_error=lambda _path, exc: messages.error(
                 request,
-                f"Track was deleted, but its source file '{path}' could not be removed: {exc}",
+                "Track was deleted, but source cleanup failed "
+                f"({type(exc).__name__}); operator cleanup is required.",
             ),
         )
 
@@ -503,9 +504,10 @@ class TrackAdmin(admin.ModelAdmin):
         delete_tracks(
             queryset,
             remove_sources=True,
-            on_source_error=lambda path, exc: messages.error(
+            on_source_error=lambda _path, exc: messages.error(
                 request,
-                f"Track was deleted, but its source file '{path}' could not be removed: {exc}",
+                "A Track was deleted, but source cleanup failed "
+                f"({type(exc).__name__}); operator cleanup is required.",
             ),
         )
 

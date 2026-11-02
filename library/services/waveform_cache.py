@@ -601,11 +601,25 @@ def install_file(track_id, staged_file, wave_dir, *, keep_previous=False,
             os.close(lock_fd)
 
 
-def restore_file(track_id, backup_file, wave_dir, *, lock_timeout=LOCK_TIMEOUT_SECONDS) -> None:
+def restore_file(
+    track_id,
+    backup_file,
+    wave_dir,
+    *,
+    lock_timeout=LOCK_TIMEOUT_SECONDS,
+    using="default",
+) -> None:
     """Put a publisher's copy of the previous cache back, verbatim and atomically (its rollback)."""
     final = canonical_path(wave_dir, track_id)
     data = Path(backup_file).read_bytes()
     with track_lock(wave_dir, track_id, timeout=lock_timeout):
+        from library.models import Track
+
+        if not Track._base_manager.using(using).filter(pk=track_id).exists():
+            raise PromotionRefused("track_missing", f"Track {track_id} no longer exists")
+        # A legitimate recreated Track owns this id and may restore/publish;
+        # clear a stale fence while holding the same lock used by deletion.
+        _clear_deleted_marker(track_id)
         staged = _stage(final.parent, track_id, data)
         try:
             os.replace(staged, final)
@@ -616,7 +630,7 @@ def restore_file(track_id, backup_file, wave_dir, *, lock_timeout=LOCK_TIMEOUT_S
 
 
 def remove(track_id, wave_dir=None, *, path=None, lock_timeout=LOCK_TIMEOUT_SECONDS,
-           track_deleted=False, preserve_file=False) -> bool:
+           track_deleted=False, preserve_file=False, using="default") -> bool:
     """Remove a Track's cache (default: canonical) under its lock.
 
     ``track_deleted`` writes a durable publisher fence before touching the
@@ -628,6 +642,14 @@ def remove(track_id, wave_dir=None, *, path=None, lock_timeout=LOCK_TIMEOUT_SECO
         return False
     with track_lock(target.parent, track_id, timeout=lock_timeout):
         if track_deleted:
+            from library.models import Track
+
+            # The row check and cache decision share the publisher's per-Track
+            # lock.  A deliberately recreated primary key is the current owner:
+            # retain its cache and clear any older deletion fence.
+            if Track._base_manager.using(using).filter(pk=track_id).exists():
+                _clear_deleted_marker(track_id)
+                return False
             _mark_track_deleted(track_id)
         if preserve_file:
             return False

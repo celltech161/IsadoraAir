@@ -411,7 +411,8 @@ async function bulkDelete() {
   const more = n > titles.length ? `\n  … and ${n - titles.length} more` : '';
   const msg =
     `Delete ${n} track${n === 1 ? '' : 's'} permanently?\n\n` +
-    `This removes the DB row AND the audio file from disk. Cannot be undone.\n\n` +
+    `This commits the database deletion and schedules source-audio cleanup. ` +
+    `Cleanup status will be reported after the request. Cannot be undone.\n\n` +
     `  • ${preview}${more}`;
   if (!confirm(msg)) return;
 
@@ -428,14 +429,29 @@ async function bulkDelete() {
     alert('Delete failed: ' + (data.error || resp.status));
     return;
   }
-  if (data.blocked && data.blocked.length) {
-    const lines = data.blocked.map(b =>
-      `  • ${b.artist ? b.artist + ' — ' : ''}${b.title}: ${b.reason}`
-    ).join('\n');
-    alert(
-      `Deleted ${data.deleted} track${data.deleted === 1 ? '' : 's'}.\n\n` +
-      `${data.blocked.length} could not be deleted:\n${lines}`
-    );
+  const cleanup = data.cleanup || {};
+  const warnings = data.cleanup_warnings || [];
+  const blocked = data.blocked || [];
+  if (blocked.length || warnings.length || data.deleted) {
+    const sections = [
+      `Deleted ${data.deleted} track${data.deleted === 1 ? '' : 's'} from the database.`,
+      `Source cleanup: ${cleanup.completed || 0} completed, ` +
+        `${cleanup.pending || 0} pending, ${cleanup.retained || 0} safely retained, ` +
+        `${cleanup.failed || 0} failed.`,
+    ];
+    if (warnings.length) {
+      const warningLines = warnings.map(w =>
+        `  • ${w.artist ? w.artist + ' — ' : ''}${w.title}: ${w.reason}`
+      ).join('\n');
+      sections.push(`Cleanup requires attention:\n${warningLines}`);
+    }
+    if (blocked.length) {
+      const lines = blocked.map(b =>
+        `  • ${b.artist ? b.artist + ' — ' : ''}${b.title}: ${b.reason}`
+      ).join('\n');
+      sections.push(`${blocked.length} could not be deleted:\n${lines}`);
+    }
+    alert(sections.join('\n\n'));
   }
   clearSelection();
   loadTracks();

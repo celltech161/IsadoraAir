@@ -437,12 +437,14 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
     def test_cas_no_reference_deletes_orphaned_track(self):
         track = self.make_track()
         req = self.make_request(track, status="pending")  # not "scheduled" -- the CAS filter can't match
+        rendered_path = Path(self._dedi_tmpdir.name) / f"request-{req.id}.flac"
 
         synthesize_dedication_intro(req)
 
         req.refresh_from_db()
         self.assertIsNone(req.intro_track_id)
         self.assertEqual(Track.objects.filter(category=self.dedication_category).count(), 0)
+        self.assertFalse(rendered_path.exists(), "lost CAS cleanup must remove the orphaned rendered audio")
 
     def test_cas_log_item_reference_preserves_track(self):
         track = self.make_track()
