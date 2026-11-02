@@ -91,6 +91,68 @@
   .bulk-btn.danger { color: var(--danger); border-color: rgba(249, 115, 115, 0.4); }
   .bulk-btn.danger:hover { border-color: var(--danger); background: rgba(249, 115, 115, 0.08); }
 
+  /* --- Selection banner (r0125) --- */
+  .select-banner {
+    display: none;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.8rem;
+    margin-bottom: 0.5rem;
+    border: 1px dashed var(--border-subtle);
+    border-radius: 8px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .select-banner.visible { display: flex; }
+  .select-banner button {
+    background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.8rem; padding: 0;
+    text-decoration: underline;
+  }
+  .select-banner button:disabled { color: var(--text-muted); cursor: not-allowed; text-decoration: none; }
+  .bulk-bar .bulk-scope { color: var(--text-muted); }
+  .bulk-bar.filter-mode { background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.35); }
+
+  /* --- Bulk editor and preview (r0125) --- */
+  .bulk-panel {
+    display: none;
+    margin-bottom: 0.75rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: var(--bg-dark);
+    font-size: 0.8rem;
+  }
+  .bulk-panel.visible { display: block; }
+  .bulk-panel h3 { margin: 0 0 0.5rem; font-size: 0.9rem; }
+  .be-grid {
+    display: grid;
+    grid-template-columns: minmax(8rem, max-content) minmax(9rem, max-content) minmax(0, 1fr);
+    gap: 0.35rem 0.6rem;
+    align-items: center;
+  }
+  .be-grid label { color: var(--text-muted); }
+  .be-grid input, .be-grid select {
+    background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px;
+    color: var(--text-main); padding: 0.3rem 0.45rem; font-size: 0.78rem; min-width: 0; max-width: 100%;
+  }
+  .be-grid input:disabled, .be-grid select:disabled { opacity: 0.45; }
+  .be-grid select[multiple] { min-height: 4.5rem; }
+  .be-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.75rem; align-items: center; }
+  .be-note { color: var(--text-muted); font-size: 0.75rem; }
+  .be-error { color: var(--danger); margin-top: 0.5rem; }
+  .be-warn { color: #f59e0b; }
+  .be-list { margin: 0.3rem 0 0.5rem 1.1rem; padding: 0; }
+  .be-table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
+  .be-table th, .be-table td {
+    text-align: left; padding: 0.25rem 0.45rem; border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    vertical-align: top; overflow-wrap: anywhere;
+  }
+  .be-table th { color: var(--text-muted); font-weight: 600; }
+  @media (max-width: 640px) {
+    .be-grid { grid-template-columns: 1fr; }
+  }
+
   /* --- Table --- */
   .lib-table-wrap {
     overflow-x: auto;
@@ -230,32 +292,116 @@
   <span class="lib-stats" id="stats"></span>
 </div>
 
-{% if not is_library_read_only %}
+{% if can_bulk_edit and not is_library_read_only %}
+<div class="select-banner" id="selectBanner" role="status" aria-live="polite"></div>
+
 <div class="bulk-bar" id="bulkBar">
-  <span class="bulk-count" id="bulkCount">0</span> selected
-  <button class="bulk-btn" onclick="bulkAction('ready2air_on')">Mark Ready</button>
-  <button class="bulk-btn" onclick="bulkAction('ready2air_off')">Mark Not Ready</button>
-  <select class="lib-select" id="bulkCategorySelect" style="font-size:0.78rem;">
+  <span><span class="bulk-count" id="bulkCount">0</span> <span id="bulkScope" class="bulk-scope">selected</span></span>
+  <button class="bulk-btn" onclick="openBulkEditor()">Edit…</button>
+  <button class="bulk-btn" onclick="quickEdit({ ready2air: { op: 'set', value: true } })">Mark Ready</button>
+  <button class="bulk-btn" onclick="quickEdit({ ready2air: { op: 'set', value: false } })">Mark Not Ready</button>
+  <select class="lib-select" id="bulkCategorySelect" style="font-size:0.78rem;" aria-label="Set primary category">
     <option value="">Set category...</option>
     {% for cat in categories %}
     <option value="{{ cat.id }}">{{ cat.name }}</option>
     {% endfor %}
   </select>
-  <select class="lib-select" id="bulkAdditionalCategorySelect" style="font-size:0.78rem;">
-    <option value="">Set additional category...</option>
+  <select class="lib-select" id="bulkAdditionalCategorySelect" style="font-size:0.78rem;" aria-label="Add additional category">
+    <option value="">Add additional category...</option>
     {% for cat in categories %}
     <option value="{{ cat.id }}">{{ cat.name }}</option>
     {% endfor %}
   </select>
-  <select class="lib-select" id="bulkHolidaySelect" style="font-size:0.78rem;">
+  <select class="lib-select" id="bulkHolidaySelect" style="font-size:0.78rem;" aria-label="Add holiday">
     <option value="">Add holiday...</option>
     {% for h in holidays %}
     <option value="{{ h.code }}">{{ h.name }}</option>
     {% endfor %}
   </select>
-  <button class="bulk-btn" onclick="bulkApply()">Apply</button>
-  <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
+  <button class="bulk-btn" onclick="bulkApply()">Preview…</button>
+  <button class="bulk-btn danger" id="bulkDeleteBtn" onclick="bulkDelete()">Delete</button>
   <button class="bulk-btn" onclick="clearSelection()" style="margin-left:auto;">Clear</button>
+</div>
+
+<div class="bulk-panel" id="bulkEditor" aria-labelledby="bulkEditorTitle">
+  <h3 id="bulkEditorTitle">Bulk edit</h3>
+  <p class="be-note">Every field starts as <strong>Leave unchanged</strong>; only the fields you set or clear are changed.
+    Database metadata only: audio-file tags, cue points, waveforms and file locations are not touched, and nothing is reanalyzed.</p>
+  <div class="be-grid" id="beGrid">
+    <label for="be-artist-op">Artist</label>
+    <select id="be-artist-op" data-field="artist" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option></select>
+    <input type="text" id="be-artist" maxlength="255" disabled aria-label="Artist value">
+    <label for="be-album-op">Album</label>
+    <select id="be-album-op" data-field="album" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-album" maxlength="255" disabled aria-label="Album value">
+    <label for="be-genre-op">Genre</label>
+    <select id="be-genre-op" data-field="genre" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-genre" maxlength="100" disabled aria-label="Genre value">
+    <label for="be-year-op">Year</label>
+    <select id="be-year-op" data-field="year" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="number" id="be-year" min="1000" max="9999" step="1" disabled aria-label="Year value">
+    <label for="be-composer-op">Composer</label>
+    <select id="be-composer-op" data-field="composer" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-composer" maxlength="255" disabled aria-label="Composer value">
+    <label for="be-publisher-op">Publisher</label>
+    <select id="be-publisher-op" data-field="publisher" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-publisher" maxlength="255" disabled aria-label="Publisher value">
+    <label for="be-record_label-op">Record label</label>
+    <select id="be-record_label-op" data-field="record_label" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-record_label" maxlength="255" disabled aria-label="Record label value">
+    <label for="be-energy-op">Energy</label>
+    <select id="be-energy-op" data-field="energy" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <select id="be-energy" disabled aria-label="energy value">{% for value, label in energy_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select>
+    <label for="be-vocal_type-op">Vocal type</label>
+    <select id="be-vocal_type-op" data-field="vocal_type" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <select id="be-vocal_type" disabled aria-label="vocal_type value">{% for value, label in vocal_type_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select>
+    <label for="be-end_type-op">End type</label>
+    <select id="be-end_type-op" data-field="end_type" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option></select>
+    <select id="be-end_type" disabled aria-label="end_type value">{% for value, label in end_type_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select>
+    <label for="be-rotation_weight-op">Rotation weight</label>
+    <select id="be-rotation_weight-op" data-field="rotation_weight" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option></select>
+    <input type="number" id="be-rotation_weight" min="0" max="5" step="1" disabled aria-label="Rotation weight value">
+    <label for="be-ready2air-op">Ready to Air</label>
+    <select id="be-ready2air-op" data-field="ready2air" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option></select>
+    <select id="be-ready2air" disabled aria-label="Ready to Air value"><option value="true">Ready</option><option value="false">Not ready</option></select>
+    <label for="be-category-op">Primary category</label>
+    <select id="be-category-op" data-field="category" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
+    <select id="be-category" disabled aria-label="Primary category value">{% for cat in categories %}<option value="{{ cat.id }}">{{ cat.code }} — {{ cat.name }}</option>{% endfor %}</select>
+    <label for="be-addcat">Add additional categories</label>
+    <span class="be-note">Existing memberships are kept</span>
+    <select id="be-addcat" multiple>{% for cat in categories %}<option value="{{ cat.id }}">{{ cat.code }} — {{ cat.name }}</option>{% endfor %}</select>
+    <label for="be-removecat">Remove additional categories</label>
+    <span class="be-note">Only the ones chosen</span>
+    <select id="be-removecat" multiple>{% for cat in categories %}<option value="{{ cat.id }}">{{ cat.code }} — {{ cat.name }}</option>{% endfor %}</select>
+    <label for="be-addhol">Add holidays</label>
+    <span class="be-note">Existing tags are kept</span>
+    <select id="be-addhol" multiple>{% for h in holidays %}<option value="{{ h.code }}">{{ h.name }}</option>{% endfor %}</select>
+    <label for="be-removehol">Remove holidays</label>
+    <span class="be-note">Only the ones chosen</span>
+    <select id="be-removehol" multiple>{% for h in holidays %}<option value="{{ h.code }}">{{ h.name }}</option>{% endfor %}</select>
+  </div>
+  <div class="be-actions">
+    <button class="bulk-btn" onclick="previewBulkEdit()">Preview</button>
+    <button class="bulk-btn" onclick="closeBulkPanels()">Cancel</button>
+  </div>
+  <div class="be-error" id="beError" role="alert"></div>
+</div>
+
+<div class="bulk-panel" id="bulkPreview" aria-labelledby="bulkPreviewTitle">
+  <h3 id="bulkPreviewTitle">Review before applying</h3>
+  <div id="bePreviewBody"></div>
+  <div class="be-actions">
+    <button class="bulk-btn" id="beApplyBtn" onclick="applyBulkEdit()">Apply</button>
+    <button class="bulk-btn" onclick="backToEditor()">Back</button>
+    <button class="bulk-btn" onclick="closeBulkPanels()">Cancel</button>
+  </div>
+  <div class="be-error" id="bePreviewError" role="alert"></div>
+</div>
+
+<div class="bulk-panel" id="bulkResult" role="status" aria-live="polite">
+  <h3>Bulk edit result</h3>
+  <div id="beResultBody"></div>
+  <div class="be-actions"><button class="bulk-btn" onclick="closeBulkPanels()">Close</button></div>
 </div>
 {% endif %}
 
@@ -263,8 +409,8 @@
   <table class="lib-table">
     <thead>
       <tr>
-        {% if not is_library_read_only %}
-        <th class="col-check"><input type="checkbox" id="selectAll" title="Select all on page"></th>
+        {% if can_bulk_edit and not is_library_read_only %}
+        <th class="col-check"><input type="checkbox" id="selectAll" title="Select the Tracks on this page" aria-label="Select the Tracks on this page"></th>
         {% endif %}
         <th data-sort="title">Title <span class="arrow"></span></th>
         <th data-sort="artist">Artist <span class="arrow"></span></th>
@@ -297,8 +443,16 @@ let currentDir = 'asc';
 let currentPage = 1;
 let totalPages = 1;
 let debounceTimer = null;
-let selectedIds = new Set();
+let selectedIds = new Set();      // ids mode: rows the operator ticked, on any page
 let pageTrackIds = [];
+let lastTotal = 0;                 // Tracks matching the current filter (last list response)
+// r0125: "every Track matching the filter" is a separate, explicit selection -- never implied by the page
+// checkbox.  It remembers the filter it was made for and the rows unticked since.
+let filterSelection = null;        // { filter: {q, category, ready2air}, total, excluded: Set }
+let lastPreview = null;            // { selection, changes, token, data }
+let selectionNote = '';
+const BULK_UI = {% if can_bulk_edit and not is_library_read_only %}true{% else %}false{% endif %};
+const BULK_MAX = {{ bulk_edit_max|default:1000 }};
 
 function getCookie(name) {
   let val = null;
@@ -341,57 +495,342 @@ function buildQuery() {
   return params.toString();
 }
 
-function updateBulkBar() {
-  const bar = document.getElementById('bulkBar');
-  const count = document.getElementById('bulkCount');
-  if (selectedIds.size > 0) {
-    bar.classList.add('visible');
-    count.textContent = selectedIds.size;
-  } else {
-    bar.classList.remove('visible');
+function currentFilter() {
+  return {
+    q: document.getElementById('searchInput').value.trim(),
+    category: document.getElementById('categoryFilter').value,
+    ready2air: document.getElementById('readyFilter').value,
+  };
+}
+
+function isSelected(id) {
+  return filterSelection ? !filterSelection.excluded.has(id) : selectedIds.has(id);
+}
+
+function selectionCount() {
+  return filterSelection ? filterSelection.total - filterSelection.excluded.size : selectedIds.size;
+}
+
+function buildSelection() {
+  if (filterSelection) {
+    return { mode: 'filter', filter: { ...filterSelection.filter }, exclude_ids: [...filterSelection.excluded] };
   }
-  document.getElementById('selectAll').checked =
-    pageTrackIds.length > 0 && pageTrackIds.every(id => selectedIds.has(id));
+  return { mode: 'ids', ids: [...selectedIds] };
+}
+
+function renderRowChecks() {
+  document.querySelectorAll('#trackBody tr').forEach(tr => {
+    const id = parseInt(tr.dataset.id);
+    const cb = tr.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = isSelected(id);
+    tr.classList.toggle('selected', isSelected(id));
+  });
+}
+
+function renderSelectBanner() {
+  const banner = document.getElementById('selectBanner');
+  banner.replaceChildren();
+  const add = (text) => banner.append(document.createTextNode(text));
+  const button = (label, onclick, disabled) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.disabled = !!disabled;
+    b.addEventListener('click', onclick);
+    banner.append(b);
+  };
+  const pageAll = pageTrackIds.length > 0 && pageTrackIds.every(id => selectedIds.has(id));
+  if (filterSelection) {
+    const unticked = filterSelection.excluded.size;
+    add(`All ${filterSelection.total.toLocaleString()} Tracks matching the filter are selected` +
+        (unticked ? ` except ${unticked} unticked` : '') + ' (across every page). ');
+    button('Clear selection', clearSelection);
+  } else if (pageAll && lastTotal > pageTrackIds.length) {
+    add(`The ${pageTrackIds.length} Tracks on this page are selected. `);
+    const tooMany = lastTotal > BULK_MAX;
+    button(`Select all ${lastTotal.toLocaleString()} Tracks matching this filter`, selectAllMatching, tooMany);
+    if (tooMany) add(` (a bulk edit is limited to ${BULK_MAX.toLocaleString()} Tracks; narrow the filter)`);
+  } else if (selectedIds.size) {
+    const offPage = [...selectedIds].filter(id => !pageTrackIds.includes(id)).length;
+    if (offPage) add(`${offPage} of the selected Tracks are on other pages or outside the current filter.`);
+  }
+  if (selectionNote) add((banner.childNodes.length ? ' ' : '') + selectionNote);
+  banner.classList.toggle('visible', banner.childNodes.length > 0);
+}
+
+function updateBulkBar() {
+  if (!BULK_UI) return;
+  const bar = document.getElementById('bulkBar');
+  const n = selectionCount();
+  bar.classList.toggle('visible', n > 0);
+  bar.classList.toggle('filter-mode', !!filterSelection);
+  document.getElementById('bulkCount').textContent = n.toLocaleString();
+  document.getElementById('bulkScope').textContent = filterSelection
+    ? 'selected: every Track matching the filter'
+    : `selected row${n === 1 ? '' : 's'}`;
+  // Bulk deletion stays limited to rows the operator ticked one by one.
+  document.getElementById('bulkDeleteBtn').style.display = filterSelection ? 'none' : '';
+  document.getElementById('selectAll').checked = filterSelection
+    ? true
+    : pageTrackIds.length > 0 && pageTrackIds.every(id => selectedIds.has(id));
+  renderSelectBanner();
+}
+
+function selectionChanged() {
+  // A preview describes one selection; any change makes it stale.
+  if (lastPreview) closeBulkPanels();
+  renderRowChecks();
+  updateBulkBar();
 }
 
 function toggleSelect(id, checkbox) {
-  if (selectedIds.has(id)) {
-    selectedIds.delete(id);
-  } else {
+  selectionNote = '';
+  if (filterSelection) {
+    if (checkbox.checked) filterSelection.excluded.delete(id);
+    else filterSelection.excluded.add(id);
+    if (selectionCount() <= 0) filterSelection = null;
+  } else if (checkbox.checked) {
     selectedIds.add(id);
+  } else {
+    selectedIds.delete(id);
   }
-  const row = checkbox.closest('tr');
-  row.classList.toggle('selected', selectedIds.has(id));
-  updateBulkBar();
+  selectionChanged();
+}
+
+function selectAllMatching() {
+  if (lastTotal > BULK_MAX) return;
+  selectionNote = '';
+  filterSelection = { filter: currentFilter(), total: lastTotal, excluded: new Set() };
+  selectedIds.clear();
+  selectionChanged();
 }
 
 function clearSelection() {
   selectedIds.clear();
-  document.querySelectorAll('#trackBody tr').forEach(tr => {
-    tr.classList.remove('selected');
-    const cb = tr.querySelector('input[type="checkbox"]');
-    if (cb) cb.checked = false;
-  });
-  updateBulkBar();
+  filterSelection = null;
+  selectionNote = '';
+  selectionChanged();
 }
 
-async function bulkAction(action) {
-  if (selectedIds.size === 0) return;
-  const resp = await fetch('/api/tracks/bulk/', {
+function filtersChanged() {
+  // A matching-results selection belongs to the filter it was made for.
+  if (filterSelection) {
+    filterSelection = null;
+    selectionNote = 'The filter changed, so the "all matching Tracks" selection was cleared.';
+    if (lastPreview) closeBulkPanels();
+  }
+}
+
+// ---- Bulk edit: editor -> preview -> apply (r0125) -------------------------------------------
+const INT_FIELDS = new Set(['year', 'rotation_weight']);
+
+function syncEditorRow(select) {
+  const input = document.getElementById('be-' + select.dataset.field);
+  input.disabled = select.value !== 'set';
+}
+
+function showPanel(id) {
+  ['bulkEditor', 'bulkPreview', 'bulkResult'].forEach(p =>
+    document.getElementById(p).classList.toggle('visible', p === id));
+}
+
+function closeBulkPanels() {
+  showPanel(null);
+  lastPreview = null;
+}
+
+function openBulkEditor() {
+  document.querySelectorAll('#beGrid .be-op').forEach(sel => { sel.value = 'leave'; syncEditorRow(sel); });
+  document.querySelectorAll('#beGrid select[multiple]').forEach(sel =>
+    [...sel.options].forEach(o => { o.selected = false; }));
+  document.getElementById('beError').textContent = '';
+  lastPreview = null;
+  showPanel('bulkEditor');
+}
+
+function backToEditor() {
+  lastPreview = null;
+  showPanel('bulkEditor');
+}
+
+function multiValues(id, asInt) {
+  return [...document.getElementById(id).selectedOptions].map(o => asInt ? parseInt(o.value) : o.value);
+}
+
+function collectChanges() {
+  const changes = {};
+  for (const sel of document.querySelectorAll('#beGrid .be-op')) {
+    const field = sel.dataset.field;
+    if (sel.value === 'leave') continue;
+    if (sel.value === 'clear') { changes[field] = { op: 'clear' }; continue; }
+    const raw = document.getElementById('be-' + field).value;
+    let value = raw;
+    if (INT_FIELDS.has(field)) value = raw.trim() === '' ? raw : Number(raw);
+    if (field === 'ready2air') value = raw === 'true';
+    if (field === 'category') value = parseInt(raw);
+    changes[field] = { op: 'set', value };
+  }
+  const addCat = multiValues('be-addcat', true), removeCat = multiValues('be-removecat', true);
+  const addHol = multiValues('be-addhol', false), removeHol = multiValues('be-removehol', false);
+  if (addCat.length || removeCat.length) changes.additional_categories = { add: addCat, remove: removeCat };
+  if (addHol.length || removeHol.length) changes.holidays = { add: addHol, remove: removeHol };
+  return changes;
+}
+
+async function postJSON(url, payload) {
+  const resp = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-CSRFToken': getCookie('csrftoken'),
-    },
-    body: JSON.stringify({ action, ids: [...selectedIds] }),
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify(payload),
   });
-  if (resp.ok) {
-    clearSelection();
-    loadTracks();
+  const data = await resp.json().catch(() => ({}));
+  return { resp, data };
+}
+
+function previewBulkEdit() {
+  const changes = collectChanges();
+  if (!Object.keys(changes).length) {
+    document.getElementById('beError').textContent = 'Nothing to change: every field is set to Leave unchanged.';
+    return;
+  }
+  runPreview(changes, 'beError');
+}
+
+function quickEdit(changes) {
+  runPreview(changes, null);
+}
+
+async function runPreview(changes, errorTarget) {
+  if (selectionCount() === 0) return;
+  const selection = buildSelection();
+  let result;
+  try {
+    result = await postJSON('/api/tracks/bulk/preview/', { selection, changes });
+  } catch (e) {
+    result = { resp: { ok: false, status: 0 }, data: { error: 'No response from the server.' } };
+  }
+  const { resp, data } = result;
+  if (!resp.ok) {
+    const msg = 'Preview failed: ' + (data.error || resp.status);
+    if (errorTarget) document.getElementById(errorTarget).textContent = msg;
+    else alert(msg);
+    return;
+  }
+  lastPreview = { selection, changes, token: data.token, data };
+  renderPreview(data);
+  showPanel('bulkPreview');
+}
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (cls) node.className = cls;
+  return node;
+}
+
+function trackLabel(t) {
+  return `${t.artist ? t.artist + ' — ' : ''}${t.title} (#${t.id})`;
+}
+
+function renderPreview(data) {
+  const body = document.getElementById('bePreviewBody');
+  body.replaceChildren();
+  document.getElementById('bePreviewError').textContent = '';
+  const sel = data.selection;
+  body.append(el('p', `Selection: ${sel.description} — ${sel.count.toLocaleString()} Track(s) found.`));
+  if (sel.missing.length) {
+    body.append(el('p', `${sel.missing.length} selected Track(s) no longer exist and will be skipped: #${sel.missing.join(', #')}.`, 'be-warn'));
+  }
+  body.append(el('p', 'Changes:'));
+  const ops = el('ul', undefined, 'be-list');
+  const verbs = { set: 'set to', clear: 'clear', add: 'add', remove: 'remove' };
+  data.operations.forEach(o => ops.append(el('li', `${o.label}: ${verbs[o.op] || o.op}${o.op === 'clear' ? '' : ' ' + o.value}`)));
+  body.append(ops);
+  const summary = el('ul', undefined, 'be-list');
+  Object.values(data.summary).forEach(s =>
+    summary.append(el('li', `${s.label}: ${s.change.toLocaleString()} will change, ${s.unchanged.toLocaleString()} already match`)));
+  body.append(summary);
+  body.append(el('p', `${data.tracks_changing.toLocaleString()} Track(s) will be changed; ` +
+                       `${data.tracks_unchanged.toLocaleString()} already match and will be left as they are.`));
+  data.warnings.forEach(w => body.append(el('p', w, 'be-warn')));
+  if (data.refusals.length) {
+    body.append(el('p', `${data.refusals.length} Track(s) will be refused and left unchanged:`, 'be-warn'));
+    const list = el('ul', undefined, 'be-list');
+    data.refusals.forEach(r => list.append(el('li', `${trackLabel(r)}: ${r.reason}`)));
+    body.append(list);
+  }
+  if (data.samples.length) {
+    body.append(el('p', `Sample (${data.samples.length} of ${data.tracks_changing.toLocaleString()}):`));
+    const table = el('table', undefined, 'be-table');
+    const head = el('tr');
+    ['Track', 'Field', 'Before', 'After'].forEach(h => head.append(el('th', h)));
+    table.append(head);
+    data.samples.forEach(t => t.changes.forEach((c, i) => {
+      const row = el('tr');
+      row.append(el('td', i === 0 ? trackLabel(t) : ''), el('td', c.label), el('td', c.before), el('td', c.after));
+      table.append(row);
+    }));
+    body.append(table);
+  }
+  const apply = document.getElementById('beApplyBtn');
+  apply.disabled = data.tracks_changing === 0;
+  apply.textContent = data.tracks_changing === 0
+    ? 'Nothing to apply'
+    : `Apply to ${data.tracks_changing.toLocaleString()} Track(s)`;
+}
+
+async function applyBulkEdit() {
+  if (!lastPreview) return;
+  const apply = document.getElementById('beApplyBtn');
+  apply.disabled = true;
+  const { selection, changes, token } = lastPreview;
+  let result;
+  try {
+    result = await postJSON('/api/tracks/bulk/apply/', { selection, changes, token });
+  } catch (e) {
+    document.getElementById('bePreviewError').textContent =
+      'No response from the server; the result is unknown. Reload the Library to see the current values.';
+    return;
+  }
+  const { resp, data } = result;
+  if (!resp.ok) {
+    document.getElementById('bePreviewError').textContent =
+      (data.error || ('Apply failed: ' + resp.status)) + (resp.status === 409 ? ' Use Back, then Preview again.' : '');
+    return;
+  }
+  renderResult(data);
+  showPanel('bulkResult');
+  lastPreview = null;
+  selectedIds.clear();
+  filterSelection = null;
+  ['bulkCategorySelect', 'bulkAdditionalCategorySelect', 'bulkHolidaySelect'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  loadTracks();
+}
+
+function renderResult(data) {
+  const body = document.getElementById('beResultBody');
+  body.replaceChildren();
+  body.append(el('p', `Updated ${data.updated.toLocaleString()} of ${data.requested.toLocaleString()} Track(s); ` +
+                       `${data.unchanged.toLocaleString()} already matched.`));
+  if (data.files_left_in_previous_category_folder) {
+    body.append(el('p', `${data.files_left_in_previous_category_folder} file(s) remain in their previous category folder ` +
+                         '(database-only category change; relocate from Track Detail).', 'be-warn'));
+  }
+  if (data.missing.length) {
+    body.append(el('p', `${data.missing.length} Track(s) no longer existed: #${data.missing.join(', #')}.`, 'be-warn'));
+  }
+  if (data.failed.length) {
+    body.append(el('p', `${data.failed.length} Track(s) were not changed:`, 'be-warn'));
+    const list = el('ul', undefined, 'be-list');
+    data.failed.forEach(f => list.append(el('li', `${trackLabel(f)}: ${f.reason}`)));
+    body.append(list);
   }
 }
 
 async function bulkDelete() {
+  if (filterSelection) return;   // deletion takes explicitly ticked rows only
   const n = selectedIds.size;
   if (n === 0) return;
   // Sample the titles we're about to delete so the operator can spot a
@@ -514,67 +953,18 @@ async function autofillRelatedArtists() {
   }
 }
 
-async function bulkApply() {
-  // Combined dispatcher for all three dropdowns in the bulk bar. Any
-  // combination of primary category / additional category / holiday
-  // can be applied together (one API call per action). If none picked,
-  // nothing happens rather than firing an empty request.
-  const catSelect = document.getElementById('bulkCategorySelect');
-  const addCatSelect = document.getElementById('bulkAdditionalCategorySelect');
-  const holSelect = document.getElementById('bulkHolidaySelect');
-  const catId = catSelect.value;
-  const addCatId = addCatSelect.value;
-  const holCode = holSelect.value;
-  if (selectedIds.size === 0) return;
-  if (!catId && !addCatId && !holCode) return;
-
-  const ids = [...selectedIds];
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-CSRFToken': getCookie('csrftoken'),
-  };
-
-  if (catId) {
-    const resp = await fetch('/api/tracks/bulk/', {
-      method: 'POST', headers,
-      body: JSON.stringify({ action: 'set_category', ids, category_id: parseInt(catId) }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      alert('Set category failed: ' + (err.error || resp.status));
-      return;
-    }
-    catSelect.value = '';
-  }
-
-  if (addCatId) {
-    const resp = await fetch('/api/tracks/bulk/', {
-      method: 'POST', headers,
-      body: JSON.stringify({ action: 'add_additional_category', ids, category_id: parseInt(addCatId) }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      alert('Set additional category failed: ' + (err.error || resp.status));
-      return;
-    }
-    addCatSelect.value = '';
-  }
-
-  if (holCode) {
-    const resp = await fetch('/api/tracks/bulk/', {
-      method: 'POST', headers,
-      body: JSON.stringify({ action: 'add_holiday', ids, holiday_code: holCode }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      alert('Add holiday failed: ' + (err.error || resp.status));
-      return;
-    }
-    holSelect.value = '';
-  }
-
-  clearSelection();
-  loadTracks();
+function bulkApply() {
+  // The bar's three dropdowns are a shortcut into the same preview: any combination of primary category,
+  // an additional category and a holiday, added (never replacing existing memberships).
+  const catId = document.getElementById('bulkCategorySelect').value;
+  const addCatId = document.getElementById('bulkAdditionalCategorySelect').value;
+  const holCode = document.getElementById('bulkHolidaySelect').value;
+  if (selectionCount() === 0 || (!catId && !addCatId && !holCode)) return;
+  const changes = {};
+  if (catId) changes.category = { op: 'set', value: parseInt(catId) };
+  if (addCatId) changes.additional_categories = { add: [parseInt(addCatId)] };
+  if (holCode) changes.holidays = { add: [holCode] };
+  runPreview(changes, null);
 }
 
 async function loadTracks() {
@@ -585,6 +975,8 @@ async function loadTracks() {
   totalPages = data.pages;
   currentPage = data.page;
   pageTrackIds = data.items.map(t => t.id);
+  lastTotal = data.total;
+  if (filterSelection) filterSelection.total = data.total;
 
   const stats = document.getElementById('stats');
   stats.textContent = data.total.toLocaleString() + ' tracks';
@@ -598,12 +990,12 @@ async function loadTracks() {
   } else {
     empty.style.display = 'none';
     body.innerHTML = data.items.map(t => {
-      const checked = selectedIds.has(t.id) ? 'checked' : '';
-      const sel = selectedIds.has(t.id) ? 'selected' : '';
+      const checked = isSelected(t.id) ? 'checked' : '';
+      const sel = isSelected(t.id) ? 'selected' : '';
       return `<tr class="${sel}" data-id="${t.id}">
-        {% if not is_library_read_only %}
+        {% if can_bulk_edit and not is_library_read_only %}
         <td class="col-check" onclick="event.stopPropagation()">
-          <input type="checkbox" ${checked}
+          <input type="checkbox" ${checked} aria-label="Select ${esc(t.title)}"
                  onchange="toggleSelect(${t.id}, this)">
         </td>
         {% endif %}
@@ -655,20 +1047,20 @@ function goPage(delta) {
   loadTracks();
 }
 
-// Select all checkbox
-document.getElementById('selectAll').addEventListener('change', function() {
+// Page checkbox: the rows on this page only.  Selecting every matching Track is a separate, explicit
+// choice offered in the banner.
+if (BULK_UI) document.getElementById('selectAll').addEventListener('change', function() {
+  selectionNote = '';
+  if (filterSelection) {
+    clearSelection();
+    return;
+  }
   if (this.checked) {
     pageTrackIds.forEach(id => selectedIds.add(id));
   } else {
     pageTrackIds.forEach(id => selectedIds.delete(id));
   }
-  document.querySelectorAll('#trackBody tr').forEach(tr => {
-    const id = parseInt(tr.dataset.id);
-    const cb = tr.querySelector('input[type="checkbox"]');
-    if (cb) cb.checked = selectedIds.has(id);
-    tr.classList.toggle('selected', selectedIds.has(id));
-  });
-  updateBulkBar();
+  selectionChanged();
 });
 
 // Sort on header click
@@ -736,6 +1128,7 @@ document.getElementById('searchInput').addEventListener('input', () => {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     currentPage = 1;
+    filtersChanged();
     loadTracks();
   }, 300);
 });
@@ -743,11 +1136,13 @@ document.getElementById('searchInput').addEventListener('input', () => {
 // Filter changes
 document.getElementById('categoryFilter').addEventListener('change', () => {
   currentPage = 1;
+  filtersChanged();
   saveFilters();
   loadTracks();
 });
 document.getElementById('readyFilter').addEventListener('change', () => {
   currentPage = 1;
+  filtersChanged();
   saveFilters();
   loadTracks();
 });

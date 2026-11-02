@@ -1750,11 +1750,19 @@ def welcome_page(request):
 
 
 def library_page(request):
+    from library.services import track_bulk_edit
+
     categories = Category.objects.order_by("name")
     holidays = Holiday.objects.order_by("month", "day")
     return render(request, "library/library.html", {
         "categories": categories,
         "holidays": holidays,
+        # r0125: the bulk editor is offered only to accounts that may use it (the endpoints check again).
+        "can_bulk_edit": bool(authorize(request.user, "library.manage_tracks")),
+        "bulk_edit_max": track_bulk_edit.MAX_TRACKS,
+        "energy_choices": Track.ENERGY_CHOICES,
+        "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
+        "end_type_choices": Track.END_TYPE_CHOICES,
     })
 
 
@@ -1961,6 +1969,62 @@ def api_track_bulk(request):
         return JsonResponse({"error": "Unknown action"}, status=400)
 
     return JsonResponse({"ok": True, "updated": updated})
+
+
+def _bulk_edit_request(request):
+    """Shared front half of the bulk-edit endpoints: authority, JSON, selection and change set."""
+    from library.services import track_bulk_edit as bulk_edit
+
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return None, forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return None, JsonResponse({"error": "Invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return None, JsonResponse({"error": "Expected a JSON object"}, status=400)
+    try:
+        ops = bulk_edit.parse_changes(body.get("changes"))
+        selection = bulk_edit.resolve_selection(body.get("selection"))
+    except bulk_edit.BulkEditError as exc:
+        return None, JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
+    return (body, selection, ops), None
+
+
+@require_http_methods(["POST"])
+def api_track_bulk_edit_preview(request):
+    """r0125 (roadmap 3.11 Phase A): what a bulk metadata/category edit would do -- the resolved Track
+    count, per-field change counts, Tracks a write guard would refuse, warnings, a before/after sample and
+    the token apply needs. Writes nothing. See library.services.track_bulk_edit."""
+    from library.services import track_bulk_edit as bulk_edit
+
+    parsed, error = _bulk_edit_request(request)
+    if error is not None:
+        return error
+    _body, selection, ops = parsed
+    return JsonResponse(bulk_edit.preview(selection, ops))
+
+
+@require_http_methods(["POST"])
+def api_track_bulk_edit_apply(request):
+    """r0125: apply exactly a previewed bulk edit (its ``token``). 409 when the selection or the change set
+    no longer matches the preview; otherwise each Track is applied on its own and every outcome is
+    reported (updated, unchanged, failed with reason, missing). Never writes audio tags, cue markers,
+    waveforms or source audio, and never relocates a file or requests reanalysis."""
+    from library.services import track_bulk_edit as bulk_edit
+
+    parsed, error = _bulk_edit_request(request)
+    if error is not None:
+        return error
+    body, selection, ops = parsed
+    token = body.get("token")
+    if not isinstance(token, str) or not token:
+        return JsonResponse({"error": "Preview the edit first: apply needs the preview's token"}, status=400)
+    try:
+        return JsonResponse(bulk_edit.apply(selection, ops, token, user=request.user))
+    except bulk_edit.BulkEditError as exc:
+        return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 
 
 @require_http_methods(["POST"])
