@@ -295,13 +295,16 @@ operator workflow is now:
 commands, decoding tolerance, category thresholds, related-artist discovery, duration update and
 established lossless (WAV/AIF→FLAC) conversion all unchanged.
 
-Tracks up to 15 minutes are analyzed in the web request. Longer Tracks return **queued** immediately:
+Tracks with a finite, positive stored duration up to 15 minutes are analyzed in the web request.
+Longer Tracks, and Tracks with a missing, zero, negative or non-finite stored duration, return
+**queued** immediately:
 the existing `analysis_requested_at` request and `isadoraair-analyze.timer` run the same analyzer
 outside Gunicorn. The timer normally begins within one minute. A queued response is only an
 acknowledgement, never proof that decoding or cache publication succeeded. Repeated clicks replace
 the pending request generation; an analysis clears only the generation it observed, so a newer
-request survives an older run. The analyzer service has a bounded 30-minute start timeout, sufficient
-for the supported one- and two-hour programme workflow without making a stuck process unbounded.
+request survives an older run. A completed background attempt clears the matching request timestamp;
+an interruption leaves it available for the next timer pass. Failed attempts remain visible through
+the analyzer's existing diagnostics and journal output. There is no frontend completion tracker.
 
 * It regenerates the waveform and recalculates only Cue In and Next Start.
 * The calculated values reach the Track only through the cue-marker authority:

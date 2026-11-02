@@ -1,6 +1,7 @@
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -2494,13 +2495,17 @@ def _track_to_dict(track):
 
 REANALYZE_SYNC_MAX_SECONDS = 15 * 60
 REANALYZE_ERROR_MAX_CHARS = 300
-_REANALYZE_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/(?:[^\s\"'<>]+)")
+_REANALYZE_ABSOLUTE_PATH = re.compile(r"(?<![\w.])/[^\r\n<>]*")
 
 
 def _reanalyze_error_for_operator(value):
     """One bounded, single-line, path-redacted reason for Track Detail."""
-    text = " ".join(str(value or "").split())
-    text = _REANALYZE_ABSOLUTE_PATH.sub("[path]", text)
+    # Fail closed for unquoted exception paths, whose filenames can contain
+    # spaces or apostrophes: redact the rest of that source line rather than
+    # risk displaying a partial station path.  The following line, if any,
+    # remains available as bounded diagnostic context.
+    text = _REANALYZE_ABSOLUTE_PATH.sub("[path]", str(value or ""))
+    text = " ".join(text.split())
     return text[:REANALYZE_ERROR_MAX_CHARS]
 
 
@@ -2515,9 +2520,10 @@ def api_track_reanalyze(request, pk):
     ``override`` with ``"confirm": true``. The manually-set marks (intro,
     sweep, outro, hooks) are never calculated.
 
-    r0124: this is the one waveform action (Refresh Waveform Only was retired). Tracks up to 15
-    minutes run here; longer Tracks return 202/``queued`` after setting ``analysis_requested_at``
-    for the existing analyzer timer. A completed response says what actually happened, never
+    r0124: this is the one waveform action (Refresh Waveform Only was retired). Tracks with a
+    finite positive stored duration up to 15 minutes run here; every other duration returns
+    202/``queued`` after setting ``analysis_requested_at`` for the existing analyzer timer. A
+    completed response says what actually happened, never
     inferred from HTTP 200: ``verified`` (new displayable waveform, identified audio),
     ``unverified`` (new displayable waveform, audio not identified) or ``not_regenerated`` (no new
     usable cache; previous cache kept). ``waveform`` carries details and resulting cache trust;
@@ -2542,7 +2548,11 @@ def api_track_reanalyze(request, pk):
     override = body.get("override") or ()
     if isinstance(override, str) or not all(isinstance(name, str) for name in override):
         return JsonResponse({"error": "override must be a list of marker names"}, status=400)
-    if (track.duration_seconds or 0) > REANALYZE_SYNC_MAX_SECONDS:
+    try:
+        duration_seconds = float(track.duration_seconds)
+    except (TypeError, ValueError, OverflowError):
+        duration_seconds = math.nan
+    if not (math.isfinite(duration_seconds) and 0 < duration_seconds <= REANALYZE_SYNC_MAX_SECONDS):
         # The timer's ordinary analysis deliberately has no operator override:
         # protected markers stay protected. Never accept a body whose requested
         # semantics cannot be carried by analysis_requested_at.
@@ -2557,7 +2567,7 @@ def api_track_reanalyze(request, pk):
             "outcome": "queued",
             "queued": True,
             "message": (
-                "Reanalysis queued. The background analyzer will regenerate this Track's waveform. "
+                "Reanalysis queued. The background analyzer will attempt reanalysis. "
                 "Locked cue markers will be preserved."
             ),
         }, status=202)
@@ -2593,7 +2603,7 @@ def api_track_reanalyze(request, pk):
     installed = analyzed.waveform_installed and verdict.displayable
     waveform_error = _reanalyze_error_for_operator(analyzed.waveform_error)
     if analyzed.waveform_installed and not verdict.displayable and not waveform_error:
-        waveform_error = "the generated waveform was not displayable; the previous waveform was kept"
+        waveform_error = "the installed waveform is not displayable"
     waveform = {"regenerated": installed, "error": waveform_error,
                 "audio_verified": installed and not analyzed.audio_problem and verdict.trusted,
                 "audio_problem": analyzed.audio_problem, "status": verdict.status, "trusted": verdict.trusted,

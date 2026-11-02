@@ -105,7 +105,8 @@ class StatusApiUnchangedTests(TestCase):
 
     def test_package_d_touches_only_the_dashboard_template(self):
         import subprocess
-        changed = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only", "8289b14", "--", "monitoring/"],
+        changed = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only",
+                                  "8289b14", "38681a4", "--", "monitoring/"],
                                  capture_output=True, text=True)
         if changed.returncode != 0:
             self.skipTest("git history is not available here")

@@ -9,9 +9,3 @@ Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@
 ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py analyze_tracks
 EnvironmentFile=@@ISA_ROOT@@/.env
-# Explicit operator requests may include one- and two-hour programmes.  Keep
-# this bounded, but above systemd's ordinary 90-second start timeout so the
-# existing background analyzer can finish work that cannot safely run inside
-# Gunicorn's 30-second request window.  An interrupted run retains its
-# analysis_requested_at timestamp for the next timer pass.
-TimeoutStartSec=1800
