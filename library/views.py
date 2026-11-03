@@ -1766,6 +1766,136 @@ def library_page(request):
     })
 
 
+# ---- Library reconciliation (roadmap 3.11 Phase B; docs/LIBRARY_RECONCILIATION.md) ----------------------
+
+def _require_track_manager(request):
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
+    return None
+
+
+@ensure_csrf_cookie
+@require_http_methods(["GET"])
+def library_reconciliation_page(request):
+    """Review page for the read-only reconciliation scan (library.manage_tracks)."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_reconciliation as reconciliation
+    return render(request, "library/reconciliation.html", {"finding_types": reconciliation.TYPES})
+
+
+@require_http_methods(["GET"])
+def api_reconciliation_summary(request):
+    """The latest complete scan's totals, and the last attempt / a running scan."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_reconciliation as reconciliation
+    report = reconciliation.load_report()
+    status = reconciliation.scan_status()
+    body = {"status": status, "report": None}
+    if report is not None:
+        body["report"] = {key: report.get(key) for key in (
+            "scan_id", "status", "status_reason", "started_at", "finished_at", "library_root", "counts", "budgets",
+            "unsupported_extensions", "hidden_samples", "errors")}
+    return JsonResponse(body)
+
+
+def _finding_matches(finding, q):
+    if not q:
+        return True
+    track = finding.get("track") or {}
+    haystack = [str(track.get("id", "")), track.get("title") or "", track.get("artist") or "",
+                track.get("filepath") or "", (finding.get("file") or {}).get("rel") or ""]
+    haystack += [c.get("rel") or "" for c in finding.get("candidates") or []]
+    haystack += [f.get("rel") or "" for f in finding.get("files") or []]
+    haystack += [str(t) for t in finding.get("members") or finding.get("track_ids") or []]
+    if q.isdigit():                      # a number is a Track id, matched exactly
+        ids = [track.get("id")] + list(finding.get("members") or finding.get("track_ids") or [])
+        return int(q) in ids
+    q = q.casefold()
+    return any(q in h.casefold() for h in haystack)
+
+
+def _track_review_details(track_ids):
+    """Current facts the operator needs to judge a duplicate group (read only)."""
+    from collections import defaultdict
+
+    from django.db.models import Count, Q
+    from django.utils import timezone as django_tz
+
+    now = django_tz.now()
+    rows = (Track.objects.filter(pk__in=track_ids)
+            .select_related("artist", "album", "category")
+            .annotate(playlist_refs=Count("playlist_items", distinct=True),
+                      rotation_refs=Count("rotation_slot_inserts", distinct=True),
+                      upcoming_log_items=Count("log_items", filter=Q(log_items__scheduled_time__gte=now), distinct=True),
+                      voicetrack_count=Count("voicetracks", distinct=True)))
+    additional = defaultdict(list)
+    for track_id, code in Track.additional_categories.through.objects.filter(
+            track_id__in=track_ids).values_list("track_id", "category__code"):
+        additional[track_id].append(code)
+    details = {}
+    for t in rows:
+        try:
+            info = os.lstat(t.filepath)
+            size, present = info.st_size, True
+        except OSError:
+            size, present = None, False
+        details[t.pk] = {
+            "id": t.pk, "title": t.title, "artist": t.artist.name if t.artist_id else "",
+            "album": t.album.title if t.album_id else "", "duration": t.duration_seconds, "format": t.format,
+            "sample_rate": t.sample_rate, "channels": t.channels, "bit_depth": t.bit_depth,
+            "filepath": t.filepath, "directory": os.path.dirname(t.filepath), "filename": t.filename,
+            "size": size, "file_present": present, "category": t.category.code if t.category_id else "",
+            "additional_categories": sorted(additional.get(t.pk, [])), "ready2air": t.ready2air,
+            "isrc": t.isrc, "historical_file_hash": t.file_hash, "play_count": t.play_count,
+            "playlist_refs": t.playlist_refs, "rotation_refs": t.rotation_refs,
+            "upcoming_log_items": t.upcoming_log_items, "voicetracks": t.voicetrack_count,
+        }
+    return details
+
+
+@require_http_methods(["GET"])
+def api_reconciliation_findings(request):
+    """One page of the latest scan's findings, filtered by type and searched by Track id, title, artist or
+    file name. Duplicate groups carry each member Track's current review facts."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_reconciliation as reconciliation
+    report = reconciliation.load_report()
+    if report is None:
+        return JsonResponse({"items": [], "total": 0, "page": 1, "pages": 1, "scan_id": None})
+    kind = request.GET.get("type", "")
+    q = request.GET.get("q", "").strip()
+    open_only = request.GET.get("open") == "1"
+    try:
+        page = max(1, int(request.GET.get("page", 1)))
+        per_page = min(max(1, int(request.GET.get("per_page", 25))), 100)
+    except ValueError:
+        return JsonResponse({"error": "page and per_page must be numbers"}, status=400)
+    if kind and kind not in reconciliation.TYPES:
+        return JsonResponse({"error": "unknown finding type"}, status=400)
+    items = [f for f in report["findings"]
+             if (not kind or f["type"] == kind) and (not open_only or f["type"] != "duplicate" or f.get("open"))
+             and _finding_matches(f, q)]
+    total = len(items)
+    pages = max(1, -(-total // per_page))
+    page = min(page, pages)
+    window = [dict(f) for f in items[(page - 1) * per_page:page * per_page]]
+    member_ids = {t for f in window if f["type"] == "duplicate" for t in f.get("members", [])}
+    if member_ids:
+        details = _track_review_details(member_ids)
+        for f in window:
+            if f["type"] == "duplicate":
+                f["tracks"] = [details.get(t, {"id": t, "deleted": True}) for t in f.get("members", [])]
+    return JsonResponse({"items": window, "total": total, "page": page, "pages": pages, "per_page": per_page,
+                         "scan_id": report["scan_id"]})
+
+
 TRACK_SORT_FIELDS = {
     "title": "title",
     "artist": "artist__name",

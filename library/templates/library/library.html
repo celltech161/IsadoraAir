@@ -289,6 +289,10 @@
   <button type="button" class="lib-import-btn" id="autofillRelatedArtistsBtn" onclick="autofillRelatedArtists()">Auto-fill Related Artists</button>
   {% endif %}
 
+  {% if can_bulk_edit and not is_library_read_only %}
+  <a href="{% url 'library:library-reconciliation' %}" class="lib-import-btn">Reconciliation</a>
+  {% endif %}
+
   <span class="lib-stats" id="stats"></span>
 </div>
 

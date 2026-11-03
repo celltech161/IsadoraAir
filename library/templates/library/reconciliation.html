@@ -1,0 +1,305 @@
+{% extends "base.html" %}
+
+{% block title %}Library Reconciliation — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .rc-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; margin-bottom: 0.75rem; }
+  .rc-head h1 { font-size: 1.15rem; margin: 0; }
+  .rc-head a { color: var(--accent); font-size: 0.8rem; }
+  .rc-box {
+    border: 1px solid var(--border-subtle); border-radius: 8px; background: var(--bg-dark);
+    padding: 0.7rem 0.9rem; margin-bottom: 0.75rem; font-size: 0.82rem;
+  }
+  .rc-box p { margin: 0.2rem 0; }
+  .rc-warn { color: #f59e0b; }
+  .rc-bad { color: var(--danger); }
+  .rc-muted { color: var(--text-muted); }
+  .rc-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; overflow-wrap: anywhere; }
+  .rc-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.75rem; }
+  .rc-chip {
+    background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 999px;
+    color: var(--text-main); padding: 0.25rem 0.65rem; font-size: 0.76rem; cursor: pointer;
+  }
+  .rc-chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .rc-filters { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.6rem; font-size: 0.8rem; }
+  .rc-filters input[type=text], .rc-filters select {
+    background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 8px;
+    color: var(--text-main); padding: 0.4rem 0.6rem; font-size: 0.8rem; min-width: 0; max-width: 100%;
+  }
+  .rc-filters input[type=text] { flex: 1 1 14rem; }
+  .rc-card {
+    border: 1px solid var(--border-subtle); border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem;
+    font-size: 0.8rem; overflow-wrap: anywhere;
+  }
+  .rc-card h3 { font-size: 0.85rem; margin: 0 0 0.3rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+  .rc-badge {
+    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.04em; border-radius: 4px;
+    padding: 0.1rem 0.4rem; border: 1px solid var(--border-subtle); color: var(--text-muted);
+  }
+  .rc-badge.t-missing, .rc-badge.t-uncertain { color: #f59e0b; border-color: rgba(245, 158, 11, 0.5); }
+  .rc-badge.t-moved { color: var(--accent); border-color: var(--accent); }
+  .rc-badge.t-protected { color: #60a5fa; border-color: rgba(96, 165, 250, 0.5); }
+  .rc-table { border-collapse: collapse; width: 100%; margin-top: 0.35rem; }
+  .rc-table th, .rc-table td {
+    text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid rgba(148, 163, 184, 0.12); vertical-align: top;
+  }
+  .rc-table th { color: var(--text-muted); font-weight: 600; }
+  .rc-table-wrap { overflow-x: auto; }
+  .rc-btn {
+    background: var(--bg-dark); border: 1px solid var(--border-subtle); border-radius: 6px; color: var(--text-main);
+    padding: 0.25rem 0.6rem; font-size: 0.76rem; cursor: pointer;
+  }
+  .rc-btn:hover { border-color: var(--accent); }
+  .rc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .rc-pager { display: flex; justify-content: center; align-items: center; gap: 0.75rem; margin: 0.75rem 0; font-size: 0.8rem; }
+  .rc-dialog { border-color: var(--accent); }
+  @media (max-width: 640px) {
+    .rc-table th:nth-child(n+5), .rc-table td:nth-child(n+5) { display: none; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="rc-head">
+  <h1>Library reconciliation</h1>
+  <a href="{% url 'library:library' %}">&larr; Library</a>
+</div>
+
+<div class="rc-box" id="scanStatus" role="status" aria-live="polite">Loading…</div>
+<div class="rc-box rc-dialog" id="actionPanel" hidden></div>
+<div class="rc-chips" id="counts" aria-label="Findings by type"></div>
+
+<div class="rc-filters">
+  <label for="typeFilter" class="rc-muted">Type</label>
+  <select id="typeFilter">
+    <option value="">All findings</option>
+    {% for t in finding_types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+  </select>
+  <input type="text" id="search" placeholder="Track ID, title, artist or file name" aria-label="Search findings">
+  <label><input type="checkbox" id="openOnly" checked> Open duplicate groups only</label>
+</div>
+
+<div id="findings"></div>
+<div class="rc-pager">
+  <button class="rc-btn" id="prevBtn" type="button">&lsaquo; Prev</button>
+  <span id="pageInfo" class="rc-muted"></span>
+  <button class="rc-btn" id="nextBtn" type="button">Next &rsaquo;</button>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// Everything shown here is text from the scan report or the database: it is only ever inserted with
+// textContent / createTextNode, never as markup.
+const TYPE_TEXT = {
+  missing: 'Missing media', moved: 'Possible moved file', unregistered: 'Unregistered file',
+  duplicate: 'Possible duplicate', category_drift: 'Category drift', shared_source: 'Shared / reused source',
+  protected: 'Protected (other subsystem)', in_delivery: 'May still be arriving', uncertain: 'Uncertain',
+};
+let page = 1, pages = 1, debounce = null, scanId = null;
+
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function getCookie(name) {
+  const hit = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith(name + '='));
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : null;
+}
+function fmtSize(n) {
+  if (n === null || n === undefined) return '—';
+  const units = ['B', 'kB', 'MB', 'GB'];
+  let i = 0, v = n;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i += 1; }
+  return (i ? v.toFixed(1) : v) + ' ' + units[i];
+}
+function fmtDuration(sec) {
+  if (sec === null || sec === undefined) return '—';
+  const total = Math.round(sec), m = Math.floor(total / 60);
+  return m + ':' + String(total - m * 60).padStart(2, '0');
+}
+function trackLink(track) {
+  const a = el('a', `#${track.id}`);
+  a.href = `/track/${encodeURIComponent(track.id)}/`;
+  return a;
+}
+
+async function loadSummary() {
+  const box = document.getElementById('scanStatus');
+  const resp = await fetch('/api/tracks/reconciliation/');
+  const data = await resp.json().catch(() => ({}));
+  box.replaceChildren();
+  if (!resp.ok) { box.append(el('p', data.error || 'Could not load the scan status.', 'rc-bad')); return; }
+  const st = data.status || {}, report = data.report;
+  if (st.running) {
+    box.append(el('p', st.running.alive
+      ? `A scan is running (${st.running.phase}, ${st.running.done} done).`
+      : 'A scan stopped before finishing (interrupted). Its partial results are not shown.', st.running.alive ? '' : 'rc-warn'));
+  }
+  if (st.last_attempt && (!st.latest || st.last_attempt.scan_id !== st.latest.scan_id)) {
+    box.append(el('p', `The most recent scan (${st.last_attempt.scan_id}) did not complete: ${st.last_attempt.status}.`, 'rc-bad'));
+  }
+  if (!report) {
+    box.append(el('p', 'No completed scan yet.'));
+  } else {
+    scanId = report.scan_id;
+    box.append(el('p', `Latest completed scan ${report.scan_id}, finished ${report.finished_at}, of ${report.library_root}.`));
+    if (report.status === 'suspect') box.append(el('p', 'Storage suspect: ' + report.status_reason, 'rc-bad'));
+    const c = report.counts;
+    box.append(el('p', `${c.tracks_total.toLocaleString()} Tracks (${c.healthy.toLocaleString()} healthy), ` +
+      `${c.files_total.toLocaleString()} audio files, ${c.relink_reviewable} relink(s) ready for review, ` +
+      `${c.duplicate_groups_open} open duplicate group(s).`));
+    if (c.unsupported_files) box.append(el('p', `${c.unsupported_files} other file(s) not audio the Library imports.`, 'rc-muted'));
+    (report.errors || []).forEach(e => box.append(el('p', 'Note: ' + e, 'rc-warn')));
+    const chips = document.getElementById('counts');
+    chips.replaceChildren();
+    const all = el('button', 'All', 'rc-chip');
+    all.type = 'button';
+    all.addEventListener('click', () => setType(''));
+    chips.append(all);
+    Object.keys(TYPE_TEXT).forEach(t => {
+      const chip = el('button', `${TYPE_TEXT[t]}: ${(c[t] || 0).toLocaleString()}`, 'rc-chip');
+      chip.type = 'button';
+      chip.dataset.type = t;
+      chip.addEventListener('click', () => setType(t));
+      chips.append(chip);
+    });
+    markChips();
+  }
+  box.append(el('p', 'Scans are read only. Run one with: manage.py reconcile_library (as the station\'s service account).', 'rc-muted'));
+}
+
+function setType(t) {
+  document.getElementById('typeFilter').value = t;
+  page = 1;
+  markChips();
+  loadFindings();
+}
+function markChips() {
+  const t = document.getElementById('typeFilter').value;
+  document.querySelectorAll('#counts .rc-chip').forEach(c => c.setAttribute('aria-pressed', String((c.dataset.type || '') === t)));
+}
+
+function trackTable(rows, columns) {
+  const wrap = el('div', undefined, 'rc-table-wrap');
+  const table = el('table', undefined, 'rc-table');
+  const head = el('tr');
+  columns.forEach(([label]) => head.append(el('th', label)));
+  table.append(head);
+  rows.forEach(r => {
+    const tr = el('tr');
+    columns.forEach(([, render]) => {
+      const td = el('td');
+      const value = render(r);
+      if (value instanceof Node) td.append(value); else td.textContent = value === undefined || value === null ? '' : String(value);
+      tr.append(td);
+    });
+    table.append(tr);
+  });
+  wrap.append(table);
+  return wrap;
+}
+
+function renderTrack(card, track) {
+  card.append(trackTable([track], [
+    ['Track', t => trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist], ['Category', t => t.category],
+    ['Duration', t => fmtDuration(t.duration)], ['Format', t => t.format], ['Ready', t => t.ready2air ? 'yes' : 'no'],
+  ]));
+  card.append(el('p', 'File: ' + (track.filepath || '(none)'), 'rc-code'));
+  if (track.file_hash) card.append(el('p', 'Historical byte hash (may be stale): ' + track.file_hash.slice(0, 16) + '…', 'rc-muted'));
+}
+
+function renderCandidates(card, finding) {
+  card.append(el('p', 'Candidate files:'));
+  card.append(trackTable(finding.candidates.map((c, i) => ({ ...c, index: i })), [
+    ['File', c => c.rel], ['Size', c => fmtSize(c.size)], ['Name matches', c => c.name_matches ? 'yes' : 'no'],
+    ['Decoded audio', c => c.identity_match === true ? 'identical' : c.identity_match === false ? 'different' : 'not compared'],
+    ['Assessment', c => c.eligible ? 'Can be relinked after review' : (c.reasons || []).join('; ')],
+    ['', c => relinkControl(finding, c)],
+  ]));
+  const ev = (finding.track || {}).evidence || {};
+  (ev.problems || []).forEach(p => card.append(el('p', 'Why relink is not available: ' + p, 'rc-warn')));
+}
+
+function relinkControl(finding, candidate) {
+  return '';
+}
+
+function renderDuplicate(card, finding) {
+  if (finding.files) {
+    card.append(trackTable(finding.files, [
+      ['File', f => f.rel], ['Size', f => fmtSize(f.size)], ['Track', f => f.track_id ? trackLink({ id: f.track_id }) : 'unregistered'],
+      ['SHA-256', f => (f.sha256 || '').slice(0, 16) + '…'],
+    ]));
+  }
+  if (finding.tracks && finding.tracks.length) {
+    card.append(trackTable(finding.tracks, [
+      ['Track', t => t.deleted ? `#${t.id} (deleted)` : trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist],
+      ['Album', t => t.album], ['Duration', t => fmtDuration(t.duration)],
+      ['Format', t => [t.format, t.sample_rate && `${t.sample_rate} Hz`, t.channels && `${t.channels} ch`, t.bit_depth && `${t.bit_depth}-bit`].filter(Boolean).join(', ')],
+      ['Size', t => t.file_present ? fmtSize(t.size) : 'missing'], ['Directory', t => t.directory],
+      ['Categories', t => [t.category, ...(t.additional_categories || [])].filter(Boolean).join(', ')],
+      ['References', t => `${t.playlist_refs} playlist, ${t.rotation_refs} rotation, ${t.upcoming_log_items} upcoming log, ${t.voicetracks} voice track, ${t.play_count} plays`],
+      ['Hash (historical)', t => t.historical_file_hash ? t.historical_file_hash.slice(0, 12) + '…' : '—'],
+    ]));
+  }
+  const decisions = Object.entries(finding.decisions || {});
+  decisions.forEach(([pair, d]) => card.append(el('p', `Pair ${pair}: ${d.resolution === 'keep_both' ? 'reviewed — not a duplicate' : d.resolution}` +
+    (d.applied ? ' (applied)' : ''), d.resolution === 'keep_both' ? 'rc-muted' : 'rc-warn')));
+  if ((finding.pending_deletion_decisions || []).length) {
+    card.append(el('p', 'A recorded keep/delete decision exists for ' + finding.pending_deletion_decisions.join(', ') +
+      '. Applying it with apply_duplicate_resolutions would delete a Track; this page never does.', 'rc-warn'));
+  }
+}
+
+function renderFinding(f) {
+  const card = el('article', undefined, 'rc-card');
+  const h = el('h3');
+  h.append(el('span', TYPE_TEXT[f.type] || f.type, 'rc-badge t-' + f.type));
+  if (f.confidence) h.append(el('span', f.confidence.replace('_', ' '), 'rc-badge'));
+  h.append(el('span', f.reason));
+  card.append(h);
+  if (f.track) renderTrack(card, f.track);
+  if (f.file) card.append(el('p', `File: ${f.file.rel} (${fmtSize(f.file.size)})`, 'rc-code'));
+  if (f.track_ids && f.type === 'shared_source') card.append(el('p', 'Tracks: #' + f.track_ids.join(', #')));
+  if (f.candidates) renderCandidates(card, f);
+  if (f.type === 'duplicate') renderDuplicate(card, f);
+  if (f.relink_candidate) card.append(el('p', 'This file is a relink candidate for a missing Track.', 'rc-muted'));
+  return card;
+}
+
+async function loadFindings() {
+  const params = new URLSearchParams({ page, per_page: 25 });
+  const t = document.getElementById('typeFilter').value;
+  const q = document.getElementById('search').value.trim();
+  if (t) params.set('type', t);
+  if (q) params.set('q', q);
+  if (document.getElementById('openOnly').checked) params.set('open', '1');
+  const resp = await fetch('/api/tracks/reconciliation/findings/?' + params);
+  const data = await resp.json().catch(() => ({}));
+  const list = document.getElementById('findings');
+  list.replaceChildren();
+  if (!resp.ok) { list.append(el('p', data.error || 'Could not load findings.', 'rc-bad')); return; }
+  page = data.page; pages = data.pages;
+  if (!data.items.length) list.append(el('p', data.scan_id ? 'No findings match.' : 'No completed scan yet.', 'rc-muted'));
+  data.items.forEach(f => list.append(renderFinding(f)));
+  document.getElementById('pageInfo').textContent = `Page ${page} of ${pages} (${data.total.toLocaleString()} findings)`;
+  document.getElementById('prevBtn').disabled = page <= 1;
+  document.getElementById('nextBtn').disabled = page >= pages;
+}
+
+document.getElementById('typeFilter').addEventListener('change', () => { page = 1; markChips(); loadFindings(); });
+document.getElementById('openOnly').addEventListener('change', () => { page = 1; loadFindings(); });
+document.getElementById('search').addEventListener('input', () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => { page = 1; loadFindings(); }, 300);
+});
+document.getElementById('prevBtn').addEventListener('click', () => { page -= 1; loadFindings(); });
+document.getElementById('nextBtn').addEventListener('click', () => { page += 1; loadFindings(); });
+loadSummary();
+loadFindings();
+</script>
+{% endblock %}
