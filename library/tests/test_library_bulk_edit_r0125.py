@@ -6,6 +6,7 @@ import hashlib
 import json
 import tempfile
 import threading
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -867,3 +868,120 @@ class TokenRedemptionConcurrencyTests(_FixtureMixin, TransactionTestCase):
         with override_settings(SESSION_ENGINE="django.contrib.sessions.backends.cache"):
             with self.assertRaises(ImproperlyConfigured):
                 track_bulk_edit.SessionPreviews(self.client.session)
+
+
+class SessionReplayTests(_FixtureMixin, TransactionTestCase):
+    """An ordinary save of the same session -- loaded before a preview was claimed and written after -- puts
+    the claimed preview record back into the session row.  It must not make the preview claimable again."""
+
+    changes = {"energy": {"op": "set", "value": "upbeat"}}
+
+    def setUp(self):
+        super().setUp()
+        self.tracks = [self.track(f"replay-{i}") for i in range(3)]
+        status, preview = self.preview(self.ids(*self.tracks), self.changes)
+        self.assertEqual(status, 200, preview)
+        self.payload = {"selection": self.ids(*self.tracks), "changes": self.changes, "token": preview["token"]}
+        self.session_key = self.client.session.session_key
+
+    def pending_in_row(self):
+        from django.contrib.sessions.models import Session
+        data = Session.objects.get(session_key=self.session_key).get_decoded()
+        return len(data.get(track_bulk_edit.SESSION_KEY) or {}), data.get("unrelated")
+
+    def unrelated_request(self, loaded, release, results):
+        """What SessionMiddleware does for any other request of this session: load, change a key, save."""
+        from importlib import import_module
+        from django.conf import settings
+
+        def run():
+            store = import_module(settings.SESSION_ENGINE).SessionStore(session_key=self.session_key)
+            store["unrelated"] = "saved later"            # loads the row, preview record included
+            loaded.set()
+            release.wait(20)
+            store.save()
+            return True
+        return _in_thread("unrelated", run, results)
+
+    def apply(self, client=None):
+        client = client or self.client
+        return client.post(reverse(APPLY), self.payload, content_type="application/json")
+
+    def test_a_stale_session_save_cannot_make_a_claimed_preview_claimable_again(self):
+        loaded, release, unrelated = threading.Event(), threading.Event(), {}
+        other = self.unrelated_request(loaded, release, unrelated)
+        other.start()
+        self.assertTrue(loaded.wait(10))
+        first = self.apply()
+        self.assertEqual((first.status_code, first.json()["updated"]), (200, 3))
+        self.assertEqual(self.pending_in_row(), (0, None))           # claimed: gone from the row
+        release.set()
+        other.join(20)
+        self.assertEqual(unrelated, {"value": True})
+        self.assertEqual(self.pending_in_row(), (1, "saved later"))  # the stale save wrote the record back
+        Track.objects.filter(pk__in=[t.pk for t in self.tracks]).update(energy="")
+        second = self.apply()
+        self.assertEqual(second.status_code, 409, second.json())
+        self.assertIn("already applied", second.json()["error"])
+        self.assertFalse(Track.objects.filter(energy="upbeat").exists())
+
+    def test_replay_while_the_first_apply_is_still_processing_tracks(self):
+        loaded, release, unrelated = threading.Event(), threading.Event(), {}
+        other = self.unrelated_request(loaded, release, unrelated)
+        other.start()
+        self.assertTrue(loaded.wait(10))
+        real_plan, calls = track_bulk_edit._plan, []
+        midway, resume = threading.Event(), threading.Event()
+
+        def paused_plan(*args, **kwargs):              # the first apply, holding its second Track's row
+            if threading.current_thread().name == "apply-1":
+                calls.append(1)
+                if len(calls) == 2:
+                    midway.set()
+                    resume.wait(20)
+            return real_plan(*args, **kwargs)
+
+        first, second = {}, {}
+        replay_client = Client()
+        replay_client.cookies = self.client.cookies
+        with mock.patch.object(track_bulk_edit, "_plan", paused_plan):
+            first_thread = _in_thread("apply-1", self.apply, first)
+            first_thread.start()
+            self.assertTrue(midway.wait(10))
+            release.set()                              # the stale session save lands mid-apply
+            other.join(20)
+            self.assertEqual(self.pending_in_row()[0], 1)
+            second_thread = _in_thread("apply-2", lambda: self.apply(replay_client), second)
+            second_thread.start()
+            # The replay is refused at once (it never reaches a Track) or, unfixed, waits for a Track row.
+            _wait_until(lambda: not second_thread.is_alive() or _row_waiters() >= 1)
+            resume.set()
+            first_thread.join(30)
+            second_thread.join(30)
+        self.assertNotIn("error", first)
+        self.assertNotIn("error", second)
+        self.assertEqual((first["value"].status_code, first["value"].json()["updated"]), (200, 3))
+        self.assertEqual(second["value"].status_code, 409, second["value"].json())
+        self.assertIn("already applied", second["value"].json()["error"])
+
+    def test_the_claim_marker_is_a_separate_userless_row_that_expires(self):
+        from django.contrib.sessions.models import Session
+        self.assertEqual(self.apply().status_code, 200)
+        markers = list(Session.objects.filter(session_key__startswith=track_bulk_edit.SessionPreviews.CLAIM_PREFIX))
+        self.assertEqual(len(markers), 1)
+        marker = markers[0]
+        self.assertEqual(len(marker.session_key), 40)
+        self.assertEqual(marker.get_decoded(), {"bulk_edit_claimed": True})       # no user: cannot authenticate
+        lifetime = (marker.expire_date - timezone.now()).total_seconds()
+        self.assertTrue(track_bulk_edit.TOKEN_MAX_AGE_SECONDS < lifetime <= track_bulk_edit.TOKEN_MAX_AGE_SECONDS + 300)
+        # Presented as a session cookie, it is an anonymous session.
+        intruder = Client()
+        intruder.cookies["sessionid"] = marker.session_key
+        response = intruder.post(reverse(APPLY), self.payload, content_type="application/json")
+        self.assertIn(response.status_code, (302, 401, 403))
+        # Expired markers are pruned by the next claim.
+        Session.objects.filter(pk=marker.pk).update(expire_date=timezone.now() - timedelta(seconds=1))
+        status, preview = self.preview(self.ids(*self.tracks), {"energy": {"op": "set", "value": "slow"}})
+        self.post(APPLY, {"selection": self.ids(*self.tracks), "changes": {"energy": {"op": "set", "value": "slow"}},
+                          "token": preview["token"]})
+        self.assertFalse(Session.objects.filter(pk=marker.pk).exists())

@@ -48,11 +48,13 @@ from pathlib import Path
 import secrets
 import time
 from contextlib import contextmanager
+from datetime import timedelta
 
 from django.conf import settings
 from django.core import signing
 from django.core.exceptions import ImproperlyConfigured, ValidationError
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
+from django.utils import timezone
 
 log = logging.getLogger(__name__)
 
@@ -334,9 +336,19 @@ class SessionPreviews:
     both claim one preview: the second waits for the first to commit, then finds the record gone.  The
     request's in-memory session is brought in line and left unmodified, so SessionMiddleware does not write
     an older copy back at the end of the request.  Needs the database session backend (the configured
-    default); anything else is refused rather than silently racing."""
+    default); anything else is refused rather than silently racing.
+
+    The session row alone cannot make a claim permanent: any other request of the session that loaded it
+    before the claim saves its whole copy afterwards, record included (Django sessions are last-writer-wins).
+    So a claim also inserts a *claim marker*: a row of its own in the same ``django_session`` table, keyed
+    by the preview's nonce under a prefix Django never generates (its keys are 32 lowercase letters and
+    digits; ``:`` cannot occur), carrying no user and expiring after the token can no longer be used.  The
+    insert succeeds exactly once (primary-key uniqueness), commits with the claim, and no ordinary session
+    save can touch it: a session only ever writes its own row.  A record that a stale save put back is
+    therefore refused."""
 
     ENGINE = "django.contrib.sessions.backends.db"
+    CLAIM_PREFIX = "bulkedit:"
 
     def __init__(self, session):
         if getattr(settings, "SESSION_ENGINE", self.ENGINE) != self.ENGINE:
@@ -370,9 +382,29 @@ class SessionPreviews:
                 del pending[key]
 
     def claim(self, nonce):
-        """The record, removed (exactly one caller gets it), or None."""
+        """The record, removed and durably marked claimed (exactly one caller ever gets it), or None."""
         with self._locked() as pending:
-            return pending.pop(nonce, None)
+            record = pending.pop(nonce, None)
+            if record is None or not self._mark_claimed(nonce):
+                return None
+            return record
+
+    def _claim_key(self, nonce):
+        digest = hashlib.sha256(str(nonce).encode()).hexdigest()
+        return self.CLAIM_PREFIX + digest[:40 - len(self.CLAIM_PREFIX)]
+
+    def _mark_claimed(self, nonce) -> bool:
+        from django.contrib.sessions.models import Session
+        now = timezone.now()
+        Session.objects.filter(session_key__startswith=self.CLAIM_PREFIX, expire_date__lt=now).delete()
+        try:
+            with transaction.atomic():
+                Session.objects.create(
+                    session_key=self._claim_key(nonce), session_data=self.session.encode({"bulk_edit_claimed": True}),
+                    expire_date=now + timedelta(seconds=TOKEN_MAX_AGE_SECONDS + 300))
+        except IntegrityError:
+            return False
+        return True
 
 
 def _issue_token(previews, user, selection, ops, tracks: dict) -> str:
