@@ -253,6 +253,40 @@ function renderDuplicate(card, finding) {
     card.append(el('p', 'A recorded keep/delete decision exists for ' + finding.pending_deletion_decisions.join(', ') +
       '. Applying it with apply_duplicate_resolutions would delete a Track; this page never does.', 'rc-warn'));
   }
+  if ((finding.members || []).length >= 2) card.append(notDuplicateControl(finding));
+}
+
+function notDuplicateControl(finding) {
+  // The only decision this page records: two Tracks are not duplicates (nothing is deleted or merged).
+  const row = el('div', undefined, 'rc-filters');
+  const pick = (label, index) => {
+    const select = el('select');
+    select.setAttribute('aria-label', label);
+    finding.members.forEach(id => { const o = el('option', `#${id}`); o.value = id; select.append(o); });
+    select.selectedIndex = Math.min(index, finding.members.length - 1);
+    return select;
+  };
+  const first = pick('First Track of the pair', 0), second = pick('Second Track of the pair', 1);
+  const button = el('button', 'Record: not a duplicate', 'rc-btn');
+  button.type = 'button';
+  const result = el('span', undefined, 'rc-muted');
+  result.setAttribute('role', 'status');
+  button.addEventListener('click', async () => {
+    if (first.value === second.value) { result.textContent = 'Choose two different Tracks.'; return; }
+    button.disabled = true;
+    const resp = await fetch('/api/tracks/reconciliation/duplicates/not-duplicate/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ scan_id: scanId, finding_id: finding.id, track_a: Number(first.value), track_b: Number(second.value) }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    button.disabled = false;
+    result.textContent = !resp.ok ? (data.error || 'Not recorded.')
+      : data.result === 'recorded' ? 'Recorded: not a duplicate. The group closes at the next scan.'
+      : `Already decided (${data.resolution}); left unchanged.`;
+  });
+  row.append(el('span', 'Pair:', 'rc-muted'), first, second, button, result);
+  return row;
 }
 
 function renderFinding(f) {

@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import time
 import unicodedata
@@ -707,7 +708,7 @@ class Scanner:
     # -- run
     def run(self) -> dict:
         started = timezone.now()
-        scan_id = started.strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
+        scan_id = _new_scan_id(started)
         self.check_root()
         self.progress("walk", 0)
         self.walk()
@@ -742,6 +743,11 @@ class Scanner:
         }
 
 
+def _new_scan_id(when) -> str:
+    """Unique even for two scans in one second: a later scan must never reuse an earlier report's id."""
+    return when.strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(4)
+
+
 def _duration_clusters(members):
     """Track-id groups of two or more whose known durations lie within the tolerance of their neighbour."""
     known = sorted((d, t) for t, d in members if d is not None)
@@ -773,7 +779,7 @@ def run_scan(**kwargs) -> dict:
 
         def failed(reason):
             return {"schema": SCHEMA, "schema_version": SCHEMA_VERSION, "status": "failed",
-                    "scan_id": timezone.now().strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}",
+                    "scan_id": _new_scan_id(timezone.now()),
                     "status_reason": reason, "started_at": None, "finished_at": timezone.now().isoformat(),
                     "counts": {}, "findings": [], "errors": [reason]}
 

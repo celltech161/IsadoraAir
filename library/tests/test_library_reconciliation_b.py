@@ -4,6 +4,7 @@ Every file lives in a per-test temporary Library root; LIBRARY_ROOT, WAVEFORMS_D
 there, so no station media, cache or report is read or written."""
 import json
 import os
+import subprocess
 import tempfile
 from io import StringIO
 from pathlib import Path
@@ -306,3 +307,147 @@ class ReviewPageTests(_Recon):
         self.assertContains(self.client.get(reverse("library:library")), reverse("library:library-reconciliation"))
         self.client.force_login(self.user_in("Contributor"))
         self.assertNotContains(self.client.get(reverse("library:library")), reverse("library:library-reconciliation"))
+
+
+def _analyze(test, track):
+    """The station's own analysis of the Track's real file: a version-2 cache with its decoded identity."""
+    from library.management.commands import analyze_tracks
+    track = Track.objects.get(pk=track.pk)
+    row = (track.pk, track.filepath, track.filename, track.duration_seconds, track.title, "A", track.related_artists)
+    with mock.patch.object(analyze_tracks, "emit_event"):
+        outcome = analyze_tracks.analyze_one_track(row, (4410, 0.05, 1000, -26.0, -45.0, 0.1), test.waves, force=True)
+    test.assertTrue(outcome, getattr(outcome, "reason", ""))
+    return Track.objects.get(pk=track.pk)
+
+
+class DuplicateReviewTests(_Recon):
+    def duplicate_groups(self, report):
+        return self.of(report, "duplicate")
+
+    def test_identical_bytes_are_exact_whatever_the_names_and_hardlinks_are_not(self):
+        data = b"identical recording bytes" * 400
+        a = self.track("ROCK/first.flac", data=data)
+        self.file("POP/copy-of-first.flac", data)
+        self.track("ROCK/other.flac", data=b"different bytes!" * 625)       # same size, other content
+        report = self.scan()
+        exact = [g for g in self.duplicate_groups(report) if g["confidence"] == "exact"]
+        self.assertEqual(len(exact), 1)
+        self.assertEqual({f["rel"] for f in exact[0]["files"]}, {"ROCK/first.flac", "POP/copy-of-first.flac"})
+        self.assertEqual(exact[0]["members"], [a.pk])
+
+    def test_a_stale_historical_file_hash_is_not_evidence(self):
+        self.track("ROCK/a.flac", data=b"A" * 1000, file_hash="f" * 64)
+        self.track("ROCK/b.flac", data=b"B" * 1001, file_hash="f" * 64)
+        self.assertEqual(self.duplicate_groups(self.scan()), [])
+
+    def test_metadata_groups_need_close_durations_and_isrc_collisions_stay_uncertain(self):
+        a = self.track("ROCK/a.flac", title="Same Song", duration=200.0)
+        b = self.track("POP/b.flac", title="  same   SONG ", duration=201.5)
+        self.track("ROCK/c.flac", title="Same Song", duration=260.0)          # a different edit
+        x = self.track("ROCK/x.flac", title="One", isrc="USRC17607839", duration=100.0)
+        y = self.track("ROCK/y.flac", title="Two", isrc="usrc17607839", duration=300.0)
+        groups = self.duplicate_groups(self.scan())
+        likely = [g for g in groups if g["confidence"] == "likely"]
+        self.assertEqual([g["members"] for g in likely], [sorted([a.pk, b.pk])])
+        collision = [g for g in groups if g["confidence"] == "uncertain" and "ISRC" in g["reason"]]
+        self.assertEqual([g["members"] for g in collision], [sorted([x.pk, y.pk])])
+
+    def test_large_metadata_groups_are_reported_once_without_pairs(self):
+        for i in range(reconciliation.DUPLICATE_GROUP_LIMIT + 5):
+            self.track(f"ROCK/intro-{i}.flac", title="Station ID", duration=10.0)
+        groups = self.duplicate_groups(self.scan())
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["confidence"], "uncertain")
+        self.assertEqual(len(groups[0]["members"]), reconciliation.DUPLICATE_GROUP_LIMIT + 5)
+        self.assertEqual(groups[0]["decisions"], {})
+
+    def test_decoded_audio_decides_between_audio_equivalent_and_different_recordings(self):
+        from library.tests.test_waveform_integrity_package_b import _audio
+        for folder in ("ROCK", "POP"):
+            (self.root / folder).mkdir(exist_ok=True)
+        # The same recording in two containers: a WAV, and a FLAC made losslessly from it.
+        same_wav = _audio(self.root / "POP" / "song.wav", freq=440)
+        same_flac = self.root / "ROCK" / "song.flac"
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(same_wav), str(same_flac)],
+                       check=True, stdin=subprocess.DEVNULL)
+        other = _audio(self.root / "POP" / "song-live.flac", freq=660)
+        tracks = []
+        for path, title in ((same_flac, "Equal"), (same_wav, "Equal"), (other, "Differs")):
+            tracks.append(Track.objects.create(filepath=str(path), filename=path.name, title=title, artist=self.artist,
+                                               category=self.rock, duration_seconds=3.0, format=path.suffix[1:]))
+        twin = self.track("ROCK/differs-twin.flac", title="Differs", duration=3.0)
+        _audio(Path(twin.filepath), freq=880)
+        for track in (*tracks, twin):
+            _analyze(self, track)
+        groups = {tuple(g["members"]): g for g in self.duplicate_groups(self.scan())}
+        self.assertEqual(groups[tuple(sorted([tracks[0].pk, tracks[1].pk]))]["confidence"], "audio_equivalent")
+        differs = groups[tuple(sorted([tracks[2].pk, twin.pk]))]
+        self.assertEqual(differs["confidence"], "uncertain")
+        self.assertIn("decoded audio differs", differs["reason"])
+
+    def test_existing_decisions_are_shown_and_a_keep_both_pair_stays_closed(self):
+        a = self.track("ROCK/a.flac", title="Twin", duration=100.0)
+        b = self.track("POP/b.flac", title="Twin", duration=100.5)
+        c = self.track("ROCK/c.flac", title="Triplet", duration=50.0)
+        d = self.track("POP/d.flac", title="Triplet", duration=50.0)
+        DuplicateCandidate.objects.create(track_a=a, track_b=b, confidence="probable", resolution="keep_both")
+        DuplicateCandidate.objects.create(track_a=c, track_b=d, confidence="probable", resolution="keep_a")
+        groups = {tuple(g["members"]): g for g in self.duplicate_groups(self.scan())}
+        closed = groups[(a.pk, b.pk)]
+        self.assertFalse(closed["open"])
+        self.assertEqual(closed["decisions"], {f"{a.pk}-{b.pk}": {"resolution": "keep_both", "applied": False}})
+        pending = groups[(c.pk, d.pk)]
+        self.assertTrue(pending["open"])
+        self.assertEqual(pending["pending_deletion_decisions"], [f"{c.pk}-{d.pk}"])
+        self.assertEqual(DuplicateCandidate.objects.get(track_a=a, track_b=b).resolution, "keep_both")
+
+
+class DuplicateDecisionEndpointTests(_Recon):
+    URL = "library:api-reconciliation-not-duplicate"
+
+    def setUp(self):
+        super().setUp()
+        self.a = self.track("ROCK/a.flac", title="Twin", duration=100.0)
+        self.b = self.track("POP/b.flac", title="Twin", duration=100.5)
+        self.c = self.track("ROCK/c.flac", title="Twin", duration=101.0)
+        self.report = reconciliation.run_scan()
+        self.group = self.of(self.report, "duplicate")[0]
+
+    def decide(self, a, b, **extra):
+        payload = {"scan_id": self.report["scan_id"], "finding_id": self.group["id"], "track_a": a.pk,
+                   "track_b": b.pk, **extra}
+        response = self.client.post(reverse(self.URL), payload, content_type="application/json")
+        return response.status_code, response.json()
+
+    def test_records_not_a_duplicate_once_and_never_overrides_a_decision(self):
+        self.assertEqual(self.decide(self.b, self.a), (200, {"result": "recorded", "resolution": "keep_both"}))
+        row = DuplicateCandidate.objects.get(track_a=self.a, track_b=self.b)
+        self.assertEqual((row.resolution, row.applied, row.confidence), ("keep_both", False, "probable"))
+        self.assertEqual(self.decide(self.a, self.b)[1]["result"], "already_decided")       # a replay
+        DuplicateCandidate.objects.create(track_a=self.a, track_b=self.c, confidence="probable", resolution="keep_a")
+        status, body = self.decide(self.a, self.c)
+        self.assertEqual((status, body["result"], body["resolution"]), (200, "already_decided", "keep_a"))
+        self.assertEqual(DuplicateCandidate.objects.get(track_a=self.a, track_b=self.c).resolution, "keep_a")
+        self.assertEqual(Track.objects.count(), 3)
+        self.assertTrue(all(Path(t.filepath).exists() for t in Track.objects.all()))
+
+    def test_an_unresolved_pair_is_resolved_not_duplicated(self):
+        DuplicateCandidate.objects.create(track_a=self.b, track_b=self.c, confidence="probable")
+        self.assertEqual(self.decide(self.c, self.b)[1]["result"], "recorded")
+        self.assertEqual(list(DuplicateCandidate.objects.filter(track_a=self.b, track_b=self.c)
+                              .values_list("resolution", flat=True)), ["keep_both"])
+
+    def test_stale_scans_foreign_pairs_and_non_managers_are_refused(self):
+        newer = reconciliation.run_scan()
+        self.assertNotEqual(newer["scan_id"], self.report["scan_id"])
+        self.assertEqual(self.decide(self.a, self.b)[0], 409)
+        self.report = newer
+        self.group = self.of(newer, "duplicate")[0]
+        stranger = self.track("ROCK/z.flac", title="Unrelated")
+        self.assertEqual(self.decide(self.a, stranger)[0], 400)
+        self.assertEqual(self.decide(self.a, self.a)[0], 400)
+        user = User.objects.create_user("contrib-dup", "c@example.invalid", "pw")
+        user.groups.add(Group.objects.get_or_create(name="Contributor")[0])
+        self.client.force_login(user)
+        self.assertEqual(self.decide(self.a, self.b)[0], 403)
+        self.assertFalse(DuplicateCandidate.objects.exists())

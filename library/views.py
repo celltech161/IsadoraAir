@@ -1896,6 +1896,49 @@ def api_reconciliation_findings(request):
                          "scan_id": report["scan_id"]})
 
 
+@require_http_methods(["POST"])
+def api_reconciliation_not_duplicate(request):
+    """Record an operator's review that two Tracks of a duplicate group are *not* duplicates
+    (DuplicateCandidate ``keep_both``). The only decision Phase B records: it deletes nothing, never feeds
+    apply_duplicate_resolutions a deletion, and never changes a decision already made."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.models import DuplicateCandidate
+    from library.services import library_reconciliation as reconciliation
+    try:
+        body = json.loads(request.body)
+        a, b = int(body["track_a"]), int(body["track_b"])
+        scan_id, finding_id = str(body["scan_id"]), str(body["finding_id"])
+    except (ValueError, KeyError, TypeError):
+        return JsonResponse({"error": "scan_id, finding_id, track_a and track_b are required"}, status=400)
+    report = reconciliation.load_report()
+    if report is None or report["scan_id"] != scan_id:
+        return JsonResponse({"error": "A newer scan replaced the one this page shows. Reload the page."}, status=409)
+    finding = next((f for f in report["findings"] if f["id"] == finding_id and f["type"] == "duplicate"), None)
+    if finding is None or a == b or not {a, b} <= set(finding.get("members", [])):
+        return JsonResponse({"error": "Those Tracks are not a pair of this duplicate group"}, status=400)
+    a, b = sorted((a, b))
+    with transaction.atomic():
+        tracks = {t.pk: t for t in Track.objects.filter(pk__in=(a, b))}
+        if len(tracks) != 2:
+            return JsonResponse({"error": "One of the Tracks no longer exists"}, status=409)
+        candidate = (DuplicateCandidate.objects.select_for_update()
+                     .filter(track_a_id=a, track_b_id=b).first())
+        if candidate is not None and candidate.resolution != "unresolved":
+            return JsonResponse({"result": "already_decided", "resolution": candidate.resolution,
+                                 "applied": candidate.applied})
+        now = timezone.now()
+        if candidate is None:
+            DuplicateCandidate.objects.create(
+                track_a=tracks[a], track_b=tracks[b], resolution="keep_both", resolved_at=now,
+                confidence="exact" if finding.get("confidence") == "exact" else "probable")
+        else:
+            candidate.resolution, candidate.resolved_at = "keep_both", now
+            candidate.save(update_fields=["resolution", "resolved_at"])
+    return JsonResponse({"result": "recorded", "resolution": "keep_both"})
+
+
 TRACK_SORT_FIELDS = {
     "title": "title",
     "artist": "artist__name",

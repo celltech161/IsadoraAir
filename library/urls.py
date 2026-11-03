@@ -52,6 +52,8 @@ urlpatterns = [
     path('api/tracks/reconciliation/', views.api_reconciliation_summary, name='api-reconciliation-summary'),
     path('api/tracks/reconciliation/findings/', views.api_reconciliation_findings,
          name='api-reconciliation-findings'),
+    path('api/tracks/reconciliation/duplicates/not-duplicate/', views.api_reconciliation_not_duplicate,
+         name='api-reconciliation-not-duplicate'),
     path('api/tracks/autofill-related-artists/', views.api_track_autofill_related_artists, name='api-track-autofill-related-artists'),
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),
     path('api/tracks/<int:pk>/audio/', views.api_track_audio, name='api-track-audio'),
