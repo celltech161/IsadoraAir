@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0125",
+  "previous_release_id": "r0124",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 3.11 Library integrity and tools: commit-safe Track deletion with post-commit source and waveform cleanup coordinated by per-path registration locks; previewed bulk metadata editing; operator-run read-only reconciliation, duplicate review and evidence-qualified relinking; Library audit events in Monitoring; documentation corrections. Restart Gunicorn and the active-message worker; no migration, static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-active-message-worker"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
