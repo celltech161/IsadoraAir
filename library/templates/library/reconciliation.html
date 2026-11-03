@@ -225,7 +225,56 @@ function renderCandidates(card, finding) {
 }
 
 function relinkControl(finding, candidate) {
-  return '';
+  // Offered only for the one candidate the scan proved to carry the Track's decoded audio.
+  if (finding.relink !== candidate.index) return '';
+  const button = el('button', 'Review relink…', 'rc-btn');
+  button.type = 'button';
+  button.addEventListener('click', () => previewRelink(finding));
+  return button;
+}
+
+function postJSON(url, payload) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify(payload),
+  }).then(async resp => ({ resp, data: await resp.json().catch(() => ({})) }));
+}
+
+function showPanel(nodes) {
+  const panel = document.getElementById('actionPanel');
+  panel.replaceChildren(...nodes);
+  panel.hidden = false;
+  panel.scrollIntoView({ block: 'nearest' });
+}
+
+async function previewRelink(finding) {
+  const { resp, data } = await postJSON('/api/tracks/reconciliation/relink/preview/', { scan_id: scanId, finding_id: finding.id });
+  if (!resp.ok) { showPanel([el('p', 'Relink refused: ' + (data.error || resp.status), 'rc-bad'), closeButton()]); return; }
+  const nodes = [el('p', `Relink Track #${data.track_id}: ${data.evidence}.`)];
+  nodes.push(trackTable(data.changes, [['Field', c => c.field], ['Now', c => c.before], ['After', c => c.after]]));
+  nodes.push(el('p', 'Unchanged: ' + data.unchanged.join('; ') + '.', 'rc-muted'));
+  data.warnings.forEach(w => nodes.push(el('p', w, 'rc-warn')));
+  const confirm = el('button', 'Confirm relink', 'rc-btn');
+  confirm.type = 'button';
+  confirm.addEventListener('click', async () => {
+    confirm.disabled = true;
+    const result = await postJSON('/api/tracks/reconciliation/relink/apply/', { token: data.token });
+    const ok = result.resp.ok && result.data.result === 'relinked';
+    showPanel([el('p', ok ? `Relinked Track #${result.data.track_id} to ${result.data.to}.`
+                          : 'Relink refused, nothing was changed: ' + (result.data.error || result.resp.status),
+                  ok ? '' : 'rc-bad'),
+               ...(ok ? result.data.warnings.map(w => el('p', w, 'rc-warn')) : []), closeButton()]);
+  });
+  nodes.push(confirm, closeButton('Cancel'));
+  showPanel(nodes);
+}
+
+function closeButton(label) {
+  const b = el('button', label || 'Close', 'rc-btn');
+  b.type = 'button';
+  b.addEventListener('click', () => { document.getElementById('actionPanel').hidden = true; });
+  return b;
 }
 
 function renderDuplicate(card, finding) {

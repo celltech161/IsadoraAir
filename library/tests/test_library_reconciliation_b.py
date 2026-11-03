@@ -14,7 +14,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
 from library.models import Artist, Category, CategoryKind, DuplicateCandidate, Track
@@ -451,3 +451,359 @@ class DuplicateDecisionEndpointTests(_Recon):
         self.client.force_login(user)
         self.assertEqual(self.decide(self.a, self.b)[0], 403)
         self.assertFalse(DuplicateCandidate.objects.exists())
+
+
+class _RelinkSetup:
+    """A real recording, analyzed by the station's own analysis (trusted v2 cache with its decoded identity),
+    with an approved cue point, then moved and renamed outside the application."""
+
+    def prepare(self, *, freq=440, approve=True):
+        from library.models import LogItem, PlayEvent, PlaylistLog
+        from library.services import cue_markers, waveform_cache
+        from library.tests.test_waveform_integrity_package_b import _audio
+        from django.utils import timezone as tz
+
+        (self.root / "ROCK").mkdir(exist_ok=True)
+        (self.root / "POP").mkdir(exist_ok=True)
+        path = _audio(self.root / "ROCK" / "song.flac", freq=freq)
+        track = Track.objects.create(filepath=str(path), filename=path.name, title="Moved Song", artist=self.artist,
+                                     category=self.rock, duration_seconds=3.0, format="flac", ready2air=True,
+                                     play_count=7)
+        track = _analyze(self, track)
+        if approve:
+            revision = waveform_cache.current_audio_revision(track)
+            self.assertIsNotNone(revision)
+            result = cue_markers.operator_edit(track.pk, expected_revision=track.cue_marker_revision, user=self.admin,
+                                               values={"intro_until_seconds": 0.8}, audio_revision=revision)
+            self.assertTrue(result.ok, result.error)
+        log = PlaylistLog.objects.create(date=tz.localdate(), hour=3, status="approved")
+        LogItem.objects.create(playlist_log=log, position=0, scheduled_time=tz.now(), track=track,
+                               track_title=track.title, category=self.rock)
+        PlayEvent.objects.create(track=track, track_title=track.title, started_at=tz.now())
+        self.moved = self.root / "POP" / "moved-song.flac"
+        os.rename(path, self.moved)
+        self.track_obj = Track.objects.get(pk=track.pk)
+        return self.track_obj
+
+    def scan_and_find(self):
+        self.report = reconciliation.run_scan()
+        moved = [f for f in self.report["findings"] if f["type"] == "moved"]
+        self.assertEqual(len(moved), 1, self.report["findings"])
+        self.finding = moved[0]
+        return self.finding
+
+    def preview(self, client=None, finding_id=None, scan_id=None):
+        client = client or self.client
+        response = client.post(reverse("library:api-reconciliation-relink-preview"),
+                               {"scan_id": scan_id or self.report["scan_id"], "finding_id": finding_id or self.finding["id"]},
+                               content_type="application/json")
+        return response.status_code, response.json()
+
+    def apply(self, token, client=None):
+        client = client or self.client
+        response = client.post(reverse("library:api-reconciliation-relink-apply"), {"token": token},
+                               content_type="application/json")
+        return response.status_code, response.json()
+
+    def frozen(self, track_id):
+        from library.models import LogItem, PlayEvent, PlaylistLog
+        row = Track.objects.filter(pk=track_id).values().get()
+        for key in ("filepath", "filename", "updated_at"):
+            row.pop(key)
+        return (row, sorted(Track.objects.get(pk=track_id).additional_categories.values_list("pk", flat=True)),
+                list(LogItem.objects.values()), list(PlayEvent.objects.values()), list(PlaylistLog.objects.values()))
+
+
+class RelinkTests(_RelinkSetup, _Recon):
+    def test_an_explicitly_reviewed_relink_reconnects_the_same_track_and_changes_nothing_else(self):
+        from library.management.commands import analyze_tracks
+        from library.services import cue_markers, waveform_cache
+        track = self.prepare()
+        finding = self.scan_and_find()
+        self.assertEqual(finding["relink"], 0)
+        self.assertTrue(finding["candidates"][0]["eligible"])
+        self.assertTrue(finding["candidates"][0]["identity_match"])
+        cache = Path(track.waveform_path).read_bytes()
+        before = self.frozen(track.pk)
+        status, preview = self.preview()
+        self.assertEqual(status, 200, preview)
+        self.assertEqual((preview["from"], preview["to"]), (track.filepath, str(self.moved)))
+        self.assertEqual([c["field"] for c in preview["changes"]], ["filepath", "filename"])
+        with mock.patch.object(analyze_tracks, "analyze_one_track") as analysis, \
+             mock.patch.object(cue_markers, "request_analysis") as requested, \
+             mock.patch("os.unlink") as unlink, mock.patch("os.rename") as rename, \
+             mock.patch("shutil.move") as move:
+            status, result = self.apply(preview["token"])
+        self.assertEqual((status, result["result"]), (200, "relinked"), result)
+        for spy in (analysis, requested, unlink, rename, move):
+            spy.assert_not_called()
+        relinked = Track.objects.get(pk=track.pk)
+        self.assertEqual((relinked.filepath, relinked.filename), (str(self.moved), "moved-song.flac"))
+        self.assertEqual(self.frozen(track.pk), before)            # metadata, markers, readiness, history, logs
+        self.assertEqual(Path(relinked.waveform_path).read_bytes(), cache)
+        verdict = waveform_cache.validate(relinked)
+        self.assertEqual((verdict.trusted, verdict.displayable), (False, True))
+        self.assertTrue(self.moved.exists())
+
+    def test_a_completed_relink_cannot_be_replayed(self):
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        self.assertEqual(self.apply(preview["token"])[0], 200)
+        status, body = self.apply(preview["token"])
+        self.assertEqual((status, body["result"]), (409, "refused"))
+        self.assertIn("changed since the scan", body["error"])
+
+    def test_a_candidate_that_changed_is_refused_at_preview_and_at_apply(self):
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        with open(self.moved, "ab") as handle:
+            handle.write(b"\0")
+        status, body = self.apply(preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("changed since its audio was compared", body["error"])
+        self.assertEqual(self.preview()[0], 409)
+        self.assertNotEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.moved))
+
+    def test_a_candidate_that_vanished_or_was_claimed_is_refused(self):
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        Track.objects.create(filepath=str(self.moved), filename="moved-song.flac", title="Claimed", artist=self.artist,
+                             category=self.pop)
+        status, body = self.apply(preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("Another Track already uses", body["error"])
+        Track.objects.filter(filepath=str(self.moved)).delete()
+        os.unlink(self.moved)
+        status, body = self.apply(preview["token"])
+        self.assertIn("no longer exists", body["error"])
+        self.assertEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.root / "ROCK" / "song.flac"))
+
+    def test_the_original_file_reappearing_or_the_track_changing_refuses(self):
+        import shutil
+        from library.services import cue_markers
+        track = self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        shutil.copy2(self.moved, track.filepath)
+        status, body = self.apply(preview["token"])
+        self.assertIn("original file is back", body["error"])
+        os.unlink(track.filepath)
+        current = Track.objects.get(pk=track.pk)
+        cue_markers.operator_edit(track.pk, expected_revision=current.cue_marker_revision, user=self.admin,
+                                  values={"outro_starts_seconds": 2.0})
+        status, body = self.apply(preview["token"])
+        self.assertIn("changed since the scan", body["error"])
+        Track.objects.get(pk=track.pk).delete()
+        status, body = self.apply(preview["token"])
+        self.assertIn("no longer exists", body["error"])
+
+    def test_tokens_are_signed_operator_bound_expiring_and_tied_to_the_latest_scan(self):
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        self.assertEqual(self.apply(preview["token"][:-2] + "zz")[0], 400)
+        self.assertEqual(self.apply("")[0], 400)
+        other = User.objects.create_superuser("other-recon", "o@example.invalid", "pw")
+        from django.test import Client
+        second = Client()
+        second.force_login(other)
+        self.assertEqual(self.apply(preview["token"], client=second)[0], 403)
+        from library.services import library_relink
+        with mock.patch.object(library_relink, "TOKEN_MAX_AGE_SECONDS", -1):
+            self.assertIn("expired", self.apply(preview["token"])[1]["error"])
+        self.assertEqual(self.preview(scan_id="20000101T000000-deadbeef")[0], 409)
+        self.assertEqual(self.preview(finding_id="F999999")[0], 400)
+        self.assertNotEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.moved))
+
+    def test_a_write_guard_refusal_rolls_the_relink_back(self):
+        from library import models as library_models
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+
+        def refuse(queryset, columns):
+            if "filepath" in columns:
+                raise library_models.TrackWriteRefused("projected spoken Track path")
+
+        guards = library_models.TRACK_WRITE_GUARDS + [(lambda t, f: None, refuse, lambda o, f: None)]
+        with mock.patch.object(library_models, "TRACK_WRITE_GUARDS", guards):
+            status, body = self.apply(preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("Protected", body["error"])
+        self.assertEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.root / "ROCK" / "song.flac"))
+
+    def test_only_track_managers_may_relink(self):
+        self.prepare()
+        self.scan_and_find()
+        _status, preview = self.preview()
+        user = User.objects.create_user("contrib-relink", "cr@example.invalid", "pw")
+        user.groups.add(Group.objects.get_or_create(name="Contributor")[0])
+        self.client.force_login(user)
+        self.assertEqual(self.preview()[0], 403)
+        self.assertEqual(self.apply(preview["token"])[0], 403)
+
+
+class RelinkEvidenceTests(_RelinkSetup, _Recon):
+    """Cases the available authority cannot prove: manual review, no relink offered."""
+
+    def assert_manual(self, reason_part):
+        finding = self.scan_and_find()
+        self.assertIsNone(finding["relink"])
+        self.assertIn(reason_part, json.dumps(finding))
+        self.assertEqual(self.preview()[0], 400)
+
+    def test_different_audio_under_the_same_name(self):
+        from library.tests.test_waveform_integrity_package_b import _audio
+        self.prepare()
+        os.unlink(self.moved)
+        _audio(self.root / "POP" / "song.flac", freq=880)       # the Track's file name, another recording
+        self.assert_manual("decoded audio differs")
+
+    def test_approvals_for_other_audio(self):
+        from library.services import cue_markers
+        track = self.prepare(approve=False)
+        cue_markers.operator_edit(track.pk, expected_revision=track.cue_marker_revision, user=self.admin,
+                                  values={"intro_until_seconds": 0.7}, audio_revision="e" * 64)
+        self.assert_manual("approvals refer to different audio")
+
+    def test_another_format(self):
+        self.prepare()
+        mp3 = self.root / "POP" / "moved-song.mp3"
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(self.moved), str(mp3)],
+                       check=True, stdin=subprocess.DEVNULL)
+        os.unlink(self.moved)
+        os.rename(mp3, self.root / "POP" / "song.mp3")         # same recording, other format
+        report = reconciliation.run_scan()
+        # A file of another format is never a relink candidate (name and size are matched per format).
+        self.assertFalse([f for f in report["findings"] if f["type"] == "moved"])
+        self.assertEqual([f["track"]["id"] for f in report["findings"] if f["type"] == "missing"],
+                         [self.track_obj.pk])
+
+    def test_two_copies_with_the_same_audio(self):
+        import shutil
+        self.prepare()
+        shutil.copy2(self.moved, self.root / "song.flac")
+        finding = self.scan_and_find()
+        self.assertIsNone(finding["relink"])
+        self.assertIn("more than one candidate", finding["reason"])
+
+
+def _advisory_waiters():
+    from django.db import connection
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+        return cursor.fetchone()[0]
+
+
+def _wait_until(predicate, timeout=10.0):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class RelinkConcurrencyTests(_RelinkSetup, _ReconFixture, TransactionTestCase):
+    """A relink serializes with registration and recall of the same path on the source-path lock (path, then
+    Track row), whichever comes first; every interleaving is forced on pg_locks."""
+
+    def start(self, name, target, results):
+        import threading
+        from django.db import close_old_connections, connections
+
+        def run():
+            close_old_connections()
+            try:
+                results["value"] = target()
+            except Exception as exc:
+                results["error"] = exc
+            finally:
+                connections.close_all()
+        thread = threading.Thread(target=run, name=name)
+        thread.start()
+        return thread
+
+    def paused(self, holder):
+        """Patch source_paths.acquire so thread ``holder`` stops right after its first path lock."""
+        import threading
+        from library.services import source_paths
+        held, release, real = threading.Event(), threading.Event(), source_paths.acquire
+
+        def acquire(path, using, *, timeout_ms):
+            real(path, using, timeout_ms=timeout_ms)
+            if threading.current_thread().name == holder and not held.is_set():
+                held.set()
+                release.wait(20)
+        return mock.patch.object(source_paths, "acquire", acquire), held, release
+
+    def relink(self, token):
+        from library.services import library_relink
+        return library_relink.apply(token, user=self.admin)
+
+    def ready(self):
+        self.prepare()
+        self.scan_and_find()
+        status, preview = self.preview()
+        self.assertEqual(status, 200, preview)
+        return preview["token"]
+
+    def test_a_registration_holding_the_candidate_path_wins_and_the_relink_refuses(self):
+        token = self.ready()
+        patcher, held, release = self.paused("creator")
+        created, relinked = {}, {}
+        with patcher:
+            creator = self.start("creator", lambda: Track.objects.create(
+                filepath=str(self.moved), filename=self.moved.name, title="Registered", artist=self.artist,
+                category=self.pop), created)
+            self.assertTrue(held.wait(10))
+            relink = self.start("relink", lambda: self.relink(token), relinked)
+            self.assertTrue(_wait_until(lambda: _advisory_waiters() >= 1), "the relink did not wait for the path")
+            release.set()
+            creator.join(20)
+            relink.join(20)
+        self.assertNotIn("error", created)
+        self.assertIn("Another Track already uses", str(relinked.get("error")))
+        self.assertEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.root / "ROCK" / "song.flac"))
+
+    def test_a_relink_holding_the_path_makes_a_concurrent_registration_fail_visibly(self):
+        from django.db import IntegrityError
+        token = self.ready()
+        patcher, held, release = self.paused("relink")
+        created, relinked = {}, {}
+        with patcher:
+            relink = self.start("relink", lambda: self.relink(token), relinked)
+            self.assertTrue(held.wait(10))
+            creator = self.start("creator", lambda: Track.objects.create(
+                filepath=str(self.moved), filename=self.moved.name, title="Registered", artist=self.artist,
+                category=self.pop), created)
+            self.assertTrue(_wait_until(lambda: _advisory_waiters() >= 1), "the registration did not wait")
+            release.set()
+            relink.join(20)
+            creator.join(20)
+        self.assertEqual(relinked.get("value", {}).get("result"), "relinked", relinked)
+        self.assertIsInstance(created.get("error"), IntegrityError)
+        self.assertEqual(list(Track.objects.filter(filepath=str(self.moved)).values_list("pk", flat=True)),
+                         [self.track_obj.pk])
+
+    def test_a_recall_holding_the_candidate_removes_it_and_the_relink_refuses(self):
+        token = self.ready()
+        patcher, held, release = self.paused("recall")
+        recalled, relinked = {}, {}
+        with patcher:
+            recall = self.start("recall", lambda: call_command("remove_track_file", str(self.moved),
+                                                               stdout=StringIO()), recalled)
+            self.assertTrue(held.wait(10))
+            relink = self.start("relink", lambda: self.relink(token), relinked)
+            self.assertTrue(_wait_until(lambda: _advisory_waiters() >= 1), "the relink did not wait for the recall")
+            release.set()
+            recall.join(20)
+            relink.join(20)
+        self.assertNotIn("error", recalled)
+        self.assertFalse(self.moved.exists())
+        self.assertIn("no longer exists", str(relinked.get("error")))
+        self.assertEqual(Track.objects.get(pk=self.track_obj.pk).filepath, str(self.root / "ROCK" / "song.flac"))

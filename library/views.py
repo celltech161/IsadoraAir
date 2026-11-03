@@ -1939,6 +1939,48 @@ def api_reconciliation_not_duplicate(request):
     return JsonResponse({"result": "recorded", "resolution": "keep_both"})
 
 
+def _relink_response(call):
+    from library.services import library_relink
+    try:
+        return JsonResponse(call())
+    except library_relink.RelinkRefused as exc:
+        return JsonResponse({"result": "refused", "error": str(exc)}, status=exc.status)
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_relink_preview(request):
+    """Revalidate a scan's relink offer and return the exact change plus a signed token (no decode, no write)."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_reconciliation as reconciliation
+    from library.services import library_relink
+    try:
+        body = json.loads(request.body)
+        scan_id, finding_id = str(body["scan_id"]), str(body["finding_id"])
+    except (ValueError, KeyError, TypeError):
+        return JsonResponse({"error": "scan_id and finding_id are required"}, status=400)
+    report = reconciliation.load_report()
+    if report is None or report["scan_id"] != scan_id:
+        return JsonResponse({"result": "refused",
+                             "error": "A newer scan replaced the one this page shows. Reload the page."}, status=409)
+    return _relink_response(lambda: library_relink.preview(report, finding_id, user=request.user))
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_relink_apply(request):
+    """Apply a previewed relink: path locks, then the Track row, full revalidation, guarded write."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_relink
+    try:
+        token = json.loads(request.body).get("token")
+    except (ValueError, AttributeError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    return _relink_response(lambda: library_relink.apply(token, user=request.user))
+
+
 TRACK_SORT_FIELDS = {
     "title": "title",
     "artist": "artist__name",

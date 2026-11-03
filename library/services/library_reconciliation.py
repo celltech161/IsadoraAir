@@ -267,6 +267,41 @@ def _protection_predicates():
     return path_owner, track_owner
 
 
+def track_audio_evidence(track_id, filepath) -> dict:
+    """What a Track's own records say about its last identified audio (read only).
+
+    ``identity`` is the decoded-audio revision its version-2 waveform cache recorded for exactly
+    ``filepath``, when nothing contradicts it: no cue-point approval names other audio.  Otherwise
+    ``identity`` is None and ``problems`` says why (a relink then stays manual)."""
+    from library.models import Track
+
+    evidence = {"identity": None, "source_size": None, "problems": []}
+    cache = waveform_cache.canonical_path(Path(settings.WAVEFORMS_DIR), track_id)
+    payload, failure = waveform_cache.read(cache)
+    if failure is None:
+        failure = waveform_cache.check_payload(payload, track_id)
+    if failure is not None or payload.get("schema") != waveform_cache.SCHEMA:
+        evidence["problems"].append("no version-2 waveform cache records this Track's audio identity"
+                                    + (f" ({failure.reason})" if failure is not None else ""))
+        return evidence
+    source = payload.get("source") or {}
+    if isinstance(source.get("size"), int):
+        evidence["source_size"] = source["size"]
+    if source.get("path") != filepath:
+        evidence["problems"].append("the waveform cache was made from a different file path")
+    revision = audio_identity.revision(payload.get("audio_identity"))
+    if revision is None:
+        evidence["problems"].append("the waveform cache has no usable decoded-audio identity")
+    state = Track.objects.filter(pk=track_id).values_list("cue_marker_state", flat=True).first() or {}
+    others = sorted({entry.get("audio_revision") for entry in state.values()
+                     if isinstance(entry, dict) and entry.get("audio_revision")} - {revision})
+    if revision is not None and others:
+        evidence["problems"].append("cue-point approvals refer to different audio")
+    if not evidence["problems"]:
+        evidence["identity"] = revision
+    return evidence
+
+
 # --------------------------------------------------------------------------- the scan
 
 class Scanner:
@@ -521,34 +556,7 @@ class Scanner:
                      relink_candidate=entry.path in claimed)
 
     def track_evidence(self, row) -> dict:
-        """What the Track's own records say about its last identified audio (read only)."""
-        from library.models import Track
-
-        evidence = {"identity": None, "source_size": None, "problems": []}
-        cache = waveform_cache.canonical_path(Path(settings.WAVEFORMS_DIR), row["id"])
-        payload, failure = waveform_cache.read(cache)
-        if failure is None:
-            failure = waveform_cache.check_payload(payload, row["id"])
-        if failure is not None or payload.get("schema") != waveform_cache.SCHEMA:
-            evidence["problems"].append("no version-2 waveform cache records this Track's audio identity"
-                                        + (f" ({failure.reason})" if failure is not None else ""))
-            return evidence
-        source = payload.get("source") or {}
-        if isinstance(source.get("size"), int):
-            evidence["source_size"] = source["size"]
-        if source.get("path") != row["filepath"]:
-            evidence["problems"].append("the waveform cache was made from a different file path")
-        revision = audio_identity.revision(payload.get("audio_identity"))
-        if revision is None:
-            evidence["problems"].append("the waveform cache has no usable decoded-audio identity")
-        state = Track.objects.filter(pk=row["id"]).values_list("cue_marker_state", flat=True).first() or {}
-        others = sorted({entry.get("audio_revision") for entry in state.values()
-                         if isinstance(entry, dict) and entry.get("audio_revision")} - {revision})
-        if revision is not None and others:
-            evidence["problems"].append("cue-point approvals refer to different audio")
-        if not evidence["problems"]:
-            evidence["identity"] = revision
-        return evidence
+        return track_audio_evidence(row["id"], row["filepath"])
 
     def candidate(self, entry: FileEntry, row, evidence, *, decode=True) -> dict:
         reasons = []
@@ -573,7 +581,8 @@ class Scanner:
                 elif identity is None:
                     reasons.append(f"its audio could not be identified ({problem})")
                 else:
-                    described["identity_match"] = audio_identity.revision(identity) == evidence["identity"]
+                    described["identity"] = audio_identity.revision(identity)
+                    described["identity_match"] = described["identity"] == evidence["identity"]
                     described["witness"] = after
                     if not described["identity_match"]:
                         reasons.append("its decoded audio differs from the Track's recorded audio")
