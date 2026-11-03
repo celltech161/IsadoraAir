@@ -763,7 +763,19 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
     row lock; every outcome is reported."""
     from library.models import Track, TrackWriteRefused
 
-    record = _redeem_token(previews, user, token, selection, ops)
+    from library.services import library_audit
+
+    operations = [f"{o.field}:{o.op}" for o in ops]
+    try:
+        record = _redeem_token(previews, user, token, selection, ops)
+    except BulkEditError as exc:
+        # Nothing was applied; worth keeping for troubleshooting (an expired, replayed, foreign or drifted preview).
+        library_audit.record(
+            "bulk_edit.apply", user=user, outcome="refused", level="warning",
+            title=f"Library bulk edit refused: {exc}"[:200],
+            detail={"reason": str(exc), "status": exc.status, "selection_mode": selection.mode,
+                    "requested": len(selection.ids) + len(selection.missing), "operations": operations})
+        raise
     previewed = record["tracks"]
     with transaction.atomic():
         targets = _prepare_targets(ops, selection.ids)
@@ -830,8 +842,24 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
              "failed=%d missing=%d", getattr(user, "pk", None), selection.mode,
              len(selection.ids) + len(selection.missing), len(updated), unchanged, len(refused), len(stale),
              len(failed), len(missing))
+    # Each Track above committed on its own; the audit summary is written after the last of them.  Its outcome
+    # is never "completed" while any Track was refused, stale, failed or missing.
+    problems = [t["id"] for t in (*refused, *stale, *failed)] + sorted(set(missing))
+    requested = len(selection.ids) + len(selection.missing)
+    outcome = ("completed" if updated and not problems else "partial" if updated
+               else "no_change" if not problems else "nothing_applied")
+    action_id = library_audit.record(
+        "bulk_edit.apply", user=user, outcome=outcome, level="info" if outcome in ("completed", "no_change") else "warning",
+        title=f"Library bulk edit {outcome.replace('_', ' ')}: {len(updated)} of {requested} Track(s) updated",
+        detail={"selection_mode": selection.mode, "requested": requested, "operations": operations,
+                "updated": len(updated), "unchanged": unchanged, "refused": len(refused), "stale": len(stale),
+                "failed": len(failed), "missing": len(set(missing)),
+                "updated_tracks": library_audit.id_sample(updated),
+                "problem_tracks": library_audit.id_sample(problems)})
     return {
         "ok": True,
+        "outcome": outcome,
+        "audit_action_id": action_id,
         "requested": len(selection.ids) + len(selection.missing),
         "updated": len(updated),
         "updated_ids": updated,

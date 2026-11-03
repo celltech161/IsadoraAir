@@ -237,3 +237,41 @@ was 31,783 bytes and expanded 50 members while reporting the exact 4,000-member 
 
   These need an independent trusted record of the Track's audio.
 * **The scan is operator-run.** Nothing schedules it.
+
+## Audit events (r0125)
+
+Bulk edits, relinks and "not a duplicate" decisions are recorded as `SystemEvent` rows (category `library`)
+through `library.services.library_audit`. They are shown in /monitoring/ Recent Events and Django admin.
+
+| `action` | Outcomes | Level |
+|---|---|---|
+| `bulk_edit.apply` | `completed`, `no_change` | info |
+| `bulk_edit.apply` | `partial`, `nothing_applied`, `refused` (an expired, replayed, foreign or drifted preview) | warning |
+| `reconciliation.relink` | `relinked` | info |
+| `reconciliation.relink` | `refused` | warning |
+| `reconciliation.not_duplicate` | `recorded`, `already_decided` | info |
+
+**Every event carries:**
+* `action_id`, which is also its `dedupe_key` (`library|audit|<action>|<action_id>`), so two operations are never
+  coalesced;
+* the operator's username and id, and the outcome.
+
+**Per action:**
+* `bulk_edit.apply`:
+  * the selection mode, requested count and operations;
+  * per-outcome counts;
+  * at most 20 Track ids per list (updated, and refused/stale/failed/missing), each list with its full count.
+
+  Its outcome is never `completed` while any Track was refused, stale, failed or missing.
+* `reconciliation.relink`: the Track id, the scan and finding, and the old and new file paths **relative to
+  `LIBRARY_ROOT`**.
+
+**Never recorded:** preview tokens, cookies, request bodies or credentials.
+
+**Timing and reliability:**
+* An event is registered with `transaction.on_commit`. It is written only after the work it describes
+  committed; a rolled-back operation records nothing.
+* A failure to write an event is logged and dropped. It never fails or replays the Library operation.
+
+This is an operational log, not an audit archive. `SystemEvent` writes are best effort, and
+`prune_systemevents` removes rows after about 30 days. Nothing here is permanent, guaranteed or append-only.

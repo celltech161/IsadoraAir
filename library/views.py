@@ -1982,6 +1982,17 @@ def api_reconciliation_not_duplicate(request):
     if finding is None or a == b or not {a, b} <= set(finding.get("members", [])):
         return JsonResponse({"error": "Those Tracks are not a pair of this duplicate group"}, status=400)
     a, b = sorted((a, b))
+    from library.services import library_audit
+
+    def audit(outcome, resolution):
+        # Registered inside the transaction: written only once it commits.
+        library_audit.record(
+            "reconciliation.not_duplicate", user=request.user, outcome=outcome,
+            title=(f"Library duplicate review: Tracks {a} and {b} recorded as not duplicates" if outcome == "recorded"
+                   else f"Library duplicate review: Tracks {a} and {b} already decided ({resolution})"),
+            detail={"track_a": a, "track_b": b, "resolution": resolution, "scan_id": scan_id,
+                    "finding_id": finding_id})
+
     with transaction.atomic():
         tracks = {t.pk: t for t in Track.objects.filter(pk__in=(a, b))}
         if len(tracks) != 2:
@@ -1989,6 +2000,7 @@ def api_reconciliation_not_duplicate(request):
         candidate = (DuplicateCandidate.objects.select_for_update()
                      .filter(track_a_id=a, track_b_id=b).first())
         if candidate is not None and candidate.resolution != "unresolved":
+            audit("already_decided", candidate.resolution)
             return JsonResponse({"result": "already_decided", "resolution": candidate.resolution,
                                  "applied": candidate.applied})
         now = timezone.now()
@@ -1999,6 +2011,7 @@ def api_reconciliation_not_duplicate(request):
         else:
             candidate.resolution, candidate.resolved_at = "keep_both", now
             candidate.save(update_fields=["resolution", "resolved_at"])
+        audit("recorded", "keep_both")
     return JsonResponse({"result": "recorded", "resolution": "keep_both"})
 
 

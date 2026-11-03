@@ -122,6 +122,32 @@ def preview(report, finding_id, *, user) -> dict:
 
 
 def apply(token, *, user) -> dict:
+    """Apply a previewed relink (see the module docstring); audited after commit, or as refused."""
+    from library.services import library_audit
+
+    plan = {}
+    try:
+        result = _apply(token, user=user, plan_out=plan)
+    except RelinkRefused as exc:
+        library_audit.record(
+            "reconciliation.relink", user=user, outcome="refused", level="warning",
+            title=f"Library relink refused: {exc}"[:200],
+            detail={"reason": str(exc), "status": exc.status, "track_id": plan.get("track_id"),
+                    "scan_id": plan.get("scan_id"), "finding_id": plan.get("finding_id"),
+                    "from": library_audit.library_relative(plan.get("from")),
+                    "to": library_audit.library_relative(plan.get("to"))})
+        raise
+    # _apply returned, so its transaction committed; the event is written now (autocommit) or at the outer commit.
+    result["audit_action_id"] = library_audit.record(
+        "reconciliation.relink", user=user, outcome="relinked",
+        title=f"Library Track {result['track_id']} relinked to its moved file",
+        detail={"track_id": result["track_id"], "scan_id": plan.get("scan_id"), "finding_id": plan.get("finding_id"),
+                "from": library_audit.library_relative(result["from"]),
+                "to": library_audit.library_relative(result["to"])})
+    return result
+
+
+def _apply(token, *, user, plan_out) -> dict:
     from library.models import Track, TrackWriteRefused
 
     if not isinstance(token, str) or not token:
@@ -134,6 +160,7 @@ def apply(token, *, user) -> dict:
         raise RelinkRefused("This is not a valid relink preview token.", status=400) from None
     if not isinstance(plan, dict) or plan.get("u") != user.pk:
         raise RelinkRefused("This relink was previewed by another operator.", status=403)
+    plan_out.update({key: plan.get(key) for key in ("track_id", "scan_id", "finding_id", "from", "to")})
     using = router.db_for_write(Track)
     try:
         with transaction.atomic(using=using):
