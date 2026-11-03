@@ -866,7 +866,13 @@ class Scanner:
             group["decision_count"] = len(decisions)
             not_dup = sum(1 for d in decisions.values() if d["resolution"] == "keep_both")
             group["keep_both_decision_count"] = not_dup
-            group["open"] = group["pair_count"] > 0 and not_dup < group["pair_count"]
+            # Two separate review needs.  A Track pair is reviewed through DuplicateCandidate decisions (unchanged);
+            # an exact-byte copy that no Track names is a *file* to review -- it has no Track id and no pair, and
+            # a resolved Track pair never closes it.
+            group["track_pair_review_open"] = group["pair_count"] > 0 and not_dup < group["pair_count"]
+            group["unregistered_file_count"] = sum(1 for f in group.get("files", []) if not f.get("track_id"))
+            group["file_review_open"] = group["unregistered_file_count"] > 0
+            group["open"] = group["track_pair_review_open"] or group["file_review_open"]
             group["pending_deletion_decisions"] = sorted(
                 k for k, d in decisions.items() if d["resolution"] in ("keep_a", "keep_b") and not d["applied"])
             group["pending_deletion_decision_count"] = len(group["pending_deletion_decisions"])
@@ -910,6 +916,10 @@ class Scanner:
                        **{k: self.counts.get(k, 0) for k in ("healthy", "tracks_total", "tracks_local",
                                                              "files_total", "hidden_entries", "unsupported_files")},
                        "duplicate_groups_open": open_duplicates,
+                       "duplicate_groups_track_pair_review_open": sum(
+                           1 for f in self.findings if f["type"] == "duplicate" and f.get("track_pair_review_open")),
+                       "duplicate_groups_file_review_open": sum(
+                           1 for f in self.findings if f["type"] == "duplicate" and f.get("file_review_open")),
                        "relink_reviewable": sum(1 for f in self.findings if f["type"] == "moved"
                                                 and f.get("relink") is not None)},
             "timings_seconds": timings,

@@ -4,6 +4,7 @@ Every file lives in a per-test temporary Library root; LIBRARY_ROOT, WAVEFORMS_D
 there, so no station media, cache or report is read or written."""
 import json
 import os
+import re
 import subprocess
 import tempfile
 from io import StringIO
@@ -634,6 +635,126 @@ class DuplicateDecisionEndpointTests(_Recon):
         self.client.force_login(user)
         self.assertEqual(self.decide(self.a, self.b)[0], 403)
         self.assertFalse(DuplicateCandidate.objects.exists())
+
+
+class UnregisteredDuplicateVisibilityTests(_Recon):
+    """Exact-byte groups with unregistered copies stay visible as a *file* review, separately from Track pairs."""
+
+    DATA = b"one recording, byte for byte" * 300
+
+    def exact(self, report):
+        return [g for g in self.of(report, "duplicate") if g["confidence"] == "exact"]
+
+    def open_ids(self):
+        body = self.client.get(reverse("library:api-reconciliation-findings"),
+                               {"type": "duplicate", "open": "1"}).json()
+        return [f["id"] for f in body["items"]]
+
+    def assert_status(self, group, *, track_pair, file_review, unregistered, open_):
+        self.assertEqual((group["track_pair_review_open"], group["file_review_open"],
+                          group["unregistered_file_count"], group["open"]),
+                         (track_pair, file_review, unregistered, open_))
+
+    def test_one_track_and_one_unregistered_copy_is_an_open_file_review(self):
+        track = self.track("ROCK/song.flac", data=self.DATA)
+        self.file("INBOX/song-copy.flac", self.DATA)
+        report = reconciliation.run_scan()
+        group, = self.exact(report)
+        self.assertEqual((group["members"], group["pair_count"], group["file_count"]), ([track.pk], 0, 2))
+        self.assert_status(group, track_pair=False, file_review=True, unregistered=1, open_=True)
+        self.assertEqual(self.open_ids(), [group["id"]])
+        self.assertEqual(report["counts"]["duplicate_groups_open"], 1)
+        self.assertEqual(report["counts"]["duplicate_groups_file_review_open"], 1)
+        self.assertEqual(report["counts"]["duplicate_groups_track_pair_review_open"], 0)
+
+    def test_one_track_and_several_unregistered_copies(self):
+        self.track("ROCK/song.flac", data=self.DATA)
+        for i in range(3):
+            self.file(f"INBOX/copy-{i}.flac", self.DATA)
+        group, = self.exact(reconciliation.run_scan())
+        self.assertEqual(group["file_count"], 4)
+        self.assert_status(group, track_pair=False, file_review=True, unregistered=3, open_=True)
+        self.assertEqual(self.open_ids(), [group["id"]])
+
+    def test_two_unregistered_copies_with_no_track(self):
+        self.file("INBOX/a.flac", self.DATA)
+        self.file("INBOX/b.flac", self.DATA)
+        group, = self.exact(reconciliation.run_scan())
+        self.assertEqual((group["members"], group["pair_count"]), ([], 0))
+        self.assert_status(group, track_pair=False, file_review=True, unregistered=2, open_=True)
+        self.assertEqual(self.open_ids(), [group["id"]])
+
+    def test_an_unresolved_registered_pair_is_open_as_before(self):
+        self.track("ROCK/a.flac", data=self.DATA)
+        self.track("POP/b.flac", data=self.DATA)
+        group, = self.exact(reconciliation.run_scan())
+        self.assert_status(group, track_pair=True, file_review=False, unregistered=0, open_=True)
+        self.assertEqual(self.open_ids(), [group["id"]])
+
+    def test_a_reviewed_registered_pair_without_unregistered_copies_stays_closed(self):
+        a = self.track("ROCK/a.flac", data=self.DATA)
+        b = self.track("POP/b.flac", data=self.DATA)
+        DuplicateCandidate.objects.create(track_a=a, track_b=b, confidence="exact", resolution="keep_both")
+        group, = self.exact(reconciliation.run_scan())
+        self.assert_status(group, track_pair=False, file_review=False, unregistered=0, open_=False)
+        self.assertEqual(self.open_ids(), [])
+        everything = self.client.get(reverse("library:api-reconciliation-findings"), {"type": "duplicate"}).json()
+        self.assertEqual([f["id"] for f in everything["items"]], [group["id"]])
+
+    def test_an_unregistered_copy_keeps_a_reviewed_pair_visible_without_reopening_the_pair(self):
+        a = self.track("ROCK/a.flac", data=self.DATA)
+        b = self.track("POP/b.flac", data=self.DATA)
+        DuplicateCandidate.objects.create(track_a=a, track_b=b, confidence="exact", resolution="keep_both")
+        self.file("INBOX/third.flac", self.DATA)
+        group, = self.exact(reconciliation.run_scan())
+        self.assert_status(group, track_pair=False, file_review=True, unregistered=1, open_=True)
+        self.assertEqual(group["decisions"], {f"{a.pk}-{b.pk}": {"resolution": "keep_both", "applied": False}})
+        self.assertEqual(self.open_ids(), [group["id"]])
+        self.assertEqual(DuplicateCandidate.objects.get(track_a=a, track_b=b).resolution, "keep_both")
+
+    def test_a_large_exact_group_has_exact_totals_and_a_bounded_response(self):
+        track = self.track("ROCK/song.flac", data=self.DATA)
+        copies = 120
+        for i in range(copies):
+            self.file(f"INBOX/copy-{i:03d}.flac", self.DATA)
+        report = reconciliation.run_scan()
+        group, = self.exact(report)
+        self.assertEqual((group["file_count"], group["unregistered_file_count"], group["members"], group["pair_count"]),
+                         (copies + 1, copies, [track.pk], 0))
+        self.assertEqual(report["budgets"]["hashed_bytes"], (copies + 1) * len(self.DATA))   # each file read once
+        item, = self.client.get(reverse("library:api-reconciliation-findings"),
+                                {"type": "duplicate", "open": "1"}).json()["items"]
+        self.assertTrue(item["files_truncated"])
+        self.assertEqual(item["file_count"], copies + 1)
+        self.assertLessEqual(len(item["files"]), reconciliation.DUPLICATE_DETAIL_MEMBER_LIMIT)
+        self.assertEqual(item["unregistered_file_count"], copies)
+
+    def test_no_track_pair_decision_can_be_fabricated_for_file_only_groups(self):
+        track = self.track("ROCK/song.flac", data=self.DATA)
+        self.file("INBOX/copy.flac", self.DATA)
+        self.file("INBOX/x.flac", b"x" * 7)
+        self.file("INBOX/y.flac", b"x" * 7)                    # a second group with no Track at all
+        outsider = self.track("ROCK/outsider.flac")
+        report = reconciliation.run_scan()
+        url = reverse("library:api-reconciliation-not-duplicate")
+        for group in self.exact(report):
+            for a, b in ((track.pk, outsider.pk), (outsider.pk, track.pk), (track.pk, track.pk)):
+                response = self.client.post(url, {"scan_id": report["scan_id"], "finding_id": group["id"],
+                                                  "track_a": a, "track_b": b}, content_type="application/json")
+                self.assertEqual(response.status_code, 400, (group["members"], a, b))
+        self.assertFalse(DuplicateCandidate.objects.exists())
+
+    def test_the_page_states_the_file_review_and_offers_no_file_action(self):
+        html = self.client.get(reverse("library:library-reconciliation")).content.decode()
+        self.assertIn("unregistered — requires review", html)
+        self.assertIn("does not mean they should be ", html)
+        self.assertIn("File review only", html)
+        # The page calls exactly the existing reconciliation endpoints: no import, delete, cleanup or merge action.
+        endpoints = set(re.findall(r"'(/api/[^'?]+)", html))
+        self.assertEqual(endpoints, {
+            "/api/tracks/reconciliation/", "/api/tracks/reconciliation/findings/",
+            "/api/tracks/reconciliation/relink/preview/", "/api/tracks/reconciliation/relink/apply/",
+            "/api/tracks/reconciliation/duplicates/not-duplicate/"})
 
 
 class _RelinkSetup:

@@ -279,16 +279,32 @@ function closeButton(label) {
 }
 
 function renderDuplicate(card, finding) {
+  // Two separate review needs: registered Track pairs (recorded decisions) and unregistered files (a file review,
+  // never a Track pair, and nothing this page acts on).
+  const unregistered = finding.unregistered_file_count || 0;
+  const status = [];
+  if (finding.pair_count) {
+    status.push(finding.track_pair_review_open
+      ? `Track-pair review pending (${finding.keep_both_decision_count || 0} of ${finding.pair_count} pairs reviewed as not duplicates)`
+      : 'Track pairs reviewed: not duplicates');
+  }
+  if (unregistered) status.push(`${unregistered.toLocaleString()} unregistered file(s) require review`);
+  if (status.length) card.append(el('p', status.join(' · '), finding.open ? 'rc-warn' : 'rc-muted'));
   if (finding.members_truncated) card.append(el('p',
     `Showing ${finding.members_returned.toLocaleString()} of ${finding.member_count.toLocaleString()} member Tracks; ` +
     'the group remains open and the complete count is retained in the scan.', 'rc-warn'));
   if (finding.files) {
     card.append(trackTable(finding.files, [
-      ['File', f => f.rel], ['Size', f => fmtSize(f.size)], ['Track', f => f.track_id ? trackLink({ id: f.track_id }) : 'unregistered'],
+      ['File', f => f.rel], ['Size', f => fmtSize(f.size)],
+      ['Track', f => f.track_id ? trackLink({ id: f.track_id }) : 'unregistered — requires review'],
       ['SHA-256', f => (f.sha256 || '').slice(0, 16) + '…'],
     ]));
     if (finding.files_truncated) card.append(el('p',
       `Showing ${finding.files_returned.toLocaleString()} of ${finding.file_count.toLocaleString()} files.`, 'rc-warn'));
+    if (unregistered) card.append(el('p',
+      'Unregistered files have the same bytes as the files listed with them. That does not mean they should be ' +
+      'deleted: one may be a delivery awaiting import, a retained or backup copy, or another subsystem\'s audio. ' +
+      'This page never deletes, imports or merges files; review them by hand.', 'rc-muted'));
   }
   if (finding.tracks && finding.tracks.length) {
     card.append(trackTable(finding.tracks, [
@@ -314,7 +330,12 @@ function renderDuplicate(card, finding) {
     card.append(el('p', `${finding.pending_deletion_decision_count.toLocaleString()} pending keep/delete decisions ` +
       'exist in this group; the response lists only a bounded sample. This page never applies them.', 'rc-warn'));
   }
-  if ((finding.members || []).length >= 2) card.append(notDuplicateControl(finding));
+  if ((finding.member_count || 0) >= 2 && (finding.members || []).length >= 2) {
+    card.append(notDuplicateControl(finding));
+  } else if (unregistered) {
+    card.append(el('p', 'File review only: fewer than two registered Tracks, so there is no Track-pair decision to record.',
+                   'rc-muted'));
+  }
 }
 
 function notDuplicateControl(finding) {

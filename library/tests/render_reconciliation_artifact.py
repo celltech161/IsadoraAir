@@ -23,9 +23,17 @@ class RenderArtifact(_RelinkSetup, _Recon):
         self.track("POP/twin-b.flac", title="Twin", duration=200.5)
         self.track("ROCK/hostile.flac", create_file=False, title=self.HOSTILE)
         self.file(f"INBOX/{self.HOSTILE.replace('/', '_')}.flac")
+        # Exact-byte file reviews: a registered Track with an identical, hostile-named unregistered copy, and two
+        # identical unregistered files with no Track at all.
+        exact = b"exact duplicate bytes" * 300
+        self.track("ROCK/exact-registered.flac", data=exact, title="Exact Registered")
+        self.file('INBOX/copy "quoted" <b onmouseover=window.__pwned=3>.flac', exact)
+        orphan = b"another identical pair" * 300
+        self.file("INBOX/orphan-a.flac", orphan)
+        self.file("INBOX/orphan-b.flac", orphan)
         report = reconciliation.run_scan()
         moved = next(f for f in report["findings"] if f["type"] == "moved")
-        duplicate = next(f for f in report["findings"] if f["type"] == "duplicate")
+        duplicate = next(f for f in report["findings"] if f["type"] == "duplicate" and len(f["members"]) >= 2)
         page = self.client.get("/library/reconciliation/").content.decode()
         get = lambda url, **q: self.client.get(url, q).content.decode()
         blobs = {
