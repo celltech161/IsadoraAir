@@ -32,7 +32,7 @@ from django.apps import apps
 from django.conf import settings
 from django.utils import timezone
 
-from library.services import audio_identity, waveform_cache
+from library.services import audio_identity, cue_markers, waveform_cache
 
 SCHEMA = "isadoraair.library_reconciliation"
 SCHEMA_VERSION = 1
@@ -45,6 +45,9 @@ _SPOKEN_NAME = re.compile(r"spoken-[0-9a-f]{32}\.flac")
 FRESH_SECONDS = 60
 MAX_CANDIDATES = 5
 DUPLICATE_GROUP_LIMIT = 25
+DUPLICATE_DETAIL_MEMBER_LIMIT = 50
+DUPLICATE_DETAIL_RESPONSE_LIMIT = 100
+DUPLICATE_DETAIL_DECISION_LIMIT = 50
 DURATION_TOLERANCE_SECONDS = 2.0
 #: At least this share (and SUSPECT_MIN) of local Tracks missing marks the storage itself suspect.
 SUSPECT_FRACTION, SUSPECT_MIN = 0.5, 20
@@ -64,6 +67,10 @@ class ScanError(Exception):
 
 class ScanBusy(ScanError):
     """Another scan holds the scan lock."""
+
+
+class HashUncertain(Exception):
+    """A file could not be bound to one stable identity for exact-byte comparison."""
 
 
 def report_dir() -> Path:
@@ -190,6 +197,8 @@ class FileEntry:
     ctime_ns: int
     nlink: int
     registered: bool = False
+    duplicate_eligible: bool = False
+    duplicate_exclusion: str = ""
 
     @property
     def suffix(self) -> str:
@@ -275,7 +284,7 @@ def _protection_predicates():
     return path_owner, track_owner
 
 
-def track_audio_evidence(track_id, filepath) -> dict:
+def track_audio_evidence(track_id, filepath, *, track=None) -> dict:
     """What a Track's own records say about its last identified audio (read only).
 
     ``identity`` is the decoded-audio revision its version-2 waveform cache recorded for exactly
@@ -284,7 +293,25 @@ def track_audio_evidence(track_id, filepath) -> dict:
     from library.models import Track
 
     evidence = {"identity": None, "source_size": None, "problems": []}
-    cache = waveform_cache.canonical_path(Path(settings.WAVEFORMS_DIR), track_id)
+    if track is None:
+        track = Track.objects.filter(pk=track_id).only(
+            "filepath", "waveform_path", "duration_seconds", "cue_marker_revision", "cue_marker_state",
+            *cue_markers.MARKERS,
+        ).first()
+    if track is None:
+        evidence["problems"].append("the Track no longer exists")
+        return evidence
+
+    def value(name):
+        return track.get(name) if isinstance(track, dict) else getattr(track, name)
+
+    if value("filepath") != filepath:
+        evidence["problems"].append("the Track's file path changed after this evidence was collected")
+        return evidence
+    cache = value("waveform_path")
+    if not cache:
+        evidence["problems"].append("the Track records no authoritative waveform cache")
+        return evidence
     payload, failure = waveform_cache.read(cache)
     if failure is None:
         failure = waveform_cache.check_payload(payload, track_id)
@@ -292,6 +319,15 @@ def track_audio_evidence(track_id, filepath) -> dict:
         evidence["problems"].append("no version-2 waveform cache records this Track's audio identity"
                                     + (f" ({failure.reason})" if failure is not None else ""))
         return evidence
+    if waveform_cache._duration_mismatch(value("duration_seconds"), payload.get("analysis_duration")):
+        evidence["problems"].append("the waveform cache duration contradicts the Track")
+    if not payload.get("samples_left"):
+        evidence["problems"].append("the waveform cache has no complete stereo waveform")
+    revision_number, markers = payload.get("marker_revision"), payload.get("markers") or {}
+    if revision_number > value("cue_marker_revision") or (
+            revision_number == value("cue_marker_revision")
+            and any(not cue_markers._same(markers.get(name), value(name)) for name in cue_markers.MARKERS)):
+        evidence["problems"].append("the waveform cache marker snapshot contradicts the Track")
     source = payload.get("source") or {}
     if isinstance(source.get("size"), int):
         evidence["source_size"] = source["size"]
@@ -300,7 +336,9 @@ def track_audio_evidence(track_id, filepath) -> dict:
     revision = audio_identity.revision(payload.get("audio_identity"))
     if revision is None:
         evidence["problems"].append("the waveform cache has no usable decoded-audio identity")
-    state = Track.objects.filter(pk=track_id).values_list("cue_marker_state", flat=True).first() or {}
+    elif payload["audio_identity"].get("algorithm") != audio_identity.ALGORITHM:
+        evidence["problems"].append("the waveform cache uses an unsupported decoded-audio identity")
+    state = value("cue_marker_state") or {}
     others = sorted({entry.get("audio_revision") for entry in state.values()
                      if isinstance(entry, dict) and entry.get("audio_revision")} - {revision})
     if revision is not None and others:
@@ -328,6 +366,8 @@ class Scanner:
         self.samples = defaultdict(list)
         self.decodes = 0
         self.hashed_bytes = 0
+        self.duplicate_decision_rows = 0
+        self.duplicate_decision_group_links = 0
 
     # -- utilities
     def add(self, kind, reason, **fields):
@@ -338,6 +378,32 @@ class Scanner:
 
     def fresh(self, entry: FileEntry) -> bool:
         return self.now_ns() - max(entry.mtime_ns, entry.ctime_ns) < FRESH_SECONDS * 1_000_000_000
+
+    @staticmethod
+    def exclude_from_duplicates(entry: FileEntry | None, reason: str) -> None:
+        if entry is not None:
+            entry.duplicate_eligible = False
+            entry.duplicate_exclusion = reason
+
+    @staticmethod
+    def include_in_duplicates(entry: FileEntry) -> None:
+        entry.duplicate_eligible = True
+        entry.duplicate_exclusion = ""
+
+    def hash_became_uncertain(self, entry: FileEntry, reason: str) -> None:
+        """Replace any earlier ordinary classification after a hash-time identity/I/O failure."""
+        self.exclude_from_duplicates(entry, reason)
+        for finding in self.findings:
+            if finding["type"] == "unregistered" and (finding.get("file") or {}).get("path") == entry.path:
+                finding["type"] = "uncertain"
+                finding["reason"] = reason
+                finding.pop("relink_candidate", None)
+                self.counts["unregistered"] -= 1
+                self.counts["uncertain"] += 1
+                return
+        if entry.registered and self.counts["healthy"]:
+            self.counts["healthy"] -= 1
+        self.add("uncertain", reason, file=entry.describe())
 
     # -- 1. the root
     def check_root(self):
@@ -414,7 +480,7 @@ class Scanner:
         self.path_owner = path_owner
         fields = ("id", "filepath", "filename", "title", "artist__name", "artist_id", "album__title", "category__code",
                   "duration_seconds", "format", "file_hash", "waveform_path", "ready2air", "isrc", "remote_url",
-                  "cue_marker_revision")
+                  "cue_marker_revision", "cue_marker_state", *cue_markers.MARKERS)
         by_inode = defaultdict(list)
         self.missing, self.metadata = [], []
         local = done = 0
@@ -426,7 +492,11 @@ class Scanner:
             summary = self.track_summary(row)
             owner = track_owner(row["id"])
             path = row["filepath"] or ""
+            entry = self.files.get(path)
             if owner or row["remote_url"]:
+                if entry is not None:
+                    entry.registered = True
+                    self.exclude_from_duplicates(entry, owner or "remote-hosted Track")
                 self.add("protected", owner or "remote-hosted Track (remote_url)", track=summary)
                 continue
             if not path:
@@ -442,26 +512,35 @@ class Scanner:
                 resolved = None
             owner = path_owner(path, self.rel(absolute), resolved)
             if owner:
+                if entry is not None:
+                    entry.registered = True
+                    self.exclude_from_duplicates(entry, owner)
                 self.add("protected", owner, track=summary)
                 continue
             local += 1
-            self.metadata.append((row["id"], row["artist_id"], normalized_title(row["title"]), row["duration_seconds"],
-                                  (row["isrc"] or "").strip().upper()))
             alias = resolved != absolute or absolute != path
-            entry = self.files.get(path)
             if entry is not None:
                 entry.registered = True
                 by_inode[(entry.dev, entry.ino)].append(row["id"])
                 if alias:
                     self.add("shared_source", "the Track's path is an alias (not its canonical path)", track=summary)
+                    self.exclude_from_duplicates(entry, "unsafe path alias")
                 if entry.size == 0:
                     self.add("uncertain", "the Track's file is empty (0 bytes)", track=summary, file=entry.describe())
+                    self.exclude_from_duplicates(entry, "empty file")
                 elif not os.access(path, os.R_OK):
                     self.add("uncertain", "the Track's file cannot be read", track=summary, file=entry.describe())
+                    self.exclude_from_duplicates(entry, "unreadable file")
                 elif self.fresh(entry):
                     self.add("in_delivery", "the Track's file changed within the last minute (delivery or replacement "
                              "in progress?)", track=summary, file=entry.describe())
+                    self.exclude_from_duplicates(entry, "in delivery")
+                elif alias:
+                    self.exclude_from_duplicates(entry, "unsafe path alias")
                 else:
+                    self.include_in_duplicates(entry)
+                    self.metadata.append((row["id"], row["artist_id"], normalized_title(row["title"]),
+                                          row["duration_seconds"], (row["isrc"] or "").strip().upper()))
                     self.counts["healthy"] += 1
                 self.check_drift(row, summary, entry)
                 continue
@@ -482,6 +561,9 @@ class Scanner:
         self.counts["tracks_local"] = local
         for inode, track_ids in by_inode.items():
             if len(track_ids) > 1:
+                for entry in self.files.values():
+                    if (entry.dev, entry.ino) == inode:
+                        self.exclude_from_duplicates(entry, "several Tracks share this inode")
                 self.add("shared_source", "several Tracks name the same file (hardlinks)", track_ids=sorted(track_ids))
 
     def track_summary(self, row) -> dict:
@@ -507,14 +589,22 @@ class Scanner:
                 continue
             owner = self.path_owner(entry.path, entry.rel)
             if owner:
+                self.exclude_from_duplicates(entry, owner)
                 self.add("protected", owner, file=entry.describe())
             elif (entry.dev, entry.ino) in registered_inodes:
+                self.exclude_from_duplicates(entry, "hardlink alias of a registered Track")
                 self.add("shared_source", "a hardlink of a registered Track's file", file=entry.describe())
             elif entry.size == 0:
+                self.exclude_from_duplicates(entry, "empty file")
                 self.add("uncertain", "empty file (0 bytes)", file=entry.describe())
+            elif not os.access(entry.path, os.R_OK):
+                self.exclude_from_duplicates(entry, "unreadable file")
+                self.add("uncertain", "the file cannot be read", file=entry.describe())
             elif self.fresh(entry):
+                self.exclude_from_duplicates(entry, "in delivery")
                 self.add("in_delivery", "changed within the last minute: may still be arriving", file=entry.describe())
             else:
+                self.include_in_duplicates(entry)
                 self.unregistered_entries.append(entry)
 
     def storage_suspect(self) -> bool:
@@ -565,7 +655,7 @@ class Scanner:
                      relink_candidate=entry.path in claimed)
 
     def track_evidence(self, row) -> dict:
-        return track_audio_evidence(row["id"], row["filepath"])
+        return track_audio_evidence(row["id"], row["filepath"], track=row)
 
     def candidate(self, entry: FileEntry, row, evidence, *, decode=True) -> dict:
         reasons = []
@@ -608,7 +698,11 @@ class Scanner:
         groups = []
         # Exact bytes: only files whose size collides, hardlinks counted once.
         by_size = defaultdict(dict)
+        excluded_inodes = {(entry.dev, entry.ino) for entry in self.files.values()
+                           if not entry.duplicate_eligible}
         for entry in self.files.values():
+            if not entry.duplicate_eligible or (entry.dev, entry.ino) in excluded_inodes:
+                continue
             if entry.size > 0:
                 by_size[entry.size].setdefault((entry.dev, entry.ino), entry)
         path_track = {}
@@ -616,6 +710,7 @@ class Scanner:
             if values[1] in self.files:
                 path_track[values[1]] = values[0]
         unhashed = 0
+        failed_paths = set()
         for size, inodes in sorted(by_size.items()):
             if len(inodes) < 2:
                 continue
@@ -625,18 +720,26 @@ class Scanner:
                     unhashed += 1
                     continue
                 try:
-                    digests[self._hash(entry.path)].append(entry)
+                    digests[self._hash(entry)].append(entry)
+                except HashUncertain as exc:
+                    failed_paths.add(entry.path)
+                    self.hash_became_uncertain(entry, f"not exact-hashed: {exc}")
                 except OSError as exc:
-                    self.add("uncertain", f"cannot be read for duplicate comparison ({_errno_name(exc)})",
-                             file=entry.describe())
+                    failed_paths.add(entry.path)
+                    self.hash_became_uncertain(
+                        entry, f"cannot be read for duplicate comparison ({_errno_name(exc)})")
             for digest, entries in digests.items():
                 if len(entries) > 1:
                     groups.append({"confidence": "exact", "reason": "identical file bytes (hashed in this scan)",
+                                   "file_count": len(entries),
                                    "files": [dict(e.describe(), track_id=path_track.get(e.path), sha256=digest)
                                              for e in sorted(entries, key=lambda e: e.rel)]})
         if unhashed:
             self.errors.append(f"{unhashed} equal-size file(s) were not hashed: byte budget reached "
                                "(rerun with a larger --max-hash-gb)")
+        if failed_paths:
+            failed_track_ids = {path_track[path] for path in failed_paths if path in path_track}
+            self.metadata = [row for row in self.metadata if row[0] not in failed_track_ids]
         # Metadata: same artist and normalized title, durations within the tolerance; and shared ISRCs.
         by_key, by_isrc = defaultdict(list), defaultdict(list)
         for track_id, artist_id, title, duration, isrc in self.metadata:
@@ -673,13 +776,44 @@ class Scanner:
         for group in groups:
             self.add("duplicate", group["reason"], **{k: v for k, v in group.items() if k != "reason"})
 
-    def _hash(self, path) -> str:
+    @staticmethod
+    def _stat_matches(entry: FileEntry, info) -> bool:
+        return stat.S_ISREG(info.st_mode) and (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink
+        ) == (entry.dev, entry.ino, entry.size, entry.mtime_ns, entry.ctime_ns, entry.nlink)
+
+    def _hash(self, entry: FileEntry) -> str:
+        """Hash exactly the walked file, reading no more than its witnessed size and the global budget."""
         digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            while chunk := handle.read(HASH_CHUNK):
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(entry.path, flags)
+        try:
+            before = os.fstat(fd)
+            if not self._stat_matches(entry, before):
+                raise HashUncertain("the file changed after the filesystem walk")
+            remaining = entry.size
+            while remaining:
+                allowed = self.max_hash_bytes - self.hashed_bytes
+                if allowed <= 0:
+                    raise HashUncertain("the scan byte budget was reached while reading")
+                chunk = os.read(fd, min(HASH_CHUNK, remaining, allowed))
+                if not chunk:
+                    raise HashUncertain("the file became shorter while it was being hashed")
                 digest.update(chunk)
                 self.hashed_bytes += len(chunk)
-        return digest.hexdigest()
+                remaining -= len(chunk)
+            after = os.fstat(fd)
+            try:
+                path_after = os.stat(entry.path, follow_symlinks=False)
+            except OSError:
+                raise HashUncertain("the file path changed while it was being hashed") from None
+            if not self._stat_matches(entry, after) or not self._stat_matches(entry, path_after):
+                raise HashUncertain("the file changed while it was being hashed")
+            return digest.hexdigest()
+        finally:
+            os.close(fd)
 
     def upgrade_with_decoded_identity(self, groups):
         """Within a likely group, trusted caches with one identity prove the same audio; different ones disprove it."""
@@ -703,25 +837,39 @@ class Scanner:
                              reason=group["reason"] + "; but the decoded audio differs (trusted waveform caches)")
 
     def attach_decisions(self, groups, DuplicateCandidate):
-        pairs = {}
+        memberships = defaultdict(set)
         ids = set()
-        for group in groups:
+        for index, group in enumerate(groups):
             members = group.get("track_ids") or [f["track_id"] for f in group.get("files", []) if f.get("track_id")]
             group["members"] = sorted(members)
+            group["member_count"] = len(group["members"])
+            group["pair_count"] = len(group["members"]) * (len(group["members"]) - 1) // 2
+            group["decisions"] = {}
+            group["pending_deletion_decisions"] = []
+            for track_id in group["members"]:
+                memberships[track_id].add(index)
             ids.update(members)
-        for a, b, resolution, applied in DuplicateCandidate.objects.filter(
-                track_a_id__in=ids, track_b_id__in=ids).values_list("track_a_id", "track_b_id", "resolution", "applied"):
-            pairs[(a, b)] = {"resolution": resolution, "applied": applied}
+        if ids:
+            rows = DuplicateCandidate.objects.filter(track_a_id__in=ids, track_b_id__in=ids).values_list(
+                "track_a_id", "track_b_id", "resolution", "applied")
+            iterator = rows.iterator(chunk_size=TRACK_CHUNK) if hasattr(rows, "iterator") else iter(rows)
+            for a, b, resolution, applied in iterator:
+                self.duplicate_decision_rows += 1
+                for index in memberships.get(a, set()) & memberships.get(b, set()):
+                    self.duplicate_decision_group_links += 1
+                    low, high = sorted((a, b))
+                    groups[index]["decisions"][f"{low}-{high}"] = {
+                        "resolution": resolution, "applied": applied,
+                    }
         for group in groups:
-            members = group["members"]
-            decisions = {f"{a}-{b}": pairs[(a, b)] for i, a in enumerate(members) for b in members[i + 1:]
-                         if (a, b) in pairs}
-            group["decisions"] = decisions
-            total_pairs = len(members) * (len(members) - 1) // 2
+            decisions = group["decisions"]
+            group["decision_count"] = len(decisions)
             not_dup = sum(1 for d in decisions.values() if d["resolution"] == "keep_both")
-            group["open"] = total_pairs > 0 and not_dup < total_pairs
+            group["keep_both_decision_count"] = not_dup
+            group["open"] = group["pair_count"] > 0 and not_dup < group["pair_count"]
             group["pending_deletion_decisions"] = sorted(
                 k for k, d in decisions.items() if d["resolution"] in ("keep_a", "keep_b") and not d["applied"])
+            group["pending_deletion_decision_count"] = len(group["pending_deletion_decisions"])
 
     # -- run
     def run(self) -> dict:
@@ -766,7 +914,9 @@ class Scanner:
                                                 and f.get("relink") is not None)},
             "timings_seconds": timings,
             "budgets": {"decodes": self.decodes, "max_decodes": self.max_decodes,
-                        "hashed_bytes": self.hashed_bytes, "max_hash_bytes": self.max_hash_bytes},
+                        "hashed_bytes": self.hashed_bytes, "max_hash_bytes": self.max_hash_bytes,
+                        "duplicate_decision_rows": self.duplicate_decision_rows,
+                        "duplicate_decision_group_links": self.duplicate_decision_group_links},
             "unsupported_extensions": dict(sorted(self.unsupported.items())),
             "hidden_samples": self.samples["hidden"],
             "errors": self.errors,

@@ -86,8 +86,11 @@ scan runs at a time (`flock`).
 * Tracks are read in 2,000-row chunks (`values_list().iterator()`).
 * Files are kept as compact stat tuples.
 * Healthy Tracks are counts only.
-* Byte hashing only touches files whose size collides with another file's, streamed in 1 MiB chunks, under a
-  byte budget (`--max-hash-gb`).
+* Byte hashing only touches stable ordinary files whose size collides with another eligible file's. Protected,
+  aliased, unreadable, empty and in-delivery files are excluded before content reads. Each file is opened with
+  `O_NOFOLLOW`, bound to the walk's device/inode/size/time witness, read only to that witnessed size in 1 MiB
+  chunks under the byte budget (`--max-hash-gb`), and revalidated through both the descriptor and path afterward.
+  A race becomes `uncertain`, never exact evidence.
 * Decodes only touch relink candidates of Tracks that have a cached identity, under a count budget
   (`--max-decodes`).
 * Progress goes to `running.json` and the console.
@@ -99,7 +102,7 @@ scan runs at a time (`flock`).
 | `exact` | Identical SHA-256 of the file bytes, computed in this scan (not `Track.file_hash`) for files of equal size. Hardlinks are `shared_source`, not duplicates. |
 | `audio_equivalent` | Same normalized title and artist and duration within 2 s, **and** both Tracks' trusted v2 caches carry the same decoded-audio identity. |
 | `likely` | Same normalized title and artist and duration within 2 s, without decoded proof; or the same ISRC with durations within 2 s. |
-| `uncertain` | ISRC equal but durations differ (an ISRC collision), same metadata but different decoded audio, or a group larger than 25 Tracks. A large group is reported once, without pairs, so pair counts cannot grow quadratically. |
+| `uncertain` | ISRC equal but durations differ (an ISRC collision), same metadata but different decoded audio, or a group larger than 25 Tracks. A large group is reported once. Its pair count is arithmetic; only actual `DuplicateCandidate` rows are read, so nonexistent pairs are never generated. |
 
 Title, artist, ISRC, filename and duration are never treated as proof of identical audio.
 `Track.file_hash` is shown as "historical byte hash (may be stale)".
@@ -109,6 +112,9 @@ Title, artist, ISRC, filename and duration are never treated as proof of identic
   later scan never reopens it.
 * Pending `keep_a`/`keep_b` decisions are shown with a warning that `apply_duplicate_resolutions` would
   delete a Track.
+* Group size, possible-pair count, recorded-decision count and pending-deletion-decision count remain exact.
+  The findings API returns at most 50 members/files/decisions per group and 100 expanded members per response,
+  with explicit truncation flags and totals; a large group cannot create an unbounded detail query or response.
 
 The page can record "not a duplicate" for a pair (`keep_both`, through `get_or_create`). It never changes a
 decision already made.
@@ -126,8 +132,10 @@ It moves, copies and deletes nothing.
 ### Eligible only when all of these hold
 1. The Track's registered file is absent (`lstat` → `ENOENT`, not a permission error), and the scan was not
    suspect.
-2. The Track's v2 waveform cache was made from **that** path (`source.path == Track.filepath`) and carries a
-   well-formed decoded-audio identity of the current algorithm.
+2. The cache named by the Track's authoritative `waveform_path` is a complete, structurally valid v2 cache,
+   was made from **that** path (`source.path == Track.filepath`) and carries a well-formed decoded-audio identity
+   of the current algorithm. A blank or invalid reference never falls back to a leftover canonical filename;
+   an explicitly recorded alternate cache path is read as the authority.
 3. Every audio revision recorded on the Track's cue-point approvals equals that identity, so no evidence
    points at other audio.
 4. The candidate is a regular, non-empty file directly under the managed root. It is not a symlink and has
@@ -176,9 +184,10 @@ running. Review the findings at **Library → Reconciliation** (`/library/reconc
   * a chip per finding type;
   * a type filter, a search (a number is a Track id; text matches title, artist or file name) and 25 findings
     per page.
-* **Duplicate groups** list each member's directory, size, format, categories, ISRC, historical hash and the
-  references a deletion would meet (playlists, rotation inserts, upcoming log items, voice tracks, plays). One
-  pair at a time can be recorded as "not a duplicate".
+* **Duplicate groups** list a bounded member sample with the exact total group size, directory, size, format,
+  categories, ISRC, historical hash and the references a deletion would meet (playlists, rotation inserts,
+  upcoming log items, voice tracks, plays). Truncated groups and decision samples are labelled explicitly. One
+  displayed pair at a time can be recorded as "not a duplicate"; small groups remain fully reviewable.
 * **A relinkable finding** shows "Review relink…": the exact change, what is kept, and the warnings; then
   "Confirm relink"; then the result.
 
@@ -194,11 +203,15 @@ running. Review the findings at **Library → Reconciliation** (`/library/reconc
 
 | Measure | Result |
 |---|---|
-| Scan time | 13.2 s: walk 2.3, Tracks 7.5, missing/relink evidence 0.4, duplicates 2.0 |
-| Database | 6 statements, 0.11 s |
-| Memory | 35 MB peak traced Python memory, +36 MB RSS |
-| Report | 2.9 MB |
-| Findings page / search from the API | 30–55 ms |
+| Scan time | 9.05 s: walk 1.47, Tracks 5.38, missing/relink evidence 0.09, duplicates 1.62 |
+| Database | 5 statements, 0.06 s |
+| Memory | 33.8 MB peak traced Python memory, +50.6 MB process maximum RSS |
+| Report | 2.75 MB |
+| Findings page / search from the API | 12–19 ms |
+
+An adversarial 4,000-Track metadata group (7,998,000 possible pairs) scanned in 1.49 s with five database
+statements and 7.5 MB peak traced memory. It examined zero decision rows because none existed; the HTTP response
+was 31,783 bytes and expanded 50 members while reporting the exact 4,000-member and 7,998,000-pair totals.
 
 **Production estimates:**
 * The Tracks phase is mostly one `realpath`, `lstat` and `access` per Track. Station paths are shallower than

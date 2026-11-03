@@ -14,6 +14,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import models
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
@@ -169,7 +170,7 @@ class ClassificationTests(_Recon):
         self.assertIsNone(moved[0]["relink"])
         self.assertEqual(moved[0]["track"]["id"], gone.pk)
         self.assertEqual([c["rel"] for c in moved[0]["candidates"]], ["POP/moved.flac"])
-        self.assertIn("no version-2 waveform cache", " ".join(moved[0]["candidates"][0]["reasons"]))
+        self.assertIn("no authoritative waveform cache", " ".join(moved[0]["candidates"][0]["reasons"]))
         self.assertTrue(self.of(report, "unregistered")[0]["relink_candidate"] is False)
 
     def test_too_many_candidates_are_not_compared(self):
@@ -400,6 +401,188 @@ class DuplicateReviewTests(_Recon):
         self.assertTrue(pending["open"])
         self.assertEqual(pending["pending_deletion_decisions"], [f"{c.pk}-{d.pk}"])
         self.assertEqual(DuplicateCandidate.objects.get(track_a=a, track_b=b).resolution, "keep_both")
+
+
+class DuplicateBoundingTests(_Recon):
+    class DecisionRows:
+        def __init__(self, rows):
+            self.rows = rows
+            self.filters = []
+
+        def filter(self, **kwargs):
+            self.filters.append(kwargs)
+            return self
+
+        def values_list(self, *fields):
+            self.fields = fields
+            return self
+
+        def iterator(self, **kwargs):
+            yield from self.rows
+
+        def __iter__(self):
+            yield from self.rows
+
+    def test_groups_of_30_1000_and_several_thousand_consult_only_recorded_decisions(self):
+        groups = [
+            {"confidence": "uncertain", "track_ids": list(range(1, 31))},
+            {"confidence": "uncertain", "track_ids": list(range(10_000, 11_000))},
+            {"confidence": "uncertain", "track_ids": list(range(20_000, 25_000))},
+            {"confidence": "exact", "files": [
+                {"track_id": track_id} for track_id in range(30_000, 31_000)
+            ]},
+        ]
+        rows = self.DecisionRows([
+            (1, 2, "keep_both", False),
+            (20_000, 20_001, "keep_both", False),
+            (20_001, 20_002, "keep_a", False),
+            (20_002, 20_003, "keep_b", True),
+            (1, 10_000, "unresolved", False),             # both ids exist, but not in one group
+        ])
+        candidate = type("Candidate", (), {"objects": rows})
+        scanner = reconciliation.Scanner()
+        scanner.attach_decisions(groups, candidate)
+
+        self.assertEqual([g["member_count"] for g in groups], [30, 1000, 5000, 1000])
+        self.assertEqual(groups[2]["pair_count"], 12_497_500)
+        self.assertTrue(all(g["open"] for g in groups))
+        self.assertEqual(groups[2]["decision_count"], 3)
+        self.assertEqual(groups[2]["keep_both_decision_count"], 1)
+        self.assertEqual(groups[2]["pending_deletion_decisions"], ["20001-20002"])
+        self.assertEqual(groups[2]["pending_deletion_decision_count"], 1)
+        self.assertEqual(scanner.duplicate_decision_rows, 5)
+        self.assertEqual(scanner.duplicate_decision_group_links, 4)
+        self.assertEqual(len(rows.filters), 1)
+
+    def test_large_duplicate_http_detail_is_explicitly_bounded_with_exact_totals(self):
+        members = list(range(1, 5001))
+        decisions = {f"{i}-{i + 1}": {"resolution": "keep_a", "applied": False}
+                     for i in range(1, 1001)}
+        files = [{"rel": f"ROCK/{i:05d}-{'x' * 80}.flac", "size": 1234, "track_id": i,
+                  "sha256": "a" * 64} for i in members]
+        report = {
+            "schema": reconciliation.SCHEMA, "schema_version": reconciliation.SCHEMA_VERSION,
+            "scan_id": "20261102T120000-deadbeef", "status": "complete", "finished_at": "now",
+            "counts": {"duplicate": 1}, "findings": [{
+                "id": "F000001", "type": "duplicate", "reason": "large exact group", "confidence": "exact",
+                "members": members, "member_count": len(members), "pair_count": len(members) * 4999 // 2,
+                "files": files, "file_count": len(files), "decisions": decisions,
+                "decision_count": len(decisions), "pending_deletion_decisions": list(decisions),
+                "pending_deletion_decision_count": len(decisions), "open": True,
+            }],
+        }
+        reconciliation.write_report(report)
+        with mock.patch("library.views._track_review_details", wraps=__import__(
+                "library.views", fromlist=["_track_review_details"])._track_review_details) as details:
+            response = self.client.get(reverse("library:api-reconciliation-findings"),
+                                       {"type": "duplicate", "per_page": 1})
+        self.assertEqual(response.status_code, 200)
+        finding = response.json()["items"][0]
+        self.assertEqual((finding["member_count"], finding["members_returned"]), (5000, 50))
+        self.assertEqual((finding["file_count"], finding["files_returned"]), (5000, 50))
+        self.assertEqual((finding["decision_count"], finding["decisions_returned"]), (1000, 50))
+        self.assertEqual(finding["pending_deletion_decision_count"], 1000)
+        self.assertTrue(finding["members_truncated"] and finding["files_truncated"]
+                        and finding["decisions_truncated"])
+        self.assertLessEqual(len(details.call_args.args[0]), reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
+        self.assertLess(len(response.content), 100_000)
+
+
+class DuplicateHashBoundaryTests(_Recon):
+    def walked(self, rel, data):
+        path = self.file(rel, data)
+        scanner = reconciliation.Scanner(root=self.root)
+        scanner.check_root()
+        scanner.walk()
+        return scanner, scanner.files[str(path)], path
+
+    def test_growth_replacement_and_symlink_substitution_never_become_exact_evidence(self):
+        data = b"a" * (reconciliation.HASH_CHUNK + 4096)
+        for mutation in ("grow", "replace", "symlink"):
+            with self.subTest(mutation=mutation):
+                scanner, entry, path = self.walked(f"ROCK/{mutation}.flac", data)
+                target = self.base / f"{mutation}-target.flac"
+                target.write_bytes(b"z" * len(data))
+                real_read, changed = os.read, [False]
+
+                def mutating_read(fd, amount):
+                    chunk = real_read(fd, amount)
+                    if not changed[0]:
+                        changed[0] = True
+                        if mutation == "grow":
+                            with open(path, "ab") as handle:
+                                handle.write(b"growth")
+                        elif mutation == "replace":
+                            os.replace(target, path)
+                        else:
+                            os.unlink(path)
+                            os.symlink(target, path)
+                    return chunk
+
+                with mock.patch.object(reconciliation.os, "read", mutating_read):
+                    with self.assertRaises(reconciliation.HashUncertain):
+                        scanner._hash(entry)
+                self.assertLessEqual(scanner.hashed_bytes, entry.size)
+
+    def test_a_hash_race_reclassifies_the_file_and_removes_it_from_metadata_groups(self):
+        data = b"r" * (reconciliation.HASH_CHUNK + 1024)
+        unstable = self.track("ROCK/unstable.flac", title="Twin", data=data)
+        self.track("ROCK/stable.flac", title="Twin", data=data)
+        real_hash, changed = reconciliation.Scanner._hash, [False]
+
+        def change_before_hash(scanner, entry):
+            if entry.path == unstable.filepath and not changed[0]:
+                changed[0] = True
+                with open(entry.path, "ab") as handle:
+                    handle.write(b"changed")
+            return real_hash(scanner, entry)
+
+        with mock.patch.object(reconciliation.Scanner, "_hash", change_before_hash):
+            report = self.scan()
+        self.assertEqual(self.of(report, "duplicate"), [])
+        uncertain = [f for f in self.of(report, "uncertain")
+                     if (f.get("file") or {}).get("path") == unstable.filepath]
+        self.assertEqual(len(uncertain), 1)
+        self.assertIn("changed", uncertain[0]["reason"])
+
+    def test_protected_and_in_delivery_media_are_not_read_by_the_duplicate_hasher(self):
+        from spoken.models import AssetMode, SpokenAsset, SpokenContentType
+
+        payload = b"same-sized-audio" * 100
+        ordinary = [self.track(f"ROCK/ordinary-{i}.flac", data=payload) for i in range(2)]
+
+        protected_track = self.track("ROCK/remote.flac", data=payload,
+                                     remote_url="https://example.invalid/remote.flac")
+        spoken = self.track("ROCK/spoken-" + "a" * 32 + ".flac", data=payload)
+        ctype = SpokenContentType.objects.create(
+            code="recon-spoken", name="Recon spoken", delivery_mode="current_edition", recipe_key="lcl_psa",
+            target_category=self.rock, enabled=True, requires_review=False, deliver_ready_to_air=True,
+        )
+        asset = SpokenAsset(content_type=ctype, mode=AssetMode.CURRENT_EDITION, slot_key="recon",
+                            track=spoken, library_relpath=f"ROCK/{Path(spoken.filepath).name}")
+        models.QuerySet.bulk_create(SpokenAsset._base_manager.all(), [asset])
+        active_path = self.file("UrgentPA/am-" + "b" * 32 + ".flac", payload)
+        arriving = self.file("Syndicated/episode.flac", payload)
+
+        hashed = []
+        real_hash = reconciliation.Scanner._hash
+
+        def recording_hash(scanner, entry):
+            hashed.append(entry.path)
+            return real_hash(scanner, entry)
+
+        with mock.patch.object(reconciliation.Scanner, "fresh",
+                               lambda _scanner, entry: entry.path == str(arriving)), \
+             mock.patch.object(reconciliation.Scanner, "_hash", recording_hash):
+            report = self.scan()
+        self.assertEqual(set(hashed), {t.filepath for t in ordinary})
+        self.assertNotIn(protected_track.filepath, hashed)
+        self.assertNotIn(spoken.filepath, hashed)
+        self.assertNotIn(str(active_path), hashed)
+        self.assertNotIn(str(arriving), hashed)
+        protected_paths = {f.get("file", {}).get("path") for f in self.of(report, "protected")}
+        self.assertIn(str(active_path), protected_paths)
+        self.assertIn(str(arriving), {f.get("file", {}).get("path") for f in self.of(report, "in_delivery")})
 
 
 class DuplicateDecisionEndpointTests(_Recon):
@@ -689,6 +872,57 @@ class RelinkEvidenceTests(_RelinkSetup, _Recon):
         finding = self.scan_and_find()
         self.assertIsNone(finding["relink"])
         self.assertIn("more than one candidate", finding["reason"])
+
+    def test_a_leftover_canonical_cache_is_not_authority_when_waveform_path_is_blank(self):
+        track = self.prepare()
+        canonical = self.waves / f"{track.pk}.json"
+        self.assertTrue(canonical.exists())
+        Track.objects.filter(pk=track.pk).update(waveform_path="")
+        report = reconciliation.run_scan()
+        self.assertFalse(any(f.get("relink") is not None for f in report["findings"]))
+        self.assertIn("no authoritative waveform cache", json.dumps(report))
+
+    def test_the_track_authoritative_alternate_cache_is_used_not_a_stale_canonical_file(self):
+        track = self.prepare()
+        canonical = Path(track.waveform_path)
+        alternate = self.waves / "authoritative-alternate.json"
+        os.rename(canonical, alternate)
+        canonical.write_text("{}", encoding="utf-8")
+        Track.objects.filter(pk=track.pk).update(waveform_path=str(alternate))
+        finding = self.scan_and_find()
+        self.assertEqual(finding["relink"], 0)
+        self.assertTrue(finding["candidates"][0]["eligible"])
+
+    def test_an_invalid_alternate_reference_does_not_fall_back_to_the_canonical_cache(self):
+        track = self.prepare()
+        alternate = self.waves / "not-a-cache.json"
+        alternate.write_text("{}", encoding="utf-8")
+        Track.objects.filter(pk=track.pk).update(waveform_path=str(alternate))
+        report = reconciliation.run_scan()
+        self.assertFalse(any(f.get("relink") is not None for f in report["findings"]))
+        self.assertIn("waveform cache", json.dumps(report))
+
+    def test_cache_source_disagreement_is_manual_review(self):
+        track = self.prepare()
+        cache = Path(track.waveform_path)
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        payload["source"]["path"] = str(self.root / "ROCK" / "another.flac")
+        cache.write_text(json.dumps(payload), encoding="utf-8")
+        self.assert_manual("different file path")
+
+    def test_preview_and_apply_recheck_the_same_authoritative_cache(self):
+        track = self.prepare()
+        self.scan_and_find()
+        status, preview = self.preview()
+        self.assertEqual(status, 200, preview)
+        cache = Path(track.waveform_path)
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        payload["source"]["path"] = str(self.root / "ROCK" / "changed.flac")
+        cache.write_text(json.dumps(payload), encoding="utf-8")
+        status, result = self.apply(preview["token"])
+        self.assertEqual(status, 409)
+        self.assertIn("recorded audio no longer matches", result["error"])
+        self.assertEqual(Track.objects.get(pk=track.pk).filepath, track.filepath)
 
 
 def _advisory_waiters():

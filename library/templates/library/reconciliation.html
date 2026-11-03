@@ -279,11 +279,16 @@ function closeButton(label) {
 }
 
 function renderDuplicate(card, finding) {
+  if (finding.members_truncated) card.append(el('p',
+    `Showing ${finding.members_returned.toLocaleString()} of ${finding.member_count.toLocaleString()} member Tracks; ` +
+    'the group remains open and the complete count is retained in the scan.', 'rc-warn'));
   if (finding.files) {
     card.append(trackTable(finding.files, [
       ['File', f => f.rel], ['Size', f => fmtSize(f.size)], ['Track', f => f.track_id ? trackLink({ id: f.track_id }) : 'unregistered'],
       ['SHA-256', f => (f.sha256 || '').slice(0, 16) + '…'],
     ]));
+    if (finding.files_truncated) card.append(el('p',
+      `Showing ${finding.files_returned.toLocaleString()} of ${finding.file_count.toLocaleString()} files.`, 'rc-warn'));
   }
   if (finding.tracks && finding.tracks.length) {
     card.append(trackTable(finding.tracks, [
@@ -299,9 +304,15 @@ function renderDuplicate(card, finding) {
   const decisions = Object.entries(finding.decisions || {});
   decisions.forEach(([pair, d]) => card.append(el('p', `Pair ${pair}: ${d.resolution === 'keep_both' ? 'reviewed — not a duplicate' : d.resolution}` +
     (d.applied ? ' (applied)' : ''), d.resolution === 'keep_both' ? 'rc-muted' : 'rc-warn')));
+  if (finding.decisions_truncated) card.append(el('p',
+    `Showing ${finding.decisions_returned.toLocaleString()} of ${finding.decision_count.toLocaleString()} recorded decisions.`, 'rc-warn'));
   if ((finding.pending_deletion_decisions || []).length) {
     card.append(el('p', 'A recorded keep/delete decision exists for ' + finding.pending_deletion_decisions.join(', ') +
       '. Applying it with apply_duplicate_resolutions would delete a Track; this page never does.', 'rc-warn'));
+  }
+  if (finding.pending_deletion_decision_count > (finding.pending_deletion_decisions || []).length) {
+    card.append(el('p', `${finding.pending_deletion_decision_count.toLocaleString()} pending keep/delete decisions ` +
+      'exist in this group; the response lists only a bounded sample. This page never applies them.', 'rc-warn'));
   }
   if ((finding.members || []).length >= 2) card.append(notDuplicateControl(finding));
 }

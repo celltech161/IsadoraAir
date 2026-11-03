@@ -90,3 +90,59 @@ class MeasureReconciliation(_ReconFixture, TransactionTestCase):
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["counts"]["missing"], self.MISSING)
         self.assertEqual(report["counts"]["unregistered"], self.UNREGISTERED + self.COPIES)
+
+
+class MeasureAdversarialDuplicateGroup(_ReconFixture, TransactionTestCase):
+    """A single several-thousand-member group must stay linear in members plus recorded decisions."""
+
+    MEMBERS = 4000
+
+    def test_measure(self):
+        folder = self.root / "ROCK"
+        folder.mkdir(exist_ok=True)
+        tracks = []
+        for i in range(self.MEMBERS):
+            path = folder / f"station-id-{i:05d}.flac"
+            path.write_bytes(i.to_bytes(4, "big") + b"x" * (64 + i))  # unique size: no exact-hash group
+            tracks.append(Track(filepath=str(path), filename=path.name, title="Station ID", artist=self.artist,
+                                category=self.rock, format="flac", duration_seconds=10.0))
+        for start in range(0, len(tracks), 1000):
+            Track.objects.bulk_create(tracks[start:start + 1000])
+
+        tracemalloc.start()
+        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        queries = {"count": 0}
+
+        def count(execute, sql, params, many, context):
+            queries["count"] += 1
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(count):
+            started = time.perf_counter()
+            report = reconciliation.run_scan()
+            scan = time.perf_counter() - started
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        duplicate = next(f for f in report["findings"] if f["type"] == "duplicate")
+        started = time.perf_counter()
+        response = self.client.get("/api/tracks/reconciliation/findings/", {"type": "duplicate", "per_page": 1})
+        api_seconds = time.perf_counter() - started
+        body = response.json()["items"][0]
+        result = {
+            "members": self.MEMBERS, "scan_seconds": round(scan, 2), "scan_db_statements": queries["count"],
+            "python_peak_traced_mb": round(peak / 1e6, 1),
+            "process_max_rss_mb_before_after": [round(rss_before / 1024, 1), round(rss_after / 1024, 1)],
+            "pair_count": duplicate["pair_count"],
+            "decision_rows_examined": report["budgets"]["duplicate_decision_rows"],
+            "api_seconds": round(api_seconds, 3), "api_bytes": len(response.content),
+            "api_members_returned": body["members_returned"],
+        }
+        print("\n=====BEGIN-LARGE-DUPLICATE-MEASURE=====\n" + json.dumps(result, indent=2)
+              + "\n=====END-LARGE-DUPLICATE-MEASURE=====")
+        self.assertEqual(duplicate["member_count"], self.MEMBERS)
+        self.assertEqual(duplicate["pair_count"], self.MEMBERS * (self.MEMBERS - 1) // 2)
+        self.assertTrue(duplicate["open"])
+        self.assertEqual(report["budgets"]["duplicate_decision_rows"], 0)
+        self.assertEqual(body["members_returned"], reconciliation.DUPLICATE_DETAIL_MEMBER_LIMIT)
+        self.assertLess(len(response.content), 100_000)

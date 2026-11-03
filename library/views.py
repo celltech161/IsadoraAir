@@ -7,6 +7,7 @@ import re
 import stat
 import time as time_mod
 from datetime import date as date_type, time
+from itertools import islice
 from pathlib import Path
 
 from django.contrib.auth import get_user_model
@@ -1819,13 +1820,25 @@ def _finding_matches(finding, q):
     return any(q in h.casefold() for h in haystack)
 
 
-def _track_review_details(track_ids):
+def _track_review_details(track_ids, *, limit=100):
     """Current facts the operator needs to judge a duplicate group (read only)."""
     from collections import defaultdict
 
     from django.db.models import Count, Q
     from django.utils import timezone as django_tz
 
+    # Defense in depth: the caller also budgets duplicate members across the whole response.  Never allow a
+    # future caller to turn one large group into an unbounded IN query and response expansion.
+    limit = max(0, int(limit))
+    bounded, seen = [], set()
+    for track_id in track_ids:
+        if len(bounded) >= limit:
+            break
+        if track_id in seen:
+            continue
+        seen.add(track_id)
+        bounded.append(track_id)
+    track_ids = bounded
     now = django_tz.now()
     rows = (Track.objects.filter(pk__in=track_ids)
             .select_related("artist", "album", "category")
@@ -1886,9 +1899,59 @@ def api_reconciliation_findings(request):
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
     window = [dict(f) for f in items[(page - 1) * per_page:page * per_page]]
-    member_ids = {t for f in window if f["type"] == "duplicate" for t in f.get("members", [])}
+    # A finding remains one finding regardless of group size.  Member/file/decision expansions are separately
+    # bounded across this HTTP response; their exact totals remain visible so truncation can never look complete.
+    member_budget = reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT
+    file_budget = reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT
+    decision_budget = reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT
+    pending_budget = reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT
+    member_ids = []
+    searched_track_id = int(q) if q.isdigit() else None
+    for finding in window:
+        if finding["type"] != "duplicate":
+            continue
+        all_members = finding.get("members") or finding.get("track_ids") or []
+        member_take = min(reconciliation.DUPLICATE_DETAIL_MEMBER_LIMIT, member_budget, len(all_members))
+        if member_take and searched_track_id in all_members:
+            finding["members"] = [searched_track_id, *islice(
+                (track_id for track_id in all_members if track_id != searched_track_id), member_take - 1)]
+        else:
+            finding["members"] = list(islice(all_members, member_take))
+        finding.pop("track_ids", None)
+        finding["member_count"] = finding.get("member_count", len(all_members))
+        finding["members_returned"] = member_take
+        finding["members_truncated"] = finding["member_count"] > member_take
+        member_ids.extend(finding["members"])
+        member_budget -= member_take
+
+        all_files = finding.get("files") or []
+        file_take = min(reconciliation.DUPLICATE_DETAIL_MEMBER_LIMIT, file_budget, len(all_files))
+        if "files" in finding:
+            finding["files"] = list(islice(all_files, file_take))
+            finding["file_count"] = finding.get("file_count", len(all_files))
+            finding["files_returned"] = file_take
+            finding["files_truncated"] = finding["file_count"] > file_take
+        file_budget -= file_take
+
+        all_decisions = finding.get("decisions") or {}
+        decision_take = min(reconciliation.DUPLICATE_DETAIL_DECISION_LIMIT,
+                            decision_budget, len(all_decisions))
+        finding["decisions"] = dict(islice(all_decisions.items(), decision_take))
+        finding["decision_count"] = finding.get("decision_count", len(all_decisions))
+        finding["decisions_returned"] = decision_take
+        finding["decisions_truncated"] = finding["decision_count"] > decision_take
+        decision_budget -= decision_take
+
+        pending = finding.get("pending_deletion_decisions") or []
+        pending_take = min(reconciliation.DUPLICATE_DETAIL_DECISION_LIMIT, pending_budget, len(pending))
+        finding["pending_deletion_decisions"] = list(islice(pending, pending_take))
+        finding["pending_deletion_decision_count"] = finding.get(
+            "pending_deletion_decision_count", len(pending))
+        finding["pending_deletion_decisions_truncated"] = (
+            finding["pending_deletion_decision_count"] > pending_take)
+        pending_budget -= pending_take
     if member_ids:
-        details = _track_review_details(member_ids)
+        details = _track_review_details(member_ids, limit=reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
         for f in window:
             if f["type"] == "duplicate":
                 f["tracks"] = [details.get(t, {"id": t, "deleted": True}) for t in f.get("members", [])]
