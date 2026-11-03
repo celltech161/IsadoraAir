@@ -40,7 +40,22 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 - Import from disk or drag-and-drop upload, with automatic tag reading (ID3, Vorbis, MP4/AAC, WAV RIFF LIST-INFO) and CD ripping built in (see below)
 - Waveform generation and automatic cue-in / next-start (mix) point detection, with per-category threshold overrides and a fast re-pick path when a threshold changes
 - Related-artist rotation separation: a shared parser auto-discovers feat./with/collaboration credits so a solo cut and a duet by the same performer don't air back-to-back
-- Searchable/filterable library UI with bulk actions (ready-to-air, categorize, holiday tags, delete) and per-track cue points, rotation weight, energy level, and RBDS overrides
+- Searchable/filterable library UI with per-track cue points, rotation weight, energy level, and RBDS overrides
+- Bulk metadata and category editing:
+  - **Fields:** artist, album, genre, year, composer, publisher, record label, energy, vocal type, end type, rotation weight, Ready to Air and primary category, each explicitly *leave*, *set* or *clear*;
+  - **Memberships:** additional categories and holiday tags are added or removed, never replaced;
+  - **Selection:** ticked rows across pages, or an explicitly chosen "every Track matching this filter", up to 1,000 per edit;
+  - **Preview first:** every edit previews the exact count and before/after values, then applies only with that preview's single-use token;
+  - **Per Track:** each Track is applied on its own; one changed since the preview is reported stale and left alone, and the result lists updated, unchanged, refused, stale and missing Tracks.
+
+  Database metadata only: audio tags, cue points and file locations are untouched. Bulk delete remains limited to ticked rows.
+- **Library reconciliation** (operator-run, read-only): `manage.py reconcile_library` compares the media tree with the Track database. It reports missing, moved, unregistered, duplicate, category-drifted, shared, protected and still-arriving items for review on a Library Reconciliation page. Scans never delete, move, import or rewrite anything, and nothing runs them automatically.
+- **Duplicate review:**
+  - **Confidence levels:** exact bytes, decoded-audio equivalent, likely and uncertain, with each copy's references and existing decisions shown.
+  - **Decisions:** the page records only "not a duplicate"; nothing is merged or deleted automatically.
+  - **Unregistered copies:** identical unregistered files stay listed for file review.
+- **Evidence-qualified relinking:** a missing-media Track can be reconnected to its moved file, keeping its Track ID, metadata, cue points and history. Relinking is offered only when the file's decoded audio matches the audio the Track's own records identified. It is previewed, revalidated under the station's path and row locks at apply time, and otherwise left for manual review. See [`docs/LIBRARY_RECONCILIATION.md`](docs/LIBRARY_RECONCILIATION.md).
+- **Monitoring events:** bulk edits, relinks and duplicate decisions are recorded as Monitoring events (an operational log kept about 30 days, not a permanent audit archive)
 - Album-art resolver with layered fallbacks (manual override, embedded art, station-hosted image, online lookup) and a station default
 
 **CD Ripping** (built into Library Import)
@@ -61,6 +76,10 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 - Lands each hour's end precisely against the real next-hour boundary, with a fallback category to top up a short hour and bounded live backfill for genuine gaps
 - A completely blank hour keeps continuation ownership with the prior program; a partial hour builds only its later transitions and becomes eligible at its first scheduled minute
 - Exact-minute transitions express programming intent at natural track/playlist boundaries; they do not chop audio at the clock minute
+- **Hour Refill** (installed, default Off):
+  - **Causes:** a shorter request substitution, an operator Eject, a Start Next, an automatic skip of missing media, or a confirmed media failure.
+  - **What it does:** when one of these leaves the current hour short, it can propose, and once separately enabled install, up to two music tracks before the hour's protected closing blocks.
+  - **Activation:** each station needs its own separately authorized category audit, dry-run observation, timing review and host arming before anything is installed. See [`docs/roadmap/2_27_PHASE_D_ROLLOUT_PACKET.md`](docs/roadmap/2_27_PHASE_D_ROLLOUT_PACKET.md).
 
 **Playback Engine**
 - Dual-deck playout with real crossfading timed off each track's own analyzed cue-in/next-start points — not a scripted fade curve
@@ -129,7 +148,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 
 **Managed Update Center**
 - Staff/superusers can inspect release state and available updates; installation is superuser-only
-- Declarative, signed release manifests validate checkout, schema, prerequisites, and protected-runtime compatibility before an install is offered; a separately installed backend independently re-authorizes and applies only release-declared actions
+- Declarative release manifests from a trusted, fast-forward-only release history validate checkout, schema, prerequisites, and protected-runtime compatibility before an install is offered. Protected-runtime (updater) releases additionally carry offline-signed attestations. A separately installed backend independently re-authorizes and applies only release-declared actions
 - Migration plans are mechanically classified. Operations outside the automatic allowlist stop at an explicit review point and require a fresh approval bound to the exact release/commit/manifest/plan digest; unsupported or destructive transitions remain fail-closed rather than being treated as universally unattended
 - Dirty, divergent, or otherwise untrustworthy source/release state fails closed rather than guessing
 
@@ -143,7 +162,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 - **Web song requests** (native, `webrequests` app): catalog sync, request lifecycle, and in-place recency-aware queue fulfillment are native features; only the public request *form* lives on a separate listener-facing website — see [`docs/WEB_REQUESTS_INTEGRATION.md`](docs/WEB_REQUESTS_INTEGRATION.md). Optional spoken dedication intros pair with the requested track
 - **Syndicated program ingestion** (companion/external today): provider-specific fetchers that carry outside credentials or scraping logic stay outside the repo; a native, operator-managed recurring-ingestion system is roadmap work
 - **ogremote** (receiving side only, native): the ogremote newsgathering/voiceover product itself is a separate upstream tool; IsadoraAir ships only the integration that receives its uploads and dispatches urgent-replay drops
-- Now-playing pushed to Bluesky and TuneIn AIR automatically on every track change
+- Now-playing pushed to TuneIn AIR (a native timer) and, where a station runs the companion poster, Bluesky
 
 ## Architecture
 
@@ -155,6 +174,12 @@ IsadoraAir (Django 5.2 LTS)
 │   └── ...                        # Models, views, admin, CD ripping, log builder, related-artist logic
 ├── authz/                         # Roles, capabilities, talent windows + authorization audit
 ├── hardware/                      # Audio I/O, ducking, stable-device identity, Remote DJ audio input
+├── production/                    # iPortal media substrate: validated immutable media, browser recorder/editor,
+│                                  # confined validation + sandboxed render service (used by voice tracking)
+├── spoken/                        # Spoken-content domain + library projection (installed; no type enabled by default)
+├── produced_content/              # Station content types + producer assignments (dormant until configured)
+├── active_messages/               # Urgent / public-address messages (installed; native airing closed --
+│                                  # the legacy ogremote path stays authoritative until a later cutover)
 ├── aircheck/                      # Aircheck recording/session management
 ├── webrequests/                   # Native request sync, scheduling + dedication intros
 ├── ogremote/                      # Receiving-side ogremote integration
@@ -418,10 +443,22 @@ python manage.py run_monitoring  # System + transmitter health checks
 ### 12. Production: systemd units, nginx, and backup/recovery
 
 See [`deploy/README.md`](deploy/README.md) for the production install
-conventions and placeholder rendering. The long-running components
-(`isadoraair-gunicorn`, `isadoraair-engine`, `isadoraair-encoders`,
-`isadoraair-rbds`, `isadoraair-monitoring`) each run as their own systemd
-unit; timer-driven jobs are separate `.service`/`.timer` pairs.
+conventions and placeholder rendering.
+
+**Core services.** `isadoraair-gunicorn`, `isadoraair-engine`, `isadoraair-encoders`, `isadoraair-rbds` and
+`isadoraair-monitoring` each run as their own systemd unit.
+
+**iPortal and content workers.** Stations that use iPortal and spoken/produced content add:
+* `isadoraair-validation`: confined media validation;
+* `isadoraair-render`: sandboxed renderer;
+* `isadoraair-spoken-render-worker`;
+* `isadoraair-active-message-worker`.
+
+On stations upgraded through the Update Center these are installed as managed units. They are not required for
+basic playback, and the content features they serve stay inert until configured.
+
+**Timers.** Timer-driven jobs (track analysis, backup, pruning, weather, road conditions, web requests and others)
+are separate `.service`/`.timer` pairs. Optional companion timers (syndicated ingest, ogremote) are station-specific.
 
 Managed release delivery has an additional protected-install boundary. See
 [`docs/UPDATE_CENTER.md`](docs/UPDATE_CENTER.md) for protected updater
@@ -436,17 +473,20 @@ the completed archive off-box over SFTP with retention handling. Recurring
 Monitoring backup assurance separately verifies the latest backup's own
 PostgreSQL catalog is readable, its provenance, and successful remote
 promotion; a weekly exact-object round-trip check confirms the last
-successful backup is still intact on the remote. A full offline,
-disposable whole-machine restore (00→95, under strict network isolation,
-on a clean Ubuntu 26.04.1 target) has passed end to end — application,
-database, and native TTS/HE-AAC/protected-updater reconstruction all
-proven from a real backup archive — see
-[`docs/DISASTER_RECOVERY_STATUS.md`](docs/DISASTER_RECOVERY_STATUS.md)
-for the authoritative result and
-[`docs/DISASTER_RECOVERY_RESTORE.md`](docs/DISASTER_RECOVERY_RESTORE.md)
-for the operator procedure. The remaining closeout item is an operator-
-friendly bootable physical recovery-media workflow, not proof that
-bare-machine recovery works at all.
+successful backup is still intact on the remote.
+
+**Disaster recovery status:**
+* **Software restore, proven:** a full offline, disposable whole-machine software restore passed end to end from a
+  real backup archive. It ran 00→95, under strict network isolation, on a clean Ubuntu 26.04.1 target, and
+  reconstructed the application, database, native TTS, HE-AAC and the protected updater. See
+  [`docs/DISASTER_RECOVERY_STATUS.md`](docs/DISASTER_RECOVERY_STATUS.md).
+* **Physical restore, not yet fully qualified:**
+  * The first physical bare-metal drill from recovery media restored every stage but exposed three defects,
+    corrected in r0085.
+  * Physical recovery is not yet fully qualified. Closing it needs a fresh backup, new sealed recovery media and a
+    second clean bare-metal restore, as listed in
+    [`docs/DISASTER_RECOVERY_PHYSICAL_ACCEPTANCE.md`](docs/DISASTER_RECOVERY_PHYSICAL_ACCEPTANCE.md).
+* **Operator procedure:** [`docs/DISASTER_RECOVERY_RESTORE.md`](docs/DISASTER_RECOVERY_RESTORE.md).
 
 For a full production bring-up, also run the read-only baseline preflight:
 
@@ -532,7 +572,7 @@ removed rather than kept as checked-off entries.
 
 ### Near-term hardening
 
-- Hands-off bootable recovery-media / operator closeout
+- Second physical bare-metal restore and hands-off bootable recovery-media closeout
 - Remote DJ connection/link-quality hardening
 - Future-log readiness validation
 
@@ -560,7 +600,7 @@ removed rather than kept as checked-off entries.
 - External mixer integration + Studio↔Remote-DJ IFB/talkback
 - Scheduled time-shift recording for external/live sources
 - Sports/special-event override scheduling
-- Library bulk operations + disk/database reconciliation
+- Reviewed Library duplicate resolution, import-from-reconciliation, and asset expiration/maximum-air rules
 - Offline future-log/program renderer
 - Terrestrial-vs-stream content substitution + external scheduler log import
 - Audio-processing topology modes for StereoTool and non-StereoTool installs
