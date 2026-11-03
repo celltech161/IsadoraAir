@@ -239,19 +239,27 @@ def _protection_predicates():
         for track_id, snapshot in Publication._base_manager.values_list("track_id", "track_id_snapshot").iterator():
             am_tracks.update(t for t in (track_id, snapshot) if t is not None)
     try:
-        from active_messages import track_guard
+        from active_messages import playout, track_guard
     except ImportError:              # pragma: no cover - the app is part of the project
         track_guard = None
+    if track_guard is not None:
+        # Resolved once per scan (the guard's helpers resolve them on every call): the quarantine roots and
+        # the publication namespace directory.  The guard's own predicate still decides inside the namespace.
+        quarantine_roots = tuple(track_guard._quarantine_roots())
+        namespace = playout._library_root() / playout.CATEGORY_CODE
+        namespaces = {str(namespace), os.path.realpath(namespace)}
 
-    def path_owner(path: str, rel: str) -> str | None:
+    def path_owner(path: str, rel: str, resolved: str | None = None) -> str | None:
+        """``resolved``: the path's realpath (the walk's paths are already canonical)."""
         name = os.path.basename(path)
         if _SPOKEN_NAME.fullmatch(name) or rel in spoken_relpaths:
             return "spoken projection file"
         if track_guard is not None:
+            resolved = resolved or os.path.abspath(path)
             try:
-                if track_guard.in_quarantine(os.path.realpath(path)):
+                if any(resolved == root or resolved.startswith(root + os.sep) for root in quarantine_roots):
                     return "Active Messages quarantine"
-                if track_guard.reserved_destination(path) is not None:
+                if os.path.dirname(resolved) in namespaces and track_guard.reserved_destination(path) is not None:
                     return "Active Messages publication namespace"
             except Exception:        # an ownership check that cannot decide is treated as protected
                 return "ownership could not be determined"
@@ -428,17 +436,18 @@ class Scanner:
             if not (absolute + os.sep).startswith(self.root + os.sep) or absolute == self.root:
                 self.add("protected", "the Track's file is outside the managed Library root", track=summary)
                 continue
-            owner = path_owner(path, self.rel(absolute))
+            try:
+                resolved = os.path.realpath(path)
+            except (OSError, ValueError):
+                resolved = None
+            owner = path_owner(path, self.rel(absolute), resolved)
             if owner:
                 self.add("protected", owner, track=summary)
                 continue
             local += 1
             self.metadata.append((row["id"], row["artist_id"], normalized_title(row["title"]), row["duration_seconds"],
                                   (row["isrc"] or "").strip().upper()))
-            try:
-                alias = os.path.realpath(path) != absolute or absolute != path
-            except (OSError, ValueError):
-                alias = True
+            alias = resolved != absolute or absolute != path
             entry = self.files.get(path)
             if entry is not None:
                 entry.registered = True
@@ -718,16 +727,28 @@ class Scanner:
     def run(self) -> dict:
         started = timezone.now()
         scan_id = _new_scan_id(started)
+        timings, mark = {}, time.perf_counter()
+
+        def lap(name):
+            nonlocal mark
+            now = time.perf_counter()
+            timings[name] = round(now - mark, 3)
+            mark = now
+
         self.check_root()
         self.progress("walk", 0)
         self.walk()
+        lap("walk")
         self.progress("tracks", 0)
         self.tracks()
         self.unregistered()
+        lap("tracks")
         suspect = self.storage_suspect()
         self.missing_tracks(suspect)
+        lap("missing_and_relink_evidence")
         self.progress("duplicates", 0)
         self.duplicates()
+        lap("duplicates")
         self.counts["unsupported_files"] = sum(self.unsupported.values())
         open_duplicates = sum(1 for f in self.findings if f["type"] == "duplicate" and f.get("open"))
         return {
@@ -743,6 +764,7 @@ class Scanner:
                        "duplicate_groups_open": open_duplicates,
                        "relink_reviewable": sum(1 for f in self.findings if f["type"] == "moved"
                                                 and f.get("relink") is not None)},
+            "timings_seconds": timings,
             "budgets": {"decodes": self.decodes, "max_decodes": self.max_decodes,
                         "hashed_bytes": self.hashed_bytes, "max_hash_bytes": self.max_hash_bytes},
             "unsupported_extensions": dict(sorted(self.unsupported.items())),

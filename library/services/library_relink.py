@@ -98,7 +98,7 @@ def _check(plan):
     if Track.objects.filter(filepath=new).exists():
         raise RelinkRefused("Another Track already uses the candidate file.")
     path_owner, track_owner = library_reconciliation._protection_predicates()
-    owner = path_owner(new, os.path.relpath(new, root)) or track_owner(plan["track_id"])
+    owner = path_owner(new, os.path.relpath(new, root), os.path.realpath(new)) or track_owner(plan["track_id"])
     if owner:
         raise RelinkRefused(f"Protected: {owner}.")
     evidence = library_reconciliation.track_audio_evidence(plan["track_id"], old)

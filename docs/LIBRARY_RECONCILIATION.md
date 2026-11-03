@@ -160,3 +160,67 @@ against an independently trusted record, which does not exist yet.
 * **After a relink,** the waveform cache's witness names the old path. The cache stays displayable but
   **unverified** (Reset Cue Points unavailable) until Reanalyze Track re-decodes. The same decoded identity
   then re-trusts it, and approvals tied to that audio revision stay valid. Phase B does not rewrite caches.
+
+## Operating it
+
+Run a scan as the station's service account, so the web application can read the report:
+
+```
+sudo -u <service-user> <venv>/bin/python manage.py reconcile_library [--max-decodes 100] [--max-hash-gb 20]
+```
+
+The command prints the counts by type and exits non-zero if the root is unavailable or another scan is
+running. Review the findings at **Library → Reconciliation** (`/library/reconciliation/`, track managers only).
+* **The page:**
+  * scan status: latest complete scan, a failed or interrupted last attempt, a running scan;
+  * a chip per finding type;
+  * a type filter, a search (a number is a Track id; text matches title, artist or file name) and 25 findings
+    per page.
+* **Duplicate groups** list each member's directory, size, format, categories, ISRC, historical hash and the
+  references a deletion would meet (playlists, rotation inserts, upcoming log items, voice tracks, plays). One
+  pair at a time can be recorded as "not a duplicate".
+* **A relinkable finding** shows "Review relink…": the exact change, what is kept, and the warnings; then
+  "Confirm relink"; then the result.
+
+## Measured (guarded sandbox, `measure_reconciliation_performance`)
+
+**Setup:** 20,000 Tracks and 24,050 small files.
+* 1,000 Tracks missing;
+* 5,000 unregistered files plus 50 byte-identical copies;
+* 1,000 files in the wrong category folder;
+* 500 metadata pairs.
+
+**Results:**
+
+| Measure | Result |
+|---|---|
+| Scan time | 13.2 s: walk 2.3, Tracks 7.5, missing/relink evidence 0.4, duplicates 2.0 |
+| Database | 6 statements, 0.11 s |
+| Memory | 35 MB peak traced Python memory, +36 MB RSS |
+| Report | 2.9 MB |
+| Findings page / search from the API | 30–55 ms |
+
+**Production estimates:**
+* The Tracks phase is mostly one `realpath`, `lstat` and `access` per Track. Station paths are shallower than
+  the sandbox's.
+* Byte hashing reads only equal-size files (here 43 MB).
+* Each relink-candidate decode costs about 0.25 s per 4-minute song (`audio_identity`), capped by
+  `--max-decodes`.
+* A cold disk cache on a station will make the walk slower. Run scans outside busy hours; the scan holds no
+  database or file locks while it reads.
+
+## Not covered by Phase B
+
+* **No bulk relink, no import of unregistered files** (use the existing Import workflow), and no cleanup or
+  garbage collection of any file.
+* **No deletion decisions.** Phase B records only "not a duplicate".
+* **`apply_duplicate_resolutions` deficiencies remain** (see B0). Integrating duplicate resolution needs its own
+  previewed, revalidating design that also handles schedule references.
+* **No relink for the unprovable cases:**
+  * no cached identity, or a cache made from another path;
+  * another format;
+  * approvals for other audio;
+  * several matching files.
+
+  These need an independent trusted record of the Track's audio.
+* **The scan is operator-run.** Nothing schedules it.
