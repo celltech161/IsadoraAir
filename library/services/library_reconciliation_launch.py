@@ -2,7 +2,7 @@
 
 One request starts the existing ``manage.py reconcile_library`` command, with its defaults, as a detached
 process of the web application's own service account, at low CPU and I/O priority, under GNU ``timeout`` (a
-fixed two-hour limit: TERM to the scan's process group, then KILL 30 s later). Nothing else is added:
+fixed two-hour limit, then KILL to the scan's whole process group). Nothing else is added:
 the scan keeps its own lock (``.scan.lock``), progress file (``running.json``), reports and
 ``scan_status()``. There is no job record and no supervisor; what the page shows comes from those files.
 
@@ -42,8 +42,11 @@ IONICE = "/usr/bin/ionice"
 # escalation reaches only the direct child; GNU's (installed with coreutils-from-uutils as gnu-coreutils, or as
 # /usr/bin/timeout's target with coreutils-from-gnu) reaches the whole process group.
 TIMEOUT = "/usr/bin/gnutimeout"
-SCAN_TIME_LIMIT = "2h"              # then TERM to the scan's process group (the scan and its ffmpeg/ffprobe)
-KILL_AFTER = "30s"                  # then KILL, if the scan has not exited
+# At the limit GNU timeout sends KILL to the scan and then to its whole process group (itself included), so the
+# scan and every ffmpeg/ffprobe it started end together. Not TERM first: the scan exits on TERM at once (it has
+# no handler, so TERM gains it no cleanup), timeout then exits too, and its KILL escalation never reaches a child
+# that ignored TERM or was slow to act on it.
+SCAN_TIME_LIMIT = "2h"
 SCAN_NICE = 10                      # lowest-but-one CPU priority (a non-root process may only lower its own)
 LAUNCH_LOCK = ".launch.lock"
 LAUNCH_WAIT_SECONDS = 2.0           # a short confirmation only; the page follows the scan through the status API
@@ -64,7 +67,7 @@ def scan_command() -> list[str]:
     group), and the scan and its ffmpeg/ffprobe children inherit the priorities and the process group."""
     manage_py = Path(settings.BASE_DIR) / "manage.py"
     return [NICE, "-n", str(SCAN_NICE), IONICE, "-c", "3",
-            TIMEOUT, "--signal=TERM", f"--kill-after={KILL_AFTER}", SCAN_TIME_LIMIT,
+            TIMEOUT, "--signal=KILL", SCAN_TIME_LIMIT,
             sys.executable, str(manage_py), "reconcile_library"]
 
 

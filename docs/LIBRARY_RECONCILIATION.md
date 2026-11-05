@@ -199,20 +199,27 @@ reports and status, and the page shows those.
 
 * **The request.** `POST /api/tracks/reconciliation/run/`, CSRF-protected, `library.manage_tracks`. Nothing in
   the request is used.
-* **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 /usr/bin/gnutimeout --signal=TERM
-  --kill-after=30s 2h <venv python> <checkout>/manage.py reconcile_library`, without a shell. It gets the web
+* **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 /usr/bin/gnutimeout --signal=KILL 2h
+  <venv python> <checkout>/manage.py reconcile_library`, without a shell. It gets the web
   application's own environment and working directory, as the CD-ripping launcher does
   (`library/cd_ripping.py`).
-* **The time limit.** GNU `timeout` (coreutils) stays as the scan's parent and leads its process group.
-  * After 2 hours it sends TERM to the whole group: the scan and the `ffmpeg`/`ffprobe` it has started. The
-    scan keeps Python's default TERM handling, so it stops at once without writing a report.
-  * If the scan has not exited 30 s later, it sends KILL to the group.
+* **The time limit.** GNU `timeout` (coreutils) stays as the scan's parent and leads its process group (the
+  session `start_new_session` creates). The scan and every `ffmpeg`/`ffprobe` it starts are in that group.
+  * After 2 hours it sends KILL to the scan, then to the whole group, itself included. Everything ends at once,
+    and its exit status is "killed by signal 9", never success.
+  * Why not TERM first, with a grace period: the scan has no TERM handler, so TERM gains it no cleanup. It
+    exits at once, `timeout` exits with it, and the later KILL step never happens. A child that ignored TERM,
+    or was slow to act on it, would outlive the scan. KILL loses nothing the scanner could have saved: its
+    files are written atomically, and a killed scan leaves at most a hidden `.<name>.<pid>.tmp` file, exactly
+    as a TERM or a Gunicorn restart already could.
   * `/usr/bin/gnutimeout` is GNU's timeout. On Ubuntu 25.10 and later, `/usr/bin/timeout` is the uutils (Rust)
     implementation by default, and its KILL escalation (0.8.0) reaches only the direct child, not the group.
     `gnu-coreutils`, which provides `gnutimeout`, is installed with either coreutils flavour. If it were
     missing, the launch fails with 500 `launch_failed` and nothing starts.
-  * A timed-out scan ends exactly like an interrupted one (see below). It is never shown as complete, and
-    `latest.json` and the findings stay on the previous complete scan.
+  * A timed-out scan ends exactly like an interrupted one (see below): its lock is released, its
+    `running.json` stays behind as "stopped before it finished", no attempt is recorded, and `latest.json` and
+    the findings stay on the previous complete scan. A scan still starting at the limit is answered (if the
+    request is still waiting) as 500 `launch_failed`.
   * **Uninterruptible I/O.** A process blocked in the kernel on storage that has stopped answering ("D" state)
     cannot act on any signal, not even KILL, until that I/O returns or fails. Until then a scan stuck there
     keeps its lock, and the time limit cannot end it sooner. An `ffmpeg`/`ffprobe` stuck there does not hold
@@ -260,11 +267,21 @@ reports and status, and the page shows those.
     * This does not claim that the scan failed.
     * The button is enabled again; a retry cannot start a second scan (the launch and scan locks).
     * The page keeps polling every 15 s, and a late scan or result is still recognised.
+  * No answer to the launch request (the connection failed), or a server error without the launcher's own
+    refusal code (for example a proxy's 502): whether a scan started is unknown, so the page does not say "Not
+    started". It watches exactly as after 202 `starting`, from the status it showed before the click. If it
+    had shown none, it says that the outcome is not known.
+  * Answers never arrive out of order on screen. Each status and findings request takes a generation number,
+    and its answer is committed (summary, findings, the scan id, the message, the button, the launch) only if
+    no newer request was started since. Clicking **Start read-only scan** invalidates status answers already
+    in flight and pauses polling until the launch request is answered; polling then resumes, whatever the
+    answer.
   * Closing or reloading the page does not affect the scan. After a reload, the page shows a running scan from
     the same status as any other page.
 * **Gunicorn restart.** The scan is a process of Gunicorn's service (`KillMode=control-group`, the default).
   `systemctl restart isadoraair-gunicorn` therefore stops it with SIGTERM, and so does an Update Center install
-  that restarts Gunicorn. The scan then ends without a report:
+  that restarts Gunicorn. systemd then sends SIGKILL to anything in the control group still running after the
+  stop timeout, so no `ffmpeg`/`ffprobe` outlives the service. The scan then ends without a report:
   * its lock is released;
   * its `running.json` stays behind, shown as "interrupted";
   * `latest.json` and the findings are unchanged;
@@ -275,11 +292,15 @@ reports and status, and the page shows those.
 **Limitations of the minimal launcher** (each would need infrastructure it deliberately does not have):
 * **Tied to Gunicorn.** A scan lives only as long as Gunicorn's service. Any restart, including an install,
   interrupts it; nothing retries.
-* **A fixed time limit, no watchdog.** A scan ends after at most 2 hours (and 30 s), however it stalls, except
-  in uninterruptible kernel I/O (above), where no signal takes effect until the I/O returns. The limit is not
+* **A fixed time limit, no watchdog.** A scan ends after at most 2 hours, however it stalls, except in
+  uninterruptible kernel I/O (above), where no signal takes effect until the I/O returns. The limit is not
   adjustable from the page, and a scan that legitimately needs more than 2 hours is stopped as interrupted.
-  The scanner's own per-decode timeouts still apply. Ending a scan sooner means restarting Gunicorn, or
-  stopping the process as the service account.
+  The scanner's own per-decode timeouts still apply. Ending a scan sooner means restarting Gunicorn, or, as the
+  service account, `kill -KILL -- -<pgid>` with the process-group id of `gnutimeout`. A plain `kill` of
+  `gnutimeout` forwards TERM to the group, which a child ignoring TERM would survive.
+* **Children that leave the group.** The time limit reaches every process in the scan's process group. The
+  scanner's `ffmpeg`/`ffprobe` stay in it; a child that made its own session or group would not be reached
+  (none does).
 * **Shares Gunicorn's resource limits.** It runs at `nice` 10 and idle I/O priority, but inside Gunicorn's
   control group, with no CPU quota or memory cap of its own.
 * **No job record.** Who started a scan is logged (Gunicorn's journal), not stored. The page links a launch

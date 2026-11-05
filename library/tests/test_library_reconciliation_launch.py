@@ -38,10 +38,12 @@ TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "library" / "reco
 # A stand-in scan: takes the REAL scan lock (or exits 1, as reconcile_library does when it is busy), writes the
 # progress file the scanner writes, then holds or exits. Used where timing must be deterministic. "decode" runs
 # the scanner's real audio_identity.compute() (which starts ffprobe as an ordinary child); "stubborn" does the
-# same but ignores SIGTERM, as a scan that cannot stop would (its ffprobe inherits that).
+# same but ignores SIGTERM (its ffprobe inherits that); "slow" is still starting when its time limit ends it.
 STAND_IN = r'''
 import fcntl, json, os, signal, sys, time
 reports, mode = sys.argv[1], sys.argv[2]
+if mode == "slow":
+    time.sleep(60)
 d = os.path.join(reports, "library-reconciliation")
 os.makedirs(d, exist_ok=True)
 fd = os.open(os.path.join(d, ".scan.lock"), os.O_RDWR | os.O_CREAT, 0o640)
@@ -80,6 +82,68 @@ def alive(pid) -> bool:
     except (OSError, IndexError):
         return False
     return state not in ("Z", "X")
+
+
+# The whole page script, run under Node against a minimal fake DOM, with every fetch a promise the test resolves
+# (in any order), timers that fire only when the test says, and a fixed clock: out-of-order answers made exact.
+PAGE_HARNESS = r"""
+class El {
+  constructor(tag) { Object.assign(this, { tag, children: [], textContent: '', className: '', disabled: false,
+    hidden: false, value: '', checked: false, dataset: {}, listeners: {}, attrs: {} }); }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  scrollIntoView() {}
+  get text() { return [this.textContent, ...this.children.map(c => typeof c === 'string' ? c : c.text)].join(' ').trim(); }
+}
+const ids = {};
+globalThis.document = {
+  cookie: 'csrftoken=t',
+  getElementById: id => (ids[id] = ids[id] || new El('div')),
+  createElement: tag => new El(tag),
+  querySelectorAll: () => [],
+};
+let NOW = 1000000;
+Date.now = () => NOW;
+const timers = new Map(); let timerId = 0;
+globalThis.setTimeout = (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId; };
+globalThis.clearTimeout = id => { timers.delete(id); };
+const requests = [];
+globalThis.fetch = (url, opts = {}) => new Promise((resolve, reject) =>
+  requests.push({ url, method: opts.method || 'GET', resolve, reject, done: false }));
+const SUMMARY = '/api/tracks/reconciliation/', RUN = '/api/tracks/reconciliation/run/';
+const isFindings = r => r.url.startsWith('/api/tracks/reconciliation/findings/');
+function open(pred) { return requests.filter(r => !r.done && pred(r)); }
+function respond(req, status, body) { req.done = true; req.resolve({ ok: status >= 200 && status < 300, status, json: async () => body }); }
+function fail(req) { req.done = true; req.reject(new TypeError('network')); }
+async function flush() { for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r)); }
+async function fire() { const due = [...timers.entries()]; timers.clear(); due.forEach(([, t]) => t.fn()); await flush(); }
+const report = id => ({ scan_id: id, finished_at: '2026-11-05T10:00:00Z', library_root: '/srv/library', status: 'complete',
+  counts: { tracks_total: 1, healthy: 1, files_total: 1, relink_reviewable: 0, duplicate_groups_open: 0 }, errors: [] });
+const status = (attempt, latest, running = null) => ({ status: { last_attempt: attempt, latest, running },
+  report: latest ? report(latest.scan_id) : null });
+const A = { scan_id: 'A', status: 'complete' }, B = { scan_id: 'B', status: 'complete' }, F = { scan_id: 'F', status: 'failed' };
+const findings = total => ({ page: 1, pages: 1, total, items: [], scan_id: 'x' });
+function snapshot() {
+  return { summary: ids.scanStatus.text, message: ids.runStatus.textContent, cls: ids.runStatus.className,
+    button: ids.runBtn.disabled, scanId, launch: launch === null ? null : JSON.stringify(launch), lastStatus:
+    typeof lastStatus === 'undefined' ? null : JSON.stringify(lastStatus), findings: ids.pageInfo.textContent, timers: [...timers.values()].map(t => t.ms),
+    open: open(() => true).map(r => r.method + ' ' + r.url.split('?')[0]) };
+}
+async function clickStart() {
+  ids.runBtn.listeners.click[0]();
+  const start = ids.actionPanel.children.find(c => c.textContent === 'Start read-only scan');
+  start.listeners.click[0]();
+  await flush();
+}
+async function boot() {
+  await flush();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(A, A));
+  respond(open(isFindings)[0], 200, findings(111));
+  await flush();
+}
+"""
 
 
 class FakeProc:
@@ -171,7 +235,7 @@ class LaunchTests(_Http):
         (argv, kwargs), = self.calls
         manage_py = str(Path(settings.BASE_DIR) / "manage.py")
         self.assertEqual(argv, ["/usr/bin/nice", "-n", "10", "/usr/bin/ionice", "-c", "3",
-                                "/usr/bin/gnutimeout", "--signal=TERM", "--kill-after=30s", "2h",
+                                "/usr/bin/gnutimeout", "--signal=KILL", "2h",
                                 sys.executable, manage_py, "reconcile_library"])
         self.assertEqual(argv, launcher.scan_command())
         self.assertNotIn("shell", kwargs)                          # an argv list, never a shell string
@@ -287,6 +351,138 @@ class PageTests(_Http):
         result = subprocess.run([self.node(), "-e", code + "\n" + body], capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def run_page(self, scenario):
+        source = TEMPLATE.read_text()
+        page = source[source.index("<script>") + len("<script>"):source.index("</script>")]
+        body = PAGE_HARNESS + page + "\n(async () => {\n" + scenario + "\n})().catch(e => { console.error(e); process.exit(1); });\n"
+        result = subprocess.run([self.node(), "-e", body], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_an_older_status_answer_never_overwrites_a_newer_one(self):
+        """Codex Medium: (1) a poll's summary request is in flight; (2) the launch starts, invalidating it and
+        pausing polling; (3) the newer state (a completed, or a failed, scan) is shown; (4) the older answer
+        arrives afterwards; (5) nothing shown or held regresses. An older findings answer is ignored likewise."""
+        for newer in ("complete", "failed"):
+            with self.subTest(newer=newer):
+                out = self.run_page(r"""
+  await boot();
+  await fire();                                              // a poll: its summary request stays in flight
+  const older = open(r => r.url === SUMMARY)[0];
+  ids.openOnly.listeners.change[0]();                        // and an older findings request (a filter change)
+  const olderFindings = open(isFindings)[0];
+  await clickStart();
+  const duringPost = snapshot();
+  refreshRun();                                              // a poll that slipped in during the POST is a no-op
+  await flush();
+  const afterSlip = snapshot();
+  const NEWER = '""" + newer + r"""';
+  respond(open(r => r.url === RUN)[0], 202, { state: 'finished', pid: 5, previous_running: null,
+    previous_attempt: { scan_id: 'A', status: 'complete' }, attempt: NEWER === 'complete' ? B : F });
+  await flush();
+  respond(open(r => r.url === SUMMARY && r !== older)[0], 200, NEWER === 'complete' ? status(B, B) : status(F, A));
+  await flush();
+  const newerFindings = open(isFindings).filter(r => r !== olderFindings);
+  newerFindings.forEach(r => respond(r, 200, findings(222)));
+  if (!newerFindings.length) respond(olderFindings, 200, findings(111));   // no new report: it is the newest
+  await flush();
+  const before = snapshot();
+  respond(older, 200, status(A, A, { alive: true, pid: 3, started: 1.5, phase: 'walk', done: 0 }));
+  if (newerFindings.length) respond(olderFindings, 200, findings(111));
+  await flush();
+  const after = snapshot();
+  process.stdout.write(JSON.stringify({ duringPost, afterSlip, newerFindings: newerFindings.length, before, after }));
+""")
+                before, after = out["before"], out["after"]
+                self.assertEqual(after, dict(before, open=after["open"]))   # nothing shown or held regressed
+                during = out["duringPost"]
+                self.assertEqual(during["timers"], [])                       # polling paused during the POST
+                self.assertTrue(during["button"])
+                self.assertEqual(sorted(during["open"]), sorted([f"GET {s}" for s in (
+                    "/api/tracks/reconciliation/", "/api/tracks/reconciliation/findings/")]
+                    + ["POST /api/tracks/reconciliation/run/"]))
+                self.assertEqual(out["afterSlip"]["open"], during["open"])   # no new status request
+                self.assertEqual(after["open"], [])
+                self.assertIsNone(after["launch"])
+                self.assertFalse(after["button"])
+                self.assertEqual(len(after["timers"]), 1)                   # exactly one poll scheduled
+                if newer == "complete":
+                    self.assertEqual(after["scanId"], "B")
+                    self.assertIn("Latest completed scan B", after["summary"])
+                    self.assertIn("Scan B finished (complete)", after["message"])
+                    self.assertEqual(out["newerFindings"], 1)
+                    self.assertIn("222 findings", after["findings"])
+                else:
+                    self.assertEqual(after["scanId"], "A")
+                    self.assertIn("(F) did not complete: failed", after["summary"])
+                    self.assertIn("Scan F failed", after["message"])
+                self.assertNotIn("A scan is running", after["summary"] + after["message"])
+
+    def test_polling_resumes_after_a_refused_launch_and_after_an_unknown_outcome(self):
+        out = self.run_page(r"""
+  const result = {};
+  // A refusal (409 with the launcher's code): "Not started", polling resumes.
+  await boot();
+  await clickStart();
+  result.pausedRefused = [...timers.values()].length;
+  respond(open(r => r.url === RUN)[0], 409, { code: 'scan_running', error: 'A reconciliation scan is already running.' });
+  await flush();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(A, A));
+  await flush();
+  result.refused = snapshot();
+  await fire();
+  result.refusedPolls = open(r => r.url === SUMMARY).length;
+  respond(open(r => r.url === SUMMARY)[0], 200, status(A, A));
+  await flush();
+  // No answer (the connection failed): not "Not started"; watched from the status shown before; polling resumes.
+  await clickStart();
+  fail(open(r => r.url === RUN)[0]);
+  await flush();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(A, A));
+  await flush();
+  result.unknown = snapshot();
+  NOW += 31000;
+  await fire();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(A, A));
+  await flush();
+  result.unknownLater = snapshot();
+  await fire();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(B, B));
+  await flush();
+  result.unknownLate = snapshot();
+  // A proxy error without the launcher's code (502) is just as unknown.
+  open(isFindings).forEach(r => respond(r, 200, findings(1)));
+  await flush();
+  NOW += 60000;
+  await clickStart();
+  respond(open(r => r.url === RUN)[0], 502, {});
+  await flush();
+  respond(open(r => r.url === SUMMARY)[0], 200, status(B, B));
+  await flush();
+  result.gateway = snapshot();
+  process.stdout.write(JSON.stringify(result));
+""")
+        self.assertEqual(out["pausedRefused"], 0)
+        refused = out["refused"]
+        self.assertIn("Not started: A reconciliation scan is already running.", refused["message"])
+        self.assertIsNone(refused["launch"])
+        self.assertEqual((refused["button"], refused["timers"]), (False, [15000]))
+        self.assertEqual(out["refusedPolls"], 1)                             # the scheduled poll ran
+        unknown = out["unknown"]
+        self.assertNotIn("Not started", unknown["message"])
+        self.assertEqual(unknown["message"], "Starting the scan…")
+        self.assertEqual((unknown["button"], unknown["timers"]), (True, [2000]))
+        self.assertIn('"previous":"A"', unknown["launch"])
+        later = out["unknownLater"]
+        self.assertEqual(later["message"], NOT_CONFIRMED)                    # the 30-second rule still applies
+        self.assertEqual((later["button"], later["timers"]), (False, [15000]))
+        late = out["unknownLate"]
+        self.assertIn("Scan B finished (complete)", late["message"])        # a late result is still recognised
+        gateway = out["gateway"]
+        self.assertEqual(gateway["message"], "Starting the scan…")
+        self.assertIn('"previous":"B"', gateway["launch"])
+        self.assertEqual(gateway["timers"], [2000])
 
     def test_the_status_logic_under_node(self):
         """The page's own runView(), extracted from the template and run under Node: the button is disabled
@@ -589,49 +785,85 @@ class LiveLaunchTests(_Live):
         with self.stand_in():
             self.assertEqual(self.launch()[0], 202)                # the lock went with the process
 
-    def test_the_time_limit_ends_the_scan_and_its_ffprobe_and_keeps_the_previous_report(self):
-        """GNU timeout (limit shortened to 3 s) sends TERM to the scan's process group: the scan and the ffprobe
-        it started through the scanner's own audio_identity code both stop, timeout reports 124 (timed out),
-        the progress file stays behind as "not alive" (the page: stopped before it finished, never complete),
-        and the last complete report is kept."""
-        previous, pointer = self.publish_previous()
-        previous_attempt = reconciliation.scan_status()["last_attempt"]
-        probes = self.fake_ffprobe()
+    # ---- The time limit (Codex High): KILL to the whole process group, shortened from 2 h to seconds.
+    LIMIT = 5
+
+    def run_into_the_limit(self, mode, *, ffprobe_ignores_term):
+        """A scan (stand-in, through the scanner's real audio_identity code) whose ffprobe hangs, under the real
+        timeout prefix with a LIMIT-second limit. Returns the launch answer, the ffprobe pid, timeout's exit
+        status and the seconds from launch until it ended."""
+        probes = self.fake_ffprobe(ignore_term=ffprobe_ignores_term)
         sample = self.file("ROCK/sample.flac")
-        with self.stand_in("decode", settings.BASE_DIR, sample), mock.patch.object(launcher, "SCAN_TIME_LIMIT", "3s"):
+        began = time.monotonic()
+        with self.stand_in(mode, settings.BASE_DIR, sample), \
+                mock.patch.object(launcher, "SCAN_TIME_LIMIT", f"{self.LIMIT}s"):
             status, body = self.launch()
         self.assertEqual((status, body["state"]), (202, "running"))
-        self.assertTrue(wait_until(lambda: probes(), 15), "the scan never started ffprobe")
+        self.assertTrue(wait_until(lambda: probes(), self.LIMIT - 1), "the scan never started ffprobe")
         (probe,) = probes()
-        self.assertEqual(os.getpgid(probe), body["pid"])           # an ordinary child, in the scan's process group
-        self.assertEqual(self.proc.wait(60), 124)
-        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]) and not alive(probe), 10))
+        # the limit is reached while the scan and its ffprobe, an ordinary child in its process group, are active
+        self.assertEqual(os.getpgid(probe), body["pid"])
+        self.assertIsNone(self.proc.poll())
+        self.assertTrue(alive(body["scan_pid"]) and alive(probe))
+        code = self.proc.wait(60)
+        return body, probe, code, time.monotonic() - began
+
+    def assert_ended_by_the_limit(self, body, probe, code, elapsed, previous, pointer, previous_attempt):
+        # nothing of the scan is left, allowing only the moment a reparented process takes to be reaped
+        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]) and not alive(probe), 2),
+                        f"still alive after the limit: scan {alive(body['scan_pid'])}, ffprobe {alive(probe)}")
+        self.assertEqual(code, -signal.SIGKILL)                     # killed with its group: never a success status
+        self.assertLess(elapsed, self.LIMIT + 10)                   # at the limit, not after a grace period
+        self.assertFalse(reconciliation._lock_holder_alive(self.directory))      # the scan lock is free
         st = reconciliation.scan_status()
-        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))
-        self.assertEqual(st["last_attempt"], previous_attempt)
+        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))  # "stopped"
+        self.assertEqual(st["last_attempt"], previous_attempt)      # no attempt recorded, so none shown as complete
         self.assertEqual(st["latest"]["scan_id"], previous)
         self.assertEqual((self.directory / "latest.json").read_bytes(), pointer)
         with self.stand_in():
-            self.assertEqual(self.launch()[0], 202)                 # the lock went with the scan
+            self.assertEqual(self.launch()[0], 202)                 # a new scan can start
 
-    def test_a_scan_that_ignores_term_is_killed_with_its_ffprobe_after_the_grace_period(self):
-        """KILL escalation (shortened: 2 s limit, then 2 s) reaches the whole process group, the stuck scan and
-        its ffprobe alike (both ignore TERM), and the previous report is kept."""
+    def test_the_limit_kills_a_scan_and_its_ffprobe_that_ignores_term(self):
+        """The flaw Codex found: with TERM first, the scan exits at once, timeout exits with it (124), and a
+        TERM-ignoring ffprobe outlives both. KILL to the group ends them together."""
         previous, pointer = self.publish_previous()
-        probes = self.fake_ffprobe(ignore_term=True)
-        sample = self.file("ROCK/sample.flac")
-        with self.stand_in("stubborn", settings.BASE_DIR, sample), \
-                mock.patch.object(launcher, "SCAN_TIME_LIMIT", "2s"), mock.patch.object(launcher, "KILL_AFTER", "2s"):
-            status, body = self.launch()
-        self.assertEqual((status, body["state"]), (202, "running"))
-        self.assertTrue(wait_until(lambda: probes(), 15), "the scan never started ffprobe")
-        (probe,) = probes()
-        self.assertIn(self.proc.wait(60), (-signal.SIGKILL, 128 + signal.SIGKILL))   # timeout KILLs its group too
-        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]) and not alive(probe), 10))
+        previous_attempt = reconciliation.scan_status()["last_attempt"]
+        result = self.run_into_the_limit("decode", ffprobe_ignores_term=True)
+        self.assert_ended_by_the_limit(*result, previous, pointer, previous_attempt)
+
+    def test_the_limit_kills_a_scan_and_its_ffprobe_that_both_ignore_term(self):
+        previous, pointer = self.publish_previous()
+        previous_attempt = reconciliation.scan_status()["last_attempt"]
+        result = self.run_into_the_limit("stubborn", ffprobe_ignores_term=True)
+        self.assert_ended_by_the_limit(*result, previous, pointer, previous_attempt)
+
+    def test_a_scan_still_starting_at_the_limit_is_a_failed_launch_not_a_success(self):
+        """A limit reached before the scan showed anything: the request reports the killed process as a failed
+        launch (its exit status, never "running" or "finished"), and nothing is recorded."""
+        previous, pointer = self.publish_previous()
+        previous_attempt = reconciliation.scan_status()["last_attempt"]
+        with self.stand_in("slow"), mock.patch.object(launcher, "SCAN_TIME_LIMIT", "1s"):
+            status, body = self.launch(wait=30.0)
+        self.assertEqual((status, body["code"]), (500, "launch_failed"))
         st = reconciliation.scan_status()
-        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))
-        self.assertEqual(st["latest"]["scan_id"], previous)
+        self.assertEqual((st["last_attempt"], st["running"]), (previous_attempt, None))
         self.assertEqual((self.directory / "latest.json").read_bytes(), pointer)
+
+    def test_a_scan_that_finishes_before_the_limit_ends_normally(self):
+        """The real command, under the real prefix (limit shortened to 2 minutes): it completes, timeout exits 0
+        with it, and the new report is published."""
+        previous, _pointer = self.publish_previous()
+        self.track("ROCK/new.flac")
+        previous_attempt = reconciliation.scan_status()["last_attempt"]
+        with mock.patch.object(launcher, "SCAN_TIME_LIMIT", "120s"):
+            status, body = self.launch()
+        self.assertEqual(status, 202, body)
+        self.assertEqual(self.proc.wait(120), 0)
+        self.assertTrue(wait_until(lambda: self.finished(previous_attempt), 10), reconciliation.scan_status())
+        st = reconciliation.scan_status()
+        self.assertEqual(st["last_attempt"]["status"], "complete")
+        self.assertNotEqual(st["latest"]["scan_id"], previous)
+        self.assertFalse(reconciliation._lock_holder_alive(self.directory))
 
     def test_end_to_end_the_real_command_completes_and_the_summary_shows_it(self):
         previous, _pointer = self.publish_previous()

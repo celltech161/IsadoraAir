@@ -104,6 +104,11 @@ const TYPE_TEXT = {
   protected: 'Protected (other subsystem)', in_delivery: 'May still be arriving', uncertain: 'Uncertain',
 };
 let page = 1, pages = 1, debounce = null, scanId = null;
+// Generations: each status or findings request takes the next number, and its answer is committed (rendered,
+// or stored in scanId, launch, the message, the button) only if no newer request, or a launch, has been
+// started since. So an older response that arrives late can never overwrite a newer one.
+let statusGen = 0, findingsGen = 0;
+const STALE = Symbol('stale');
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -133,7 +138,7 @@ function trackLink(track) {
   return a;
 }
 
-async function loadSummary() {
+async function loadSummary(gen) {
   const box = document.getElementById('scanStatus');
   let resp, data;
   try {
@@ -142,6 +147,7 @@ async function loadSummary() {
   } catch (e) {
     resp = { ok: false }; data = {};
   }
+  if (gen !== statusGen) return STALE;      // superseded while in flight: commit nothing
   box.replaceChildren();
   if (!resp.ok) { box.append(el('p', data.error || 'Could not load the scan status.', 'rc-bad')); return null; }
   const st = data.status || {}, report = data.report;
@@ -188,7 +194,7 @@ async function loadSummary() {
 // ---- Run reconciliation. The server starts manage.py reconcile_library; everything shown about it comes from
 // the scan's own status (the summary API above), so a refresh or a second tab sees the same scan, and leaving
 // the page does not stop it. `launch` is only this page's memory of the scan it started.
-let launch = null, starting = false, pollTimer = null, shownScan;
+let launch = null, starting = false, pollTimer = null, shownScan, lastStatus = null;
 
 // runView:begin -- pure: the button and the message, from the status and this page's launch (tested under Node).
 // `launch` holds what existed before it (the last attempt's scan_id and the progress file's identity, both
@@ -237,7 +243,13 @@ function runView(st, launch, now) {
 // runView:end
 
 async function refreshRun() {
-  const st = await loadSummary();
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  if (starting) return;                      // paused while the launch request is underway; it resumes polling
+  const gen = ++statusGen;
+  const st = await loadSummary(gen);
+  if (st === STALE || gen !== statusGen) return;   // a newer refresh, or a launch, owns the page now
+  lastStatus = st;
   observe(st, launch, Date.now());
   const view = runView(st, launch, Date.now());
   document.getElementById('runBtn').disabled = view.busy || starting;
@@ -247,7 +259,6 @@ async function refreshRun() {
   if (view.done) launch = null;
   if (shownScan !== undefined && scanId !== shownScan) { page = 1; loadFindings(); }   // a new complete report, once
   shownScan = scanId;
-  clearTimeout(pollTimer);
   pollTimer = setTimeout(refreshRun, view.busy ? 2000 : 15000);
 }
 
@@ -257,6 +268,10 @@ function confirmRun() {
   start.addEventListener('click', async () => {
     if (starting) return;                    // one request, however often it is clicked
     starting = true;
+    statusGen += 1;                          // status answers already in flight are stale now: none is committed
+    clearTimeout(pollTimer);                 // and polling pauses until the launch has its answer
+    pollTimer = null;
+    const before = lastStatus;               // the last status this page showed, before the launch
     start.disabled = true;
     document.getElementById('runBtn').disabled = true;
     document.getElementById('actionPanel').hidden = true;
@@ -267,20 +282,30 @@ function confirmRun() {
     try {
       result = await postJSON('/api/tracks/reconciliation/run/', {});
     } catch (e) {
-      result = { resp: { ok: false, status: 0 }, data: { error: 'The request did not reach the server.' } };
+      result = { resp: { ok: false, status: 0 }, data: {} };
     }
     starting = false;
+    // No answer, or a server error without the launcher's own refusal code: the scan may or may not have
+    // started. Not reported as "not started"; watched like a 202 "starting", from the status shown before.
+    const unknown = !result.resp.ok && !result.data.code && (result.resp.status === 0 || result.resp.status >= 500);
     if (result.resp.ok) {
       const prev = result.data.previous_attempt;
       launch = { previous: prev ? prev.scan_id : null, previousRunning: runKey(result.data.previous_running),
                  seen: Date.now(), confirmed: result.data.state === 'running' };
+    } else if (unknown && before) {
+      launch = { previous: before.last_attempt ? before.last_attempt.scan_id : null,
+                 previousRunning: runKey(before.running), seen: Date.now(), confirmed: false };
     } else {
       launch = null;
     }
-    await refreshRun();
-    if (!result.resp.ok) {
+    await refreshRun();                      // resumes polling, whatever the answer was
+    if (!result.resp.ok && !unknown) {
       msg.textContent = 'Not started: ' + (result.data.error || `HTTP ${result.resp.status}`);
       msg.className = result.resp.status === 409 ? 'rc-warn' : 'rc-bad';
+    } else if (unknown && !launch) {
+      msg.textContent = 'No answer from the server, so whether the scan started is not known. The scan status ' +
+                        'here updates automatically; check it before trying again.';
+      msg.className = 'rc-warn';
     }
   });
   showPanel([el('p', 'Run a reconciliation scan now? It only reads the Library: no Track, file or setting is ' +
@@ -510,8 +535,15 @@ async function loadFindings() {
   if (t) params.set('type', t);
   if (q) params.set('q', q);
   if (document.getElementById('openOnly').checked) params.set('open', '1');
-  const resp = await fetch('/api/tracks/reconciliation/findings/?' + params);
-  const data = await resp.json().catch(() => ({}));
+  const gen = ++findingsGen;
+  let resp, data;
+  try {
+    resp = await fetch('/api/tracks/reconciliation/findings/?' + params);
+    data = await resp.json().catch(() => ({}));
+  } catch (e) {
+    resp = { ok: false }; data = {};
+  }
+  if (gen !== findingsGen) return;          // a newer findings request (new scan, filter or page) supersedes it
   const list = document.getElementById('findings');
   list.replaceChildren();
   if (!resp.ok) { list.append(el('p', data.error || 'Could not load findings.', 'rc-bad')); return; }
