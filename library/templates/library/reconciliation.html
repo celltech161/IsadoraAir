@@ -56,6 +56,8 @@
   .rc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .rc-pager { display: flex; justify-content: center; align-items: center; gap: 0.75rem; margin: 0.75rem 0; font-size: 0.8rem; }
   .rc-dialog { border-color: var(--accent); }
+  .rc-run { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin-bottom: 0.75rem; font-size: 0.82rem; }
+  .rc-run .rc-btn { font-size: 0.82rem; padding: 0.4rem 0.8rem; }
   /* Narrow screens: tables scroll inside .rc-table-wrap; no column (and so no action) is ever hidden. */
 </style>
 {% endblock %}
@@ -66,6 +68,10 @@
   <a href="{% url 'library:library' %}">&larr; Library</a>
 </div>
 
+<div class="rc-run">
+  <button class="rc-btn" id="runBtn" type="button" disabled>Run reconciliation</button>
+  <span id="runStatus" role="status" aria-live="polite"></span>
+</div>
 <div class="rc-box" id="scanStatus" role="status" aria-live="polite">Loading…</div>
 <div class="rc-box rc-dialog" id="actionPanel" hidden></div>
 <div class="rc-chips" id="counts" aria-label="Findings by type"></div>
@@ -129,10 +135,15 @@ function trackLink(track) {
 
 async function loadSummary() {
   const box = document.getElementById('scanStatus');
-  const resp = await fetch('/api/tracks/reconciliation/');
-  const data = await resp.json().catch(() => ({}));
+  let resp, data;
+  try {
+    resp = await fetch('/api/tracks/reconciliation/');
+    data = await resp.json().catch(() => ({}));
+  } catch (e) {
+    resp = { ok: false }; data = {};
+  }
   box.replaceChildren();
-  if (!resp.ok) { box.append(el('p', data.error || 'Could not load the scan status.', 'rc-bad')); return; }
+  if (!resp.ok) { box.append(el('p', data.error || 'Could not load the scan status.', 'rc-bad')); return null; }
   const st = data.status || {}, report = data.report;
   if (st.running) {
     box.append(el('p', st.running.alive
@@ -170,8 +181,93 @@ async function loadSummary() {
     });
     markChips();
   }
-  box.append(el('p', 'Scans are read only. Run one with: manage.py reconcile_library (as the station\'s service account).', 'rc-muted'));
+  box.append(el('p', 'Scans are read only: they change no Track, file or setting, and write only a new report.', 'rc-muted'));
+  return st;
 }
+
+// ---- Run reconciliation. The server starts manage.py reconcile_library; everything shown about it comes from
+// the scan's own status (the summary API above), so a refresh or a second tab sees the same scan, and leaving
+// the page does not stop it. `launch` is only this page's memory of the scan it started.
+let launch = null, starting = false, pollTimer = null, shownScan;
+
+// runView:begin -- pure: the button and the message, from the status and this page's launch (tested under Node)
+const START_GRACE_MS = 30000;      // a started process must show progress or a result within this
+function runView(st, launch, now) {
+  if (st === null) return { busy: true, done: false, cls: 'rc-bad', text: 'The scan status cannot be determined right now.' };
+  const running = st.running || null, attempt = st.last_attempt || null;
+  if (running && running.alive) {
+    return { busy: true, done: false, cls: '', text: `A scan is running (${running.phase}, ${running.done} done).` };
+  }
+  if (!launch) return { busy: false, done: false, cls: '', text: '' };
+  if (attempt && attempt.scan_id !== launch.previous) {
+    if (attempt.status === 'complete' || attempt.status === 'suspect') {
+      return { busy: false, done: true, refresh: true, cls: attempt.status === 'suspect' ? 'rc-warn' : '',
+               text: `Scan ${attempt.scan_id} finished (${attempt.status}). The summary and findings below are from it.` };
+    }
+    return { busy: false, done: true, cls: 'rc-bad',
+             text: `Scan ${attempt.scan_id} failed. Nothing was replaced: the findings below are still from the previous complete scan.` };
+  }
+  if (running && running.pid === launch.pid) {
+    return { busy: false, done: true, cls: 'rc-warn',
+             text: 'The scan was interrupted before it finished (for example, the web application restarted). Nothing was replaced.' };
+  }
+  if (now - launch.seen < START_GRACE_MS) return { busy: true, done: false, cls: '', text: 'Starting the scan…' };
+  return { busy: false, done: true, cls: 'rc-bad',
+           text: 'The scan stopped without a report. Nothing was replaced; see the web application\'s journal.' };
+}
+// runView:end
+
+async function refreshRun() {
+  const st = await loadSummary();
+  if (launch && st && st.running && st.running.alive && st.running.pid === launch.pid) launch.seen = Date.now();
+  const view = runView(st, launch, Date.now());
+  document.getElementById('runBtn').disabled = view.busy || starting;
+  const msg = document.getElementById('runStatus');
+  msg.textContent = view.text;
+  msg.className = view.cls;
+  if (view.done) launch = null;
+  if (shownScan !== undefined && scanId !== shownScan) { page = 1; loadFindings(); }   // a new complete report, once
+  shownScan = scanId;
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(refreshRun, view.busy ? 2000 : 15000);
+}
+
+function confirmRun() {
+  const start = el('button', 'Start read-only scan', 'rc-btn');
+  start.type = 'button';
+  start.addEventListener('click', async () => {
+    if (starting) return;                    // one request, however often it is clicked
+    starting = true;
+    start.disabled = true;
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('actionPanel').hidden = true;
+    const msg = document.getElementById('runStatus');
+    msg.textContent = 'Starting the scan…';
+    msg.className = '';
+    let result;
+    try {
+      result = await postJSON('/api/tracks/reconciliation/run/', {});
+    } catch (e) {
+      result = { resp: { ok: false, status: 0 }, data: { error: 'The request did not reach the server.' } };
+    }
+    starting = false;
+    if (result.resp.ok) {
+      const prev = result.data.previous_attempt;
+      launch = { pid: result.data.pid, previous: prev ? prev.scan_id : null, seen: Date.now() };
+    } else {
+      launch = null;
+    }
+    await refreshRun();
+    if (!result.resp.ok) {
+      msg.textContent = 'Not started: ' + (result.data.error || `HTTP ${result.resp.status}`);
+      msg.className = result.resp.status === 409 ? 'rc-warn' : 'rc-bad';
+    }
+  });
+  showPanel([el('p', 'Run a reconciliation scan now? It only reads the Library: no Track, file or setting is ' +
+                     'changed, and it writes a new report. It can take several minutes; you can leave this page.'),
+             start, closeButton('Cancel')]);
+}
+document.getElementById('runBtn').addEventListener('click', confirmRun);
 
 function setType(t) {
   document.getElementById('typeFilter').value = t;
@@ -415,7 +511,7 @@ document.getElementById('search').addEventListener('input', () => {
 });
 document.getElementById('prevBtn').addEventListener('click', () => { page -= 1; loadFindings(); });
 document.getElementById('nextBtn').addEventListener('click', () => { page += 1; loadFindings(); });
-loadSummary();
+refreshRun();
 loadFindings();
 </script>
 {% endblock %}

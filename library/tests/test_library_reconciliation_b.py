@@ -749,12 +749,13 @@ class UnregisteredDuplicateVisibilityTests(_Recon):
         self.assertIn("unregistered — requires review", html)
         self.assertIn("does not mean they should be ", html)
         self.assertIn("File review only", html)
-        # The page calls exactly the existing reconciliation endpoints: no import, delete, cleanup or merge action.
+        # The page calls exactly the reconciliation endpoints: no import, delete, cleanup or merge action. (3.11:
+        # plus Run reconciliation, which starts the same read-only scan.)
         endpoints = set(re.findall(r"'(/api/[^'?]+)", html))
         self.assertEqual(endpoints, {
             "/api/tracks/reconciliation/", "/api/tracks/reconciliation/findings/",
             "/api/tracks/reconciliation/relink/preview/", "/api/tracks/reconciliation/relink/apply/",
-            "/api/tracks/reconciliation/duplicates/not-duplicate/"})
+            "/api/tracks/reconciliation/duplicates/not-duplicate/", "/api/tracks/reconciliation/run/"})
 
 
 class _RelinkSetup:

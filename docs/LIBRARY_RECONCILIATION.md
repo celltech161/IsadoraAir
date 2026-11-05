@@ -191,6 +191,75 @@ running. Review the findings at **Library → Reconciliation** (`/library/reconc
 * **A relinkable finding** shows "Review relink…": the exact change, what is kept, and the warnings; then
   "Confirm relink"; then the result.
 
+### Run reconciliation from the page (3.11, minimal launcher)
+
+**Run reconciliation** (track managers only) starts the same command, `manage.py reconcile_library`, with its
+defaults. It adds no service, job record, queue or state of its own: the scan keeps its lock, progress file,
+reports and status, and the page shows those.
+
+* **The request.** `POST /api/tracks/reconciliation/run/`, CSRF-protected, `library.manage_tracks`. Nothing in
+  the request is used.
+* **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 <venv python> <checkout>/manage.py
+  reconcile_library`, without a shell. It gets the web application's own environment and working directory, as
+  the CD-ripping launcher does (`library/cd_ripping.py`).
+* **How it runs.** As the web application's service account, in its own session, so the request, the browser
+  and the Gunicorn worker can all go away without stopping it. Its output is discarded; errors reach
+  Gunicorn's journal.
+* **The answer is never a guess.** The request waits up to 10 s for its own process:
+
+  | What the process did | Answer |
+  |---|---|
+  | holds the scan lock and has written `running.json` with its pid | 202 `running` |
+  | finished already | 202 `finished`, naming the new attempt (complete, suspect or failed) |
+  | exited without scanning, another scan holding the lock | 409 `scan_running` |
+  | exited without scanning, lock free | 500 `launch_failed`, with its exit status |
+  | none of the above within 10 s | 202 `starting`: launched, not yet confirmed |
+
+  A 202 never means the scan completed.
+* **Concurrency.**
+  * A scan already holding the lock, whether started here or from the command line, refuses the request with
+    409, and nothing is started.
+  * The launch runs under `.launch.lock`, an empty lock file held only by the request, so a second request at
+    the same moment gets 409 `scan_starting`.
+  * Whatever happens, the scanner's own lock lets only one scan run, and a command-line scan started during a
+    page scan is refused as before.
+* **On the page.**
+  * The button is disabled while a scan runs or starts. Progress comes from the summary API every 2 s while
+    busy, every 15 s otherwise.
+  * Completion is the new attempt in `last_attempt.json`. A complete or suspect scan reloads the summary and
+    the findings once.
+  * A failed scan says so: nothing was replaced, and `latest.json` and the findings stay on the previous
+    complete scan.
+  * A started process that leaves its progress file behind without a report was interrupted.
+  * One that shows neither progress nor a report within 30 s stopped without a report.
+  * Closing or reloading the page does not affect the scan. After a reload, the page shows a running scan from
+    the same status as any other page.
+* **Gunicorn restart.** The scan is a process of Gunicorn's service (`KillMode=control-group`, the default).
+  `systemctl restart isadoraair-gunicorn` therefore stops it with SIGTERM, and so does an Update Center install
+  that restarts Gunicorn. The scan then ends without a report:
+  * its lock is released;
+  * its `running.json` stays behind, shown as "interrupted";
+  * `latest.json` and the findings are unchanged;
+  * it is never resumed or retried. Run it again.
+
+  A Gunicorn worker that only exits or is recycled does not stop the scan (its own session).
+
+**Limitations of the minimal launcher** (each would need infrastructure it deliberately does not have):
+* **Tied to Gunicorn.** A scan lives only as long as Gunicorn's service. Any restart, including an install,
+  interrupts it; nothing retries.
+* **No time limit or watchdog.** A scan stalled on hung storage holds the lock until it ends; the scanner's
+  own per-decode timeouts still apply. Ending it means restarting Gunicorn, or stopping the process as the
+  service account. A process stuck in uninterruptible I/O may not end even then.
+* **Shares Gunicorn's resource limits.** It runs at `nice` 10 and idle I/O priority, but inside Gunicorn's
+  control group, with no CPU quota or memory cap of its own.
+* **No job record.** Who started a scan is logged (Gunicorn's journal), not stored. The page links a launch
+  to its result only by the next attempt and its own pid; a page that was closed or reloaded shows the shared
+  status instead.
+* **Zombies until reaped.** A finished scan process stays a zombie until the same Gunicorn worker next starts
+  a subprocess, or exits (as with the CD-ripping launcher). A zombie holds no lock and no file.
+* **A short wait in the request.** The request occupies one of Gunicorn's three sync workers for up to 10 s
+  while it waits for its own process.
+
 ## Measured (guarded sandbox, `measure_reconciliation_performance`)
 
 **Setup:** 20,000 Tracks and 24,050 small files.

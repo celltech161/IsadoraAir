@@ -1804,6 +1804,23 @@ def api_reconciliation_summary(request):
     return JsonResponse(body)
 
 
+@require_http_methods(["POST"])
+def api_reconciliation_run(request):
+    """Run Reconciliation (library.manage_tracks; CSRF-protected): start the read-only ``reconcile_library``
+    command with its defaults. Nothing in the request is used: no argument, path or budget can be chosen.
+    202 once this request's own scan process is running (or has already finished); 409 if a scan is running
+    or being started; 500 if it could not start. See library_reconciliation_launch."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_reconciliation_launch as launcher
+    try:
+        result = launcher.launch(username=request.user.get_username())
+    except launcher.LaunchRefused as exc:
+        return JsonResponse({"error": exc.message, "code": exc.code}, status=exc.status)
+    return JsonResponse(result, status=202)
+
+
 def _finding_matches(finding, q):
     if not q:
         return True

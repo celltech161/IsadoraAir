@@ -50,6 +50,7 @@ urlpatterns = [
     path('api/tracks/bulk/preview/', views.api_track_bulk_edit_preview, name='api-track-bulk-edit-preview'),
     path('api/tracks/bulk/apply/', views.api_track_bulk_edit_apply, name='api-track-bulk-edit-apply'),
     path('api/tracks/reconciliation/', views.api_reconciliation_summary, name='api-reconciliation-summary'),
+    path('api/tracks/reconciliation/run/', views.api_reconciliation_run, name='api-reconciliation-run'),
     path('api/tracks/reconciliation/findings/', views.api_reconciliation_findings,
          name='api-reconciliation-findings'),
     path('api/tracks/reconciliation/duplicates/not-duplicate/', views.api_reconciliation_not_duplicate,
