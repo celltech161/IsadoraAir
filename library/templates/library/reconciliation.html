@@ -201,6 +201,8 @@ let launch = null, starting = false, pollTimer = null, shownScan, lastStatus = n
 // recorded by the server under its launch lock), so an older report or an older progress file is never taken
 // for this launch's. `seen` is the last time there was evidence of a new scan; `confirmed` that there was any.
 const START_GRACE_MS = 30000;      // a launch must show a new scan or a new result within this
+const UNKNOWN_LAUNCH_TEXT = 'No answer from the server, so whether the scan started is not known. The scan status ' +
+                            'here updates automatically; check it before trying again.';
 function runKey(running) { return running ? `${running.pid}:${running.started}` : null; }
 function observe(st, launch, now) {
   if (launch && st && st.running && st.running.alive && runKey(st.running) !== launch.previousRunning) {
@@ -229,7 +231,9 @@ function runView(st, launch, now) {
                    'its two-hour limit). Nothing was replaced: the findings below are still from the previous complete scan.' };
   }
   if (now - launch.seen < START_GRACE_MS) {
-    return { busy: true, done: false, cls: '', text: launch.confirmed ? 'Waiting for the scan’s result…' : 'Starting the scan…' };
+    return { busy: true, done: false, cls: launch.unknown ? 'rc-warn' : '',
+             text: launch.confirmed ? 'Waiting for the scan’s result…'
+                                    : launch.unknown ? UNKNOWN_LAUNCH_TEXT : 'Starting the scan…' };
   }
   // No evidence either way: say so, without claiming a failure. Kept as this page's launch, so a late scan or
   // result is still recognised; a retry is safe (the scanner's lock allows one scan at a time).
@@ -260,6 +264,7 @@ async function refreshRun() {
   if (shownScan !== undefined && scanId !== shownScan) { page = 1; loadFindings(); }   // a new complete report, once
   shownScan = scanId;
   pollTimer = setTimeout(refreshRun, view.busy ? 2000 : 15000);
+  return view;
 }
 
 function confirmRun() {
@@ -294,17 +299,17 @@ function confirmRun() {
                  seen: Date.now(), confirmed: result.data.state === 'running' };
     } else if (unknown && before) {
       launch = { previous: before.last_attempt ? before.last_attempt.scan_id : null,
-                 previousRunning: runKey(before.running), seen: Date.now(), confirmed: false };
+                 previousRunning: runKey(before.running), seen: Date.now(), confirmed: false, unknown: true };
     } else {
       launch = null;
     }
-    await refreshRun();                      // resumes polling, whatever the answer was
+    const refreshed = await refreshRun();    // resumes polling, whatever the answer was
+    const definitive = refreshed && (refreshed.done || (lastStatus && lastStatus.running && lastStatus.running.alive));
     if (!result.resp.ok && !unknown) {
       msg.textContent = 'Not started: ' + (result.data.error || `HTTP ${result.resp.status}`);
       msg.className = result.resp.status === 409 ? 'rc-warn' : 'rc-bad';
-    } else if (unknown && !launch) {
-      msg.textContent = 'No answer from the server, so whether the scan started is not known. The scan status ' +
-                        'here updates automatically; check it before trying again.';
+    } else if (unknown && !launch && !definitive) {
+      msg.textContent = UNKNOWN_LAUNCH_TEXT;
       msg.className = 'rc-warn';
     }
   });

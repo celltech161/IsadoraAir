@@ -32,6 +32,8 @@ from library.tests.test_library_reconciliation_b import _ReconFixture
 
 User = get_user_model()
 NOT_CONFIRMED = "Start not confirmed. No scan activity or result was detected. Check status before trying again."
+UNKNOWN_OUTCOME = ("No answer from the server, so whether the scan started is not known. The scan status here "
+                   "updates automatically; check it before trying again.")
 RUN = "library:api-reconciliation-run"
 TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "library" / "reconciliation.html"
 
@@ -471,7 +473,7 @@ class PageTests(_Http):
         self.assertEqual(out["refusedPolls"], 1)                             # the scheduled poll ran
         unknown = out["unknown"]
         self.assertNotIn("Not started", unknown["message"])
-        self.assertEqual(unknown["message"], "Starting the scan…")
+        self.assertEqual(unknown["message"], UNKNOWN_OUTCOME)
         self.assertEqual((unknown["button"], unknown["timers"]), (True, [2000]))
         self.assertIn('"previous":"A"', unknown["launch"])
         later = out["unknownLater"]
@@ -480,9 +482,45 @@ class PageTests(_Http):
         late = out["unknownLate"]
         self.assertIn("Scan B finished (complete)", late["message"])        # a late result is still recognised
         gateway = out["gateway"]
-        self.assertEqual(gateway["message"], "Starting the scan…")
+        self.assertEqual(gateway["message"], UNKNOWN_OUTCOME)
         self.assertIn('"previous":"B"', gateway["launch"])
         self.assertEqual(gateway["timers"], [2000])
+
+    def test_an_unknown_launch_answer_never_overwrites_a_definitive_refresh(self):
+        """A network rejection or unstructured proxy error is older than the status refresh it triggers. If that
+        refresh proves completion or failure, its terminal result wins; the unknown-outcome fallback is used only
+        when the refresh still shows exactly the pre-launch state."""
+        for outcome in ("network_then_complete", "proxy_then_failed", "network_without_new_evidence"):
+            with self.subTest(outcome=outcome):
+                out = self.run_page(r"""
+  await boot();
+  await clickStart();
+  const OUTCOME = '""" + outcome + r"""';
+  const post = open(r => r.url === RUN)[0];
+  if (OUTCOME.startsWith('network')) fail(post); else respond(post, 502, {});
+  await flush();
+  const refreshed = open(r => r.url === SUMMARY)[0];
+  respond(refreshed, 200, OUTCOME === 'network_then_complete' ? status(B, B)
+                        : OUTCOME === 'proxy_then_failed' ? status(F, A) : status(A, A));
+  await flush();
+  open(isFindings).forEach(r => respond(r, 200, findings(222)));
+  await flush();
+  process.stdout.write(JSON.stringify(snapshot()));
+""")
+                if outcome == "network_then_complete":
+                    self.assertIn("Scan B finished (complete)", out["message"])
+                    self.assertIn("Latest completed scan B", out["summary"])
+                    self.assertIsNone(out["launch"])
+                elif outcome == "proxy_then_failed":
+                    self.assertIn("Scan F failed", out["message"])
+                    self.assertIn("(F) did not complete: failed", out["summary"])
+                    self.assertIsNone(out["launch"])
+                else:
+                    self.assertEqual(out["message"], UNKNOWN_OUTCOME)
+                    self.assertIn('"previous":"A"', out["launch"])
+                if outcome != "network_without_new_evidence":
+                    self.assertNotIn("whether the scan started is not known", out["message"])
+                self.assertEqual(len(out["timers"]), 1)
 
     def test_the_status_logic_under_node(self):
         """The page's own runView(), extracted from the template and run under Node: the button is disabled
