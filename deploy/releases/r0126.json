@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0126",
+  "previous_release_id": "r0125",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 3.11 minimal browser-initiated Library Reconciliation launcher: authorized Track managers can start the existing read-only scanner through a fixed asynchronous command, with bounded launch confirmation, a two-hour GNU timeout, scanner-lock arbitration and race-safe status reporting. Restart Gunicorn only; no migration, static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
