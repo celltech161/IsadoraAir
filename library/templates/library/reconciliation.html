@@ -190,8 +190,18 @@ async function loadSummary() {
 // the page does not stop it. `launch` is only this page's memory of the scan it started.
 let launch = null, starting = false, pollTimer = null, shownScan;
 
-// runView:begin -- pure: the button and the message, from the status and this page's launch (tested under Node)
-const START_GRACE_MS = 30000;      // a started process must show progress or a result within this
+// runView:begin -- pure: the button and the message, from the status and this page's launch (tested under Node).
+// `launch` holds what existed before it (the last attempt's scan_id and the progress file's identity, both
+// recorded by the server under its launch lock), so an older report or an older progress file is never taken
+// for this launch's. `seen` is the last time there was evidence of a new scan; `confirmed` that there was any.
+const START_GRACE_MS = 30000;      // a launch must show a new scan or a new result within this
+function runKey(running) { return running ? `${running.pid}:${running.started}` : null; }
+function observe(st, launch, now) {
+  if (launch && st && st.running && st.running.alive && runKey(st.running) !== launch.previousRunning) {
+    launch.seen = now;
+    launch.confirmed = true;
+  }
+}
 function runView(st, launch, now) {
   if (st === null) return { busy: true, done: false, cls: 'rc-bad', text: 'The scan status cannot be determined right now.' };
   const running = st.running || null, attempt = st.last_attempt || null;
@@ -207,19 +217,28 @@ function runView(st, launch, now) {
     return { busy: false, done: true, cls: 'rc-bad',
              text: `Scan ${attempt.scan_id} failed. Nothing was replaced: the findings below are still from the previous complete scan.` };
   }
-  if (running && running.pid === launch.pid) {
+  if (running && runKey(running) !== launch.previousRunning) {
     return { busy: false, done: true, cls: 'rc-warn',
-             text: 'The scan was interrupted before it finished (for example, the web application restarted). Nothing was replaced.' };
+             text: 'The scan stopped before it finished (for example, the web application restarted, or the scan reached ' +
+                   'its two-hour limit). Nothing was replaced: the findings below are still from the previous complete scan.' };
   }
-  if (now - launch.seen < START_GRACE_MS) return { busy: true, done: false, cls: '', text: 'Starting the scan…' };
-  return { busy: false, done: true, cls: 'rc-bad',
-           text: 'The scan stopped without a report. Nothing was replaced; see the web application\'s journal.' };
+  if (now - launch.seen < START_GRACE_MS) {
+    return { busy: true, done: false, cls: '', text: launch.confirmed ? 'Waiting for the scan’s result…' : 'Starting the scan…' };
+  }
+  // No evidence either way: say so, without claiming a failure. Kept as this page's launch, so a late scan or
+  // result is still recognised; a retry is safe (the scanner's lock allows one scan at a time).
+  if (launch.confirmed) {
+    return { busy: false, done: false, cls: 'rc-warn',
+             text: 'The scan is no longer running and no new result was detected. Nothing was replaced. Check status before trying again.' };
+  }
+  return { busy: false, done: false, cls: 'rc-warn',
+           text: 'Start not confirmed. No scan activity or result was detected. Check status before trying again.' };
 }
 // runView:end
 
 async function refreshRun() {
   const st = await loadSummary();
-  if (launch && st && st.running && st.running.alive && st.running.pid === launch.pid) launch.seen = Date.now();
+  observe(st, launch, Date.now());
   const view = runView(st, launch, Date.now());
   document.getElementById('runBtn').disabled = view.busy || starting;
   const msg = document.getElementById('runStatus');
@@ -253,7 +272,8 @@ function confirmRun() {
     starting = false;
     if (result.resp.ok) {
       const prev = result.data.previous_attempt;
-      launch = { pid: result.data.pid, previous: prev ? prev.scan_id : null, seen: Date.now() };
+      launch = { previous: prev ? prev.scan_id : null, previousRunning: runKey(result.data.previous_running),
+                 seen: Date.now(), confirmed: result.data.state === 'running' };
     } else {
       launch = null;
     }

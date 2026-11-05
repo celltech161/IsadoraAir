@@ -2,8 +2,10 @@
 
 The scanner itself is covered by test_library_reconciliation_b; these tests cover only what the launcher adds:
 who may start a scan, CSRF, the fixed command, a refused or failed launch, simultaneous requests, the scan
-lock shared with the command line, the page's status logic, a completed scan, an interrupted one, and that the
-previous report is kept. Real child processes run against the runner's isolated roots and test database."""
+lock shared with the command line, the two-second confirmation, the page's status logic (including "Start not
+confirmed"), a completed scan, an interrupted one, the GNU timeout limit reaching the scan's ffprobe, and that the
+previous report is kept. Real child processes run against the runner's isolated roots and test database; time
+limits are shortened for them (seconds, not hours), and nothing touches station media."""
 import json
 import os
 import shutil
@@ -29,13 +31,16 @@ from library.services import library_reconciliation_launch as launcher
 from library.tests.test_library_reconciliation_b import _ReconFixture
 
 User = get_user_model()
+NOT_CONFIRMED = "Start not confirmed. No scan activity or result was detected. Check status before trying again."
 RUN = "library:api-reconciliation-run"
 TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "library" / "reconciliation.html"
 
 # A stand-in scan: takes the REAL scan lock (or exits 1, as reconcile_library does when it is busy), writes the
-# progress file the scanner writes, then holds or exits. Used where timing must be deterministic.
+# progress file the scanner writes, then holds or exits. Used where timing must be deterministic. "decode" runs
+# the scanner's real audio_identity.compute() (which starts ffprobe as an ordinary child); "stubborn" does the
+# same but ignores SIGTERM, as a scan that cannot stop would (its ffprobe inherits that).
 STAND_IN = r'''
-import fcntl, json, os, sys, time
+import fcntl, json, os, signal, sys, time
 reports, mode = sys.argv[1], sys.argv[2]
 d = os.path.join(reports, "library-reconciliation")
 os.makedirs(d, exist_ok=True)
@@ -49,6 +54,12 @@ tmp = os.path.join(d, ".running.json.tmp")
 with open(tmp, "w") as handle:
     json.dump({"pid": os.getpid(), "started": time.time(), "phase": "walk", "done": 0, "heartbeat": time.time()}, handle)
 os.replace(tmp, os.path.join(d, "running.json"))
+if mode == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if mode in ("decode", "stubborn"):
+    sys.path.insert(0, sys.argv[3])
+    from library.services import audio_identity
+    audio_identity.compute(sys.argv[4])
 while mode == "hold":
     time.sleep(0.5)
 '''
@@ -159,14 +170,49 @@ class LaunchTests(_Http):
                              content_type="application/json", HTTP_X_FORWARDED_FOR="10.0.0.1")
         (argv, kwargs), = self.calls
         manage_py = str(Path(settings.BASE_DIR) / "manage.py")
-        self.assertEqual(argv, ["/usr/bin/nice", "-n", "10", "/usr/bin/ionice", "-c", "3", sys.executable, manage_py,
-                                "reconcile_library"])
+        self.assertEqual(argv, ["/usr/bin/nice", "-n", "10", "/usr/bin/ionice", "-c", "3",
+                                "/usr/bin/gnutimeout", "--signal=TERM", "--kill-after=30s", "2h",
+                                sys.executable, manage_py, "reconcile_library"])
         self.assertEqual(argv, launcher.scan_command())
         self.assertNotIn("shell", kwargs)                          # an argv list, never a shell string
         self.assertEqual(kwargs["cwd"], str(settings.BASE_DIR))
         self.assertTrue(kwargs["start_new_session"])               # not in the request worker's process group
         self.assertEqual(kwargs["env"], dict(os.environ))          # the server's own environment, nothing added
         self.assertEqual((kwargs["stdin"], kwargs["stdout"]), (subprocess.DEVNULL, subprocess.DEVNULL))
+
+    def test_the_time_limit_is_gnu_timeout(self):
+        """GNU's KILL escalation reaches the scan's whole process group; uutils' timeout (Ubuntu's
+        /usr/bin/timeout since 25.10) sends it only to the direct child."""
+        version = subprocess.run([launcher.TIMEOUT, "--version"], capture_output=True, text=True, timeout=10).stdout
+        self.assertIn("GNU coreutils", version)
+
+    def test_confirmation_waits_two_seconds_at_most_then_answers_starting(self):
+        """A deterministic clock: the request watches its process for two seconds, then answers "starting"
+        (never "complete"), and never waits for the scan itself."""
+        self.assertEqual(launcher.LAUNCH_WAIT_SECONDS, 2.0)
+        now, polls = [1000.0], []
+
+        def sleep(seconds):
+            now[0] += seconds
+        with self.fake_popen(FakeProc(on_poll=lambda proc: polls.append(now[0] - 1000.0))):
+            result = launcher.launch(clock=lambda: now[0], sleep=sleep)
+        self.assertEqual(result["state"], "starting")
+        self.assertGreaterEqual(now[0] - 1000.0, 2.0)
+        self.assertLess(now[0] - 1000.0, 2.0 + launcher.POLL_SECONDS + 1e-6)
+        self.assertLess(max(polls), 2.0 + launcher.POLL_SECONDS)
+
+    def test_an_existing_report_and_progress_file_are_not_taken_for_a_new_scan(self):
+        """The last report and a stale progress file (an earlier interrupted scan) are recorded as "before";
+        a process that has not scanned yet is "starting", not "finished" or "running"."""
+        _previous, _pointer = self.publish()
+        before = reconciliation.scan_status()["last_attempt"]
+        stale = {"pid": os.getpid(), "started": 12345.5, "phase": "walk", "done": 0, "heartbeat": 12345.5}
+        (self.reports / "library-reconciliation" / "running.json").write_text(json.dumps(stale))
+        with self.fake_popen(FakeProc()), mock.patch.object(launcher, "LAUNCH_WAIT_SECONDS", 0.3):
+            body = self.post().json()
+        self.assertEqual(body["state"], "starting")
+        self.assertEqual(body["previous_attempt"], before)
+        self.assertEqual(body["previous_running"], {"pid": os.getpid(), "started": 12345.5})
 
     def test_a_launch_that_fails_is_reported_and_starts_nothing(self):
         _previous, pointer = self.publish()
@@ -189,6 +235,7 @@ class LaunchTests(_Http):
         self.assertEqual(body["state"], "finished")
         self.assertEqual(body["attempt"]["status"], "complete")
         self.assertIsNone(body["previous_attempt"])
+        self.assertIsNone(body["previous_running"])
 
     def test_a_process_not_yet_confirmed_is_reported_as_starting(self):
         with self.fake_popen(FakeProc()), mock.patch.object(launcher, "LAUNCH_WAIT_SECONDS", 0.3):
@@ -221,10 +268,7 @@ class PageTests(_Http):
         self.assertIn("csrftoken", self.client.cookies)
         self.assertNotIn("Run one with: manage.py reconcile_library", body)
 
-    def test_the_status_logic_under_node(self):
-        """The page's own runView(), extracted from the template and run under Node: the button is disabled
-        while a scan runs or starts, a launch is never shown as complete until its new attempt appears, and a
-        failure or interruption says that nothing was replaced."""
+    def node(self):
         node = shutil.which("node")
         if node is None:
             try:
@@ -235,38 +279,49 @@ class PageTests(_Http):
                 node = None
         if node is None:
             self.skipTest("no Node.js available to run the page script")
+        return node
+
+    def run_page_script(self, body):
         source = TEMPLATE.read_text()
         code = source[source.index("// runView:begin"):source.index("// runView:end")]
+        result = subprocess.run([self.node(), "-e", code + "\n" + body], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_the_status_logic_under_node(self):
+        """The page's own runView(), extracted from the template and run under Node: the button is disabled
+        while a scan runs or starts, a launch is never shown as complete until its new attempt appears, an older
+        report or progress file is never taken for its own, and a failure or interruption says that nothing was
+        replaced."""
+        A = {"scan_id": "A", "status": "complete"}
+        launch = {"previous": "A", "previousRunning": "3:100.5", "seen": 0, "confirmed": False}
         cases = {
             "unknown status": [None, None, 0],
-            "idle": [{"running": None, "last_attempt": {"scan_id": "A", "status": "complete"}}, None, 0],
+            "idle": [{"running": None, "last_attempt": A}, None, 0],
             "cli scan running": [{"running": {"alive": True, "pid": 5, "phase": "walk", "done": 0}}, None, 0],
-            "own scan running": [{"running": {"alive": True, "pid": 7, "phase": "duplicates", "done": 3},
-                                  "last_attempt": {"scan_id": "A", "status": "complete"}},
-                                 {"pid": 7, "previous": "A", "seen": 0}, 1000],
-            "starting": [{"running": None, "last_attempt": {"scan_id": "A", "status": "complete"}},
-                         {"pid": 7, "previous": "A", "seen": 0}, 1000],
+            "own scan running": [{"running": {"alive": True, "pid": 7, "started": 200.0, "phase": "duplicates",
+                                              "done": 3}, "last_attempt": A}, launch, 1000],
+            "starting": [{"running": None, "last_attempt": A}, launch, 1000],
             "finished complete": [{"running": None, "last_attempt": {"scan_id": "B", "status": "complete"}},
-                                  {"pid": 7, "previous": "A", "seen": 0}, 1000],
+                                  launch, 1000],
             "finished failed": [{"running": None, "last_attempt": {"scan_id": "B", "status": "failed"}},
-                                {"pid": 7, "previous": "A", "seen": 0}, 1000],
-            "interrupted (own)": [{"running": {"alive": False, "pid": 7, "phase": "walk", "done": 0},
-                                   "last_attempt": {"scan_id": "A", "status": "complete"}},
-                                  {"pid": 7, "previous": "A", "seen": 0}, 1000],
-            "stale file of an older scan": [{"running": {"alive": False, "pid": 3, "phase": "walk", "done": 0},
-                                             "last_attempt": {"scan_id": "A", "status": "complete"}},
-                                            {"pid": 7, "previous": "A", "seen": 0}, 1000],
-            "never showed progress": [{"running": None, "last_attempt": {"scan_id": "A", "status": "complete"}},
-                                      {"pid": 7, "previous": "A", "seen": 0}, 31000],
+                                launch, 1000],
+            "interrupted (new progress file)": [{"running": {"alive": False, "pid": 7, "started": 200.0,
+                                                             "phase": "walk", "done": 0}, "last_attempt": A},
+                                                launch, 1000],
+            "stale file of an older scan": [{"running": {"alive": False, "pid": 3, "started": 100.5,
+                                                         "phase": "walk", "done": 0}, "last_attempt": A},
+                                            launch, 1000],
+            "stale file and old report after 30 s": [{"running": {"alive": False, "pid": 3, "started": 100.5,
+                                                                   "phase": "walk", "done": 0}, "last_attempt": A},
+                                                      launch, 31000],
             "first ever scan finished": [{"running": None, "last_attempt": {"scan_id": "B", "status": "suspect"}},
-                                         {"pid": 7, "previous": None, "seen": 0}, 1000],
+                                         dict(launch, previous=None, previousRunning=None), 1000],
         }
-        script = code + "\nconst cases = " + json.dumps(cases) + ";\nconst out = {};\n" \
-            "for (const [k, a] of Object.entries(cases)) out[k] = runView(a[0], a[1], a[2]);\n" \
-            "process.stdout.write(JSON.stringify(out));\n"
-        result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        views = json.loads(result.stdout)
+        views = self.run_page_script(
+            "const cases = " + json.dumps(cases) + ";\nconst out = {};\n"
+            "for (const [k, a] of Object.entries(cases)) out[k] = runView(a[0], a[1], a[2]);\n"
+            "process.stdout.write(JSON.stringify(out));\n")
 
         def shape(name):
             v = views[name]
@@ -277,16 +332,91 @@ class PageTests(_Http):
         self.assertEqual(shape("own scan running"), (True, False, False))
         self.assertIn("duplicates, 3 done", views["own scan running"]["text"])
         self.assertEqual(shape("starting"), (True, False, False))
+        self.assertEqual(views["starting"]["text"], "Starting the scan…")
         self.assertEqual(shape("finished complete"), (False, True, True))
         self.assertIn("Scan B finished (complete)", views["finished complete"]["text"])
         self.assertEqual(shape("finished failed"), (False, True, False))
         self.assertIn("Nothing was replaced", views["finished failed"]["text"])
-        self.assertEqual(shape("interrupted (own)"), (False, True, False))
-        self.assertIn("interrupted", views["interrupted (own)"]["text"])
+        self.assertEqual(shape("interrupted (new progress file)"), (False, True, False))
+        self.assertIn("stopped before it finished", views["interrupted (new progress file)"]["text"])
+        self.assertIn("two-hour limit", views["interrupted (new progress file)"]["text"])
         self.assertEqual(shape("stale file of an older scan"), (True, False, False))   # still waiting for its own
-        self.assertEqual(shape("never showed progress"), (False, True, False))
-        self.assertIn("without a report", views["never showed progress"]["text"])
+        self.assertEqual(shape("stale file and old report after 30 s"), (False, False, False))
+        self.assertEqual(views["stale file and old report after 30 s"]["text"], NOT_CONFIRMED)
         self.assertEqual(shape("first ever scan finished"), (False, True, True))
+
+    def test_a_launch_answered_starting_is_followed_through_the_status_api(self):
+        """Timelines with a deterministic clock (ms since the 202 "starting"), each step applying the page's
+        observe() and runView() to one status answer, as refreshRun() does."""
+        A = {"scan_id": "A", "status": "complete"}
+        stale = {"alive": False, "pid": 3, "started": 100.5, "phase": "walk", "done": 0}
+        new = {"pid": 9, "started": 500.25, "phase": "walk", "done": 0}
+        timelines = {
+            "to running then complete": [
+                [{"running": stale, "last_attempt": A}, 1000],
+                [{"running": dict(new, alive=True), "last_attempt": A}, 6000],
+                [{"running": dict(new, alive=True, phase="hash", done=2000), "last_attempt": A}, 40000],
+                [{"running": None, "last_attempt": A}, 42000],          # between its last progress and its report
+                [{"running": None, "last_attempt": {"scan_id": "B", "status": "complete"}}, 44000]],
+            "directly to a completed result": [
+                [{"running": stale, "last_attempt": A}, 2000],
+                [{"running": None, "last_attempt": {"scan_id": "B", "status": "suspect"}}, 4000]],
+            "no evidence": [
+                [{"running": stale, "last_attempt": A}, 2000],
+                [{"running": stale, "last_attempt": A}, 29999],
+                [{"running": stale, "last_attempt": A}, 30000],
+                [{"running": stale, "last_attempt": A}, 45000]],
+            "no evidence, then a late result": [
+                [{"running": None, "last_attempt": A}, 31000],
+                [{"running": None, "last_attempt": {"scan_id": "C", "status": "failed"}}, 46000]],
+            "seen running, then nothing": [
+                [{"running": dict(new, alive=True), "last_attempt": A}, 1000],
+                [{"running": None, "last_attempt": A}, 31001]],
+            "running, then stopped by its time limit": [
+                [{"running": dict(new, alive=True), "last_attempt": A}, 1000],
+                [{"running": dict(new, alive=False), "last_attempt": A}, 7200000]],
+        }
+        views = self.run_page_script(
+            "const timelines = " + json.dumps(timelines) + ";\nconst out = {};\n"
+            "for (const [k, steps] of Object.entries(timelines)) {\n"
+            "  const launch = { previous: 'A', previousRunning: runKey({pid: 3, started: 100.5}), seen: 0,"
+            " confirmed: false };\n"
+            "  out[k] = steps.map(([st, now]) => { observe(st, launch, now); return runView(st, launch, now); });\n"
+            "}\nprocess.stdout.write(JSON.stringify(out));\n")
+
+        def shapes(name):
+            return [(v["busy"], v["done"], v["text"]) for v in views[name]]
+        running = shapes("to running then complete")
+        self.assertEqual(running[0], (True, False, "Starting the scan…"))
+        self.assertEqual(running[1][:2], (True, False))
+        self.assertIn("A scan is running (walk, 0 done)", running[1][2])
+        self.assertIn("hash, 2000 done", running[2][2])                  # past 30 s: running is not "not confirmed"
+        self.assertEqual(running[3], (True, False, "Waiting for the scan’s result…"))
+        self.assertEqual(running[4][:2], (False, True))
+        self.assertIn("Scan B finished (complete)", running[4][2])
+        direct = shapes("directly to a completed result")
+        self.assertEqual(direct[0][:2], (True, False))
+        self.assertEqual(direct[1][:2], (False, True))
+        self.assertIn("Scan B finished (suspect)", direct[1][2])
+        none = shapes("no evidence")
+        self.assertEqual([v[:2] for v in none], [(True, False), (True, False), (False, False), (False, False)])
+        self.assertEqual(none[1][2], "Starting the scan…")
+        self.assertEqual(none[2][2], NOT_CONFIRMED)
+        self.assertEqual(none[3][2], NOT_CONFIRMED)
+        for _busy, _done, text in none:
+            self.assertNotIn("fail", text.lower())                     # missing confirmation is not a failure
+        late = shapes("no evidence, then a late result")
+        self.assertEqual(late[0][2], NOT_CONFIRMED)
+        self.assertEqual(late[1][:2], (False, True))
+        self.assertIn("Scan C failed", late[1][2])
+        vanished = shapes("seen running, then nothing")
+        self.assertEqual(vanished[1][:2], (False, False))
+        self.assertNotEqual(vanished[1][2], NOT_CONFIRMED)
+        self.assertIn("no new result was detected", vanished[1][2])
+        limit = shapes("running, then stopped by its time limit")
+        self.assertEqual(limit[1][:2], (False, True))
+        self.assertIn("stopped before it finished", limit[1][2])
+        self.assertNotRegex(limit[1][2], r"Scan \S+ finished")          # never presented as a completed scan
 
 
 class _Live(_ReconFixture, TransactionTestCase):
@@ -331,18 +461,42 @@ class _Live(_ReconFixture, TransactionTestCase):
             except ChildProcessError:
                 pass
 
-    def stand_in(self, mode="hold"):
-        prefix = launcher.scan_command()[:6]                       # the real nice/ionice prefix
-        return mock.patch.object(launcher, "scan_command", lambda: prefix + [
-            sys.executable, "-I", "-c", STAND_IN, str(self.reports), mode])
+    def stand_in(self, mode="hold", *extra):
+        real = launcher.scan_command                                # the real nice/ionice/timeout prefix,
+        return mock.patch.object(launcher, "scan_command", lambda: real()[:-3] + [   # read at launch time
+            sys.executable, "-I", "-c", STAND_IN, str(self.reports), mode, *map(str, extra)])
 
-    def launch(self):
+    def launch(self, wait=10.0):
+        """launcher.launch() with the real Popen. The two-second default is tested with a deterministic clock;
+        here a longer confirmation wait keeps a loaded test machine from turning "running" into "starting"."""
+        procs = []
+
+        def popen(*args, **kwargs):
+            procs.append(subprocess.Popen(*args, **kwargs))
+            return procs[-1]
         try:
-            result = launcher.launch(username="test")
+            result = launcher.launch(username="test", wait=wait, popen=popen)
         except launcher.LaunchRefused as exc:
             return exc.status, {"code": exc.code}
-        self.pids.append(result["pid"])
+        finally:
+            self.pids.extend(proc.pid for proc in procs)
+        self.proc = procs[0]
         return 202, result
+
+    def fake_ffprobe(self, *, ignore_term=False):
+        """An ``ffprobe`` first on PATH that records its pid and hangs (as on storage that stopped answering)."""
+        tools, record = self.base / "fake-tools", self.base / "fake-tools.pids"
+        tools.mkdir(exist_ok=True)
+        probe = tools / "ffprobe"
+        probe.write_text("#!/bin/sh\n" + ("trap '' TERM\n" if ignore_term else "")
+                         + f"echo $$ >> '{record}'\nexec sleep 600\n")
+        probe.chmod(0o755)
+        self.addCleanup(shutil.rmtree, tools, True)
+        self.addCleanup(lambda: record.unlink(missing_ok=True))
+        path = mock.patch.dict(os.environ, {"PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"})
+        path.start()
+        self.addCleanup(path.stop)
+        return lambda: [int(x) for x in record.read_text().split()] if record.exists() else []
 
     def finished(self, previous):
         status = reconciliation.scan_status()
@@ -360,8 +514,11 @@ class LiveLaunchTests(_Live):
         with self.stand_in():
             status, body = self.launch()
         self.assertEqual((status, body["state"]), (202, "running"))
-        pid = body["pid"]
-        self.assertEqual(os.getsid(pid), pid)                       # its own session: a worker's exit is not its end
+        leader, pid = body["pid"], body["scan_pid"]                 # timeout, and the scan it runs
+        self.assertNotEqual(pid, leader)
+        self.assertEqual(os.getsid(leader), leader)                 # its own session: a worker's exit is not its end
+        self.assertEqual((os.getsid(pid), os.getpgid(pid)), (leader, leader))
+        self.assertIn("gnutimeout", Path(f"/proc/{leader}/cmdline").read_bytes().decode().replace("\0", " "))
         nice = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[16])
         self.assertEqual(nice, 10)
         self.assertIn("idle", subprocess.run(["/usr/bin/ionice", "-p", str(pid)], capture_output=True, text=True).stdout)
@@ -392,9 +549,9 @@ class LiveLaunchTests(_Live):
         statuses = sorted(status for status, _ in results)
         self.assertEqual(statuses, [202, 409, 409, 409], results)
         self.assertTrue(all(body["code"] in ("scan_starting", "scan_running") for s, body in results if s == 409))
-        (pid,) = [body["pid"] for s, body in results if s == 202]
-        self.assertTrue(alive(pid))
-        self.assertEqual(reconciliation.scan_status()["running"]["pid"], pid)
+        (body,) = [body for s, body in results if s == 202]
+        self.assertTrue(alive(body["scan_pid"]))
+        self.assertEqual(reconciliation.scan_status()["running"]["pid"], body["scan_pid"])
 
     def test_a_command_line_scan_that_takes_the_lock_first_wins_and_the_launch_says_so(self):
         holder = subprocess.Popen([sys.executable, "-I", "-c", STAND_IN, str(self.reports), "hold"],
@@ -419,21 +576,62 @@ class LiveLaunchTests(_Live):
         previous, pointer = self.publish_previous()
         with self.stand_in():
             status, body = self.launch()
-        self.assertEqual(status, 202)
+        self.assertEqual((status, body["state"]), (202, "running"))
         os.killpg(body["pid"], signal.SIGTERM)
-        try:
-            os.waitpid(body["pid"], 0)
-        except ChildProcessError:
-            pass                                                    # already reaped by subprocess's own cleanup
-        self.assertTrue(wait_until(lambda: not alive(body["pid"]), 10))
+        self.proc.wait(30)
+        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]), 10))
         st = reconciliation.scan_status()
-        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["pid"], False))
+        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))
         self.assertEqual(st["latest"]["scan_id"], previous)
         self.assertEqual((self.directory / "latest.json").read_bytes(), pointer)
         summary = self.client.get(reverse("library:api-reconciliation-summary")).json()
         self.assertEqual(summary["report"]["scan_id"], previous)
         with self.stand_in():
             self.assertEqual(self.launch()[0], 202)                # the lock went with the process
+
+    def test_the_time_limit_ends_the_scan_and_its_ffprobe_and_keeps_the_previous_report(self):
+        """GNU timeout (limit shortened to 3 s) sends TERM to the scan's process group: the scan and the ffprobe
+        it started through the scanner's own audio_identity code both stop, timeout reports 124 (timed out),
+        the progress file stays behind as "not alive" (the page: stopped before it finished, never complete),
+        and the last complete report is kept."""
+        previous, pointer = self.publish_previous()
+        previous_attempt = reconciliation.scan_status()["last_attempt"]
+        probes = self.fake_ffprobe()
+        sample = self.file("ROCK/sample.flac")
+        with self.stand_in("decode", settings.BASE_DIR, sample), mock.patch.object(launcher, "SCAN_TIME_LIMIT", "3s"):
+            status, body = self.launch()
+        self.assertEqual((status, body["state"]), (202, "running"))
+        self.assertTrue(wait_until(lambda: probes(), 15), "the scan never started ffprobe")
+        (probe,) = probes()
+        self.assertEqual(os.getpgid(probe), body["pid"])           # an ordinary child, in the scan's process group
+        self.assertEqual(self.proc.wait(60), 124)
+        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]) and not alive(probe), 10))
+        st = reconciliation.scan_status()
+        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))
+        self.assertEqual(st["last_attempt"], previous_attempt)
+        self.assertEqual(st["latest"]["scan_id"], previous)
+        self.assertEqual((self.directory / "latest.json").read_bytes(), pointer)
+        with self.stand_in():
+            self.assertEqual(self.launch()[0], 202)                 # the lock went with the scan
+
+    def test_a_scan_that_ignores_term_is_killed_with_its_ffprobe_after_the_grace_period(self):
+        """KILL escalation (shortened: 2 s limit, then 2 s) reaches the whole process group, the stuck scan and
+        its ffprobe alike (both ignore TERM), and the previous report is kept."""
+        previous, pointer = self.publish_previous()
+        probes = self.fake_ffprobe(ignore_term=True)
+        sample = self.file("ROCK/sample.flac")
+        with self.stand_in("stubborn", settings.BASE_DIR, sample), \
+                mock.patch.object(launcher, "SCAN_TIME_LIMIT", "2s"), mock.patch.object(launcher, "KILL_AFTER", "2s"):
+            status, body = self.launch()
+        self.assertEqual((status, body["state"]), (202, "running"))
+        self.assertTrue(wait_until(lambda: probes(), 15), "the scan never started ffprobe")
+        (probe,) = probes()
+        self.assertIn(self.proc.wait(60), (-signal.SIGKILL, 128 + signal.SIGKILL))   # timeout KILLs its group too
+        self.assertTrue(wait_until(lambda: not alive(body["scan_pid"]) and not alive(probe), 10))
+        st = reconciliation.scan_status()
+        self.assertEqual((st["running"]["pid"], st["running"]["alive"]), (body["scan_pid"], False))
+        self.assertEqual(st["latest"]["scan_id"], previous)
+        self.assertEqual((self.directory / "latest.json").read_bytes(), pointer)
 
     def test_end_to_end_the_real_command_completes_and_the_summary_shows_it(self):
         previous, _pointer = self.publish_previous()

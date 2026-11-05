@@ -199,23 +199,42 @@ reports and status, and the page shows those.
 
 * **The request.** `POST /api/tracks/reconciliation/run/`, CSRF-protected, `library.manage_tracks`. Nothing in
   the request is used.
-* **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 <venv python> <checkout>/manage.py
-  reconcile_library`, without a shell. It gets the web application's own environment and working directory, as
-  the CD-ripping launcher does (`library/cd_ripping.py`).
+* **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 /usr/bin/gnutimeout --signal=TERM
+  --kill-after=30s 2h <venv python> <checkout>/manage.py reconcile_library`, without a shell. It gets the web
+  application's own environment and working directory, as the CD-ripping launcher does
+  (`library/cd_ripping.py`).
+* **The time limit.** GNU `timeout` (coreutils) stays as the scan's parent and leads its process group.
+  * After 2 hours it sends TERM to the whole group: the scan and the `ffmpeg`/`ffprobe` it has started. The
+    scan keeps Python's default TERM handling, so it stops at once without writing a report.
+  * If the scan has not exited 30 s later, it sends KILL to the group.
+  * `/usr/bin/gnutimeout` is GNU's timeout. On Ubuntu 25.10 and later, `/usr/bin/timeout` is the uutils (Rust)
+    implementation by default, and its KILL escalation (0.8.0) reaches only the direct child, not the group.
+    `gnu-coreutils`, which provides `gnutimeout`, is installed with either coreutils flavour. If it were
+    missing, the launch fails with 500 `launch_failed` and nothing starts.
+  * A timed-out scan ends exactly like an interrupted one (see below). It is never shown as complete, and
+    `latest.json` and the findings stay on the previous complete scan.
+  * **Uninterruptible I/O.** A process blocked in the kernel on storage that has stopped answering ("D" state)
+    cannot act on any signal, not even KILL, until that I/O returns or fails. Until then a scan stuck there
+    keeps its lock, and the time limit cannot end it sooner. An `ffmpeg`/`ffprobe` stuck there does not hold
+    the lock (it never inherits the lock's descriptor).
 * **How it runs.** As the web application's service account, in its own session, so the request, the browser
   and the Gunicorn worker can all go away without stopping it. Its output is discarded; errors reach
   Gunicorn's journal.
-* **The answer is never a guess.** The request waits up to 10 s for its own process:
+* **The answer is never a guess.** The request waits up to 2 s for its own process (`timeout`, the leader of
+  the new session); it never waits for the scan to finish:
 
   | What the process did | Answer |
   |---|---|
-  | holds the scan lock and has written `running.json` with its pid | 202 `running` |
+  | its scan holds the scan lock and has written `running.json`, with a pid in this session | 202 `running`, with `scan_pid` |
   | finished already | 202 `finished`, naming the new attempt (complete, suspect or failed) |
   | exited without scanning, another scan holding the lock | 409 `scan_running` |
-  | exited without scanning, lock free | 500 `launch_failed`, with its exit status |
-  | none of the above within 10 s | 202 `starting`: launched, not yet confirmed |
+  | another request is starting a scan | 409 `scan_starting` |
+  | could not be started, or exited without scanning with the lock free | 500 `launch_failed`, with its exit status |
+  | none of the above within 2 s | 202 `starting`: launched, not yet confirmed |
 
-  A 202 never means the scan completed.
+  A 202 never means the scan completed. Every 202 also carries what existed before the launch, recorded under
+  the launch lock: `previous_attempt` (the last attempt's pointer) and `previous_running` (the pid and start
+  time of a progress file left by an earlier scan, if any).
 * **Concurrency.**
   * A scan already holding the lock, whether started here or from the command line, refuses the request with
     409, and nothing is started.
@@ -226,12 +245,21 @@ reports and status, and the page shows those.
 * **On the page.**
   * The button is disabled while a scan runs or starts. Progress comes from the summary API every 2 s while
     busy, every 15 s otherwise.
+  * Only something new counts. A result is an attempt whose `scan_id` differs from `previous_attempt`. A scan
+    is a progress file whose pid and start time differ from `previous_running`. An older report or an older
+    interrupted scan's progress file is never taken for this launch's.
   * Completion is the new attempt in `last_attempt.json`. A complete or suspect scan reloads the summary and
     the findings once.
   * A failed scan says so: nothing was replaced, and `latest.json` and the findings stay on the previous
     complete scan.
-  * A started process that leaves its progress file behind without a report was interrupted.
-  * One that shows neither progress nor a report within 30 s stopped without a report.
+  * A new progress file left behind without a report means the scan stopped before it finished: interrupted,
+    or ended by its time limit.
+  * After 202 `starting`, the page shows "Starting the scan…" and polls the status every 2 s. If neither a new
+    scan nor a new result appears within 30 s, it stops showing "Starting" and says: "Start not confirmed. No
+    scan activity or result was detected. Check status before trying again."
+    * This does not claim that the scan failed.
+    * The button is enabled again; a retry cannot start a second scan (the launch and scan locks).
+    * The page keeps polling every 15 s, and a late scan or result is still recognised.
   * Closing or reloading the page does not affect the scan. After a reload, the page shows a running scan from
     the same status as any other page.
 * **Gunicorn restart.** The scan is a process of Gunicorn's service (`KillMode=control-group`, the default).
@@ -247,17 +275,20 @@ reports and status, and the page shows those.
 **Limitations of the minimal launcher** (each would need infrastructure it deliberately does not have):
 * **Tied to Gunicorn.** A scan lives only as long as Gunicorn's service. Any restart, including an install,
   interrupts it; nothing retries.
-* **No time limit or watchdog.** A scan stalled on hung storage holds the lock until it ends; the scanner's
-  own per-decode timeouts still apply. Ending it means restarting Gunicorn, or stopping the process as the
-  service account. A process stuck in uninterruptible I/O may not end even then.
+* **A fixed time limit, no watchdog.** A scan ends after at most 2 hours (and 30 s), however it stalls, except
+  in uninterruptible kernel I/O (above), where no signal takes effect until the I/O returns. The limit is not
+  adjustable from the page, and a scan that legitimately needs more than 2 hours is stopped as interrupted.
+  The scanner's own per-decode timeouts still apply. Ending a scan sooner means restarting Gunicorn, or
+  stopping the process as the service account.
 * **Shares Gunicorn's resource limits.** It runs at `nice` 10 and idle I/O priority, but inside Gunicorn's
   control group, with no CPU quota or memory cap of its own.
 * **No job record.** Who started a scan is logged (Gunicorn's journal), not stored. The page links a launch
-  to its result only by the next attempt and its own pid; a page that was closed or reloaded shows the shared
-  status instead.
+  to its result only by what is new since the launch (attempt and progress file); a page that was closed or
+  reloaded shows the shared status instead. A command-line scan that starts in the same moment is shown the
+  same way, since it is equally new.
 * **Zombies until reaped.** A finished scan process stays a zombie until the same Gunicorn worker next starts
   a subprocess, or exits (as with the CD-ripping launcher). A zombie holds no lock and no file.
-* **A short wait in the request.** The request occupies one of Gunicorn's three sync workers for up to 10 s
+* **A short wait in the request.** The request occupies one of Gunicorn's three sync workers for up to 2 s
   while it waits for its own process.
 
 ## Measured (guarded sandbox, `measure_reconciliation_performance`)
