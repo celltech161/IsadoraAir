@@ -93,6 +93,7 @@
   <label><input type="checkbox" id="openOnly" checked> Open duplicate groups only</label>
 </div>
 
+<div class="rc-box rc-dialog" id="navGuard" role="alert" hidden></div>
 <div class="rc-box" id="resolveBar" role="status" aria-live="polite" hidden></div>
 <div class="rc-box rc-dialog" id="resolvePanel" hidden></div>
 <div id="findings"></div>
@@ -330,9 +331,7 @@ document.getElementById('runBtn').addEventListener('click', confirmRun);
 
 function setType(t) {
   document.getElementById('typeFilter').value = t;
-  page = 1;
-  markChips();
-  loadFindings();
+  navigate(() => { page = 1; markChips(); });
 }
 function markChips() {
   const t = document.getElementById('typeFilter').value;
@@ -579,18 +578,39 @@ function readiness(preview, options) {
   });
   return { deletions, keeps, undecided, ready: undecided === 0 && deletions + keeps > 0 };
 }
-function applyChoices(preview, options) {
-  const out = {};
+// The confirmed batch, in preview order: one apply request per included pair, each with that pair's own
+// single-use token (so no request ever deletes more than one Track). Unticked or cancelled pairs are never sent.
+function applyQueue(preview, options) {
+  const send = [], cancelled = [];
   preview.items.forEach(item => {
     const o = options.get(item.finding_id);
-    if (!o) return;
-    out[item.finding_id] = item.action === 'keep_both' ? { include: o.include }
-      : { include: o.include, categories: o.include ? [...o.categories] : [], acknowledge_voicetracks: o.ack === 'delete' };
+    if (!o || !item.token) return;
+    if (!o.include) {
+      cancelled.push({ finding_id: item.finding_id, action: item.action, outcome: 'cancelled',
+                       message: 'Cancelled: nothing was changed for this pair.' });
+      return;
+    }
+    send.push({ finding_id: item.finding_id, action: item.action, token: item.token,
+                choice: item.action === 'keep_both' ? {}
+                  : { categories: [...o.categories], acknowledge_voicetracks: o.ack === 'delete' } });
   });
-  return out;
+  return { send, cancelled };
 }
-// After apply: resolved, recorded and cancelled pairs leave the selection; blocked, stale, refused or failed ones
-// stay selected for review and a later preview.
+// One pair's answer: its result; a refusal (nothing was applied); or null when the answer was lost or unreadable,
+// so whether the pair was applied is not known -- the batch then stops rather than send anything more.
+function applyAnswer(job, resp, data) {
+  if (resp.ok) return data && data.item ? data.item : null;
+  if (!resp.status || (resp.status >= 500 && !(data && data.error))) return null;
+  return { finding_id: job.finding_id, action: job.action, outcome: 'refused',
+           message: 'Not applied: ' + ((data && data.error) || `HTTP ${resp.status}`) };
+}
+function outcomeCounts(items) {
+  const counts = {};
+  items.forEach(r => { counts[r.outcome] = (counts[r.outcome] || 0) + 1; });
+  return counts;
+}
+// After apply: resolved, recorded and cancelled pairs leave the selection; blocked, stale, refused, failed, unknown
+// or unsent ones stay selected for review and a later preview.
 const SETTLED = new Set(['deleted', 'recorded', 'already_decided', 'cancelled']);
 function choicesAfterApply(map, items) {
   const next = new Map(map);
@@ -742,7 +762,7 @@ function renderPreview(data) {
   };
   confirmBox.addEventListener('change', refresh);
   data.items.forEach(item => nodes.push(previewItem(item, options, refresh)));
-  if (data.token) {
+  if (data.applicable) {
     nodes.push(confirmLabel, summary);
     const row = el('div', undefined, 'rc-actions');
     row.append(applyBtn, actionButton('Re-check', reviewSelection), closeResolveButton('Cancel'));
@@ -839,44 +859,61 @@ function previewItem(item, options, refresh) {
 const OUTCOME_TEXT = {
   deleted: 'Deleted', recorded: 'Recorded', already_decided: 'Already decided', cancelled: 'Cancelled',
   blocked: 'Blocked', stale: 'Changed since the preview', needs_acknowledgment: 'Not acknowledged',
-  refused: 'Refused', failed: 'Failed',
+  refused: 'Refused', failed: 'Failed', unknown: 'Unknown (no answer)', not_attempted: 'Not attempted',
 };
+const APPLY_URL = '/api/tracks/reconciliation/duplicates/apply/';
 
+// One confirmation, then the pairs one request at a time, in order, with progress. A pair that is blocked, busy
+// or refused is reported and the next one is sent; a lost answer stops the batch (an irreversible action is never
+// retried or continued blindly) and the findings are reloaded from the server.
 async function applySelection(preview, options, confirmed) {
   if (resolveBusy) return;
-  const gen = ++resolveGen;
+  const { send, cancelled } = applyQueue(preview, options);
+  resolveGen += 1;
   resolveBusy = true;
   updateResolveBar();
-  showResolve([el('p', 'Applying, one pair at a time…')]);
-  let result;
-  try {
-    result = await postJSON('/api/tracks/reconciliation/duplicates/apply/',
-                            { token: preview.token, confirm: confirmed, choices: applyChoices(preview, options) });
-  } catch (e) {
-    result = { resp: { ok: false, status: 0 }, data: {} };
+  const results = [...cancelled];
+  let processed = 0, unknown = false;
+  for (let i = 0; i < send.length; i += 1) {
+    const job = send[i];
+    showResolve([el('p', `Applying one pair at a time: ${processed} of ${send.length} pair(s) processed…`)]);
+    let result;
+    try {
+      result = await postJSON(APPLY_URL, { token: job.token, confirm: confirmed === true, choice: job.choice });
+    } catch (e) {
+      result = { resp: { ok: false, status: 0 }, data: {} };
+    }
+    const item = applyAnswer(job, result.resp, result.data);
+    if (item === null) {
+      unknown = true;
+      results.push({ finding_id: job.finding_id, action: job.action, outcome: 'unknown',
+                     message: 'No answer from the server: whether this pair was applied is not known.' });
+      send.slice(i + 1).forEach(rest => results.push({ finding_id: rest.finding_id, action: rest.action,
+        outcome: 'not_attempted', message: 'Not sent: processing stopped at the unanswered pair above.' }));
+      break;
+    }
+    processed += 1;
+    results.push(item);
   }
   resolveBusy = false;
-  if (gen === resolveGen) {
-    if (result.resp.ok) {
-      choices = choicesAfterApply(choices, result.data.items || []);
-      renderResults(result.data);
-    } else if (result.resp.status === 0 || (result.resp.status >= 500 && !result.data.error)) {
-      showResolve([el('p', 'No answer from the server, so whether the pairs were applied is not known. The findings ' +
-                           'below have been refreshed; use Review selected… to see the current state.', 'rc-warn'),
-                   closeResolveButton()]);
-    } else {
-      showResolve([el('p', 'Nothing was applied: ' + (result.data.error || `HTTP ${result.resp.status}`), 'rc-bad'),
-                   closeResolveButton()]);
-    }
-  }
+  document.getElementById('navGuard').hidden = true;
+  choices = choicesAfterApply(choices, results);
+  renderResults({ scan_id: preview.scan_id, items: results, processed, total: send.length, unknown,
+                  rescan_recommended: results.some(r => r.outcome === 'deleted') });
   updateResolveBar();
   loadFindings();                             // current Track and reference facts (the report itself is a snapshot)
 }
 
 function renderResults(data) {
   const nodes = [];
-  const counts = Object.entries(data.counts || {}).map(([k, n]) => `${OUTCOME_TEXT[k] || k}: ${n}`).join(' · ');
-  nodes.push(el('p', 'Result: ' + counts, data.outcome === 'completed' ? 'rc-ok' : 'rc-warn'));
+  const counts = Object.entries(outcomeCounts(data.items)).map(([k, n]) => `${OUTCOME_TEXT[k] || k}: ${n}`).join(' · ');
+  const settled = data.items.every(r => SETTLED.has(r.outcome));
+  nodes.push(el('p', `Processed ${data.processed} of ${data.total} pair(s). Result: ` + counts, settled ? 'rc-ok' : 'rc-warn'));
+  if (data.unknown) {
+    nodes.push(el('p', 'Stopped: the answer for one pair was lost, so whether it was applied is not known, and the ' +
+                       'pairs after it were not sent. The findings below have been reloaded from the server; use ' +
+                       'Review selected… to see the current state before trying again.', 'rc-warn'));
+  }
   data.items.forEach(r => {
     const card = el('div', undefined, 'rc-card');
     const head = el('h3');
@@ -903,6 +940,56 @@ function renderResults(data) {
   showResolve(nodes);
 }
 
+// ---- Selections belong to the findings page on screen. A page, filter or search change with selections made
+// asks first: stay (the controls go back to the page shown) or discard them and continue. A search asks once the
+// typing pauses (the existing debounce), not on every keystroke.
+let shown = { t: '', q: '', open: true }, choicesScan;
+function restoreFilters() {
+  document.getElementById('typeFilter').value = shown.t;
+  document.getElementById('search').value = shown.q;
+  document.getElementById('openOnly').checked = shown.open;
+  markChips();
+}
+function showGuard(nodes) {
+  const guard = document.getElementById('navGuard');
+  guard.replaceChildren(...nodes);
+  guard.hidden = false;
+  guard.scrollIntoView({ block: 'nearest' });
+}
+function applyFilters(f) {
+  document.getElementById('typeFilter').value = f.t;
+  document.getElementById('search').value = f.q;
+  document.getElementById('openOnly').checked = f.open;
+  markChips();
+}
+function navigate(change) {
+  const guard = document.getElementById('navGuard');
+  if (!choices.size) { guard.hidden = true; change(); loadFindings(); return; }
+  if (resolveBusy) {
+    restoreFilters();
+    showGuard([el('p', 'The selected pairs are being applied; change the page or filters when that has finished.', 'rc-warn')]);
+    return;
+  }
+  // The findings shown stay as they are until the operator answers (loadFindings keeps their filters while
+  // selections exist); what was asked for is replayed only after a discard.
+  const want = { t: document.getElementById('typeFilter').value, q: document.getElementById('search').value,
+                 open: document.getElementById('openOnly').checked };
+  const row = el('div', undefined, 'rc-actions');
+  row.append(actionButton('Stay and keep selections', () => { guard.hidden = true; restoreFilters(); }),
+             actionButton('Discard selections and continue', () => {
+               guard.hidden = true;
+               choices = new Map();
+               resolveGen += 1;
+               document.getElementById('resolvePanel').hidden = true;
+               updateResolveBar();
+               applyFilters(want);
+               change();
+               loadFindings();
+             }));
+  showGuard([el('p', `${choices.size} duplicate selection(s) on this page have not been applied. Changing the page, ` +
+                     'filter or search discards them.', 'rc-warn'), row]);
+}
+
 function renderFinding(f) {
   const card = el('article', undefined, 'rc-card');
   const h = el('h3');
@@ -921,11 +1008,14 @@ function renderFinding(f) {
 
 async function loadFindings() {
   const params = new URLSearchParams({ page, per_page: 25 });
-  const t = document.getElementById('typeFilter').value;
-  const q = document.getElementById('search').value.trim();
+  // With selections made, a refresh keeps the filters of the page shown: only navigate() (after asking) or a new
+  // scan changes the page, so a control edited meanwhile never silently discards them.
+  const f = choices.size ? { ...shown } : { t: document.getElementById('typeFilter').value,
+    q: document.getElementById('search').value, open: document.getElementById('openOnly').checked };
+  const t = f.t, q = f.q.trim();
   if (t) params.set('type', t);
   if (q) params.set('q', q);
-  if (document.getElementById('openOnly').checked) params.set('open', '1');
+  if (f.open) params.set('open', '1');
   const gen = ++findingsGen;
   let resp, data;
   try {
@@ -939,13 +1029,25 @@ async function loadFindings() {
   list.replaceChildren();
   if (!resp.ok) { list.append(el('p', data.error || 'Could not load findings.', 'rc-bad')); return; }
   page = data.page; pages = data.pages;
-  // Duplicate choices belong to one page of one scan: another page, filter or scan starts with none.
+  shown = f;
+  // Duplicate choices belong to one page of one scan: another page, filter or scan starts with none. Selections
+  // are only ever dropped here when a newer scan replaced the report (or the page shown no longer exists): say so.
   const scope = [data.scan_id, data.page, t, q, params.get('open') || ''].join('|');
   if (scope !== choicesScope) {
+    const lost = choices.size, before = choicesScan;
     choicesScope = scope;
-    choices = new Map();
-    resolveGen += 1;
-    document.getElementById('resolvePanel').hidden = true;
+    choicesScan = data.scan_id;
+    if (lost) {
+      choices = new Map();
+      resolveGen += 1;
+      document.getElementById('resolvePanel').hidden = true;
+      const ok = actionButton('OK', () => { document.getElementById('navGuard').hidden = true; });
+      showGuard([el('p', before !== data.scan_id
+        ? `A newer reconciliation scan (${data.scan_id}) replaced the report, so your ${lost} duplicate selection(s) ` +
+          `from scan ${before} were cleared. Nothing was applied; review the new findings.`
+        : `The findings page changed, so your ${lost} duplicate selection(s) were cleared. Nothing was applied.`,
+        'rc-warn'), ok]);
+    }
   }
   if (!data.items.length) list.append(el('p', data.scan_id ? 'No findings match.' : 'No completed scan yet.', 'rc-muted'));
   data.items.forEach(f => list.append(renderFinding(f)));
@@ -955,14 +1057,14 @@ async function loadFindings() {
   updateResolveBar();
 }
 
-document.getElementById('typeFilter').addEventListener('change', () => { page = 1; markChips(); loadFindings(); });
-document.getElementById('openOnly').addEventListener('change', () => { page = 1; loadFindings(); });
+document.getElementById('typeFilter').addEventListener('change', () => navigate(() => { page = 1; markChips(); }));
+document.getElementById('openOnly').addEventListener('change', () => navigate(() => { page = 1; }));
 document.getElementById('search').addEventListener('input', () => {
-  clearTimeout(debounce);
-  debounce = setTimeout(() => { page = 1; loadFindings(); }, 300);
+  clearTimeout(debounce);                     // asked once the typing pauses, not on every keystroke
+  debounce = setTimeout(() => navigate(() => { page = 1; }), 300);
 });
-document.getElementById('prevBtn').addEventListener('click', () => { page -= 1; loadFindings(); });
-document.getElementById('nextBtn').addEventListener('click', () => { page += 1; loadFindings(); });
+document.getElementById('prevBtn').addEventListener('click', () => navigate(() => { page -= 1; }));
+document.getElementById('nextBtn').addEventListener('click', () => navigate(() => { page += 1; }));
 refreshRun();
 loadFindings();
 </script>

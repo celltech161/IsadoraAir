@@ -15,35 +15,47 @@ duplicate-management subsystem:
 * **Preview.**  Writes nothing.  For each selection it reports both Tracks, the survivor's suggested additional
   categories, the discarded Track's references and whether the deletion is eligible, needs an explicit
   acknowledgment (it has VoiceTracks, which the deletion would remove with it) or is blocked.  It returns a
-  token signed with ``django.core.signing``, bound to the operator, valid ``TOKEN_MAX_AGE_SECONDS``, naming the
-  scan, the pairs and what was previewed of both Tracks (columns, categories and file identity).
-* **Apply.**  Each pair is independent and is its own transaction: lock both Track rows (in id order), recheck
-  everything against the current state and the preview, add the chosen categories to the survivor, delete the
-  discarded Track through ``library.services.track_deletion.delete_track`` (PROTECT references, publication
-  ownership and commit-safe source cleanup unchanged).  The category additions and the deletion commit
-  together or not at all.  One blocked, stale or failing pair neither blocks nor rolls back the others.
-  Anything changed since the preview refuses that pair; nothing is guessed.
+  token *per applicable pair*, signed with ``django.core.signing``, bound to the operator, valid
+  ``TOKEN_MAX_AGE_SECONDS``, naming the scan, that pair and what was previewed of both Tracks (columns,
+  categories and file identity), and good for one apply request only (``_claim``).
+* **Apply.**  One pair per request: the page sends a confirmed batch pair by pair, so a request does at most
+  one deletion and its lock waits are bounded (``PAIR_LOCK_BUDGET_SECONDS``, ``CLAIM_LOCK_TIMEOUT``,
+  ``CLEANUP_LOCK_TIMEOUT_SECONDS``, ``KEEP_BOTH_LOCK_TIMEOUT``) well inside the Gunicorn worker timeout.  The
+  pair is its own transaction: lock both Track rows (in id order), recheck everything against the current
+  state and the preview, add the chosen categories to the survivor, delete the discarded Track through
+  ``library.services.track_deletion.delete_track`` (PROTECT references, publication ownership and commit-safe
+  source cleanup unchanged).  The category additions and the deletion commit together or not at all.  Anything
+  changed since the preview refuses the pair; nothing is guessed.  Pairs are independent: one blocked, stale or
+  failing pair neither blocks nor rolls back another.
 
 Blocked (never deleted here): a discarded Track in a playlist or a rotation slot (PROTECT), in the log of the
-current or a later hour (or the engine's active log), on air or claimed by the engine, protected by another
-subsystem (spoken projection, Active Messages), remote-hosted, or whose file -- or the survivor's -- no longer
-matches what the scan hashed.  Logs are never modified or regenerated.
+current or a later hour (or the engine's active log, which can be an earlier hour's), on air or claimed by the
+engine, protected by another subsystem (spoken projection, Active Messages), remote-hosted, or whose file -- or
+the survivor's -- is no longer exactly the file the scan hashed.  Every deletion also needs a fresh, well-formed
+observation of the playout engine (``_engine_state``); without one nothing is deleted.  Logs are never
+modified or regenerated.
 
-The duplicate evidence is the scan's: identical SHA-256 for both files at the size and modification time the
-scan recorded.  Nothing is re-hashed in the web worker; at apply both files must still be regular files at the
-same path, with the size and modification time the scan hashed, and with the same identity (device, inode,
-size, mtime, ctime) the preview saw.  A rewrite that preserves size and modification time is not detected.
+The duplicate evidence is the scan's: identical SHA-256 for both files, and the stat witness each was hashed
+under (device, inode, size, mtime, ctime, link count; ``library_reconciliation.FileEntry.witness``).  Nothing is
+re-hashed in the web worker; at preview and at apply both files must still be regular files at the same path
+with exactly that witness, and with the identity the preview saw.  A report without witnesses (made before
+they were recorded) stays reviewable but authorizes no deletion.  The witness detects ordinary modification or
+replacement (any write changes the ctime); it is not a cryptographic proof against a privileged user who
+rewrites the bytes and then resets every recorded metadata field.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import secrets
 import stat
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 
 from django.core import signing
-from django.db import DatabaseError, OperationalError, connections, router, transaction
+from django.db import DatabaseError, IntegrityError, OperationalError, connections, router, transaction
 from django.db.models import Q
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -52,8 +64,10 @@ from library.services import library_reconciliation
 
 log = logging.getLogger(__name__)
 
-TOKEN_SALT = "library.reconciliation.duplicate_resolution.v1"
+TOKEN_SALT = "library.reconciliation.duplicate_resolution.v2"      # v2: one pair per token, single use
 TOKEN_MAX_AGE_SECONDS = 10 * 60
+#: Spent tokens: rows of their own in ``django_session`` (see ``_claim``), a prefix Django never generates.
+CLAIM_PREFIX = "dupres:"
 #: Most selections one preview or apply handles: one findings page (the page shows 25 findings).
 MAX_SELECTIONS = 25
 #: Bounded reference listings in a preview (the full counts are always given).
@@ -62,8 +76,18 @@ REFERENCE_SAMPLE = 10
 CLAIM_WINDOW = timedelta(hours=3)
 #: A Track that started this long ago plus its duration may still be on air.
 PLAY_MARGIN = timedelta(minutes=10)
-#: Longest wait for a row another operation holds: the request answers "busy" instead of tying up a worker.
-LOCK_TIMEOUT = "5s"
+# Lock waits of one apply request, each answered "busy, try again" when exceeded (the Gunicorn worker timeout
+# is 30 s; together these are at most 1 + 3 + 2 + 2 = 8 s):
+#: Spending the token (waits only for a concurrent request spending the same token).
+CLAIM_LOCK_TIMEOUT = "1s"
+#: All lock waits of the pair's transaction together: Track rows, category rows, the deletion's cascade.
+PAIR_LOCK_BUDGET_SECONDS = 3.0
+#: Each after-commit cleanup lock: the source path's and the waveform cache's (track_deletion).
+CLEANUP_LOCK_TIMEOUT_SECONDS = 2.0
+#: Keep both: the pair's DuplicateCandidate row.
+KEEP_BOTH_LOCK_TIMEOUT = "2s"
+#: An engine state stamped further in the future than this is not trusted (clock confusion).
+ENGINE_CLOCK_TOLERANCE_SECONDS = 5
 
 DELETE, KEEP_BOTH = "delete", "keep_both"
 ELIGIBLE, NEEDS_ACK, BLOCKED = "eligible", "needs_acknowledgment", "blocked"
@@ -94,38 +118,54 @@ def finding_eligibility(finding) -> tuple[bool, str]:
         return False, "file review only: fewer than two registered Tracks"
     if len(members) > 2 or finding.get("member_count", len(members)) != 2:
         return False, f"{finding.get('member_count', len(members))} Tracks share these bytes: resolve by hand"
-    evidence = _evidence(finding)
+    evidence, why = _evidence(finding)
     if evidence is None:
-        return False, "the scan did not record identical-byte evidence for both Tracks"
+        return False, why
     return True, ""
 
 
-def _evidence(finding) -> dict | None:
-    """{track_id: file entry} for the two members, when both carry the same scan-time SHA-256."""
+NO_EVIDENCE = "the scan did not record identical-byte evidence for both Tracks"
+NO_WITNESS = ("this scan did not record the files' full identity (it was made by an earlier version): run "
+              "reconciliation again to resolve this pair here")
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _evidence(finding) -> tuple[dict | None, str]:
+    """({track_id: file entry}, "") for the two members, when both carry the same scan-time SHA-256 and the
+    stat witness they were hashed under; (None, why) otherwise."""
     members = finding.get("members") or []
     by_track = {}
     for entry in finding.get("files") or []:
         track_id = entry.get("track_id")
         if track_id in members:
             if track_id in by_track:
-                return None
+                return None, NO_EVIDENCE
             by_track[track_id] = entry
     if len(members) != 2 or set(by_track) != set(members):
-        return None
+        return None, NO_EVIDENCE
     digests = {by_track[t].get("sha256") for t in members}
     if len(digests) != 1 or not all(isinstance(d, str) and len(d) == 64 for d in digests):
-        return None
+        return None, NO_EVIDENCE
     for entry in by_track.values():
-        if not isinstance(entry.get("path"), str) or not isinstance(entry.get("size"), int) \
-                or not isinstance(entry.get("mtime_ns"), int):
-            return None
-    return by_track
+        if not isinstance(entry.get("path"), str) or not _is_int(entry.get("size")) \
+                or not _is_int(entry.get("mtime_ns")):
+            return None, NO_EVIDENCE
+    for entry in by_track.values():
+        witness = entry.get("witness")
+        if not (isinstance(witness, list) and len(witness) == 6 and all(_is_int(v) for v in witness)):
+            return None, NO_WITNESS
+        if witness[2:4] != [entry["size"], entry["mtime_ns"]]:
+            return None, NO_EVIDENCE
+    return by_track, ""
 
 
 # --------------------------------------------------------------------------- current state
 
 def _file_identity(path):
-    """(dev, ino, size, mtime_ns, ctime_ns) of exactly this regular file (no symlink followed), or a reason."""
+    """The stat witness (as the scan records it) of exactly this regular file (no symlink followed), or a reason."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -134,7 +174,7 @@ def _file_identity(path):
         return None, f"its file cannot be checked ({exc.strerror or type(exc).__name__})"
     if not stat.S_ISREG(info.st_mode):
         return None, "its path is no longer a regular file"
-    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns], ""
+    return library_reconciliation.stat_witness(info), ""
 
 
 def _additional(track_ids) -> dict:
@@ -166,12 +206,44 @@ def _local_hour(now):
     return local.date(), local.hour
 
 
-def _engine_state():
+def _engine_state() -> tuple[dict | None, str]:
+    """(state, "") for a fresh, well-formed observation of the playout engine; (None, why) otherwise.
+
+    A deletion needs one.  The database cannot show what the running engine has loaded or queued -- its active
+    log can be an earlier hour's, still playing after the clock has moved on -- so a missing, stale, unreadable
+    or incomplete state never counts as "nothing on air".  Read with the shared reader
+    (``webrequests.services._read_engine_state``: present, parseable and written within
+    ``STATE_STALENESS_SECONDS``); this checks that the fields the deletion checks use are there."""
+    from webrequests import services as engine_status
+
     try:
-        from webrequests.services import _read_engine_state
-        return _read_engine_state()
-    except Exception:                       # unreadable engine state: rely on the database checks alone
-        return None
+        state = engine_status._read_engine_state()
+    except (AttributeError, TypeError, ValueError):       # not an object, or a timestamp that is not a number
+        return None, "its state file is malformed"
+    except Exception as exc:
+        return None, f"its state file cannot be read ({type(exc).__name__})"
+    if state is None:
+        try:
+            present = engine_status.ENGINE_STATE_PATH.exists()
+        except OSError:
+            present = True
+        if not present:
+            return None, "there is no engine state file (is the playout engine running?)"
+        return None, (f"its state file is unreadable, malformed or older than "
+                      f"{engine_status.STATE_STALENESS_SECONDS} seconds (the engine may be stopped or stalled)")
+    stamp = state.get("timestamp") if isinstance(state, dict) else None
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) \
+            or stamp - time.time() > ENGINE_CLOCK_TOLERANCE_SECONDS:
+        return None, "its state file's timestamp is invalid or in the future"
+    decks, queue = state.get("decks"), state.get("queue")
+    if not isinstance(decks, dict) or not all(
+            deck is None or (isinstance(deck, dict) and _is_int(deck.get("track_id"))) for deck in decks.values()):
+        return None, "its state file has no valid list of playback decks"
+    if not isinstance(queue, list) or not all(isinstance(q, dict) and _is_int(q.get("track_id")) for q in queue):
+        return None, "its state file has no valid upcoming queue"
+    if "log_id" not in state or not (state["log_id"] is None or _is_int(state["log_id"])):
+        return None, "its state file does not name the active log"
+    return state, ""
 
 
 def _log_url(date, hour) -> str:
@@ -202,7 +274,7 @@ def _on_air(track, now, engine) -> list[str]:
     from library.models import LogItem, PlayEvent
 
     reasons = []
-    for deck in ((engine or {}).get("decks") or {}).values():
+    for deck in ((engine or {}).get("decks") or {}).values():   # a deletion always has a checked state
         if isinstance(deck, dict) and deck.get("track_id") == track.pk:
             reasons.append("it is loaded on a playback deck")
             break
@@ -284,12 +356,14 @@ class _Inspection:
     described: dict = field(default_factory=dict)
 
 
-def _inspect(finding, keep_id, discard_id, *, protection, now, engine, describe=True, tracks=None) -> _Inspection:
-    """Everything a deletion depends on, read now.  ``tracks``: rows the caller has already locked."""
+def _inspect(finding, keep_id, discard_id, *, protection, now, engine, engine_problem="", describe=True,
+             tracks=None) -> _Inspection:
+    """Everything a deletion depends on, read now.  ``tracks``: rows the caller has already locked.  ``engine``:
+    a checked engine state, or None with ``engine_problem`` saying why there is none (the deletion is blocked)."""
     from library.models import Track
 
     out = _Inspection()
-    evidence = _evidence(finding) or {}
+    evidence = _evidence(finding)[0] or {}
     if tracks is None:
         tracks = {t.pk: t for t in Track.objects.select_related("artist", "album").filter(pk__in=(keep_id, discard_id))}
     keep, discard = tracks.get(keep_id), tracks.get(discard_id)
@@ -307,8 +381,9 @@ def _inspect(finding, keep_id, discard_id, *, protection, now, engine, describe=
             out.blockers.append(f"the {role} Track's file path changed since the scan; run a new scan")
         elif identity is None:
             out.blockers.append(f"the {role} Track: {problem}")
-        elif (identity[2], identity[3]) != (scanned.get("size"), scanned.get("mtime_ns")):
-            out.blockers.append(f"the {role} Track's file changed since the scan compared it; run a new scan")
+        elif identity != scanned.get("witness"):
+            out.blockers.append(f"the {role} Track's file was modified or replaced since the scan compared it "
+                                "(it is no longer exactly the file that was hashed); run reconciliation again")
         owner = _owner(track, protection)
         if owner:
             out.blockers.append(f"the {role} Track is protected: {owner}")
@@ -336,6 +411,10 @@ def _inspect(finding, keep_id, discard_id, *, protection, now, engine, describe=
     if upcoming[discard_id]:
         out.blockers.append(f"the discarded Track is scheduled in {len(upcoming[discard_id])} current or upcoming "
                             "log hour(s): edit those logs first (nothing here changes a log)")
+    if engine is None:
+        out.blockers.append("the playout engine's current state cannot be confirmed: "
+                            f"{engine_problem or 'it is unavailable'}. Nothing is deleted until it can be (Keep "
+                            "both is still available)")
     out.blockers.extend(f"the discarded Track may be on air: {reason}" for reason in _on_air(discard, now, engine))
     out.voicetracks = refs["voicetracks"]
     if discard.ready2air and not keep.ready2air:
@@ -415,11 +494,13 @@ def _legacy_decision(finding, a, b):
 
 
 def preview(scan_id, raw_selections, *, user) -> dict:
-    """What the selected resolutions would do now, and the token apply needs.  Writes nothing."""
+    """What the selected resolutions would do now, and a token for each pair that can be applied.  Writes
+    nothing."""
     report = _report(scan_id)
     selections = _parse_selections(raw_selections)
     conflicts = _conflicts(selections)
-    protection, now, engine = _protection(), _now(), _engine_state()
+    protection, now = _protection(), _now()
+    engine, engine_problem = _engine_state()
     items, planned = [], []
     for index, sel in enumerate(selections):
         finding = _finding(report, sel["finding_id"])
@@ -442,7 +523,8 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             if decision and decision.get("resolution") in ("keep_a", "keep_b") and not decision.get("applied"):
                 item["warnings"] = [f"A legacy decision ({decision['resolution']}) is recorded for this pair and is "
                                     "left unchanged; apply_duplicate_resolutions could still act on it."]
-            planned.append({"f": sel["finding_id"], "a": KEEP_BOTH, "t": sorted(members)})
+            item["token"] = _token(user, scan_id, {"f": sel["finding_id"], "a": KEEP_BOTH, "t": sorted(members)})
+            planned.append(item)
             continue
         eligible, why = finding_eligibility(finding)
         if not eligible:
@@ -451,7 +533,8 @@ def preview(scan_id, raw_selections, *, user) -> dict:
         if {sel["keep"], sel["discard"]} != set(members) or sel["keep"] == sel["discard"]:
             item.update(status=BLOCKED, reasons=["those Tracks are not the two Tracks of this finding"])
             continue
-        inspection = _inspect(finding, sel["keep"], sel["discard"], protection=protection, now=now, engine=engine)
+        inspection = _inspect(finding, sel["keep"], sel["discard"], protection=protection, now=now, engine=engine,
+                              engine_problem=engine_problem)
         item.update(keep=sel["keep"], discard=sel["discard"], **inspection.described,
                     voicetracks=inspection.voicetracks, warnings=inspection.warnings,
                     legacy_decision=_legacy_decision(finding, sel["keep"], sel["discard"]))
@@ -459,14 +542,19 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             item.update(status=BLOCKED, reasons=inspection.blockers)
             continue
         item.update(status=NEEDS_ACK if inspection.voicetracks else ELIGIBLE, reasons=[])
-        planned.append({"f": sel["finding_id"], "a": DELETE, "k": sel["keep"], "d": sel["discard"],
-                        "fp": inspection.fingerprints, "c": inspection.suggestions, "v": inspection.voicetracks})
+        item["token"] = _token(user, scan_id, {"f": sel["finding_id"], "a": DELETE, "k": sel["keep"],
+                                               "d": sel["discard"], "fp": inspection.fingerprints,
+                                               "c": inspection.suggestions, "v": inspection.voicetracks})
+        planned.append(item)
     counts = {s: sum(1 for i in items if i["status"] == s) for s in (ELIGIBLE, NEEDS_ACK, BLOCKED)}
-    token = signing.dumps({"u": user.pk, "s": scan_id, "p": planned}, salt=TOKEN_SALT, compress=True) if planned \
-        else None
-    return {"scan_id": scan_id, "items": items, "counts": counts,
-            "deletions": sum(1 for p in planned if p["a"] == DELETE), "token": token,
-            "expires_in": TOKEN_MAX_AGE_SECONDS}
+    return {"scan_id": scan_id, "items": items, "counts": counts, "applicable": len(planned),
+            "deletions": sum(1 for i in planned if i["action"] == DELETE), "expires_in": TOKEN_MAX_AGE_SECONDS}
+
+
+def _token(user, scan_id, entry) -> str:
+    """One pair's authorization: this operator, this scan, this pair as previewed, a nonce spent at apply."""
+    return signing.dumps({"u": user.pk, "s": scan_id, "n": secrets.token_urlsafe(16), "p": entry},
+                         salt=TOKEN_SALT, compress=True)
 
 
 def _redeem(token, user) -> dict:
@@ -480,25 +568,55 @@ def _redeem(token, user) -> dict:
         raise ResolutionRefused("This is not a valid preview token.", status=400) from None
     if not isinstance(plan, dict) or plan.get("u") != user.pk:
         raise ResolutionRefused("This preview was made by another operator.", status=403)
+    if not isinstance(plan.get("n"), str) or not isinstance(plan.get("p"), dict) \
+            or plan["p"].get("a") not in (DELETE, KEEP_BOTH):
+        raise ResolutionRefused("This is not a valid preview token.", status=400)
     return plan
 
 
-def _parse_choices(raw):
+def _claim(nonce) -> None:
+    """Spend a token: exactly one apply request ever gets past this for it (any worker, any connection).
+
+    The bulk edit's claim marker (``track_bulk_edit.SessionPreviews``): a row of its own in ``django_session``,
+    keyed by a digest of the token's nonce under a prefix Django never generates, carrying no user and expiring
+    after the token could be used.  Its primary key can be inserted once; the insert commits before the pair is
+    applied, so a token is spent even when its pair is then refused (preview again to retry)."""
+    from django.contrib.sessions.backends.db import SessionStore
+    from django.contrib.sessions.models import Session
+
+    using = router.db_for_write(Session)
+    now = timezone.now()
+    key = CLAIM_PREFIX + hashlib.sha256(nonce.encode()).hexdigest()[:40 - len(CLAIM_PREFIX)]
+    try:
+        with transaction.atomic(using=using):
+            with connections[using].cursor() as cursor:
+                cursor.execute(f"SET LOCAL lock_timeout = '{CLAIM_LOCK_TIMEOUT}'")
+            Session.objects.using(using).create(
+                session_key=key, session_data=SessionStore().encode({"duplicate_resolution_claimed": True}),
+                expire_date=now + timedelta(seconds=TOKEN_MAX_AGE_SECONDS + 300))
+    except IntegrityError:
+        raise ResolutionRefused("This pair's preview was already used. Preview again.") from None
+    except OperationalError:
+        raise ResolutionRefused("This pair's preview is being used by another request. Preview again.") from None
+    try:                                     # best effort: an expired marker is inert (clearsessions removes it too)
+        with transaction.atomic(using=using):
+            with connections[using].cursor() as cursor:
+                cursor.execute(f"SET LOCAL lock_timeout = '{CLAIM_LOCK_TIMEOUT}'")
+            Session.objects.using(using).filter(session_key__startswith=CLAIM_PREFIX, expire_date__lt=now).delete()
+    except DatabaseError:
+        pass
+
+
+def _parse_choice(raw) -> dict:
+    """The operator's options for the pair: the suggested categories to add and the voice-track acknowledgment."""
     if raw is None:
-        return {}
+        raw = {}
     if not isinstance(raw, dict):
-        raise ResolutionRefused("choices must be an object keyed by finding id.", status=400)
-    out = {}
-    for finding_id, choice in raw.items():
-        if not isinstance(choice, dict):
-            raise ResolutionRefused("Each choice must be an object.", status=400)
-        categories = choice.get("categories", [])
-        if not isinstance(categories, list) or not all(isinstance(c, int) and not isinstance(c, bool)
-                                                       for c in categories):
-            raise ResolutionRefused("categories must be a list of category ids.", status=400)
-        out[finding_id] = {"include": choice.get("include", True) is True, "categories": set(categories),
-                           "acknowledge_voicetracks": choice.get("acknowledge_voicetracks") is True}
-    return out
+        raise ResolutionRefused("choice must be an object.", status=400)
+    categories = raw.get("categories", [])
+    if not isinstance(categories, list) or not all(_is_int(c) for c in categories):
+        raise ResolutionRefused("categories must be a list of category ids.", status=400)
+    return {"categories": set(categories), "acknowledge_voicetracks": raw.get("acknowledge_voicetracks") is True}
 
 
 CLEANUP_TEXT = {
@@ -522,52 +640,61 @@ def _cleanup(result) -> dict:
     return {"status": status, "outcome": kind, "message": text}
 
 
-def apply(token, raw_choices, *, confirm, user) -> dict:
-    """Apply a previewed selection, one pair at a time (see the module docstring).  Every outcome is reported."""
+SETTLED = ("deleted", "recorded", "already_decided")
+
+
+def apply(token, raw_choice, *, confirm, user) -> dict:
+    """Apply ONE previewed pair (see the module docstring); its outcome is reported and audited."""
     from library.services import library_audit
 
     try:
         plan = _redeem(token, user)
-        choices = _parse_choices(raw_choices)
-        deletions = [p for p in plan["p"] if p["a"] == DELETE and choices.get(p["f"], {}).get("include", True)]
-        if deletions and confirm is not True:
+        entry = plan["p"]
+        choice = _parse_choice(raw_choice)
+        if entry["a"] == DELETE and confirm is not True:
             raise ResolutionRefused("Confirm the permanent deletion first.", status=400)
         report = _report(plan["s"])
+        _claim(plan["n"])
     except ResolutionRefused as exc:
-        # Nothing was applied; kept for troubleshooting (an expired, foreign, unconfirmed or outdated preview).
+        # Nothing was applied; kept for troubleshooting (an expired, foreign, spent, unconfirmed or outdated preview).
         library_audit.record(
             "reconciliation.duplicate_resolution", user=user, outcome="refused", level="warning",
             title=f"Library duplicate resolution refused: {exc}"[:200], detail={"reason": str(exc), "status": exc.status})
         raise
-    protection = _protection()
-    results = []
-    for entry in plan["p"]:
-        choice = choices.get(entry["f"], {"include": True, "categories": set(), "acknowledge_voicetracks": False})
-        if not choice["include"]:
-            results.append({"finding_id": entry["f"], "action": entry["a"], "outcome": "cancelled",
-                            "message": "Cancelled: nothing was changed for this pair."})
-            continue
-        finding = _finding(report, entry["f"])
-        if entry["a"] == KEEP_BOTH:
-            results.append(_apply_keep_both(report, finding, entry, user))
-            continue
-        # The engine's state is read again for each pair: a batch never relies on an older snapshot.
-        results.append(_apply_delete(report, finding, entry, choice, user=user, protection=protection,
-                                     engine=_engine_state()))
-    counts = {}
-    for r in results:
-        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
-    deleted = [r for r in results if r["outcome"] == "deleted"]
-    problems = [r for r in results if r["outcome"] not in ("deleted", "recorded", "already_decided", "cancelled")]
-    outcome = ("completed" if not problems else "partial" if len(problems) < len(results) else "nothing_applied")
+    finding = _finding(report, entry["f"])
+    if entry["a"] == KEEP_BOTH:
+        result = _apply_keep_both(report, finding, entry, user)
+    else:
+        # The engine is observed again for this request: the preview's observation is never relied on.
+        engine, engine_problem = _engine_state()
+        result = _apply_delete(report, finding, entry, choice, user=user, protection=_protection(), engine=engine,
+                               engine_problem=engine_problem)
+    outcome = result["outcome"]
     action_id = library_audit.record(
         "reconciliation.duplicate_resolution", user=user, outcome=outcome,
-        level="info" if outcome == "completed" else "warning",
-        title=f"Library duplicate resolution {outcome.replace('_', ' ')}: {len(deleted)} Track(s) deleted",
-        detail={"scan_id": plan["s"], "requested": len(results), "outcomes": counts,
-                "deleted_tracks": library_audit.id_sample([r["discard"] for r in deleted])})
-    return {"scan_id": plan["s"], "outcome": outcome, "counts": counts, "items": results,
-            "audit_action_id": action_id, "rescan_recommended": bool(deleted)}
+        level="info" if outcome in SETTLED else "warning",
+        title=f"Library duplicate resolution: {outcome.replace('_', ' ')} ({entry['f']})"[:200],
+        detail={"scan_id": plan["s"], "finding_id": entry["f"], "resolution": entry["a"],
+                "tracks": entry["t"] if entry["a"] == KEEP_BOTH else [entry["k"], entry["d"]]})
+    return {"scan_id": plan["s"], "item": result, "audit_action_id": action_id,
+            "rescan_recommended": outcome == "deleted"}
+
+
+class _LockBudget:
+    """``execute_wrapper`` for one pair's transaction: each statement may wait for locks only for what is left
+    of the budget (``lock_timeout``, local to this transaction).  Once it is spent, a lock another transaction
+    holds is refused at once (1 ms) rather than waited for; uncontended statements still run, so a slow but
+    unobstructed deletion is never cut short."""
+
+    SQL = "SELECT set_config('lock_timeout', %s, true)"
+
+    def __init__(self, seconds):
+        self.deadline = time.monotonic() + seconds
+
+    def __call__(self, execute, sql, params, many, context):
+        value = f"{max(1, int((self.deadline - time.monotonic()) * 1000))}ms"
+        execute(self.SQL, [[value]] if many else [value], many, context)
+        return execute(sql, params, many, context)
 
 
 def _apply_keep_both(report, finding, entry, user) -> dict:
@@ -578,13 +705,16 @@ def _apply_keep_both(report, finding, entry, user) -> dict:
     result = record_keep_both(report["scan_id"], entry["f"], finding, a, b, user=user)
     if result["result"] == "missing":
         return {**base, "outcome": "stale", "message": "One of the Tracks no longer exists."}
+    if result["result"] == "busy":
+        return {**base, "outcome": "failed", "message": "Not recorded: another operation is changing this pair's "
+                                                        "decision. Preview again and retry."}
     if result["result"] == "recorded":
         return {**base, "outcome": "recorded", "message": "Recorded: keep both (not duplicates)."}
     return {**base, "outcome": "already_decided", "resolution": result["resolution"],
             "message": f"Already decided ({result['resolution']}); left unchanged."}
 
 
-def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -> dict:
+def _apply_delete(report, finding, entry, choice, *, user, protection, engine, engine_problem="") -> dict:
     from library.models import Track
     from library.services import library_audit
     from library.services.track_deletion import delete_track
@@ -601,9 +731,8 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -
     using = router.db_for_write(Track)
     cleanup, added = None, []
     try:
-        with transaction.atomic(using=using):
-            with connections[using].cursor() as cursor:      # this transaction only (SET LOCAL)
-                cursor.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+        with transaction.atomic(using=using), \
+                connections[using].execute_wrapper(_LockBudget(PAIR_LOCK_BUDGET_SECONDS)):
             # Both rows locked, lowest id first: concurrent edits, deletions and new log entries naming
             # either Track wait for this transaction.
             locked = {t.pk: t for t in Track.objects.select_for_update(of=("self",))
@@ -611,7 +740,7 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -
             tracks = {t.pk: t for t in Track.objects.select_related("artist", "album")
                       .filter(pk__in=list(locked))}
             inspection = _inspect(finding, keep_id, discard_id, protection=protection, now=_now(),
-                                  engine=engine, describe=False, tracks=tracks)
+                                  engine=engine, engine_problem=engine_problem, describe=False, tracks=tracks)
             if inspection.keep is None or inspection.discard is None:
                 return {**base, "outcome": "stale", "message": inspection.blockers[0][:1].upper()
                         + inspection.blockers[0][1:] + "; nothing was changed."}
@@ -638,7 +767,7 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -
                 added = sorted(chosen)
             discard = inspection.discard
             rel = _relative(discard.filepath)
-            cleanup = delete_track(discard, remove_source=True)
+            cleanup = delete_track(discard, remove_source=True, cleanup_lock_timeout=CLEANUP_LOCK_TIMEOUT_SECONDS)
             library_audit.record(
                 "reconciliation.duplicate_delete", user=user, outcome="deleted",
                 title=f"Library duplicate resolved: Track {discard_id} deleted, Track {keep_id} kept",
@@ -651,9 +780,9 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -
                 "message": f"Blocked; nothing was changed: still referenced by {', '.join(names)}."}
     except OperationalError as exc:
         log.warning("duplicate resolution finding=%s busy: %s", entry["f"], type(exc).__name__)
-        return {**base, "outcome": "failed", "message": "Not applied: one of the Tracks is locked by another "
-                                                        "operation (or the database was unavailable); nothing was "
-                                                        "changed for this pair. Try again."}
+        return {**base, "outcome": "failed", "message": "Not applied: one of the Tracks is busy (another operation "
+                                                        "holds it, or the database was unavailable); nothing was "
+                                                        "changed for this pair. Preview again and retry."}
     except DatabaseError as exc:
         log.warning("duplicate resolution finding=%s keep=%s discard=%s failed: %s", entry["f"], keep_id, discard_id,
                     type(exc).__name__)
@@ -674,7 +803,8 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine) -
 def record_keep_both(scan_id, finding_id, finding, a, b, *, user) -> dict:
     """The existing not-a-duplicate decision (``DuplicateCandidate`` ``keep_both``): recorded once, never
     overriding a decision already made, audited after commit.  Returns {"result": "recorded" | "already_decided"
-    | "missing", "resolution", "applied"}."""
+    | "missing" | "busy", "resolution", "applied"}; "busy" when the decision row stayed locked by another
+    operation for ``KEEP_BOTH_LOCK_TIMEOUT`` (nothing recorded)."""
     from library.models import DuplicateCandidate, Track
     from library.services import library_audit
 
@@ -688,22 +818,30 @@ def record_keep_both(scan_id, finding_id, finding, a, b, *, user) -> dict:
             detail={"track_a": a, "track_b": b, "resolution": resolution, "scan_id": scan_id,
                     "finding_id": finding_id})
 
-    with transaction.atomic():
-        tracks = {t.pk: t for t in Track.objects.filter(pk__in=(a, b))}
-        if len(tracks) != 2:
-            return {"result": "missing"}
-        candidate = (DuplicateCandidate.objects.select_for_update()
-                     .filter(track_a_id=a, track_b_id=b).first())
-        if candidate is not None and candidate.resolution != "unresolved":
-            audit("already_decided", candidate.resolution)
-            return {"result": "already_decided", "resolution": candidate.resolution, "applied": candidate.applied}
-        now = timezone.now()
-        if candidate is None:
-            DuplicateCandidate.objects.create(
-                track_a=tracks[a], track_b=tracks[b], resolution="keep_both", resolved_at=now,
-                confidence="exact" if finding.get("confidence") == "exact" else "probable")
-        else:
-            candidate.resolution, candidate.resolved_at = "keep_both", now
-            candidate.save(update_fields=["resolution", "resolved_at"])
-        audit("recorded", "keep_both")
+    using = router.db_for_write(DuplicateCandidate)
+    try:
+        with transaction.atomic(using=using):
+            with connections[using].cursor() as cursor:      # this transaction only (SET LOCAL)
+                cursor.execute(f"SET LOCAL lock_timeout = '{KEEP_BOTH_LOCK_TIMEOUT}'")
+            tracks = {t.pk: t for t in Track.objects.filter(pk__in=(a, b))}
+            if len(tracks) != 2:
+                return {"result": "missing"}
+            candidate = (DuplicateCandidate.objects.select_for_update()
+                         .filter(track_a_id=a, track_b_id=b).first())
+            if candidate is not None and candidate.resolution != "unresolved":
+                audit("already_decided", candidate.resolution)
+                return {"result": "already_decided", "resolution": candidate.resolution,
+                        "applied": candidate.applied}
+            now = timezone.now()
+            if candidate is None:
+                DuplicateCandidate.objects.create(
+                    track_a=tracks[a], track_b=tracks[b], resolution="keep_both", resolved_at=now,
+                    confidence="exact" if finding.get("confidence") == "exact" else "probable")
+            else:
+                candidate.resolution, candidate.resolved_at = "keep_both", now
+                candidate.save(update_fields=["resolution", "resolved_at"])
+            audit("recorded", "keep_both")
+    except OperationalError as exc:
+        log.warning("keep both tracks=%s,%s busy: %s", a, b, type(exc).__name__)
+        return {"result": "busy"}
     return {"result": "recorded", "resolution": "keep_both"}

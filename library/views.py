@@ -2011,6 +2011,9 @@ def api_reconciliation_not_duplicate(request):
     result = duplicate_resolution.record_keep_both(scan_id, finding_id, finding, a, b, user=request.user)
     if result["result"] == "missing":
         return JsonResponse({"error": "One of the Tracks no longer exists"}, status=409)
+    if result["result"] == "busy":
+        return JsonResponse({"error": "Another operation is changing this pair's decision; nothing was recorded. "
+                                      "Try again."}, status=409)
     return JsonResponse(result)
 
 
@@ -2024,8 +2027,8 @@ def _duplicate_resolution_response(call):
 
 @require_http_methods(["POST"])
 def api_reconciliation_duplicates_preview(request):
-    """Roadmap 3.12: what resolving the selected exact duplicate pairs (one findings page) would do now, and the
-    token apply needs. Writes nothing. See library.services.library_duplicate_resolution."""
+    """Roadmap 3.12: what resolving the selected exact duplicate pairs (one findings page) would do now, and one
+    token per applicable pair for apply. Writes nothing. See library.services.library_duplicate_resolution."""
     denied = _require_track_manager(request)
     if denied is not None:
         return denied
@@ -2041,8 +2044,9 @@ def api_reconciliation_duplicates_preview(request):
 
 @require_http_methods(["POST"])
 def api_reconciliation_duplicates_apply(request):
-    """Roadmap 3.12: apply a previewed selection, each pair independently (categories and deletion together),
-    after confirmation; every pair's outcome and file-cleanup result is reported."""
+    """Roadmap 3.12: apply ONE previewed pair (its own single-use token; categories and deletion together), after
+    confirmation; its outcome and file-cleanup result are reported. The page sends a confirmed batch one pair per
+    request, so no request does more than one deletion."""
     denied = _require_track_manager(request)
     if denied is not None:
         return denied
@@ -2054,7 +2058,7 @@ def api_reconciliation_duplicates_apply(request):
     except (ValueError, TypeError):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     return _duplicate_resolution_response(lambda: duplicate_resolution.apply(
-        body.get("token"), body.get("choices"), confirm=body.get("confirm"), user=request.user))
+        body.get("token"), body.get("choice"), confirm=body.get("confirm"), user=request.user))
 
 
 def _relink_response(call):

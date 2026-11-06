@@ -211,6 +211,15 @@ class FileEntry:
     def describe(self) -> dict:
         return {"path": self.path, "rel": self.rel, "size": self.size, "mtime_ns": self.mtime_ns}
 
+    def witness(self) -> list:
+        """The identity the file was walked (and, for an exact duplicate, hashed) under."""
+        return [self.dev, self.ino, self.size, self.mtime_ns, self.ctime_ns, self.nlink]
+
+
+def stat_witness(info) -> list:
+    """The same six fields of an ``os.stat_result``, for comparison with ``FileEntry.witness()``."""
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink]
+
 
 def normalized_title(title) -> str:
     text = unicodedata.normalize("NFKC", title or "").casefold()
@@ -732,7 +741,10 @@ class Scanner:
                 if len(entries) > 1:
                     groups.append({"confidence": "exact", "reason": "identical file bytes (hashed in this scan)",
                                    "file_count": len(entries),
-                                   "files": [dict(e.describe(), track_id=path_track.get(e.path), sha256=digest)
+                                   # The witness lets a later deletion confirm these are still the bytes
+                                   # that were hashed (library_duplicate_resolution).
+                                   "files": [dict(e.describe(), track_id=path_track.get(e.path), sha256=digest,
+                                                  witness=e.witness())
                                              for e in sorted(entries, key=lambda e: e.rel)]})
         if unhashed:
             self.errors.append(f"{unhashed} equal-size file(s) were not hashed: byte budget reached "
@@ -778,9 +790,7 @@ class Scanner:
 
     @staticmethod
     def _stat_matches(entry: FileEntry, info) -> bool:
-        return stat.S_ISREG(info.st_mode) and (
-            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink
-        ) == (entry.dev, entry.ino, entry.size, entry.mtime_ns, entry.ctime_ns, entry.nlink)
+        return stat.S_ISREG(info.st_mode) and stat_witness(info) == entry.witness()
 
     def _hash(self, entry: FileEntry) -> str:
         """Hash exactly the walked file, reading no more than its witnessed size and the global budget."""

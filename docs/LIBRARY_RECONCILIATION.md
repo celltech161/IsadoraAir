@@ -177,15 +177,21 @@ Track only after an explicit choice, a preview and a confirmation, and only thro
 and never writes a `keep_a`/`keep_b` row that the command could act on later.
 
 **Eligible findings.** Only a duplicate finding of the latest **complete** scan with `exact` confidence (both
-files' SHA-256 equal, hashed in that scan) and **exactly two registered Tracks**. Review only, with the reason
-shown: groups of three or more Tracks, `likely`/`audio_equivalent`/`uncertain` findings, file-only groups and
-every finding of a `suspect` scan. Unregistered files of an eligible group are never touched. Track Detail
+files' SHA-256 equal, hashed in that scan) and **exactly two registered Tracks**, whose report records each
+file's **stat witness**: the device, inode, size, mtime, ctime and link count the file was hashed under (the
+scanner's own `FileEntry` identity, verified before and after hashing; exact findings only). Review only, with
+the reason shown: groups of three or more Tracks, `likely`/`audio_equivalent`/`uncertain` findings, file-only
+groups, every finding of a `suspect` scan, and exact findings of a report made before witnesses were recorded
+(r0126 and earlier: run reconciliation once after installing to resolve them here). Unregistered files of an eligible group are never touched. Track Detail
 links stay in every group for listening and for checking cue points and categories.
 
 **Choice per pair** (the page, default *No action*): keep A and discard B; keep B and discard A; keep both
 intentionally (the existing `keep_both` decision, recorded exactly as "Record: not a duplicate" does: once,
 never over a decision already made); no action. A is the lower Track id. Nothing is chosen automatically.
-Choices belong to the findings page shown: another page, filter or scan starts with none.
+Choices belong to the findings page shown. With selections made, a page, filter or search change asks first:
+**Stay and keep selections** (the controls return to the page shown) or **Discard selections and continue**; a
+search asks once the typing pauses. A newer scan replacing the report clears them with a message saying so;
+nothing is ever applied against another scan.
 
 **Preview** (`POST /api/tracks/reconciliation/duplicates/preview/`, at most 25 selections, writes nothing).
 For each pair: both Tracks (link, title, artist, file, format, size, categories, playlist / rotation /
@@ -195,7 +201,7 @@ current-or-upcoming-log / voice-track references) and a status:
 |---|---|
 | Can be deleted | none of the below |
 | Needs acknowledgment | the discarded Track has VoiceTracks: deleting it deletes them (Track CASCADE); they are not moved |
-| Blocked | the discarded Track is in a playlist or a rotation slot (PROTECT); is in the log of the current or a later station hour, or of the engine's active log; is on a deck or in the engine's queue, was claimed by the engine in the last 3 hours and has not played, or started playing within its duration + 10 minutes; either Track is protected (spoken projection, Active Messages, remote-hosted, non-canonical path), missing, at another path than the scan's, or its file's size or modification time differs from what the scan hashed; both name the same file; the finding is not eligible; or another selection of the batch names the same finding or Track |
+| Blocked | the playout engine's state is missing, stale (older than the shared reader's 30 s), unreadable, malformed, stamped in the future or lacks its decks, queue or active-log field; the discarded Track is in a playlist or a rotation slot (PROTECT); is in the log of the current or a later station hour, or of the engine's active log (which can be an earlier hour's); is on a deck or in the engine's queue, was claimed by the engine in the last 3 hours and has not played, or started playing within its duration + 10 minutes; either Track is protected (spoken projection, Active Messages, remote-hosted, non-canonical path), missing, at another path than the scan's, or its file's current stat witness differs from the one the scan hashed it under (modified or replaced); both name the same file; the finding is not eligible; or another selection of the batch names the same finding or Track |
 
 Blocked log entries are listed by date and hour, each linking to `/logs/?date=…&hour=…&return=reconciliation`
 (new tab; the Logs page opens that hour and offers a link back). Nothing here edits or regenerates a log; after
@@ -203,19 +209,25 @@ editing, **Re-check** previews again. The preview also lists the categories the 
 and additional) that the kept Track lacks, as suggested **additional** categories, each ticked by default; the
 operator can untick any. The kept Track's primary category is never changed and no category is removed.
 
-It returns a token (`django.core.signing`, bound to the operator, 10 minutes) naming the scan and, for each
-pair that can proceed, both Tracks' fingerprints (file path and name, format, title, artist, album, duration,
-primary and additional categories, and the file's device, inode, size, mtime and ctime), the suggested
-categories and the voice-track count. A replay deletes nothing more (the discarded Track no longer exists).
+Keep both needs no engine state (it deletes nothing). Each pair that can proceed gets **its own token**
+(`django.core.signing`, bound to the operator, 10 minutes, single use) naming the scan, the pair, both Tracks'
+fingerprints (file path and name, format, title, artist, album, duration, primary and additional categories,
+and the file's stat witness), the suggested categories and the voice-track count.
 
-**Apply** (`POST /api/tracks/reconciliation/duplicates/apply/`) needs `confirm: true` for any deletion, and
-per pair `include`, the chosen `categories` and `acknowledge_voicetracks`. The client's categories must be a
-subset of the server's suggestions; nothing else from the client is trusted. Each pair is independent, in its
-own transaction, with a 5-second lock wait:
+**Apply** (`POST /api/tracks/reconciliation/duplicates/apply/`, body `{token, choice, confirm}`) applies **one
+pair per request**. The page confirms the batch once, then sends the pairs one at a time in order, showing
+"*n* of *m* pair(s) processed"; a blocked, busy or refused pair is reported and the next one is sent; a lost
+answer stops the batch (that pair is *unknown*, the rest *not attempted*) and the findings are reloaded, so an
+irreversible action is never retried blindly. A deletion needs `confirm: true`; `choice` carries the chosen
+`categories` (a subset of the server's suggestions; nothing else from the client is trusted) and
+`acknowledge_voicetracks`. Unticked or cancelled pairs are never sent. The token is spent before the pair is
+applied (a `django_session` claim-marker row under the `dupres:` prefix, as bulk edit's: its key can be
+inserted once), so a replay, or a second tab, is refused; preview again to retry. Each pair is its own
+transaction:
 
-1. lock both Track rows (lowest id first; a new log entry naming either Track waits, then fails on the
-   deleted one);
-2. recheck the scan (still the latest, still complete), the finding, both Tracks, files and scan evidence,
+1. observe the engine again (the preview's observation is never relied on); lock both Track rows (lowest id
+   first; a new log entry naming either Track waits, then fails on the deleted one);
+2. recheck the scan (still the latest, still complete), the finding, both Tracks, files and their stat witness,
    references and on-air evidence, and compare both fingerprints with the preview's: any difference is
    *stale* (preview again);
 3. refuse an unacknowledged voice-track deletion, or a voice-track count that changed;
@@ -236,16 +248,27 @@ A failure on one pair never rolls back another. Every pair is reported:
 
 Pairs that were not applied stay selected on the page for review and a later preview.
 
+**Request time.** One request does at most one deletion, and every lock wait in it is bounded, each answered
+"busy, try again" (nothing changed, or for the cleanup: the file retained and reported): spending the token
+1 s; the pair's transaction 3 s in all (`PAIR_LOCK_BUDGET_SECONDS`: Track rows, category rows and the deletion's
+cascade together; once spent, a contended lock is refused at once while uncontended statements still run); the
+after-commit source-path lock 2 s and waveform-cache lock 2 s (`delete_track(cleanup_lock_timeout=…)`; other
+callers keep 5 s and 15 s). That is at most 8 s of lock waiting, against Gunicorn's 30 s worker timeout. Keep
+both (also the "Record: not a duplicate" button) waits at most 2 s for the decision row.
+
 **Not changed:** the kept Track's audio file, path, cue markers, waveform, readiness and every other field;
 logs; the report. The report is a snapshot: after a resolution the page refreshes the Tracks' current facts
 (a deleted Track shows as such) and recommends a new scan with the existing **Run reconciliation** button. It
 never starts one by itself.
 
 **Limitations:**
-* The duplicate evidence is the scan's hash. Nothing is re-hashed in the web worker, so a rewrite of either
-  file that keeps its size and modification time is not detected.
-* "On air" comes from the engine's state file (when fresh) and the database: a Track loaded by a path the
-  engine does not report is not seen.
+* The duplicate evidence is the scan's hash and stat witness. Nothing is re-hashed in the web worker. The
+  witness detects ordinary modification or replacement (any write changes the ctime, a replacement the inode);
+  it is not a cryptographic guard against a privileged user who rewrites the bytes and then resets every
+  recorded metadata field.
+* "On air" comes from the engine's state file (required fresh and well formed for any deletion) and the
+  database: a Track loaded by a path the engine does not report is not seen. With the engine stopped, nothing
+  can be deleted here.
 * Live fill or an operator insert that picks the discarded Track at the instant of deletion has its insert
   refused; that writer, not this workflow, handles the refusal.
 * Holidays, blocked slots, rotation weight, play history and voice tracks are not carried over to the kept
@@ -455,8 +478,8 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
 | `reconciliation.relink` | `refused` | warning |
 | `reconciliation.not_duplicate` | `recorded`, `already_decided` | info |
 | `reconciliation.duplicate_delete` (3.12, one per deleted Track) | `deleted` | info |
-| `reconciliation.duplicate_resolution` (3.12, one per apply) | `completed` | info |
-| `reconciliation.duplicate_resolution` | `partial`, `nothing_applied`, `refused` | warning |
+| `reconciliation.duplicate_resolution` (3.12, one per apply request, i.e. per pair) | `deleted`, `recorded`, `already_decided` | info |
+| `reconciliation.duplicate_resolution` | `blocked`, `stale`, `needs_acknowledgment`, `failed`, `refused` (an expired, spent, foreign, unconfirmed or outdated token) | warning |
 
 **Every event carries:**
 * `action_id`, which is also its `dedupe_key` (`library|audit|<action>|<action_id>`), so two operations are never
@@ -479,8 +502,8 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
   * the categories added and the number of voice tracks deleted.
 
   It is written only if that pair's transaction committed.
-* `reconciliation.duplicate_resolution`: the scan, the per-outcome counts and at most 20 deleted Track ids, or
-  for a refusal, the reason.
+* `reconciliation.duplicate_resolution`: the scan, the finding, the resolution (`delete` or `keep_both`) and the
+  pair's Track ids, or for a refusal, the reason.
 
 **Never recorded:** preview tokens, cookies, request bodies or credentials.
 

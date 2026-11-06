@@ -2,13 +2,16 @@
 
 Every file lives in a per-test temporary Library root (library.tests.test_library_reconciliation_b's fixture):
 LIBRARY_ROOT, WAVEFORMS_DIR and REPORTS_ROOT point there, so no station media, cache or report is touched.
-The engine state is patched (no /run file is read) and the clock the service uses is fixed where an hour
-boundary would matter."""
+The engine state is a fresh file in the test's own directory (webrequests.services.ENGINE_STATE_PATH patched,
+read by the shared reader; never /run), and the clock the service uses is fixed where an hour boundary would
+matter.  Apply is one pair per request (its own token), as the page sends a confirmed batch; the corrections
+after Codex's first review have their own regressions (test_library_duplicate_resolution_corrections)."""
 import json
 import os
 import re
 import subprocess
 import time
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
@@ -27,6 +30,7 @@ from library.services import library_reconciliation as reconciliation
 from library.services import track_deletion
 from library.tests.test_library_reconciliation_b import User, _ReconFixture
 from library.tests.test_library_reconciliation_launch import PAGE_HARNESS, TEMPLATE
+from webrequests import services as engine_status
 
 PREVIEW = "library:api-reconciliation-duplicates-preview"
 APPLY = "library:api-reconciliation-duplicates-apply"
@@ -39,9 +43,11 @@ class _Pairs(_ReconFixture):
 
     def setUp(self):
         super().setUp()
-        engine = mock.patch.object(resolution, "_engine_state", return_value=None)
+        self.state_path = self.base / "engine_state.json"
+        engine = mock.patch.object(engine_status, "ENGINE_STATE_PATH", self.state_path)
         engine.start()
         self.addCleanup(engine.stop)
+        self.engine()
         kind = self.rock.kind
         self.jazz = Category.objects.create(code="JAZZ", name="Jazz", kind=kind)
         self.blues = Category.objects.create(code="BLUES", name="Blues", kind=kind)
@@ -71,8 +77,39 @@ class _Pairs(_ReconFixture):
         return {"finding_id": self.finding(keep, discard)["id"], "action": "delete", "keep": keep.pk,
                 "discard": discard.pk}
 
-    def apply(self, token, choices=None, confirm=True):
-        return self.post(APPLY, {"token": token, "choices": choices or {}, "confirm": confirm})
+    def engine(self, **fields):
+        """A fresh engine state (the fields library.services.engine._write_state writes that matter here)."""
+        state = {"transport": "PLAYING", "timestamp": time.time(), "decks": {"A": None, "B": None}, "queue": [],
+                 "log_id": None}
+        state.update(fields)
+        self.state_path.write_text(json.dumps(state))
+
+    @staticmethod
+    def token(body, index=0):
+        return body["items"][index]["token"]
+
+    @staticmethod
+    def tokens(body):
+        return [i.get("token") for i in body["items"] if i.get("token")]
+
+    def apply(self, token, choice=None, confirm=True, client=None):
+        """One pair: one request with its own token."""
+        return self.post(APPLY, {"token": token, "choice": choice or {}, "confirm": confirm}, client)
+
+    def apply_all(self, body, choices=None, confirm=True):
+        """Every applicable pair of a preview, in order, one request each (as the page sends a confirmed batch);
+        ``choices`` per finding id.  Returns the pair results."""
+        results = []
+        for item in body["items"]:
+            if item.get("token"):
+                status, result = self.apply(item["token"], (choices or {}).get(item["finding_id"]), confirm)
+                self.assertEqual(status, 200, result)
+                results.append(result["item"])
+        return results
+
+    @staticmethod
+    def counts(results):
+        return dict(Counter(r["outcome"] for r in results))
 
     def additional(self, track):
         return sorted(track.additional_categories.values_list("code", flat=True))
@@ -102,7 +139,7 @@ class EligibilityTests(_Resolution):
         trio_finding = self.finding(*trio)
         status, body = self.preview({"finding_id": trio_finding["id"], "action": "delete", "keep": trio[0].pk,
                                      "discard": trio[1].pk})
-        self.assertEqual((status, body["items"][0]["status"], body["token"]), (200, "blocked", None))
+        self.assertEqual((status, body["items"][0]["status"], self.tokens(body)), (200, "blocked", []))
         likely = self.finding(like_a, like_b)
         status, body = self.preview({"finding_id": likely["id"], "action": "delete", "keep": like_a.pk,
                                      "discard": like_b.pk})
@@ -118,8 +155,8 @@ class EligibilityTests(_Resolution):
         status, body = self.preview(self.delete(a, b))
         with mock.patch.object(track_deletion, "SOURCE_FRESHNESS_GRACE_SECONDS", 0), \
                 self.captureOnCommitCallbacks(execute=True):
-            status, result = self.apply(body["token"])
-        self.assertEqual(result["items"][0]["outcome"], "deleted")
+            status, result = self.apply(self.token(body))
+        self.assertEqual(result["item"]["outcome"], "deleted")
         self.assertTrue(copy.exists())
         self.assertTrue(Path(a.filepath).exists())
         self.assertFalse(Path(b.filepath).exists())
@@ -156,10 +193,9 @@ class SingleAndBulkDeletionTests(_Resolution):
         # The patch is the outer context: the captured on-commit cleanup runs while it still applies.
         with mock.patch.object(track_deletion, "SOURCE_FRESHNESS_GRACE_SECONDS", 0), \
                 self.captureOnCommitCallbacks(execute=True):
-            status, result = self.apply(body["token"], {item["finding_id"]: {
-                "categories": [self.pop.pk, self.jazz.pk]}})
+            status, result = self.apply(item["token"], {"categories": [self.pop.pk, self.jazz.pk]})
         self.assertEqual(status, 200, result)
-        done = result["items"][0]
+        done = result["item"]
         self.assertEqual((done["outcome"], sorted(done["categories_added"]), result["rescan_recommended"]),
                          ("deleted", ["JAZZ", "POP"], True))
         self.assertFalse(Track.objects.filter(pk=b.pk).exists())
@@ -184,12 +220,11 @@ class SingleAndBulkDeletionTests(_Resolution):
         self.assertEqual(body["counts"], {"eligible": 2, "needs_acknowledgment": 0, "blocked": 2})
         self.assertIn("playlist(s) 'Morning'", body["items"][1]["reasons"][0])
         self.assertIn("rotation(s) 'Hot'", body["items"][2]["reasons"][0])
-        status, result = self.apply(body["token"])
-        self.assertEqual(status, 200)
-        self.assertEqual([r["finding_id"] for r in result["items"]],
+        results = self.apply_all(body)
+        self.assertEqual([r["finding_id"] for r in results],
                          [body["items"][0]["finding_id"], body["items"][3]["finding_id"]])
-        self.assertEqual(result["counts"], {"deleted": 2})
-        self.assertEqual(result["items"][0]["cleanup"]["outcome"], "pending")   # this test's transaction never commits
+        self.assertEqual(self.counts(results), {"deleted": 2})
+        self.assertEqual(results[0]["cleanup"]["outcome"], "pending")   # this test's transaction never commits
         remaining = set(Track.objects.values_list("pk", flat=True))
         self.assertEqual(remaining, {pairs[0][0].pk, pairs[1][0].pk, pairs[1][1].pk, pairs[2][0].pk, pairs[2][1].pk,
                                      pairs[3][0].pk})
@@ -197,8 +232,7 @@ class SingleAndBulkDeletionTests(_Resolution):
         PlaylistItem.objects.all().delete()
         status, body = self.preview(self.delete(*pairs[1]), self.delete(*pairs[2]))
         self.assertEqual([i["status"] for i in body["items"]], ["eligible", "blocked"])
-        status, result = self.apply(body["token"])
-        self.assertEqual(result["counts"], {"deleted": 1})
+        self.assertEqual(self.counts(self.apply_all(body)), {"deleted": 1})
         self.assertFalse(Track.objects.filter(pk=pairs[1][1].pk).exists())
         self.assertTrue(Track.objects.filter(pk=pairs[2][1].pk).exists())
 
@@ -210,8 +244,8 @@ class SingleAndBulkDeletionTests(_Resolution):
         self.scanned()
         status, body = self.preview(*(self.delete(a, b) for a, b in pairs))
         self.assertEqual(body["counts"], {"eligible": 8, "needs_acknowledgment": 0, "blocked": 2})
-        status, result = self.apply(body["token"])
-        self.assertEqual((result["counts"], result["outcome"]), ({"deleted": 8}, "completed"))
+        self.assertEqual(len(self.tokens(body)), 8)
+        self.assertEqual(self.counts(self.apply_all(body)), {"deleted": 8})
         self.assertEqual(Track.objects.count(), 12)
         self.assertTrue(Track.objects.filter(pk__in=[pairs[3][1].pk, pairs[7][1].pk]).count() == 2)
 
@@ -225,8 +259,8 @@ class CategoryTests(_Resolution):
         status, body = self.preview(self.delete(a, b))
         item = body["items"][0]
         self.assertEqual(sorted(c["code"] for c in item["suggested_categories"]), ["JAZZ", "POP"])
-        status, result = self.apply(body["token"], {item["finding_id"]: {"categories": [self.jazz.pk]}})
-        self.assertEqual(result["items"][0]["categories_added"], ["JAZZ"])
+        status, result = self.apply(item["token"], {"categories": [self.jazz.pk]})
+        self.assertEqual(result["item"]["categories_added"], ["JAZZ"])
         a.refresh_from_db()
         self.assertEqual((a.category_id, self.additional(a)), (self.rock.pk, ["BLUES", "JAZZ"]))
 
@@ -234,20 +268,20 @@ class CategoryTests(_Resolution):
         a, b = self.pair("none")
         self.scanned()
         status, body = self.preview(self.delete(a, b))
-        status, result = self.apply(body["token"])                 # no choices sent: nothing added
-        self.assertEqual((result["items"][0]["outcome"], result["items"][0]["categories_added"]), ("deleted", []))
+        status, result = self.apply(self.token(body))              # no categories sent: nothing added
+        self.assertEqual((result["item"]["outcome"], result["item"]["categories_added"]), ("deleted", []))
         self.assertEqual(self.additional(a), [])
 
     def test_a_category_that_was_not_suggested_is_refused(self):
         a, b = self.pair("forged")
         self.scanned()
         status, body = self.preview(self.delete(a, b))
-        fid = body["items"][0]["finding_id"]
-        status, result = self.apply(body["token"], {fid: {"categories": [self.blues.pk]}})
-        self.assertEqual(result["items"][0]["outcome"], "refused")
+        status, result = self.apply(self.token(body), {"categories": [self.blues.pk]})
+        self.assertEqual(result["item"]["outcome"], "refused")
         self.assertTrue(Track.objects.filter(pk=b.pk).exists())
         self.assertEqual(self.additional(a), [])
-        status, result = self.apply(body["token"], {fid: {"categories": ["POP"]}})
+        status, body = self.preview(self.delete(a, b))
+        status, result = self.apply(self.token(body), {"categories": ["POP"]})
         self.assertEqual(status, 400)
 
     def test_categories_and_deletion_commit_together_or_not_at_all(self):
@@ -262,18 +296,17 @@ class CategoryTests(_Resolution):
         real = resolution._references
         with mock.patch.object(resolution, "_references",
                                lambda track_id: {**real(track_id), "playlist_count": 0, "playlists": []}):
-            status, result = self.apply(body["token"], {f["finding_id"]: {"categories": [self.pop.pk]}
-                                                        for f in body["items"]})
-        self.assertEqual([r["outcome"] for r in result["items"]], ["blocked", "deleted"])
-        self.assertIn("PlaylistItem", result["items"][0]["message"])
+            results = self.apply_all(body, {f["finding_id"]: {"categories": [self.pop.pk]} for f in body["items"]})
+        self.assertEqual([r["outcome"] for r in results], ["blocked", "deleted"])
+        self.assertIn("PlaylistItem", results[0]["message"])
         self.assertEqual(self.additional(a), [])                    # rolled back with the refused deletion
         self.assertTrue(Track.objects.filter(pk=b.pk).exists())
         self.assertEqual(self.additional(c), ["POP"])
         PlaylistItem.objects.all().delete()
         status, body = self.preview(self.delete(a, b))
         with mock.patch("library.services.track_deletion.delete_track", side_effect=DatabaseError("boom")):
-            status, result = self.apply(body["token"], {body["items"][0]["finding_id"]: {"categories": [self.pop.pk]}})
-        self.assertEqual(result["items"][0]["outcome"], "failed")
+            status, result = self.apply(self.token(body), {"categories": [self.pop.pk]})
+        self.assertEqual(result["item"]["outcome"], "failed")
         self.assertEqual(self.additional(a), [])
         self.assertTrue(Track.objects.filter(pk=b.pk).exists())
 
@@ -304,7 +337,7 @@ class LogAndOnAirTests(_Resolution):
                          [(now.date().isoformat(), now.hour), ((now + timedelta(hours=26)).date().isoformat(),
                                                                 (now + timedelta(hours=26)).hour)])
         self.assertEqual(logs[0]["url"], f"/logs/?date={now.date().isoformat()}&hour={now.hour}&return=reconciliation")
-        self.assertIsNone(body["token"])
+        self.assertEqual(self.tokens(body), [])
         # The operator edits the logs (here: removes the entries) and re-checks: now eligible.
         current.delete()
         later.delete()
@@ -313,8 +346,8 @@ class LogAndOnAirTests(_Resolution):
             self.assertEqual(body["items"][0]["status"], "eligible")
             # ...but a log entry added after the preview blocks the apply.
             self.schedule(b, now + timedelta(hours=1))
-            status, result = self.apply(body["token"])
-        self.assertEqual(result["items"][0]["outcome"], "blocked")
+            status, result = self.apply(self.token(body))
+        self.assertEqual(result["item"]["outcome"], "blocked")
         self.assertTrue(Track.objects.filter(pk=b.pk).exists())
 
     def test_the_engines_active_log_and_on_air_evidence_block(self):
@@ -328,10 +361,11 @@ class LogAndOnAirTests(_Resolution):
             "queue": dict(engine={"queue": [{"item_id": 1, "track_id": b.pk}]}),
         }
         for name, case in cases.items():
-            with self.subTest(name), mock.patch.object(resolution, "_now", return_value=now), \
-                    mock.patch.object(resolution, "_engine_state", return_value=case["engine"]):
+            with self.subTest(name), mock.patch.object(resolution, "_now", return_value=now):
+                self.engine(**case["engine"])
                 status, body = self.preview(self.delete(a, b))
                 self.assertEqual(body["items"][0]["status"], "blocked", body["items"][0])
+        self.engine()
         for name, fields in {"claimed": {"playback_claimed_at": now - timedelta(minutes=2)},
                              "playing": {"played_at": now - timedelta(minutes=1)}}.items():
             with self.subTest(name):
@@ -354,14 +388,12 @@ class VoiceTrackTests(_Resolution):
         status, body = self.preview(self.delete(a, b))
         item = body["items"][0]
         self.assertEqual((item["status"], item["voicetracks"]), ("needs_acknowledgment", 2))
-        fid = item["finding_id"]
-        status, result = self.apply(body["token"])
-        self.assertEqual(result["items"][0]["outcome"], "needs_acknowledgment")
+        status, result = self.apply(item["token"])               # not acknowledged: nothing is deleted
+        self.assertEqual(result["item"]["outcome"], "needs_acknowledgment")
         self.assertEqual(VoiceTrack.objects.filter(track=b).count(), 2)
-        status, result = self.apply(body["token"], {fid: {"include": False}})
-        self.assertEqual(result["items"][0]["outcome"], "cancelled")
-        status, result = self.apply(body["token"], {fid: {"acknowledge_voicetracks": True}})
-        self.assertEqual((result["items"][0]["outcome"], result["items"][0]["voicetracks_deleted"]), ("deleted", 2))
+        status, body = self.preview(self.delete(a, b))            # (Cancel is the page's: that pair is not sent)
+        status, result = self.apply(self.token(body), {"acknowledge_voicetracks": True})
+        self.assertEqual((result["item"]["outcome"], result["item"]["voicetracks_deleted"]), ("deleted", 2))
         self.assertFalse(VoiceTrack.objects.filter(track_id=b.pk).exists())
 
     def test_a_voice_track_added_after_the_preview_is_never_deleted_unacknowledged(self):
@@ -369,8 +401,8 @@ class VoiceTrackTests(_Resolution):
         self.scanned()
         status, body = self.preview(self.delete(a, b))
         VoiceTrack.objects.create(track=b, position="intro", filepath="/nonexistent/late.wav")
-        status, result = self.apply(body["token"], {body["items"][0]["finding_id"]: {"acknowledge_voicetracks": True}})
-        self.assertEqual(result["items"][0]["outcome"], "stale")
+        status, result = self.apply(self.token(body), {"acknowledge_voicetracks": True})
+        self.assertEqual(result["item"]["outcome"], "stale")
         self.assertEqual(VoiceTrack.objects.filter(track=b).count(), 1)
 
 
@@ -396,8 +428,8 @@ class RevalidationTests(_Resolution):
             with self.subTest(name):
                 a, b, body = self.ready(f"re{i}")
                 change(a, b)
-                status, result = self.apply(body["token"])
-                self.assertEqual(result["items"][0]["outcome"], "stale", result["items"][0])
+                status, result = self.apply(self.token(body))
+                self.assertEqual(result["item"]["outcome"], "stale", result["item"])
                 # Nothing was deleted by the apply: each Track is gone only if the change itself removed it.
                 self.assertEqual(Track.objects.filter(pk=b.pk).exists(), name != "discard deleted")
                 self.assertEqual(Track.objects.filter(pk=a.pk).exists(), name != "survivor deleted")
@@ -407,7 +439,7 @@ class RevalidationTests(_Resolution):
         self.scanned()
         Path(b.filepath).write_bytes(SAME + b"evidence-changed")      # different bytes since the scan
         status, body = self.preview(self.delete(a, b))
-        self.assertIn("changed since the scan", body["items"][0]["reasons"][0])
+        self.assertIn("modified or replaced since the scan", body["items"][0]["reasons"][0])
         Path(a.filepath).unlink()
         status, body = self.preview(self.delete(a, b))
         self.assertTrue(any("kept Track: its file no longer exists" in r for r in body["items"][0]["reasons"]))
@@ -416,7 +448,7 @@ class RevalidationTests(_Resolution):
     def test_a_newer_scan_refuses_the_preview_and_the_apply(self):
         a, b, body = self.ready("newer")
         reconciliation.run_scan()
-        status, result = self.apply(body["token"])
+        status, result = self.apply(self.token(body))
         self.assertEqual(status, 409)
         self.assertIn("newer scan", result["error"])
         status, result = self.preview(self.delete(a, b), scan_id=body["scan_id"])
@@ -425,16 +457,17 @@ class RevalidationTests(_Resolution):
 
     def test_tokens_are_bound_to_the_operator_and_expire_and_need_confirmation(self):
         a, b, body = self.ready("token")
-        status, result = self.apply(body["token"], confirm=False)
+        token = self.token(body)
+        status, result = self.apply(token, confirm=False)
         self.assertEqual((status, Track.objects.filter(pk=b.pk).exists()), (400, True))
         other = User.objects.create_superuser("other-admin", "o@example.invalid", "pw")
         client = Client()
         client.force_login(other)
-        status, result = self.post(APPLY, {"token": body["token"], "confirm": True}, client=client)
+        status, result = self.post(APPLY, {"token": token, "confirm": True}, client=client)
         self.assertEqual(status, 403)
         with mock.patch.object(resolution, "TOKEN_MAX_AGE_SECONDS", -1), \
                 self.captureOnCommitCallbacks(execute=True):
-            status, result = self.apply(body["token"])
+            status, result = self.apply(token)
         self.assertEqual(status, 409)
         from monitoring.models import SystemEvent
         refused = [e.detail for e in SystemEvent.objects.filter(category="library")
@@ -443,9 +476,11 @@ class RevalidationTests(_Resolution):
         forged = signing.dumps({"u": self.admin.pk, "s": body["scan_id"], "p": []}, salt="something.else")
         self.assertEqual(self.apply(forged)[0], 400)
         self.assertTrue(Track.objects.filter(pk=b.pk).exists())
-        status, result = self.apply(body["token"])                   # replay-safe: the first apply deletes,
-        status, again = self.apply(body["token"])                    # the replay finds nothing to delete
-        self.assertEqual((result["items"][0]["outcome"], again["items"][0]["outcome"]), ("deleted", "stale"))
+        status, result = self.apply(token)                           # none of the refusals above spent it
+        self.assertEqual(result["item"]["outcome"], "deleted")
+        status, again = self.apply(token)                            # single use: a replay is refused
+        self.assertEqual(status, 409)
+        self.assertIn("already used", again["error"])
 
 
 class SelectionTests(_Resolution):
@@ -463,7 +498,7 @@ class SelectionTests(_Resolution):
         statuses = [i["status"] for i in body["items"]]
         self.assertEqual(statuses, ["blocked", "blocked", "blocked", "blocked"])
         self.assertIn("same finding or Track", body["items"][0]["reasons"][0])
-        self.assertIsNone(body["token"])
+        self.assertEqual(self.tokens(body), [])
         status, body = self.preview(self.delete(c, d), {"finding_id": "F999999", "action": "delete", "keep": a.pk,
                                                         "discard": b.pk})
         self.assertEqual([i["status"] for i in body["items"]], ["eligible", "blocked"])
@@ -488,8 +523,8 @@ class SelectionTests(_Resolution):
         status, body = self.preview({"finding_id": self.finding(a, b)["id"], "action": "keep_both"},
                                     {"finding_id": self.finding(c, d)["id"], "action": "keep_both"})
         self.assertIn("legacy decision (keep_a)", body["items"][1]["warnings"][0])
-        status, result = self.apply(body["token"], confirm=False)          # no deletion: no confirmation needed
-        self.assertEqual([r["outcome"] for r in result["items"]], ["recorded", "already_decided"])
+        results = self.apply_all(body, confirm=False)                       # no deletion: no confirmation needed
+        self.assertEqual([r["outcome"] for r in results], ["recorded", "already_decided"])
         self.assertEqual(sorted(DuplicateCandidate.objects.values_list("resolution", flat=True)),
                          ["keep_a", "keep_both"])
         self.assertEqual(Track.objects.count(), 4)
@@ -500,7 +535,7 @@ class SelectionTests(_Resolution):
         self.scanned()
         status, body = self.preview(self.delete(b, a))                     # the opposite of the legacy decision
         self.assertEqual(body["items"][0]["legacy_decision"], {"resolution": "keep_a", "applied": False})
-        self.apply(body["token"])
+        self.apply(self.token(body))
         self.assertFalse(Track.objects.filter(pk=a.pk).exists())
         self.assertFalse(DuplicateCandidate.objects.exists())              # nothing left for the old CLI to apply
 
@@ -516,10 +551,11 @@ class PermissionTests(_Resolution):
         self.assertEqual(self.post(PREVIEW, {"scan_id": self.report["scan_id"], "selections": [self.delete(a, b)]},
                                    client=client)[0], 403)
         status, body = self.preview(self.delete(a, b))
-        self.assertEqual(self.post(APPLY, {"token": body["token"], "confirm": True}, client=client)[0], 403)
+        self.assertEqual(self.post(APPLY, {"token": self.token(body), "confirm": True}, client=client)[0], 403)
         strict = Client(enforce_csrf_checks=True)
         strict.force_login(self.admin)
-        response = strict.post(reverse(APPLY), {"token": body["token"], "confirm": True}, content_type="application/json")
+        response = strict.post(reverse(APPLY), {"token": self.token(body), "confirm": True},
+                               content_type="application/json")
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.client.get(reverse(PREVIEW)).status_code, 405)
         self.assertEqual(Track.objects.count(), 2)
@@ -556,14 +592,14 @@ class CleanupReportingTests(_Pairs, TransactionTestCase):
                 mock.patch.object(track_deletion, "_now_ns", lambda: later), \
                 mock.patch.object(track_deletion, "_source_witness", witness), \
                 mock.patch.object(Path, "unlink", unlink):
-            status, result = self.apply(body["token"])
-        outcomes = [(r["outcome"], r["cleanup"]["status"], r["cleanup"]["outcome"]) for r in result["items"]]
+            results = self.apply_all(body)
+        outcomes = [(r["outcome"], r["cleanup"]["status"], r["cleanup"]["outcome"]) for r in results]
         self.assertEqual(outcomes, [("deleted", "removed", "completed"), ("deleted", "retained_recent", "retained"),
                                     ("deleted", "failed", "failed")])
         self.assertFalse(Path(pairs[0][1].filepath).exists())
         self.assertTrue(Path(pairs[1][1].filepath).exists())
         self.assertTrue(failing.exists())
-        self.assertIn("remove the file by hand", result["items"][2]["cleanup"]["message"])
+        self.assertIn("remove the file by hand", results[2]["cleanup"]["message"])
         self.assertEqual(Track.objects.count(), 3)
 
 
@@ -629,16 +665,16 @@ class ConcurrencyTests(_Pairs, TransactionTestCase):
         patcher, held, release = self.holding_locks("first")
         first, second = {}, {}
         with patcher:
-            t1 = self.start("first", lambda: self.apply_as(body["token"], self.admin), first)
+            t1 = self.start("first", lambda: self.apply_as(self.token(body), self.admin), first)
             self.assertTrue(held.wait(10))
-            t2 = self.start("second", lambda: self.apply_as(body2["token"], other), second)
+            t2 = self.start("second", lambda: self.apply_as(self.token(body2), other), second)
             self.assertTrue(_wait_until(lambda: _ungranted_locks() >= 1), "the second apply did not wait")
             release.set()
             t1.join(20)
             t2.join(20)
         self.assertNotIn("error", first)
         self.assertNotIn("error", second)
-        self.assertEqual((first["value"]["items"][0]["outcome"], second["value"]["items"][0]["outcome"]),
+        self.assertEqual((first["value"]["item"]["outcome"], second["value"]["item"]["outcome"]),
                          ("deleted", "stale"))
         self.assertEqual(list(Track.objects.values_list("pk", flat=True)), [a.pk])
 
@@ -651,7 +687,7 @@ class ConcurrencyTests(_Pairs, TransactionTestCase):
         patcher, held, release = self.holding_locks("apply")
         applied, inserted = {}, {}
         with patcher:
-            t1 = self.start("apply", lambda: self.apply_as(body["token"], self.admin), applied)
+            t1 = self.start("apply", lambda: self.apply_as(self.token(body), self.admin), applied)
             self.assertTrue(held.wait(10))
             t2 = self.start("insert", lambda: LogItem.objects.create(
                 playlist_log=log, position=1, scheduled_time=timezone.now() + timedelta(days=2), track_id=b.pk),
@@ -660,7 +696,7 @@ class ConcurrencyTests(_Pairs, TransactionTestCase):
             release.set()
             t1.join(20)
             t2.join(20)
-        self.assertEqual(applied["value"]["items"][0]["outcome"], "deleted")
+        self.assertEqual(applied["value"]["item"]["outcome"], "deleted")
         self.assertIsInstance(inserted.get("error"), IntegrityError)
         self.assertFalse(LogItem.objects.filter(track_id=b.pk).exists())
         self.assertFalse(LogItem.objects.filter(playlist_log=log).exists())
@@ -751,9 +787,9 @@ class PageTests(_Resolution):
         out = _node(self, code + r"""
 const m = new Map([['F1', choiceFor('keep_a', 1, 2)], ['F2', choiceFor('keep_b', 3, 4)], ['F3', choiceFor('keep_both', 5, 6)]]);
 const preview = { items: [
-  { finding_id: 'F1', action: 'delete', status: 'eligible', suggested_categories: [{ id: 7 }, { id: 8 }] },
-  { finding_id: 'F2', action: 'delete', status: 'needs_acknowledgment', suggested_categories: [] },
-  { finding_id: 'F3', action: 'keep_both', status: 'eligible' },
+  { finding_id: 'F1', action: 'delete', status: 'eligible', suggested_categories: [{ id: 7 }, { id: 8 }], token: 't1' },
+  { finding_id: 'F2', action: 'delete', status: 'needs_acknowledgment', suggested_categories: [], token: 't2' },
+  { finding_id: 'F3', action: 'keep_both', status: 'eligible', token: 't3' },
   { finding_id: 'F9', action: 'delete', status: 'blocked' } ] };
 const o = initialOptions(preview);
 const before = readiness(preview, o);
@@ -763,7 +799,13 @@ const after = readiness(preview, o);
 console.log(JSON.stringify({
   payload: selectionsPayload(m), keys: [choiceKey(m.get('F1'), 1, 2), choiceKey(m.get('F2'), 3, 4), choiceKey(m.get('F3'), 5, 6),
     choiceKey(undefined, 1, 2)], none: choiceFor('none', 1, 2), blockedHasOptions: o.has('F9'), before, after,
-  choices: applyChoices(preview, o),
+  queue: applyQueue(preview, o),
+  cancelledF3: (o.get('F3').include = false, applyQueue(preview, o).cancelled.map(c => [c.finding_id, c.outcome])),
+  answers: [applyAnswer({ finding_id: 'F1', action: 'delete' }, { ok: true, status: 200 }, { item: { outcome: 'deleted' } }),
+            applyAnswer({ finding_id: 'F1', action: 'delete' }, { ok: true, status: 200 }, {}),
+            applyAnswer({ finding_id: 'F1', action: 'delete' }, { ok: false, status: 0 }, {}),
+            applyAnswer({ finding_id: 'F1', action: 'delete' }, { ok: false, status: 502 }, {}),
+            applyAnswer({ finding_id: 'F1', action: 'delete' }, { ok: false, status: 409 }, { error: 'already used' })],
   kept: [...choicesAfterApply(m, [{ finding_id: 'F1', outcome: 'deleted' }, { finding_id: 'F2', outcome: 'stale' },
                                   { finding_id: 'F3', outcome: 'recorded' }]).keys()] }));
 """)
@@ -776,10 +818,15 @@ console.log(JSON.stringify({
         self.assertFalse(out["blockedHasOptions"])
         self.assertEqual(out["before"], {"deletions": 1, "keeps": 1, "undecided": 1, "ready": False})
         self.assertEqual(out["after"], {"deletions": 2, "keeps": 1, "undecided": 0, "ready": True})
-        self.assertEqual(out["choices"], {
-            "F1": {"include": True, "categories": [8], "acknowledge_voicetracks": False},
-            "F2": {"include": True, "categories": [], "acknowledge_voicetracks": True},
-            "F3": {"include": True}})
+        self.assertEqual(out["queue"], {"cancelled": [], "send": [
+            {"finding_id": "F1", "action": "delete", "token": "t1",
+             "choice": {"categories": [8], "acknowledge_voicetracks": False}},
+            {"finding_id": "F2", "action": "delete", "token": "t2",
+             "choice": {"categories": [], "acknowledge_voicetracks": True}},
+            {"finding_id": "F3", "action": "keep_both", "token": "t3", "choice": {}}]})
+        self.assertEqual(out["cancelledF3"], [["F3", "cancelled"]])
+        self.assertEqual(out["answers"], [{"outcome": "deleted"}, None, None, None, {
+            "finding_id": "F1", "action": "delete", "outcome": "refused", "message": "Not applied: already used"}])
         self.assertEqual(out["kept"], ["F2"])
 
     def test_select_preview_acknowledge_confirm_apply_and_keep_the_blocked(self):
@@ -793,12 +840,13 @@ console.log(JSON.stringify({
   await flush();
   const previewReq = open(r => r.url === PREVIEW)[0];
   const previewBody = JSON.parse(previewReq.body);
-  respond(previewReq, 200, { scan_id: 'A', token: 'tok', deletions: 2, counts: { eligible: 1, needs_acknowledgment: 1, blocked: 1 },
+  respond(previewReq, 200, { scan_id: 'A', applicable: 2, deletions: 2, counts: { eligible: 1, needs_acknowledgment: 1, blocked: 1 },
     items: [
       { finding_id: 'F1', action: 'delete', status: 'eligible', keep: 1, discard: 2, keep_track: desc(1), discard_track: desc(2),
-        suggested_categories: [{ id: 7, code: 'POP', name: 'Pop' }], voicetracks: 0, reasons: [], warnings: [] },
+        suggested_categories: [{ id: 7, code: 'POP', name: 'Pop' }], voicetracks: 0, reasons: [], warnings: [], token: 'tok-F1' },
       { finding_id: 'F3', action: 'delete', status: 'needs_acknowledgment', keep: 4, discard: 3, keep_track: desc(4),
-        discard_track: desc(3), suggested_categories: [{ id: 9, code: 'JAZZ', name: 'Jazz' }], voicetracks: 2, reasons: [], warnings: [] },
+        discard_track: desc(3), suggested_categories: [{ id: 9, code: 'JAZZ', name: 'Jazz' }], voicetracks: 2, reasons: [],
+        warnings: [], token: 'tok-F3' },
       { finding_id: 'F4', action: 'delete', status: 'blocked', keep: 5, discard: 6, keep_track: desc(5),
         discard_track: desc(6, { references: { playlist_count: 0, rotation_count: 0, upcoming_log_items: 1, upcoming_log_count: 1,
           voicetracks: 0, upcoming_logs: [{ date: '2026-11-06', hour: 14, status: 'approved', items: 1,
@@ -821,14 +869,20 @@ console.log(JSON.stringify({
   states.ready = apply.disabled; states.label = apply.textContent;
   apply.listeners.click[0]();
   await flush();
-  const applyReq = open(r => r.url === APPLY)[0];
-  const applyBody = JSON.parse(applyReq.body);
-  respond(applyReq, 200, { scan_id: 'A', outcome: 'completed', counts: { deleted: 2 }, rescan_recommended: true, items: [
+  const applyBodies = [];
+  let applyReq = open(r => r.url === APPLY)[0];
+  applyBodies.push(JSON.parse(applyReq.body));
+  respond(applyReq, 200, { scan_id: 'A', rescan_recommended: true, item:
     { finding_id: 'F1', action: 'delete', keep: 1, discard: 2, outcome: 'deleted', message: 'Track #2 deleted; Track #1 kept.',
-      file: 'X/2.flac', categories_added: [], voicetracks_deleted: 0, cleanup: { status: 'removed', outcome: 'completed', message: 'The discarded file was removed.' } },
-    { finding_id: 'F3', action: 'delete', keep: 4, discard: 3, outcome: 'deleted', message: 'Track #3 deleted; Track #4 kept.',
-      file: 'X/3.flac', categories_added: ['JAZZ'], voicetracks_deleted: 2, cleanup: { status: 'pending', outcome: 'pending', message: 'File removal is pending.' } } ] });
+      file: 'X/2.flac', categories_added: [], voicetracks_deleted: 0, cleanup: { status: 'removed', outcome: 'completed', message: 'The discarded file was removed.' } } });
   await flush();
+  applyReq = open(r => r.url === APPLY)[0];
+  applyBodies.push(JSON.parse(applyReq.body));
+  respond(applyReq, 200, { scan_id: 'A', rescan_recommended: true, item:
+    { finding_id: 'F3', action: 'delete', keep: 4, discard: 3, outcome: 'deleted', message: 'Track #3 deleted; Track #4 kept.',
+      file: 'X/3.flac', categories_added: ['JAZZ'], voicetracks_deleted: 2, cleanup: { status: 'pending', outcome: 'pending', message: 'File removal is pending.' } } });
+  await flush();
+  const moreApply = open(r => r.url === APPLY).length;
   const results = ids.resolvePanel.text;
   const reload = open(isFindings);
   const after = { F1: PAGE1.items[0], F3: PAGE1.items[1] };
@@ -838,12 +892,14 @@ console.log(JSON.stringify({
   await flush();
   const kept = { F4: radio('resolve-F4', 'keep_a').checked, F1gone: !radio('resolve-F1', 'keep_a'), bar: ids.resolveBar.text,
                  barHidden: ids.resolveBar.hidden };
-  ids.nextBtn.listeners.click[0]();                                   // another page: the selection starts empty
+  ids.nextBtn.listeners.click[0]();                                   // another page: asked first, then empty
+  await flush();
+  button(ids.navGuard, 'Discard').listeners.click[0]();
   await flush();
   respond(open(isFindings)[0], 200, { ...PAGE1, page: 2, items: [dup('F9', 11, 12)] });
   await flush();
   console.log(JSON.stringify({ offered, bar, previewBody, logLink: logLink && { href: logLink.href, target: logLink.target },
-    states, applyBody, results, kept, page2: { barHidden: ids.resolveBar.hidden, panelHidden: ids.resolvePanel.hidden } }));
+    states, applyBodies, moreApply, results, kept, page2: { barHidden: ids.resolveBar.hidden, panelHidden: ids.resolvePanel.hidden } }));
 """)
         self.assertEqual(out["offered"], {"F1": True, "F5": False, "defaultNone": True, "barHidden": True})
         self.assertIn("3 pair(s) selected on this page: 3 to delete, 0 to keep both.", out["bar"])
@@ -855,9 +911,11 @@ console.log(JSON.stringify({
                                           "target": "_blank"})
         self.assertEqual(out["states"], {"initial": True, "confirmedButUndecided": True, "ready": False,
                                          "label": "Delete 2 duplicate Track(s)"})
-        self.assertEqual(out["applyBody"], {"token": "tok", "confirm": True, "choices": {
-            "F1": {"include": True, "categories": [], "acknowledge_voicetracks": False},
-            "F3": {"include": True, "categories": [9], "acknowledge_voicetracks": True}}})
+        self.assertEqual(out["applyBodies"], [
+            {"token": "tok-F1", "confirm": True, "choice": {"categories": [], "acknowledge_voicetracks": False}},
+            {"token": "tok-F3", "confirm": True, "choice": {"categories": [9], "acknowledge_voicetracks": True}}])
+        self.assertEqual(out["moreApply"], 0)
+        self.assertIn("Processed 2 of 2 pair(s)", out["results"])
         self.assertIn("Deleted: 2", out["results"])
         self.assertIn("File removal is pending.", out["results"])
         self.assertIn("2 voice track(s) were deleted with it.", out["results"])
@@ -876,15 +934,15 @@ console.log(JSON.stringify({
   const first = open(r => r.url === PREVIEW)[0];
   button(ids.resolvePanel, 'Close');                                  // the panel shows "Checking…" only
   ids.resolvePanel.hidden = true; resolveGen += 1;                     // closed by the operator
-  respond(first, 200, { scan_id: 'A', token: 'tok', deletions: 0, counts: { eligible: 1, needs_acknowledgment: 0, blocked: 0 },
-    items: [{ finding_id: 'F1', action: 'keep_both', status: 'eligible', track_a: 1, track_b: 2 }] });
+  respond(first, 200, { scan_id: 'A', applicable: 1, deletions: 0, counts: { eligible: 1, needs_acknowledgment: 0, blocked: 0 },
+    items: [{ finding_id: 'F1', action: 'keep_both', status: 'eligible', track_a: 1, track_b: 2, token: 'tok-F1' }] });
   await flush();
   const ignored = ids.resolvePanel.hidden;
   button(ids.resolveBar, 'Review selected').listeners.click[0]();
   await flush();
-  respond(open(r => r.url === PREVIEW)[0], 200, { scan_id: 'A', token: 'tok', deletions: 0,
+  respond(open(r => r.url === PREVIEW)[0], 200, { scan_id: 'A', applicable: 1, deletions: 0,
     counts: { eligible: 1, needs_acknowledgment: 0, blocked: 0 },
-    items: [{ finding_id: 'F1', action: 'keep_both', status: 'eligible', track_a: 1, track_b: 2 }] });
+    items: [{ finding_id: 'F1', action: 'keep_both', status: 'eligible', track_a: 1, track_b: 2, token: 'tok-F1' }] });
   await flush();
   const record = button(ids.resolvePanel, 'Record 1 keep-both');
   const confirm = walk(ids.resolvePanel, n => n.tag === 'input' && n.type === 'checkbox')[1];
@@ -897,6 +955,7 @@ console.log(JSON.stringify({
                                reloaded: open(isFindings).length }));
 """)
         self.assertTrue(out["ignored"])
-        self.assertIn("whether the pairs were applied is not known", out["lost"])
+        self.assertIn("Unknown (no answer): 1", out["lost"])
+        self.assertIn("whether it was applied is not known", out["lost"])
         self.assertTrue(out["stillSelected"])
         self.assertEqual(out["reloaded"], 1)

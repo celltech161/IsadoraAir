@@ -133,6 +133,7 @@ def _remove_waveform_after_commit(
     *,
     using: str,
     preserve_file=False,
+    lock_timeout=None,
 ) -> None:
     try:
         waveform_cache.remove(
@@ -141,6 +142,7 @@ def _remove_waveform_after_commit(
             track_deleted=True,
             preserve_file=preserve_file,
             using=using,
+            **({} if lock_timeout is None else {"lock_timeout": lock_timeout}),
         )
     except Exception as exc:
         _log_cleanup(
@@ -191,6 +193,7 @@ def schedule_waveform_cleanup(sender, instance, using, **kwargs) -> None:
         preserve_file = True
     else:
         preserve_file = False
+    lock_timeout = getattr(instance, "_cleanup_lock_timeout", None)     # delete_track(cleanup_lock_timeout=)
 
     transaction.on_commit(
         lambda: _remove_waveform_after_commit(
@@ -198,6 +201,7 @@ def schedule_waveform_cleanup(sender, instance, using, **kwargs) -> None:
             canonical,
             using=using,
             preserve_file=preserve_file,
+            lock_timeout=lock_timeout,
         ),
         using=using,
         robust=True,
@@ -233,6 +237,7 @@ def _schedule_source_cleanup(
     track_id: int,
     on_error=None,
     grace: bool = True,
+    lock_timeout_ms: int | None = None,
 ) -> None:
     if path is None:
         return
@@ -277,7 +282,8 @@ def _schedule_source_cleanup(
             try:
                 with transaction.atomic(using=using):
                     try:
-                        source_paths.acquire(canonical, using, timeout_ms=source_paths.CLEANUP_LOCK_TIMEOUT_MS)
+                        source_paths.acquire(canonical, using, timeout_ms=source_paths.CLEANUP_LOCK_TIMEOUT_MS
+                                             if lock_timeout_ms is None else lock_timeout_ms)
                     except OperationalError as exc:
                         raise _PathBusy from exc
                     decide_and_unlink()
@@ -300,16 +306,22 @@ def _schedule_source_cleanup(
     transaction.on_commit(remove, using=using, robust=True)
 
 
-def delete_track(track, *, remove_source: bool, on_source_error=None, source_grace: bool = True) -> SourceCleanup:
+def delete_track(track, *, remove_source: bool, on_source_error=None, source_grace: bool = True,
+                 cleanup_lock_timeout: float | None = None) -> SourceCleanup:
     """Delete one Track and register intended source cleanup after commit.
 
     ``source_grace=False`` is for a caller that itself created the source file moments ago and owns its
-    path (the dedication render's abandoned audio); everyone else keeps recently changed audio."""
+    path (the dedication render's abandoned audio); everyone else keeps recently changed audio.
+    ``cleanup_lock_timeout`` (seconds) shortens the after-commit waits for the source path's lock and the
+    waveform cache's lock (otherwise ``source_paths.CLEANUP_LOCK_TIMEOUT_MS`` and the cache's own default), for
+    a caller answering an HTTP request; a cleanup that gives up retains its file, as on any other timeout."""
     using = track._state.db or DEFAULT_DB_ALIAS
     track_id = track.pk
     source = Path(track.filepath) if remove_source and track.filepath else None
     externally_owned = _publication_owns_source(track_id, using)
     result = SourceCleanup(source)
+    if cleanup_lock_timeout is not None:
+        track._cleanup_lock_timeout = cleanup_lock_timeout          # read by the post_delete waveform handler
     with transaction.atomic(using=using):
         track.delete(using=using)
         if source is not None and not externally_owned:
@@ -320,6 +332,7 @@ def delete_track(track, *, remove_source: bool, on_source_error=None, source_gra
                 track_id=track_id,
                 on_error=on_source_error,
                 grace=source_grace,
+                lock_timeout_ms=None if cleanup_lock_timeout is None else int(cleanup_lock_timeout * 1000),
             )
     return result
 
