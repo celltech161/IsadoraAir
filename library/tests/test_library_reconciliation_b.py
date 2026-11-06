@@ -749,13 +749,16 @@ class UnregisteredDuplicateVisibilityTests(_Recon):
         self.assertIn("unregistered — requires review", html)
         self.assertIn("does not mean they should be ", html)
         self.assertIn("File review only", html)
-        # The page calls exactly the reconciliation endpoints: no import, delete, cleanup or merge action. (3.11:
-        # plus Run reconciliation, which starts the same read-only scan.)
+        # The page calls exactly the reconciliation endpoints: no import, cleanup or merge action, and no action on
+        # a file. (3.11: plus Run reconciliation, which starts the same read-only scan. 3.12: plus the previewed
+        # duplicate resolution, which deletes only a registered Track of an exact two-Track pair, never an
+        # unregistered file -- library.tests.test_library_duplicate_resolution.)
         endpoints = set(re.findall(r"'(/api/[^'?]+)", html))
         self.assertEqual(endpoints, {
             "/api/tracks/reconciliation/", "/api/tracks/reconciliation/findings/",
             "/api/tracks/reconciliation/relink/preview/", "/api/tracks/reconciliation/relink/apply/",
-            "/api/tracks/reconciliation/duplicates/not-duplicate/", "/api/tracks/reconciliation/run/"})
+            "/api/tracks/reconciliation/duplicates/not-duplicate/", "/api/tracks/reconciliation/run/",
+            "/api/tracks/reconciliation/duplicates/preview/", "/api/tracks/reconciliation/duplicates/apply/"})
 
 
 class _RelinkSetup:

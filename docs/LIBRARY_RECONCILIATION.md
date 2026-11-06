@@ -169,6 +169,88 @@ against an independently trusted record, which does not exist yet.
   **unverified** (Reset Cue Points unavailable) until Reanalyze Track re-decodes. The same decoded identity
   then re-trusts it, and approvals tied to that audio revision stay valid. Phase B does not rewrite caches.
 
+## Duplicate resolution from the page (roadmap 3.12)
+
+A small workflow over existing mechanisms (`library.services.library_duplicate_resolution`). It deletes a
+Track only after an explicit choice, a preview and a confirmation, and only through the commit-safe
+`track_deletion.delete_track` used by every other Track deletion. It never runs `apply_duplicate_resolutions`
+and never writes a `keep_a`/`keep_b` row that the command could act on later.
+
+**Eligible findings.** Only a duplicate finding of the latest **complete** scan with `exact` confidence (both
+files' SHA-256 equal, hashed in that scan) and **exactly two registered Tracks**. Review only, with the reason
+shown: groups of three or more Tracks, `likely`/`audio_equivalent`/`uncertain` findings, file-only groups and
+every finding of a `suspect` scan. Unregistered files of an eligible group are never touched. Track Detail
+links stay in every group for listening and for checking cue points and categories.
+
+**Choice per pair** (the page, default *No action*): keep A and discard B; keep B and discard A; keep both
+intentionally (the existing `keep_both` decision, recorded exactly as "Record: not a duplicate" does: once,
+never over a decision already made); no action. A is the lower Track id. Nothing is chosen automatically.
+Choices belong to the findings page shown: another page, filter or scan starts with none.
+
+**Preview** (`POST /api/tracks/reconciliation/duplicates/preview/`, at most 25 selections, writes nothing).
+For each pair: both Tracks (link, title, artist, file, format, size, categories, playlist / rotation /
+current-or-upcoming-log / voice-track references) and a status:
+
+| Status | When |
+|---|---|
+| Can be deleted | none of the below |
+| Needs acknowledgment | the discarded Track has VoiceTracks: deleting it deletes them (Track CASCADE); they are not moved |
+| Blocked | the discarded Track is in a playlist or a rotation slot (PROTECT); is in the log of the current or a later station hour, or of the engine's active log; is on a deck or in the engine's queue, was claimed by the engine in the last 3 hours and has not played, or started playing within its duration + 10 minutes; either Track is protected (spoken projection, Active Messages, remote-hosted, non-canonical path), missing, at another path than the scan's, or its file's size or modification time differs from what the scan hashed; both name the same file; the finding is not eligible; or another selection of the batch names the same finding or Track |
+
+Blocked log entries are listed by date and hour, each linking to `/logs/?date=…&hour=…&return=reconciliation`
+(new tab; the Logs page opens that hour and offers a link back). Nothing here edits or regenerates a log; after
+editing, **Re-check** previews again. The preview also lists the categories the discarded Track has (primary
+and additional) that the kept Track lacks, as suggested **additional** categories, each ticked by default; the
+operator can untick any. The kept Track's primary category is never changed and no category is removed.
+
+It returns a token (`django.core.signing`, bound to the operator, 10 minutes) naming the scan and, for each
+pair that can proceed, both Tracks' fingerprints (file path and name, format, title, artist, album, duration,
+primary and additional categories, and the file's device, inode, size, mtime and ctime), the suggested
+categories and the voice-track count. A replay deletes nothing more (the discarded Track no longer exists).
+
+**Apply** (`POST /api/tracks/reconciliation/duplicates/apply/`) needs `confirm: true` for any deletion, and
+per pair `include`, the chosen `categories` and `acknowledge_voicetracks`. The client's categories must be a
+subset of the server's suggestions; nothing else from the client is trusted. Each pair is independent, in its
+own transaction, with a 5-second lock wait:
+
+1. lock both Track rows (lowest id first; a new log entry naming either Track waits, then fails on the
+   deleted one);
+2. recheck the scan (still the latest, still complete), the finding, both Tracks, files and scan evidence,
+   references and on-air evidence, and compare both fingerprints with the preview's: any difference is
+   *stale* (preview again);
+3. refuse an unacknowledged voice-track deletion, or a voice-track count that changed;
+4. add the chosen additional categories to the kept Track, then delete the discarded Track
+   (`delete_track(remove_source=True)`). A PROTECT refusal or any failure rolls back that pair's category
+   additions too.
+
+A failure on one pair never rolls back another. Every pair is reported:
+
+* `deleted`, with the file-cleanup result after commit:
+  * *completed* (removed, or already gone);
+  * *retained* (kept for a stated reason: a live owner of the path, replaced, recently changed, busy,
+    unverified or non-canonical);
+  * *pending*;
+  * *failed* (the database deletion committed; remove the file by hand).
+* `blocked`, `stale`, `needs_acknowledgment`, `refused`, `failed` or `cancelled`: nothing changed for that pair.
+* `recorded` or `already_decided`, for keep both.
+
+Pairs that were not applied stay selected on the page for review and a later preview.
+
+**Not changed:** the kept Track's audio file, path, cue markers, waveform, readiness and every other field;
+logs; the report. The report is a snapshot: after a resolution the page refreshes the Tracks' current facts
+(a deleted Track shows as such) and recommends a new scan with the existing **Run reconciliation** button. It
+never starts one by itself.
+
+**Limitations:**
+* The duplicate evidence is the scan's hash. Nothing is re-hashed in the web worker, so a rewrite of either
+  file that keeps its size and modification time is not detected.
+* "On air" comes from the engine's state file (when fresh) and the database: a Track loaded by a path the
+  engine does not report is not seen.
+* Live fill or an operator insert that picks the discarded Track at the instant of deletion has its insert
+  refused; that writer, not this workflow, handles the refusal.
+* Holidays, blocked slots, rotation weight, play history and voice tracks are not carried over to the kept
+  Track; only additional categories are offered.
+
 ## Operating it
 
 Run a scan as the station's service account, so the web application can read the report:
@@ -347,9 +429,10 @@ was 31,783 bytes and expanded 50 members while reporting the exact 4,000-member 
 
 * **No bulk relink, no import of unregistered files** (use the existing Import workflow), and no cleanup or
   garbage collection of any file.
-* **No deletion decisions.** Phase B records only "not a duplicate".
-* **`apply_duplicate_resolutions` deficiencies remain** (see B0). Integrating duplicate resolution needs its own
-  previewed, revalidating design that also handles schedule references.
+* **No deletion decisions in Phase B.** Phase B records only "not a duplicate"; deletion of an exact
+  two-Track duplicate is the 3.12 workflow above.
+* **`apply_duplicate_resolutions` deficiencies remain** (see B0). The 3.12 workflow does not use it and
+  writes nothing it acts on.
 * **No relink for the unprovable cases:**
   * no cached identity, or a cache made from another path;
   * another format;
@@ -371,6 +454,9 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
 | `reconciliation.relink` | `relinked` | info |
 | `reconciliation.relink` | `refused` | warning |
 | `reconciliation.not_duplicate` | `recorded`, `already_decided` | info |
+| `reconciliation.duplicate_delete` (3.12, one per deleted Track) | `deleted` | info |
+| `reconciliation.duplicate_resolution` (3.12, one per apply) | `completed` | info |
+| `reconciliation.duplicate_resolution` | `partial`, `nothing_applied`, `refused` | warning |
 
 **Every event carries:**
 * `action_id`, which is also its `dedupe_key` (`library|audit|<action>|<action_id>`), so two operations are never
@@ -386,6 +472,15 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
   Its outcome is never `completed` while any Track was refused, stale, failed or missing.
 * `reconciliation.relink`: the Track id, the scan and finding, and the old and new file paths **relative to
   `LIBRARY_ROOT`**.
+* `reconciliation.duplicate_delete`:
+  * the kept and deleted Track ids;
+  * the scan and finding;
+  * the deleted file relative to `LIBRARY_ROOT`;
+  * the categories added and the number of voice tracks deleted.
+
+  It is written only if that pair's transaction committed.
+* `reconciliation.duplicate_resolution`: the scan, the per-outcome counts and at most 20 deleted Track ids, or
+  for a refusal, the reason.
 
 **Never recorded:** preview tokens, cookies, request bodies or credentials.
 

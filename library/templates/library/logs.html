@@ -333,6 +333,8 @@
     align-self: flex-end;
   }
   .swap-close:hover { color: var(--text-main); border-color: var(--text-main); }
+  #returnLink { color: var(--accent); font-size: 0.8rem; align-self: center; }
+  #returnLink[hidden] { display: none; }
 </style>
 {% endblock %}
 
@@ -345,6 +347,7 @@
   <button class="build-btn" id="buildBtn" onclick="buildLog()">Build</button>
   <button class="action-btn" id="previewBtn" onclick="previewLog()" title="Simulate a build without saving or affecting the real log">Test Build (Preview)</button>
   <span class="log-msg" id="logMsg"></span>
+  <a id="returnLink" href="{% url 'library:library-reconciliation' %}" hidden>&larr; Back to Library reconciliation</a>
 </div>
 
 <div class="log-layout">
@@ -864,7 +867,24 @@ async function deleteLog(logId) {
   }
 }
 
-// Load today's logs on page load
-loadDateLogs();
+// Deep link (roadmap 3.12): /logs/?date=YYYY-MM-DD&hour=H opens that hour's log, e.g. from Library
+// reconciliation's duplicate review; &return=reconciliation shows a link back. Anything else opens today.
+function linkedHour(search) {
+  const params = new URLSearchParams(search);
+  const date = params.get('date') || '', hour = params.get('hour') || '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}$/.test(hour) || Number(hour) > 23) return null;
+  if (Number.isNaN(new Date(date + 'T00:00:00').getTime())) return null;
+  return { date, hour: Number(hour), back: params.get('return') === 'reconciliation' };
+}
+const linked = linkedHour(window.location.search);
+if (linked && linked.back) document.getElementById('returnLink').hidden = false;
+if (linked) {
+  document.getElementById('dateInput').value = linked.date;
+  document.getElementById('hourSelect').value = linked.hour;
+  loadDateLogs().then(() => loadHourLog(linked.date, linked.hour));
+} else {
+  // Load today's logs on page load
+  loadDateLogs();
+}
 </script>
 {% endblock %}

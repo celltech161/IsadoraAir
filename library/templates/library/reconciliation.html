@@ -59,6 +59,13 @@
   .rc-run { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; margin-bottom: 0.75rem; font-size: 0.82rem; }
   .rc-run .rc-btn { font-size: 0.82rem; padding: 0.4rem 0.8rem; }
   /* Narrow screens: tables scroll inside .rc-table-wrap; no column (and so no action) is ever hidden. */
+  .rc-resolve { border: 1px solid var(--border-subtle); border-radius: 6px; padding: 0.4rem 0.6rem; margin: 0.45rem 0 0; }
+  .rc-resolve legend { color: var(--text-muted); font-size: 0.76rem; padding: 0 0.3rem; }
+  .rc-choice { display: block; padding: 0.15rem 0; cursor: pointer; }
+  .rc-choice input { margin-right: 0.4rem; }
+  .rc-ok { color: #22c55e; }
+  .rc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+  #resolveBar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
 </style>
 {% endblock %}
 
@@ -86,6 +93,8 @@
   <label><input type="checkbox" id="openOnly" checked> Open duplicate groups only</label>
 </div>
 
+<div class="rc-box" id="resolveBar" role="status" aria-live="polite" hidden></div>
+<div class="rc-box rc-dialog" id="resolvePanel" hidden></div>
 <div id="findings"></div>
 <div class="rc-pager">
   <button class="rc-btn" id="prevBtn" type="button">&lsaquo; Prev</button>
@@ -453,7 +462,9 @@ function renderDuplicate(card, finding) {
       'This page never deletes, imports or merges files; review them by hand.', 'rc-muted'));
   }
   if (finding.tracks && finding.tracks.length) {
+    const pairNames = (finding.resolution || {}).deletable && (finding.members || []).length === 2;
     card.append(trackTable(finding.tracks, [
+      ...(pairNames ? [['', t => t.id === finding.members[0] ? 'A' : 'B']] : []),
       ['Track', t => t.deleted ? `#${t.id} (deleted)` : trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist],
       ['Album', t => t.album], ['Duration', t => fmtDuration(t.duration)],
       ['Format', t => [t.format, t.sample_rate && `${t.sample_rate} Hz`, t.channels && `${t.channels} ch`, t.bit_depth && `${t.bit_depth}-bit`].filter(Boolean).join(', ')],
@@ -470,13 +481,18 @@ function renderDuplicate(card, finding) {
     `Showing ${finding.decisions_returned.toLocaleString()} of ${finding.decision_count.toLocaleString()} recorded decisions.`, 'rc-warn'));
   if ((finding.pending_deletion_decisions || []).length) {
     card.append(el('p', 'A recorded keep/delete decision exists for ' + finding.pending_deletion_decisions.join(', ') +
-      '. Applying it with apply_duplicate_resolutions would delete a Track; this page never does.', 'rc-warn'));
+      '. Applying it with apply_duplicate_resolutions would delete a Track. This page never applies it; deleting ' +
+      'a Track here (after your own choice and confirmation) removes that Track\'s recorded decisions.', 'rc-warn'));
   }
   if (finding.pending_deletion_decision_count > (finding.pending_deletion_decisions || []).length) {
     card.append(el('p', `${finding.pending_deletion_decision_count.toLocaleString()} pending keep/delete decisions ` +
       'exist in this group; the response lists only a bounded sample. This page never applies them.', 'rc-warn'));
   }
-  if ((finding.member_count || 0) >= 2 && (finding.members || []).length >= 2) {
+  const resolution = finding.resolution || {};
+  if (resolution.deletable && (finding.members || []).length === 2) {
+    card.append(resolutionControl(finding));
+  } else if ((finding.member_count || 0) >= 2 && (finding.members || []).length >= 2) {
+    if (resolution.reason) card.append(el('p', 'Review only: ' + resolution.reason + '.', 'rc-muted'));
     card.append(notDuplicateControl(finding));
   } else if (unregistered) {
     card.append(el('p', 'File review only: fewer than two registered Tracks, so there is no Track-pair decision to record.',
@@ -517,6 +533,376 @@ function notDuplicateControl(finding) {
   return row;
 }
 
+// ---- Duplicate resolution (roadmap 3.12). Only exact, two-Track findings the server marks deletable offer it.
+// `choices` holds the operator's explicit choice per finding of THIS page (finding id -> choice); nothing is
+// chosen by default. A preview shows what would happen and returns a token; apply sends that token with the
+// operator's per-pair options (included or cancelled, categories to add, voice-track acknowledgment). The
+// server rechecks everything and trusts none of it beyond being a subset of what it suggested.
+let choices = new Map(), choicesScope = null, resolveGen = 0, resolveBusy = false;
+
+// resolve:begin -- pure helpers (tested under Node).
+function choiceFor(value, a, b) {
+  if (value === 'keep_a') return { action: 'delete', keep: a, discard: b };
+  if (value === 'keep_b') return { action: 'delete', keep: b, discard: a };
+  if (value === 'keep_both') return { action: 'keep_both' };
+  return null;
+}
+function choiceKey(choice, a, b) {
+  if (!choice) return 'none';
+  if (choice.action === 'keep_both') return 'keep_both';
+  return choice.keep === a && choice.discard === b ? 'keep_a' : choice.keep === b && choice.discard === a ? 'keep_b' : 'none';
+}
+function selectionsPayload(map) {
+  return [...map.entries()].map(([id, c]) => c.action === 'keep_both'
+    ? { finding_id: id, action: 'keep_both' } : { finding_id: id, action: 'delete', keep: c.keep, discard: c.discard });
+}
+// Per-pair options the operator sets in the preview: deletions start included with every suggested category
+// ticked; one that needs a voice-track acknowledgment starts undecided (neither cancelled nor acknowledged).
+function initialOptions(preview) {
+  const options = new Map();
+  preview.items.forEach(item => {
+    if (item.status === 'blocked') return;
+    options.set(item.finding_id, item.action === 'keep_both' ? { include: true }
+      : { include: item.status !== 'needs_acknowledgment', ack: null,
+          categories: new Set((item.suggested_categories || []).map(c => c.id)) });
+  });
+  return options;
+}
+function readiness(preview, options) {
+  let deletions = 0, keeps = 0, undecided = 0;
+  preview.items.forEach(item => {
+    const o = options.get(item.finding_id);
+    if (!o) return;
+    if (item.action === 'keep_both') { if (o.include) keeps += 1; return; }
+    if (item.status === 'needs_acknowledgment' && o.ack === null) { undecided += 1; return; }
+    if (o.include) deletions += 1;
+  });
+  return { deletions, keeps, undecided, ready: undecided === 0 && deletions + keeps > 0 };
+}
+function applyChoices(preview, options) {
+  const out = {};
+  preview.items.forEach(item => {
+    const o = options.get(item.finding_id);
+    if (!o) return;
+    out[item.finding_id] = item.action === 'keep_both' ? { include: o.include }
+      : { include: o.include, categories: o.include ? [...o.categories] : [], acknowledge_voicetracks: o.ack === 'delete' };
+  });
+  return out;
+}
+// After apply: resolved, recorded and cancelled pairs leave the selection; blocked, stale, refused or failed ones
+// stay selected for review and a later preview.
+const SETTLED = new Set(['deleted', 'recorded', 'already_decided', 'cancelled']);
+function choicesAfterApply(map, items) {
+  const next = new Map(map);
+  items.forEach(r => { if (SETTLED.has(r.outcome)) next.delete(r.finding_id); });
+  return next;
+}
+// resolve:end
+
+function setChoice(findingId, value, a, b) {
+  const choice = choiceFor(value, a, b);
+  if (choice) choices.set(findingId, choice); else choices.delete(findingId);
+  updateResolveBar();
+}
+
+function resolutionControl(finding) {
+  const [a, b] = finding.members;
+  const box = el('fieldset', undefined, 'rc-resolve');
+  const gone = (finding.tracks || []).filter(t => t.deleted).map(t => t.id);
+  if (gone.length) {
+    choices.delete(finding.id);
+    box.append(el('p', `Track #${gone.join(', #')} no longer exists (deleted after this scan). Run a new scan to ` +
+                       'update this finding.', 'rc-muted'));
+    return box;
+  }
+  box.append(el('legend', `Resolve this pair (A is #${a}, B is #${b})`));
+  const current = choiceKey(choices.get(finding.id), a, b);
+  [['none', 'No action'], ['keep_a', `Keep A (#${a}), discard B (#${b})`], ['keep_b', `Keep B (#${b}), discard A (#${a})`],
+   ['keep_both', 'Keep both intentionally (not duplicates)']].forEach(([value, text]) => {
+    const label = el('label', undefined, 'rc-choice');
+    const input = el('input');
+    input.type = 'radio';
+    input.name = 'resolve-' + finding.id;
+    input.value = value;
+    input.checked = value === current;
+    input.addEventListener('change', () => { if (input.checked) setChoice(finding.id, value, a, b); });
+    label.append(input, el('span', text));
+    box.append(label);
+  });
+  box.append(el('p', 'Nothing happens until you review the selection and confirm it. Listen to both on their Track ' +
+                     'pages first if you are unsure.', 'rc-muted'));
+  return box;
+}
+
+function actionButton(text, onClick) {
+  const b = el('button', text, 'rc-btn');
+  b.type = 'button';
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function updateResolveBar() {
+  const bar = document.getElementById('resolveBar');
+  const list = selectionsPayload(choices);
+  if (!list.length) { bar.replaceChildren(); bar.hidden = true; return; }
+  const deletes = list.filter(s => s.action === 'delete').length;
+  const review = actionButton('Review selected…', reviewSelection);
+  review.disabled = resolveBusy;
+  bar.replaceChildren(el('span', `${list.length} pair(s) selected on this page: ${deletes} to delete, ` +
+                                 `${list.length - deletes} to keep both.`), review,
+                      actionButton('Clear selection', () => { choices.clear(); updateResolveBar(); loadFindings(); }));
+  bar.hidden = false;
+}
+
+function showResolve(nodes) {
+  const panel = document.getElementById('resolvePanel');
+  panel.replaceChildren(...nodes);
+  panel.hidden = false;
+  panel.scrollIntoView({ block: 'nearest' });
+}
+function closeResolveButton(label) {
+  return actionButton(label || 'Close', () => { resolveGen += 1; document.getElementById('resolvePanel').hidden = true; });
+}
+
+async function reviewSelection() {
+  const selections = selectionsPayload(choices);
+  if (!selections.length || resolveBusy) return;
+  const gen = ++resolveGen;
+  resolveBusy = true;
+  updateResolveBar();
+  showResolve([el('p', `Checking ${selections.length} pair(s) against the Library as it is now…`)]);
+  let result;
+  try {
+    result = await postJSON('/api/tracks/reconciliation/duplicates/preview/', { scan_id: scanId, selections });
+  } catch (e) {
+    result = { resp: { ok: false, status: 0 }, data: {} };
+  }
+  resolveBusy = false;
+  updateResolveBar();
+  if (gen !== resolveGen) return;             // closed, or superseded by a newer review
+  if (!result.resp.ok) {
+    showResolve([el('p', 'Not previewed, nothing was changed: ' + (result.data.error || 'no answer from the server.'), 'rc-bad'),
+                 closeResolveButton()]);
+    return;
+  }
+  renderPreview(result.data);
+}
+
+function categoryText(t) {
+  return [t.category && t.category.code, ...(t.additional_categories || []).map(c => c.code)].filter(Boolean).join(', ') || '—';
+}
+function referenceText(t) {
+  const r = t.references || {};
+  return `${r.playlist_count || 0} playlist, ${r.rotation_count || 0} rotation, ${r.upcoming_log_items || 0} entr` +
+         `${r.upcoming_log_items === 1 ? 'y' : 'ies'} in ${r.upcoming_log_count || 0} current/upcoming log hour(s), ` +
+         `${r.voicetracks || 0} voice track(s)`;
+}
+function logLinks(t) {
+  const r = t.references || {};
+  const p = el('p');
+  if (!(r.upcoming_logs || []).length) return p;
+  p.append(el('span', 'Scheduled in: '));
+  r.upcoming_logs.forEach((log, i) => {
+    const a = el('a', `${log.date} ${String(log.hour).padStart(2, '0')}:00 (${log.status}, ${log.items} entr${log.items === 1 ? 'y' : 'ies'})`);
+    a.href = log.url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    p.append(a);
+    if (i < r.upcoming_logs.length - 1) p.append(el('span', ', '));
+  });
+  if (r.upcoming_log_count > r.upcoming_logs.length) p.append(el('span', ` and ${r.upcoming_log_count - r.upcoming_logs.length} more`));
+  p.append(el('span', '. Each opens in a new tab: edit the log there, then use Re-check here.', 'rc-muted'));
+  return p;
+}
+
+const STATUS_TEXT = { eligible: 'Can be deleted', needs_acknowledgment: 'Needs your acknowledgment', blocked: 'Blocked' };
+
+function renderPreview(data) {
+  const options = initialOptions(data);
+  const nodes = [];
+  const c = data.counts;
+  nodes.push(el('p', `Review: ${c.eligible} can proceed, ${c.needs_acknowledgment} need your acknowledgment, ` +
+                     `${c.blocked} blocked. Blocked pairs are left unchanged and stay selected.`));
+  const confirmBox = el('input');
+  confirmBox.type = 'checkbox';
+  const confirmLabel = el('label', undefined, 'rc-choice');
+  const applyBtn = actionButton('Apply', () => applySelection(data, options, confirmBox.checked));
+  const summary = el('p', undefined, 'rc-muted');
+  const refresh = () => {
+    const r = readiness(data, options);
+    confirmLabel.replaceChildren(confirmBox, el('span', r.deletions
+      ? `I understand that ${r.deletions} Track(s) will be permanently deleted from the Library database, with ` +
+        'their files, waveforms and any acknowledged voice tracks. The kept Tracks are not changed except for the ' +
+        'ticked categories.'
+      : 'Confirm these decisions.'));
+    applyBtn.textContent = r.deletions ? `Delete ${r.deletions} duplicate Track(s)` +
+                                         (r.keeps ? ` and record ${r.keeps} keep-both` : '') : `Record ${r.keeps} keep-both`;
+    summary.textContent = r.undecided ? `${r.undecided} pair(s) with voice tracks need a choice: Cancel or Delete anyway.` : '';
+    applyBtn.disabled = !r.ready || !confirmBox.checked || resolveBusy;
+  };
+  confirmBox.addEventListener('change', refresh);
+  data.items.forEach(item => nodes.push(previewItem(item, options, refresh)));
+  if (data.token) {
+    nodes.push(confirmLabel, summary);
+    const row = el('div', undefined, 'rc-actions');
+    row.append(applyBtn, actionButton('Re-check', reviewSelection), closeResolveButton('Cancel'));
+    nodes.push(row);
+    refresh();
+  } else {
+    const row = el('div', undefined, 'rc-actions');
+    row.append(actionButton('Re-check', reviewSelection), closeResolveButton());
+    nodes.push(el('p', 'Nothing in this selection can proceed now.', 'rc-warn'), row);
+  }
+  showResolve(nodes);
+}
+
+function previewItem(item, options, refresh) {
+  const card = el('div', undefined, 'rc-card');
+  const o = options.get(item.finding_id);
+  const head = el('h3');
+  head.append(el('span', STATUS_TEXT[item.status] || item.status, 'rc-badge'));
+  if (item.action === 'keep_both') {
+    head.append(el('span', `Keep both #${item.track_a} and #${item.track_b} (record: not duplicates)`));
+    card.append(head);
+  } else if (item.keep !== undefined) {
+    head.append(el('span', `Keep #${item.keep}, delete #${item.discard}`));
+    card.append(head);
+  } else {
+    head.append(el('span', `Finding ${item.finding_id}`));
+    card.append(head);
+  }
+  if (item.keep_track && item.discard_track) {
+    card.append(trackTable([{ role: 'Keep', ...item.keep_track }, { role: 'Delete', ...item.discard_track }], [
+      ['', t => t.role], ['Track', t => trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist],
+      ['File', t => t.rel], ['Format', t => t.format], ['Size', t => fmtSize(t.size)], ['Categories', t => categoryText(t)],
+      ['References', t => referenceText(t)],
+    ]));
+    card.append(logLinks(item.discard_track));
+  }
+  (item.reasons || []).forEach(r => card.append(el('p', r, 'rc-bad')));
+  (item.warnings || []).forEach(w => card.append(el('p', w, 'rc-warn')));
+  const legacy = item.legacy_decision;
+  if (legacy && legacy.resolution && legacy.resolution !== 'unresolved') {
+    card.append(el('p', `Recorded decision for this pair: ${legacy.resolution}${legacy.applied ? ' (applied)' : ''}.` +
+      (item.action === 'delete' ? ' Deleting a Track removes its recorded decisions.' : ''), 'rc-muted'));
+  }
+  if (!o) return card;
+  if (item.action === 'delete') {
+    const suggested = item.suggested_categories || [];
+    if (suggested.length) {
+      card.append(el('p', `Add to #${item.keep} as additional categories (it keeps its primary category and all ` +
+                          'current ones):'));
+      suggested.forEach(cat => {
+        const label = el('label', undefined, 'rc-choice');
+        const box = el('input');
+        box.type = 'checkbox';
+        box.checked = o.categories.has(cat.id);
+        box.addEventListener('change', () => { if (box.checked) o.categories.add(cat.id); else o.categories.delete(cat.id); refresh(); });
+        label.append(box, el('span', `${cat.code} — ${cat.name}`));
+        card.append(label);
+      });
+    } else {
+      card.append(el('p', `#${item.keep} already has every category #${item.discard} has.`, 'rc-muted'));
+    }
+    if (item.status === 'needs_acknowledgment') {
+      card.append(el('p', `Track #${item.discard} has ${item.voicetracks} voice track(s). Deleting it deletes them too; ` +
+                          'they are not moved to the kept Track.', 'rc-warn'));
+      const link = el('a', `Open Track #${item.discard}`);
+      link.href = `/track/${encodeURIComponent(item.discard)}/`;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      card.append(link);
+      [['cancel', 'Cancel this pair'], ['delete', `Delete anyway: I acknowledge that Track #${item.discard}'s ` +
+        `${item.voicetracks} voice track(s) will be deleted`]].forEach(([value, text]) => {
+        const label = el('label', undefined, 'rc-choice');
+        const radio = el('input');
+        radio.type = 'radio';
+        radio.name = 'ack-' + item.finding_id;
+        radio.checked = o.ack === value;
+        radio.addEventListener('change', () => { if (radio.checked) { o.ack = value; o.include = value === 'delete'; refresh(); } });
+        label.append(radio, el('span', text));
+        card.append(label);
+      });
+      return card;
+    }
+  }
+  const label = el('label', undefined, 'rc-choice');
+  const include = el('input');
+  include.type = 'checkbox';
+  include.checked = o.include;
+  include.addEventListener('change', () => { o.include = include.checked; refresh(); });
+  label.append(include, el('span', 'Include this pair (untick to cancel it)'));
+  card.append(label);
+  return card;
+}
+
+const OUTCOME_TEXT = {
+  deleted: 'Deleted', recorded: 'Recorded', already_decided: 'Already decided', cancelled: 'Cancelled',
+  blocked: 'Blocked', stale: 'Changed since the preview', needs_acknowledgment: 'Not acknowledged',
+  refused: 'Refused', failed: 'Failed',
+};
+
+async function applySelection(preview, options, confirmed) {
+  if (resolveBusy) return;
+  const gen = ++resolveGen;
+  resolveBusy = true;
+  updateResolveBar();
+  showResolve([el('p', 'Applying, one pair at a time…')]);
+  let result;
+  try {
+    result = await postJSON('/api/tracks/reconciliation/duplicates/apply/',
+                            { token: preview.token, confirm: confirmed, choices: applyChoices(preview, options) });
+  } catch (e) {
+    result = { resp: { ok: false, status: 0 }, data: {} };
+  }
+  resolveBusy = false;
+  if (gen === resolveGen) {
+    if (result.resp.ok) {
+      choices = choicesAfterApply(choices, result.data.items || []);
+      renderResults(result.data);
+    } else if (result.resp.status === 0 || (result.resp.status >= 500 && !result.data.error)) {
+      showResolve([el('p', 'No answer from the server, so whether the pairs were applied is not known. The findings ' +
+                           'below have been refreshed; use Review selected… to see the current state.', 'rc-warn'),
+                   closeResolveButton()]);
+    } else {
+      showResolve([el('p', 'Nothing was applied: ' + (result.data.error || `HTTP ${result.resp.status}`), 'rc-bad'),
+                   closeResolveButton()]);
+    }
+  }
+  updateResolveBar();
+  loadFindings();                             // current Track and reference facts (the report itself is a snapshot)
+}
+
+function renderResults(data) {
+  const nodes = [];
+  const counts = Object.entries(data.counts || {}).map(([k, n]) => `${OUTCOME_TEXT[k] || k}: ${n}`).join(' · ');
+  nodes.push(el('p', 'Result: ' + counts, data.outcome === 'completed' ? 'rc-ok' : 'rc-warn'));
+  data.items.forEach(r => {
+    const card = el('div', undefined, 'rc-card');
+    const head = el('h3');
+    head.append(el('span', OUTCOME_TEXT[r.outcome] || r.outcome, 'rc-badge'));
+    head.append(el('span', r.message || ''));
+    card.append(head);
+    if (r.outcome === 'deleted') {
+      if ((r.categories_added || []).length) card.append(el('p', `Added to #${r.keep}: ${r.categories_added.join(', ')}.`));
+      if (r.voicetracks_deleted) card.append(el('p', `${r.voicetracks_deleted} voice track(s) were deleted with it.`, 'rc-warn'));
+      const cleanup = r.cleanup || {};
+      card.append(el('p', `File ${r.file || ''}: ${cleanup.message || 'outcome unknown.'}`,
+                     cleanup.outcome === 'completed' ? 'rc-muted' : cleanup.outcome === 'failed' ? 'rc-bad' : 'rc-warn'));
+    }
+    (r.reasons || []).forEach(reason => card.append(el('p', reason, 'rc-bad')));
+    nodes.push(card);
+  });
+  nodes.push(el('p', 'Deleting a Track removes its database record at once; each file’s removal is reported above ' +
+                     'separately and is not guaranteed. Pairs that were not applied stay selected.', 'rc-muted'));
+  if (data.rescan_recommended) {
+    nodes.push(el('p', `The findings below are still from scan ${data.scan_id} (a snapshot); their Track details are ` +
+                       'current. Run reconciliation (above) for a new scan when you have finished.', 'rc-warn'));
+  }
+  nodes.push(closeResolveButton());
+  showResolve(nodes);
+}
+
 function renderFinding(f) {
   const card = el('article', undefined, 'rc-card');
   const h = el('h3');
@@ -553,11 +939,20 @@ async function loadFindings() {
   list.replaceChildren();
   if (!resp.ok) { list.append(el('p', data.error || 'Could not load findings.', 'rc-bad')); return; }
   page = data.page; pages = data.pages;
+  // Duplicate choices belong to one page of one scan: another page, filter or scan starts with none.
+  const scope = [data.scan_id, data.page, t, q, params.get('open') || ''].join('|');
+  if (scope !== choicesScope) {
+    choicesScope = scope;
+    choices = new Map();
+    resolveGen += 1;
+    document.getElementById('resolvePanel').hidden = true;
+  }
   if (!data.items.length) list.append(el('p', data.scan_id ? 'No findings match.' : 'No completed scan yet.', 'rc-muted'));
   data.items.forEach(f => list.append(renderFinding(f)));
   document.getElementById('pageInfo').textContent = `Page ${page} of ${pages} (${data.total.toLocaleString()} findings)`;
   document.getElementById('prevBtn').disabled = page <= 1;
   document.getElementById('nextBtn').disabled = page >= pages;
+  updateResolveBar();
 }
 
 document.getElementById('typeFilter').addEventListener('change', () => { page = 1; markChips(); loadFindings(); });

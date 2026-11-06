@@ -1967,6 +1967,15 @@ def api_reconciliation_findings(request):
         finding["pending_deletion_decisions_truncated"] = (
             finding["pending_deletion_decision_count"] > pending_take)
         pending_budget -= pending_take
+    from library.services import library_duplicate_resolution as duplicate_resolution
+    for f in window:
+        if f["type"] == "duplicate":
+            # Computed from the scan's own finding (the page only displays it; preview and apply recheck it).
+            original = next((o for o in report["findings"] if o.get("id") == f["id"]), f)
+            deletable, why = duplicate_resolution.finding_eligibility(original)
+            f["resolution"] = {"deletable": deletable and report.get("status") == "complete",
+                               "reason": why if deletable is False else
+                               ("" if report.get("status") == "complete" else "the scan is not complete")}
     if member_ids:
         details = _track_review_details(member_ids, limit=reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
         for f in window:
@@ -1998,38 +2007,54 @@ def api_reconciliation_not_duplicate(request):
     finding = next((f for f in report["findings"] if f["id"] == finding_id and f["type"] == "duplicate"), None)
     if finding is None or a == b or not {a, b} <= set(finding.get("members", [])):
         return JsonResponse({"error": "Those Tracks are not a pair of this duplicate group"}, status=400)
-    a, b = sorted((a, b))
-    from library.services import library_audit
+    from library.services import library_duplicate_resolution as duplicate_resolution
+    result = duplicate_resolution.record_keep_both(scan_id, finding_id, finding, a, b, user=request.user)
+    if result["result"] == "missing":
+        return JsonResponse({"error": "One of the Tracks no longer exists"}, status=409)
+    return JsonResponse(result)
 
-    def audit(outcome, resolution):
-        # Registered inside the transaction: written only once it commits.
-        library_audit.record(
-            "reconciliation.not_duplicate", user=request.user, outcome=outcome,
-            title=(f"Library duplicate review: Tracks {a} and {b} recorded as not duplicates" if outcome == "recorded"
-                   else f"Library duplicate review: Tracks {a} and {b} already decided ({resolution})"),
-            detail={"track_a": a, "track_b": b, "resolution": resolution, "scan_id": scan_id,
-                    "finding_id": finding_id})
 
-    with transaction.atomic():
-        tracks = {t.pk: t for t in Track.objects.filter(pk__in=(a, b))}
-        if len(tracks) != 2:
-            return JsonResponse({"error": "One of the Tracks no longer exists"}, status=409)
-        candidate = (DuplicateCandidate.objects.select_for_update()
-                     .filter(track_a_id=a, track_b_id=b).first())
-        if candidate is not None and candidate.resolution != "unresolved":
-            audit("already_decided", candidate.resolution)
-            return JsonResponse({"result": "already_decided", "resolution": candidate.resolution,
-                                 "applied": candidate.applied})
-        now = timezone.now()
-        if candidate is None:
-            DuplicateCandidate.objects.create(
-                track_a=tracks[a], track_b=tracks[b], resolution="keep_both", resolved_at=now,
-                confidence="exact" if finding.get("confidence") == "exact" else "probable")
-        else:
-            candidate.resolution, candidate.resolved_at = "keep_both", now
-            candidate.save(update_fields=["resolution", "resolved_at"])
-        audit("recorded", "keep_both")
-    return JsonResponse({"result": "recorded", "resolution": "keep_both"})
+def _duplicate_resolution_response(call):
+    from library.services import library_duplicate_resolution as duplicate_resolution
+    try:
+        return JsonResponse(call())
+    except duplicate_resolution.ResolutionRefused as exc:
+        return JsonResponse({"result": "refused", "error": str(exc)}, status=exc.status)
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_duplicates_preview(request):
+    """Roadmap 3.12: what resolving the selected exact duplicate pairs (one findings page) would do now, and the
+    token apply needs. Writes nothing. See library.services.library_duplicate_resolution."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_duplicate_resolution as duplicate_resolution
+    try:
+        body = json.loads(request.body)
+        scan_id, selections = str(body["scan_id"]), body["selections"]
+    except (ValueError, KeyError, TypeError):
+        return JsonResponse({"error": "scan_id and selections are required"}, status=400)
+    return _duplicate_resolution_response(
+        lambda: duplicate_resolution.preview(scan_id, selections, user=request.user))
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_duplicates_apply(request):
+    """Roadmap 3.12: apply a previewed selection, each pair independently (categories and deletion together),
+    after confirmation; every pair's outcome and file-cleanup result is reported."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_duplicate_resolution as duplicate_resolution
+    try:
+        body = json.loads(request.body)
+        if not isinstance(body, dict):
+            raise TypeError
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    return _duplicate_resolution_response(lambda: duplicate_resolution.apply(
+        body.get("token"), body.get("choices"), confirm=body.get("confirm"), user=request.user))
 
 
 def _relink_response(call):
