@@ -25,20 +25,32 @@ digest, the rate and the frame count in the waveform cache.
 The source's ``os.stat`` identity (``stat_source``) is the inexpensive race detector around a
 decode and the witness that a file is still the one an identity was computed from; it is never a
 substitute for the decoded identity. ``Track.file_hash``, file names, sizes and times are never
-treated as audio identity."""
+treated as audio identity.
+
+``compute`` gives ffprobe and ffmpeg the pathname (each opens it itself); ``compute_fd`` gives them a
+file the caller already holds open (inherited, read through ``/proc/self/fd/N``), so the identity is of
+exactly that open file -- whatever happens to the pathname meanwhile -- and the caller can compare the
+open file's ``fstat`` with the witness it expects.
+
+Time: ``timeout`` bounds the whole computation. One ``time.monotonic()`` deadline is shared by the
+probe (at most ``PROBE_TIMEOUT_SECONDS`` of it) and the decode, which gets only what the probe left;
+nothing is started once it has passed, and ffmpeg is killed when it is reached."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 import subprocess
+import stat as _stat
 import threading
+import time
 from pathlib import Path
 
 ALGORITHM = "isadoraair-audio/v1:pcm_s32le:2ch:native-rate:sha256"
 CHANNELS, SAMPLE_FORMAT, BYTES_PER_FRAME = 2, "s32le", 8
 CHUNK_BYTES = 1 << 20
 DEFAULT_TIMEOUT_SECONDS = 1800
+PROBE_TIMEOUT_SECONDS = 60
 _STDERR_LIMIT = 4096
 _decoder_version = None
 
@@ -58,7 +70,6 @@ def stat_source(path) -> dict | None:
         info = os.stat(path, follow_symlinks=False)
     except (OSError, ValueError):
         return None
-    import stat as _stat
     if not _stat.S_ISREG(info.st_mode):
         return None
     return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
@@ -109,11 +120,20 @@ def decoder_version() -> str:
     return _decoder_version
 
 
-def _probe_rate(path, timeout) -> int:
+def _remaining(deadline, step) -> float:
+    """The time left before ``deadline`` (``time.monotonic``); IdentityUnavailable if none is left."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise IdentityUnavailable(f"the time allowed for identifying the audio ran out before {step}")
+    return left
+
+
+def _probe_rate(source, deadline, pass_fds=()) -> int:
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate",
-             "-of", "json", str(path)], capture_output=True, timeout=min(timeout, 60))
+             "-of", "json", source], capture_output=True, stdin=subprocess.DEVNULL, pass_fds=pass_fds,
+            timeout=min(_remaining(deadline, "probing"), PROBE_TIMEOUT_SECONDS))
     except subprocess.TimeoutExpired:
         raise IdentityUnavailable("ffprobe timed out") from None
     except OSError as exc:
@@ -132,16 +152,36 @@ def _probe_rate(path, timeout) -> int:
 
 def compute(path, *, timeout=DEFAULT_TIMEOUT_SECONDS) -> dict:
     """The identity of the decoded audio of ``path``; IdentityUnavailable if there is none."""
+    deadline = time.monotonic() + timeout
     path = Path(path)
     if stat_source(path) is None:
         raise IdentityUnavailable("not a regular file")
-    rate = _probe_rate(path, timeout)
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror", "-i", str(path),
+    return _identify(str(path), (), deadline, timeout)
+
+
+def compute_fd(fd, *, timeout=DEFAULT_TIMEOUT_SECONDS) -> dict:
+    """The identity of the decoded audio of the regular file open as ``fd``: ffprobe and ffmpeg inherit the
+    descriptor and read that open file (``/proc/self/fd/N``, a new read position for each), never a pathname.
+    No pathname fallback: if they cannot read it so, IdentityUnavailable."""
+    deadline = time.monotonic() + timeout
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise IdentityUnavailable("not a regular file")
+    except (OSError, TypeError, ValueError):
+        raise IdentityUnavailable("not an open file") from None
+    return _identify(f"/proc/self/fd/{fd}", (fd,), deadline, timeout)
+
+
+def _identify(source, pass_fds, deadline, timeout) -> dict:
+    rate = _probe_rate(source, deadline, pass_fds)
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror", "-i", source,
            "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", str(CHANNELS), "-ar", str(rate),
            "-c:a", "pcm_s32le", "-f", SAMPLE_FORMAT, "pipe:1"]
     digest = hashlib.sha256(b"isadoraair-audio/v1\n" + f"{rate}\n{CHANNELS}\n{SAMPLE_FORMAT}\n".encode())
+    left = _remaining(deadline, "decoding")
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                pass_fds=pass_fds)
     except OSError as exc:
         raise IdentityUnavailable(f"ffmpeg unavailable: {exc.strerror}") from None
     errors = bytearray()
@@ -153,7 +193,7 @@ def compute(path, *, timeout=DEFAULT_TIMEOUT_SECONDS) -> dict:
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
     timed_out = threading.Event()
-    watchdog = threading.Timer(timeout, lambda: (timed_out.set(), proc.kill()))
+    watchdog = threading.Timer(left, lambda: (timed_out.set(), proc.kill()))
     watchdog.start()
     total = 0
     try:
@@ -170,7 +210,7 @@ def compute(path, *, timeout=DEFAULT_TIMEOUT_SECONDS) -> dict:
         proc.stdout.close()
         proc.stderr.close()
     if timed_out.is_set():
-        raise IdentityUnavailable(f"decoding took longer than {timeout}s")
+        raise IdentityUnavailable(f"decoding took longer than the {round(timeout, 3):g}s allowed")
     if proc.returncode != 0 or errors:
         detail = bytes(errors).decode("utf-8", "replace").strip().splitlines()
         raise IdentityUnavailable("the audio does not decode cleanly" + (f": {detail[0][:200]}" if detail else ""))
@@ -184,5 +224,13 @@ def compute_or_none(path, **kwargs) -> tuple[dict | None, str]:
     """``(identity, "")`` or ``(None, reason)``."""
     try:
         return compute(path, **kwargs), ""
+    except IdentityUnavailable as exc:
+        return None, str(exc)
+
+
+def compute_fd_or_none(fd, **kwargs) -> tuple[dict | None, str]:
+    """``compute_fd`` as ``(identity, "")`` or ``(None, reason)``."""
+    try:
+        return compute_fd(fd, **kwargs), ""
     except IdentityUnavailable as exc:
         return None, str(exc)

@@ -18,16 +18,24 @@ two files, the full decoded-audio identity (``audio_identity``: algorithm, SHA-2
 rate, frame count) bound to the file it was taken from -- its path and the six-field stat witness the walk
 recorded (``FileEntry.witness``).  An identity comes from the Track's trusted waveform cache when that cache was
 made from exactly the walked file (its source path, device, inode, size, mtime and ctime), and otherwise, when
-verification was requested and its budget allows, from a decode in this scan with the file's witness checked
-before and after.  Matching identities: ``audio_equivalent``, with ``audio_verification`` evidence that
-``library_duplicate_resolution`` accepts for deletion.  Different identities (from the same decoder): the pair is
-``uncertain``, never resolvable.  Anything else -- no trusted cache and no decode, a failed or interrupted decode,
-an exhausted budget -- leaves it ``likely`` with the reason recorded: no false positive.  Groups of three or more
-Tracks keep the earlier label-only upgrade from trusted caches (no evidence, review only).  Each file is decoded
-at most once per scan; the decodes are bounded in number (``2 * verify_audio_pairs``, at most
-``2 * MAX_VERIFY_AUDIO_PAIRS``), in total time (``VERIFY_AUDIO_MAX_SECONDS``) and each in time
-(``VERIFY_DECODE_TIMEOUT_SECONDS``, ffmpeg killed at the limit); they run one at a time, streaming (bounded
-memory), at the scan's own priority.
+verification was requested and its budget allows, from a decode in this scan of exactly the walked file: opened
+once (``O_NOFOLLOW``), its ``fstat`` equal to the walk's witness, ffprobe and ffmpeg reading that open file and
+never the pathname, and the open file and the pathname both still that witness afterwards
+(``_decode_open_file``).  Matching identities: ``audio_equivalent``, with ``audio_verification`` evidence that
+``library_duplicate_resolution`` accepts for deletion.  Different identities from the same decoder: the pair is
+``uncertain``, never resolvable.  Different identities from different ffmpeg versions prove nothing: a cached
+identity not made by the running ffmpeg is decoded again (verification and budget allowing), otherwise the pair
+stays unverified.  Anything else -- no trusted cache and no decode, a failed or interrupted decode, an exhausted
+budget -- leaves it ``likely`` with the reason recorded: no false positive.  Groups of three or more Tracks keep
+the earlier label-only upgrade from trusted caches (no evidence, review only).
+
+Bounds: at most ``verify_audio_pairs`` pairs (at most ``MAX_VERIFY_AUDIO_PAIRS``) take fresh verification -- one
+slot per pair that needs any decode, taken before its first; pairs proven by trusted caches or by this scan's
+earlier decodes need none.  Independently at most ``2 * verify_audio_pairs`` decodes, each file decoded at most
+once per scan, and a pair starts only when everything it may need fits.  Time: ``VERIFY_AUDIO_MAX_SECONDS`` for
+all of them together, and each file (probe and decode together, one deadline) gets at most
+``VERIFY_DECODE_TIMEOUT_SECONDS`` and never more than what is left of the total; ffmpeg is killed at the limit.
+They run one at a time, streaming (bounded memory), at the scan's own priority.
 """
 from __future__ import annotations
 
@@ -76,8 +84,8 @@ DEFAULT_MAX_HASH_BYTES = 20 * (1 << 30)
 #: Decoded-audio verification of likely duplicate pairs: off unless requested (``--verify-audio-pairs``).
 VERIFY_AUDIO_PAIR_CHOICES = (25, 50, 100)       # what the page offers
 MAX_VERIFY_AUDIO_PAIRS = 100                    # most pairs one scan may decode for (two decodes each at most)
-VERIFY_AUDIO_MAX_SECONDS = 30 * 60              # all of one scan's verification decodes together
-VERIFY_DECODE_TIMEOUT_SECONDS = 300             # one file; ffmpeg is killed at the limit
+VERIFY_AUDIO_MAX_SECONDS = 30 * 60              # all of one scan's verification probes and decodes together
+VERIFY_DECODE_TIMEOUT_SECONDS = 300             # one file, probe and decode together; ffmpeg is killed at the limit
 LIST_LIMIT = 200                       # samples kept for counted-only categories
 
 TYPES = ("missing", "moved", "unregistered", "duplicate", "category_drift", "shared_source", "protected",
@@ -390,6 +398,8 @@ class Scanner:
         self.max_hash_bytes = max_hash_bytes
         self.verify_audio_pairs = max(0, min(int(verify_audio_pairs or 0), MAX_VERIFY_AUDIO_PAIRS))
         self.verify_max_decodes = 2 * self.verify_audio_pairs
+        self.verify_pairs_attempted = 0             # pairs that took a fresh-verification slot (<= verify_audio_pairs)
+        self.current_decoder = None                 # the running ffmpeg's version, when verification was requested
         self.verify_decodes = 0
         self.verify_seconds = 0.0
         self.verify_deadline = None
@@ -887,14 +897,21 @@ class Scanner:
         pairs = [g for g in likely if len(g["track_ids"]) == 2]
         self.verify_counts["candidates"] = len(pairs)
         if self.verify_audio_pairs:
+            # The running ffmpeg's version (one cached ``ffmpeg -version``), before the verification time starts:
+            # a cached identity from another version is decoded again rather than taken as disproof.
+            self.current_decoder = audio_identity.decoder_version()
             self.verify_deadline = self.clock() + VERIFY_AUDIO_MAX_SECONDS
         # Open pairs first (deterministic order); a pair already reviewed as not duplicates is never decoded.
         for group in sorted(pairs, key=lambda g: (not g.get("track_pair_review_open", True), g["track_ids"])):
             self.verify_pair(group, tracks, trusted, decode=bool(group.get("track_pair_review_open", True)))
         if self.verify_counts["budget_exhausted"]:
+            limits = ", ".join(f"{self.verify_counts[k]} by the {what}" for k, what in (
+                ("skipped_pair_limit", f"limit of {self.verify_audio_pairs} pair(s)"),
+                ("skipped_decode_limit", "decode limit"), ("skipped_time_limit", "time limit"))
+                if self.verify_counts[k])
             self.errors.append(f"{self.verify_counts['budget_exhausted']} likely duplicate pair(s) were not verified: "
-                               "this scan's audio verification budget was used up (run again; verified pairs that "
-                               "are resolved no longer need it)")
+                               f"this scan's audio verification budget was used up ({limits}; run again -- verified "
+                               "pairs that are resolved no longer need it)")
 
     # -- decoded-audio verification of one likely pair
     def verify_pair(self, group, tracks, trusted, *, decode):
@@ -904,9 +921,10 @@ class Scanner:
 
         def unverified(reason, counter="unverified"):
             evidence["reason"] = reason
-            self.verify_counts[counter] += 1
-            if counter != "unverified":
-                self.verify_counts["unverified"] += 1
+            self.verify_counts["unverified"] += 1
+            if counter != "unverified":                 # a limit: skipped_pair_limit / _decode_limit / _time_limit
+                self.verify_counts[counter] += 1
+                self.verify_counts["budget_exhausted"] += 1
 
         entries = []
         for track_id in (a, b):
@@ -919,33 +937,62 @@ class Scanner:
             return unverified("both Tracks name the same file")
         evidence["bytes"] = self._byte_relation(entries[0][1], entries[1][1])
         found = [self._known_identity(track, entry, trusted.get(track.pk)) for track, entry in entries]
-        conflict = (all(f[0] is not None for f in found) and not audio_identity.same_audio(found[0][0], found[1][0])
-                    and found[0][0].get("decoder") != found[1][0].get("decoder"))
-        if conflict:
-            # Different decoder versions may decode the same audio differently: only one decoder's output can
-            # disprove (or prove) the match.  The cached identities are decoded again, if allowed.
-            found = [(None, "", "") if f[1] == "waveform_cache" else f for f in found]
-        missing = [i for i, f in enumerate(found) if f[0] is None and not f[2]]
         failed = [f for f in found if f[0] is None and f[2]]
         if failed:
             return unverified(failed[0][2])
-        if missing:
-            if not (decode and self.verify_audio_pairs):
-                why = ("this pair was already reviewed as not duplicates" if not decode
-                       else "the identities on record were made by different decoder versions and disagree"
-                       if conflict else "no trusted waveform cache records it")
-                return unverified(f"decoded audio not verified: {why}"
-                                  + ("" if not decode else " (Run reconciliation with \"Verify audio for likely "
-                                                           "duplicates\" to compare it)"))
-            if self.verify_decodes + len(missing) > self.verify_max_decodes:
-                return unverified("decoded audio not verified: this scan's audio verification budget was used up",
-                                  "budget_exhausted")
-            for i in missing:
-                track, entry = entries[i]
-                found[i] = self._decode(entry)
+        if self._conclusive(found):
+            return self._record_pair(group, evidence, entries, found)
+        # Fresh work: a file has no identity yet, or the two identities disagree but were made by different
+        # ffmpeg versions (which may decode the same audio differently: no disproof).  ``redo`` is every
+        # cache-derived identity not made by the running ffmpeg -- what a disagreement would have decoded again.
+        missing = [i for i, f in enumerate(found) if f[0] is None]
+        redo = [i for i, f in enumerate(found) if f[0] is not None and f[1] == "waveform_cache"
+                and f[0].get("decoder") != self.current_decoder]
+        if not (decode and self.verify_audio_pairs):
+            why = ("this pair was already reviewed as not duplicates" if not decode
+                   else "no trusted waveform cache records it" if missing
+                   else "the identities on record were made by different decoder versions and disagree")
+            return unverified(f"decoded audio not verified: {why}"
+                              + ("" if not decode else " (Run reconciliation with \"Verify audio for likely "
+                                                       "duplicates\" to compare it)"))
+        # One fresh-verification slot per pair (``verify_audio_pairs``), taken before its first decode, and room
+        # in the decode limit for everything the pair may need: never a budget that ends halfway through a pair.
+        if self.verify_pairs_attempted >= self.verify_audio_pairs:
+            return unverified("decoded audio not verified: this scan's audio verification budget was used up "
+                              f"(it verifies at most {self.verify_audio_pairs} pair(s) needing a decode)",
+                              "skipped_pair_limit")
+        if self.verify_decodes + len(missing) + len(redo) > self.verify_max_decodes:
+            return unverified("decoded audio not verified: this scan's audio verification budget was used up "
+                              "(decode limit)", "skipped_decode_limit")
+        self.verify_pairs_attempted += 1
+        for i in (missing if missing else redo):
+            found[i] = self._decode(entries[i][1])
+            if found[i][0] is None:
+                return unverified(found[i][2], "skipped_time_limit" if found[i][1] == "budget" else "unverified")
+        if not self._conclusive(found):
+            # Still disagreeing across decoder versions: decode the cached side(s) with the running ffmpeg.
+            for i in [i for i, f in enumerate(found) if f[1] == "waveform_cache"
+                      and f[0].get("decoder") != self.current_decoder]:
+                found[i] = self._decode(entries[i][1])
                 if found[i][0] is None:
-                    counter = "budget_exhausted" if found[i][1] == "budget" else "unverified"
-                    return unverified(found[i][2], counter)
+                    return unverified(found[i][2], "skipped_time_limit" if found[i][1] == "budget" else "unverified")
+        if not self._conclusive(found):
+            return unverified("decoded audio not verified: the identities were made by different decoder versions "
+                              "and disagree")
+        return self._record_pair(group, evidence, entries, found)
+
+    @staticmethod
+    def _conclusive(found) -> bool:
+        """Both identities known, and either the same audio or made by the same (named) decoder: a real
+        mismatch.  A disagreement between different or unrecorded decoder versions proves nothing."""
+        (first, _s1, _r1), (second, _s2, _r2) = found
+        if first is None or second is None:
+            return False
+        decoder = first.get("decoder")
+        return audio_identity.same_audio(first, second) or (
+            isinstance(decoder, str) and bool(decoder) and decoder == second.get("decoder"))
+
+    def _record_pair(self, group, evidence, entries, found):
         (first, first_source, _), (second, second_source, _) = found
         evidence["files"] = [
             dict(entry.describe(), track_id=track.pk, witness=entry.witness(), identity=identity,
@@ -989,37 +1036,61 @@ class Scanner:
         return None, "", ""
 
     def _decode(self, entry: FileEntry):
-        """Decode exactly the walked file (witness checked before and after), within the budgets; memoized."""
+        """Decode exactly the walked file (``_decode_open_file``), within the budgets; memoized per file."""
         remaining = self.verify_deadline - self.clock()
         if remaining < 1:
             return None, "budget", "decoded audio not verified: this scan's audio verification time was used up"
         self.verify_decodes += 1
         self.progress("verify", self.verify_decodes)
 
-        def current():
+        started = self.clock()
+        try:
+            result = self._decode_open_file(entry, min(VERIFY_DECODE_TIMEOUT_SECONDS, remaining))
+        finally:
+            self.verify_seconds += self.clock() - started
+        self.audio_memo[(entry.dev, entry.ino)] = result
+        return result
+
+    @staticmethod
+    def _decode_open_file(entry: FileEntry, timeout):
+        """(identity, "decoded", "") of exactly the walked file, else (None, "decoded", reason).
+
+        The file is opened once (read only, ``O_NOFOLLOW``, non-blocking) and the open file's ``fstat`` must be the
+        walk's six-field witness; ffprobe and ffmpeg then read that open file (``audio_identity.compute_fd``),
+        never the pathname, so a path swapped meanwhile -- a parent directory exchanged and restored -- cannot lend
+        another recording's audio.  Afterwards the open file and the pathname must both still be that witness."""
+        def path_witness():
             try:
                 info = os.lstat(entry.path)
             except OSError:
                 return None
             return stat_witness(info) if stat.S_ISREG(info.st_mode) else None
 
-        started = self.clock()
+        def fd_witness(fd):
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                return None
+            return stat_witness(info) if stat.S_ISREG(info.st_mode) else None
+
+        expected = entry.witness()
+        if path_witness() != expected:
+            return None, "decoded", "the file changed after the filesystem walk; its audio was not compared"
         try:
-            if current() != entry.witness():
-                result = (None, "decoded", "the file changed after the filesystem walk; its audio was not compared")
-            else:
-                identity, problem = audio_identity.compute_or_none(
-                    entry.path, timeout=max(1, int(min(VERIFY_DECODE_TIMEOUT_SECONDS, remaining))))
-                if current() != entry.witness():
-                    result = (None, "decoded", "the file changed while its audio was being decoded")
-                elif identity is None:
-                    result = (None, "decoded", f"its audio could not be identified ({problem})")
-                else:
-                    result = (identity, "decoded", "")
+            fd = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as exc:
+            return None, "decoded", f"the file could not be opened ({_errno_name(exc)}); its audio was not compared"
+        try:
+            if fd_witness(fd) != expected:
+                return None, "decoded", "the file changed after the filesystem walk; its audio was not compared"
+            identity, problem = audio_identity.compute_fd_or_none(fd, timeout=timeout)
+            if fd_witness(fd) != expected or path_witness() != expected:
+                return None, "decoded", "the file changed while its audio was being decoded"
         finally:
-            self.verify_seconds += self.clock() - started
-        self.audio_memo[(entry.dev, entry.ino)] = result
-        return result
+            os.close(fd)
+        if identity is None:
+            return None, "decoded", f"its audio could not be identified ({problem})"
+        return identity, "decoded", ""
 
     def attach_decisions(self, groups, DuplicateCandidate):
         memberships = defaultdict(set)
@@ -1113,11 +1184,13 @@ class Scanner:
                         "duplicate_decision_rows": self.duplicate_decision_rows,
                         "duplicate_decision_group_links": self.duplicate_decision_group_links,
                         "audio_verification": {
-                            "requested_pairs": self.verify_audio_pairs, "max_decodes": self.verify_max_decodes,
+                            "requested_pairs": self.verify_audio_pairs,
+                            "pairs_attempted": self.verify_pairs_attempted, "max_decodes": self.verify_max_decodes,
                             "decodes": self.verify_decodes, "seconds": round(self.verify_seconds, 3),
                             "max_seconds": VERIFY_AUDIO_MAX_SECONDS if self.verify_audio_pairs else 0,
                             **{k: self.verify_counts.get(k, 0) for k in (
-                                "candidates", "verified", "different", "unverified", "budget_exhausted")}}},
+                                "candidates", "verified", "different", "unverified", "budget_exhausted",
+                                "skipped_pair_limit", "skipped_decode_limit", "skipped_time_limit")}}},
             "unsupported_extensions": dict(sorted(self.unsupported.items())),
             "hidden_samples": self.samples["hidden"],
             "errors": self.errors,

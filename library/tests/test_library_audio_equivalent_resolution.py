@@ -7,6 +7,13 @@ in this scan -- only when the operator asked for verification, within its budget
 is the unchanged r0127 path (preview, single-use per-pair tokens, one pair per request, engine/log/voice-track
 protections, track_deletion).
 
+Codex corrections (this module's second half): the decode is bound to the walked file through one held
+descriptor (a parent directory exchanged and restored around ffmpeg lends nothing); a disagreement between
+identities from different ffmpeg versions is decoded again or left unverified, never "different"; the pair limit
+counts pairs needing fresh verification, not decodes; one deadline covers probe and decode, and the scan's total
+bounds each of them.  ``DECODE_ENTRY`` follows whichever decode function the scanner calls, so the module also
+runs against the uncorrected implementation (where those regressions fail).
+
 Real audio throughout: ffmpeg writes a tone, and a "metadata-only" duplicate is a stream copy with different ID3
 tags (different bytes and size, identical decoded audio).  Every file lives in the test's own Library root; the
 engine state is a file in the test's directory (see test_library_duplicate_resolution_corrections).
@@ -15,6 +22,8 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
+import time
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -38,6 +47,75 @@ FINDINGS = "library:api-reconciliation-findings"
 RUN = "library:api-reconciliation-run"
 SECONDS = 2.0
 FRAMES = 88200                          # 2 s at 44.1 kHz
+OLD_DECODER = "ffmpeg version 0.0 (an older build)"
+#: What the scanner's verification calls to decode: a held descriptor (corrected) or a pathname (uncorrected).
+DECODE_ENTRY = "compute_fd_or_none" if hasattr(audio_identity, "compute_fd_or_none") else "compute_or_none"
+
+
+def _source_of(arg):
+    """The file a decode call is about: a descriptor's file (as this process sees it), or a pathname."""
+    return os.readlink(f"/proc/self/fd/{arg}") if isinstance(arg, int) else str(arg)
+
+
+def _cli_source(cmd):
+    """The input an ffprobe/ffmpeg command line names, resolved as this process sees it."""
+    source = cmd[cmd.index("-i") + 1] if "-i" in cmd else cmd[-1]
+    if source.startswith("/proc/self/fd/"):              # the child inherits the parent's descriptor number
+        try:
+            return os.readlink(source)
+        except OSError:
+            return source
+    return source
+
+
+class _SubprocessProxy:
+    """Stands in for ``subprocess`` inside one module: hooks ``run``/``Popen``, delegates everything else."""
+
+    def __init__(self, on_run=None, on_popen=None):
+        self.on_run, self.on_popen, self.calls = on_run, on_popen, []
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+    def run(self, cmd, **kwargs):
+        self.calls.append(("run", list(cmd), kwargs))
+        if self.on_run:
+            cmd, kwargs = self.on_run(list(cmd), dict(kwargs)) or (cmd, kwargs)
+        return subprocess.run(cmd, **kwargs)
+
+    def Popen(self, cmd, **kwargs):
+        self.calls.append(("Popen", list(cmd), kwargs))
+        if self.on_popen:
+            cmd, kwargs = self.on_popen(list(cmd), dict(kwargs)) or (cmd, kwargs)
+        return subprocess.Popen(cmd, **kwargs)
+
+
+class _Exchange:
+    """Puts ``other`` where the directory ``live`` is, and back (Codex's parent-directory exchange)."""
+
+    def __init__(self, live, other):
+        self.live, self.other, self.aside, self.swaps = Path(live), Path(other), Path(f"{live}.aside"), 0
+
+    def swap(self):
+        os.rename(self.live, self.aside)
+        os.rename(self.other, self.live)
+        self.swaps += 1
+
+    def restore(self):
+        if self.aside.exists():
+            os.rename(self.live, self.other)
+            os.rename(self.aside, self.live)
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+    def __call__(self):
+        return self.now
 
 
 def _ffmpeg(*args):
@@ -72,12 +150,12 @@ class _Audio(_Fixture, TestCase):
     def setUp(self):
         super().setUp()
         self.decoded = []
-        real = audio_identity.compute_or_none
+        real = getattr(audio_identity, DECODE_ENTRY)
 
-        def spy(path, **kwargs):
-            self.decoded.append((str(path), kwargs.get("timeout")))
-            return real(path, **kwargs)
-        patcher = mock.patch.object(audio_identity, "compute_or_none", side_effect=spy)
+        def spy(source, **kwargs):
+            self.decoded.append((_source_of(source), kwargs.get("timeout")))
+            return real(source, **kwargs)
+        patcher = mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=spy)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -113,6 +191,24 @@ class _Audio(_Fixture, TestCase):
 
     def audio_budget(self):
         return self.report["budgets"]["audio_verification"]
+
+    def cached(self, track, **identity_changes):
+        """The station's analysis of the Track (a trusted cache), its recorded identity then edited."""
+        track = _analyze(self, track)
+        if identity_changes:
+            cache = Path(track.waveform_path)
+            payload = json.loads(cache.read_text())
+            payload["audio_identity"].update(identity_changes)
+            cache.write_text(json.dumps(payload))
+        return track
+
+    def assert_not_resolvable(self, a, b):
+        self.assertNotEqual(self.finding(a, b)["confidence"], "audio_equivalent")
+        listed = self.findings_api()[tuple(sorted((a.pk, b.pk)))]
+        self.assertFalse(listed["resolution"]["deletable"], listed["resolution"])
+        status, body = self.preview(self.delete(a, b))
+        self.assertEqual((status, body["items"][0]["status"]), (200, "blocked"), body)
+        self.assertEqual(self.tokens_of(body), [])
 
 
 # --------------------------------------------------------------------------- the scan's verification
@@ -240,12 +336,8 @@ class VerificationScanTests(_Audio):
         """A trusted cache made by an older ffmpeg may record another digest for the same audio: that is not an
         explicit mismatch.  Without verification the pair stays unverified; with it both are decoded now."""
         a, b = self.audio_pair("decoder")
-        _analyze(self, a)
-        b_track = _analyze(self, b)
-        cache = Path(b_track.waveform_path)
-        payload = json.loads(cache.read_text())
-        payload["audio_identity"].update(sha256="0" * 64, decoder="ffmpeg version 0.0 (an older build)")
-        cache.write_text(json.dumps(payload))
+        self.cached(a)
+        self.cached(b, sha256="0" * 64, decoder=OLD_DECODER)
         self.decoded.clear()
         self.scan()
         finding = self.finding(a, b)
@@ -254,7 +346,10 @@ class VerificationScanTests(_Audio):
         self.scan(verify=25)
         finding = self.finding(a, b)
         self.assertEqual(finding["confidence"], "audio_equivalent")
-        self.assertEqual({f["identity_source"] for f in finding["audio_verification"]["files"]}, {"decoded"})
+        # Only the identity the running ffmpeg did not make is decoded again; the current cache stands.
+        sources = {f["track_id"]: f["identity_source"] for f in finding["audio_verification"]["files"]}
+        self.assertEqual(sources, {a.pk: "waveform_cache", b.pk: "decoded"})
+        self.assertEqual([p for p, _t in self.decoded], [b.filepath])
 
     def test_fixture9_groups_of_three_are_not_verified_or_resolvable(self):
         first = _tone(self.root / "ROCK" / "trio-a.mp3")
@@ -303,19 +398,31 @@ class VerificationScanTests(_Audio):
 
     def test_a_file_changed_while_it_is_decoded_is_not_evidence(self):
         a, b = self.audio_pair("race")
-        real = audio_identity.compute
+        real = getattr(audio_identity, DECODE_ENTRY)
 
-        def changing(path, **kwargs):
-            identity = real(path, **kwargs)
-            if str(path) == b.filepath:
-                with open(path, "ab") as handle:
-                    handle.write(b"\0")
-            return identity, ""
-        with mock.patch.object(audio_identity, "compute_or_none", side_effect=changing):
-            self.scan(verify=25)
-        finding = self.finding(a, b)
-        self.assertEqual(finding["confidence"], "likely")
-        self.assertIn("changed while its audio was being decoded", finding["audio_verification"]["reason"])
+        def appending(path):
+            with open(path, "ab") as handle:
+                handle.write(b"\0")
+
+        def overwriting(path):                     # same size, mtime put back: only ctime tells
+            info = os.stat(path)
+            with open(path, "r+b") as handle:
+                handle.seek(info.st_size // 2)
+                handle.write(b"\0\0\0\0")
+            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        for name, modify in (("append", appending), ("in place", overwriting)):
+            with self.subTest(name):
+                def changing(source, **kwargs):
+                    result = real(source, **kwargs)
+                    if _source_of(source) == b.filepath:
+                        modify(b.filepath)
+                    return result
+                with mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=changing):
+                    self.scan(verify=25)
+                finding = self.finding(a, b)
+                self.assertEqual(finding["confidence"], "likely")
+                self.assertIn("changed while its audio was being decoded", finding["audio_verification"]["reason"])
+                self.assert_not_resolvable(a, b)
 
     def test_a_failed_scan_keeps_the_last_complete_report(self):
         a, b = self.audio_pair("keep")
@@ -325,6 +432,558 @@ class VerificationScanTests(_Audio):
                 self.scan(verify=25)
         self.assertEqual(reconciliation.load_report()["scan_id"], good)
         self.assertEqual(reconciliation.scan_status()["last_attempt"]["status"], "failed")
+
+
+# --------------------------------------------------------------------------- Codex finding 1: descriptor-bound decode
+
+class DescriptorBindingTests(_Audio):
+    """The decoded identity is of the file the walk witnessed, whatever happens to its pathname meanwhile."""
+
+    def exchange_scenario(self, name):
+        """Genuinely different recordings a and b; a stand-in directory holds a file of b's name that carries a's
+        audio (a tagged copy).  Exchanging b's parent directory with it would lend b the audio of a."""
+        a, b = self.audio_pair(name, differ=True)
+        live = Path(b.filepath).parent
+        decoy = self.root.parent / f"{name}-decoy"
+        _retag(Path(a.filepath), decoy / Path(b.filepath).name, title="decoy")
+        self.genuine_b = audio_identity.compute(b.filepath)
+        self.assertFalse(audio_identity.same_audio(self.genuine_b, audio_identity.compute(a.filepath)))
+        return a, b, _Exchange(live, decoy)
+
+    def test_codex_parent_directory_exchange_restored_before_the_final_check_lends_nothing(self):
+        """Codex's reproduction: witness confirmed, the parent directory exchanged as ffprobe/ffmpeg start, the
+        decode finishes, the directory is restored, the pathname's witness is unchanged."""
+        a, b, exchange = self.exchange_scenario("swap")
+        self.addCleanup(exchange.restore)
+        real = getattr(audio_identity, DECODE_ENTRY)
+
+        def on_run(cmd, kwargs):
+            if cmd[0] == "ffprobe" and _cli_source(cmd) == b.filepath and not exchange.swaps:
+                exchange.swap()
+
+        def restoring(source, **kwargs):
+            try:
+                return real(source, **kwargs)
+            finally:
+                exchange.restore()
+        proxy = _SubprocessProxy(on_run=on_run)
+        with mock.patch.object(audio_identity, "subprocess", proxy), \
+                mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=restoring):
+            self.scan(verify=25)
+        self.assertEqual(exchange.swaps, 1, "the exchange must actually have happened")
+        finding = self.finding(a, b)
+        self.assertNotEqual(finding["confidence"], "audio_equivalent", finding)
+        # The held descriptor was decoded: the genuine b, which differs from a.
+        self.assertEqual((finding["confidence"], finding["audio_verification"]["status"]), ("uncertain", "different"))
+        recorded = {f["track_id"]: f["identity"] for f in finding["audio_verification"]["files"]}
+        self.assertTrue(audio_identity.same_audio(recorded[b.pk], self.genuine_b))
+        # ffprobe and ffmpeg were given the inherited descriptor, never the Library pathname.
+        for kind, cmd, kwargs in proxy.calls:
+            if cmd[0] in ("ffprobe", "ffmpeg") and "-version" not in cmd:
+                source = cmd[cmd.index("-i") + 1] if "-i" in cmd else cmd[-1]
+                self.assertTrue(source.startswith("/proc/self/fd/"), cmd)
+                self.assertEqual(tuple(kwargs.get("pass_fds")), (int(source.rsplit("/", 1)[1]),))
+                self.assertNotIn(b.filepath, cmd)
+                self.assertNotIn(a.filepath, cmd)
+        self.assert_not_resolvable(a, b)
+
+    def test_an_exchange_left_in_place_after_the_decode_is_refused(self):
+        a, b, exchange = self.exchange_scenario("left")
+        self.addCleanup(exchange.restore)
+
+        def on_run(cmd, kwargs):
+            if cmd[0] == "ffprobe" and _cli_source(cmd) == b.filepath and not exchange.swaps:
+                exchange.swap()
+        with mock.patch.object(audio_identity, "subprocess", _SubprocessProxy(on_run=on_run)):
+            self.scan(verify=25)
+        exchange.restore()
+        self.assertEqual(exchange.swaps, 1)
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("changed while its audio was being decoded", finding["audio_verification"]["reason"])
+        self.assert_not_resolvable(a, b)
+
+    def test_an_exchange_before_the_descriptor_is_taken_is_refused(self):
+        """The pathname passes its check, then names the stand-in when it is opened: the open file's fstat is not
+        the walk's witness, so nothing is decoded (restored at once, so only the descriptor check can tell)."""
+        a, b, exchange = self.exchange_scenario("early")
+        self.addCleanup(exchange.restore)
+        state = {"armed": False}
+        real_decode, real_open = reconciliation.Scanner._decode, os.open
+
+        def armed_decode(scanner, entry):
+            state["armed"] = entry.path == b.filepath
+            try:
+                return real_decode(scanner, entry)
+            finally:
+                state["armed"] = False
+
+        class _Os:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def open(path, flags, *args, **kwargs):
+                if state["armed"] and str(path) == b.filepath and not exchange.swaps:
+                    exchange.swap()
+                    try:
+                        return real_open(path, flags, *args, **kwargs)
+                    finally:
+                        exchange.restore()
+                return real_open(path, flags, *args, **kwargs)
+        with mock.patch.object(reconciliation.Scanner, "_decode", armed_decode), \
+                mock.patch.object(reconciliation, "os", _Os()):
+            self.scan(verify=25)
+        self.assertEqual(exchange.swaps, 1)
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("changed after the filesystem walk", finding["audio_verification"]["reason"])
+        self.assertNotIn(b.filepath, [p for p, _t in self.decoded])
+        self.assert_not_resolvable(a, b)
+
+    def test_an_exchange_before_the_decode_starts_is_refused(self):
+        a, b, exchange = self.exchange_scenario("before")
+        self.addCleanup(exchange.restore)
+        real_decode = reconciliation.Scanner._decode
+
+        def swapped_decode(scanner, entry):
+            if entry.path == b.filepath and not exchange.swaps:
+                exchange.swap()
+            return real_decode(scanner, entry)
+        with mock.patch.object(reconciliation.Scanner, "_decode", swapped_decode):
+            self.scan(verify=25)
+        exchange.restore()
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("changed after the filesystem walk", finding["audio_verification"]["reason"])
+        self.assert_not_resolvable(a, b)
+
+    def test_failed_descriptor_decoding_has_no_pathname_fallback(self):
+        """If ffprobe/ffmpeg cannot read the inherited descriptor (here: it is not passed), nothing is identified
+        and the pathname is never decoded instead."""
+        a, b = self.audio_pair("nofd")
+        by_path = mock.Mock(side_effect=AssertionError("pathname decode"))
+
+        def withhold(cmd, kwargs):
+            kwargs.pop("pass_fds", None)
+            return cmd, kwargs
+        with mock.patch.object(audio_identity, "subprocess", _SubprocessProxy(on_run=withhold, on_popen=withhold)), \
+                mock.patch.object(audio_identity, "compute", by_path):
+            self.scan(verify=25)
+        by_path.assert_not_called()
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("its audio could not be identified (ffprobe could not read the file)",
+                      finding["audio_verification"]["reason"])
+        self.assert_not_resolvable(a, b)
+
+
+class AudioIdentityDescriptorTests(TestCase):
+    """``audio_identity.compute_fd``: the open file, not its pathname; equal to ``compute`` for every format."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix="isadoraair-fd-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.dir)], check=False))
+
+    def test_the_held_file_is_decoded_even_after_its_pathname_names_another_recording(self):
+        path = _tone(self.dir / "held.mp3")
+        original = audio_identity.compute(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        self.addCleanup(os.close, fd)
+        os.unlink(path)
+        _tone(path, freq=300)                                   # the pathname now names another recording
+        proxy = _SubprocessProxy()
+        with mock.patch.object(audio_identity, "subprocess", proxy):
+            held = audio_identity.compute_fd(fd, timeout=60)
+        self.assertTrue(audio_identity.same_audio(held, original))
+        self.assertFalse(audio_identity.same_audio(held, audio_identity.compute(path)))
+        tools = [(cmd, kwargs) for _k, cmd, kwargs in proxy.calls if cmd[0] in ("ffprobe", "ffmpeg")
+                 and "-version" not in cmd]
+        self.assertEqual([cmd[0] for cmd, _kw in tools], ["ffprobe", "ffmpeg"])
+        for cmd, kwargs in tools:
+            self.assertIn(f"/proc/self/fd/{fd}", cmd)
+            self.assertNotIn(str(path), cmd)
+            self.assertEqual(tuple(kwargs["pass_fds"]), (fd,))
+
+    def test_every_supported_format_has_the_same_identity_through_its_descriptor(self):
+        """Seeking works through ``/proc/self/fd/N`` (an M4A with its index at the end needs it)."""
+        for name, extra in (("t.mp3", ()), ("t.flac", ()), ("t.wav", ()), ("t.ogg", ()), ("t.aiff", ()),
+                            ("t.mp2", ()), ("t.m4a", ()), ("alac.m4a", ("-c:a", "alac"))):
+            with self.subTest(name):
+                path = self.dir / name
+                _ffmpeg("-f", "lavfi", "-i", "aevalsrc=exprs='0.5*sin(2*PI*440*t)':d=2:s=44100", "-ac", "2",
+                        *extra, str(path))
+                if name == "t.m4a":
+                    data = path.read_bytes()
+                    self.assertGreater(data.find(b"moov"), data.find(b"mdat"))     # the index is at the end
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    self.assertTrue(audio_identity.same_audio(audio_identity.compute_fd(fd, timeout=60),
+                                                              audio_identity.compute(path, timeout=60)))
+                finally:
+                    os.close(fd)
+
+    def test_what_is_not_an_open_regular_file_is_refused(self):
+        fd = os.open(self.dir, os.O_RDONLY)
+        try:
+            with self.assertRaisesRegex(audio_identity.IdentityUnavailable, "not a regular file"):
+                audio_identity.compute_fd(fd)
+        finally:
+            os.close(fd)
+        closed = os.open(_tone(self.dir / "closed.mp3"), os.O_RDONLY)
+        os.close(closed)
+        self.assertEqual(audio_identity.compute_fd_or_none(closed), (None, "not an open file"))
+        broken = self.dir / "broken.mp3"
+        broken.write_bytes(b"\xff\xfb not an mp3 at all " * 400)
+        fd = os.open(broken, os.O_RDONLY)
+        try:
+            identity, reason = audio_identity.compute_fd_or_none(fd, timeout=60)
+        finally:
+            os.close(fd)
+        self.assertIsNone(identity)
+        self.assertTrue(reason, reason)
+
+
+# --------------------------------------------------------------------------- Codex finding 2: mixed decoder versions
+
+class MixedDecoderVersionTests(_Audio):
+    """A disagreement is only conclusive between identities made by the same ffmpeg."""
+
+    def test_same_version_matching_identities_need_no_decode(self):
+        a, b = self.audio_pair("samematch")
+        self.cached(a)
+        self.cached(b)
+        self.decoded.clear()
+        self.scan(verify=25)
+        self.assertEqual(self.finding(a, b)["confidence"], "audio_equivalent")
+        self.assertEqual((self.decoded, self.audio_budget()["pairs_attempted"]), ([], 0))
+
+    def test_same_version_differing_identities_are_a_real_mismatch(self):
+        a, b = self.audio_pair("samediff")
+        self.cached(a)
+        self.cached(b, sha256="1" * 64)                    # the running ffmpeg's own (cached) disagreement
+        self.decoded.clear()
+        self.scan(verify=25)
+        finding = self.finding(a, b)
+        self.assertEqual((finding["confidence"], finding["audio_verification"]["status"]), ("uncertain", "different"))
+        self.assertEqual((self.decoded, self.audio_budget()["pairs_attempted"]), ([], 0))
+        self.assert_not_resolvable(a, b)
+
+    def test_an_old_cache_disagreeing_with_a_fresh_decode_is_decoded_again_and_matches(self):
+        """a has no cache (decoded now); b's cache, from an older ffmpeg, records another digest for the same
+        audio.  Uncorrected, the fresh decode against the old cache was declared different."""
+        a, b = self.audio_pair("mixmatch")
+        self.cached(b, sha256="2" * 64, decoder=OLD_DECODER)
+        self.decoded.clear()
+        self.scan(verify=25)
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "audio_equivalent", finding["audio_verification"])
+        self.assertEqual({f["identity_source"] for f in finding["audio_verification"]["files"]}, {"decoded"})
+        self.assertEqual(sorted(p for p, _t in self.decoded), sorted([a.filepath, b.filepath]))
+        self.assertEqual((self.audio_budget()["pairs_attempted"], self.audio_budget()["decodes"]), (1, 2))
+        self.assertTrue(self.findings_api()[(a.pk, b.pk)]["resolution"]["deletable"])
+
+    def test_an_old_cache_decoded_again_can_establish_a_real_mismatch(self):
+        a, b = self.audio_pair("mixdiff", differ=True)
+        self.cached(b, sha256="3" * 64, decoder=OLD_DECODER)
+        self.decoded.clear()
+        self.scan(verify=25)
+        finding = self.finding(a, b)
+        self.assertEqual((finding["confidence"], finding["audio_verification"]["status"]), ("uncertain", "different"))
+        self.assertEqual({f["identity_source"] for f in finding["audio_verification"]["files"]}, {"decoded"})
+        self.assertEqual(len(self.decoded), 2)
+        self.assert_not_resolvable(a, b)
+
+    def test_an_old_cache_matching_a_fresh_decode_is_not_decoded_again(self):
+        a, b = self.audio_pair("oldmatch")
+        self.cached(b, decoder=OLD_DECODER)                 # same digest, older ffmpeg: an exact match stands
+        self.decoded.clear()
+        self.scan(verify=25)
+        self.assertEqual(self.finding(a, b)["confidence"], "audio_equivalent")
+        self.assertEqual([p for p, _t in self.decoded], [a.filepath])
+
+    def test_a_needed_redecode_that_cannot_run_leaves_the_pair_unverified(self):
+        for limit in ("pairs", "decodes", "time"):
+            with self.subTest(limit):
+                Track.objects.all().delete()
+                a, b = self.audio_pair(f"short{limit}")
+                self.cached(b, sha256="4" * 64, decoder=OLD_DECODER)
+                scanner = reconciliation.Scanner(verify_audio_pairs=1)
+                patcher = None
+                if limit == "pairs":
+                    scanner.verify_pairs_attempted = 1      # the scan's only slot already taken
+                elif limit == "decodes":
+                    scanner.verify_max_decodes = 1          # room for a's decode only, not b's again
+                else:
+                    clock = _Clock()
+                    scanner.clock = clock
+                    real = getattr(audio_identity, DECODE_ENTRY)
+
+                    def slow(source, **kwargs):
+                        clock.now += reconciliation.VERIFY_AUDIO_MAX_SECONDS   # a's decode uses all the time
+                        return real(source, **kwargs)
+                    patcher = mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=slow)
+                    patcher.start()
+                try:
+                    self.report = scanner.run()
+                finally:
+                    if patcher is not None:
+                        patcher.stop()
+                reconciliation.write_report(self.report)          # what the findings API and preview read
+                finding = self.finding(a, b)
+                self.assertEqual((finding["confidence"], finding["audio_verification"]["status"]),
+                                 ("likely", "unverified"), finding["audio_verification"])
+                self.assertIn("budget was used up" if limit != "time" else "time was used up",
+                              finding["audio_verification"]["reason"])
+                self.assertEqual(self.audio_budget()["budget_exhausted"], 1)
+                self.assertEqual(self.audio_budget()["different"], 0)
+                self.assert_not_resolvable(a, b)
+
+    def test_without_verification_a_cross_version_disagreement_is_inconclusive(self):
+        a, b = self.audio_pair("noverify")
+        self.cached(a)
+        self.cached(b, sha256="5" * 64, decoder=OLD_DECODER)
+        self.decoded.clear()
+        self.scan()
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("different decoder versions", finding["audio_verification"]["reason"])
+        self.assertEqual(self.decoded, [])
+        self.assert_not_resolvable(a, b)
+
+
+# --------------------------------------------------------------------------- Codex finding 3: the pair limit
+
+class PairLimitTests(_Audio):
+    """``verify_audio_pairs=N`` limits the pairs that take fresh verification, not the decoder invocations."""
+
+    def half_cached(self, name):
+        a, b = self.audio_pair(name)
+        self.cached(a)
+        return a, b
+
+    def test_two_half_cached_pairs_with_a_limit_of_one(self):
+        """Codex: a 2 x N decode budget let one requested pair verify two half-cached pairs."""
+        pairs = [self.half_cached(f"half{i}") for i in range(2)]
+        self.decoded.clear()
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        confidences = sorted(self.finding(a, b)["confidence"] for a, b in pairs)
+        self.assertEqual(confidences, ["audio_equivalent", "likely"])
+        self.assertEqual(len(self.decoded), 1)
+        budget = self.audio_budget()
+        self.assertEqual((budget["requested_pairs"], budget["pairs_attempted"], budget["decodes"],
+                          budget["verified"], budget["skipped_pair_limit"], budget["budget_exhausted"]),
+                         (1, 1, 1, 1, 1, 1))
+        skipped = next(self.finding(a, b) for a, b in pairs if self.finding(a, b)["confidence"] == "likely")
+        self.assertIn("at most 1 pair(s) needing a decode", skipped["audio_verification"]["reason"])
+        self.assertTrue(any("1 by the limit of 1 pair(s)" in e for e in self.report["errors"]), self.report["errors"])
+
+    def test_a_fully_cached_pair_takes_no_slot(self):
+        cached_a, cached_b = self.audio_pair("full")
+        self.cached(cached_a)
+        self.cached(cached_b)
+        fresh_a, fresh_b = self.audio_pair("fresh")
+        self.decoded.clear()
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        self.assertEqual(self.finding(cached_a, cached_b)["confidence"], "audio_equivalent")
+        self.assertEqual(self.finding(fresh_a, fresh_b)["confidence"], "audio_equivalent")
+        budget = self.audio_budget()
+        self.assertEqual((budget["pairs_attempted"], budget["decodes"], budget["budget_exhausted"]), (1, 2, 0))
+
+    def test_a_pair_needing_two_decodes_takes_one_slot(self):
+        a, b = self.audio_pair("two")
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        self.assertEqual(self.finding(a, b)["confidence"], "audio_equivalent")
+        self.assertEqual((self.audio_budget()["pairs_attempted"], self.audio_budget()["decodes"]), (1, 2))
+
+    def test_an_exhausted_decode_limit_skips_the_pair_whole(self):
+        a, b = self.audio_pair("declimit")
+        scanner = reconciliation.Scanner(verify_audio_pairs=1)
+        scanner.verify_max_decodes = 1                      # independent of the pair limit
+        self.report = scanner.run()
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("(decode limit)", finding["audio_verification"]["reason"])
+        budget = self.audio_budget()
+        self.assertEqual((budget["pairs_attempted"], budget["decodes"], budget["skipped_decode_limit"]), (0, 0, 1))
+        self.assertEqual(self.decoded, [])
+
+    def test_a_cross_version_redecode_counts_against_the_pair_limit(self):
+        old_a, old_b = self.audio_pair("cross")
+        self.cached(old_a)
+        self.cached(old_b, sha256="6" * 64, decoder=OLD_DECODER)
+        other = self.half_cached("other")
+        self.decoded.clear()
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        budget = self.audio_budget()
+        self.assertEqual((budget["pairs_attempted"], budget["decodes"], budget["verified"],
+                          budget["skipped_pair_limit"]), (1, 1, 1, 1))
+        self.assertEqual(sorted([self.finding(old_a, old_b)["confidence"], self.finding(*other)["confidence"]]),
+                         ["audio_equivalent", "likely"])
+
+    def test_findings_sharing_a_decoded_file(self):
+        """The shared file is decoded once; a later pair needing no new decode takes no slot, one that needs one
+        does."""
+        shared = self.registered(_tone(self.root / "ROCK" / "shared.mp3"), title="Shared", isrc="USRC10000002")
+        b = self.registered(_retag(Path(shared.filepath), self.root / "POP" / "shared-b.mp3", title="x"),
+                            title="Shared")
+        c = self.registered(_retag(Path(shared.filepath), self.root / "POP" / "shared-c.mp3", title="y"),
+                            title="Other title", isrc="USRC10000002")
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        verified = [o for o in (b, c) if self.finding(shared, o)["confidence"] == "audio_equivalent"]
+        self.assertEqual(len(verified), 1)                  # the second pair needs c decoded: no slot left
+        self.assertEqual(len(self.decoded), 2)
+        self.assertEqual((self.audio_budget()["pairs_attempted"], self.audio_budget()["decodes"]), (1, 2))
+        self.cached(c)
+        self.decoded.clear()
+        self.report = reconciliation.Scanner(verify_audio_pairs=1).run()
+        self.assertEqual([self.finding(shared, o)["confidence"] for o in (b, c)], ["audio_equivalent"] * 2)
+        self.assertEqual((self.audio_budget()["pairs_attempted"], self.audio_budget()["decodes"]), (1, 2))
+        self.assertEqual(sorted(p for p, _t in self.decoded), sorted([shared.filepath, b.filepath]))
+
+
+# --------------------------------------------------------------------------- Codex finding 4: deadlines
+
+class DeadlineTests(TestCase):
+    """One deadline per file shared by ffprobe and ffmpeg; nothing starts once it has passed."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix="isadoraair-deadline-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.dir)], check=False))
+        self.path = _tone(self.dir / "tone.mp3")
+        self.clock = _Clock()
+        self.timers = []
+        real_timer = threading.Timer
+
+        def timer(interval, function):
+            self.timers.append(interval)
+            return real_timer(interval, function)
+        fake_threading = mock.Mock(wraps=threading, Timer=timer, Thread=threading.Thread, Event=threading.Event)
+        for patcher in (mock.patch.object(audio_identity, "time", self.clock),
+                        mock.patch.object(audio_identity, "threading", fake_threading)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def probing_takes(self, seconds):
+        def on_run(cmd, kwargs):
+            if cmd[0] == "ffprobe":
+                self.probe_timeout = kwargs.get("timeout")
+                self.clock.now += seconds
+        return _SubprocessProxy(on_run=on_run)
+
+    def test_probe_time_reduces_the_decode_allowance(self):
+        for compute, arg in ((audio_identity.compute, lambda: self.path), (audio_identity.compute_fd, None)):
+            with self.subTest(compute.__name__):
+                self.timers.clear()
+                fd = os.open(self.path, os.O_RDONLY) if arg is None else None
+                try:
+                    with mock.patch.object(audio_identity, "subprocess", self.probing_takes(250)):
+                        identity = compute(fd if arg is None else arg(), timeout=300)
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+                self.assertTrue(audio_identity.well_formed(identity))
+                self.assertEqual(self.probe_timeout, audio_identity.PROBE_TIMEOUT_SECONDS)
+                self.assertEqual(self.timers, [50])          # 300 - 250, not a fresh 300
+
+    def test_the_probe_gets_no_more_than_the_whole_allowance(self):
+        with mock.patch.object(audio_identity, "subprocess", self.probing_takes(0)):
+            audio_identity.compute(self.path, timeout=30)
+        self.assertEqual((self.probe_timeout, self.timers), (30, [30]))
+
+    def test_an_exhausted_allowance_starts_no_decoder(self):
+        proxy = self.probing_takes(300)
+        with mock.patch.object(audio_identity, "subprocess", proxy):
+            identity, reason = audio_identity.compute_or_none(self.path, timeout=300)
+        self.assertIsNone(identity)
+        self.assertIn("ran out before decoding", reason)
+        self.assertEqual([kind for kind, cmd, _kw in proxy.calls if cmd[0] == "ffmpeg" and "-version" not in cmd], [])
+        self.assertEqual(self.timers, [])
+
+    def test_no_time_at_all_starts_nothing(self):
+        proxy = _SubprocessProxy()
+        with mock.patch.object(audio_identity, "subprocess", proxy):
+            identity, reason = audio_identity.compute_or_none(self.path, timeout=0)
+        self.assertIsNone(identity)
+        self.assertIn("ran out before probing", reason)
+        self.assertEqual([c for c in proxy.calls if c[1][0] in ("ffprobe", "ffmpeg") and "-version" not in c[1]], [])
+
+    def test_a_decoder_timeout_never_yields_an_identity_and_the_child_is_reaped(self):
+        """A real child that outlives the allowance (it never ends by itself) is killed at the deadline."""
+        children = []
+
+        def stubborn(cmd, kwargs):
+            if cmd[0] == "ffmpeg":
+                return ["sleep", "30"], kwargs
+        proxy = _SubprocessProxy(on_popen=stubborn)
+        real_popen = proxy.Popen
+
+        def popen(cmd, **kwargs):
+            child = real_popen(cmd, **kwargs)
+            children.append(child)
+            return child
+        proxy.Popen = popen
+        with mock.patch.object(audio_identity, "time", time), mock.patch.object(audio_identity, "subprocess", proxy):
+            started = time.monotonic()
+            identity, reason = audio_identity.compute_or_none(self.path, timeout=1.5)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(identity)
+        self.assertIn("took longer than", reason)
+        self.assertLess(elapsed, 5)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)         # killed and reaped
+
+
+class ScanDeadlineTests(_Audio):
+    def test_the_scan_total_bounds_each_decode_and_an_exhausted_total_starts_no_other(self):
+        a, b = self.audio_pair("total")
+        c, d = self.audio_pair("total2")
+        clock = _Clock()
+        scanner = reconciliation.Scanner(verify_audio_pairs=25, clock=clock)
+        real = getattr(audio_identity, DECODE_ENTRY)
+        timeouts = []
+
+        def spending(source, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            # each decode "takes" 1,000 s of the scan's 1,800
+            clock.now += 1000
+            return real(source, **kwargs)
+        with mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=spending):
+            self.report = scanner.run()
+        statuses = sorted(self.finding(x, y)["audio_verification"]["status"] for x, y in ((a, b), (c, d)))
+        self.assertEqual(statuses, ["unverified", "verified"])
+        # First decode: the per-file 300 s; second: what the total had left (800 s) capped at 300; then 1800 - 2000
+        # < 0: no third probe or decode.
+        self.assertEqual(timeouts, [300, 300])
+        budget = self.audio_budget()
+        self.assertEqual((budget["decodes"], budget["skipped_time_limit"]), (2, 1))
+        clock.now = 0
+        scanner = reconciliation.Scanner(verify_audio_pairs=25, clock=clock)
+        timeouts.clear()
+
+        def late(source, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            clock.now += reconciliation.VERIFY_AUDIO_MAX_SECONDS - 10   # leaves 10 s for the next file
+            return real(source, **kwargs)
+        with mock.patch.object(audio_identity, DECODE_ENTRY, side_effect=late):
+            self.report = scanner.run()
+        self.assertEqual(timeouts, [300, 10])               # the scan's remainder, not a fresh 300
+
+    def test_a_decoder_timeout_in_the_scan_is_never_proof(self):
+        a, b = self.audio_pair("timeout")
+
+        def stubborn(cmd, kwargs):
+            if cmd[0] == "ffmpeg":
+                return ["sleep", "30"], kwargs
+        with mock.patch.object(reconciliation, "VERIFY_DECODE_TIMEOUT_SECONDS", 1.5), \
+                mock.patch.object(audio_identity, "subprocess", _SubprocessProxy(on_popen=stubborn)):
+            self.scan(verify=25)
+        finding = self.finding(a, b)
+        self.assertEqual(finding["confidence"], "likely")
+        self.assertIn("took longer than", finding["audio_verification"]["reason"])
+        self.assert_not_resolvable(a, b)
 
 
 # --------------------------------------------------------------------------- resolution (the r0127 path)

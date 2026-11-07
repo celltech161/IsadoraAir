@@ -117,30 +117,47 @@ A likely pair of exactly two registered Tracks is upgraded only with recorded pr
 * **Where it comes from.** First the Track's **trusted** waveform cache (`waveform_cache.validate`), and only
   when that cache was made from exactly the walked file: its recorded source path, device, inode, size, mtime
   and ctime equal the scan's. No decode is needed then, in any scan. Otherwise, only when the operator asked for
-  verification, a **decode in this scan** of exactly the walked file: its six-field stat witness is checked
-  before and after the decode and must equal the walk's. A stale, unverified, legacy or inconsistent cache is
-  never used.
+  verification, a **decode in this scan** of exactly the walked file. The scanner checks the pathname's
+  six-field stat witness, opens the file once (read only, `O_NOFOLLOW`), and requires the open file's `fstat`
+  to equal the walk's witness. ffprobe and ffmpeg then read **that open file**, inherited as
+  `/proc/self/fd/N` (`audio_identity.compute_fd`); they never reopen the Library pathname, so a path that is
+  swapped meanwhile (for example a parent directory exchanged and then restored) cannot lend another
+  recording's audio. Afterwards the open file and the pathname must both still equal the walk's witness. If the
+  tools cannot read the descriptor, the file is unidentified: there is no pathname fallback. A stale,
+  unverified, legacy or inconsistent cache is never used.
 * **Bound to the file.** The report records, for each file, its path, the walk's six-field witness, the full
   identity and its source (`audio_verification.files`), and the byte relation of the two files
   (`different_size`, `different_bytes`, `identical_bytes` or `not_compared`).
 * **Outcomes.** Equal identities: `audio_equivalent`, status `verified`. Different identities from the same
-  decoder: `uncertain`, status `different`, never resolvable. Identities on record from **different ffmpeg
-  versions** that disagree prove nothing either way: both are decoded again if verification was requested,
-  otherwise the pair stays unverified. Anything else (no trusted cache and no decode, an undecodable file, a
+  decoder: `uncertain`, status `different`, never resolvable. Identities from **different ffmpeg versions** that
+  disagree prove nothing either way. This is judged on the two identities actually compared, after any missing
+  one has been decoded: each cached identity that the running ffmpeg did not make is decoded again if
+  verification was requested and its budget allows. When that cannot happen, the pair stays unverified, never
+  "different". An exact match stands whatever made the two identities. Anything else (no trusted cache and no decode, an undecodable file, a
   file that changed, a pair already reviewed as not duplicates, an exhausted budget) leaves the pair `likely`
   with status `unverified` and the reason.
 * **Bounds.** Off by default: a normal scan decodes nothing for duplicates. Requested with
-  `--verify-audio-pairs N` (0 to 100; the page offers 25, 50 or 100): at most `2 × N` decodes, at most 30
-  minutes of decoding in all (`VERIFY_AUDIO_MAX_SECONDS`), each decode at most 5 minutes
-  (`VERIFY_DECODE_TIMEOUT_SECONDS`, ffmpeg killed at the limit). One decode at a time, streamed (memory bounded
-  by `audio_identity`'s 1 MiB chunks), at the scan's priority (`nice 10`, `ionice` idle from the page). A file
-  in several findings is decoded once. A pair is decoded only when both of its missing identities fit in the
-  remaining budget, so a budget never ends with half a pair. Open pairs come first; a pair already recorded as
-  "not a duplicate" is never decoded. Pairs left over are reported (`budget_exhausted`, and a note in the
-  report's errors); running again verifies them, since resolved pairs no longer need it.
+  `--verify-audio-pairs N` (0 to 100; the page offers 25, 50 or 100).
+  * **Pairs.** `N` limits the **pairs that need fresh verification**, meaning any decode at all, whether one
+    file or two. It does not count decoder runs. A pair takes its slot before its first decode. A pair proven
+    by trusted caches, or by files this scan has already decoded, needs no slot.
+  * **Decodes.** Independently, at most `2 × N` decodes. A file in several findings is decoded once. A pair
+    starts only when everything it may need fits, including a possible second decode of a cache from another
+    ffmpeg version, so a budget never ends with half a pair.
+  * **Time.** At most 30 minutes in all (`VERIFY_AUDIO_MAX_SECONDS`). Each file gets at most 5 minutes
+    (`VERIFY_DECODE_TIMEOUT_SECONDS`) and never more than what is left of the 30. One `time.monotonic()`
+    deadline per file covers ffprobe (at most 60 s of it) and ffmpeg, which gets only what the probe left.
+    Nothing starts once a deadline has passed, and ffmpeg is killed and reaped at the limit.
+  * **Running.** One decode at a time, streamed (memory bounded by `audio_identity`'s 1 MiB chunks), at the
+    scan's priority (`nice 10`, `ionice` idle from the page). Open pairs come first; a pair already recorded
+    as "not a duplicate" is never decoded.
+  * **Leftovers.** Pairs left over are reported: `budget_exhausted`, split into `skipped_pair_limit`,
+    `skipped_decode_limit` and `skipped_time_limit`, plus a note in the report's errors. Running again
+    verifies them, since resolved pairs no longer need it.
 * **Read only.** Nothing is written but the report: no tag, Track, waveform cache, cue marker or audio file is
-  changed. `budgets.audio_verification` records the requested pairs, decodes, seconds and the verified /
-  different / unverified / budget-exhausted counts. A failed scan keeps the last complete report.
+  changed. `budgets.audio_verification` records the requested pairs, the pairs that took a slot
+  (`pairs_attempted`), the decodes, the seconds, and the verified / different / unverified / budget-exhausted
+  counts, with the budget-exhausted count split by limit. A failed scan keeps the last complete report.
 
 Groups of three or more Tracks are never decoded; their trusted caches label them `audio_equivalent` as before,
 and they stay review only.

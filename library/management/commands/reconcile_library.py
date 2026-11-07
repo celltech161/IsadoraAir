@@ -22,7 +22,8 @@ class Command(BaseCommand):
                             help="Most gigabytes read to compare equal-size files byte for byte (default 20).")
         parser.add_argument("--verify-audio-pairs", type=int, default=0,
                             help="Verify the decoded audio of up to this many likely duplicate pairs of two Tracks "
-                                 "(at most two decodes each; read only). Default 0: no verification decodes; "
+                                 "that need a decode (pairs proven by trusted caches do not count; at most two "
+                                 "decodes each; read only). Default 0: no verification decodes; "
                                  f"at most {reconciliation.MAX_VERIFY_AUDIO_PAIRS}.")
 
     def handle(self, *args, **options):
@@ -57,7 +58,8 @@ class Command(BaseCommand):
         if audio["requested_pairs"] or audio["verified"]:
             self.stdout.write(f"  likely pairs verified by decoded audio: {audio['verified']} identical, "
                               f"{audio['different']} different, {audio['unverified']} not verified "
-                              f"({audio['decodes']} decode(s), {audio['seconds']} s)")
+                              f"({audio['pairs_attempted']} of {audio['requested_pairs']} pair(s) needing a decode, "
+                              f"{audio['decodes']} decode(s), {audio['seconds']} s)")
         for error in report["errors"]:
             self.stdout.write(self.style.WARNING(f"  note: {error}"))
         self.stdout.write("Review the findings at /library/reconciliation/.")
