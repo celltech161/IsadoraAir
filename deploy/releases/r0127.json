@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0127",
+  "previous_release_id": "r0126",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 3.12 frontend duplicate resolution: authorized Track managers can review exact two-Track duplicate findings and explicitly keep both or delete one Track with scan-witness, live-playout, log, VoiceTrack, token, transaction and cleanup safeguards. Browser sequencing stops on uncertain outcomes. Restart Gunicorn only; no migration, static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
