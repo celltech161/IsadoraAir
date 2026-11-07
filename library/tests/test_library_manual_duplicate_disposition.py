@@ -14,16 +14,20 @@ engine state is a file in the test's directory.  The decoded-audio cases use rea
 fake DOM of the earlier page tests.
 """
 import contextlib
+import copy
 import json
 import os
+import re
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
 from django.core import signing
-from django.db import DatabaseError
-from django.test import TestCase
+from django.db import DatabaseError, connection, connections, transaction
+from django.test import Client, TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 
@@ -81,8 +85,6 @@ class _ManualMixin:
     def alive(self, *tracks):
         return [Track.objects.filter(pk=t.pk).exists() for t in tracks]
 
-
-class _Manual(_ManualMixin, _Pairs, TestCase):
     def likely(self, name, n=2, *, categories=None, durations=None, **fields):
         """``n`` Tracks of one artist and title, durations within 2 s, different bytes: a likely group (no proof)."""
         categories = categories or [self.rock, self.pop, self.jazz, self.blues]
@@ -93,6 +95,10 @@ class _Manual(_ManualMixin, _Pairs, TestCase):
                                      category=categories[i % len(categories)],
                                      duration=(durations or [200.0 + 0.4 * j for j in range(n)])[i], **fields))
         return tracks
+
+
+class _Manual(_ManualMixin, _Pairs, TestCase):
+    pass
 
 
 # --------------------------------------------------------------------------- the scan's file record
@@ -905,3 +911,484 @@ console.log(JSON.stringify({
         self.assertFalse(out["toggle"])
         self.assertTrue(out["notDup"])
         self.assertIn("Manual resolution is not available: this scan did not record", out["text"])
+
+
+
+# --------------------------------------------------------------------------- Codex correction B: complete evidence
+
+APPLY = "library:api-reconciliation-duplicates-apply"
+INCOMPLETE = resolution.MANUAL_INCOMPLETE
+
+
+class CompleteGroupEvidenceTests(_Manual):
+    """A manual deletion needs exactly one complete, consistent, distinct file record (``member_files``) for EVERY
+    member of the finding.  A missing, malformed, duplicated or foreign record is never skipped: it makes the
+    whole group ineligible for a manual deletion, including its otherwise valid pairs (Keep both stays)."""
+
+    def quad(self, name):
+        tracks = self.likely(name, 4)
+        self.scanned()
+        return tracks, self.group(*tracks)
+
+    def store(self, finding, files=None, *, drop=False):
+        """The stored report (same scan) with this finding's ``member_files`` replaced (or removed)."""
+        for f in self.report["findings"]:
+            if f.get("id") == finding["id"]:
+                if drop:
+                    f.pop("member_files", None)
+                else:
+                    f["member_files"] = files
+        reconciliation.write_report(self.report)
+
+    def assert_refused(self, tracks, reason=INCOMPLETE):
+        """No route to a manual deletion of any pair of the group: not offered, every preview blocked with
+        ``reason`` and no token.  Keep both of a pair is still available."""
+        finding = self.group(*tracks)
+        self.assertEqual(resolution.manual_eligibility(finding)[:2], (False, reason))
+        manual = self.listed()[tuple(sorted(t.pk for t in tracks))]["manual"]
+        self.assertEqual((manual["available"], manual["reason"]), (False, reason))
+        a, b = tracks[0], tracks[1]
+        for keep, discard in ((a, b), (b, a), (tracks[-1], tracks[-2])):
+            status, body = self.preview(self.manual(finding, keep, discard))
+            self.assertEqual((status, body["items"][0]["status"], body["items"][0]["reasons"], self.tokens(body)),
+                             (200, "blocked", [reason], []))
+        status, body = self.preview({"finding_id": finding["id"], "action": "keep_both", "tracks": [a.pk, b.pk]})
+        self.assertEqual((body["items"][0]["status"], len(self.tokens(body))), ("eligible", 1))
+
+    def test_b1_to_b5_incomplete_or_malformed_records_block_the_whole_group(self):
+        tracks, finding = self.quad("partial")
+        a, b, c, d = tracks
+        other, = self.likely("unrelated", 1)
+        good = copy.deepcopy(finding["member_files"])
+        self.assertEqual(sorted(f["track_id"] for f in good), sorted(t.pk for t in tracks))
+        self.assertTrue(resolution.manual_eligibility(finding)[0])
+        last = good[-1]
+
+        def with_last(**changes):
+            return good[:-1] + [{**copy.deepcopy(last), **changes}]
+
+        def witness(index, value):
+            w = list(last["witness"])
+            w[index] = value
+            return with_last(witness=w)
+
+        cases = {
+            # 1. Four members, only two records (the two named by the selected pair).
+            "only two records": [e for e in good if e["track_id"] in (a.pk, b.pk)],
+            "three records": good[:-1],
+            "no records": [],
+            # 2. One malformed record.
+            "record not an object": good[:-1] + ["x"],
+            "record without a path": with_last(path=None),
+            "relative path": with_last(path=last["rel"]),
+            "path with NUL": with_last(path=last["path"] + "\0"),
+            "path and rel disagree": with_last(rel="ELSEWHERE/other.flac"),
+            "no rel": with_last(rel=None),
+            "size missing": with_last(size=None),
+            # 3. Duplicate records for one Track.
+            "a record twice in place of another": good[:-1] + [copy.deepcopy(good[0])],
+            "a record twice in addition": good + [copy.deepcopy(good[0])],
+            # 4. A Track id the finding does not name.
+            "unknown Track": with_last(track_id=987654321),
+            "another finding's Track": with_last(track_id=other.pk),
+            "boolean Track id": with_last(track_id=True),
+            "string Track id": with_last(track_id=str(last["track_id"])),
+            # 5. Missing or invalid six-field witness.
+            "no witness": [*good[:-1], {k: v for k, v in last.items() if k != "witness"}],
+            "five fields": with_last(witness=last["witness"][:5]),
+            "seven fields": with_last(witness=last["witness"] + [0]),
+            "non-integer field": witness(1, "inode"),
+            "boolean field": witness(5, True),
+            "size disagrees": witness(2, last["size"] + 1),
+            "mtime disagrees": witness(3, last["mtime_ns"] + 1),
+            "no links": witness(5, 0),
+            "witness not a list": with_last(witness="x"),
+            "member_files not a list": "x",
+            "member_files null": None,
+        }
+        for name, files in cases.items():
+            with self.subTest(name):
+                self.store(finding, files)
+                self.assert_refused(tracks)
+        # The same inode named twice is refused as such (never one of the two picked).
+        self.store(finding, with_last(witness=good[0]["witness"][:2] + last["witness"][2:]))
+        self.assert_refused(tracks, resolution.MANUAL_SAME_FILE)
+        self.store(finding, with_last(path=good[0]["path"], rel=good[0]["rel"]))
+        self.assert_refused(tracks, resolution.MANUAL_SAME_FILE)
+        self.assertEqual(self.alive(a, b, c, d, other), [True] * 5)
+        # Restored: the complete record authorizes again.
+        self.store(finding, good)
+        self.engine()                                   # a fresh observation after the long loop above
+        status, body = self.preview(self.manual(self.group(*tracks), a, b))
+        self.assertEqual((body["items"][0]["status"], len(self.tokens(body))), ("eligible", 1), body["items"][0])
+
+    def test_malformed_member_lists_are_refused(self):
+        tracks, finding = self.quad("members")
+        ids = sorted(t.pk for t in tracks)
+        for name, members in {"repeated": [ids[0], ids[0], ids[2], ids[3]], "string": [str(ids[0])] + ids[1:],
+                              "boolean": [True] + ids[1:], "zero": [0] + ids[1:], "not a list": "x",
+                              "null": None}.items():
+            with self.subTest(name):
+                self.assertEqual(resolution.manual_eligibility({**finding, "members": members})[:2],
+                                 (False, INCOMPLETE))
+        self.assertFalse(resolution.manual_eligibility({**finding, "member_count": 5})[0])
+        big = list(range(1, 27))
+        files = [{"track_id": t, "path": f"/x/{t}.flac", "rel": f"{t}.flac", "size": 1, "mtime_ns": 1,
+                  "witness": [1, t, 1, 1, 1, 1]} for t in big]
+        self.assertEqual(resolution.manual_eligibility({**finding, "members": big, "member_count": 26,
+                                                        "member_files": files})[0], False)
+        self.assertEqual(resolution._manual_files({**finding, "members": big, "member_files": files}),
+                         ({}, INCOMPLETE))
+
+    def test_b6_two_members_sharing_an_unsafe_inode_make_the_group_ineligible(self):
+        """Codex's natural case: A and B are ordinary files; C and D are one hard-linked file (a shared source,
+        excluded from duplicate comparison).  The scan still groups all four by artist and title and records
+        only A and B; the exclusion is kept (no witness is made up for C or D) and the group is not deletable."""
+        a, b = self.likely("shared", 2)
+        c = self.track("JAZZ/shared-c.flac", title="Song shared", data=b"shared c " * 400, category=self.jazz,
+                       duration=200.8)
+        d = Track.objects.create(filepath=str(self.root / "BLUES" / "shared-d.flac"), filename="shared-d.flac",
+                                 title="Song shared", artist=self.artist, category=self.blues, format="flac",
+                                 duration_seconds=201.0)
+        Path(d.filepath).parent.mkdir(parents=True, exist_ok=True)
+        os.link(c.filepath, d.filepath)
+        self.scanned()
+        finding = self.group(a, b, c, d)
+        self.assertEqual(sorted(f["track_id"] for f in finding["member_files"]), sorted([a.pk, b.pk]))
+        self.assert_refused([a, b, c, d])
+        self.assertEqual(self.alive(a, b, c, d), [True] * 4)
+
+    def test_b7_b8_complete_two_three_and_four_member_groups_stay_usable(self):
+        pair = self.likely("two", 2)
+        trio = self.likely("three", 3)
+        tracks = self.likely("four", 4)
+        self.scanned()
+        for group in (pair, trio, tracks):
+            with self.subTest(size=len(group)):
+                finding = self.group(*group)
+                self.assertEqual(len(finding["member_files"]), len(group))
+                self.assertEqual(resolution.manual_eligibility(finding),
+                                 (True, "", sorted(t.pk for t in group)))
+                status, body = self.preview(self.manual(finding, group[-1], group[0]))
+                self.assertEqual((body["items"][0]["status"], len(self.tokens(body))), ("eligible", 1), body)
+        _s, body = self.preview(self.manual(self.group(*tracks), tracks[2], tracks[1]))
+        with self.committed():
+            status, result = self.manual_apply(self.token(body))
+        self.assertEqual(result["item"]["outcome"], "deleted", result)
+        self.assertEqual(self.alive(*tracks), [True, False, True, True])
+
+    def test_b9_a_legacy_report_without_member_files_stays_review_only(self):
+        tracks, finding = self.quad("legacy")
+        self.store(finding, drop=True)
+        self.assert_refused(tracks, resolution.NO_MANUAL_WITNESS)
+
+    def test_b10_evidence_malformed_after_the_preview_refuses_the_apply(self):
+        tracks, finding = self.quad("later")
+        a, b, c, d = tracks
+        good = copy.deepcopy(finding["member_files"])
+        _s, body = self.preview(self.manual(finding, a, b))
+        token = self.token(body)
+        for name, files in {"a member's record dropped": [e for e in good if e["track_id"] != d.pk],
+                            "a member's witness broken": [dict(e, witness=e["witness"][:5]) if e["track_id"] == c.pk
+                                                          else e for e in good]}.items():
+            with self.subTest(name):
+                self.store(finding, files)
+                status, again = self.preview(self.manual(self.group(*tracks), a, b))
+                self.assertEqual((again["items"][0]["reasons"], self.tokens(again)), ([INCOMPLETE], []))
+        with self.committed():
+            status, result = self.manual_apply(token)
+        self.assertEqual((status, result["item"]["outcome"]), (200, "stale"), result)
+        self.assertEqual(self.alive(a, b, c, d), [True] * 4)
+
+
+# --------------------------------------------------------------------------- Codex correction A: group serialization
+
+class GroupLockTests(_Manual):
+    def test_the_group_is_locked_in_one_statement_in_ascending_id_order(self):
+        tracks = self.likely("order", 4)
+        self.scanned()
+        finding = self.group(*tracks)
+        a, d = tracks[0], tracks[3]
+        _s, body = self.preview(self.manual(finding, d, a))            # the pair is not the lowest ids
+        with self.committed(), CaptureQueriesContext(connection) as queries:
+            status, result = self.manual_apply(self.token(body))
+        self.assertEqual(result["item"]["outcome"], "deleted", result)
+        locks = [q["sql"] for q in queries.captured_queries
+                 if "FOR UPDATE" in q["sql"] and '"library_track"' in q["sql"]]
+        self.assertEqual(len(locks), 1, locks)
+        ids = re.search(r'"library_track"\."id" IN \(([^)]*)\)', locks[0]).group(1)
+        self.assertEqual(sorted(int(i) for i in ids.split(",")), sorted(t.pk for t in tracks))
+        self.assertIn('ORDER BY "library_track"."id" ASC', locks[0])
+        self.assertIn('FOR UPDATE OF "library_track"', locks[0])
+        # A verified pair still locks its two rows only.
+        x, y = self.pair("verified")
+        self.scanned()
+        _s, body = self.preview(self.delete(x, y))
+        with self.committed(), CaptureQueriesContext(connection) as queries:
+            self.assertEqual(self.apply(self.token(body))[1]["item"]["outcome"], "deleted")
+        locks = [q["sql"] for q in queries.captured_queries
+                 if "FOR UPDATE" in q["sql"] and '"library_track"' in q["sql"]]
+        ids = re.search(r'"library_track"\."id" IN \(([^)]*)\)', locks[0]).group(1)
+        self.assertEqual(sorted(int(i) for i in ids.split(",")), sorted([x.pk, y.pk]))
+
+    def test_the_lock_set_is_the_bounded_finding_and_the_token_must_name_a_subset(self):
+        finding = {"members": [4, 9, 2, 7]}
+        entry = {"k": 9, "d": 2, "g": [2, 4, 7, 9]}
+        self.assertEqual(resolution._manual_group(finding, entry), [2, 4, 7, 9])
+        self.assertEqual(resolution._manual_group(finding, {**entry, "g": [2, 4, 9]}), [2, 4, 7, 9])
+        for name, change in {"unsorted": {"g": [9, 2]}, "outside": {"g": [2, 9, 11]}, "no keep": {"g": [2, 4]},
+                             "no discard": {"g": [4, 9]}, "repeated": {"g": [2, 2, 9]}, "null": {"g": None},
+                             "strings": {"g": ["2", "9"]}}.items():
+            with self.subTest(name):
+                self.assertIsNone(resolution._manual_group(finding, {**entry, **change}))
+        big = list(range(1, 27))
+        self.assertIsNone(resolution._manual_group({"members": big}, {"k": 1, "d": 2, "g": big}))
+        self.assertIsNone(resolution._manual_group(None, entry))
+
+    def test_sequential_resolution_after_a_fresh_preview(self):
+        tracks = self.likely("fresh", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        finding = self.group(*tracks)
+        _s, first = self.preview(self.manual(finding, a, b))
+        _s, second = self.preview(self.manual(finding, c, d))
+        with self.committed():
+            self.assertEqual(self.manual_apply(self.token(first))[1]["item"]["outcome"], "deleted")
+            status, stale = self.manual_apply(self.token(second))
+        self.assertEqual(stale["item"]["outcome"], "stale")
+        self.assertIn("Another Track of this group was deleted", stale["item"]["message"])
+        _s, fresh = self.preview(self.manual(finding, c, d))
+        self.assertEqual(signing.loads(self.token(fresh), salt=resolution.TOKEN_SALT)["p"]["g"],
+                         [a.pk, c.pk, d.pk])
+        with self.committed():
+            self.assertEqual(self.manual_apply(self.token(fresh))[1]["item"]["outcome"], "deleted")
+        self.assertEqual(self.alive(a, b, c, d), [True, False, True, False])
+
+    def test_a_member_deleted_elsewhere_before_apply_makes_it_stale(self):
+        tracks = self.likely("elsewhere", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        _s, body = self.preview(self.manual(self.group(*tracks), a, b))
+        with self.committed():
+            track_deletion.delete_track(Track.objects.get(pk=c.pk), remove_source=False)    # e.g. the Track page
+            status, result = self.manual_apply(self.token(body))
+        self.assertEqual((status, result["item"]["outcome"]), (200, "stale"), result)
+        self.assertIn("Another Track of this group was deleted", result["item"]["message"])
+        self.assertEqual(self.alive(a, b, c, d), [True, True, False, True])
+
+    def test_one_pair_per_request_is_kept(self):
+        tracks = self.likely("onepair", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        finding = self.group(*tracks)
+        status, body = self.preview(self.manual(finding, a, b), self.manual(finding, c, d))
+        self.assertEqual(([i["status"] for i in body["items"]], self.tokens(body)), (["blocked", "blocked"], []))
+        _s, body = self.preview(self.manual(finding, a, b))
+        with self.committed():
+            status, result = self.post(APPLY, {"token": self.token(body), "confirm": True,
+                                               "choice": {"acknowledge_manual": True},
+                                               "tokens": [self.token(body)]})
+        self.assertEqual(result["item"]["outcome"], "deleted")
+        self.assertEqual(self.alive(a, b, c, d), [True, False, True, True])
+
+
+class _ManualThreads(_ManualMixin, _Pairs, TransactionTestCase):
+    """Real PostgreSQL transactions: each apply request runs on its own thread, client and database connection."""
+
+    def setUp(self):
+        super().setUp()
+        grace = mock.patch.object(track_deletion, "SOURCE_FRESHNESS_GRACE_SECONDS", 0)
+        grace.start()
+        self.addCleanup(grace.stop)
+
+    def thread(self, name, fn):
+        box = {}
+
+        def run():
+            try:
+                box["value"] = fn()
+            except BaseException as exc:          # reported by the test
+                box["error"] = exc
+            finally:
+                connections.close_all()
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        thread.start()
+        return thread, box
+
+    def apply_on_thread(self, name, token, categories=()):
+        def call():
+            client = Client()
+            client.force_login(self.admin)
+            started = time.monotonic()
+            status, body = self.post(APPLY, {"token": token, "confirm": True, "choice": {
+                "categories": list(categories), "acknowledge_manual": True}}, client)
+            return status, body, time.monotonic() - started
+        return self.thread(name, call)
+
+    def lock_waiters(self) -> int:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                           "AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()")
+            return cursor.fetchone()[0]
+
+    def race(self, first, second, first_discard, first_categories=()):
+        """``first`` applies until it is inside delete_track for ``first_discard`` -- every lock of its
+        transaction held, its group check passed -- and pauses there; ``second`` then applies.  ``first``
+        resumes once ``second`` is seen waiting for a row lock, or has finished (the starting implementation,
+        which locked only the pair, never waited).  Returns (first, second, whether second waited)."""
+        paused, resume = threading.Event(), threading.Event()
+        real = track_deletion.delete_track
+
+        def gated(track, **kwargs):
+            if track.pk == first_discard.pk:
+                paused.set()
+                resume.wait(30)
+            return real(track, **kwargs)
+
+        self.engine()                                       # a fresh observation for both requests
+        with mock.patch.object(track_deletion, "delete_track", gated):
+            one, box1 = self.apply_on_thread("first", first, first_categories)
+            self.assertTrue(paused.wait(20), box1)
+            two, box2 = self.apply_on_thread("second", second)
+            waited, deadline = False, time.monotonic() + 10
+            while time.monotonic() < deadline and two.is_alive():
+                if self.lock_waiters():
+                    waited = True
+                    break
+                time.sleep(0.02)
+            resume.set()
+            one.join(30)
+            two.join(30)
+        self.assertNotIn("error", box1)
+        self.assertNotIn("error", box2)
+        return box1["value"], box2["value"], waited
+
+
+class ConcurrentGroupTests(_ManualThreads):
+    def test_concurrent_disjoint_pairs_of_one_group_are_serialized_one_deletion_one_stale(self):
+        """Codex's reproduction: A/B/C/D, Keep A / Delete B and Keep C / Delete D applied at the same time.
+        Before the correction each request locked only its own pair, both saw the original group and both
+        deleted.  Now the second waits for the first's group locks, then sees B gone and refuses."""
+        tracks = self.likely("race", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        finding = self.group(*tracks)
+        _s, first = self.preview(self.manual(finding, a, b))
+        _s, second = self.preview(self.manual(finding, c, d))
+        self.assertEqual([signing.loads(self.token(x), salt=resolution.TOKEN_SALT)["p"]["g"] for x in (first, second)],
+                         [[a.pk, b.pk, c.pk, d.pk]] * 2)
+        (s1, r1, _t1), (s2, r2, t2), waited = self.race(self.token(first), self.token(second), b,
+                                                         first_categories=[self.pop.pk])
+        self.assertEqual((s1, r1["item"]["outcome"]), (200, "deleted"), r1)
+        self.assertEqual((s2, r2["item"]["outcome"]), (200, "stale"), r2)
+        self.assertIn("Another Track of this group was deleted", r2["item"]["message"])
+        self.assertTrue(waited, "the second request never waited for the group's locks")
+        self.assertLess(t2, resolution.PAIR_LOCK_BUDGET_SECONDS + 1.5)
+        # One deletion, the survivor kept, no unintended second deletion.
+        self.assertEqual(self.alive(a, b, c, d), [True, False, True, True])
+        self.assertEqual((Path(b.filepath).exists(), Path(d.filepath).exists(), Path(c.filepath).exists()),
+                         (False, True, True))
+        self.assertEqual(r1["item"]["cleanup"]["status"], "removed")
+        self.assertEqual(r1["item"]["categories_added"], ["POP"])
+        self.assertEqual((self.additional(a), self.additional(c)), (["POP"], []))
+        self.assertEqual(Track.objects.get(pk=a.pk).category_id, self.rock.pk)
+        self.assertEqual(Track.objects.get(pk=c.pk).category_id, self.jazz.pk)
+        deletes = _events("reconciliation.duplicate_delete")
+        self.assertEqual([(e["deleted"], e["kept"], e["evidence"], e["members"]) for e in deletes],
+                         [(b.pk, a.pk, MANUAL, [a.pk, b.pk, c.pk, d.pk])])
+        outcomes = sorted((e["outcome"], e.get("authority")) for e in _events("reconciliation.duplicate_resolution"))
+        self.assertEqual(outcomes, [("deleted", MANUAL), ("stale", MANUAL)])
+
+    def test_concurrent_requests_sharing_a_selected_track(self):
+        tracks = self.likely("shared", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        finding = self.group(*tracks)
+        _s, first = self.preview(self.manual(finding, a, b))
+        _s, second = self.preview(self.manual(finding, b, c))          # keeps the Track the first deletes
+        (s1, r1, _t1), (s2, r2, _t2), waited = self.race(self.token(first), self.token(second), b)
+        self.assertEqual((r1["item"]["outcome"], r2["item"]["outcome"]), ("deleted", "stale"), (r1, r2))
+        self.assertTrue(waited)
+        self.assertIn("The kept Track no longer exists", r2["item"]["message"])
+        self.assertEqual(self.alive(a, b, c, d), [True, False, True, True])
+        self.assertEqual(len(_events("reconciliation.duplicate_delete")), 1)
+
+    def test_a_locked_member_outside_the_pair_is_answered_busy_within_the_budget(self):
+        tracks = self.likely("busy", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        _s, body = self.preview(self.manual(self.group(*tracks), a, b))
+        held, release, box = threading.Event(), threading.Event(), {}
+
+        def holder():
+            try:
+                with transaction.atomic():
+                    list(Track.objects.select_for_update().filter(pk=d.pk))     # another operation holds D
+                    held.set()
+                    release.wait(30)
+            except Exception as exc:
+                box["error"] = exc
+                held.set()
+            finally:
+                connections.close_all()
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (release.set(), thread.join(30)))
+        self.assertTrue(held.wait(10))
+        self.assertNotIn("error", box)
+        started = time.monotonic()
+        status, result = self.manual_apply(self.token(body))
+        elapsed = time.monotonic() - started
+        self.assertEqual((status, result["item"]["outcome"]), (200, "failed"), result)
+        self.assertIn("a Track of this group is busy", result["item"]["message"])
+        self.assertLess(elapsed, resolution.PAIR_LOCK_BUDGET_SECONDS + 1.0)
+        self.assertGreaterEqual(elapsed, resolution.PAIR_LOCK_BUDGET_SECONDS - 0.5)   # it did wait, bounded
+        self.assertEqual(self.alive(a, b, c, d), [True] * 4)
+        self.assertEqual(self.additional(a), [])
+        release.set()
+        thread.join(30)
+        _s, body = self.preview(self.manual(self.group(*tracks), a, b))
+        status, result = self.manual_apply(self.token(body))
+        self.assertEqual(result["item"]["outcome"], "deleted", result)
+        self.assertEqual(self.alive(a, b, c, d), [True, False, True, True])
+
+    def test_the_finding_is_rechecked_once_the_group_is_locked(self):
+        """The report changes (here: a member's record is broken) while the request waits for a group lock held
+        elsewhere; once it has the locks it reads the finding again and refuses."""
+        tracks = self.likely("recheck", 4)
+        self.scanned()
+        a, b, c, d = tracks
+        finding = self.group(*tracks)
+        _s, body = self.preview(self.manual(finding, a, b))
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            try:
+                with transaction.atomic():
+                    list(Track.objects.select_for_update().filter(pk=c.pk))
+                    held.set()
+                    release.wait(30)
+            finally:
+                connections.close_all()
+        hold = threading.Thread(target=holder, daemon=True)
+        hold.start()
+        self.addCleanup(lambda: (release.set(), hold.join(30)))
+        self.assertTrue(held.wait(10))
+        self.engine()
+        request, box = self.apply_on_thread("waiting", self.token(body))
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline and not self.lock_waiters() and request.is_alive():
+            time.sleep(0.02)
+        self.assertTrue(request.is_alive(), box)
+        for f in self.report["findings"]:
+            if f.get("id") == finding["id"]:
+                f["member_files"] = [dict(e, witness=e["witness"][:5]) if e["track_id"] == d.pk else e
+                                     for e in f["member_files"]]
+        reconciliation.write_report(self.report)
+        release.set()
+        request.join(30)
+        self.assertNotIn("error", box)
+        status, result, _elapsed = box["value"]
+        self.assertEqual((status, result["item"]["outcome"]), (200, "stale"), result)
+        self.assertIn("The scan or this finding changed", result["item"]["message"])
+        self.assertEqual(self.alive(a, b, c, d), [True] * 4)

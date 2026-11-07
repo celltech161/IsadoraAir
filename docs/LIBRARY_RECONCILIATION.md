@@ -374,6 +374,17 @@ extra is read, hashed or decoded. The page never receives these records (the fin
 server). A report made before this version has none and stays review only for this route ("run reconciliation
 again"); nothing is reconstructed from names, titles or durations.
 
+**Every member, or no manual deletion.** A manual deletion needs exactly one complete, consistent record for
+*every* member of the finding: a well-formed member list (distinct Track ids, at most 25), one record per member
+and none for any other Track, each with an absolute path agreeing with its Library-relative form, its size and
+mtime, and a six-field witness agreeing with them (at least one link), all naming distinct files. Nothing is
+skipped: a member the scan left out as unsafe (for example two members that are one hard-linked file, a protected
+or non-canonical path, a file that failed hashing), or a missing, malformed, duplicated or foreign record, makes
+the *whole group* ineligible, including its otherwise valid pairs. The page says so ("this finding does not
+contain valid file evidence for every Track; review the unsafe or missing members and run reconciliation again
+when the source issue is resolved"); **Keep both** stays available. The scanner's exclusion is kept as it is: no
+record is made up for an unsafe member.
+
 **On the page.** Such a finding offers **Review & Resolve Manually**, which opens the usual choices for one
 explicitly selected pair: *Keep Track A / delete Track B*, *Keep Track B / delete Track A*, *Keep both (not a
 duplicate)*, *No action* (the default). In a group of three or more, the operator chooses the two Tracks first
@@ -398,9 +409,16 @@ apply.
 * A selection carries `authority: "manual_editorial"` and `acknowledge_manual: true`. Without the acknowledgment
   the preview lists the pair as blocked and issues **no token**.
 * The token names the authority, the acknowledgment and the group's members that exist at preview. Apply
-  refuses (400, token not spent) unless the request repeats `acknowledge_manual: true`, then rechecks inside
-  the pair's transaction: the group's existing members must be unchanged. A deletion of any other Track of the
-  group in between makes the pair *stale*, so a group is reviewed again after each deletion.
+  refuses (400, token not spent) unless the request repeats `acknowledge_manual: true`.
+* **Decisions against one group are serialized.** Inside the pair's transaction, apply first locks the rows of
+  *every* member of the finding (at most 25; one `SELECT … FOR UPDATE` in ascending Track id order, the same order
+  every pair deletion uses, so two requests cannot deadlock on Track rows), within the same lock budget as any
+  pair (`PAIR_LOCK_BUDGET_SECONDS`, 3 s for the whole transaction; nothing waits longer). A group it cannot lock
+  in time is answered *busy* and nothing changes. Holding the locks, it rechecks that the scan and the finding are
+  still the previewed ones and that exactly the members that existed at preview still exist. Any other deletion
+  in between -- another pair of the same group, even one applied at the same moment, or a deletion from the Track
+  page -- makes the pair *stale*, so a group is reviewed again after each deletion. Only then is the selected
+  pair inspected and deleted.
 * From there it is the same deletion as above: the files must still match the recorded witnesses at preview
   and apply, and every blocker (playlist, rotation, current/future and active logs, decks, queue, recent
   claims and plays, engine state, ownership, protected resources, voice tracks), the locks and bounds, the

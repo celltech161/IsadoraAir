@@ -39,16 +39,22 @@ Manual editorial disposition (3.11, final operator-review layer).  A duplicate f
 (likely or uncertain, a pair whose decoded audio differs or could not be decoded, a group of three or more
 Tracks) can still be resolved by an operator's own editorial decision -- a third, separate authority
 (``MANUAL_EDITORIAL``), never a relabelling of the finding as exact or audio-equivalent.  It needs: a complete
-scan that recorded the members' files (``member_files``: path and six-field walk witness of each duplicate-eligible
-member, ``library_reconciliation.Scanner.record_member_files``; groups of at most
-``library_reconciliation.DUPLICATE_GROUP_LIMIT`` Tracks); an explicitly selected pair of two different members of
-that finding, each with its witness; and the operator's explicit acknowledgment that the recordings were not
-verified identical, given before the preview issues the pair's token (which names the authority and the
-acknowledgment) and repeated with the apply request.  Everything after that is the same deletion as above: the
-same inspection, blockers, engine observation, locks, transaction, category carry-forward, voice-track
-acknowledgment and cleanup.  The token also names which members of the group exist at preview; a deletion of
-any of them in between (another pair of the same group) makes it stale, so a group is reviewed again after each
-deletion.  The audit records ``evidence: manual_editorial``.  Keep both may name a pair of a larger group
+scan that recorded the files of *every* member of the finding (``member_files``: exactly one well-formed record --
+path and six-field walk witness -- per member, no other, all distinct files;
+``library_reconciliation.Scanner.record_member_files``; groups of at most
+``library_reconciliation.DUPLICATE_GROUP_LIMIT`` Tracks; a member the scan left out as unsafe -- shared inode,
+protected or non-canonical path, failed hash -- or a malformed record makes the whole group ineligible, never
+skipped); an explicitly selected pair of two different members of that finding; and the operator's explicit
+acknowledgment that the recordings were not verified identical, given before the preview issues the pair's token
+(which names the authority and the acknowledgment) and repeated with the apply request.  The token also names
+which members of the group exist at preview.  Apply serializes decisions against the group: inside the pair's
+transaction it locks the rows of *all* the finding's members (at most ``DUPLICATE_GROUP_LIMIT``, ascending id,
+within the same ``PAIR_LOCK_BUDGET_SECONDS``; a group it cannot lock in time is refused as busy), then rechecks
+that the scan and the finding are still the previewed ones and that exactly the previewed members still exist
+(any other deletion in between -- another pair of the same group, even one applied concurrently -- makes it
+stale, so a group is reviewed again after each deletion), and only then runs the same inspection, blockers,
+engine observation, transaction, category carry-forward, voice-track acknowledgment and cleanup as above, for
+the selected pair only.  The audit records ``evidence: manual_editorial``.  Keep both may name a pair of a larger group
 (``tracks``) and records that pair only.  A report without ``member_files`` (an earlier version's) stays review
 only.
 
@@ -166,6 +172,10 @@ MANUAL_WARNING = ("These recordings have not been verified as identical. They ma
                   "own review.")
 NO_MANUAL_WITNESS = ("this scan did not record the Tracks' files for manual resolution (it was made by an earlier "
                      "version): run reconciliation again to resolve it here")
+#: A group whose file record is incomplete or malformed: no pair of it is deletable (Keep both still is).
+MANUAL_INCOMPLETE = ("this finding does not contain valid file evidence for every Track; review the unsafe or "
+                     "missing members and run reconciliation again when the source issue is resolved")
+MANUAL_SAME_FILE = "two members name the same file: resolve by hand"
 NO_EVIDENCE = "the scan did not record identical-byte evidence for both Tracks"
 NO_AUDIO_EVIDENCE = ("the scan did not record verified decoded-audio evidence for both Tracks' files (run "
                      "reconciliation with \"Verify audio for likely duplicates\" to resolve this pair here)")
@@ -283,52 +293,82 @@ def evidence_summary(finding) -> dict | None:
                         if e.get("identity_source") in ("decoded", "waveform_cache")}}
 
 
+def _manual_member_ids(members) -> bool:
+    """A finding's member list as a manual decision needs it: a list of distinct positive Track ids."""
+    return (isinstance(members, list) and all(_is_int(t) and t > 0 for t in members)
+            and len(set(members)) == len(members))
+
+
+def _manual_record_problem(entry) -> str:
+    """"" when one ``member_files`` record is complete and consistent: an absolute path, its Library-relative
+    form, size and mtime, and the six-field witness agreeing with them; else why not."""
+    if _witness_ok(entry):
+        return MANUAL_INCOMPLETE
+    path, rel = entry["path"], entry.get("rel")
+    if not path or "\0" in path or not os.path.isabs(path) or not isinstance(rel, str) or not rel \
+            or not path.endswith(os.sep + rel):
+        return MANUAL_INCOMPLETE
+    witness = entry["witness"]
+    if witness[2] < 0 or witness[5] < 1:
+        return MANUAL_INCOMPLETE
+    return ""
+
+
 def _manual_files(finding) -> tuple[dict, str]:
-    """({track_id: file entry}, "") for the members whose files the scan recorded for manual resolution (each a
-    path and the six-field walk witness, distinct files); ({}, why) when it recorded none usable."""
-    members = finding.get("members") or []
-    files = finding.get("member_files")
-    if not isinstance(files, list):
+    """({track_id: file entry}, "") when the scan recorded exactly one complete, consistent, distinct file record
+    for EVERY member of the finding and none for anything else; ({}, why) otherwise.  Nothing is skipped: one
+    missing (a member the scan left out as unsafe), malformed, duplicated or foreign record makes the whole group
+    ineligible for a manual deletion.  A report with no record at all is an earlier version's (rescan)."""
+    members = finding.get("members")
+    if not _manual_member_ids(members) or len(members) > library_reconciliation.DUPLICATE_GROUP_LIMIT:
+        return {}, MANUAL_INCOMPLETE
+    if "member_files" not in finding:
         return {}, NO_MANUAL_WITNESS
-    by_track, seen = {}, set()
+    files = finding["member_files"]
+    if not isinstance(files, list) or len(files) != len(members):
+        return {}, MANUAL_INCOMPLETE
+    wanted = set(members)
+    by_track, inodes, paths = {}, set(), set()
     for entry in files:
         if not isinstance(entry, dict):
-            return {}, NO_MANUAL_WITNESS
+            return {}, MANUAL_INCOMPLETE
         track_id = entry.get("track_id")
-        if not _is_int(track_id) or track_id not in members or track_id in by_track:
-            return {}, NO_MANUAL_WITNESS
-        if _witness_ok(entry):
-            continue                                   # this member is not resolvable; the others may be
+        if not _is_int(track_id) or track_id not in wanted or track_id in by_track:
+            return {}, MANUAL_INCOMPLETE
+        if _manual_record_problem(entry):
+            return {}, MANUAL_INCOMPLETE
         inode = tuple(entry["witness"][:2])
-        if inode in seen or entry["path"] in {e["path"] for e in by_track.values()}:
-            return {}, "two members name the same file: resolve by hand"
-        seen.add(inode)
+        if inode in inodes or entry["path"] in paths:
+            return {}, MANUAL_SAME_FILE
+        inodes.add(inode)
+        paths.add(entry["path"])
         by_track[track_id] = entry
+    if set(by_track) != wanted:
+        return {}, MANUAL_INCOMPLETE
     return by_track, ""
 
 
 def manual_eligibility(finding) -> tuple[bool, str, list]:
     """Whether the operator may resolve a pair of this finding by an editorial decision (``MANUAL_EDITORIAL``),
-    why not, and which members have recorded files.  Findings the scan proved (exact bytes, verified decoded
-    audio) use that evidence instead; nothing here relabels them."""
+    why not, and its members (all of which have recorded files when it may).  Findings the scan proved (exact
+    bytes, verified decoded audio) use that evidence instead; nothing here relabels them."""
     if not isinstance(finding, dict) or finding.get("type") != "duplicate":
         return False, "not a duplicate finding", []
     if finding_eligibility(finding)[0]:
         return False, "the scan proved this pair: resolve it with its verified evidence", []
-    members = finding.get("members") or []
+    members = finding.get("members")
+    if not _manual_member_ids(members):
+        return False, MANUAL_INCOMPLETE, []
     count = finding.get("member_count", len(members))
     if len(members) < 2 or count != len(members):
         return False, "fewer than two registered Tracks", []
     if count > library_reconciliation.DUPLICATE_GROUP_LIMIT:
         return False, (f"{count} Tracks: too many to review as pairs here "
                        f"(at most {library_reconciliation.DUPLICATE_GROUP_LIMIT})"), []
-    by_track, why = _manual_files(finding)
+    _by_track, why = _manual_files(finding)
     if why:
         return False, why, []
-    if len(by_track) < 2:
-        return False, ("the scan recorded the files of fewer than two of these Tracks (the others were excluded from "
-                       "duplicate comparison)"), sorted(by_track)
-    return True, "", sorted(by_track)
+    return True, "", sorted(members)
 
 
 def _manual_evidence(finding, keep_id, discard_id) -> tuple[dict | None, str]:
@@ -342,9 +382,21 @@ def _manual_evidence(finding, keep_id, discard_id) -> tuple[dict | None, str]:
     if keep_id not in members or discard_id not in members:
         return None, "those Tracks are not both members of this finding"
     by_track, _why = _manual_files(finding)
-    if keep_id not in by_track or discard_id not in by_track:
-        return None, "the scan did not record the file of one of these Tracks: run reconciliation again"
     return {keep_id: by_track[keep_id], discard_id: by_track[discard_id]}, ""
+
+
+def _manual_group(finding, entry) -> list | None:
+    """The Track ids a manual deletion locks (every member of the finding, ascending; bounded by
+    ``DUPLICATE_GROUP_LIMIT``), or None when the token's previewed members (``g``) are not a well-formed subset
+    of them naming both Tracks of the pair."""
+    members = finding.get("members") if isinstance(finding, dict) else None
+    previewed = entry.get("g")
+    if not _manual_member_ids(members) or len(members) > library_reconciliation.DUPLICATE_GROUP_LIMIT:
+        return None
+    if not _manual_member_ids(previewed) or previewed != sorted(previewed) or not set(previewed) <= set(members) \
+            or not {entry.get("k"), entry.get("d")} <= set(previewed):
+        return None
+    return sorted(members)
 
 
 def manual_context(finding) -> dict:
@@ -1008,8 +1060,10 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
     manual = entry.get("e") == MANUAL_EDITORIAL
     base = {"finding_id": entry["f"], "action": DELETE, "keep": keep_id, "discard": discard_id,
             **({"authority": MANUAL_EDITORIAL} if manual else {})}
+    group = None
     if manual:
-        if finding is None or _manual_evidence(finding, keep_id, discard_id)[0] is None:
+        group = _manual_group(finding, entry)
+        if finding is None or group is None or _manual_evidence(finding, keep_id, discard_id)[0] is None:
             return {**base, "outcome": "stale", "message": "This finding no longer offers this pair; reload the page."}
     elif finding is None or finding_eligibility(finding)[0] is False \
             or sorted(finding.get("members") or []) != sorted((keep_id, discard_id)):
@@ -1024,21 +1078,22 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
         with transaction.atomic(using=using), \
                 connections[using].execute_wrapper(_LockBudget(PAIR_LOCK_BUDGET_SECONDS)):
             # Both rows locked, lowest id first: concurrent edits, deletions and new log entries naming
-            # either Track wait for this transaction.
+            # either Track wait for this transaction.  A manual decision locks every member of its group
+            # (ascending id, one statement, the same budget), so decisions against one group are serialized.
             locked = {t.pk: t for t in Track.objects.select_for_update(of=("self",))
-                      .filter(pk__in=(keep_id, discard_id)).order_by("pk")}
+                      .filter(pk__in=group if manual else (keep_id, discard_id)).order_by("pk")}
+            if manual:
+                stale = _manual_group_stale(report, finding, entry, locked)
+                if stale:
+                    return {**base, "outcome": "stale", "message": stale}
             tracks = {t.pk: t for t in Track.objects.select_related("artist", "album")
-                      .filter(pk__in=list(locked))}
+                      .filter(pk__in=[t for t in (keep_id, discard_id) if t in locked])}
             inspection = _inspect(finding, keep_id, discard_id, protection=protection, now=_now(),
                                   engine=engine, engine_problem=engine_problem, describe=False, tracks=tracks,
                                   manual=manual)
             if inspection.keep is None or inspection.discard is None:
                 return {**base, "outcome": "stale", "message": inspection.blockers[0][:1].upper()
                         + inspection.blockers[0][1:] + "; nothing was changed."}
-            if manual and _existing_members(finding) != entry["g"]:
-                return {**base, "outcome": "stale",
-                        "message": "Another Track of this group was deleted since the preview; nothing was changed. "
-                                   "Review the group again."}
             if inspection.fingerprints != entry["fp"]:
                 return {**base, "outcome": "stale",
                         "message": "One of the Tracks changed since the preview (its file, details or categories); "
@@ -1078,9 +1133,9 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
                 "message": f"Blocked; nothing was changed: still referenced by {', '.join(names)}."}
     except OperationalError as exc:
         log.warning("duplicate resolution finding=%s busy: %s", entry["f"], type(exc).__name__)
-        return {**base, "outcome": "failed", "message": "Not applied: one of the Tracks is busy (another operation "
-                                                        "holds it, or the database was unavailable); nothing was "
-                                                        "changed for this pair. Preview again and retry."}
+        return {**base, "outcome": "failed", "message": "Not applied: " + (
+            "a Track of this group" if manual else "one of the Tracks") + " is busy (another operation holds it, or "
+            "the database was unavailable); nothing was changed for this pair. Preview again and retry."}
     except DatabaseError as exc:
         log.warning("duplicate resolution finding=%s keep=%s discard=%s failed: %s", entry["f"], keep_id, discard_id,
                     type(exc).__name__)
@@ -1096,6 +1151,25 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
     return {**base, "outcome": "deleted", "file": rel, "categories_added": [codes.get(c, str(c)) for c in added],
             "voicetracks_deleted": inspection.voicetracks, "cleanup": _cleanup(cleanup),
             "message": f"Track #{discard_id} deleted; Track #{keep_id} kept."}
+
+
+def _manual_group_stale(report, finding, entry, locked) -> str:
+    """Once the group's rows are locked: why a manual decision is stale ("" when it is not).  The scan and the
+    finding must still be the previewed ones, the pair must exist, and exactly the members that existed at
+    preview must exist now (read through the locks and again in a fresh statement)."""
+    current = library_reconciliation.load_report()
+    current_finding = _finding(current, entry["f"]) if isinstance(current, dict) \
+        and current.get("scan_id") == report["scan_id"] and current.get("status") == "complete" else None
+    if current_finding is None or current_finding.get("members") != finding.get("members") \
+            or current_finding.get("member_files") != finding.get("member_files"):
+        return "The scan or this finding changed since the preview; nothing was changed. Reload the page."
+    for role, track_id in (("kept", entry["k"]), ("discarded", entry["d"])):
+        if track_id not in locked:
+            return f"The {role} Track no longer exists; nothing was changed."
+    if sorted(locked) != entry["g"] or _existing_members(finding) != entry["g"]:
+        return ("Another Track of this group was deleted since the preview; nothing was changed. Review the group "
+                "again.")
+    return ""
 
 
 def record_keep_both(scan_id, finding_id, finding, a, b, *, user) -> dict:
