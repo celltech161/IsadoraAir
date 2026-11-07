@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import secrets
 import stat
@@ -77,8 +78,9 @@ CLAIM_WINDOW = timedelta(hours=3)
 #: A Track that started this long ago plus its duration may still be on air.
 PLAY_MARGIN = timedelta(minutes=10)
 # Lock waits of one apply request, each answered "busy, try again" when exceeded (the Gunicorn worker timeout
-# is 30 s; together these are at most 1 + 3 + 2 + 2 = 8 s):
-#: Spending the token (waits only for a concurrent request spending the same token).
+# is 30 s; together these are at most 1 + 1 + 3 + 2 + 2 = 9 s of lock waiting -- not the request's duration):
+#: Spending the token (waits only for a concurrent request spending the same token), and separately the
+#: best-effort removal of expired claim markers after it.
 CLAIM_LOCK_TIMEOUT = "1s"
 #: All lock waits of the pair's transaction together: Track rows, category rows, the deletion's cascade.
 PAIR_LOCK_BUDGET_SECONDS = 3.0
@@ -88,6 +90,8 @@ CLEANUP_LOCK_TIMEOUT_SECONDS = 2.0
 KEEP_BOTH_LOCK_TIMEOUT = "2s"
 #: An engine state stamped further in the future than this is not trusted (clock confusion).
 ENGINE_CLOCK_TOLERANCE_SECONDS = 5
+#: The playback decks the engine's state always names (``engine.SLOTS``; an empty deck is ``null``).
+ENGINE_DECKS = ("A", "B")
 
 DELETE, KEEP_BOTH = "delete", "keep_both"
 ELIGIBLE, NEEDS_ACK, BLOCKED = "eligible", "needs_acknowledgment", "blocked"
@@ -232,11 +236,19 @@ def _engine_state() -> tuple[dict | None, str]:
         return None, (f"its state file is unreadable, malformed or older than "
                       f"{engine_status.STATE_STALENESS_SECONDS} seconds (the engine may be stopped or stalled)")
     stamp = state.get("timestamp") if isinstance(state, dict) else None
-    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) \
-            or stamp - time.time() > ENGINE_CLOCK_TOLERANCE_SECONDS:
-        return None, "its state file's timestamp is invalid or in the future"
+    # JSON accepts NaN and +/-Infinity, and every comparison with NaN is false: only a finite number can be
+    # checked for freshness.
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not math.isfinite(stamp):
+        return None, "its state file's timestamp is not a valid time"
+    age = time.time() - stamp
+    if age > engine_status.STATE_STALENESS_SECONDS:
+        return None, (f"its state file is older than {engine_status.STATE_STALENESS_SECONDS} seconds "
+                      f"(the engine may be stopped or stalled)")
+    if -age > ENGINE_CLOCK_TOLERANCE_SECONDS:
+        return None, "its state file's timestamp is in the future"
     decks, queue = state.get("decks"), state.get("queue")
-    if not isinstance(decks, dict) or not all(
+    # Every deck must be reported; a missing one is unknown, not empty.
+    if not isinstance(decks, dict) or not all(slot in decks for slot in ENGINE_DECKS) or not all(
             deck is None or (isinstance(deck, dict) and _is_int(deck.get("track_id"))) for deck in decks.values()):
         return None, "its state file has no valid list of playback decks"
     if not isinstance(queue, list) or not all(isinstance(q, dict) and _is_int(q.get("track_id")) for q in queue):

@@ -10,6 +10,13 @@ after the correction.  So that the same tests run against both, ``_Fixture.apply
 either apply contract (the starting one batch token, the corrected one token per pair) and the page scenarios
 answer either request shape; everything asserted is the behaviour the finding is about.
 
+Codex's targeted review of those corrections (6fd0573) found two more, reproduced by the tests marked ``review2``:
+
+5. (High) A NaN timestamp (JSON accepts it, and every comparison with NaN is false) or a deck map missing ``A`` or
+   ``B`` (``{}`` included) passed the engine-state check.
+6. (Medium) A 5xx answer with a JSON ``error`` body (a proxy's ``{"error": "Bad Gateway"}``) counted as a definite
+   refusal, so the page went on to delete the next pair although the unanswered one may have been deleted.
+
 Fixtures as in test_library_duplicate_resolution: a per-test Library root, waveform and report directories; the
 engine state is a real file in the test's own directory (``webrequests.services.ENGINE_STATE_PATH`` patched), read
 by the shared reader -- never /run.
@@ -220,7 +227,7 @@ class EngineStateTests(_Fix):
         "no queue": lambda self: self.engine(queue=None),
         "queue entry without a track": lambda self: self.engine(queue=[{"item_id": 3}]),
         "no active log field": lambda self: self.state_path.write_text(json.dumps(
-            {"timestamp": time.time(), "decks": {"A": None}, "queue": []})),
+            {"timestamp": time.time(), "decks": {"A": None, "B": None}, "queue": []})),
         "active log not an id": lambda self: self.engine(log_id="12"),
     }
 
@@ -302,6 +309,76 @@ class EngineStateTests(_Fix):
         status, body = self.preview(self.delete(a, b))
         self.assertEqual(body["items"][0]["status"], "eligible")
         self.assertEqual([r["outcome"] for r in self.apply_all(body)], ["deleted"])
+
+
+class EngineStateValidationTests(_Fix):
+    """review2 High: values the first correction's checks let through.  (+/-Infinity were already refused at
+    6fd0573, by the future-timestamp check and the shared reader's staleness test; they are kept here as guards.)"""
+    MALFORMED = {
+        "timestamp NaN": {"timestamp": float("nan")},
+        "timestamp +Infinity": {"timestamp": float("inf")},
+        "timestamp -Infinity": {"timestamp": float("-inf")},
+        "empty deck map": {"decks": {}},
+        "deck map missing A": {"decks": {"B": None}},
+        "deck map missing B": {"decks": {"A": None}},
+    }
+
+    def damage(self, fields):
+        self.engine(**fields)                     # json.dumps writes NaN / Infinity / -Infinity, as the reader accepts
+
+    def blocked_by_engine(self, item):
+        self.assertEqual(item["status"], "blocked", item)
+        self.assertTrue(any("playout engine's current state cannot be confirmed" in r and "Keep both" in r
+                            for r in item["reasons"]), item["reasons"])
+
+    def test_review2_malformed_engine_state_refuses_deletion_at_preview(self):
+        for name, fields in self.MALFORMED.items():
+            with self.subTest(state=name):
+                a, b = self.pair("pv-" + name.replace(" ", "-").replace("+", "p"))
+                self.scanned()
+                self.damage(fields)
+                status, body = self.preview(self.delete(a, b))
+                self.assertEqual(status, 200, body)
+                self.blocked_by_engine(body["items"][0])
+                self.assertIsNone(body["items"][0].get("token"))
+                self.apply_all(body)
+                self.assertEqual(self.exists(a, b), [True, True])
+
+    def test_review2_malformed_engine_state_after_preview_refuses_the_apply(self):
+        for name, fields in self.MALFORMED.items():
+            with self.subTest(state=name):
+                a, b = self.pair("ap-" + name.replace(" ", "-").replace("+", "p"))
+                self.scanned()
+                self.engine()
+                status, body = self.preview(self.delete(a, b))
+                self.assertEqual(body["items"][0]["status"], "eligible", body["items"][0])
+                self.damage(fields)
+                status, results = self.apply_token(self.first_token(body))
+                self.assertEqual(status, 200, results)
+                self.assertEqual(results[0]["outcome"], "blocked", results[0])
+                self.assertIn("playout engine's current state cannot be confirmed", results[0]["message"])
+                self.assertEqual(self.exists(a, b), [True, True])
+
+    def test_keep_both_stays_available_whatever_the_engine_state(self):
+        for name, fields in self.MALFORMED.items():
+            with self.subTest(state=name):
+                a, b = self.pair("kb-" + name.replace(" ", "-").replace("+", "p"))
+                self.scanned()
+                self.damage(fields)
+                status, body = self.preview(self.keep_both(a, b))
+                self.assertEqual(body["items"][0]["status"], "eligible", body["items"][0])
+                self.assertEqual([r["outcome"] for r in self.apply_all(body, confirm=False)], ["recorded"])
+                self.assertEqual(self.exists(a, b), [True, True])
+
+    def test_a_healthy_structurally_complete_state_still_permits_deletion(self):
+        a, b = self.pair("complete")
+        self.scanned()
+        self.engine(decks={"A": None, "B": {"track_id": a.pk, "slot": "B"}}, queue=[], log_id=None)
+        self.assertEqual(resolution._engine_state()[1], "")
+        status, body = self.preview(self.delete(a, b))
+        self.assertEqual(body["items"][0]["status"], "eligible", body["items"][0])
+        self.assertEqual([r["outcome"] for r in self.apply_all(body)], ["deleted"])
+        self.assertEqual(self.exists(a, b), [True, False])
 
 
 # --------------------------------------------------------------------------- 3. one pair per request
@@ -572,6 +649,82 @@ class PageTests(_Page):
         self.assertIn("whether it was applied is not known", out["results"])
         self.assertEqual(out["reloaded"], 1)
         self.assertEqual(out["selected"], ["G2", "G3"])
+
+
+# review2 Medium: the first pair's answer is uncertain or definite; the scenario reports what the page did next.
+UNCERTAIN_SCENARIO = r"""
+  const items = [exact(1, 11, 12), exact(2, 13, 14), exact(3, 15, 16)];
+  await bootDup({ page: 1, pages: 1, total: 3, scan_id: 'A', items });
+  items.forEach(f => choose('resolve-' + f.id, 'keep_a'));
+  button(ids.resolveBar, 'Review selected').listeners.click[0]();
+  await flush();
+  answerPreview(items, []);
+  await flush();
+  confirmAndApply();
+  await flush();
+  const first = open(r => r.url === APPLY)[0];
+  const reloadsBefore = requests.filter(isFindings).length;
+  ANSWER(first);
+  for (let i = 0; i < 5; i++) await flush();
+  const after = open(r => r.url === APPLY);
+  const continued = after.length;
+  for (let guard = 0; guard < 5 && open(r => r.url === APPLY).length; guard++) {
+    answerApply(open(r => r.url === APPLY)[0], () => 'deleted');
+    for (let i = 0; i < 3; i++) await flush();
+  }
+  console.log(JSON.stringify({ continued, tokens: requests.filter(r => r.url === APPLY).map(r => JSON.parse(r.body).token),
+    results: ids.resolvePanel.text, reloads: requests.filter(isFindings).length - reloadsBefore,
+    selected: [...choices.keys()].sort() }));
+"""
+EMPTY_BODY = "function respondEmpty(req, status) { req.done = true; req.resolve({ ok: false, status, " \
+             "json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } }); }\n"
+
+
+class UncertainAnswerPageTests(_Page):
+    UNCERTAIN = {
+        "502 Bad Gateway, JSON error body": "respond(req, 502, { error: 'Bad Gateway' })",
+        "500 structured application error": "respond(req, 500, { result: 'refused', error: 'Internal error' })",
+        "503 structured response": "respond(req, 503, { error: 'Service Unavailable', retry_after: 5 })",
+        "502 empty body": "respondEmpty(req, 502)",
+        "network failure": "fail(req)",
+    }
+
+    def run_answer(self, answer):
+        return self.run_page(EMPTY_BODY + UNCERTAIN_SCENARIO.replace("ANSWER(first)",
+                                                                     f"(req => {{ {answer}; }})(first)"))
+
+    def test_review2_every_5xx_or_lost_answer_stops_the_batch(self):
+        """Before the correction the three structured 5xx answers counted as refusals and the page sent the next
+        pair's deletion."""
+        for name, answer in self.UNCERTAIN.items():
+            with self.subTest(answer=name):
+                out = self.run_answer(answer)
+                self.assertEqual(out["continued"], 0, out)
+                self.assertEqual(out["tokens"], ["tok-G1"])                     # never retried, nothing more sent
+                self.assertIn("Unknown (no answer): 1", out["results"])
+                self.assertIn("Not attempted: 2", out["results"])
+                self.assertIn("Processed 0 of 3 pair(s)", out["results"])
+                self.assertIn("whether it was applied is not known", out["results"])
+                self.assertEqual(out["reloads"], 1)                              # authoritative findings reloaded
+                self.assertEqual(out["selected"], ["G1", "G2", "G3"])           # kept for review and a new preview
+
+    def test_definite_answers_still_continue_the_batch(self):
+        cases = {
+            "409 refusal": ("respond(req, 409, { result: 'refused', error: \"This pair's preview was already "
+                            "used. Preview again.\" })", "Refused: 1", ["G1", "G2", "G3"], ["G1"]),
+            "403 refusal": ("respond(req, 403, { result: 'refused', error: 'This preview belongs to another "
+                            "operator.' })", "Refused: 1", ["G1", "G2", "G3"], ["G1"]),
+            "success": ("answerApply(req, () => 'deleted')", "Deleted: 3", ["G1", "G2", "G3"], []),
+        }
+        for name, (answer, count, sent, selected) in cases.items():
+            with self.subTest(answer=name):
+                out = self.run_answer(answer)
+                self.assertEqual(out["continued"], 1, out)
+                self.assertEqual(out["tokens"], [f"tok-{f}" for f in sent])
+                self.assertIn(count, out["results"])
+                self.assertIn("Processed 3 of 3 pair(s)", out["results"])
+                self.assertNotIn("Unknown", out["results"])
+                self.assertEqual(out["selected"], selected)
 
 
 class NavigationGuardTests(_Page):

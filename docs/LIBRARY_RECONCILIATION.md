@@ -201,7 +201,7 @@ current-or-upcoming-log / voice-track references) and a status:
 |---|---|
 | Can be deleted | none of the below |
 | Needs acknowledgment | the discarded Track has VoiceTracks: deleting it deletes them (Track CASCADE); they are not moved |
-| Blocked | the playout engine's state is missing, stale (older than the shared reader's 30 s), unreadable, malformed, stamped in the future or lacks its decks, queue or active-log field; the discarded Track is in a playlist or a rotation slot (PROTECT); is in the log of the current or a later station hour, or of the engine's active log (which can be an earlier hour's); is on a deck or in the engine's queue, was claimed by the engine in the last 3 hours and has not played, or started playing within its duration + 10 minutes; either Track is protected (spoken projection, Active Messages, remote-hosted, non-canonical path), missing, at another path than the scan's, or its file's current stat witness differs from the one the scan hashed it under (modified or replaced); both name the same file; the finding is not eligible; or another selection of the batch names the same finding or Track |
+| Blocked | the playout engine's state is missing, stale (older than the shared reader's 30 s), unreadable, malformed, has a timestamp that is not a finite number (JSON's `NaN`/`Infinity`) or is in the future, does not report both decks (`A` and `B`; a missing deck is unknown, not empty), or lacks its queue or active-log field; the discarded Track is in a playlist or a rotation slot (PROTECT); is in the log of the current or a later station hour, or of the engine's active log (which can be an earlier hour's); is on a deck or in the engine's queue, was claimed by the engine in the last 3 hours and has not played, or started playing within its duration + 10 minutes; either Track is protected (spoken projection, Active Messages, remote-hosted, non-canonical path), missing, at another path than the scan's, or its file's current stat witness differs from the one the scan hashed it under (modified or replaced); both name the same file; the finding is not eligible; or another selection of the batch names the same finding or Track |
 
 Blocked log entries are listed by date and hour, each linking to `/logs/?date=…&hour=…&return=reconciliation`
 (new tab; the Logs page opens that hour and offers a link back). Nothing here edits or regenerates a log; after
@@ -216,8 +216,8 @@ and the file's stat witness), the suggested categories and the voice-track count
 
 **Apply** (`POST /api/tracks/reconciliation/duplicates/apply/`, body `{token, choice, confirm}`) applies **one
 pair per request**. The page confirms the batch once, then sends the pairs one at a time in order, showing
-"*n* of *m* pair(s) processed"; a blocked, busy or refused pair is reported and the next one is sent; a lost
-answer stops the batch (that pair is *unknown*, the rest *not attempted*) and the findings are reloaded, so an
+"*n* of *m* pair(s) processed"; a blocked, busy or refused pair (a 4xx answer) is reported and the next one is sent; a lost
+answer, or any 5xx answer whatever its body (a proxy's 502 can follow a deletion that committed), stops the batch (that pair is *unknown*, the rest *not attempted*) and the findings are reloaded, so an
 irreversible action is never retried blindly. A deletion needs `confirm: true`; `choice` carries the chosen
 `categories` (a subset of the server's suggestions; nothing else from the client is trusted) and
 `acknowledge_voicetracks`. Unticked or cancelled pairs are never sent. The token is spent before the pair is
@@ -250,10 +250,13 @@ Pairs that were not applied stay selected on the page for review and a later pre
 
 **Request time.** One request does at most one deletion, and every lock wait in it is bounded, each answered
 "busy, try again" (nothing changed, or for the cleanup: the file retained and reported): spending the token
-1 s; the pair's transaction 3 s in all (`PAIR_LOCK_BUDGET_SECONDS`: Track rows, category rows and the deletion's
+1 s, and the best-effort removal of expired claim markers after it another 1 s (its own transaction); the pair's
+transaction 3 s in all (`PAIR_LOCK_BUDGET_SECONDS`: Track rows, category rows and the deletion's
 cascade together; once spent, a contended lock is refused at once while uncontended statements still run); the
 after-commit source-path lock 2 s and waveform-cache lock 2 s (`delete_track(cleanup_lock_timeout=…)`; other
-callers keep 5 s and 15 s). That is at most 8 s of lock waiting, against Gunicorn's 30 s worker timeout. Keep
+callers keep 5 s and 15 s). The cumulative controllable lock-wait budget is therefore **9 s** per request
+(1 + 1 + 3 + 2 + 2), against Gunicorn's 30 s worker timeout. It bounds waiting for locks only, not the request's
+total duration: ordinary database and filesystem work (the deletion itself, removing the file) comes on top. Keep
 both (also the "Record: not a duplicate" button) waits at most 2 s for the decision row.
 
 **Not changed:** the kept Track's audio file, path, cue markers, waveform, readiness and every other field;

@@ -597,10 +597,12 @@ function applyQueue(preview, options) {
   return { send, cancelled };
 }
 // One pair's answer: its result; a refusal (nothing was applied); or null when the answer was lost or unreadable,
-// so whether the pair was applied is not known -- the batch then stops rather than send anything more.
+// so whether the pair was applied is not known -- the batch then stops rather than send anything more.  Every 5xx
+// is such an answer, whatever its body: the server refuses with 4xx only, and a proxy's 502/504 (or a worker that
+// failed after the commit) can follow a deletion that did happen.
 function applyAnswer(job, resp, data) {
   if (resp.ok) return data && data.item ? data.item : null;
-  if (!resp.status || (resp.status >= 500 && !(data && data.error))) return null;
+  if (!resp.status || resp.status >= 500) return null;
   return { finding_id: job.finding_id, action: job.action, outcome: 'refused',
            message: 'Not applied: ' + ((data && data.error) || `HTTP ${resp.status}`) };
 }
@@ -887,7 +889,9 @@ async function applySelection(preview, options, confirmed) {
     if (item === null) {
       unknown = true;
       results.push({ finding_id: job.finding_id, action: job.action, outcome: 'unknown',
-                     message: 'No answer from the server: whether this pair was applied is not known.' });
+                     message: (result.resp.status ? `Uncertain answer from the server (HTTP ${result.resp.status})`
+                                                  : 'No answer from the server') +
+                              ': whether this pair was applied is not known. It is not retried automatically.' });
       send.slice(i + 1).forEach(rest => results.push({ finding_id: rest.finding_id, action: rest.action,
         outcome: 'not_attempted', message: 'Not sent: processing stopped at the unanswered pair above.' }));
       break;
@@ -910,8 +914,8 @@ function renderResults(data) {
   const settled = data.items.every(r => SETTLED.has(r.outcome));
   nodes.push(el('p', `Processed ${data.processed} of ${data.total} pair(s). Result: ` + counts, settled ? 'rc-ok' : 'rc-warn'));
   if (data.unknown) {
-    nodes.push(el('p', 'Stopped: the answer for one pair was lost, so whether it was applied is not known, and the ' +
-                       'pairs after it were not sent. The findings below have been reloaded from the server; use ' +
+    nodes.push(el('p', 'Stopped: the answer for one pair was lost or uncertain, so whether it was applied is not ' +
+                       'known, and the pairs after it were not sent. The findings below have been reloaded from the server; use ' +
                        'Review selected… to see the current state before trying again.', 'rc-warn'));
   }
   data.items.forEach(r => {
