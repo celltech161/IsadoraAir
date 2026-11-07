@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0128",
+  "previous_release_id": "r0127",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 3.11 verified audio-equivalent duplicate resolution: operator-requested, bounded reconciliation may prove two Track files decode to identical audio and then use the existing guarded r0127 review and deletion workflow. Metadata similarity alone remains review-only. Restart Gunicorn only; no migration, static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
