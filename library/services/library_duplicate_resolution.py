@@ -11,7 +11,8 @@ duplicate-management subsystem:
   confidence with the scan's ``audio_verification`` evidence: both files' full decoded-audio identities
   (algorithm, digest, sample rate, frame count; equal) bound to each file's path and stat witness
   (``library_reconciliation.Scanner.upgrade_with_decoded_identity``).  Groups of three or more Tracks, likely /
-  uncertain findings, audio-equivalent findings without that evidence and file-only groups stay review-only.
+  uncertain findings, audio-equivalent findings without that evidence and file-only groups are not resolvable by
+  evidence (only by the operator's manual editorial decision, below, which is a separate authority).
   The two kinds of evidence are never mixed: an exact finding needs its byte evidence, a decoded-audio one
   its decoded-audio evidence; a title, artist, ISRC or duration never stands in for either.
 * **Decisions.**  Per pair: keep A and delete B, keep B and delete A, keep both (the existing non-destructive
@@ -33,6 +34,23 @@ duplicate-management subsystem:
   source cleanup unchanged).  The category additions and the deletion commit together or not at all.  Anything
   changed since the preview refuses the pair; nothing is guessed.  Pairs are independent: one blocked, stale or
   failing pair neither blocks nor rolls back another.
+
+Manual editorial disposition (3.11, final operator-review layer).  A duplicate finding the scan could not prove
+(likely or uncertain, a pair whose decoded audio differs or could not be decoded, a group of three or more
+Tracks) can still be resolved by an operator's own editorial decision -- a third, separate authority
+(``MANUAL_EDITORIAL``), never a relabelling of the finding as exact or audio-equivalent.  It needs: a complete
+scan that recorded the members' files (``member_files``: path and six-field walk witness of each duplicate-eligible
+member, ``library_reconciliation.Scanner.record_member_files``; groups of at most
+``library_reconciliation.DUPLICATE_GROUP_LIMIT`` Tracks); an explicitly selected pair of two different members of
+that finding, each with its witness; and the operator's explicit acknowledgment that the recordings were not
+verified identical, given before the preview issues the pair's token (which names the authority and the
+acknowledgment) and repeated with the apply request.  Everything after that is the same deletion as above: the
+same inspection, blockers, engine observation, locks, transaction, category carry-forward, voice-track
+acknowledgment and cleanup.  The token also names which members of the group exist at preview; a deletion of
+any of them in between (another pair of the same group) makes it stale, so a group is reviewed again after each
+deletion.  The audit records ``evidence: manual_editorial``.  Keep both may name a pair of a larger group
+(``tracks``) and records that pair only.  A report without ``member_files`` (an earlier version's) stays review
+only.
 
 Blocked (never deleted here): a discarded Track in a playlist or a rotation slot (PROTECT), in the log of the
 current or a later hour (or the engine's active log, which can be an earlier hour's), on air or claimed by the
@@ -141,6 +159,13 @@ def finding_eligibility(finding) -> tuple[bool, str]:
 
 
 EXACT, AUDIO_EQUIVALENT = "exact", "audio_equivalent"
+#: The operator's editorial decision: the third authority (never machine-verified sameness).
+MANUAL_EDITORIAL = "manual_editorial"
+MANUAL_WARNING = ("These recordings have not been verified as identical. They may contain different edits, masters, "
+                  "audio quality or performances. You are authorizing deletion of the selected version based on your "
+                  "own review.")
+NO_MANUAL_WITNESS = ("this scan did not record the Tracks' files for manual resolution (it was made by an earlier "
+                     "version): run reconciliation again to resolve it here")
 NO_EVIDENCE = "the scan did not record identical-byte evidence for both Tracks"
 NO_AUDIO_EVIDENCE = ("the scan did not record verified decoded-audio evidence for both Tracks' files (run "
                      "reconciliation with \"Verify audio for likely duplicates\" to resolve this pair here)")
@@ -256,6 +281,100 @@ def evidence_summary(finding) -> dict | None:
                 "different_size", "different_bytes", "identical_bytes") else "not_compared",
             "sources": {str(t): e.get("identity_source") for t, e in by_track.items()
                         if e.get("identity_source") in ("decoded", "waveform_cache")}}
+
+
+def _manual_files(finding) -> tuple[dict, str]:
+    """({track_id: file entry}, "") for the members whose files the scan recorded for manual resolution (each a
+    path and the six-field walk witness, distinct files); ({}, why) when it recorded none usable."""
+    members = finding.get("members") or []
+    files = finding.get("member_files")
+    if not isinstance(files, list):
+        return {}, NO_MANUAL_WITNESS
+    by_track, seen = {}, set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            return {}, NO_MANUAL_WITNESS
+        track_id = entry.get("track_id")
+        if not _is_int(track_id) or track_id not in members or track_id in by_track:
+            return {}, NO_MANUAL_WITNESS
+        if _witness_ok(entry):
+            continue                                   # this member is not resolvable; the others may be
+        inode = tuple(entry["witness"][:2])
+        if inode in seen or entry["path"] in {e["path"] for e in by_track.values()}:
+            return {}, "two members name the same file: resolve by hand"
+        seen.add(inode)
+        by_track[track_id] = entry
+    return by_track, ""
+
+
+def manual_eligibility(finding) -> tuple[bool, str, list]:
+    """Whether the operator may resolve a pair of this finding by an editorial decision (``MANUAL_EDITORIAL``),
+    why not, and which members have recorded files.  Findings the scan proved (exact bytes, verified decoded
+    audio) use that evidence instead; nothing here relabels them."""
+    if not isinstance(finding, dict) or finding.get("type") != "duplicate":
+        return False, "not a duplicate finding", []
+    if finding_eligibility(finding)[0]:
+        return False, "the scan proved this pair: resolve it with its verified evidence", []
+    members = finding.get("members") or []
+    count = finding.get("member_count", len(members))
+    if len(members) < 2 or count != len(members):
+        return False, "fewer than two registered Tracks", []
+    if count > library_reconciliation.DUPLICATE_GROUP_LIMIT:
+        return False, (f"{count} Tracks: too many to review as pairs here "
+                       f"(at most {library_reconciliation.DUPLICATE_GROUP_LIMIT})"), []
+    by_track, why = _manual_files(finding)
+    if why:
+        return False, why, []
+    if len(by_track) < 2:
+        return False, ("the scan recorded the files of fewer than two of these Tracks (the others were excluded from "
+                       "duplicate comparison)"), sorted(by_track)
+    return True, "", sorted(by_track)
+
+
+def _manual_evidence(finding, keep_id, discard_id) -> tuple[dict | None, str]:
+    """({keep: entry, discard: entry}, "") when the operator may decide this pair of this finding."""
+    eligible, why, _members = manual_eligibility(finding)
+    if not eligible:
+        return None, why
+    if keep_id == discard_id:
+        return None, "choose two different Tracks: one to keep and one to delete"
+    members = finding.get("members") or []
+    if keep_id not in members or discard_id not in members:
+        return None, "those Tracks are not both members of this finding"
+    by_track, _why = _manual_files(finding)
+    if keep_id not in by_track or discard_id not in by_track:
+        return None, "the scan did not record the file of one of these Tracks: run reconciliation again"
+    return {keep_id: by_track[keep_id], discard_id: by_track[discard_id]}, ""
+
+
+def manual_context(finding) -> dict:
+    """What the scan established about the audio of a manually resolved pair (display and audit; never proof):
+    "different" (decoded and compared: it differs), "unverified" (not compared, or the comparison failed, with
+    the recorded reason) or "not_compared" (no record, e.g. a larger group)."""
+    record = finding.get("audio_verification") if isinstance(finding, dict) else None
+    status = record.get("status") if isinstance(record, dict) else None
+    reason = record.get("reason") if isinstance(record, dict) and isinstance(record.get("reason"), str) else ""
+    if status == "different":
+        return {"audio": "different", "audio_reason": reason[:300]}
+    if status == "unverified":
+        return {"audio": "unverified", "audio_reason": reason[:300]}
+    return {"audio": "not_compared", "audio_reason": ""}
+
+
+def manual_summary(finding, *, complete=True) -> dict:
+    """The page's view of the manual route (display only; preview and apply recheck everything)."""
+    eligible, why, members = manual_eligibility(finding)
+    if eligible and not complete:
+        eligible, why, members = False, "the scan is not complete", []
+    return {"available": eligible, "reason": why, "members": members, "warning": MANUAL_WARNING,
+            **manual_context(finding)}
+
+
+def _existing_members(finding) -> list:
+    """The finding's members that exist now (bounded: a manual finding has at most DUPLICATE_GROUP_LIMIT)."""
+    from library.models import Track
+    members = (finding.get("members") or [])[:library_reconciliation.DUPLICATE_GROUP_LIMIT]
+    return sorted(Track.objects.filter(pk__in=members).values_list("pk", flat=True))
 
 
 # --------------------------------------------------------------------------- current state
@@ -461,13 +580,14 @@ class _Inspection:
 
 
 def _inspect(finding, keep_id, discard_id, *, protection, now, engine, engine_problem="", describe=True,
-             tracks=None) -> _Inspection:
+             tracks=None, manual=False) -> _Inspection:
     """Everything a deletion depends on, read now.  ``tracks``: rows the caller has already locked.  ``engine``:
-    a checked engine state, or None with ``engine_problem`` saying why there is none (the deletion is blocked)."""
+    a checked engine state, or None with ``engine_problem`` saying why there is none (the deletion is blocked).
+    ``manual``: the pair is an editorial decision; the files must still be the ones the scan recorded."""
     from library.models import Track
 
     out = _Inspection()
-    evidence = _evidence(finding)[0] or {}
+    evidence = (_manual_evidence(finding, keep_id, discard_id)[0] if manual else _evidence(finding)[0]) or {}
     if tracks is None:
         tracks = {t.pk: t for t in Track.objects.select_related("artist", "album").filter(pk__in=(keep_id, discard_id))}
     keep, discard = tracks.get(keep_id), tracks.get(discard_id)
@@ -487,9 +607,10 @@ def _inspect(finding, keep_id, discard_id, *, protection, now, engine, engine_pr
             out.blockers.append(f"the {role} Track: {problem}")
         elif identity != scanned.get("witness"):
             out.blockers.append(f"the {role} Track's file was modified or replaced since the scan compared it "
-                                "(it is no longer exactly the file whose "
-                                + ("bytes were hashed" if evidence_kind(finding) == "exact_bytes"
-                                   else "decoded audio was verified") + "); run reconciliation again")
+                                "(it is no longer exactly the file " + (
+                                    "the scan recorded" if manual else "whose bytes were hashed"
+                                    if evidence_kind(finding) == "exact_bytes" else "whose decoded audio was verified")
+                                + "); run reconciliation again")
         owner = _owner(track, protection)
         if owner:
             out.blockers.append(f"the {role} Track is protected: {owner}")
@@ -562,14 +683,24 @@ def _parse_selections(raw):
             raise ResolutionRefused("Each selection needs a finding_id.", status=400)
         action = item.get("action")
         if action == KEEP_BOTH:
-            parsed.append({"finding_id": item["finding_id"], "action": KEEP_BOTH})
+            tracks = item.get("tracks")
+            if tracks is not None and not (isinstance(tracks, list) and len(tracks) == 2
+                                           and all(_is_int(t) for t in tracks)):
+                raise ResolutionRefused("Keep both names the pair as two Track ids.", status=400)
+            parsed.append({"finding_id": item["finding_id"], "action": KEEP_BOTH,
+                           "tracks": sorted(tracks) if tracks is not None else None})
             continue
         if action != DELETE:
             raise ResolutionRefused("Each selection's action is 'delete' or 'keep_both'.", status=400)
         keep, discard = item.get("keep"), item.get("discard")
         if not all(isinstance(v, int) and not isinstance(v, bool) for v in (keep, discard)):
             raise ResolutionRefused("A deletion names the Track to keep and the Track to discard.", status=400)
-        parsed.append({"finding_id": item["finding_id"], "action": DELETE, "keep": keep, "discard": discard})
+        authority = item.get("authority")
+        if authority not in (None, MANUAL_EDITORIAL):
+            raise ResolutionRefused("A deletion's authority is the scan's evidence or 'manual_editorial'.", status=400)
+        parsed.append({"finding_id": item["finding_id"], "action": DELETE, "keep": keep, "discard": discard,
+                       "manual": authority == MANUAL_EDITORIAL,
+                       "acknowledge_manual": item.get("acknowledge_manual") is True})
     return parsed
 
 
@@ -621,16 +752,26 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             continue
         members = finding.get("members") or []
         if sel["action"] == KEEP_BOTH:
-            if len(members) != 2:
-                item.update(status=BLOCKED, reasons=["Keep both is offered here only for a pair of two Tracks"])
+            pair = sel["tracks"] or (sorted(members) if len(members) == 2 else None)
+            if pair is None:
+                item.update(status=BLOCKED, reasons=["Choose the two Tracks of this group to keep both of"])
                 continue
-            decision = _legacy_decision(finding, *members)
-            item.update(status=ELIGIBLE, track_a=members[0], track_b=members[1], legacy_decision=decision)
+            if pair[0] == pair[1] or not set(pair) <= set(members):
+                item.update(status=BLOCKED, reasons=["those Tracks are not two different Tracks of this finding"])
+                continue
+            decision = _legacy_decision(finding, *pair)
+            item.update(status=ELIGIBLE, track_a=pair[0], track_b=pair[1], legacy_decision=decision)
             if decision and decision.get("resolution") in ("keep_a", "keep_b") and not decision.get("applied"):
                 item["warnings"] = [f"A legacy decision ({decision['resolution']}) is recorded for this pair and is "
                                     "left unchanged; apply_duplicate_resolutions could still act on it."]
-            item["token"] = _token(user, scan_id, {"f": sel["finding_id"], "a": KEEP_BOTH, "t": sorted(members)})
+            item["token"] = _token(user, scan_id, {"f": sel["finding_id"], "a": KEEP_BOTH, "t": pair})
             planned.append(item)
+            continue
+        if sel["manual"]:
+            _preview_manual(item, sel, finding, user=user, scan_id=scan_id, protection=protection, now=now,
+                            engine=engine, engine_problem=engine_problem)
+            if item.get("token"):
+                planned.append(item)
             continue
         eligible, why = finding_eligibility(finding)
         if not eligible:
@@ -657,6 +798,34 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             "deletions": sum(1 for i in planned if i["action"] == DELETE), "expires_in": TOKEN_MAX_AGE_SECONDS}
 
 
+def _preview_manual(item, sel, finding, *, user, scan_id, protection, now, engine, engine_problem):
+    """One manually decided pair of a preview (``MANUAL_EDITORIAL``): the same inspection as a verified pair; a
+    token only with the operator's acknowledgment and nothing in the way."""
+    keep, discard = sel["keep"], sel["discard"]
+    item.update(authority=MANUAL_EDITORIAL, keep=keep, discard=discard,
+                manual={"warning": MANUAL_WARNING, **manual_context(finding)})
+    evidence, why = _manual_evidence(finding, keep, discard)
+    if evidence is None:
+        item.update(status=BLOCKED, reasons=[why])
+        return
+    inspection = _inspect(finding, keep, discard, protection=protection, now=now, engine=engine,
+                          engine_problem=engine_problem, manual=True)
+    item.update(evidence={"kind": MANUAL_EDITORIAL}, **inspection.described, voicetracks=inspection.voicetracks,
+                warnings=inspection.warnings, legacy_decision=_legacy_decision(finding, keep, discard))
+    reasons = list(inspection.blockers)
+    if not sel["acknowledge_manual"]:
+        reasons.append("acknowledge that this is your own editorial decision (the recordings were not verified "
+                       "identical) before it can be authorized")
+    if reasons:
+        item.update(status=BLOCKED, reasons=reasons)
+        return
+    item.update(status=NEEDS_ACK if inspection.voicetracks else ELIGIBLE, reasons=[], manual_acknowledged=True)
+    item["token"] = _token(user, scan_id, {"f": sel["finding_id"], "a": DELETE, "k": keep, "d": discard,
+                                           "fp": inspection.fingerprints, "c": inspection.suggestions,
+                                           "v": inspection.voicetracks, "e": MANUAL_EDITORIAL, "m": True,
+                                           "g": _existing_members(finding)})
+
+
 def _token(user, scan_id, entry) -> str:
     """One pair's authorization: this operator, this scan, this pair as previewed, a nonce spent at apply."""
     return signing.dumps({"u": user.pk, "s": scan_id, "n": secrets.token_urlsafe(16), "p": entry},
@@ -675,7 +844,9 @@ def _redeem(token, user) -> dict:
     if not isinstance(plan, dict) or plan.get("u") != user.pk:
         raise ResolutionRefused("This preview was made by another operator.", status=403)
     if not isinstance(plan.get("n"), str) or not isinstance(plan.get("p"), dict) \
-            or plan["p"].get("a") not in (DELETE, KEEP_BOTH):
+            or plan["p"].get("a") not in (DELETE, KEEP_BOTH) or plan["p"].get("e") not in (None, MANUAL_EDITORIAL) \
+            or (plan["p"].get("e") == MANUAL_EDITORIAL and (plan["p"].get("a") != DELETE or plan["p"].get("m") is not True
+                                                            or not isinstance(plan["p"].get("g"), list))):
         raise ResolutionRefused("This is not a valid preview token.", status=400)
     return plan
 
@@ -722,7 +893,8 @@ def _parse_choice(raw) -> dict:
     categories = raw.get("categories", [])
     if not isinstance(categories, list) or not all(_is_int(c) for c in categories):
         raise ResolutionRefused("categories must be a list of category ids.", status=400)
-    return {"categories": set(categories), "acknowledge_voicetracks": raw.get("acknowledge_voicetracks") is True}
+    return {"categories": set(categories), "acknowledge_voicetracks": raw.get("acknowledge_voicetracks") is True,
+            "acknowledge_manual": raw.get("acknowledge_manual") is True}
 
 
 CLEANUP_TEXT = {
@@ -759,6 +931,9 @@ def apply(token, raw_choice, *, confirm, user) -> dict:
         choice = _parse_choice(raw_choice)
         if entry["a"] == DELETE and confirm is not True:
             raise ResolutionRefused("Confirm the permanent deletion first.", status=400)
+        if entry.get("e") == MANUAL_EDITORIAL and not choice["acknowledge_manual"]:
+            raise ResolutionRefused("Acknowledge that this deletion is your own editorial decision (the recordings "
+                                    "were not verified identical) first.", status=400)
         report = _report(plan["s"])
         _claim(plan["n"])
     except ResolutionRefused as exc:
@@ -781,7 +956,10 @@ def apply(token, raw_choice, *, confirm, user) -> dict:
         level="info" if outcome in SETTLED else "warning",
         title=f"Library duplicate resolution: {outcome.replace('_', ' ')} ({entry['f']})"[:200],
         detail={"scan_id": plan["s"], "finding_id": entry["f"], "resolution": entry["a"],
-                "tracks": entry["t"] if entry["a"] == KEEP_BOTH else [entry["k"], entry["d"]]})
+                "tracks": entry["t"] if entry["a"] == KEEP_BOTH else [entry["k"], entry["d"]],
+                **({"authority": MANUAL_EDITORIAL, "manual_acknowledged": True,
+                    "cleanup": (result.get("cleanup") or {}).get("status")}
+                   if entry.get("e") == MANUAL_EDITORIAL else {})})
     return {"scan_id": plan["s"], "item": result, "audit_action_id": action_id,
             "rescan_recommended": outcome == "deleted"}
 
@@ -806,7 +984,8 @@ class _LockBudget:
 def _apply_keep_both(report, finding, entry, user) -> dict:
     a, b = entry["t"]
     base = {"finding_id": entry["f"], "action": KEEP_BOTH, "track_a": a, "track_b": b}
-    if finding is None or sorted(finding.get("members") or []) != [a, b]:
+    members = (finding.get("members") or []) if finding is not None else []
+    if finding is None or a == b or not {a, b} <= set(members):
         return {**base, "outcome": "stale", "message": "This finding no longer names this pair."}
     result = record_keep_both(report["scan_id"], entry["f"], finding, a, b, user=user)
     if result["result"] == "missing":
@@ -826,8 +1005,13 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
     from library.services.track_deletion import delete_track
 
     keep_id, discard_id = entry["k"], entry["d"]
-    base = {"finding_id": entry["f"], "action": DELETE, "keep": keep_id, "discard": discard_id}
-    if finding is None or finding_eligibility(finding)[0] is False \
+    manual = entry.get("e") == MANUAL_EDITORIAL
+    base = {"finding_id": entry["f"], "action": DELETE, "keep": keep_id, "discard": discard_id,
+            **({"authority": MANUAL_EDITORIAL} if manual else {})}
+    if manual:
+        if finding is None or _manual_evidence(finding, keep_id, discard_id)[0] is None:
+            return {**base, "outcome": "stale", "message": "This finding no longer offers this pair; reload the page."}
+    elif finding is None or finding_eligibility(finding)[0] is False \
             or sorted(finding.get("members") or []) != sorted((keep_id, discard_id)):
         return {**base, "outcome": "stale", "message": "This finding no longer offers this pair; reload the page."}
     chosen = choice["categories"]
@@ -846,10 +1030,15 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
             tracks = {t.pk: t for t in Track.objects.select_related("artist", "album")
                       .filter(pk__in=list(locked))}
             inspection = _inspect(finding, keep_id, discard_id, protection=protection, now=_now(),
-                                  engine=engine, engine_problem=engine_problem, describe=False, tracks=tracks)
+                                  engine=engine, engine_problem=engine_problem, describe=False, tracks=tracks,
+                                  manual=manual)
             if inspection.keep is None or inspection.discard is None:
                 return {**base, "outcome": "stale", "message": inspection.blockers[0][:1].upper()
                         + inspection.blockers[0][1:] + "; nothing was changed."}
+            if manual and _existing_members(finding) != entry["g"]:
+                return {**base, "outcome": "stale",
+                        "message": "Another Track of this group was deleted since the preview; nothing was changed. "
+                                   "Review the group again."}
             if inspection.fingerprints != entry["fp"]:
                 return {**base, "outcome": "stale",
                         "message": "One of the Tracks changed since the preview (its file, details or categories); "
@@ -878,9 +1067,11 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
                 "reconciliation.duplicate_delete", user=user, outcome="deleted",
                 title=f"Library duplicate resolved: Track {discard_id} deleted, Track {keep_id} kept",
                 detail={"scan_id": report["scan_id"], "finding_id": entry["f"], "kept": keep_id,
-                        "deleted": discard_id, "evidence": evidence_kind(finding),
+                        "deleted": discard_id, "evidence": MANUAL_EDITORIAL if manual else evidence_kind(finding),
                         "file": library_audit.library_relative(discard.filepath),
-                        "categories_added": added, "voicetracks_deleted": inspection.voicetracks})
+                        "categories_added": added, "voicetracks_deleted": inspection.voicetracks,
+                        **({"manual_acknowledged": True, "finding_confidence": finding.get("confidence"),
+                            "members": entry["g"], **manual_context(finding)} if manual else {})})
     except ProtectedError as exc:
         names = sorted({type(o).__name__ for o in exc.protected_objects})
         return {**base, "outcome": "blocked", "reasons": [f"still referenced by {', '.join(names)}"],

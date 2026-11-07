@@ -65,6 +65,7 @@
   .rc-choice input { margin-right: 0.4rem; }
   .rc-ok { color: #22c55e; }
   .rc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+  .rc-manual-warning { border-left: 3px solid #f59e0b; padding: 0.3rem 0.6rem; margin: 0.4rem 0; color: #f59e0b; }
   #resolveBar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
 </style>
 {% endblock %}
@@ -467,7 +468,21 @@ function evidenceText(ev) {
            'tags, artwork, cue points and other Track details may differ. Nothing is merged: the kept Track stays ' +
            'as it is, except for the categories you choose to add.';
   }
+  if (ev.kind === 'manual_editorial') {
+    return 'Manual editorial decision: the scan did not verify these recordings as identical. Nothing is merged: the ' +
+           'kept Track stays as it is, except for the categories you choose to add.';
+  }
   return '';
+}
+// What the scan established about a manually reviewed pair's audio: never presented as a successful comparison.
+function manualAudioText(m) {
+  if (!m) return '';
+  if (m.audio === 'different') {
+    return 'The scan decoded both files and their audio differs' + (m.audio_reason ? ` (${m.audio_reason})` : '') +
+           ': they are different recordings, edits or masters.';
+  }
+  if (m.audio === 'unverified') return 'The decoded audio was not verified: ' + (m.audio_reason || 'no reason recorded') + '.';
+  return 'The decoded audio of these files was not compared.';
 }
 function identitySourceText(source) {
   return source === 'decoded' ? 'decoded in this scan' : source === 'waveform_cache' ? 'trusted waveform cache' : '—';
@@ -554,8 +569,14 @@ function renderDuplicate(card, finding) {
   if (resolution.deletable && (finding.members || []).length === 2) {
     if (finding.evidence) card.append(el('p', evidenceText(finding.evidence), 'rc-muted'));
     card.append(resolutionControl(finding));
+  } else if ((finding.manual || {}).available) {
+    if (resolution.reason) card.append(el('p', 'Not verified as identical: ' + resolution.reason + '.', 'rc-muted'));
+    card.append(manualControl(finding));
   } else if ((finding.member_count || 0) >= 2 && (finding.members || []).length >= 2) {
     if (resolution.reason) card.append(el('p', 'Review only: ' + resolution.reason + '.', 'rc-muted'));
+    if (finding.manual && finding.manual.reason) {
+      card.append(el('p', 'Manual resolution is not available: ' + finding.manual.reason + '.', 'rc-muted'));
+    }
     card.append(notDuplicateControl(finding));
   } else if (unregistered) {
     card.append(el('p', 'File review only: fewer than two registered Tracks, so there is no Track-pair decision to record.',
@@ -611,14 +632,35 @@ function choiceFor(value, a, b) {
   if (value === 'keep_both') return { action: 'keep_both' };
   return null;
 }
+// A manual editorial choice: always an explicit pair of two different Tracks of the finding, and a deletion
+// carries the operator's acknowledgment (false until ticked; the server issues no authorization without it).
+function manualChoice(value, a, b, ack) {
+  if (!a || !b || a === b) return null;
+  const pair = [a, b];
+  if (value === 'keep_a') return { action: 'delete', keep: a, discard: b, manual: true, pair, ack: ack === true };
+  if (value === 'keep_b') return { action: 'delete', keep: b, discard: a, manual: true, pair, ack: ack === true };
+  if (value === 'keep_both') return { action: 'keep_both', manual: true, pair };
+  return null;
+}
 function choiceKey(choice, a, b) {
   if (!choice) return 'none';
+  if (choice.pair && !(choice.pair[0] === a && choice.pair[1] === b)) return 'none';
   if (choice.action === 'keep_both') return 'keep_both';
   return choice.keep === a && choice.discard === b ? 'keep_a' : choice.keep === b && choice.discard === a ? 'keep_b' : 'none';
 }
 function selectionsPayload(map) {
-  return [...map.entries()].map(([id, c]) => c.action === 'keep_both'
-    ? { finding_id: id, action: 'keep_both' } : { finding_id: id, action: 'delete', keep: c.keep, discard: c.discard });
+  return [...map.entries()].map(([id, c]) => {
+    if (c.action === 'keep_both') {
+      return c.manual ? { finding_id: id, action: 'keep_both', tracks: [...c.pair] } : { finding_id: id, action: 'keep_both' };
+    }
+    const sel = { finding_id: id, action: 'delete', keep: c.keep, discard: c.discard };
+    return c.manual ? { ...sel, authority: 'manual_editorial', acknowledge_manual: c.ack === true } : sel;
+  });
+}
+function manualCounts(map) {
+  let manual = 0, unacknowledged = 0;
+  map.forEach(c => { if (c.manual && c.action === 'delete') { manual += 1; if (c.ack !== true) unacknowledged += 1; } });
+  return { manual, unacknowledged };
 }
 // Per-pair options the operator sets in the preview: deletions start included with every suggested category
 // ticked; one that needs a voice-track acknowledgment starts undecided (neither cancelled nor acknowledged).
@@ -628,7 +670,8 @@ function initialOptions(preview) {
     if (item.status === 'blocked') return;
     options.set(item.finding_id, item.action === 'keep_both' ? { include: true }
       : { include: item.status !== 'needs_acknowledgment', ack: null,
-          categories: new Set((item.suggested_categories || []).map(c => c.id)) });
+          categories: new Set((item.suggested_categories || []).map(c => c.id)),
+          ...(item.authority === 'manual_editorial' ? { manualAck: item.manual_acknowledged === true } : {}) });
   });
   return options;
 }
@@ -657,7 +700,8 @@ function applyQueue(preview, options) {
     }
     send.push({ finding_id: item.finding_id, action: item.action, token: item.token,
                 choice: item.action === 'keep_both' ? {}
-                  : { categories: [...o.categories], acknowledge_voicetracks: o.ack === 'delete' } });
+                  : { categories: [...o.categories], acknowledge_voicetracks: o.ack === 'delete',
+                      ...(item.authority === 'manual_editorial' ? { acknowledge_manual: o.manualAck === true } : {}) } });
   });
   return { send, cancelled };
 }
@@ -721,6 +765,130 @@ function resolutionControl(finding) {
   return box;
 }
 
+// ---- Manual review (3.11): an operator's editorial decision for a finding the scan could not prove. One
+// explicitly chosen pair per finding; a deletion needs the operator's own acknowledgment before the server
+// authorizes it, and then follows exactly the same preview, confirmation and checks as any other deletion.
+const manualOpen = new Set(), manualPairs = new Map();
+function setManualChoice(findingId, choice) {
+  if (choice) choices.set(findingId, choice); else choices.delete(findingId);
+  // A preview on screen no longer matches the selection: it is withdrawn, and Review selected… asks again.
+  resolveGen += 1;
+  if (!resolveBusy) document.getElementById('resolvePanel').hidden = true;
+  updateResolveBar();
+}
+
+function manualControl(finding) {
+  const m = finding.manual;
+  const wrap = el('div');
+  const live = (finding.tracks || []).filter(t => !t.deleted && (m.members || []).includes(t.id)).map(t => t.id);
+  const gone = (finding.tracks || []).filter(t => t.deleted).map(t => t.id);
+  if (live.length < 2) {
+    choices.delete(finding.id);
+    wrap.append(el('p', 'Fewer than two of this group\'s Tracks remain to review here. Run a new scan to update this finding.',
+                   'rc-muted'));
+    return wrap;
+  }
+  const box = el('fieldset', undefined, 'rc-resolve');
+  box.hidden = !(manualOpen.has(finding.id) || choices.has(finding.id));
+  const toggle = actionButton('Review & Resolve Manually', () => {
+    box.hidden = !box.hidden;
+    if (box.hidden) manualOpen.delete(finding.id); else manualOpen.add(finding.id);
+  });
+  wrap.append(toggle, box);
+  box.append(el('legend', 'Manual review: your editorial decision'));
+  if (gone.length) box.append(el('p', `Track #${gone.join(', #')} was deleted after this scan; choose among the remaining Tracks.`, 'rc-muted'));
+  const existing = choices.get(finding.id);
+  if (existing && existing.pair && !(live.includes(existing.pair[0]) && live.includes(existing.pair[1]))) choices.delete(finding.id);
+  const chosen = choices.get(finding.id);
+  let pair = live.length === 2
+    ? (chosen && chosen.pair && chosen.pair.every(id => live.includes(id)) ? [...chosen.pair] : [...live])
+    : chosen && chosen.pair ? [...chosen.pair] : manualPairs.get(finding.id) || [null, null];
+  pair = pair.map(id => (live.includes(id) ? id : null));       // a Track deleted since is never offered
+  const body = el('div');
+  const render = () => {
+    const [a, b] = pair;
+    const current = choiceKey(choices.get(finding.id), a, b);
+    const valid = a && b && a !== b;
+    const nodes = [];
+    if (live.length > 2) {
+      const row = el('div', undefined, 'rc-filters');
+      const pick = (label, index) => {
+        const select = el('select');
+        select.setAttribute('aria-label', label);
+        const blank = el('option', 'Choose…');
+        blank.value = '';
+        select.append(blank);
+        live.forEach(id => { const o = el('option', `#${id}`); o.value = String(id); select.append(o); });
+        select.value = pair[index] ? String(pair[index]) : '';
+        select.addEventListener('change', () => {
+          pair = [...pair];
+          pair[index] = Number(select.value) || null;
+          manualPairs.set(finding.id, pair);
+          setManualChoice(finding.id, null);         // a new pair starts with no decision
+          render();
+        });
+        return select;
+      };
+      row.append(el('span', 'Pair to review:', 'rc-muted'), pick('Track A', 0), pick('Track B', 1));
+      nodes.push(row);
+      if (a && b && a === b) nodes.push(el('p', 'Choose two different Tracks.', 'rc-warn'));
+    }
+    if (valid) {
+      const links = el('p', undefined, 'rc-muted');
+      links.append(el('span', 'Listen and compare first: '));
+      [a, b].forEach((id, i) => {
+        const link = el('a', `Track ${i ? 'B' : 'A'} (#${id})`);
+        link.href = `/track/${encodeURIComponent(id)}/`;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        links.append(link);
+        if (!i) links.append(el('span', ' · '));
+      });
+      nodes.push(links);
+      [['none', 'No action'], ['keep_a', `Keep Track A (#${a}), delete Track B (#${b})`],
+       ['keep_b', `Keep Track B (#${b}), delete Track A (#${a})`], ['keep_both', 'Keep both (not a duplicate)']].forEach(([value, text]) => {
+        const label = el('label', undefined, 'rc-choice');
+        const input = el('input');
+        input.type = 'radio';
+        input.name = 'manual-' + finding.id;
+        input.value = value;
+        input.checked = value === current;
+        input.addEventListener('change', () => {
+          if (!input.checked) return;
+          setManualChoice(finding.id, manualChoice(value, a, b, false));   // a new decision is not yet acknowledged
+          render();
+        });
+        label.append(input, el('span', text));
+        nodes.push(label);
+      });
+      const choice = choices.get(finding.id);
+      if (choice && choice.action === 'delete' && current !== 'none') {
+        nodes.push(el('p', m.warning, 'rc-manual-warning'));
+        nodes.push(el('p', manualAudioText(m), 'rc-manual-warning'));
+        const ackLabel = el('label', undefined, 'rc-choice');
+        const ack = el('input');
+        ack.type = 'checkbox';
+        ack.name = 'manual-ack-' + finding.id;
+        ack.checked = choice.ack === true;
+        ack.addEventListener('change', () => {
+          setManualChoice(finding.id, manualChoice(current, a, b, ack.checked));
+          render();
+        });
+        ackLabel.append(ack, el('span', `I have reviewed both recordings and authorize deleting Track #${choice.discard} ` +
+                                       'as my own editorial decision.'));
+        nodes.push(ackLabel);
+      } else {
+        nodes.push(el('p', manualAudioText(m), 'rc-muted'));
+      }
+    }
+    nodes.push(el('p', 'Nothing happens until you review the selection and confirm it.', 'rc-muted'));
+    body.replaceChildren(...nodes);
+  };
+  render();
+  box.append(body);
+  return wrap;
+}
+
 function actionButton(text, onClick) {
   const b = el('button', text, 'rc-btn');
   b.type = 'button';
@@ -733,10 +901,13 @@ function updateResolveBar() {
   const list = selectionsPayload(choices);
   if (!list.length) { bar.replaceChildren(); bar.hidden = true; return; }
   const deletes = list.filter(s => s.action === 'delete').length;
+  const manual = manualCounts(choices);
   const review = actionButton('Review selected…', reviewSelection);
   review.disabled = resolveBusy;
   bar.replaceChildren(el('span', `${list.length} pair(s) selected on this page: ${deletes} to delete, ` +
-                                 `${list.length - deletes} to keep both.`), review,
+                                 `${list.length - deletes} to keep both.` +
+                                 (manual.manual ? ` ${manual.manual} deletion(s) by manual editorial decision` +
+                                  (manual.unacknowledged ? ` (${manual.unacknowledged} not yet acknowledged).` : '.') : '')), review,
                       actionButton('Clear selection', () => { choices.clear(); updateResolveBar(); loadFindings(); }));
   bar.hidden = false;
 }
@@ -815,12 +986,15 @@ function renderPreview(data) {
   const confirmLabel = el('label', undefined, 'rc-choice');
   const applyBtn = actionButton('Apply', () => applySelection(data, options, confirmBox.checked));
   const summary = el('p', undefined, 'rc-muted');
+  const manualIncluded = () => data.items.filter(i => i.authority === 'manual_editorial' && i.token &&
+    (options.get(i.finding_id) || {}).include).length;
   const refresh = () => {
     const r = readiness(data, options);
     confirmLabel.replaceChildren(confirmBox, el('span', r.deletions
       ? `I understand that ${r.deletions} Track(s) will be permanently deleted from the Library database, with ` +
         'their files, waveforms and any acknowledged voice tracks. The kept Tracks are not changed except for the ' +
-        'ticked categories.'
+        'ticked categories.' + (manualIncluded() ? ` ${manualIncluded()} of them by my own editorial decision, not ` +
+                                                   'verified as identical.' : '')
       : 'Confirm these decisions.'));
     applyBtn.textContent = r.deletions ? `Delete ${r.deletions} duplicate Track(s)` +
                                          (r.keeps ? ` and record ${r.keeps} keep-both` : '') : `Record ${r.keeps} keep-both`;
@@ -852,13 +1026,18 @@ function previewItem(item, options, refresh) {
     head.append(el('span', `Keep both #${item.track_a} and #${item.track_b} (record: not duplicates)`));
     card.append(head);
   } else if (item.keep !== undefined) {
-    head.append(el('span', `Keep #${item.keep}, delete #${item.discard}`));
+    head.append(el('span', `Keep #${item.keep}, delete #${item.discard}` +
+                           (item.authority === 'manual_editorial' ? ' (manual editorial decision)' : '')));
     card.append(head);
   } else {
     head.append(el('span', `Finding ${item.finding_id}`));
     card.append(head);
   }
   if (item.evidence) card.append(el('p', evidenceText(item.evidence), 'rc-muted'));
+  if (item.authority === 'manual_editorial' && item.manual) {
+    card.append(el('p', item.manual.warning, 'rc-manual-warning'));
+    card.append(el('p', manualAudioText(item.manual), 'rc-manual-warning'));
+  }
   if (item.keep_track && item.discard_track) {
     card.append(trackTable([{ role: 'Keep', ...item.keep_track }, { role: 'Delete', ...item.discard_track }], [
       ['', t => t.role], ['Track', t => trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist],
@@ -991,6 +1170,7 @@ function renderResults(data) {
     head.append(el('span', r.message || ''));
     card.append(head);
     if (r.outcome === 'deleted') {
+      if (r.authority === 'manual_editorial') card.append(el('p', 'Deleted by your manual editorial decision (not verified as identical).', 'rc-muted'));
       if ((r.categories_added || []).length) card.append(el('p', `Added to #${r.keep}: ${r.categories_added.join(', ')}.`));
       if (r.voicetracks_deleted) card.append(el('p', `${r.voicetracks_deleted} voice track(s) were deleted with it.`, 'rc-warn'));
       const cleanup = r.cleanup || {};

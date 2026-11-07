@@ -243,8 +243,9 @@ ctime and link count of the scanner's own `FileEntry`, verified around the hash 
   Track details are the same.
 
 The kinds are never mixed and nothing stands in for them: a title, artist, ISRC or duration match, an
-`audio_equivalent` label without that record, or a recorded mismatch never authorizes a deletion. Review only,
-with the reason shown: groups of three or more Tracks, `likely`/`uncertain` findings, `audio_equivalent`
+`audio_equivalent` label without that record, or a recorded mismatch never authorizes a deletion by evidence.
+Not resolvable by evidence (only by the operator's manual editorial decision, below), with the reason shown:
+groups of three or more Tracks, `likely`/`uncertain` findings, `audio_equivalent`
 findings without a verified record, file-only groups, every finding of a `suspect` scan, and exact findings of a
 report made before witnesses were recorded (r0126 and earlier: run reconciliation once after installing to
 resolve them here). From preview on, both kinds follow the same path: the files must still match the recorded
@@ -348,6 +349,73 @@ never starts one by itself.
   refused; that writer, not this workflow, handles the refusal.
 * Holidays, blocked slots, rotation weight, play history and voice tracks are not carried over to the kept
   Track; only additional categories are offered.
+
+### Manual editorial disposition (3.11, final operator-review layer)
+
+What the scan cannot prove -- `likely` and `uncertain` findings, pairs whose decoded audio differs or could not
+be decoded, groups of three or more Tracks -- an authorized Library manager can still resolve from the same page,
+as **their own editorial decision**. It is a third authority beside the two kinds of proof, kept distinct
+everywhere:
+
+| Authority | Established by | Audit `evidence` |
+|---|---|---|
+| Exact file match | the scan: identical SHA-256 | `exact_bytes` |
+| Verified decoded-audio match | the scan: identical decoded-audio identities | `decoded_audio` |
+| Manual editorial decision | the operator's review and explicit acknowledgment | `manual_editorial` |
+
+The finding is never relabelled: it stays `likely` or `uncertain`, no hash or identity is made up, and nothing
+claims the recordings are the same.
+
+**What the scan records for it.** Every duplicate group of at most 25 Tracks (`DUPLICATE_GROUP_LIMIT`) records
+`member_files`: for each member whose file is part of the duplicate comparison (registered, canonical path, not
+protected, not shared by another Track, not in delivery, not failed while hashing), its path and the six-field
+witness from the walk (device, inode, size, mtime, ctime, link count). This is the walk's own metadata: nothing
+extra is read, hashed or decoded. The page never receives these records (the findings API keeps them on the
+server). A report made before this version has none and stays review only for this route ("run reconciliation
+again"); nothing is reconstructed from names, titles or durations.
+
+**On the page.** Such a finding offers **Review & Resolve Manually**, which opens the usual choices for one
+explicitly selected pair: *Keep Track A / delete Track B*, *Keep Track B / delete Track A*, *Keep both (not a
+duplicate)*, *No action* (the default). In a group of three or more, the operator chooses the two Tracks first
+(the same Track cannot be both; a Track deleted since the scan is not offered). The Track Detail links stay, for
+listening and checking metadata and cue markers. Choosing a deletion shows:
+
+> These recordings have not been verified as identical. They may contain different edits, masters, audio
+> quality or performances. You are authorizing deletion of the selected version based on your own review.
+
+and what the scan established about the audio: that the decoded audio was compared and **differs** (with the
+scan's reason), that it was **not verified** (with the recorded reason, e.g. a decode failure), or that it was
+**not compared** (larger groups). A separate checkbox acknowledges the editorial decision. It is distinct from
+the voice-track acknowledgment, which is still required when the discarded Track has voice tracks. Any change to
+a manual choice withdraws a preview on screen. Then the usual **Review selected…**, preview, one confirmation and
+apply.
+
+**Server rules** (`library_duplicate_resolution.manual_eligibility`, `_manual_evidence`):
+* Offered only where the evidence route is not: a pair the scan proved is resolved with its proof, never
+  manually.
+* A complete scan; the pair is two different members of that finding, both with recorded files (distinct
+  files).
+* A selection carries `authority: "manual_editorial"` and `acknowledge_manual: true`. Without the acknowledgment
+  the preview lists the pair as blocked and issues **no token**.
+* The token names the authority, the acknowledgment and the group's members that exist at preview. Apply
+  refuses (400, token not spent) unless the request repeats `acknowledge_manual: true`, then rechecks inside
+  the pair's transaction: the group's existing members must be unchanged. A deletion of any other Track of the
+  group in between makes the pair *stale*, so a group is reviewed again after each deletion.
+* From there it is the same deletion as above: the files must still match the recorded witnesses at preview
+  and apply, and every blocker (playlist, rotation, current/future and active logs, decks, queue, recent
+  claims and plays, engine state, ownership, protected resources, voice tracks), the locks and bounds, the
+  one-pair transaction with the category additions, the cleanup reporting and the batch behaviour are
+  unchanged. The acknowledgment overrides none of them.
+* **Keep both** may name a pair of a larger group (`tracks: [a, b]`) and records that pair only (the group stays
+  open until every pair is reviewed). It never overwrites a decision already made. A pending legacy `keep_a`/
+  `keep_b` decision is still shown and left unchanged; it authorizes nothing.
+
+**Audit.**
+* `reconciliation.duplicate_delete` records `evidence: manual_editorial`, `manual_acknowledged`, the finding's
+  confidence, what the scan said about the audio (`audio`, `audio_reason`) and the group's members at preview.
+* `reconciliation.duplicate_resolution` records `authority: manual_editorial` and the file-cleanup status.
+
+Verified deletions record neither field.
 
 ## Operating it
 
@@ -575,14 +643,16 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
   `LIBRARY_ROOT`**.
 * `reconciliation.duplicate_delete`:
   * the kept and deleted Track ids;
-  * the evidence: `exact_bytes` or `decoded_audio`;
+  * the evidence: `exact_bytes`, `decoded_audio` or `manual_editorial` (with the acknowledgment, the finding's
+    confidence, the scan's audio verdict and the group's members);
   * the scan and finding;
   * the deleted file relative to `LIBRARY_ROOT`;
   * the categories added and the number of voice tracks deleted.
 
   It is written only if that pair's transaction committed.
 * `reconciliation.duplicate_resolution`: the scan, the finding, the resolution (`delete` or `keep_both`) and the
-  pair's Track ids, or for a refusal, the reason.
+  pair's Track ids, or for a refusal, the reason. A manual editorial deletion also records
+  `authority: manual_editorial` and the cleanup status.
 
 **Never recorded:** preview tokens, cookies, request bodies or credentials.
 

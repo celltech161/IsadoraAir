@@ -36,6 +36,11 @@ once per scan, and a pair starts only when everything it may need fits.  Time: `
 all of them together, and each file (probe and decode together, one deadline) gets at most
 ``VERIFY_DECODE_TIMEOUT_SECONDS`` and never more than what is left of the total; ffmpeg is killed at the limit.
 They run one at a time, streaming (bounded memory), at the scan's own priority.
+
+Every duplicate group of at most ``DUPLICATE_GROUP_LIMIT`` Tracks also records ``member_files``: each
+duplicate-eligible member's path and walk witness (``Scanner.record_member_files``), the file identity an
+operator's manual editorial resolution of a pair is bound to (``library_duplicate_resolution``).  It is the walk's
+own metadata: no extra read.
 """
 from __future__ import annotations
 
@@ -831,8 +836,27 @@ class Scanner:
         # the members, never the confidence.
         self.attach_decisions(groups, DuplicateCandidate)
         self.upgrade_with_decoded_identity(groups)
+        track_entry = {track_id: self.files[path] for path, track_id in path_track.items()}
+        for group in groups:
+            self.record_member_files(group, track_entry)
         for group in groups:
             self.add("duplicate", group["reason"], **{k: v for k, v in group.items() if k != "reason"})
+
+    @staticmethod
+    def record_member_files(group, track_entry) -> None:
+        """The walk's record of each member Track's file (path and six-field witness), for the operator's manual
+        editorial resolution (``library_duplicate_resolution.MANUAL_EDITORIAL``): only members whose file is still
+        part of the duplicate comparison (registered, canonical, not shared, not in delivery, hashed without
+        trouble), and only for groups of at most ``DUPLICATE_GROUP_LIMIT`` Tracks.  Metadata already collected by
+        the walk: nothing is read, hashed or decoded for it."""
+        members = group.get("members") or []
+        files = []
+        if len(members) <= DUPLICATE_GROUP_LIMIT:
+            for track_id in members:
+                entry = track_entry.get(track_id)
+                if entry is not None and entry.registered and entry.duplicate_eligible:
+                    files.append(dict(entry.describe(), track_id=track_id, witness=entry.witness()))
+        group["member_files"] = files
 
     @staticmethod
     def _stat_matches(entry: FileEntry, info) -> bool:

@@ -1992,6 +1992,10 @@ def api_reconciliation_findings(request):
                                ("" if report.get("status") == "complete" else "the scan is not complete")}
             # What proves a deletable pair (exact bytes, or verified decoded audio): display only.
             f["evidence"] = duplicate_resolution.evidence_summary(original) if deletable else None
+            # The operator's manual editorial route for what the scan could not prove (display only; preview and
+            # apply recheck it). The scan's per-member file witnesses stay on the server.
+            f["manual"] = duplicate_resolution.manual_summary(original, complete=report.get("status") == "complete")
+            f.pop("member_files", None)
     if member_ids:
         details = _track_review_details(member_ids, limit=reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
         for f in window:
