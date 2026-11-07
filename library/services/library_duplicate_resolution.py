@@ -1,13 +1,19 @@
-"""Resolve exact duplicate Track pairs from the Library Reconciliation page (roadmap 3.12).
+"""Resolve duplicate Track pairs from the Library Reconciliation page (roadmap 3.12; decoded-audio pairs 3.11).
 
-An operator reviews two registered Tracks whose files the latest scan found byte-identical, chooses which one
+An operator reviews two registered Tracks whose files the latest scan proved to be the same recording -- byte
+for byte (``exact``), or by identical decoded audio (``audio_equivalent`` with recorded verification) -- chooses which one
 to keep, optionally carries the discarded Track's categories over to the survivor as additional categories,
 previews the consequences and deletes the duplicate.  This is a small workflow over existing mechanisms, not a
 duplicate-management subsystem:
 
-* **Eligible findings only.**  A duplicate finding of the latest *complete* scan with ``exact`` confidence
-  (identical bytes, hashed in that scan) and exactly two registered Tracks.  Groups of three or more Tracks,
-  likely / audio-equivalent / uncertain findings and file-only groups stay review-only.
+* **Eligible findings only.**  A duplicate finding of the latest *complete* scan with exactly two registered
+  Tracks and either ``exact`` confidence (identical bytes, hashed in that scan) or ``audio_equivalent``
+  confidence with the scan's ``audio_verification`` evidence: both files' full decoded-audio identities
+  (algorithm, digest, sample rate, frame count; equal) bound to each file's path and stat witness
+  (``library_reconciliation.Scanner.upgrade_with_decoded_identity``).  Groups of three or more Tracks, likely /
+  uncertain findings, audio-equivalent findings without that evidence and file-only groups stay review-only.
+  The two kinds of evidence are never mixed: an exact finding needs its byte evidence, a decoded-audio one
+  its decoded-audio evidence; a title, artist, ISRC or duration never stands in for either.
 * **Decisions.**  Per pair: keep A and delete B, keep B and delete A, keep both (the existing non-destructive
   ``DuplicateCandidate`` ``keep_both`` record, unchanged), or nothing.  No ``keep_a`` / ``keep_b`` row is ever
   written, so ``apply_duplicate_resolutions`` has nothing new to act on; deleting a Track removes its legacy
@@ -35,10 +41,11 @@ the survivor's -- is no longer exactly the file the scan hashed.  Every deletion
 observation of the playout engine (``_engine_state``); without one nothing is deleted.  Logs are never
 modified or regenerated.
 
-The duplicate evidence is the scan's: identical SHA-256 for both files, and the stat witness each was hashed
-under (device, inode, size, mtime, ctime, link count; ``library_reconciliation.FileEntry.witness``).  Nothing is
-re-hashed in the web worker; at preview and at apply both files must still be regular files at the same path
-with exactly that witness, and with the identity the preview saw.  A report without witnesses (made before
+The duplicate evidence is the scan's: identical SHA-256 for both files (exact), or identical decoded-audio
+identities (audio-equivalent), and the stat witness each file was hashed or identified under (device, inode,
+size, mtime, ctime, link count; ``library_reconciliation.FileEntry.witness``).  Nothing is re-hashed or decoded
+in the web worker; at preview and at apply both files must still be regular files at the same path with exactly
+that witness, and with the identity the preview saw.  A report without witnesses (made before
 they were recorded) stays reviewable but authorizes no deletion.  The witness detects ordinary modification or
 replacement (any write changes the ctime); it is not a cryptographic proof against a privileged user who
 rewrites the bytes and then resets every recorded metadata field.
@@ -115,20 +122,29 @@ def finding_eligibility(finding) -> tuple[bool, str]:
         return False, "not a duplicate finding"
     members = finding.get("members") or []
     confidence = finding.get("confidence")
-    if confidence != "exact":
-        return False, ("only identical-byte (exact) findings can be resolved here; this one is "
-                       f"{str(confidence or 'unknown').replace('_', ' ')}: review it by hand")
+    if confidence not in (EXACT, AUDIO_EQUIVALENT):
+        verification = finding.get("audio_verification")
+        note = (f" ({verification['reason']})" if isinstance(verification, dict)
+                and isinstance(verification.get("reason"), str) and verification["reason"] else "")
+        return False, ("only identical-byte (exact) findings, and pairs whose decoded audio the scan verified "
+                       "identical, can be resolved here; this one is "
+                       f"{str(confidence or 'unknown').replace('_', ' ')}{note}: review it by hand")
     if len(members) < 2:
         return False, "file review only: fewer than two registered Tracks"
     if len(members) > 2 or finding.get("member_count", len(members)) != 2:
-        return False, f"{finding.get('member_count', len(members))} Tracks share these bytes: resolve by hand"
+        shared = "these bytes" if confidence == EXACT else "this audio"
+        return False, f"{finding.get('member_count', len(members))} Tracks share {shared}: resolve by hand"
     evidence, why = _evidence(finding)
     if evidence is None:
         return False, why
     return True, ""
 
 
+EXACT, AUDIO_EQUIVALENT = "exact", "audio_equivalent"
 NO_EVIDENCE = "the scan did not record identical-byte evidence for both Tracks"
+NO_AUDIO_EVIDENCE = ("the scan did not record verified decoded-audio evidence for both Tracks' files (run "
+                     "reconciliation with \"Verify audio for likely duplicates\" to resolve this pair here)")
+AUDIO_MISMATCH = "the scan's decoded-audio identities of the two files do not match"
 NO_WITNESS = ("this scan did not record the files' full identity (it was made by an earlier version): run "
               "reconciliation again to resolve this pair here")
 
@@ -137,9 +153,33 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def evidence_kind(finding) -> str | None:
+    """What proves the pair the same recording: "exact_bytes", "decoded_audio", or None (nothing deletable)."""
+    confidence = finding.get("confidence") if isinstance(finding, dict) else None
+    return {EXACT: "exact_bytes", AUDIO_EQUIVALENT: "decoded_audio"}.get(confidence)
+
+
+def _witness_ok(entry) -> str:
+    """"" when a file entry names a path and the six-field witness of its size and mtime; else the reason."""
+    if not isinstance(entry.get("path"), str) or not _is_int(entry.get("size")) or not _is_int(entry.get("mtime_ns")):
+        return NO_EVIDENCE
+    witness = entry.get("witness")
+    if not (isinstance(witness, list) and len(witness) == 6 and all(_is_int(v) for v in witness)):
+        return NO_WITNESS
+    if witness[2:4] != [entry["size"], entry["mtime_ns"]]:
+        return NO_EVIDENCE
+    return ""
+
+
 def _evidence(finding) -> tuple[dict | None, str]:
-    """({track_id: file entry}, "") for the two members, when both carry the same scan-time SHA-256 and the
-    stat witness they were hashed under; (None, why) otherwise."""
+    """({track_id: file entry}, "") for the two members, when the finding's own kind of evidence is complete:
+    exact -- both carry the same scan-time SHA-256 and the stat witness they were hashed under; audio-equivalent
+    -- both carry well-formed, equal decoded-audio identities and the stat witness they were identified under.
+    (None, why) otherwise."""
+    if evidence_kind(finding) == "decoded_audio":
+        return _audio_evidence(finding)
+    if evidence_kind(finding) != "exact_bytes":
+        return None, NO_EVIDENCE
     members = finding.get("members") or []
     by_track = {}
     for entry in finding.get("files") or []:
@@ -164,6 +204,58 @@ def _evidence(finding) -> tuple[dict | None, str]:
         if witness[2:4] != [entry["size"], entry["mtime_ns"]]:
             return None, NO_EVIDENCE
     return by_track, ""
+
+
+def _audio_evidence(finding) -> tuple[dict | None, str]:
+    """The decoded-audio kind of ``_evidence``: the scan's ``audio_verification`` record, complete and
+    consistent -- status verified, exactly the two members, distinct files, each with its witness and a
+    well-formed identity of the current algorithm, the two identities equal (``audio_identity.same_audio``:
+    algorithm, digest, sample rate, frame count)."""
+    from library.services import audio_identity
+
+    members = finding.get("members") or []
+    record = finding.get("audio_verification")
+    if not isinstance(record, dict) or record.get("status") != "verified" or len(members) != 2:
+        return None, NO_AUDIO_EVIDENCE
+    files = record.get("files")
+    if not isinstance(files, list) or len(files) != 2 or not all(isinstance(f, dict) for f in files):
+        return None, NO_AUDIO_EVIDENCE
+    by_track = {}
+    for entry in files:
+        track_id = entry.get("track_id")
+        if track_id not in members or track_id in by_track:
+            return None, NO_AUDIO_EVIDENCE
+        by_track[track_id] = entry
+    for entry in by_track.values():
+        problem = _witness_ok(entry)
+        if problem:
+            return None, problem if problem == NO_WITNESS else NO_AUDIO_EVIDENCE
+        identity = entry.get("identity")
+        if not audio_identity.well_formed(identity) or identity.get("algorithm") != audio_identity.ALGORITHM:
+            return None, NO_AUDIO_EVIDENCE
+    first, second = (by_track[t] for t in members)
+    if first["path"] == second["path"] or first["witness"][:2] == second["witness"][:2]:
+        return None, NO_AUDIO_EVIDENCE
+    if not audio_identity.same_audio(first["identity"], second["identity"]):
+        return None, AUDIO_MISMATCH
+    return by_track, ""
+
+
+def evidence_summary(finding) -> dict | None:
+    """What the page shows about the proof of an eligible finding (display only; never trusted back)."""
+    kind = evidence_kind(finding)
+    by_track, _why = _evidence(finding)
+    if kind is None or by_track is None:
+        return None
+    if kind == "exact_bytes":
+        return {"kind": kind, "sha256": next(iter(by_track.values())).get("sha256")}
+    identity = next(iter(by_track.values()))["identity"]
+    record = finding.get("audio_verification") or {}
+    return {"kind": kind, "sha256": identity["sha256"], "sample_rate": identity["sample_rate"],
+            "frames": identity["frames"], "bytes": record.get("bytes") if record.get("bytes") in (
+                "different_size", "different_bytes", "identical_bytes") else "not_compared",
+            "sources": {str(t): e.get("identity_source") for t, e in by_track.items()
+                        if e.get("identity_source") in ("decoded", "waveform_cache")}}
 
 
 # --------------------------------------------------------------------------- current state
@@ -395,7 +487,9 @@ def _inspect(finding, keep_id, discard_id, *, protection, now, engine, engine_pr
             out.blockers.append(f"the {role} Track: {problem}")
         elif identity != scanned.get("witness"):
             out.blockers.append(f"the {role} Track's file was modified or replaced since the scan compared it "
-                                "(it is no longer exactly the file that was hashed); run reconciliation again")
+                                "(it is no longer exactly the file whose "
+                                + ("bytes were hashed" if evidence_kind(finding) == "exact_bytes"
+                                   else "decoded audio was verified") + "); run reconciliation again")
         owner = _owner(track, protection)
         if owner:
             out.blockers.append(f"the {role} Track is protected: {owner}")
@@ -547,7 +641,7 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             continue
         inspection = _inspect(finding, sel["keep"], sel["discard"], protection=protection, now=now, engine=engine,
                               engine_problem=engine_problem)
-        item.update(keep=sel["keep"], discard=sel["discard"], **inspection.described,
+        item.update(keep=sel["keep"], discard=sel["discard"], evidence=evidence_summary(finding), **inspection.described,
                     voicetracks=inspection.voicetracks, warnings=inspection.warnings,
                     legacy_decision=_legacy_decision(finding, sel["keep"], sel["discard"]))
         if inspection.blockers:
@@ -784,7 +878,8 @@ def _apply_delete(report, finding, entry, choice, *, user, protection, engine, e
                 "reconciliation.duplicate_delete", user=user, outcome="deleted",
                 title=f"Library duplicate resolved: Track {discard_id} deleted, Track {keep_id} kept",
                 detail={"scan_id": report["scan_id"], "finding_id": entry["f"], "kept": keep_id,
-                        "deleted": discard_id, "file": library_audit.library_relative(discard.filepath),
+                        "deleted": discard_id, "evidence": evidence_kind(finding),
+                        "file": library_audit.library_relative(discard.filepath),
                         "categories_added": added, "voicetracks_deleted": inspection.voicetracks})
     except ProtectedError as exc:
         names = sorted({type(o).__name__ for o in exc.protected_objects})

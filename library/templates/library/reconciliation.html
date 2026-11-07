@@ -277,9 +277,20 @@ async function refreshRun() {
   return view;
 }
 
+// The optional decoded-audio verification of likely duplicate pairs: one of the server's fixed choices (the
+// server refuses anything else). Off by default: a normal scan decodes no audio for duplicates.
+const VERIFY_AUDIO_CHOICES = [[0, 'Off'], [25, 'Up to 25 pairs'], [50, 'Up to 50 pairs'], [100, 'Up to 100 pairs']];
 function confirmRun() {
   const start = el('button', 'Start read-only scan', 'rc-btn');
   start.type = 'button';
+  const verify = el('select');
+  verify.id = 'verifyAudio';
+  VERIFY_AUDIO_CHOICES.forEach(([value, text]) => { const o = el('option', text); o.value = String(value); verify.append(o); });
+  verify.value = '0';
+  const verifyLabel = el('label', 'Verify audio for likely duplicates: ');
+  verifyLabel.setAttribute('for', 'verifyAudio');
+  const verifyRow = el('p', undefined, 'rc-filters');
+  verifyRow.append(verifyLabel, verify);
   start.addEventListener('click', async () => {
     if (starting) return;                    // one request, however often it is clicked
     starting = true;
@@ -295,7 +306,7 @@ function confirmRun() {
     msg.className = '';
     let result;
     try {
-      result = await postJSON('/api/tracks/reconciliation/run/', {});
+      result = await postJSON('/api/tracks/reconciliation/run/', { verify_audio_pairs: Number(verify.value) || 0 });
     } catch (e) {
       result = { resp: { ok: false, status: 0 }, data: {} };
     }
@@ -325,6 +336,12 @@ function confirmRun() {
   });
   showPanel([el('p', 'Run a reconciliation scan now? It only reads the Library: no Track, file or setting is ' +
                      'changed, and it writes a new report. It can take several minutes; you can leave this page.'),
+             verifyRow,
+             el('p', 'Verifying decodes the audio of likely duplicate pairs (two Tracks, same artist and title or ' +
+                     'ISRC) that no trusted waveform already identifies, at most two files per pair, to prove whether ' +
+                     'they are the same recording; files are only read. Each decode takes a few seconds, and the ' +
+                     'verification stops after 30 minutes in all. Pairs whose decoded audio is identical can then be ' +
+                     'resolved here.', 'rc-muted'),
              start, closeButton('Cancel')]);
 }
 document.getElementById('runBtn').addEventListener('click', confirmRun);
@@ -432,6 +449,51 @@ function closeButton(label) {
   return b;
 }
 
+// evidence:begin -- pure: how the page names a pair's proof (tested under Node). Exact file match and verified
+// decoded-audio match are never presented as the same thing, and a decoded-audio match never claims that the
+// files, their tags, cue points or other Track details are identical.
+const BYTES_TEXT = {
+  different_size: 'The two files are different (different sizes)',
+  different_bytes: 'The two files are different (same size, different bytes)',
+  identical_bytes: 'The two files are also byte-identical',
+  not_compared: 'The two files were not compared byte for byte',
+};
+function evidenceText(ev) {
+  if (!ev) return '';
+  if (ev.kind === 'exact_bytes') return 'Exact file match: both files have identical bytes (SHA-256 checked in this scan).';
+  if (ev.kind === 'decoded_audio') {
+    return 'Verified decoded-audio match: both files decode to identical audio (same digest, ' +
+           `${ev.sample_rate} Hz, ${ev.frames} frames). ${BYTES_TEXT[ev.bytes] || BYTES_TEXT.not_compared}; their ` +
+           'tags, artwork, cue points and other Track details may differ. Nothing is merged: the kept Track stays ' +
+           'as it is, except for the categories you choose to add.';
+  }
+  return '';
+}
+function identitySourceText(source) {
+  return source === 'decoded' ? 'decoded in this scan' : source === 'waveform_cache' ? 'trusted waveform cache' : '—';
+}
+// evidence:end
+
+function audioVerificationNodes(av) {
+  if (av.status === 'verified') {
+    const nodes = [el('p', 'Verified decoded-audio match: ' + (av.reason || 'decoded audio identical') + '. ' +
+                           (BYTES_TEXT[av.bytes] || BYTES_TEXT.not_compared) + '; tags, artwork, cue points and ' +
+                           'other Track details may differ.', 'rc-ok')];
+    nodes.push(trackTable(av.files || [], [
+      ['File', f => f.rel], ['Size', f => fmtSize(f.size)], ['Track', f => trackLink({ id: f.track_id })],
+      ['Decoded audio', f => (f.identity.sha256 || '').slice(0, 16) + '…'],
+      ['Rate', f => `${f.identity.sample_rate} Hz`], ['Length', f => fmtDuration(f.identity.frames / f.identity.sample_rate)],
+      ['Identified by', f => identitySourceText(f.identity_source)],
+    ]));
+    return nodes;
+  }
+  if (av.status === 'different') {
+    return [el('p', 'Decoded audio compared: ' + (av.reason || 'it differs') + '. These are different recordings or ' +
+                    'edits; they cannot be resolved as duplicates here.', 'rc-warn')];
+  }
+  return [el('p', 'Decoded audio: ' + (av.reason || 'not verified') + '.', 'rc-muted')];
+}
+
 function renderDuplicate(card, finding) {
   // Two separate review needs: registered Track pairs (recorded decisions) and unregistered files (a file review,
   // never a Track pair, and nothing this page acts on).
@@ -460,6 +522,7 @@ function renderDuplicate(card, finding) {
       'deleted: one may be a delivery awaiting import, a retained or backup copy, or another subsystem\'s audio. ' +
       'This page never deletes, imports or merges files; review them by hand.', 'rc-muted'));
   }
+  if (finding.audio_verification) audioVerificationNodes(finding.audio_verification).forEach(n => card.append(n));
   if (finding.tracks && finding.tracks.length) {
     const pairNames = (finding.resolution || {}).deletable && (finding.members || []).length === 2;
     card.append(trackTable(finding.tracks, [
@@ -489,6 +552,7 @@ function renderDuplicate(card, finding) {
   }
   const resolution = finding.resolution || {};
   if (resolution.deletable && (finding.members || []).length === 2) {
+    if (finding.evidence) card.append(el('p', evidenceText(finding.evidence), 'rc-muted'));
     card.append(resolutionControl(finding));
   } else if ((finding.member_count || 0) >= 2 && (finding.members || []).length >= 2) {
     if (resolution.reason) card.append(el('p', 'Review only: ' + resolution.reason + '.', 'rc-muted'));
@@ -532,7 +596,8 @@ function notDuplicateControl(finding) {
   return row;
 }
 
-// ---- Duplicate resolution (roadmap 3.12). Only exact, two-Track findings the server marks deletable offer it.
+// ---- Duplicate resolution (roadmap 3.12). Only two-Track findings the server marks deletable offer it: exact
+// file matches, and pairs whose decoded audio the scan verified identical.
 // `choices` holds the operator's explicit choice per finding of THIS page (finding id -> choice); nothing is
 // chosen by default. A preview shows what would happen and returns a token; apply sends that token with the
 // operator's per-pair options (included or cancelled, categories to add, voice-track acknowledgment). The
@@ -793,6 +858,7 @@ function previewItem(item, options, refresh) {
     head.append(el('span', `Finding ${item.finding_id}`));
     card.append(head);
   }
+  if (item.evidence) card.append(el('p', evidenceText(item.evidence), 'rc-muted'));
   if (item.keep_track && item.discard_track) {
     card.append(trackTable([{ role: 'Keep', ...item.keep_track }, { role: 'Delete', ...item.discard_track }], [
       ['', t => t.role], ['Track', t => trackLink(t)], ['Title', t => t.title], ['Artist', t => t.artist],

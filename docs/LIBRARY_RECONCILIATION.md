@@ -100,11 +100,50 @@ scan runs at a time (`flock`).
 | Confidence | Evidence |
 |---|---|
 | `exact` | Identical SHA-256 of the file bytes, computed in this scan (not `Track.file_hash`) for files of equal size. Hardlinks are `shared_source`, not duplicates. |
-| `audio_equivalent` | Same normalized title and artist and duration within 2 s, **and** both Tracks' trusted v2 caches carry the same decoded-audio identity. |
-| `likely` | Same normalized title and artist and duration within 2 s, without decoded proof; or the same ISRC with durations within 2 s. |
-| `uncertain` | ISRC equal but durations differ (an ISRC collision), same metadata but different decoded audio, or a group larger than 25 Tracks. A large group is reported once. Its pair count is arithmetic; only actual `DuplicateCandidate` rows are read, so nonexistent pairs are never generated. |
+| `audio_equivalent` | A likely group whose decoded audio is proved identical. For a pair of two Tracks: both files' full decoded-audio identities, recorded with each file's stat witness (`audio_verification`, below). For a larger group: both Tracks' trusted v2 caches carry the same identity (label only, review only). |
+| `likely` | Same normalized title and artist and duration within 2 s, without decoded proof; or the same ISRC with durations within 2 s. A pair records why its audio was not verified. |
+| `uncertain` | ISRC equal but durations differ (an ISRC collision), same metadata but different decoded audio (from the same decoder), or a group larger than 25 Tracks. A large group is reported once. Its pair count is arithmetic; only actual `DuplicateCandidate` rows are read, so nonexistent pairs are never generated. |
 
 Title, artist, ISRC, filename and duration are never treated as proof of identical audio.
+
+### Decoded-audio verification of likely pairs (3.11 extension)
+
+A likely pair of exactly two registered Tracks is upgraded only with recorded proof, per file:
+
+* **The identity** is `audio_identity`'s: the SHA-256 of the first audio stream decoded to 2-channel
+  `pcm_s32le` at its native rate, with the algorithm, sample rate and frame count. It ignores tags, cover art and
+  container; it is not a perceptual fingerprint and has no similarity threshold. Two identities match only when
+  algorithm, digest, sample rate and frame count are all equal.
+* **Where it comes from.** First the Track's **trusted** waveform cache (`waveform_cache.validate`), and only
+  when that cache was made from exactly the walked file: its recorded source path, device, inode, size, mtime
+  and ctime equal the scan's. No decode is needed then, in any scan. Otherwise, only when the operator asked for
+  verification, a **decode in this scan** of exactly the walked file: its six-field stat witness is checked
+  before and after the decode and must equal the walk's. A stale, unverified, legacy or inconsistent cache is
+  never used.
+* **Bound to the file.** The report records, for each file, its path, the walk's six-field witness, the full
+  identity and its source (`audio_verification.files`), and the byte relation of the two files
+  (`different_size`, `different_bytes`, `identical_bytes` or `not_compared`).
+* **Outcomes.** Equal identities: `audio_equivalent`, status `verified`. Different identities from the same
+  decoder: `uncertain`, status `different`, never resolvable. Identities on record from **different ffmpeg
+  versions** that disagree prove nothing either way: both are decoded again if verification was requested,
+  otherwise the pair stays unverified. Anything else (no trusted cache and no decode, an undecodable file, a
+  file that changed, a pair already reviewed as not duplicates, an exhausted budget) leaves the pair `likely`
+  with status `unverified` and the reason.
+* **Bounds.** Off by default: a normal scan decodes nothing for duplicates. Requested with
+  `--verify-audio-pairs N` (0 to 100; the page offers 25, 50 or 100): at most `2 × N` decodes, at most 30
+  minutes of decoding in all (`VERIFY_AUDIO_MAX_SECONDS`), each decode at most 5 minutes
+  (`VERIFY_DECODE_TIMEOUT_SECONDS`, ffmpeg killed at the limit). One decode at a time, streamed (memory bounded
+  by `audio_identity`'s 1 MiB chunks), at the scan's priority (`nice 10`, `ionice` idle from the page). A file
+  in several findings is decoded once. A pair is decoded only when both of its missing identities fit in the
+  remaining budget, so a budget never ends with half a pair. Open pairs come first; a pair already recorded as
+  "not a duplicate" is never decoded. Pairs left over are reported (`budget_exhausted`, and a note in the
+  report's errors); running again verifies them, since resolved pairs no longer need it.
+* **Read only.** Nothing is written but the report: no tag, Track, waveform cache, cue marker or audio file is
+  changed. `budgets.audio_verification` records the requested pairs, decodes, seconds and the verified /
+  different / unverified / budget-exhausted counts. A failed scan keeps the last complete report.
+
+Groups of three or more Tracks are never decoded; their trusted caches label them `audio_equivalent` as before,
+and they stay review only.
 `Track.file_hash` is shown as "historical byte hash (may be stale)".
 
 **Existing decisions:**
@@ -176,13 +215,23 @@ Track only after an explicit choice, a preview and a confirmation, and only thro
 `track_deletion.delete_track` used by every other Track deletion. It never runs `apply_duplicate_resolutions`
 and never writes a `keep_a`/`keep_b` row that the command could act on later.
 
-**Eligible findings.** Only a duplicate finding of the latest **complete** scan with `exact` confidence (both
-files' SHA-256 equal, hashed in that scan) and **exactly two registered Tracks**, whose report records each
-file's **stat witness**: the device, inode, size, mtime, ctime and link count the file was hashed under (the
-scanner's own `FileEntry` identity, verified before and after hashing; exact findings only). Review only, with
-the reason shown: groups of three or more Tracks, `likely`/`audio_equivalent`/`uncertain` findings, file-only
-groups, every finding of a `suspect` scan, and exact findings of a report made before witnesses were recorded
-(r0126 and earlier: run reconciliation once after installing to resolve them here). Unregistered files of an eligible group are never touched. Track Detail
+**Eligible findings.** Only a duplicate finding of the latest **complete** scan with **exactly two registered
+Tracks** and one of two kinds of proof, each with each file's **stat witness** (the device, inode, size, mtime,
+ctime and link count of the scanner's own `FileEntry`, verified around the hash or decode):
+* **Exact file match:** `exact` confidence, both files' SHA-256 equal, hashed in that scan.
+* **Verified decoded-audio match:** `audio_equivalent` confidence with a complete `audio_verification` record:
+  status `verified`, both members, two distinct files, each with its witness and a well-formed identity of the
+  current algorithm, and the two identities equal (algorithm, digest, sample rate, frame count). The bytes of the
+  two files differ (usually tags); the page says so and never claims that tags, artwork, cue points or other
+  Track details are the same.
+
+The kinds are never mixed and nothing stands in for them: a title, artist, ISRC or duration match, an
+`audio_equivalent` label without that record, or a recorded mismatch never authorizes a deletion. Review only,
+with the reason shown: groups of three or more Tracks, `likely`/`uncertain` findings, `audio_equivalent`
+findings without a verified record, file-only groups, every finding of a `suspect` scan, and exact findings of a
+report made before witnesses were recorded (r0126 and earlier: run reconciliation once after installing to
+resolve them here). From preview on, both kinds follow the same path: the files must still match the recorded
+witnesses at preview and at apply, and every protection, token and bound below applies unchanged. Unregistered files of an eligible group are never touched. Track Detail
 links stay in every group for listening and for checking cue points and categories.
 
 **Choice per pair** (the page, default *No action*): keep A and discard B; keep B and discard A; keep both
@@ -265,7 +314,13 @@ logs; the report. The report is a snapshot: after a resolution the page refreshe
 never starts one by itself.
 
 **Limitations:**
-* The duplicate evidence is the scan's hash and stat witness. Nothing is re-hashed in the web worker. The
+* A decoded-audio match proves the two files decode to the same PCM with this station's ffmpeg; it says nothing
+  about tags, artwork, cue points, readiness or other Track details, and nothing of them is merged. A pair whose
+  recordings merely sound alike (another master, edit, encode or sample rate) has different identities and
+  stays review only. A trusted cache's identity is as good as the cache: caches are written only by the
+  station's analysis, through `waveform_cache`.
+* The duplicate evidence is the scan's hash or decoded identity and stat witness. Nothing is re-hashed or
+  decoded in the web worker. The
   witness detects ordinary modification or replacement (any write changes the ctime, a replacement the inode);
   it is not a cryptographic guard against a privileged user who rewrites the bytes and then resets every
   recorded metadata field.
@@ -282,7 +337,7 @@ never starts one by itself.
 Run a scan as the station's service account, so the web application can read the report:
 
 ```
-sudo -u <service-user> <venv>/bin/python manage.py reconcile_library [--max-decodes 100] [--max-hash-gb 20]
+sudo -u <service-user> <venv>/bin/python manage.py reconcile_library [--max-decodes 100] [--max-hash-gb 20] [--verify-audio-pairs 0..100]
 ```
 
 The command prints the counts by type and exits non-zero if the root is unavailable or another scan is
@@ -305,10 +360,13 @@ running. Review the findings at **Library → Reconciliation** (`/library/reconc
 defaults. It adds no service, job record, queue or state of its own: the scan keeps its lock, progress file,
 reports and status, and the page shows those.
 
-* **The request.** `POST /api/tracks/reconciliation/run/`, CSRF-protected, `library.manage_tracks`. Nothing in
-  the request is used.
+* **The request.** `POST /api/tracks/reconciliation/run/`, CSRF-protected, `library.manage_tracks`. Only one
+  thing in it is used: an optional JSON `verify_audio_pairs`, which must be `0` or one of 25, 50 or 100 (`400
+  invalid_choice` otherwise, and nothing starts). The confirmation offers it as **Verify audio for likely
+  duplicates** (Off by default). A form body is no choice at all.
 * **The command.** Fixed: `/usr/bin/nice -n 10 /usr/bin/ionice -c 3 /usr/bin/gnutimeout --signal=KILL 2h
-  <venv python> <checkout>/manage.py reconcile_library`, without a shell. It gets the web
+  <venv python> <checkout>/manage.py reconcile_library`, without a shell, plus `--verify-audio-pairs <25|50|100>`
+  only when that choice was made. Verification's 30 minutes fit within the 2 hours. It gets the web
   application's own environment and working directory, as the CD-ripping launcher does
   (`library/cd_ripping.py`).
 * **The time limit.** GNU `timeout` (coreutils) stays as the scan's parent and leads its process group (the
@@ -500,6 +558,7 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
   `LIBRARY_ROOT`**.
 * `reconciliation.duplicate_delete`:
   * the kept and deleted Track ids;
+  * the evidence: `exact_bytes` or `decoded_audio`;
   * the scan and finding;
   * the deleted file relative to `LIBRARY_ROOT`;
   * the categories added and the number of voice tracks deleted.

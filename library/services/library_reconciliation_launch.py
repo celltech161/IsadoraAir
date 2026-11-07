@@ -1,7 +1,8 @@
 """Run Reconciliation from the page (roadmap 3.11, minimal launcher; docs/LIBRARY_RECONCILIATION.md).
 
-One request starts the existing ``manage.py reconcile_library`` command, with its defaults, as a detached
-process of the web application's own service account, at low CPU and I/O priority, under GNU ``timeout`` (a
+One request starts the existing ``manage.py reconcile_library`` command, with its defaults (plus, only when the
+operator chooses one of ``reconciliation.VERIFY_AUDIO_PAIR_CHOICES``, ``--verify-audio-pairs <that number>``), as
+a detached process of the web application's own service account, at low CPU and I/O priority, under GNU ``timeout`` (a
 fixed two-hour limit, then KILL to the scan's whole process group). Nothing else is added:
 the scan keeps its own lock (``.scan.lock``), progress file (``running.json``), reports and
 ``scan_status()``. There is no job record and no supervisor; what the page shows comes from those files.
@@ -71,6 +72,13 @@ def scan_command() -> list[str]:
             sys.executable, str(manage_py), "reconcile_library"]
 
 
+def audio_verification_args(pairs) -> list[str]:
+    """The only request-dependent part of the command: one of the fixed choices, or nothing."""
+    if type(pairs) is int and pairs in reconciliation.VERIFY_AUDIO_PAIR_CHOICES:     # not bool, not 25.0
+        return ["--verify-audio-pairs", str(pairs)]
+    return []
+
+
 def _attempt():
     pointer = reconciliation._read_json(reconciliation.report_dir() / "last_attempt.json")
     return pointer if isinstance(pointer, dict) else None
@@ -116,7 +124,7 @@ def _busy():
                                               "the command line). Try again when it has finished.")
 
 
-def launch(*, username="", wait=None, popen=None, clock=None, sleep=None) -> dict:
+def launch(*, username="", verify_audio_pairs=0, wait=None, popen=None, clock=None, sleep=None) -> dict:
     """Start one scan, or raise LaunchRefused. Returns {"state": "running"|"finished"|"starting", "pid", ...}
     with the attempt and the progress file that existed before this launch ("previous_attempt",
     "previous_running"), so the page can tell a new result or a new scan from an older one."""
@@ -129,14 +137,17 @@ def launch(*, username="", wait=None, popen=None, clock=None, sleep=None) -> dic
             raise _busy()
         previous, previous_running = _attempt(), _identity(_running())
         try:
-            proc = popen(scan_command(), cwd=str(settings.BASE_DIR), env=os.environ.copy(),
+            proc = popen(scan_command() + audio_verification_args(verify_audio_pairs), cwd=str(settings.BASE_DIR),
+                         env=os.environ.copy(),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=None,
                          start_new_session=True, close_fds=True)
         except OSError as exc:
             logger.error("library reconciliation: the scan could not be started (%s)", exc)
             raise LaunchRefused(500, "launch_failed", "The scan could not be started. Nothing was changed; see "
                                                       "the web application's journal.") from None
-        logger.info("library reconciliation: scan process %s started by %s", proc.pid, username or "?")
+        logger.info("library reconciliation: scan process %s started by %s%s", proc.pid, username or "?",
+                    f" (audio verification: up to {verify_audio_pairs} pairs)" if audio_verification_args(
+                        verify_audio_pairs) else "")
         known = {"pid": proc.pid, "previous_attempt": previous, "previous_running": previous_running}
         deadline = clock() + wait
         while True:

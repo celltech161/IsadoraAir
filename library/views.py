@@ -12,6 +12,7 @@ from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.http import FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound
+from django.http.request import RawPostDataException
 from django.shortcuts import render
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
@@ -1807,15 +1808,28 @@ def api_reconciliation_summary(request):
 @require_http_methods(["POST"])
 def api_reconciliation_run(request):
     """Run Reconciliation (library.manage_tracks; CSRF-protected): start the read-only ``reconcile_library``
-    command with its defaults. Nothing in the request is used: no argument, path or budget can be chosen.
-    202 once this request's own scan process is running (or has already finished); 409 if a scan is running
-    or being started; 500 if it could not start. See library_reconciliation_launch."""
+    command with its defaults. The only thing taken from the request is the optional ``verify_audio_pairs``
+    choice (0 or one of ``VERIFY_AUDIO_PAIR_CHOICES``; anything else is refused): no other argument, path or
+    budget can be chosen. 202 once this request's own scan process is running (or has already finished); 409 if
+    a scan is running or being started; 500 if it could not start. See library_reconciliation_launch."""
     denied = _require_track_manager(request)
     if denied is not None:
         return denied
+    from library.services import library_reconciliation as reconciliation
     from library.services import library_reconciliation_launch as launcher
+    body = {}
+    if request.content_type == "application/json":
+        try:
+            body = json.loads(request.body or b"{}")
+        except (ValueError, UnicodeDecodeError, RawPostDataException):
+            body = {}
+    pairs = body.get("verify_audio_pairs", 0) if isinstance(body, dict) else 0
+    if not (type(pairs) is int and (pairs == 0 or pairs in reconciliation.VERIFY_AUDIO_PAIR_CHOICES)):
+        choices = ", ".join(str(c) for c in reconciliation.VERIFY_AUDIO_PAIR_CHOICES)
+        return JsonResponse({"error": f"verify_audio_pairs must be 0 or one of {choices}.",
+                             "code": "invalid_choice"}, status=400)
     try:
-        result = launcher.launch(username=request.user.get_username())
+        result = launcher.launch(username=request.user.get_username(), verify_audio_pairs=pairs)
     except launcher.LaunchRefused as exc:
         return JsonResponse({"error": exc.message, "code": exc.code}, status=exc.status)
     return JsonResponse(result, status=202)
@@ -1976,6 +1990,8 @@ def api_reconciliation_findings(request):
             f["resolution"] = {"deletable": deletable and report.get("status") == "complete",
                                "reason": why if deletable is False else
                                ("" if report.get("status") == "complete" else "the scan is not complete")}
+            # What proves a deletable pair (exact bytes, or verified decoded audio): display only.
+            f["evidence"] = duplicate_resolution.evidence_summary(original) if deletable else None
     if member_ids:
         details = _track_review_details(member_ids, limit=reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
         for f in window:
