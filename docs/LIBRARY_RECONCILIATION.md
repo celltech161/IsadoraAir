@@ -510,8 +510,10 @@ that future scheduling will select the Track under its new Category.
 Each eligible repair gets its own token:
 
 * signed (`django.core.signing`, salt `library.reconciliation.category_drift.v1`);
-* operator-bound, expiring after ten minutes, and spent on first use (a claim row in `django_session`, prefix
-  `driftfix:`);
+* operator-bound and bound to the authenticated session that previewed it (a keyed digest of its session key,
+  never the key): the same operator in another session, or after the session key was renewed or the session
+  ended, is refused (403);
+* expiring after ten minutes, and spent on first use (a claim row in `django_session`, prefix `driftfix:`);
 * binding the scan and finding, the Track, the direction, the source path and witness, the destination (A) or
   target Category (B), the additional-Category changes and the Track's fingerprint (its additional Categories
   included).
@@ -637,6 +639,9 @@ playout checks above apply to strict callers.
   * It checks each file to be moved (the strict rules above, the destination, the same-filesystem rule,
     the playout checks, and two selected files moving to the same name), lists every planned move and the
     refusals, and needs an explicit confirmation before Apply.
+  * The apply request must carry `confirm_move: true` with the move policy; the server checks it before the
+    preview token is used, so a missing or false confirmation is refused (400) and the preview stays valid. A
+    metadata-only request needs none.
   * It binds the policy and each move's path, witness and destination to its token; changing the policy
     invalidates the preview.
 * **Apply.** Each moving Track's whole change (Category, other fields, memberships and path) is one
@@ -646,7 +651,14 @@ playout checks above apply to strict callers.
   bounded at 2 s per Track and 10 s per request.
 * **Unchanged edits.** Tracks whose file is already in the new folder, and every non-moving edit, apply exactly
   as in r0125, with no file or engine checks.
-* **Stop.** An `uncertain` outcome stops the remaining Tracks (`not_attempted`).
+* **Stop.** Every outcome that needs the operator stops the remaining Tracks (`not_attempted`):
+  * `uncertain`;
+  * `committed_cleanup_required`;
+  * a staged entry that could not be removed;
+  * an unexpected failure whose outcome is unknown.
+
+  The result reports `attempted`, updated, moved, refused, stale, failed, cleanup-required, uncertain and
+  not-attempted Tracks, and each `relocation.track` event names `category_from` and `category_to`.
 
 **Waveform caches.**
 * *Effect of a move.* A moved file's cache records the old path and ctime, so it shows as **unverified** until

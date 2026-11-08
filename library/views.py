@@ -1949,7 +1949,8 @@ def api_reconciliation_drift_preview(request):
         scan_id, selections = str(body["scan_id"]), body["selections"]
     except (ValueError, KeyError, TypeError):
         return JsonResponse({"error": "scan_id and selections are required"}, status=400)
-    return _category_drift_response(lambda: category_drift.preview(scan_id, selections, user=request.user))
+    return _category_drift_response(lambda: category_drift.preview(
+        scan_id, selections, user=request.user, session_key=request.session.session_key))
 
 
 @require_http_methods(["POST"])
@@ -1968,7 +1969,7 @@ def api_reconciliation_drift_apply(request):
     except (ValueError, TypeError):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     return _category_drift_response(lambda: category_drift.apply(
-        body.get("token"), confirm=body.get("confirm"), user=request.user))
+        body.get("token"), confirm=body.get("confirm"), user=request.user, session_key=request.session.session_key))
 
 
 def _relink_response(call):
@@ -2227,7 +2228,7 @@ def api_track_bulk_edit_apply(request):
     try:
         return JsonResponse(bulk_edit.apply(selection, ops, body.get("token"), user=request.user,
                                             previews=bulk_edit.SessionPreviews(request.session),
-                                            file_location=file_location))
+                                            file_location=file_location, confirm_move=body.get("confirm_move")))
     except bulk_edit.BulkEditError as exc:
         return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 

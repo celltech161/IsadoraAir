@@ -28,8 +28,9 @@ as a warning: their existing entries are never rewritten or rebuilt.
 **Evidence and authorization.**  Only a finding of the latest *complete* scan that recorded ``drift`` evidence
 (the walked path and witness and the Track's ``filepath``/``filename``/``category_id``) can be repaired; older
 reports stay review only.  ``preview`` writes nothing; it rechecks everything against the current state and
-issues one token per eligible finding, signed (``django.core.signing``), bound to the operator, the scan and the
-finding, the Track, the direction, the source path and witness, the destination path (A) or the target Category
+issues one token per eligible finding, signed (``django.core.signing``), bound to the operator and the
+authenticated session that previewed it (a keyed digest of its session key: another session of the same operator, or
+a renewed session, is refused), the scan and the finding, the Track, the direction, the source path and witness, the destination path (A) or the target Category
 (B), the Track's fingerprint including its additional Categories, valid ``TOKEN_MAX_AGE_SECONDS`` and spent at
 its first apply (``_claim``).  A token for A never authorizes B, another Track or another destination.
 
@@ -355,9 +356,18 @@ def _parse_selections(raw):
     return parsed
 
 
-def preview(scan_id, raw_selections, *, user) -> dict:
-    """What the selected repairs would do now, and a token for each one that can be applied.  Writes nothing."""
+def _session_binding(session_key) -> str:
+    """The issuing session, as the token carries it: a keyed digest of the session key (never the key itself)."""
+    if not isinstance(session_key, str) or not session_key:
+        raise DriftRefused("Your session has ended. Sign in again, then preview again.")
+    return signing.Signer(salt=TOKEN_SALT + ".session").signature(session_key)
+
+
+def preview(scan_id, raw_selections, *, user, session_key=None) -> dict:
+    """What the selected repairs would do now, and a token for each one that can be applied.  Writes nothing.
+    Each token is bound to the authenticated session that issued it (``session_key``)."""
     from library.services.library_duplicate_resolution import _engine_state
+    session = _session_binding(session_key)
     report = _report(scan_id)
     selections = _parse_selections(raw_selections)
     root = _root()
@@ -396,7 +406,7 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             continue
         plan = inspection["plan"]
         item["status"] = ELIGIBLE
-        item["token"] = _token(user, scan_id, {
+        item["token"] = _token(user, scan_id, session, {
             "f": sel["finding_id"], "t": track_id, "d": sel["direction"], "src": plan["source"],
             "dst": plan["destination"], "cat": plan["category_to"], "cf": plan["category_from"],
             "k": sel["keep_old"], "w": inspection["witness"], "fp": inspection["fingerprint"],
@@ -420,12 +430,12 @@ def preview(scan_id, raw_selections, *, user) -> dict:
             "max_selections": MAX_SELECTIONS}
 
 
-def _token(user, scan_id, entry) -> str:
-    return signing.dumps({"u": user.pk, "s": scan_id, "n": secrets.token_urlsafe(16), "p": entry},
+def _token(user, scan_id, session, entry) -> str:
+    return signing.dumps({"u": user.pk, "k": session, "s": scan_id, "n": secrets.token_urlsafe(16), "p": entry},
                          salt=TOKEN_SALT, compress=True)
 
 
-def _redeem(token, user) -> dict:
+def _redeem(token, user, session_key=None) -> dict:
     if not isinstance(token, str) or not token:
         raise DriftRefused("Preview the repair first.", status=400)
     try:
@@ -436,6 +446,9 @@ def _redeem(token, user) -> dict:
         raise DriftRefused("This is not a valid preview token.", status=400) from None
     if not isinstance(plan, dict) or plan.get("u") != user.pk:
         raise DriftRefused("This preview was made by another operator.", status=403)
+    if not isinstance(plan.get("k"), str) or plan["k"] != _session_binding(session_key):
+        raise DriftRefused("This preview was made in another sign-in session (or yours was renewed); preview it "
+                           "again here.", status=403)
     entry = plan.get("p")
     if not isinstance(plan.get("n"), str) or not isinstance(entry, dict) or entry.get("d") not in DIRECTIONS \
             or not _is_int(entry.get("t")) or not isinstance(entry.get("src"), str) \
@@ -473,13 +486,13 @@ def _claim(nonce) -> None:
         pass
 
 
-def apply(token, *, confirm, user) -> dict:
+def apply(token, *, confirm, user, session_key=None) -> dict:
     """Apply ONE previewed repair (see the module docstring); its outcome is reported and audited."""
     from library.services import library_audit
     from library.services.library_duplicate_resolution import _engine_state
 
     try:
-        plan = _redeem(token, user)
+        plan = _redeem(token, user, session_key)
         entry = plan["p"]
         if confirm is not True:
             raise DriftRefused("Confirm the repair first.", status=400)

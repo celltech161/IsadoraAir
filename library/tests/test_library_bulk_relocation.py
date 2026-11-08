@@ -41,7 +41,7 @@ class _BulkFixture(_DriftFixture):
             body["file_location"] = mode
         return self.post(PREVIEW, body, client)
 
-    def apply(self, selection, changes, mode=None, token=None, apply_mode="same", client=None):
+    def apply(self, selection, changes, mode=None, token=None, apply_mode="same", client=None, confirm=True):
         if token is None:
             status, body = self.preview(selection, changes, mode, client)
             self.assertEqual(status, 200, body)
@@ -51,6 +51,8 @@ class _BulkFixture(_DriftFixture):
         sent = mode if apply_mode == "same" else apply_mode
         if sent is not None:
             payload["file_location"] = sent
+        if sent == bulk.MOVE_FILES and confirm is not None:
+            payload["confirm_move"] = confirm
         return self.post(APPLY, payload, client)
 
     def put(self, rel, category=None, **fields):
@@ -99,6 +101,7 @@ class CompatibilityTests(_Bulk):
         self.assertEqual((body["moves_count"], body["no_move_needed"], body["refusals"]), (0, 1, []))
         self.state_path.unlink()                                      # no engine: irrelevant without a move
         status, result = self.post(APPLY, {"selection": self.ids(home), "file_location": bulk.MOVE_FILES,
+                                           "confirm_move": True,
                                            "changes": self.to(self.pop, energy={"op": "set", "value": "upbeat"}),
                                            "token": body["token"]})
         self.assertEqual((result["updated"], result["moved"]), (1, 0))
@@ -261,6 +264,83 @@ class MoveTests(_Bulk):
                          ("moved", "bulk_edit"))
         self.assertEqual((actions["bulk_edit.apply"]["detail"]["file_location"],
                           actions["bulk_edit.apply"]["detail"]["moved"]), (bulk.MOVE_FILES, 1))
+
+
+class CorrectionTests(_Bulk):
+    def test_m1_a_cleanup_required_outcome_stops_the_remaining_tracks(self):
+        first = self.put("ROCK/stop-1.flac")
+        second = self.put("ROCK/stop-2.flac")
+        status, body = self.preview(self.ids(first, second), self.to(self.jazz), bulk.MOVE_FILES)
+        with mock.patch.object(m.StagedMediaRelocation, "remove_source", side_effect=OSError("injected")):
+            status, result = self.apply(self.ids(first, second), self.to(self.jazz), bulk.MOVE_FILES,
+                                        token=body["token"])
+        self.assertEqual([c["id"] for c in result["cleanup_required"]], [first.pk])
+        self.assertEqual([n["id"] for n in result["not_attempted"]], [second.pk])
+        self.assertEqual((result["attempted"], result["updated"], result["moved"]), (1, 1, 1))
+        self.assertEqual(self.where(second), ("ROCK", "ROCK/stop-2.flac"))      # never attempted
+        self.assertEqual(result["outcome"], "partial")
+
+    def test_m1_an_unexpected_failure_stops_the_remaining_tracks(self):
+        first = self.put("ROCK/boom-1.flac")
+        second = self.put("ROCK/boom-2.flac")
+        status, body = self.preview(self.ids(first, second), self.to(self.jazz), bulk.MOVE_FILES)
+        with mock.patch.object(bulk, "_apply_move", side_effect=RuntimeError("unexpected")):
+            status, result = self.apply(self.ids(first, second), self.to(self.jazz), bulk.MOVE_FILES,
+                                        token=body["token"])
+        self.assertEqual(([u["id"] for u in result["uncertain"]], [n["id"] for n in result["not_attempted"]]),
+                         ([first.pk], [second.pk]))
+
+    def test_m2_a_move_needs_an_explicit_server_checked_confirmation(self):
+        track = self.put("ROCK/confirm.flac")
+        status, body = self.preview(self.ids(track), self.to(self.jazz), bulk.MOVE_FILES)
+        token = body["token"]
+        for confirm in (None, False, "true", 1):
+            with self.subTest(confirm=confirm):
+                status, result = self.apply(self.ids(track), self.to(self.jazz), bulk.MOVE_FILES, token=token,
+                                            confirm=confirm)
+                self.assertEqual(status, 400, result)
+                self.assertIn("confirm_move", result["error"])
+        self.assertEqual(self.where(track), ("ROCK", "ROCK/confirm.flac"))
+        status, result = self.apply(self.ids(track), self.to(self.jazz), bulk.MOVE_FILES, token=token, confirm=True)
+        self.assertEqual((status, result["moved"]), (200, 1))              # the refused attempts spent nothing
+        self.assertEqual(self.where(track), ("JAZZ", "JAZZ/confirm.flac"))
+
+    def test_m2_metadata_only_needs_no_confirmation(self):
+        track = self.put("ROCK/plain.flac")
+        status, result = self.apply(self.ids(track), self.to(self.jazz))
+        self.assertEqual((status, result["updated"]), (200, 1))
+
+    def test_m4_the_relocation_audit_names_both_categories_for_every_outcome(self):
+        def on_air(track):
+            state = {"decks": {"A": {"track_id": track.pk}, "B": None}, "queue": [], "log_id": None}
+            return mock.patch("library.services.library_duplicate_resolution._engine_state", return_value=(state, ""))
+
+        cases = {
+            m.MOVED: (None, lambda t: mock.patch.object(bulk, "MOVE_LIMIT", bulk.MOVE_LIMIT)),
+            m.STALE: (lambda t: Track.objects.filter(pk=t.pk).update(energy="upbeat"),
+                      lambda t: mock.patch.object(bulk, "MOVE_LIMIT", bulk.MOVE_LIMIT)),
+            m.REFUSED: (None, on_air),
+            m.FAILED_BEFORE_COMMIT: (None, lambda t: mock.patch.object(m, "stage_no_replace",
+                                                                       side_effect=OSError("io"))),
+            m.COMMITTED_CLEANUP_REQUIRED: (None, lambda t: mock.patch.object(
+                m.StagedMediaRelocation, "remove_source", side_effect=OSError("io"))),
+        }
+        for outcome, (prepare, patch) in cases.items():
+            with self.subTest(outcome=outcome):
+                track = self.put(f"ROCK/audit-{outcome}.flac")
+                status, body = self.preview(self.ids(track), self.to(self.jazz), bulk.MOVE_FILES)
+                if prepare:
+                    prepare(track)
+                with mock.patch("library.services.library_audit.record", return_value="a") as record, patch(track):
+                    self.apply(self.ids(track), self.to(self.jazz), bulk.MOVE_FILES, token=body["token"])
+                event = next(c.kwargs for c in record.call_args_list if c.args[0] == "relocation.track")
+                detail = event["detail"]
+                self.assertEqual(event["outcome"], outcome, detail)
+                self.assertEqual((detail["category_from"], detail["category_to"]), ("ROCK", "JAZZ"))
+                self.assertEqual((detail["from"], detail["to"]), (f"ROCK/audit-{outcome}.flac",
+                                                                  f"JAZZ/audit-{outcome}.flac"))
+                self.assertIn("committed", detail)
+                self.assertIn("cleanup", detail)
 
 
 class C14ConcurrencyTests(_BulkFixture, TransactionTestCase):

@@ -18,12 +18,16 @@ waveform-cache lock.**  Every path-registering write claims its path before it w
 row: ``save``/``update``/``bulk_update``/``bulk_create`` claim before their statement, several paths are
 claimed in sorted order, and ``TrackQuerySet.update_or_create`` claims a literal ``defaults["filepath"]``
 before Django's ``select_for_update``.  Cleanup and ``remove_track_file`` take the lock before their
-ownership lookup and lock no Track row.  Known exception, deliberately left as is (3.11): Track Detail's
-category relocation (``api_track_update``) locks the row first and then claims the destination.  A cycle
-needs a second transaction that already holds that same destination path and then waits for the same
-Track's row; PostgreSQL detects it and aborts one side.  An aborted relocation rolls back, removes its
-staged destination link and keeps the original file, and Track Detail reports the error.  A wait is always bounded (``lock_timeout``): the cleanup retains the file, a registration fails
-visibly.
+ownership lookup and lock no Track row.  Every file relocation -- Track Detail's category change, the
+reconciliation's category-drift repair and the bulk editor's "move files" -- goes through
+``library.services.media_relocation.execute``, which takes the source's and the destination's locks (sorted)
+before the Track's row, then claims the destination re-entrantly when it saves the row; its removal of the old
+entry after commit takes the old path's lock again in a short transaction of its own and locks no Track row.
+(Until 3.11 Track Detail locked the row first and then claimed the destination; that exception is gone: it now
+decides the paths from an unlocked read, takes the path locks, then the row, and refuses with 409 if the row
+changed in between.)  No documented exception remains.  Should a cycle arise anyway, PostgreSQL detects it and
+aborts one side, which rolls back.  A wait is always bounded (``lock_timeout``): the cleanup retains the file, a
+registration fails visibly, a relocation reports "busy".
 
 ``remove_track_file`` (an explicit recall) and ``sync_track_file`` (registration of a file that already
 exists) are the two ends of a recall race.  The recall looks up the Track and unlinks only while holding the

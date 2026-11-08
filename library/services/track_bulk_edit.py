@@ -47,8 +47,11 @@ alone; ``move`` needs a ``category:set`` (a ``category:clear`` has no folder and
 preview checks every file to be moved (the strict source rules, the destination, the filesystem, and the
 playout engine: a Track on air, queued, claimed or in the current or next log hour is refused) and binds the
 policy, each file's path and witness and its destination to the token; changing the policy invalidates the
-preview.  At most ``MOVE_LIMIT`` files move per bulk edit (the 1,000-Track selection limit is unchanged);
-their lock waits are bounded per Track and per request.  Every other edit -- and every Track whose file is
+preview.  Applying the move policy needs ``confirm_move: true``, checked before the preview is spent (a missing or
+false confirmation is refused and the preview stays valid).  At most ``MOVE_LIMIT`` files move per bulk edit (the
+1,000-Track selection limit is unchanged); their lock waits are bounded per Track and per request.  Every outcome
+that needs the operator (``media_relocation.ATTENTION``, a staged entry that could not be removed, an unexpected
+failure) stops the remaining Tracks, which are reported as not attempted.  Every other edit -- and every Track whose file is
 already in the new Category's folder -- is applied exactly as before, with no new file or engine checks.
 """
 from __future__ import annotations
@@ -804,7 +807,7 @@ def _write_plan(track, plan, *, extra_fields=()) -> None:
             ignore_conflicts=True)
 
 
-def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget_seconds):
+def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget_seconds, category_from=None):
     """One previewed move: the Track's whole planned change and its file move as one guarded operation
     (``media_relocation.execute``).  Returns its ``media_relocation.Result``."""
     from library.models import Track
@@ -814,11 +817,17 @@ def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget
     state_then, _disposition, source, destination, witness = entry[:5]
     engine, engine_problem = _engine_state()
     held = {}
+    target = next((o.value for o in ops if o.field == "category" and o.op == SET), None)
+    # Both Categories for the audit: the original from the row as read before the move and, once it is locked, as
+    # it is under the lock (never from the Track after the change); the destination from the change set.
+    audit = {"operation": "bulk_category_move", "witness": witness, "category_from": category_from,
+             "category_to": targets.category(target).code if target is not None else None}
 
     def check(locked):
         track = Track.objects.select_related("artist", "album", "genre", "category").get(pk=locked.pk)
         additional, holidays = _memberships([track_id])
         current_additional, current_holidays = additional.get(track_id, set()), holidays.get(track_id, set())
+        audit["category_from"] = track.category.code if track.category_id else None
         if edit_state(track, current_additional, current_holidays) != state_then:
             raise m.Stop(m.STALE, "changed since the preview; left as it is")
         plan = _plan(track, ops, targets, current_additional=current_additional, current_holidays=current_holidays)
@@ -839,8 +848,7 @@ def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget
 
     return m.execute(track_id=track_id, source=source, destination=destination, origin="bulk_edit", user=user,
                      write=write, check=check, expected_witness=witness, strict=True, allow_copy=False,
-                     lock_budget_seconds=budget_seconds, protection=protection,
-                     audit={"operation": "bulk_category_move", "witness": witness})
+                     lock_budget_seconds=budget_seconds, protection=protection, audit=audit)
 
 
 def preview(selection: Selection, ops, *, user, previews, file_location=METADATA_ONLY) -> dict:
@@ -943,13 +951,17 @@ def _prepare_targets(ops, ids) -> _Targets:
     return targets
 
 
-def apply(selection: Selection, ops, token, *, user, previews, file_location=METADATA_ONLY) -> dict:
+def apply(selection: Selection, ops, token, *, user, previews, file_location=METADATA_ONLY, confirm_move=False) -> dict:
     """Apply exactly the previewed edit (see the module docstring).  Each Track is its own transaction under its
-    row lock; every outcome is reported."""
+    row lock; every outcome is reported.  ``confirm_move``: the move policy needs the operator's explicit
+    confirmation with the apply request, checked before the preview is spent."""
     from library.models import Track, TrackWriteRefused
 
     from library.services import library_audit, media_relocation
 
+    if file_location == MOVE_FILES and confirm_move is not True:
+        raise BulkEditError("Confirm that the previewed files will be moved (confirm_move) before applying. The "
+                            "preview is still valid.")
     operations = [f"{o.field}:{o.op}" for o in ops]
     try:
         record = _redeem_token(previews, user, token, selection, ops, file_location)
@@ -979,30 +991,40 @@ def apply(selection: Selection, ops, token, *, user, previews, file_location=MET
     updated, unchanged, folder_stays = [], 0, 0
     refused, stale, failed, missing = [], [], [], list(selection.missing)
     moved, cleanup_required, uncertain, not_attempted = [], [], [], []
-    halted = False
+    halted, attempted = False, 0
     for track_id in selection.ids:
         title = artist = ""
         state_then, disposition, *reason = previewed.get(str(track_id), [None, None])
         if halted:
             not_attempted.append({"id": track_id, "title": "", "artist": "",
-                                  "reason": "not attempted: processing stopped at the Track whose outcome is uncertain"})
+                                  "reason": "not attempted: processing stopped at a Track that needs attention"})
             continue
+        attempted += 1
         if disposition == "move":
-            row = Track.objects.filter(pk=track_id).values("title", "artist__name").first()
+            row = Track.objects.filter(pk=track_id).values("title", "artist__name", "category__code").first()
             if row is None:
                 missing.append(track_id)
                 continue
             info = {"id": track_id, "title": row["title"], "artist": row["artist__name"] or ""}
             budget = max(0.001, min(MOVE_LOCK_BUDGET_SECONDS, move_deadline - time.monotonic()))
-            result = _apply_move(track_id, [state_then, disposition, *reason], ops, targets, user=user, root=root,
-                                 protection=protection, budget_seconds=budget)
+            try:
+                result = _apply_move(track_id, [state_then, disposition, *reason], ops, targets, user=user,
+                                     root=root, protection=protection, budget_seconds=budget,
+                                     category_from=row["category__code"])
+            except Exception as exc:              # an unresolved result: stop, never guess
+                log.exception("bulk_edit track_id=%s move: unexpected failure", track_id)
+                uncertain.append({**info, "reason": f"unexpected error ({type(exc).__name__}); its outcome is not "
+                                                    "known. Check this Track before doing anything else."})
+                halted = True
+                continue
             m = media_relocation
             if result.outcome in (m.MOVED, m.COMMITTED_CLEANUP_REQUIRED):
                 updated.append(track_id)
                 moved.append({**info, "from": os.path.relpath(result.source, root),
                               "to": os.path.relpath(result.destination, root)})
                 if result.outcome == m.COMMITTED_CLEANUP_REQUIRED:
-                    cleanup_required.append({**info, "reason": result.message})
+                    cleanup_required.append({**info, "reason": result.message,
+                                             "location": result.as_dict().get("cleanup_location")})
             elif result.outcome == m.STALE:
                 stale.append({**info, "reason": result.message})
             elif result.outcome == m.UNCHANGED:
@@ -1015,7 +1037,9 @@ def apply(selection: Selection, ops, token, *, user, previews, file_location=MET
             else:
                 failed.append({**info, "reason": result.message + (
                     f" {result.cleanup_message}" if result.cleanup_message else "")})
-                halted = halted or result.attention
+            # Every outcome that needs the operator (media_relocation.ATTENTION, or a staged entry that could not be
+            # removed) stops the remaining Tracks.
+            halted = halted or result.attention
             continue
         try:
             with transaction.atomic():
@@ -1075,7 +1099,8 @@ def apply(selection: Selection, ops, token, *, user, previews, file_location=MET
         detail={"selection_mode": selection.mode, "requested": requested, "operations": operations,
                 "updated": len(updated), "unchanged": unchanged, "refused": len(refused), "stale": len(stale),
                 "failed": len(failed), "missing": len(set(missing)), "file_location": file_location,
-                "moved": len(moved), "cleanup_required": len(cleanup_required), "uncertain": len(uncertain),
+                "attempted": attempted, "moved": len(moved), "cleanup_required": len(cleanup_required),
+                "uncertain": len(uncertain),
                 "not_attempted": len(not_attempted),
                 "updated_tracks": library_audit.id_sample(updated),
                 "problem_tracks": library_audit.id_sample(problems)})
@@ -1093,6 +1118,7 @@ def apply(selection: Selection, ops, token, *, user, previews, file_location=MET
         "missing": sorted(set(missing)),
         "files_left_in_previous_category_folder": folder_stays,
         "file_location": file_location,
+        "attempted": attempted,
         "moved": len(moved),
         "moved_tracks": moved,
         "cleanup_required": cleanup_required,

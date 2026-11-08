@@ -296,6 +296,40 @@ class EvidenceAndTokenTests(_Drift):
         self.assertEqual(status, 409)
         self.assertIn("already used", body["error"])
 
+    def test_m3_a_token_works_only_in_the_session_that_previewed_it(self):
+        from django.contrib.sessions.models import Session
+        track = self.drifted("POP/session.flac", self.rock)
+        self.scanned()
+        token = self.token(track)
+        payload = signing.loads(token, salt=drift.TOKEN_SALT)
+        self.assertNotIn(self.client.session.session_key, json.dumps(payload))   # only a keyed digest
+        same_user_elsewhere = Client()
+        same_user_elsewhere.force_login(self.admin)
+        status, body = self.apply(token, client=same_user_elsewhere)
+        self.assertEqual(status, 403)
+        self.assertIn("another sign-in session", body["error"])
+        status, body = self.apply(token)                                  # the issuing session; unspent
+        self.assertEqual((status, body["item"]["outcome"]), (200, m.MOVED))
+        self.assertEqual(self.apply(token)[0], 409)                       # replay
+
+    def test_m3_a_renewed_or_ended_session_cannot_apply(self):
+        from django.contrib.sessions.models import Session
+        a = self.drifted("POP/renewed.flac", self.rock)
+        b = self.drifted("POP/ended.flac", self.rock)
+        self.scanned()
+        token_a, token_b = self.token(a), self.token(b)
+        from django.conf import settings
+        session = self.client.session
+        session.cycle_key()                                                # a renewed session key, same login
+        session.save()
+        self.client.cookies[settings.SESSION_COOKIE_NAME] = session.session_key
+        status, body = self.apply(token_a)
+        self.assertEqual(status, 403, body)
+        Session.objects.filter(session_key=self.client.session.session_key).delete()
+        response = self.client.post(reverse(APPLY), {"token": token_b, "confirm": True}, content_type="application/json")
+        self.assertNotEqual(response.status_code, 200)
+        self.assertEqual((self.row(a).filepath, self.row(b).filepath), (a.filepath, b.filepath))
+
     def test_b14_a_token_authorizes_exactly_its_direction_track_and_destination(self):
         track = self.drifted("POP/direction.flac", self.rock)
         self.scanned()
@@ -623,7 +657,7 @@ class ConcurrencyTests(_DriftFixture, TransactionTestCase):
     def apply_on_thread(self, token, out, key):
         def call():
             client = Client()
-            client.force_login(self.admin)
+            client.cookies = self.client.cookies           # the issuing session (tokens are session-bound)
             response = client.post(reverse(APPLY), {"token": token, "confirm": True}, content_type="application/json")
             return response.status_code, response.json()
         return self.thread(call, out, key)

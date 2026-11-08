@@ -838,6 +838,17 @@ function renderMovePreview(body, data, apply) {
   body.append(el('p', `${data.moves_count} file(s) will be moved; ${data.no_move_needed} already in the new ` +
                        `Category's folder; ${data.collisions} destination collision(s); ${data.scheduling_conflicts} ` +
                        `blocked by current or upcoming playout; ${data.file_refusals} file(s) that cannot be moved safely.`));
+  // The move policy always needs this explicit confirmation; the server refuses the apply without it.
+  const label = el('label', undefined, 'be-choice');
+  const box = el('input');
+  box.type = 'checkbox';
+  box.id = 'beConfirmMove';
+  label.append(box, el('span', data.moves_count
+    ? ` I confirm that ${data.moves_count} file(s) will be moved to their new Category folder.`
+    : ' I confirm the move policy (no file needs to move in this selection).'));
+  const ready = apply.disabled;
+  apply.disabled = true;
+  box.addEventListener('change', () => { apply.disabled = ready || !box.checked; });
   if (data.moves.length) {
     const table = el('table', undefined, 'be-table');
     const head = el('tr');
@@ -849,15 +860,8 @@ function renderMovePreview(body, data, apply) {
       table.append(row);
     });
     body.append(table);
-    const label = el('label', undefined, 'be-choice');
-    const box = el('input');
-    box.type = 'checkbox';
-    label.append(box, el('span', ` I confirm that ${data.moves_count} file(s) will be moved to their new Category folder.`));
-    body.append(label);
-    const ready = apply.disabled;
-    apply.disabled = true;
-    box.addEventListener('change', () => { apply.disabled = ready || !box.checked; });
   }
+  body.append(label);
 }
 
 async function applyBulkEdit() {
@@ -873,8 +877,10 @@ async function applyBulkEdit() {
   let result;
   try {
     const { fileLocation } = lastPreview;
+    const confirmBox = document.getElementById('beConfirmMove');
     result = await postJSON('/api/tracks/bulk/apply/',
-                            { selection, changes, token, ...(fileLocation ? { file_location: fileLocation } : {}) });
+                            { selection, changes, token, ...(fileLocation ? { file_location: fileLocation } : {}),
+                              ...(fileLocation === 'move' ? { confirm_move: !!(confirmBox && confirmBox.checked) } : {}) });
   } catch (e) {
     document.getElementById('bePreviewError').textContent =
       'No response from the server; the result is unknown. Reload the Library to see the current values.';
