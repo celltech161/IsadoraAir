@@ -33,14 +33,29 @@ previews it, then applies exactly what was previewed:
 
 Deliberately not done here: audio-file tags are never written (that stays a separate Track Detail
 action), cue markers are never written (they are not editable fields), waveform caches, source audio,
-logs and PlayEvents are untouched, nothing is reanalyzed, and a primary-category change is database-only
--- the file is not relocated (Track Detail's relocation remains the one way to move a file); the preview
-and the result count the files that will stay in their old category folder.
+logs and PlayEvents are untouched and nothing is reanalyzed.  A primary-category change is database-only
+by default -- the file is not relocated; the preview and the result count the files that will stay in
+their old category folder.
+
+**File-location policy (3.11).**  ``file_location`` chooses what a *Set primary category* does to the
+files: ``metadata_only`` (the default, and what every request that omits it gets: the r0125 behaviour
+above) or ``move`` -- each affected file moves to ``LIBRARY_ROOT/<new Category code>/<its name>`` through
+the shared guarded relocation service (``media_relocation``), in the same per-Track transaction as the
+Track's other changes, so the Category and the path commit together or not at all and a failed move never
+falls back to a metadata-only change.  Relocation authority is never inferred from a ``category:set``
+alone; ``move`` needs a ``category:set`` (a ``category:clear`` has no folder and is refused with it).  The
+preview checks every file to be moved (the strict source rules, the destination, the filesystem, and the
+playout engine: a Track on air, queued, claimed or in the current or next log hour is refused) and binds the
+policy, each file's path and witness and its destination to the token; changing the policy invalidates the
+preview.  At most ``MOVE_LIMIT`` files move per bulk edit (the 1,000-Track selection limit is unchanged);
+their lock waits are bounded per Track and per request.  Every other edit -- and every Track whose file is
+already in the new Category's folder -- is applied exactly as before, with no new file or engine checks.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,6 +86,14 @@ SESSION_KEY = "library_bulk_edit_previews"
 _TOKEN_SALT = "library.track_bulk_edit.preview.v2"
 
 LEAVE, SET, CLEAR = "leave", "set", "clear"
+#: The file-location policy of a primary-category change (3.11).
+METADATA_ONLY, MOVE_FILES = "metadata_only", "move"
+FILE_LOCATIONS = (METADATA_ONLY, MOVE_FILES)
+#: Most files one bulk edit may move (each one is its own guarded transaction).
+MOVE_LIMIT = 25
+#: Lock waits of one moving Track's transaction, and of all of a request's moves together.
+MOVE_LOCK_BUDGET_SECONDS = 2.0
+MOVE_REQUEST_LOCK_BUDGET_SECONDS = 10.0
 SELECTION_IDS, SELECTION_FILTER = "ids", "filter"
 
 
@@ -251,6 +274,23 @@ def parse_changes(raw) -> tuple[Operation, ...]:
     return tuple(ops)
 
 
+def parse_file_location(raw, ops) -> str:
+    """The file-location policy of a request: ``metadata_only`` when omitted (r0125 compatibility).  Raises
+    BulkEditError for anything else than the two policies, or ``move`` without a primary-category ``set``."""
+    if raw is None:
+        return METADATA_ONLY
+    if raw not in FILE_LOCATIONS:
+        raise BulkEditError("file_location must be 'move' or 'metadata_only'")
+    if raw == MOVE_FILES:
+        category = [o for o in ops if o.field == "category"]
+        if not category:
+            raise BulkEditError("Moving files needs a primary-category change (Set primary category)")
+        if category[0].op != SET:
+            raise BulkEditError("Clearing the primary category has no folder to move files to; choose "
+                                "'metadata_only'")
+    return raw
+
+
 def resolve_selection(raw) -> Selection:
     """The Track ids a selection names now (sorted), and the requested ids that no longer exist."""
     from library.models import Track
@@ -407,16 +447,16 @@ class SessionPreviews:
         return True
 
 
-def _issue_token(previews, user, selection, ops, tracks: dict) -> str:
-    """Record a preview for the operator and return the signed token naming it."""
+def _issue_token(previews, user, selection, ops, tracks: dict, mode=METADATA_ONLY) -> str:
+    """Record a preview for the operator and return the signed token naming it (and its file-location policy)."""
     nonce = secrets.token_urlsafe(16)
     previews.issue(nonce, {"user": user.pk, "ids": ids_digest(selection.ids), "ops": ops_digest(ops),
-                           "issued": int(time.time()), "tracks": tracks})
-    return signing.dumps({"n": nonce, "u": user.pk, "s": ids_digest(selection.ids), "o": ops_digest(ops)},
-                         salt=_TOKEN_SALT)
+                           "issued": int(time.time()), "tracks": tracks, "mode": mode})
+    return signing.dumps({"n": nonce, "u": user.pk, "s": ids_digest(selection.ids), "o": ops_digest(ops),
+                          "m": mode}, salt=_TOKEN_SALT)
 
 
-def _redeem_token(previews, user, token, selection, ops) -> dict:
+def _redeem_token(previews, user, token, selection, ops, mode=METADATA_ONLY) -> dict:
     """The preview a token names, removed from the session (one use).  Raises BulkEditError."""
     if not isinstance(token, str) or not token:
         raise BulkEditError("Preview the edit first: apply needs the preview's token")
@@ -440,6 +480,9 @@ def _redeem_token(previews, user, token, selection, ops) -> dict:
             "Preview again before applying.", status=409, count=len(selection.ids), missing=selection.missing)
     if claims.get("o") != ops_digest(ops) or record["ops"] != claims.get("o"):
         raise BulkEditError("The changes differ from the preview. Preview again before applying.", status=409)
+    if claims.get("m", METADATA_ONLY) != mode or record.get("mode", METADATA_ONLY) != mode:
+        raise BulkEditError("The file-location choice (move files, or update the Category only) differs from the "
+                            "preview. Preview again before applying.", status=409)
     return record
 
 
@@ -680,10 +723,132 @@ def _track_rows(ids):
     return Track.objects.select_related("artist", "album", "genre", "category").filter(pk__in=ids).order_by("pk")
 
 
-def preview(selection: Selection, ops, *, user, previews) -> dict:
+class _Mover:
+    """Move-policy planning (3.11): which files a primary-category change relocates, and which it cannot."""
+
+    def __init__(self, targets):
+        from library.services import library_reconciliation, media_relocation
+        from library.services.library_duplicate_resolution import _engine_state
+        try:
+            self.root = media_relocation.library_root()
+        except media_relocation.Stop as stop:
+            raise BulkEditError(stop.message, status=409) from None
+        self.targets = targets
+        self.protection = library_reconciliation._protection_predicates()
+        self.now = timezone.now()
+        self.engine, self.engine_problem = _engine_state()
+        self.destinations = {}
+        self.moves = []
+        self.counts = {"no_move_needed": 0, "collisions": 0, "scheduling_conflicts": 0, "file_refusals": 0,
+                       "later_log_warnings": 0}
+
+    def plan(self, track, plan):
+        """(move, refusal): the file move this Track's change needs (None when its file is already in the new
+        Category's folder), or why it cannot be moved now."""
+        from library.services import media_relocation as m
+        code = self.targets.category(plan.columns["category_id"]).code
+        try:
+            m.validate_category_storage_component(code)
+        except ValidationError:
+            return None, f"File not moved: the Category code {code!r} cannot be a Library folder name"
+        if m.category_folder(track.filepath, self.root) == code:
+            self.counts["no_move_needed"] += 1
+            return None, None
+        try:
+            witness = m.check_source(track.filepath, root=self.root, strict=True, protection=self.protection,
+                                     track=track)
+            destination = m.destination_for(track.filepath, code, self.root)
+            m.check_destination(track.filepath, destination, root=self.root, track_id=track.pk, allow_copy=False)
+        except m.Stop as stop:
+            self.counts["collisions" if stop.outcome == m.COLLISION else "file_refusals"] += 1
+            return None, "File not moved: " + stop.message
+        if destination in self.destinations:
+            self.counts["collisions"] += 1
+            return None, (f"File not moved: Track #{self.destinations[destination]} of this selection moves a file "
+                          "with the same name to the same folder")
+        blockers, warnings = m.playout_conflicts(track, now=self.now, engine=self.engine,
+                                                 engine_problem=self.engine_problem)
+        if blockers:
+            self.counts["scheduling_conflicts"] += 1
+            return None, "Not moved now: " + "; ".join(blockers)
+        self.counts["later_log_warnings"] += bool(warnings)
+        self.destinations[destination] = track.pk
+        move = {"from": track.filepath, "to": destination, "witness": witness}
+        self.moves.append({"id": track.pk, "title": track.title, "artist": track.artist.name if track.artist_id else "",
+                           "from": os.path.relpath(track.filepath, self.root),
+                           "to": os.path.relpath(destination, self.root)})
+        return move, None
+
+
+def _write_plan(track, plan, *, extra_fields=()) -> None:
+    """Write one Track's planned columns and memberships (inside the caller's transaction, under its row lock)."""
+    from library.models import Track
+    through_categories = Track.additional_categories.through
+    through_holidays = Track.holidays.through
+    track_id = track.pk
+    if plan.columns or extra_fields:
+        for attname, value in plan.columns.items():
+            setattr(track, attname, value)
+        track.save(update_fields=sorted({*plan.update_fields, *extra_fields, "updated_at"}))
+    if plan.remove_categories:
+        through_categories.objects.filter(track_id=track_id, category_id__in=plan.remove_categories).delete()
+    if plan.add_categories:
+        through_categories.objects.bulk_create(
+            [through_categories(track_id=track_id, category_id=pk) for pk in plan.add_categories],
+            ignore_conflicts=True)
+    if plan.remove_holidays:
+        through_holidays.objects.filter(track_id=track_id, holiday_id__in=plan.remove_holidays).delete()
+    if plan.add_holidays:
+        through_holidays.objects.bulk_create(
+            [through_holidays(track_id=track_id, holiday_id=code) for code in plan.add_holidays],
+            ignore_conflicts=True)
+
+
+def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget_seconds):
+    """One previewed move: the Track's whole planned change and its file move as one guarded operation
+    (``media_relocation.execute``).  Returns its ``media_relocation.Result``."""
+    from library.models import Track
+    from library.services import media_relocation as m
+    from library.services.library_duplicate_resolution import _engine_state
+
+    state_then, _disposition, source, destination, witness = entry[:5]
+    engine, engine_problem = _engine_state()
+    held = {}
+
+    def check(locked):
+        track = Track.objects.select_related("artist", "album", "genre", "category").get(pk=locked.pk)
+        additional, holidays = _memberships([track_id])
+        current_additional, current_holidays = additional.get(track_id, set()), holidays.get(track_id, set())
+        if edit_state(track, current_additional, current_holidays) != state_then:
+            raise m.Stop(m.STALE, "changed since the preview; left as it is")
+        plan = _plan(track, ops, targets, current_additional=current_additional, current_holidays=current_holidays)
+        target = plan.columns.get("category_id")
+        if target is None or m.destination_for(track.filepath, targets.category(target).code, root) != destination:
+            raise m.Stop(m.STALE, "its planned destination changed since the preview; left as it is")
+        blockers, _warnings = m.playout_conflicts(track, now=timezone.now(), engine=engine,
+                                                  engine_problem=engine_problem)
+        if blockers:
+            raise m.Stop(m.REFUSED, "not moved now: " + "; ".join(blockers))
+        held.update(track=track, plan=plan)
+
+    def write(_locked, filepath):
+        track, plan = held["track"], held["plan"]
+        track.filepath = filepath
+        _write_plan(track, plan, extra_fields=("filepath",))
+        return {"category_to": targets.category(plan.columns["category_id"]).code}
+
+    return m.execute(track_id=track_id, source=source, destination=destination, origin="bulk_edit", user=user,
+                     write=write, check=check, expected_witness=witness, strict=True, allow_copy=False,
+                     lock_budget_seconds=budget_seconds, protection=protection,
+                     audit={"operation": "bulk_category_move", "witness": witness})
+
+
+def preview(selection: Selection, ops, *, user, previews, file_location=METADATA_ONLY) -> dict:
     """What applying ``ops`` to ``selection`` would do, and the token to apply exactly that.  Writes nothing to
-    the library; ``previews`` (normally ``SessionPreviews``) records the preview."""
+    the library; ``previews`` (normally ``SessionPreviews``) records the preview.  ``file_location``: the
+    policy for files of a primary-category change (``move`` plans and checks every move)."""
     targets = _Targets(create=False)
+    mover = _Mover(targets) if file_location == MOVE_FILES else None
     additional, holidays = _memberships(selection.ids)
     summary = {}
     for op in ops:
@@ -704,13 +869,16 @@ def preview(selection: Selection, ops, *, user, previews) -> dict:
             continue
         title, artist = track.title, track.artist.name if track.artist_id else ""
         refusal = _guard_refusal(track, plan)
+        move = None
+        if not refusal and mover is not None and "category_id" in plan.columns:
+            move, refusal = mover.plan(track, plan)
         if refusal:
             refusals.append({"id": track.pk, "title": title, "artist": artist, "reason": refusal})
             tracks[str(track.pk)] = [state, "refused", refusal[:300]]
             continue
-        tracks[str(track.pk)] = [state, "change"]
+        tracks[str(track.pk)] = [state, "move", move["from"], move["to"], move["witness"]] if move else [state, "change"]
         changing += 1
-        folder_stays += plan.folder_stays
+        folder_stays += plan.folder_stays if mover is None else 0
         if len(samples) < SAMPLE_SIZE:
             samples.append({"id": track.pk, "title": title, "artist": artist, "changes": plan.changes})
     warnings = []
@@ -723,7 +891,24 @@ def preview(selection: Selection, ops, *, user, previews) -> dict:
     new_rows += sorted({f"album \"{title}\"" for (title, _aa), row in targets.albums.items() if row is None})
     if new_rows:
         warnings.append("Will be created: " + ", ".join(new_rows) + ".")
+    moving = {}
+    if mover is not None:
+        if len(mover.moves) > MOVE_LIMIT:
+            raise BulkEditError(
+                f"{len(mover.moves)} files would be moved; at most {MOVE_LIMIT} files can be moved in one bulk edit. "
+                "Narrow the selection, or choose to update the Category only.", count=len(mover.moves))
+        if mover.moves:
+            warnings.append(
+                f"{len(mover.moves)} file(s) will be moved to the new Category's folder. A moved file's waveform shows "
+                "as unverified until you run Reanalyze Track on it (Repick and Reset Cue Points wait until then); "
+                "cue points, approvals, play history, logs and the audio itself are unchanged.")
+        if mover.counts["later_log_warnings"]:
+            warnings.append(f"{mover.counts['later_log_warnings']} Track(s) to be moved are in later approved log "
+                            "hours; those entries are kept as they are and will play the file from its new place.")
+        moving = {"moves": mover.moves, "moves_count": len(mover.moves), "move_limit": MOVE_LIMIT, **mover.counts}
     return {
+        "file_location": file_location,
+        **moving,
         "selection": {"mode": selection.mode, "description": selection.description,
                       "count": len(selection.ids), "missing": selection.missing},
         "operations": _describe_ops(ops, targets),
@@ -733,7 +918,7 @@ def preview(selection: Selection, ops, *, user, previews) -> dict:
         "refusals": refusals,
         "warnings": warnings,
         "samples": samples,
-        "token": _issue_token(previews, user, selection, ops, tracks),
+        "token": _issue_token(previews, user, selection, ops, tracks, file_location),
         "token_expires_in": TOKEN_MAX_AGE_SECONDS,
         "max_tracks": MAX_TRACKS,
     }
@@ -758,16 +943,16 @@ def _prepare_targets(ops, ids) -> _Targets:
     return targets
 
 
-def apply(selection: Selection, ops, token, *, user, previews) -> dict:
+def apply(selection: Selection, ops, token, *, user, previews, file_location=METADATA_ONLY) -> dict:
     """Apply exactly the previewed edit (see the module docstring).  Each Track is its own transaction under its
     row lock; every outcome is reported."""
     from library.models import Track, TrackWriteRefused
 
-    from library.services import library_audit
+    from library.services import library_audit, media_relocation
 
     operations = [f"{o.field}:{o.op}" for o in ops]
     try:
-        record = _redeem_token(previews, user, token, selection, ops)
+        record = _redeem_token(previews, user, token, selection, ops, file_location)
     except BulkEditError as exc:
         # Nothing was applied; worth keeping for troubleshooting (an expired, replayed, foreign or drifted preview).
         library_audit.record(
@@ -777,15 +962,61 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
                     "requested": len(selection.ids) + len(selection.missing), "operations": operations})
         raise
     previewed = record["tracks"]
+    movers = [k for k, v in previewed.items() if v[1] == "move"]
+    if movers and (file_location != MOVE_FILES or len(movers) > MOVE_LIMIT):
+        raise BulkEditError("This preview cannot be applied. Preview again.", status=409)
     with transaction.atomic():
         targets = _prepare_targets(ops, selection.ids)
-    through_categories = Track.additional_categories.through
-    through_holidays = Track.holidays.through
+    root = protection = None
+    if movers:
+        from library.services import library_reconciliation
+        try:
+            root = media_relocation.library_root()
+        except media_relocation.Stop as stop:
+            raise BulkEditError(stop.message, status=409) from None
+        protection = library_reconciliation._protection_predicates()
+    move_deadline = time.monotonic() + MOVE_REQUEST_LOCK_BUDGET_SECONDS
     updated, unchanged, folder_stays = [], 0, 0
     refused, stale, failed, missing = [], [], [], list(selection.missing)
+    moved, cleanup_required, uncertain, not_attempted = [], [], [], []
+    halted = False
     for track_id in selection.ids:
         title = artist = ""
         state_then, disposition, *reason = previewed.get(str(track_id), [None, None])
+        if halted:
+            not_attempted.append({"id": track_id, "title": "", "artist": "",
+                                  "reason": "not attempted: processing stopped at the Track whose outcome is uncertain"})
+            continue
+        if disposition == "move":
+            row = Track.objects.filter(pk=track_id).values("title", "artist__name").first()
+            if row is None:
+                missing.append(track_id)
+                continue
+            info = {"id": track_id, "title": row["title"], "artist": row["artist__name"] or ""}
+            budget = max(0.001, min(MOVE_LOCK_BUDGET_SECONDS, move_deadline - time.monotonic()))
+            result = _apply_move(track_id, [state_then, disposition, *reason], ops, targets, user=user, root=root,
+                                 protection=protection, budget_seconds=budget)
+            m = media_relocation
+            if result.outcome in (m.MOVED, m.COMMITTED_CLEANUP_REQUIRED):
+                updated.append(track_id)
+                moved.append({**info, "from": os.path.relpath(result.source, root),
+                              "to": os.path.relpath(result.destination, root)})
+                if result.outcome == m.COMMITTED_CLEANUP_REQUIRED:
+                    cleanup_required.append({**info, "reason": result.message})
+            elif result.outcome == m.STALE:
+                stale.append({**info, "reason": result.message})
+            elif result.outcome == m.UNCHANGED:
+                unchanged += 1
+            elif result.outcome in (m.REFUSED, m.COLLISION):
+                refused.append({**info, "reason": result.message})
+            elif result.outcome == m.UNCERTAIN:
+                uncertain.append({**info, "reason": result.message})
+                halted = True
+            else:
+                failed.append({**info, "reason": result.message + (
+                    f" {result.cleanup_message}" if result.cleanup_message else "")})
+                halted = halted or result.attention
+            continue
         try:
             with transaction.atomic():
                 track = (Track.objects.select_related("artist", "album", "genre", "category")
@@ -809,23 +1040,12 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
                 if plan.empty:
                     unchanged += 1
                     continue
-                if plan.columns:
-                    for attname, value in plan.columns.items():
-                        setattr(track, attname, value)
-                    track.save(update_fields=sorted({*plan.update_fields, "updated_at"}))
-                if plan.remove_categories:
-                    through_categories.objects.filter(track_id=track_id,
-                                                      category_id__in=plan.remove_categories).delete()
-                if plan.add_categories:
-                    through_categories.objects.bulk_create(
-                        [through_categories(track_id=track_id, category_id=pk) for pk in plan.add_categories],
-                        ignore_conflicts=True)
-                if plan.remove_holidays:
-                    through_holidays.objects.filter(track_id=track_id, holiday_id__in=plan.remove_holidays).delete()
-                if plan.add_holidays:
-                    through_holidays.objects.bulk_create(
-                        [through_holidays(track_id=track_id, holiday_id=code) for code in plan.add_holidays],
-                        ignore_conflicts=True)
+                if file_location == MOVE_FILES and "category_id" in plan.columns and _needs_move(track, plan, targets):
+                    # Previewed as needing no move, but its file is no longer in the new Category's folder.
+                    stale.append({"id": track_id, "title": title, "artist": artist,
+                                  "reason": "its file location changed since the preview; left as it is"})
+                    continue
+                _write_plan(track, plan)
                 updated.append(track_id)
                 folder_stays += plan.folder_stays
         except TrackWriteRefused as exc:
@@ -844,7 +1064,8 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
              len(failed), len(missing))
     # Each Track above committed on its own; the audit summary is written after the last of them.  Its outcome
     # is never "completed" while any Track was refused, stale, failed or missing.
-    problems = [t["id"] for t in (*refused, *stale, *failed)] + sorted(set(missing))
+    problems = [t["id"] for t in (*refused, *stale, *failed, *uncertain, *not_attempted, *cleanup_required)] \
+        + sorted(set(missing))
     requested = len(selection.ids) + len(selection.missing)
     outcome = ("completed" if updated and not problems else "partial" if updated
                else "no_change" if not problems else "nothing_applied")
@@ -853,7 +1074,9 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
         title=f"Library bulk edit {outcome.replace('_', ' ')}: {len(updated)} of {requested} Track(s) updated",
         detail={"selection_mode": selection.mode, "requested": requested, "operations": operations,
                 "updated": len(updated), "unchanged": unchanged, "refused": len(refused), "stale": len(stale),
-                "failed": len(failed), "missing": len(set(missing)),
+                "failed": len(failed), "missing": len(set(missing)), "file_location": file_location,
+                "moved": len(moved), "cleanup_required": len(cleanup_required), "uncertain": len(uncertain),
+                "not_attempted": len(not_attempted),
                 "updated_tracks": library_audit.id_sample(updated),
                 "problem_tracks": library_audit.id_sample(problems)})
     return {
@@ -869,4 +1092,20 @@ def apply(selection: Selection, ops, token, *, user, previews) -> dict:
         "failed": failed,
         "missing": sorted(set(missing)),
         "files_left_in_previous_category_folder": folder_stays,
+        "file_location": file_location,
+        "moved": len(moved),
+        "moved_tracks": moved,
+        "cleanup_required": cleanup_required,
+        "uncertain": uncertain,
+        "not_attempted": not_attempted,
     }
+
+
+def _needs_move(track, plan, targets) -> bool:
+    """Move policy: does this Track's file (now) sit outside the new primary Category's folder?"""
+    from library.services import media_relocation
+    try:
+        root = media_relocation.library_root()
+    except media_relocation.Stop:
+        return True
+    return media_relocation.category_folder(track.filepath, root) != targets.category(plan.columns["category_id"]).code

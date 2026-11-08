@@ -1577,6 +1577,7 @@ def library_page(request):
         # r0125: the bulk editor is offered only to accounts that may use it (the endpoints check again).
         "can_bulk_edit": bool(authorize(request.user, "library.manage_tracks")),
         "bulk_edit_max": track_bulk_edit.MAX_TRACKS,
+        "bulk_edit_move_limit": track_bulk_edit.MOVE_LIMIT,
         "energy_choices": Track.ENERGY_CHOICES,
         "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
         "end_type_choices": Track.END_TYPE_CHOICES,
@@ -2181,10 +2182,12 @@ def _bulk_edit_request(request):
         return None, JsonResponse({"error": "Expected a JSON object"}, status=400)
     try:
         ops = bulk_edit.parse_changes(body.get("changes"))
+        # 3.11: what a primary-category change does to the files; omitted = metadata only (r0125 behaviour).
+        file_location = bulk_edit.parse_file_location(body.get("file_location"), ops)
         selection = bulk_edit.resolve_selection(body.get("selection"))
     except bulk_edit.BulkEditError as exc:
         return None, JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
-    return (body, selection, ops), None
+    return (body, selection, ops, file_location), None
 
 
 @require_http_methods(["POST"])
@@ -2197,9 +2200,13 @@ def api_track_bulk_edit_preview(request):
     parsed, error = _bulk_edit_request(request)
     if error is not None:
         return error
-    _body, selection, ops = parsed
-    return JsonResponse(bulk_edit.preview(selection, ops, user=request.user,
-                                          previews=bulk_edit.SessionPreviews(request.session)))
+    _body, selection, ops, file_location = parsed
+    try:
+        return JsonResponse(bulk_edit.preview(selection, ops, user=request.user,
+                                              previews=bulk_edit.SessionPreviews(request.session),
+                                              file_location=file_location))
+    except bulk_edit.BulkEditError as exc:
+        return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 
 
 @require_http_methods(["POST"])
@@ -2209,16 +2216,18 @@ def api_track_bulk_edit_apply(request):
     expired, already used, or the selection or change set no longer matches). Each Track is then applied
     on its own under its row lock and reported as updated, unchanged, refused, stale (changed since the
     preview: left alone), missing or failed. Never writes audio tags, cue markers, waveforms or source
-    audio, and never relocates a file or requests reanalysis."""
+    audio, and never requests reanalysis. Files move only with the explicit ``file_location: "move"``
+    policy the preview was made with (3.11; through the shared guarded relocation service)."""
     from library.services import track_bulk_edit as bulk_edit
 
     parsed, error = _bulk_edit_request(request)
     if error is not None:
         return error
-    body, selection, ops = parsed
+    body, selection, ops, file_location = parsed
     try:
         return JsonResponse(bulk_edit.apply(selection, ops, body.get("token"), user=request.user,
-                                            previews=bulk_edit.SessionPreviews(request.session)))
+                                            previews=bulk_edit.SessionPreviews(request.session),
+                                            file_location=file_location))
     except bulk_edit.BulkEditError as exc:
         return JsonResponse({"error": str(exc), **exc.extra}, status=exc.status)
 

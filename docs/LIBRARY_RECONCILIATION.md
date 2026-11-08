@@ -585,6 +585,29 @@ playout checks above apply to strict callers.
 * *Fix:* choosing the Category whose folder already holds the file is now a category-only change. In r0129 it
   failed, because the file collided with itself.
 
+**The /library/ bulk editor.** *Set primary category* now asks what to do with the files:
+
+* **Options.** *Update Category and move files to its folder* (recommended, the editor's default) or *Update
+  Category only*.
+* **API compatibility.** A request that omits `file_location` is `metadata_only`, the r0125 behaviour, with its
+  "files stay in their folder" warning; the quick *Set category…* bar sends none.
+* **When `move` is allowed.** `file_location: "move"` needs a `category:set`; `category:clear` has no folder
+  and is refused with it.
+* **Preview.**
+  * It checks each file to be moved (the strict rules above, the destination, the same-filesystem rule,
+    the playout checks, and two selected files moving to the same name), lists every planned move and the
+    refusals, and needs an explicit confirmation before Apply.
+  * It binds the policy and each move's path, witness and destination to its token; changing the policy
+    invalidates the preview.
+* **Apply.** Each moving Track's whole change (Category, other fields, memberships and path) is one
+  `media_relocation.execute`; a failed move changes nothing for that Track and never falls back to
+  metadata-only.
+* **Limits.** At most 25 files move per bulk edit; the 1,000-Track selection limit is unchanged. Lock waits are
+  bounded at 2 s per Track and 10 s per request.
+* **Unchanged edits.** Tracks whose file is already in the new folder, and every non-moving edit, apply exactly
+  as in r0125, with no file or engine checks.
+* **Stop.** An `uncertain` outcome stops the remaining Tracks (`not_attempted`).
+
 **Waveform caches.**
 * *Effect of a move.* A moved file's cache records the old path and ctime, so it shows as **unverified** until
   Reanalyze Track decodes the file again. Repick and Reset Cue Points wait until then.

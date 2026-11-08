@@ -142,6 +142,10 @@
   .be-note { color: var(--text-muted); font-size: 0.75rem; }
   .be-error { color: var(--danger); margin-top: 0.5rem; }
   .be-warn { color: #f59e0b; }
+  .be-location { grid-column: 1 / -1; border: 1px solid var(--border-subtle); border-radius: 6px; padding: 0.35rem 0.6rem; margin: 0; }
+  .be-location legend { color: var(--text-muted); font-size: 0.76rem; padding: 0 0.3rem; }
+  .be-choice { display: block; padding: 0.15rem 0; color: var(--text-main) !important; cursor: pointer; }
+  .be-mode { border-left: 3px solid var(--accent); padding: 0.2rem 0.6rem; margin: 0.3rem 0; }
   .be-list { margin: 0.3rem 0 0.5rem 1.1rem; padding: 0; }
   .be-table { border-collapse: collapse; width: 100%; margin-top: 0.4rem; }
   .be-table th, .be-table td {
@@ -371,6 +375,12 @@
     <label for="be-category-op">Primary category</label>
     <select id="be-category-op" data-field="category" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
     <select id="be-category" disabled aria-label="Primary category value">{% for cat in categories %}<option value="{{ cat.id }}">{{ cat.code }} — {{ cat.name }}</option>{% endfor %}</select>
+    <fieldset id="beFileLocation" class="be-location" hidden>
+      <legend>Files of the Tracks whose primary category changes</legend>
+      <label class="be-choice"><input type="radio" name="be-file-location" value="move" checked onchange="invalidatePreview()"> <strong>Update Category and move files to its folder</strong> — recommended</label>
+      <label class="be-choice"><input type="radio" name="be-file-location" value="metadata_only" onchange="invalidatePreview()"> Update Category only; leave existing file locations unchanged</label>
+      <span class="be-note">Moving is checked file by file in the preview (at most {{ bulk_edit_move_limit }} files per bulk edit); nothing moves until you confirm.</span>
+    </fieldset>
     <label for="be-addcat">Add additional categories</label>
     <span class="be-note">Existing memberships are kept</span>
     <select id="be-addcat" multiple>{% for cat in categories %}<option value="{{ cat.id }}">{{ cat.code }} — {{ cat.name }}</option>{% endfor %}</select>
@@ -641,6 +651,16 @@ const INT_FIELDS = new Set(['year', 'rotation_weight']);
 function syncEditorRow(select) {
   const input = document.getElementById('be-' + select.dataset.field);
   input.disabled = select.value !== 'set';
+  // 3.11: the file-location choice exists only for "Set primary category" (a cleared category has no folder).
+  if (select.dataset.field === 'category') document.getElementById('beFileLocation').hidden = select.value !== 'set';
+}
+
+// The editor's file-location policy for a primary-category change, or undefined when the change set has none
+// (the server then keeps the r0125 metadata-only behaviour). Never inferred from the category change alone.
+function fileLocationChoice(changes) {
+  if (!changes.category || changes.category.op !== 'set') return undefined;
+  const checked = document.querySelector('input[name="be-file-location"]:checked');
+  return checked ? checked.value : undefined;
 }
 
 function showPanel(id) {
@@ -656,6 +676,7 @@ function closeBulkPanels() {
 function openBulkEditor() {
   invalidatePreview();
   document.querySelectorAll('#beGrid .be-op').forEach(sel => { sel.value = 'leave'; syncEditorRow(sel); });
+  document.querySelector('input[name="be-file-location"][value="move"]').checked = true;
   document.querySelectorAll('#beGrid select[multiple]').forEach(sel =>
     [...sel.options].forEach(o => { o.selected = false; }));
   document.getElementById('beError').textContent = '';
@@ -709,14 +730,14 @@ function previewBulkEdit() {
     document.getElementById('beError').textContent = 'Nothing to change: every field is set to Leave unchanged.';
     return;
   }
-  runPreview(changes, 'beError');
+  runPreview(changes, 'beError', fileLocationChoice(changes));
 }
 
 function quickEdit(changes) {
-  runPreview(changes, null);
+  runPreview(changes, null, undefined);
 }
 
-async function runPreview(changes, errorTarget) {
+async function runPreview(changes, errorTarget, fileLocation) {
   if (selectionCount() === 0) return;
   invalidatePreview();
   const generation = previewGeneration;
@@ -726,7 +747,9 @@ async function runPreview(changes, errorTarget) {
   const selectionKey = JSON.stringify(selection);
   let result;
   try {
-    result = await postJSON('/api/tracks/bulk/preview/', { selection, changes }, controller.signal);
+    result = await postJSON('/api/tracks/bulk/preview/',
+                            { selection, changes, ...(fileLocation ? { file_location: fileLocation } : {}) },
+                            controller.signal);
   } catch (e) {
     if (controller.signal.aborted) return;
     result = { resp: { ok: false, status: 0 }, data: { error: 'No response from the server.' } };
@@ -741,7 +764,7 @@ async function runPreview(changes, errorTarget) {
     else alert(msg);
     return;
   }
-  lastPreview = { selection, changes, token: data.token, data };
+  lastPreview = { selection, changes, fileLocation, token: data.token, data };
   renderPreview(data);
   showPanel('bulkPreview');
 }
@@ -802,6 +825,39 @@ function renderPreview(data) {
   apply.textContent = data.tracks_changing === 0
     ? 'Nothing to apply'
     : `Apply to ${data.tracks_changing.toLocaleString()} Track(s)`;
+  if (data.file_location === 'move') renderMovePreview(body, data, apply);
+  else if (data.operations.some(o => o.field === 'category' && o.op === 'set')) {
+    body.prepend(el('p', 'File locations: update the Category only; files stay in their current folders.', 'be-mode'));
+  }
+}
+
+// 3.11: the move policy's preview -- the mode, every planned move, what blocks the others, and an explicit
+// confirmation before Apply can move anything.
+function renderMovePreview(body, data, apply) {
+  body.prepend(el('p', 'File locations: update the Category and move files to its folder.', 'be-mode'));
+  body.append(el('p', `${data.moves_count} file(s) will be moved; ${data.no_move_needed} already in the new ` +
+                       `Category's folder; ${data.collisions} destination collision(s); ${data.scheduling_conflicts} ` +
+                       `blocked by current or upcoming playout; ${data.file_refusals} file(s) that cannot be moved safely.`));
+  if (data.moves.length) {
+    const table = el('table', undefined, 'be-table');
+    const head = el('tr');
+    ['Track', 'From', 'To'].forEach(h => head.append(el('th', h)));
+    table.append(head);
+    data.moves.forEach(m => {
+      const row = el('tr');
+      row.append(el('td', trackLabel(m)), el('td', m.from), el('td', m.to));
+      table.append(row);
+    });
+    body.append(table);
+    const label = el('label', undefined, 'be-choice');
+    const box = el('input');
+    box.type = 'checkbox';
+    label.append(box, el('span', ` I confirm that ${data.moves_count} file(s) will be moved to their new Category folder.`));
+    body.append(label);
+    const ready = apply.disabled;
+    apply.disabled = true;
+    box.addEventListener('change', () => { apply.disabled = ready || !box.checked; });
+  }
 }
 
 async function applyBulkEdit() {
@@ -816,7 +872,9 @@ async function applyBulkEdit() {
   apply.disabled = true;
   let result;
   try {
-    result = await postJSON('/api/tracks/bulk/apply/', { selection, changes, token });
+    const { fileLocation } = lastPreview;
+    result = await postJSON('/api/tracks/bulk/apply/',
+                            { selection, changes, token, ...(fileLocation ? { file_location: fileLocation } : {}) });
   } catch (e) {
     document.getElementById('bePreviewError').textContent =
       'No response from the server; the result is unknown. Reload the Library to see the current values.';
@@ -845,6 +903,10 @@ function renderResult(data) {
   body.append(el('p', `Updated ${data.updated.toLocaleString()} of ${data.requested.toLocaleString()} Track(s); ` +
                        `${data.unchanged.toLocaleString()} already matched. Each Track is applied on its own, ` +
                        'so the others below were not rolled back.'));
+  if (data.file_location === 'move') {
+    body.append(el('p', `${data.moved} file(s) moved to the new Category folder.` +
+                         (data.moved ? ' Their waveforms show as unverified until Reanalyze Track.' : '')));
+  }
   if (data.files_left_in_previous_category_folder) {
     body.append(el('p', `${data.files_left_in_previous_category_folder} file(s) remain in their previous category folder ` +
                          '(database-only category change; relocate from Track Detail).', 'be-warn'));
@@ -853,9 +915,13 @@ function renderResult(data) {
     body.append(el('p', `${data.missing.length} Track(s) no longer existed: #${data.missing.join(', #')}.`, 'be-warn'));
   }
   const groups = [
+    ['uncertain', 'have an uncertain outcome (the database did not confirm the save; both file entries were kept). ' +
+                  'Check them before doing anything else; nothing is retried'],
+    ['cleanup_required', 'were moved and saved, but the old file entry needs attention (it is not retried)'],
     ['stale', 'changed since the preview and were left as they are (preview again to edit them)'],
     ['refused', 'were refused'],
     ['failed', 'failed and were not changed'],
+    ['not_attempted', 'were not attempted'],
   ];
   groups.forEach(([key, text]) => {
     const rows = data[key] || [];
