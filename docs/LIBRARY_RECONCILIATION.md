@@ -562,16 +562,56 @@ changes. One Track, one short transaction (`durable`), in this order:
    non-empty, the expected witness, and for strict callers a link count of 1, not in delivery, readable and
    not protected. The destination checks: free, plain folder, same filesystem. Then the caller's own checks.
 3. **Stage.** A second directory entry for the same inode, created relative to descriptors of the Library
-   root and the Category folder (`O_NOFOLLOW`), its identity verified. Strict callers refuse `EXDEV`;
-   Track Detail keeps its accepted copy fallback.
-4. **Write.** The caller's row changes with the new path; the row is read back and the destination binding
-   verified again.
+   root and the Category folder (`O_NOFOLLOW`; a link never overwrites).
+   * The destination's expected identity is fixed by the creation: the inode of the source descriptor, held
+     open until the operation ends. It is never re-learned from a later look at the pathname.
+   * Strict callers refuse `EXDEV`.
+   * Track Detail keeps its copy fallback, now bound to the descriptor of the file it created with `O_EXCL`
+     and proven by reading the copy back (SHA-256 of source and copy), never by its size.
+4. **Write.** The caller's row changes with the new path; the row is read back. Immediately before commit, the
+   service checks again that:
+   * the source descriptor is unchanged and its path still names it;
+   * the destination folder and entry are still the staged object.
 5. **Commit.**
-   * A failure before commit rolls back and removes only the staged entry; the original is never touched.
+   * A failure before commit rolls back; the staged entry is removed only through the identity-safe removal
+     below, never when it is the recording's last remaining name, and the original is never touched. Anything
+     not removable is kept and reported (`destination_retained`).
    * A failure at commit leaves the outcome unknown: both entries are kept and the result is `uncertain`.
 6. **Cleanup.** In its own transaction, holding the old path's lock (2 s), with no Track naming the old path
-   and the old entry still the same inode, the old entry is unlinked. Anything else is
-   `committed_cleanup_required`.
+   and the committed destination still naming the moved recording, the old entry is removed through the
+   identity-safe removal. Anything else is `committed_cleanup_required`.
+
+**Threat model and identity-safe removal.**
+
+* **Who it defends against.** Other filesystem writers may replace, rename, create or delete entries in the
+  Library's folders at any moment without taking IsadoraAir's PostgreSQL path locks: ingest scripts, file
+  managers, an operator's shell, another IsadoraAir operation.
+* **Rule 1: identity comes from creation.** A relocation never commits a Track to an entry that is not the
+  inode it created; that inode is held open, so its number cannot be reused.
+* **Rule 2: nothing is unlinked because its name passed a check.**
+  * An entry is removed only by moving it atomically and without overwriting (`renameat2(RENAME_NOREPLACE)`)
+    into a fresh, random sub-directory of the private quarantine `LIBRARY_ROOT/.relocation-quarantine/` (mode
+    0700, owned by IsadoraAir's user, opened no-follow and refused if it is not private).
+  * The moved object is examined there against the fixed identity. Only a match is unlinked, inside the
+    quarantine.
+  * A mismatch (the name had been replaced) is never deleted. It is moved back without overwriting, or, if its
+    name was taken again meanwhile, kept in the quarantine and reported.
+  * If the quarantine cannot be used (no `renameat2`, a different filesystem, a directory that is not
+    private), nothing is removed and the entry is reported as retained.
+* **Out of scope**, as everywhere in IsadoraAir:
+  * a process running as IsadoraAir's own user that deliberately works inside that private quarantine;
+  * a writer that rewrites a recording's bytes and then restores its size and modification time before the
+    link is made (the scan's witness is metadata, not a hash).
+
+**Recovering a retained object.**
+* *Where it is.* Every object kept in the quarantine is at `.relocation-quarantine/<time>-<random>/entry`,
+  next to a `RETAINED.json` naming its original path, its role (staged destination or old source), the
+  expected and found identity, and why it was kept.
+* *How it is reported.* The result and the `relocation.track` audit event carry the same location
+  (`cleanup_location`).
+* *What to do.* Compare it with the Track's current file, then move it back or delete it by hand.
+* *What the scan sees.* The quarantine is a hidden directory: the scan counts it, never walks it. After a
+  normal relocation it is empty (only the top directory remains).
 
 A move preserves the audio exactly: the inode moves. It changes the path future playback opens, so the
 playout checks above apply to strict callers.

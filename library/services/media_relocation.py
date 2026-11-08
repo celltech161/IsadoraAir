@@ -31,21 +31,28 @@ Category is right.
    directory component -- must not exist and no other Track may name it (``collision``: never an overwrite,
    rename or numeric suffix).  Then the caller's ``check``.
 3. **Stage** (``stage_no_replace``): a second directory entry for the same inode at the destination, made
-   relative to descriptors of the Library root and the Category directory (``O_NOFOLLOW``, ``O_EXCL``
-   semantics of ``link``), its identity verified against the open source.  Strict callers refuse a
-   cross-filesystem move (``allow_copy=False``): the link fails with ``EXDEV`` before anything is created.
-   Track Detail keeps its accepted copy fallback.  The staged inode must still be the witnessed one.
+   relative to descriptors of the Library root and the Category directory (no-follow; ``link`` never
+   overwrites).  The destination's expected identity is fixed by the creation itself -- the inode of the source
+   descriptor this operation opened and keeps open -- and is never re-learned from a later look at the
+   pathname (see "Threat model" below).  Strict callers refuse a cross-filesystem move (``allow_copy=False``):
+   the link fails with ``EXDEV`` before anything is created.  Track Detail keeps its copy fallback, now bound to
+   the descriptor of the file it created with ``O_EXCL`` and verified by reading the copy back (SHA-256 of
+   source and copy).  The staged inode must be the witnessed recording.
 4. **Write**: the caller's ``write(track, filepath)`` saves its row changes with the path to store (the
    destination, or the unchanged source); ``Track.save`` claims the destination path re-entrantly.  The row is
-   read back and the destination binding verified again.
-5. **Commit.**  Before commit any failure rolls back and removes only the staged destination entry (its witness
-   must be unchanged); the original is never touched (``failed_before_commit``; if the staged entry cannot be
-   removed safely it is kept and reported).  A failure *at* commit leaves the outcome unknown: both entries
-   are kept and the result is ``uncertain`` -- the database names one of them either way.
+   read back, and immediately before commit ``StagedMediaRelocation.verify`` checks again that the source
+   descriptor is unchanged and its path still names it, and that the destination directory and entry are
+   still the staged object.
+5. **Commit.**  Before commit any failure rolls back; the staged entry is removed only through the
+   identity-safe removal (``remove_entry``), never a recording's last remaining name, and the original is never
+   touched (``failed_before_commit``; whatever cannot be removed safely is kept and reported,
+   ``destination_retained``).  A failure *at* commit leaves the outcome unknown: both entries are kept and the
+   result is ``uncertain`` -- the database names one of them either way.
 6. **Cleanup** after commit: in its own short transaction, holding the old path's lock (bounded), with no Track
-   naming the old path, and only while the old entry is still the staged inode, the old directory entry is
-   unlinked.  Anything else keeps it and is reported as ``committed_cleanup_required``: the move committed
-   and is valid; only an extra directory entry remains.  Nothing is ever retried automatically.
+   naming the old path and while the committed destination still names the relocated recording, the old entry
+   is removed through ``remove_entry``.  Anything else keeps it and is reported as
+   ``committed_cleanup_required`` (with the quarantine location of anything kept there): the move committed and
+   is valid.  Nothing is ever retried automatically.
 
 The audio is never decoded, re-encoded, tagged or hashed: the inode moves, so its content is unchanged.  Every
 outcome is audited (``library_audit``, ``relocation.track``) with the operation's origin.
@@ -61,6 +68,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import secrets
 import stat
 import time
 from dataclasses import dataclass, field
@@ -100,12 +108,10 @@ CLEANUP_RETAINED_OWNER = "retained_live_owner"
 CLEANUP_RETAINED_BUSY = "retained_busy"
 CLEANUP_RETAINED_CHANGED = "retained_changed"
 CLEANUP_FAILED = "failed"
+CLEANUP_QUARANTINED = "retained_quarantined"            # kept, untouched, in the relocation quarantine
+CLEANUP_RETAINED_UNSAFE = "retained_unsafe"             # identity-safe removal impossible: left in place
 CLEANUP_DESTINATION_RETAINED = "destination_retained"   # rolled back, but the staged entry could not be removed
 CLEANUP_BOTH_RETAINED = "both_retained"                 # uncertain commit: neither entry removed
-
-
-class CrossFilesystemRefused(OSError):
-    """The destination is on another filesystem and this caller does not copy."""
 
 
 class Stop(Exception):
@@ -127,6 +133,7 @@ class Result:
     committed: bool = False
     cleanup: str = ""
     cleanup_message: str = ""
+    cleanup_location: str | None = None         # a retained object's place in the relocation quarantine
     error: str = ""
     detail: dict = field(default_factory=dict)
 
@@ -140,85 +147,295 @@ class Result:
                 "source": library_audit.library_relative(self.source),
                 "destination": library_audit.library_relative(self.destination) if self.destination else None,
                 "committed": self.committed, "cleanup": self.cleanup, "cleanup_message": self.cleanup_message,
+                "cleanup_location": library_audit.library_relative(self.cleanup_location)
+                if self.cleanup_location else None,
                 "attention": self.attention, **self.detail}
 
 
-# --------------------------------------------------------------------------- staging (moved from library.views)
+# --------------------------------------------------------------------------- staging and identity-safe removal
+#
+# Threat model.  Other filesystem writers -- ingest scripts, file managers, an operator's shell, a second
+# IsadoraAir operation -- may create, rename, replace or delete entries in the Library's folders at any moment, and
+# need not take IsadoraAir's PostgreSQL path locks.  Against them two rules hold:
+#
+# * **A destination's identity comes from its creation, never from a later look at its name.**  The expected
+#   inode is that of a descriptor this operation holds open for its whole life: the source's own descriptor when
+#   the destination is a hard link to it, or the descriptor ``O_CREAT | O_EXCL`` returned when Track Detail's
+#   copy fallback created it.  An open inode cannot be freed and its number reused, so "this entry has the expected
+#   (device, inode)" proves "this entry is the recording we authorized".  Every later observation of the pathname
+#   is checked against that fixed identity; none ever replaces it.
+# * **Nothing is unlinked because its name passed a check.**  An entry is removed only by moving it atomically
+#   (``renameat2(RENAME_NOREPLACE)``) into a fresh private quarantine directory (``QUARANTINE_DIRNAME`` beneath
+#   the Library root: mode 0700, owned by this user, a new random sub-directory per removal, all
+#   descriptor-relative and no-follow), then examining *the moved object there* against the expected identity.
+#   Only a match is unlinked -- inside the quarantine, where no other writer operates.  A mismatch (the name had
+#   been replaced) is never deleted: it is moved back without overwriting anything, or, if its old name has been
+#   taken meanwhile, kept in the quarantine with a ``RETAINED.json`` manifest and reported for the operator.  If
+#   the quarantine cannot be used (no ``renameat2``, another filesystem, an unsafe quarantine directory), nothing
+#   is removed and the entry is reported as retained.
+#
+# Out of scope, as for every other IsadoraAir component: a process running as the same user that deliberately
+# operates inside IsadoraAir's private quarantine directory, or rewrites a recording's bytes and then restores its
+# size and modification time before the link is made (the recorded six-field witness is metadata, not a hash).
 
-def _stat_witness(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+QUARANTINE_DIRNAME = ".relocation-quarantine"
+RENAME_NOREPLACE = 1
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+# Removal outcomes (``remove_entry``).
+ENTRY_REMOVED = "removed"                     # the expected object was removed
+ENTRY_MISSING = "missing"                     # nothing was at the name
+ENTRY_FOREIGN_RESTORED = "foreign_restored"   # another object was at the name; it was put back untouched
+ENTRY_QUARANTINED = "quarantined"             # an object could not be put back: kept in the quarantine
+ENTRY_NOT_MOVED = "not_moved"                 # the quarantine could not be used: nothing was moved or removed
+ENTRY_GONE = (ENTRY_REMOVED, ENTRY_MISSING)
+
+
+class CrossFilesystemRefused(OSError):
+    """The destination is on another filesystem and this caller does not copy."""
+
+
+class QuarantineUnavailable(OSError):
+    """No atomic no-overwrite move into a private quarantine is possible here."""
+
+
+class StagingUnwindIncomplete(OSError):
+    """Staging failed and its destination entry could not be removed safely: it was kept (see the message)."""
+
+
+def _load_renameat2():
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = libc.renameat2
+    except (OSError, AttributeError, ImportError):
+        return None, None
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    return function, ctypes
+
+
+_RENAMEAT2, _CTYPES = _load_renameat2()
+
+
+def _rename_noreplace(src_dir_fd, src_name, dst_dir_fd, dst_name) -> None:
+    """``renameat2(..., RENAME_NOREPLACE)``: atomically move one directory entry; never overwrite."""
+    if _RENAMEAT2 is None:
+        raise QuarantineUnavailable(errno.ENOSYS, "renameat2 is not available")
+    if _RENAMEAT2(src_dir_fd, os.fsencode(src_name), dst_dir_fd, os.fsencode(dst_name), RENAME_NOREPLACE) != 0:
+        code = _CTYPES.get_errno()
+        if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.EXDEV):
+            raise QuarantineUnavailable(code, f"no atomic no-overwrite move here ({os.strerror(code)})")
+        raise OSError(code, os.strerror(code), os.fsdecode(src_name))
+
+
+def _identity(info) -> tuple:
+    return (info.st_dev, info.st_ino)
 
 
 def _inode_witness(info):
     return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
 
 
-def _content_witness(info):
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+def _stat_witness(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _entry_witness(directory_fd, name):
     return _stat_witness(os.stat(name, dir_fd=directory_fd, follow_symlinks=False))
 
 
-class StagedMediaRelocation:
-    """Two descriptor-anchored directory entries retained until transaction outcome."""
+def _open_quarantine(root_fd):
+    """The private quarantine directory beneath the Library root (created on first use), as a descriptor."""
+    try:
+        os.mkdir(QUARANTINE_DIRNAME, 0o700, dir_fd=root_fd)
+    except FileExistsError:
+        pass
+    fd = os.open(QUARANTINE_DIRNAME, _DIRECTORY_FLAGS, dir_fd=root_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise QuarantineUnavailable(errno.EPERM, "the relocation quarantine directory is not private to IsadoraAir")
+    return fd
 
-    def __init__(self, source, destination, source_parent_fd, destination_parent_fd,
-                 source_witness, destination_witness):
-        self.source = source
-        self.destination = destination
-        self.source_parent_fd = source_parent_fd
-        self.destination_parent_fd = destination_parent_fd
-        self.source_witness = source_witness
-        self.destination_witness = destination_witness
+
+def _write_manifest(directory_fd, manifest) -> None:
+    import json
+    try:
+        fd = os.open("RETAINED.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                     dir_fd=directory_fd)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(manifest, handle, indent=1, sort_keys=True)
+    except OSError:
+        log.warning("relocation quarantine manifest not written")
+
+
+def remove_entry(root, root_fd, dir_fd, name, expected, *, context, keep_last_link=False) -> tuple[str, str, str | None]:
+    """Remove the entry ``name`` of directory ``dir_fd`` only if it is the object ``expected`` (device, inode), which
+    the caller holds open.  ``keep_last_link``: never remove the recording's last remaining name (a hard-linked
+    relocation whose other name another writer removed or replaced).  Returns (outcome, explanation, quarantine
+    location or None); see the threat model."""
+    try:
+        quarantine_fd = _open_quarantine(root_fd)
+    except OSError as exc:
+        return ENTRY_NOT_MOVED, f"it was left in place: the relocation quarantine is unavailable ({exc})", None
+    holder = f"{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(8)}"
+    location = os.path.join(root, QUARANTINE_DIRNAME, holder, "entry")
+    try:
+        try:
+            os.mkdir(holder, 0o700, dir_fd=quarantine_fd)
+            holder_fd = os.open(holder, _DIRECTORY_FLAGS, dir_fd=quarantine_fd)
+        except OSError as exc:
+            return ENTRY_NOT_MOVED, f"it was left in place: no quarantine entry could be made ({exc})", None
+        moved = False
+        try:
+            try:
+                _rename_noreplace(dir_fd, name, holder_fd, "entry")
+                moved = True
+            except FileNotFoundError:
+                return ENTRY_MISSING, "nothing was there any more", None
+            except OSError as exc:
+                return ENTRY_NOT_MOVED, f"it was left in place: it could not be moved aside safely ({exc})", None
+            info = os.stat("entry", dir_fd=holder_fd, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode) and _identity(info) == tuple(expected):
+                if keep_last_link and info.st_nlink < 2:
+                    try:                                    # the recording's only name: keep it where it was
+                        _rename_noreplace(holder_fd, "entry", dir_fd, name)
+                        moved = False
+                        return ENTRY_NOT_MOVED, ("it was kept in place: it is the recording's only remaining name "
+                                                 "(its other name was removed or replaced by another writer)"), None
+                    except OSError as exc:
+                        _write_manifest(holder_fd, {**context, "reason": f"the recording's only name; not restorable "
+                                                                         f"({exc})",
+                                                    "expected": {"dev": expected[0], "ino": expected[1]}})
+                        return ENTRY_QUARANTINED, ("it is the recording's only remaining name and could not be put "
+                                                   f"back; it was kept, untouched, at {location}"), location
+                os.unlink("entry", dir_fd=holder_fd)        # the authorized object, in the private quarantine
+                moved = False
+                return ENTRY_REMOVED, "", None
+            try:                                            # not ours: put it back, never overwriting anything
+                _rename_noreplace(holder_fd, "entry", dir_fd, name)
+                moved = False
+                return ENTRY_FOREIGN_RESTORED, ("another file had replaced it; that file was not removed and is "
+                                                "back in its place"), None
+            except OSError as exc:
+                _write_manifest(holder_fd, {**context, "reason": f"replaced by another file; not restorable ({exc})",
+                                            "expected": {"dev": expected[0], "ino": expected[1]},
+                                            "found": {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size}})
+                return ENTRY_QUARANTINED, ("another file had replaced it and its name has been taken again; that file "
+                                           f"was kept, untouched, at {location}"), location
+        except OSError as exc:
+            if moved:
+                _write_manifest(holder_fd, {**context, "reason": f"removal interrupted ({exc})",
+                                            "expected": {"dev": expected[0], "ino": expected[1]}})
+                return ENTRY_QUARANTINED, f"its removal was interrupted ({exc}); it was kept at {location}", location
+            return ENTRY_NOT_MOVED, f"it was left in place ({exc})", None
+        finally:
+            os.close(holder_fd)
+            if not moved:
+                try:
+                    os.rmdir(holder, dir_fd=quarantine_fd)
+                except OSError:
+                    pass
+    finally:
+        os.close(quarantine_fd)
+
+
+class StagedMediaRelocation:
+    """A staged destination and the descriptors that fix its identity, retained until the transaction's outcome.
+
+    ``source_identity`` is the inode of the open source descriptor.  ``destination_identity`` is the same inode for
+    a hard link, or the inode of the exclusively created copy's open descriptor; neither is ever taken from a look
+    at a pathname.  ``source_state`` / ``destination_state`` are (size, mtime, ctime) of those descriptors once
+    staged: any later write, truncation, timestamp or permission change alters the ctime."""
+
+    def __init__(self, *, source, destination, root, root_fd, source_parent_fd, destination_parent_fd, source_fd,
+                 destination_fd, source_identity, destination_identity, source_state, destination_state):
+        self.source, self.destination, self.root = source, destination, root
+        self.root_fd, self.source_parent_fd, self.destination_parent_fd = root_fd, source_parent_fd, destination_parent_fd
+        self.source_fd, self.destination_fd = source_fd, destination_fd
+        self.source_identity, self.destination_identity = source_identity, destination_identity
+        self.source_state, self.destination_state = source_state, destination_state
+        self.copied = destination_fd is not None
         self.closed = False
 
-    def verify_destination_binding(self):
-        """The pathname saved in the database must still name our anchored file and directory."""
+    @staticmethod
+    def _state(info):
+        return (info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def verify(self):
+        """Raise OSError unless the source is still the authorized recording at its path and the destination
+        directory and entry still are the staged ones (checked against the fixed identities)."""
+        if self._state(os.fstat(self.source_fd)) != self.source_state:
+            raise OSError("the source media changed while it was being relocated")
+        try:
+            at_source = os.stat(self.source.name, dir_fd=self.source_parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise OSError("the source path no longer names the source media") from None
+        if not stat.S_ISREG(at_source.st_mode) or _identity(at_source) != self.source_identity:
+            raise OSError("the source path no longer names the source media")
+        if self.destination_fd is not None and self._state(os.fstat(self.destination_fd)) != self.destination_state:
+            raise OSError("the staged copy changed during the Track update")
         anchored_parent = _inode_witness(os.fstat(self.destination_parent_fd))
         named_parent = _inode_witness(os.lstat(self.destination.parent))
         if named_parent != anchored_parent or named_parent[2] != stat.S_IFDIR:
             raise OSError("the destination category directory changed during the Track update")
-        anchored = _entry_witness(self.destination_parent_fd, self.destination.name)
-        try:
-            named = _stat_witness(os.lstat(self.destination))
-        except FileNotFoundError:
-            named = None
-        if anchored != self.destination_witness or named != self.destination_witness:
-            raise OSError("the staged destination changed during the Track update")
+        for observed in (os.stat(self.destination.name, dir_fd=self.destination_parent_fd, follow_symlinks=False),
+                         _lstat_or_none(self.destination)):
+            if observed is None or not stat.S_ISREG(observed.st_mode) or _identity(observed) != self.destination_identity:
+                raise OSError("the staged destination is no longer the relocated recording")
 
-    def _remove(self, directory_fd, path, witness):
-        try:
-            current = _entry_witness(directory_fd, path.name)
-        except FileNotFoundError:
-            return
-        if current != witness:
-            raise OSError(f"refusing to remove {path}: it changed during the Track update")
-        os.unlink(path.name, dir_fd=directory_fd)
+    verify_destination_binding = verify
+
+    def _context(self, role):
+        return {"role": role, "source": str(self.source), "destination": str(self.destination),
+                "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
     def remove_destination(self):
-        self._remove(self.destination_parent_fd, self.destination, self.destination_witness)
+        """Roll back the staging: remove the destination entry only if it is still the staged object."""
+        return remove_entry(self.root, self.root_fd, self.destination_parent_fd, self.destination.name,
+                            self.destination_identity, context=self._context("staged destination (rolled back)"),
+                            keep_last_link=not self.copied)
 
     def remove_source(self):
-        self._remove(self.source_parent_fd, self.source, self.source_witness)
+        """After commit: remove the old source entry only if it is still the source object, and only while the
+        committed destination still names the relocated recording."""
+        observed = _lstat_or_none(self.destination)
+        if observed is None or _identity(observed) != self.destination_identity:
+            return ENTRY_NOT_MOVED, ("it was left in place: the committed destination no longer names the relocated "
+                                     "recording"), None
+        return remove_entry(self.root, self.root_fd, self.source_parent_fd, self.source.name, self.source_identity,
+                            context=self._context("old source (after commit)"), keep_last_link=not self.copied)
 
     def close(self):
         if not self.closed:
-            os.close(self.source_parent_fd)
-            os.close(self.destination_parent_fd)
+            for fd in (self.source_fd, self.destination_fd, self.source_parent_fd, self.destination_parent_fd,
+                       self.root_fd):
+                if fd is not None:
+                    os.close(fd)
             self.closed = True
+
+
+def _lstat_or_none(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
 
 
 def stage_no_replace(source: Path, destination: Path, *, library_root: Path, allow_copy: bool = True):
     """Stage a confined destination without following source or directory symlinks.
 
-    The category directory is created/opened relative to an already-resolved root descriptor and
-    remains open through the database transaction. Both the hard-link path and EXDEV copy fallback
-    use that descriptor, O_EXCL and no-follow source opens. The returned handle owns the directory
-    descriptors until the caller commits or rolls back.  ``allow_copy=False``: a cross-filesystem
-    destination raises ``CrossFilesystemRefused`` before anything is created.
+    The category directory is created/opened relative to an already-resolved root descriptor.  A hard link is
+    the normal case: the created entry must be the open source's inode.  ``allow_copy`` (Track Detail only): on
+    ``EXDEV`` the bytes are copied into a file created with ``O_EXCL`` and verified by reading it back through
+    its own descriptor (SHA-256 of both); otherwise ``EXDEV`` raises ``CrossFilesystemRefused`` before anything is
+    created.  The returned handle owns every descriptor until the caller commits or rolls back.  On failure the
+    created entry is removed only through ``remove_entry`` (identity-safe); if that cannot be done the error is a
+    ``StagingUnwindIncomplete`` saying what was kept.
     """
+    import hashlib
+
     root = Path(library_root).resolve(strict=True)
     source = Path(os.path.abspath(source))
     destination = Path(os.path.abspath(destination))
@@ -235,110 +452,109 @@ def stage_no_replace(source: Path, destination: Path, *, library_root: Path, all
     if source_parent.resolve(strict=True) != source_parent:
         raise OSError("the source media directory contains a symlink")
 
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    root_fd = os.open(root, directory_flags)
-    source_parent_fd = destination_parent_fd = source_fd = None
-    destination_created = False
+    root_fd = os.open(root, _DIRECTORY_FLAGS)
+    source_parent_fd = destination_parent_fd = source_fd = destination_fd = None
+    created = None                 # (device, inode) of the destination entry this call created
+    handed_over = False
     try:
         try:
             os.mkdir(category_code, mode=0o755, dir_fd=root_fd)
         except FileExistsError:
             pass
-        destination_parent_fd = os.open(category_code, directory_flags, dir_fd=root_fd)
+        destination_parent_fd = os.open(category_code, _DIRECTORY_FLAGS, dir_fd=root_fd)
         # Refuse a symlink/path substitution between the descriptor-relative open and its pathname.
         if _inode_witness(os.lstat(destination.parent)) != _inode_witness(os.fstat(destination_parent_fd)):
             raise OSError("the destination category directory is not a stable directory beneath the library root")
 
-        source_parent_fd = os.open(source_parent, directory_flags)
-        source_fd = os.open(
-            source.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=source_parent_fd,
-        )
+        source_parent_fd = os.open(source_parent, _DIRECTORY_FLAGS)
+        source_fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=source_parent_fd)
         source_info = os.fstat(source_fd)
         if not stat.S_ISREG(source_info.st_mode):
             raise OSError("the source media is not a regular file")
         if _entry_witness(source_parent_fd, source.name) != _stat_witness(source_info):
             raise OSError("the source media changed while relocation was staged")
+        source_identity = _identity(source_info)
 
         try:
-            os.link(
-                source.name, destination.name,
-                src_dir_fd=source_parent_fd, dst_dir_fd=destination_parent_fd,
-                follow_symlinks=False,
-            )
-            destination_created = True
-            linked = os.stat(destination.name, dir_fd=destination_parent_fd, follow_symlinks=False)
-            if not stat.S_ISREG(linked.st_mode) or (linked.st_dev, linked.st_ino) != (
-                    source_info.st_dev, source_info.st_ino):
-                raise OSError("the source media changed while its hard link was created")
+            os.link(source.name, destination.name, src_dir_fd=source_parent_fd, dst_dir_fd=destination_parent_fd,
+                    follow_symlinks=False)
+            linked = True
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
+            linked = False
+        if linked:
+            created = source_identity                # the entry this call made names the source's inode
+            observed = os.stat(destination.name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(observed.st_mode) or _identity(observed) != source_identity:
+                raise OSError("the staged destination was replaced right after its creation")
+            destination_identity = source_identity
+        else:
             if not allow_copy:
                 raise CrossFilesystemRefused(
                     errno.EXDEV, "the destination folder is on another filesystem; a cross-filesystem move is "
-                                 "not supported here") from None
-            destination_fd = os.open(
-                destination.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                source_info.st_mode & 0o777,
-                dir_fd=destination_parent_fd,
-            )
-            destination_created = True
-            try:
-                while True:
-                    chunk = os.read(source_fd, 1024 * 1024)
-                    if not chunk:
-                        break
-                    view = memoryview(chunk)
-                    while view:
-                        view = view[os.write(destination_fd, view):]
-                os.fsync(destination_fd)
-            finally:
-                os.close(destination_fd)
-            os.utime(
-                destination.name,
-                ns=(source_info.st_atime_ns, source_info.st_mtime_ns),
-                dir_fd=destination_parent_fd,
-                follow_symlinks=False,
-            )
+                                 "not supported here")
+            destination_fd = os.open(destination.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     source_info.st_mode & 0o777, dir_fd=destination_parent_fd)
+            created = destination_identity = _identity(os.fstat(destination_fd))
+            before = os.fstat(source_fd)
+            written, digest = 0, hashlib.sha256()
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    count = os.write(destination_fd, view)
+                    view = view[count:]
+                    written += count
+            os.fsync(destination_fd)
+            after = os.fstat(source_fd)
+            if StagedMediaRelocation._state(before) != StagedMediaRelocation._state(after) or written != after.st_size:
+                raise OSError("the source media changed while it was being copied")
+            check, offset = hashlib.sha256(), 0
+            while True:                              # the copy, read back through its own descriptor
+                chunk = os.pread(destination_fd, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                check.update(chunk)
+                offset += len(chunk)
+            if offset != written or check.digest() != digest.digest():
+                raise OSError("the copied media does not match the source")
+            os.utime(destination_fd, ns=(source_info.st_atime_ns, source_info.st_mtime_ns))
+            observed = os.stat(destination.name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(observed.st_mode) or _identity(observed) != destination_identity:
+                raise OSError("the staged copy was replaced while it was written")
 
-        source_witness = _entry_witness(source_parent_fd, source.name)
-        if not stat.S_ISREG(source_witness[2]) or _content_witness(
-                os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)) != _content_witness(source_info):
+        source_now = os.fstat(source_fd)
+        if (source_now.st_size, source_now.st_mtime_ns) != (source_info.st_size, source_info.st_mtime_ns):
             raise OSError("the source media changed while relocation was staged")
-        destination_witness = _entry_witness(destination_parent_fd, destination.name)
-        if not stat.S_ISREG(destination_witness[2]) or destination_witness[3] != source_info.st_size:
-            raise OSError("the staged destination is not a regular file")
-
         staged = StagedMediaRelocation(
-            source, destination, source_parent_fd, destination_parent_fd,
-            source_witness, destination_witness,
-        )
-        try:
-            staged.verify_destination_binding()
-        except BaseException:
-            staged.remove_destination()
-            staged.close()
-            source_parent_fd = destination_parent_fd = None
-            destination_created = False
-            raise
-        source_parent_fd = destination_parent_fd = None
+            source=source, destination=destination, root=str(root), root_fd=root_fd,
+            source_parent_fd=source_parent_fd, destination_parent_fd=destination_parent_fd, source_fd=source_fd,
+            destination_fd=destination_fd, source_identity=source_identity, destination_identity=destination_identity,
+            source_state=StagedMediaRelocation._state(source_now),
+            destination_state=StagedMediaRelocation._state(os.fstat(destination_fd)) if destination_fd is not None
+            else StagedMediaRelocation._state(source_now))
+        staged.verify()
+        handed_over = True
         return staged
-    except BaseException:
-        if destination_created and destination_parent_fd is not None:
-            try:
-                os.unlink(destination.name, dir_fd=destination_parent_fd)
-            except FileNotFoundError:
-                pass
+    except BaseException as exc:
+        if created is not None and destination_parent_fd is not None:
+            outcome, explanation, _location = remove_entry(
+                str(root), root_fd, destination_parent_fd, destination.name, created,
+                context={"role": "staged destination (staging failed)", "source": str(source),
+                         "destination": str(destination), "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+            if outcome not in ENTRY_GONE and outcome != ENTRY_FOREIGN_RESTORED:
+                raise StagingUnwindIncomplete(
+                    errno.EIO, f"{exc}; the staged destination {destination} was not removed: {explanation}") from exc
         raise
     finally:
-        if source_fd is not None:
-            os.close(source_fd)
-        if source_parent_fd is not None:
-            os.close(source_parent_fd)
-        if destination_parent_fd is not None:
-            os.close(destination_parent_fd)
-        os.close(root_fd)
+        if not handed_over:
+            for fd in (source_fd, destination_fd, source_parent_fd, destination_parent_fd, root_fd):
+                if fd is not None:
+                    os.close(fd)
 
 
 def validate_category_storage_component(value):
@@ -516,8 +732,9 @@ def future_log_hours(track_id, now) -> int:
 
 # --------------------------------------------------------------------------- the operation
 
-def _remove_old_entry(staged, source, using) -> tuple[str, str]:
-    """After commit: unlink the old directory entry under its path lock, only while no Track names it."""
+def _remove_old_entry(staged, source, using) -> tuple[str, str, str | None]:
+    """After commit: remove the old directory entry under its path lock, only while no Track names that path, and
+    only through the identity-safe removal (``StagedMediaRelocation.remove_source``)."""
     from library.models import Track
     from library.services import source_paths
     try:
@@ -526,17 +743,23 @@ def _remove_old_entry(staged, source, using) -> tuple[str, str]:
                 source_paths.acquire(source, using, timeout_ms=CLEANUP_LOCK_TIMEOUT_MS)
             except OperationalError:
                 return CLEANUP_RETAINED_BUSY, ("the old file entry was kept: another operation held its path; "
-                                               "remove it by hand after checking no Track uses it")
+                                               "remove it by hand after checking no Track uses it"), None
             if Track._base_manager.using(using).filter(filepath=source).exists():
-                return CLEANUP_RETAINED_OWNER, "the old file entry was kept: another Track now names that path"
+                return CLEANUP_RETAINED_OWNER, "the old file entry was kept: another Track now names that path", None
             try:
-                staged.remove_source()
+                outcome, explanation, location = staged.remove_source()
             except OSError as exc:
-                return CLEANUP_RETAINED_CHANGED, f"the old file entry was kept: {exc}"
+                return CLEANUP_RETAINED_CHANGED, f"the old file entry was kept: {exc}", None
     except Exception as exc:                  # never fail a committed move because its cleanup failed
         log.warning("relocation cleanup of %s failed: %s", source, type(exc).__name__)
-        return CLEANUP_FAILED, f"the old file entry could not be removed ({type(exc).__name__}: {exc})"
-    return CLEANUP_REMOVED, ""
+        return CLEANUP_FAILED, f"the old file entry could not be removed ({type(exc).__name__}: {exc})", None
+    if outcome in ENTRY_GONE:
+        return CLEANUP_REMOVED, "", None
+    if outcome == ENTRY_QUARANTINED:
+        return CLEANUP_QUARANTINED, f"the old file entry: {explanation}", location
+    if outcome == ENTRY_FOREIGN_RESTORED:
+        return CLEANUP_RETAINED_CHANGED, f"the old file entry: {explanation}", None
+    return CLEANUP_RETAINED_UNSAFE, f"the old file entry: {explanation}", None
 
 
 def execute(*, track_id, source, destination, origin, user, write, check=None, expected_witness=None,
@@ -594,11 +817,12 @@ def execute(*, track_id, source, destination, origin, user, write, check=None, e
             if destination is not None:
                 staged = stage_no_replace(Path(source), Path(destination), library_root=Path(root),
                                           allow_copy=allow_copy)
-                linked = staged.source_witness
-                if witness is not None and (linked[0], linked[1], linked[3], linked[4]) != (
-                        witness[0], witness[1], witness[2], witness[3]):
+                # The staged inode must be the witnessed recording (the source descriptor's identity and content
+                # metadata; the link itself changes only its ctime and link count).
+                if witness is not None and (staged.source_identity != (witness[0], witness[1])
+                                            or staged.source_state[:2] != (witness[2], witness[3])):
                     raise Stop(STALE, "The Track's file was replaced while it was being moved.")
-                staged.verify_destination_binding()
+                staged.verify()
             extra = write(track, destination or source)
             if extra:
                 result.detail.update(extra)
@@ -606,8 +830,9 @@ def execute(*, track_id, source, destination, origin, user, write, check=None, e
             if stored != (destination or source):
                 raise RuntimeError("the Track row does not name the expected file path after the update")
             if staged is not None:
-                # Catch deterministic directory/path substitution after staging but before commit.
-                staged.verify_destination_binding()
+                # Immediately before commit: the source is still the authorized recording at its path, and the
+                # destination directory and entry are still the staged object (fixed identities).
+                staged.verify()
             body_done = True
     except BaseException as exc:
         if body_done and not committed[0]:
@@ -628,14 +853,20 @@ def execute(*, track_id, source, destination, origin, user, write, check=None, e
         if not committed[0]:
             if staged is not None:
                 try:
-                    staged.remove_destination()
+                    outcome, explanation, location = staged.remove_destination()
                 except BaseException as restore_exc:
-                    result.cleanup = CLEANUP_DESTINATION_RETAINED
-                    result.cleanup_message = (f"the staged entry {staged.destination} could not be removed safely "
-                                              f"({restore_exc}); the original remains at {staged.source}")
+                    outcome, explanation, location = ENTRY_NOT_MOVED, f"it was left in place ({restore_exc})", None
                 finally:
                     staged.close()
+                if outcome not in ENTRY_GONE and outcome != ENTRY_FOREIGN_RESTORED:
+                    result.cleanup = CLEANUP_DESTINATION_RETAINED
+                    result.cleanup_location = location
+                    result.cleanup_message = (f"the staged entry {staged.destination} was not removed: {explanation}; "
+                                              f"the original remains at {staged.source}")
                 staged = None
+            elif isinstance(exc, StagingUnwindIncomplete):
+                result.cleanup = CLEANUP_DESTINATION_RETAINED
+                result.cleanup_message = str(exc)
             if not isinstance(exc, Exception):
                 raise
             result.outcome, result.message = _failure(exc, destination)
@@ -657,7 +888,7 @@ def execute(*, track_id, source, destination, origin, user, write, check=None, e
         result.message = result.message or "Updated; the file was not moved."
     else:
         try:
-            result.cleanup, result.cleanup_message = _remove_old_entry(staged, source, using)
+            result.cleanup, result.cleanup_message, result.cleanup_location = _remove_old_entry(staged, source, using)
         finally:
             staged.close()
         if result.cleanup == CLEANUP_REMOVED:
@@ -702,4 +933,6 @@ def _audit(result, origin, user, extra) -> None:
                 "from": library_audit.library_relative(result.source),
                 "to": library_audit.library_relative(result.destination) if result.destination else None,
                 "committed": result.committed, "cleanup": result.cleanup or None,
+                "cleanup_location": library_audit.library_relative(result.cleanup_location)
+                if result.cleanup_location else None,
                 "reason": result.message[:300], **(extra or {}), **result.detail})
