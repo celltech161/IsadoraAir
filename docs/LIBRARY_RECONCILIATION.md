@@ -76,7 +76,7 @@ scan runs at a time (`flock`).
 | `unregistered` | A supported audio file no Track names. |
 | `moved` | A missing Track with candidate files: same basename, or same byte size as its cache's source witness, with the same extension; at most 5. More than 5 is uncertain. |
 | `duplicate` | A group, with a confidence (B2). |
-| `category_drift` | The file's first folder under the root is not the Track's primary category code. |
+| `category_drift` | The file's first folder under the root is not the Track's primary category code. Records `drift` evidence for a repair (see Category drift below). |
 | `shared_source` | Several Tracks or files on one inode (hardlinks), or a Track path that is not canonical (a symlink or `..` alias). |
 | `protected` | See ownership boundaries. |
 | `in_delivery` | An unregistered or registered file changed within the last 60 seconds. |
@@ -435,6 +435,164 @@ apply.
 
 Verified deletions record neither field.
 
+## Category drift: review and resolve (3.11)
+
+A Category is a programming decision; a folder is a storage location. When a Track's file is in a first-level
+folder other than its primary Category's code (`category_drift`), the operator decides which one is right. The
+page then carries out exactly that choice through the same guarded file and Track machinery as Track Detail and
+the bulk editor (`library.services.media_relocation`). Nothing is guessed, nothing falls back silently, and
+nothing is repaired automatically.
+
+### The choices, per finding
+
+| Choice | What changes | What never changes |
+|---|---|---|
+| **A — Move file to primary Category** | The file moves to `LIBRARY_ROOT/<primary Category code>/<the same file name>`, and `Track.filepath` follows. This is also the repair when a Category changed but the file was left behind. | The primary and additional Categories, and everything else about the Track. |
+| **B — Change primary Category to match folder** | The primary Category becomes the existing Category whose code is exactly the folder's name. An additional membership that would duplicate the new primary is dropped. The old primary is added as an additional Category only if the operator ticks *also keep* (previewed and audited). | The file: it is not moved, transcoded or rewritten. |
+| **C — No action / defer** | Nothing; nothing is selected by default. | — |
+
+* **A is unavailable** when the primary Category's code cannot be a folder name (one component: no `/`, `.`,
+  `..` or NUL).
+* **B is unavailable** when the file is in the Library root, or no Category's code matches its folder exactly
+  (case-sensitive). No Category is ever created.
+* **Neither guesses** a Category from artist, genre, album, file name or tags.
+
+### Evidence
+
+* **What the scan records.** Each `category_drift` finding records `drift`:
+  * the folder and the primary Category code and id;
+  * the walked file's absolute and relative path;
+  * the six-field witness (device, inode, size, mtime, ctime, link count);
+  * the Track's `filepath`, `filename` and `category_id`.
+
+  That is the walk's own metadata: no extra read, and the scan still writes nothing.
+* **Older reports.** A report without `drift` (an earlier version's), or with malformed evidence, stays review
+  only: run reconciliation again.
+* **Only the latest complete scan.** A `suspect` or failed scan authorizes nothing.
+
+### Preview
+
+The preview takes at most 25 findings (one page), writes nothing and rechecks everything against the current
+state. It reports, per finding:
+
+* the Track's id, title and artist;
+* the old and new primary Category, including a change of content kind;
+* the current folder and path, and the destination path (A) or target Category (B);
+* additional-Category changes;
+* each blocking reason, and warnings.
+
+Totals: selected, eligible, refused, already resolved, expected moves, expected Category changes, destination
+collisions, scheduling conflicts and files requiring review.
+
+**Blocked** (with the exact reason):
+
+* **The Track changed.** Its path, file name or primary Category is no longer what the scan saw.
+* **The file is not safe to move.**
+  * It is no longer exactly the file the scan walked (path and witness).
+  * It is not a canonical, non-empty, readable regular file inside the Library (symlinks are never followed).
+  * It is shared (a link count above 1), changed within the last minute (in delivery), owned by another
+    subsystem (spoken projection, Active Messages) or remote-hosted.
+* **The destination is not free.** A file exists there (never overwritten, renamed or numbered), another
+  Track names it, or the Category folder is not a plain directory.
+* **The move would cross filesystems.** Moves across filesystems are refused here.
+* **The engine may be playing it, or about to.** Any of:
+  * it is loaded on a deck, in the engine's queue, or claimed by the engine;
+  * it started recently;
+  * it is in an unplayed entry of the current or next local log hour, or of the engine's active log (the
+    engine holds those Track rows in memory);
+  * the engine's state cannot be confirmed (missing, stale, malformed).
+
+  A healthy Track can therefore be ineligible for a while: retry later. Historical log entries never block.
+
+Later approved log hours are a warning: their existing entries are never rewritten or rebuilt. B also explains
+that future scheduling will select the Track under its new Category.
+
+Each eligible repair gets its own token:
+
+* signed (`django.core.signing`, salt `library.reconciliation.category_drift.v1`);
+* operator-bound, expiring after ten minutes, and spent on first use (a claim row in `django_session`, prefix
+  `driftfix:`);
+* binding the scan and finding, the Track, the direction, the source path and witness, the destination (A) or
+  target Category (B), the additional-Category changes and the Track's fingerprint (its additional Categories
+  included).
+
+A token for A can never authorize B, another Track or another destination. The apply request's own fields are
+never trusted.
+
+### Apply
+
+* **One Track per request.** The page sends a confirmed batch one repair at a time.
+* **Bounded waits.** Each request's lock waits are bounded (3 s in all, `LOCK_BUDGET_SECONDS`).
+* **Guarded and audited.** Each repair is one `media_relocation.execute`; every outcome is audited.
+
+**Outcomes:**
+* `moved` (A) or `updated` (B);
+* `unchanged`: already resolved, nothing written;
+* `stale`, `refused`, `collision`, `busy`, `failed_before_commit`: nothing changed;
+* `committed_cleanup_required`: the move committed and is valid, but the old directory entry needs the operator;
+* `uncertain`: the database did not confirm the commit; both entries were kept.
+
+**The page stops the batch on:**
+* any 5xx;
+* a lost or unreadable answer;
+* `committed_cleanup_required` or `uncertain` (`stop_batch`).
+
+It never retries. Afterwards the selection is cleared and the findings are reloaded: a fresh view is required
+before another batch. A finding disappears only at the next scan, once the Track's Category and its file's
+folder actually agree.
+
+### Filtering, grouping and bounded selection
+
+* **Filters.** With *Type: category_drift*, the page filters by current folder and/or primary Category
+  (`folder`, `category`) and can group by folder → Category (`sort=mismatch`).
+* **Groups.** It lists the largest folder → Category groups with their counts; the response carries at most 100.
+* **Bounded selection.** *Select visible: move files* or *Select visible: change Category* applies one
+  explicitly chosen direction to the visible findings that offer it: at most one page (25). There is no
+  "Fix all".
+
+### The shared relocation service (`library.services.media_relocation`)
+
+The one implementation of moving a Track's audio, used by Track Detail, this page and the bulk editor. It
+provides the mechanics; each caller keeps its own authority and evidence, and passes in its own checks and row
+changes. One Track, one short transaction (`durable`), in this order:
+
+1. **Locks.** The source's and destination's path registration locks, sorted (`source_paths`), then the Track
+   row. This is the canonical order, now also used by Track Detail.
+2. **Checks under the locks.** The Track still names the source. The source checks: canonical path, regular,
+   non-empty, the expected witness, and for strict callers a link count of 1, not in delivery, readable and
+   not protected. The destination checks: free, plain folder, same filesystem. Then the caller's own checks.
+3. **Stage.** A second directory entry for the same inode, created relative to descriptors of the Library
+   root and the Category folder (`O_NOFOLLOW`), its identity verified. Strict callers refuse `EXDEV`;
+   Track Detail keeps its accepted copy fallback.
+4. **Write.** The caller's row changes with the new path; the row is read back and the destination binding
+   verified again.
+5. **Commit.**
+   * A failure before commit rolls back and removes only the staged entry; the original is never touched.
+   * A failure at commit leaves the outcome unknown: both entries are kept and the result is `uncertain`.
+6. **Cleanup.** In its own transaction, holding the old path's lock (2 s), with no Track naming the old path
+   and the old entry still the same inode, the old entry is unlinked. Anything else is
+   `committed_cleanup_required`.
+
+A move preserves the audio exactly: the inode moves. It changes the path future playback opens, so the
+playout checks above apply to strict callers.
+
+**Track Detail.**
+* *Kept from r0112:* its authority, strictness and copy fallback, its marker-edit checks before any file
+  operation, and its responses.
+* *Lock order:* it decides the paths from the current row and then takes path locks before the row lock (the
+  documented r0112 exception is gone). A Category changed concurrently is refused with 409 instead of being
+  filed into the wrong folder.
+* *Fix:* choosing the Category whose folder already holds the file is now a category-only change. In r0129 it
+  failed, because the file collided with itself.
+
+**Waveform caches.**
+* *Effect of a move.* A moved file's cache records the old path and ctime, so it shows as **unverified** until
+  Reanalyze Track decodes the file again. Repick and Reset Cue Points wait until then.
+* *What is untouched.* Cue points, their locks, revisions and approvals; playback; and the cache file itself
+  (never rewritten).
+* *Many moves.* Hundreds of moved Tracks mean as many Reanalyze Track runs before Repick works on them again;
+  playout and existing cue points are unaffected. There is no bulk reanalysis here.
+
 ## Operating it
 
 Run a scan as the station's service account, so the web application can read the report:
@@ -615,7 +773,8 @@ was 31,783 bytes and expanded 50 members while reporting the exact 4,000-member 
 ## Not covered by Phase B
 
 * **No bulk relink, no import of unregistered files** (use the existing Import workflow), and no cleanup or
-  garbage collection of any file.
+  garbage collection of any file. Category drift is repaired only by the operator's explicit choice per finding
+  (above); `find_category_drift --apply` is a separate historical command, not the page's authority.
 * **No deletion decisions in Phase B.** Phase B records only "not a duplicate"; deletion of an exact
   two-Track duplicate is the 3.12 workflow above.
 * **`apply_duplicate_resolutions` deficiencies remain** (see B0). The 3.12 workflow does not use it and
@@ -644,6 +803,10 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
 | `reconciliation.duplicate_delete` (3.12, one per deleted Track) | `deleted` | info |
 | `reconciliation.duplicate_resolution` (3.12, one per apply request, i.e. per pair) | `deleted`, `recorded`, `already_decided` | info |
 | `reconciliation.duplicate_resolution` | `blocked`, `stale`, `needs_acknowledgment`, `failed`, `refused` (an expired, spent, foreign, unconfirmed or outdated token) | warning |
+| `relocation.track` (3.11, one per Track: Track Detail moves, category-drift repairs, bulk-edit moves) | `moved`, `updated`, `unchanged` | info |
+| `relocation.track` | `stale`, `refused`, `collision`, `busy`, `failed_before_commit` | warning |
+| `relocation.track` | `committed_cleanup_required`, `uncertain` | error |
+| `reconciliation.category_drift` | `refused` (an expired, spent, foreign, unconfirmed or outdated token) | warning |
 
 **Every event carries:**
 * `action_id`, which is also its `dedupe_key` (`library|audit|<action>|<action_id>`), so two operations are never
@@ -668,6 +831,16 @@ through `library.services.library_audit`. They are shown in /monitoring/ Recent 
   * the categories added and the number of voice tracks deleted.
 
   It is written only if that pair's transaction committed.
+* `relocation.track`:
+  * the origin (`track_detail`, `reconciliation` or `bulk_edit`) and the Track id;
+  * the old and new path relative to `LIBRARY_ROOT`;
+  * whether it committed, the cleanup status and the reason;
+  * for a reconciliation repair, the operation, direction, scan, finding, witness, preview digest and the
+    old/new Categories (`file_moved` says whether a file moved); for a bulk move, the witness and the new
+    Category.
+
+  `bulk_edit.apply` also records `file_location` and the moved, cleanup-required, uncertain and not-attempted
+  counts.
 * `reconciliation.duplicate_resolution`: the scan, the finding, the resolution (`delete` or `keep_both`) and the
   pair's Track ids, or for a refusal, the reason. A manual editorial deletion also records
   `authority: manual_editorial` and the cleanup status.

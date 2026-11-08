@@ -94,7 +94,10 @@
   <label><input type="checkbox" id="openOnly" checked> Open duplicate groups only</label>
 </div>
 
+<div class="rc-filters" id="driftTools" hidden></div>
 <div class="rc-box rc-dialog" id="navGuard" role="alert" hidden></div>
+<div class="rc-box" id="driftBar" role="status" aria-live="polite" hidden></div>
+<div class="rc-box rc-dialog" id="driftPanel" hidden></div>
 <div class="rc-box" id="resolveBar" role="status" aria-live="polite" hidden></div>
 <div class="rc-box rc-dialog" id="resolvePanel" hidden></div>
 <div id="findings"></div>
@@ -1190,6 +1193,352 @@ function renderResults(data) {
   showResolve(nodes);
 }
 
+// ---- Category drift (3.11): the operator decides, per finding, whether the Category (A: move the file to its
+// folder) or the folder (B: change the primary Category to the folder's) is right, or does nothing (C). Nothing is
+// chosen by default. A preview rechecks everything on the server and returns one single-use token per repair; a
+// confirmed batch (at most one findings page) is then sent one repair per request, in order, and stops on any
+// answer that leaves the outcome unknown. After a batch the selection is cleared and the findings reloaded: an old
+// selection is never applied to a changed report.
+let driftChoices = new Map(), driftGen = 0, driftBusy = false, driftFilter = { folder: null, category: null, sort: false };
+let driftGroups = null, driftVisible = [];
+
+// drift:begin -- pure helpers (tested under Node).
+function driftSelectionsPayload(map) {
+  return [...map.entries()].map(([finding_id, c]) => ({ finding_id, direction: c.direction,
+    ...(c.direction === 'set_category' ? { keep_old_primary: c.keepOld === true } : {}) }));
+}
+// The confirmed batch, in preview order: one apply request per included eligible repair, each with its own token.
+function driftQueue(preview, include) {
+  const send = [], cancelled = [];
+  preview.items.forEach(item => {
+    if (item.status !== 'eligible' || !item.token) return;
+    if (include.get(item.finding_id) === false) {
+      cancelled.push({ finding_id: item.finding_id, direction: item.direction, outcome: 'cancelled',
+                       message: 'Cancelled: nothing was changed.' });
+      return;
+    }
+    send.push({ finding_id: item.finding_id, direction: item.direction, token: item.token });
+  });
+  return { send, cancelled };
+}
+// One repair's answer: its result, a refusal (4xx: nothing was applied), or null when the answer was lost,
+// unreadable or a 5xx -- whether it was applied is then unknown and the batch stops.
+function driftAnswer(job, resp, data) {
+  if (resp.ok) return data && data.item ? data.item : null;
+  if (!resp.status || resp.status >= 500) return null;
+  return { finding_id: job.finding_id, direction: job.direction, outcome: 'refused',
+           message: 'Not applied: ' + ((data && data.error) || `HTTP ${resp.status}`) };
+}
+// An item the operator must look at before anything else happens (committed but its old file entry needs
+// attention, or an unconfirmed commit) also stops the batch.
+function driftStops(item) { return item === null || item.stop_batch === true; }
+// drift:end
+
+const DRIFT_TEXT = { move_file: 'Move file to primary Category', set_category: 'Change primary Category to match folder' };
+const DRIFT_OUTCOME = {
+  moved: 'Moved', updated: 'Category changed', unchanged: 'Already resolved', stale: 'Changed since the preview',
+  refused: 'Refused', collision: 'Destination collision', busy: 'Busy', failed_before_commit: 'Failed (nothing changed)',
+  committed_cleanup_required: 'Moved — old file entry needs attention', uncertain: 'Uncertain (check this Track)',
+  cancelled: 'Cancelled', unknown: 'Unknown (no answer)', not_attempted: 'Not attempted',
+};
+const DRIFT_APPLY_URL = '/api/tracks/reconciliation/drift/apply/';
+
+function catText(c) { return c ? `${c.code}${c.name ? ' — ' + c.name : ''}${c.kind ? ' (' + c.kind + ')' : ''}` : '—'; }
+
+function renderDrift(card, f) {
+  const r = f.drift_review || {};
+  const d = f.drift || {};
+  card.append(trackTable([{}], [
+    ['Primary Category', () => catText(r.category)], ['Current folder', () => (r.folder === null || r.folder === undefined)
+      ? '—' : (r.folder || '(Library root)')],
+    ['Folder’s Category', () => (r.set_category || {}).category ? catText(r.set_category.category) : 'none'],
+    ['Move destination', () => (r.move || {}).destination || '—'],
+  ]));
+  if (d.rel) card.append(el('p', 'Current file: ' + d.rel, 'rc-code'));
+  if (!r.evidence) { card.append(el('p', 'Review only: ' + (r.reason || 'no repair evidence') + '.', 'rc-warn')); return; }
+  const box = el('fieldset', undefined, 'rc-resolve');
+  box.append(el('legend', 'Resolve'));
+  const current = driftChoices.get(f.id);
+  const keep = el('input');
+  keep.type = 'checkbox';
+  keep.checked = !!(current && current.keepOld);
+  keep.disabled = !(current && current.direction === 'set_category');
+  const options = [
+    ['move_file', `A — Move file to ${(r.category || {}).code || 'its Category'} folder` +
+      ((r.move || {}).destination ? ` (${r.move.destination})` : ''), r.move || {}],
+    ['set_category', `B — Change primary Category to ${((r.set_category || {}).category || {}).code || r.folder || '—'}`,
+     r.set_category || {}],
+    ['', 'C — No action / defer', { available: true }],
+  ];
+  options.forEach(([value, text, opt]) => {
+    const label = el('label', undefined, 'rc-choice');
+    const radio = el('input');
+    radio.type = 'radio';
+    radio.name = 'drift-' + f.id;
+    radio.value = value;
+    radio.disabled = !opt.available || driftBusy;
+    radio.checked = value ? !!(current && current.direction === value) : !current;
+    radio.addEventListener('change', () => {
+      if (!radio.checked) return;
+      if (value) driftChoices.set(f.id, { direction: value, keepOld: value === 'set_category' && keep.checked });
+      else driftChoices.delete(f.id);
+      keep.disabled = value !== 'set_category';
+      updateDriftBar();
+    });
+    label.append(radio, el('span', text + (opt.available ? '' : ` — unavailable: ${opt.reason || 'not offered'}`)));
+    box.append(label);
+  });
+  const keepLabel = el('label', undefined, 'rc-choice');
+  keep.addEventListener('change', () => {
+    const c = driftChoices.get(f.id);
+    if (c && c.direction === 'set_category') { c.keepOld = keep.checked; updateDriftBar(); }
+  });
+  keepLabel.append(keep, el('span', `With B: also keep ${(r.category || {}).code || 'the old primary Category'} as an additional Category`));
+  box.append(keepLabel);
+  box.append(el('p', 'A changes the path future playback opens (the Categories stay the same; the waveform shows as ' +
+                     'unverified until Reanalyze Track). B changes what the scheduler may select this Track for (the ' +
+                     'file stays where it is). Tracks on air or in the current or next hour are refused until later.', 'rc-muted'));
+  card.append(box);
+}
+
+function renderDriftTools(groups) {
+  const tools = document.getElementById('driftTools');
+  if (groups) driftGroups = groups;
+  if (document.getElementById('typeFilter').value !== 'category_drift' || !driftGroups) {
+    tools.hidden = true;
+    tools.replaceChildren();
+    return;
+  }
+  const folders = [...new Set(driftGroups.map(g => g.folder))].sort();
+  const cats = [...new Set(driftGroups.map(g => g.category))].sort();
+  const select = (label, values, current, apply) => {
+    const s = el('select');
+    s.setAttribute('aria-label', label);
+    const any = el('option', label + ': any');
+    any.value = '\u0000any';
+    s.append(any);
+    values.forEach(v => { const o = el('option', v || '(Library root)'); o.value = v; s.append(o); });
+    s.value = current === null ? '\u0000any' : current;
+    s.addEventListener('change', () => navigate(() => { page = 1; apply(s.value === '\u0000any' ? null : s.value); }));
+    return s;
+  };
+  const sortBox = el('input');
+  sortBox.type = 'checkbox';
+  sortBox.checked = driftFilter.sort;
+  sortBox.addEventListener('change', () => navigate(() => { page = 1; driftFilter.sort = sortBox.checked; }));
+  const sortLabel = el('label');
+  sortLabel.append(sortBox, el('span', ' Group by folder → Category'));
+  const row = [el('span', 'Drift:', 'rc-muted'),
+    select('Current folder', folders, driftFilter.folder, v => { driftFilter.folder = v; }),
+    select('Primary Category', cats, driftFilter.category, v => { driftFilter.category = v; }), sortLabel,
+    actionButton('Select visible: move files', () => selectVisibleDrift('move_file')),
+    actionButton('Select visible: change Category', () => selectVisibleDrift('set_category')),
+    actionButton('Clear drift selection', () => { driftChoices.clear(); updateDriftBar(); loadFindings(); })];
+  driftGroups.slice(0, 12).forEach(g => {
+    const chip = el('button', `${g.folder || '(root)'} → ${g.category} (${g.count})`, 'rc-chip');
+    chip.type = 'button';
+    chip.setAttribute('aria-pressed', String(driftFilter.folder === g.folder && driftFilter.category === g.category));
+    chip.addEventListener('click', () => navigate(() => { page = 1; driftFilter.folder = g.folder; driftFilter.category = g.category; }));
+    row.push(chip);
+  });
+  tools.replaceChildren(...row);
+  tools.hidden = false;
+}
+
+// One explicitly chosen direction for every visible finding that offers it (at most one page: 25 findings).
+function selectVisibleDrift(direction) {
+  if (driftBusy) return;
+  driftVisible.forEach(f => {
+    const r = f.drift_review || {};
+    if (((direction === 'move_file' ? r.move : r.set_category) || {}).available) driftChoices.set(f.id, { direction, keepOld: false });
+  });
+  updateDriftBar();
+  loadFindings();
+}
+
+function updateDriftBar() {
+  const bar = document.getElementById('driftBar');
+  const list = driftSelectionsPayload(driftChoices);
+  if (!list.length) { bar.replaceChildren(); bar.hidden = true; return; }
+  const moves = list.filter(s => s.direction === 'move_file').length;
+  const review = actionButton('Review category drift…', reviewDrift);
+  review.disabled = driftBusy;
+  bar.replaceChildren(el('span', `${list.length} category-drift finding(s) selected: ${moves} to move a file, ` +
+                                 `${list.length - moves} to change the primary Category.`), review,
+                      actionButton('Clear', () => { driftChoices.clear(); updateDriftBar(); loadFindings(); }));
+  bar.hidden = false;
+}
+
+function showDrift(nodes) {
+  const panel = document.getElementById('driftPanel');
+  panel.replaceChildren(...nodes);
+  panel.hidden = false;
+  panel.scrollIntoView({ block: 'nearest' });
+}
+function closeDriftButton(label) {
+  return actionButton(label || 'Close', () => { driftGen += 1; document.getElementById('driftPanel').hidden = true; });
+}
+
+async function reviewDrift() {
+  const selections = driftSelectionsPayload(driftChoices);
+  if (!selections.length || driftBusy) return;
+  const gen = ++driftGen;
+  driftBusy = true;
+  updateDriftBar();
+  showDrift([el('p', `Checking ${selections.length} finding(s) against the Library as it is now…`)]);
+  let result;
+  try {
+    result = await postJSON('/api/tracks/reconciliation/drift/preview/', { scan_id: scanId, selections });
+  } catch (e) {
+    result = { resp: { ok: false, status: 0 }, data: {} };
+  }
+  driftBusy = false;
+  updateDriftBar();
+  if (gen !== driftGen) return;
+  if (!result.resp.ok) {
+    showDrift([el('p', 'Not previewed, nothing was changed: ' + (result.data.error || 'no answer from the server.'), 'rc-bad'),
+               closeDriftButton()]);
+    return;
+  }
+  renderDriftPreview(result.data);
+}
+
+const DRIFT_STATUS = { eligible: 'Can be applied', blocked: 'Blocked', already_resolved: 'Already resolved' };
+
+function renderDriftPreview(data) {
+  const c = data.counts;
+  const include = new Map();
+  const nodes = [el('p', `Selected ${c.selected}: ${c.eligible} eligible, ${c.refused} refused, ${c.already_resolved} ` +
+    `already resolved. Expected: ${c.expected_moves} file move(s), ${c.expected_category_changes} Category change(s). ` +
+    `${c.destination_collisions} destination collision(s), ${c.scheduling_conflicts} scheduling conflict(s), ` +
+    `${c.files_requiring_review} file(s) requiring review.`)];
+  data.items.forEach(item => {
+    const card = el('div', undefined, 'rc-card');
+    const head = el('h3');
+    head.append(el('span', DRIFT_STATUS[item.status] || item.status, 'rc-badge'));
+    head.append(el('span', `${DRIFT_TEXT[item.direction] || item.direction} — finding ${item.finding_id}`));
+    card.append(head);
+    const t = item.track;
+    if (t) {
+      card.append(trackTable([t], [['Track', x => trackLink(x)], ['Title', x => x.title], ['Artist', x => x.artist],
+        ['File', x => x.rel]]));
+      if (item.direction === 'move_file' && item.destination) {
+        card.append(el('p', `Moves to ${item.destination}. Primary Category stays ${catText(item.category_from)}; ` +
+                            'additional Categories are unchanged.'));
+      } else if (item.direction === 'set_category' && item.category_to) {
+        card.append(el('p', `Primary Category: ${catText(item.category_from)} → ${catText(item.category_to)}. The file stays where it is.`));
+        (item.additional_add || []).forEach(a => card.append(el('p', `Adds ${a.code} as an additional Category (your choice).`)));
+      }
+    }
+    (item.reasons || []).forEach(r => card.append(el('p', r, 'rc-bad')));
+    (item.warnings || []).forEach(w => card.append(el('p', w, 'rc-warn')));
+    if (item.status === 'eligible') {
+      const label = el('label', undefined, 'rc-choice');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = true;
+      box.addEventListener('change', () => { include.set(item.finding_id, box.checked); refresh(); });
+      label.append(box, el('span', 'Include this repair (untick to cancel it)'));
+      card.append(label);
+    }
+    nodes.push(card);
+  });
+  const confirmBox = el('input');
+  confirmBox.type = 'checkbox';
+  const applyBtn = actionButton('Apply', () => applyDrift(data, include, confirmBox.checked));
+  const confirmLabel = el('label', undefined, 'rc-choice');
+  const refresh = () => {
+    const n = driftQueue(data, include).send.length;
+    confirmLabel.replaceChildren(confirmBox, el('span', `I have reviewed these ${n} repair(s): files are moved or primary ` +
+      'Categories changed exactly as shown above, one Track at a time.'));
+    applyBtn.textContent = `Apply ${n} repair(s)`;
+    applyBtn.disabled = !n || !confirmBox.checked || driftBusy;
+  };
+  confirmBox.addEventListener('change', refresh);
+  const row = el('div', undefined, 'rc-actions');
+  if (c.eligible) {
+    row.append(applyBtn, actionButton('Re-check', reviewDrift), closeDriftButton('Cancel'));
+    nodes.push(confirmLabel, row);
+    refresh();
+  } else {
+    row.append(actionButton('Re-check', reviewDrift), closeDriftButton());
+    nodes.push(el('p', 'Nothing in this selection can be applied now.', 'rc-warn'), row);
+  }
+  showDrift(nodes);
+}
+
+async function applyDrift(preview, include, confirmed) {
+  if (driftBusy) return;
+  const { send, cancelled } = driftQueue(preview, include);
+  driftGen += 1;
+  driftBusy = true;
+  updateDriftBar();
+  const results = [...cancelled];
+  let processed = 0, stopped = '';
+  for (let i = 0; i < send.length; i += 1) {
+    const job = send[i];
+    showDrift([el('p', `Applying one repair at a time: ${processed} of ${send.length} processed…`)]);
+    let result;
+    try {
+      result = await postJSON(DRIFT_APPLY_URL, { token: job.token, confirm: confirmed === true });
+    } catch (e) {
+      result = { resp: { ok: false, status: 0 }, data: {} };
+    }
+    const item = driftAnswer(job, result.resp, result.data);
+    if (item === null) {
+      stopped = 'unknown';
+      results.push({ finding_id: job.finding_id, direction: job.direction, outcome: 'unknown',
+                     message: (result.resp.status ? `Uncertain answer from the server (HTTP ${result.resp.status})`
+                                                  : 'No answer from the server') +
+                              ': whether this repair was applied is not known. It is not retried automatically.' });
+    } else {
+      processed += 1;
+      results.push(item);
+      if (driftStops(item)) stopped = 'attention';
+    }
+    if (stopped) {
+      send.slice(i + 1).forEach(rest => results.push({ finding_id: rest.finding_id, direction: rest.direction,
+        outcome: 'not_attempted', message: 'Not sent: processing stopped at the repair above.' }));
+      break;
+    }
+  }
+  driftBusy = false;
+  driftChoices = new Map();                   // a fresh view of the current state is required before another batch
+  renderDriftResults({ scan_id: preview.scan_id, items: results, processed, total: send.length, stopped });
+  updateDriftBar();
+  loadFindings();
+}
+
+function renderDriftResults(data) {
+  const counts = {};
+  data.items.forEach(r => { counts[r.outcome] = (counts[r.outcome] || 0) + 1; });
+  const nodes = [el('p', `Processed ${data.processed} of ${data.total} repair(s). Result: ` +
+    Object.entries(counts).map(([k, n]) => `${DRIFT_OUTCOME[k] || k}: ${n}`).join(' · '), data.stopped ? 'rc-warn' : 'rc-ok')];
+  if (data.stopped === 'unknown') {
+    nodes.push(el('p', 'Stopped: the answer for one repair was lost or uncertain, so whether it was applied is not known, ' +
+                       'and the repairs after it were not sent. Check that Track before trying again.', 'rc-warn'));
+  } else if (data.stopped === 'attention') {
+    nodes.push(el('p', 'Stopped: one repair needs your attention (see below) before anything else is done.', 'rc-warn'));
+  }
+  data.items.forEach(r => {
+    const card = el('div', undefined, 'rc-card');
+    const head = el('h3');
+    head.append(el('span', DRIFT_OUTCOME[r.outcome] || r.outcome, 'rc-badge'));
+    head.append(el('span', `#${r.track_id || '?'} ${r.message || ''}`));
+    card.append(head);
+    if (r.outcome === 'moved' || r.outcome === 'committed_cleanup_required') {
+      card.append(el('p', `${r.source} → ${r.destination}`, 'rc-code'));
+    }
+    if (r.outcome === 'updated') card.append(el('p', `Primary Category ${r.category_from} → ${r.category_to}; the file was not moved.`));
+    if (r.cleanup_message) card.append(el('p', r.cleanup_message, r.attention ? 'rc-bad' : 'rc-warn'));
+    nodes.push(card);
+  });
+  nodes.push(el('p', `The findings below are still from scan ${data.scan_id} (a snapshot). Run reconciliation for a new ` +
+                     'scan: a repaired finding is gone only when its Track and file actually agree.', 'rc-muted'));
+  nodes.push(closeDriftButton());
+  showDrift(nodes);
+}
+
 // ---- Selections belong to the findings page on screen. A page, filter or search change with selections made
 // asks first: stay (the controls go back to the page shown) or discard them and continue. A search asks once the
 // typing pauses (the existing debounce), not on every keystroke.
@@ -1199,6 +1548,7 @@ function restoreFilters() {
   document.getElementById('search').value = shown.q;
   document.getElementById('openOnly').checked = shown.open;
   markChips();
+  renderDriftTools(null);
 }
 function showGuard(nodes) {
   const guard = document.getElementById('navGuard');
@@ -1214,8 +1564,8 @@ function applyFilters(f) {
 }
 function navigate(change) {
   const guard = document.getElementById('navGuard');
-  if (!choices.size) { guard.hidden = true; change(); loadFindings(); return; }
-  if (resolveBusy) {
+  if (!choices.size && !driftChoices.size) { guard.hidden = true; change(); loadFindings(); return; }
+  if (resolveBusy || driftBusy) {
     restoreFilters();
     showGuard([el('p', 'The selected pairs are being applied; change the page or filters when that has finished.', 'rc-warn')]);
     return;
@@ -1229,14 +1579,20 @@ function navigate(change) {
              actionButton('Discard selections and continue', () => {
                guard.hidden = true;
                choices = new Map();
+               driftChoices = new Map();
                resolveGen += 1;
+               driftGen += 1;
                document.getElementById('resolvePanel').hidden = true;
+               document.getElementById('driftPanel').hidden = true;
                updateResolveBar();
+               updateDriftBar();
                applyFilters(want);
                change();
                loadFindings();
              }));
-  showGuard([el('p', `${choices.size} duplicate selection(s) on this page have not been applied. Changing the page, ` +
+  const pending = [choices.size ? `${choices.size} duplicate selection(s)` : '',
+                   driftChoices.size ? `${driftChoices.size} category-drift selection(s)` : ''].filter(Boolean).join(' and ');
+  showGuard([el('p', `${pending} on this page have not been applied. Changing the page, ` +
                      'filter or search discards them.', 'rc-warn'), row]);
 }
 
@@ -1252,6 +1608,7 @@ function renderFinding(f) {
   if (f.track_ids && f.type === 'shared_source') card.append(el('p', 'Tracks: #' + f.track_ids.join(', #')));
   if (f.candidates) renderCandidates(card, f);
   if (f.type === 'duplicate') renderDuplicate(card, f);
+  if (f.type === 'category_drift') renderDrift(card, f);
   if (f.relink_candidate) card.append(el('p', 'This file is a relink candidate for a missing Track.', 'rc-muted'));
   return card;
 }
@@ -1260,12 +1617,17 @@ async function loadFindings() {
   const params = new URLSearchParams({ page, per_page: 25 });
   // With selections made, a refresh keeps the filters of the page shown: only navigate() (after asking) or a new
   // scan changes the page, so a control edited meanwhile never silently discards them.
-  const f = choices.size ? { ...shown } : { t: document.getElementById('typeFilter').value,
+  const f = (choices.size || driftChoices.size) ? { ...shown } : { t: document.getElementById('typeFilter').value,
     q: document.getElementById('search').value, open: document.getElementById('openOnly').checked };
   const t = f.t, q = f.q.trim();
   if (t) params.set('type', t);
   if (q) params.set('q', q);
   if (f.open) params.set('open', '1');
+  if (t === 'category_drift') {
+    if (driftFilter.folder !== null) params.set('folder', driftFilter.folder);
+    if (driftFilter.category !== null) params.set('category', driftFilter.category);
+    if (driftFilter.sort) params.set('sort', 'mismatch');
+  }
   const gen = ++findingsGen;
   let resp, data;
   try {
@@ -1282,7 +1644,19 @@ async function loadFindings() {
   shown = f;
   // Duplicate choices belong to one page of one scan: another page, filter or scan starts with none. Selections
   // are only ever dropped here when a newer scan replaced the report (or the page shown no longer exists): say so.
-  const scope = [data.scan_id, data.page, t, q, params.get('open') || ''].join('|');
+  const scope = [data.scan_id, data.page, t, q, params.get('open') || ''].join('|') +
+    (t === 'category_drift' ? '|' + [params.get('folder'), params.get('category'), params.get('sort')].join('|') : '');
+  if (scope !== choicesScope && driftChoices.size) {
+    // Category-drift selections belong to one page of one scan too.
+    const lostDrift = driftChoices.size;
+    driftChoices = new Map();
+    driftGen += 1;
+    document.getElementById('driftPanel').hidden = true;
+    updateDriftBar();
+    const ok = actionButton('OK', () => { document.getElementById('navGuard').hidden = true; });
+    showGuard([el('p', `The findings changed (a newer scan or another page), so your ${lostDrift} category-drift ` +
+                       'selection(s) were cleared. Nothing was applied.', 'rc-warn'), ok]);
+  }
   if (scope !== choicesScope) {
     const lost = choices.size, before = choicesScan;
     choicesScope = scope;
@@ -1300,7 +1674,10 @@ async function loadFindings() {
     }
   }
   if (!data.items.length) list.append(el('p', data.scan_id ? 'No findings match.' : 'No completed scan yet.', 'rc-muted'));
+  driftVisible = data.items.filter(f => f.type === 'category_drift');
   data.items.forEach(f => list.append(renderFinding(f)));
+  renderDriftTools(data.drift_groups || (t === 'category_drift' ? driftGroups : null));
+  if (t !== 'category_drift') { driftGroups = null; renderDriftTools(null); }
   document.getElementById('pageInfo').textContent = `Page ${page} of ${pages} (${data.total.toLocaleString()} findings)`;
   document.getElementById('prevBtn').disabled = page <= 1;
   document.getElementById('nextBtn').disabled = page >= pages;

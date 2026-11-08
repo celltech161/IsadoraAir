@@ -41,6 +41,11 @@ Every duplicate group of at most ``DUPLICATE_GROUP_LIMIT`` Tracks also records `
 duplicate-eligible member's path and walk witness (``Scanner.record_member_files``), the file identity an
 operator's manual editorial resolution of a pair is bound to (``library_duplicate_resolution``).  It is the walk's
 own metadata: no extra read.
+
+Every ``category_drift`` finding likewise records ``drift``: the folder and the primary Category the scan saw, the
+walked file's path, relative path and six-field witness, and the Track's ``filepath``/``filename``/``category_id``
+(``drift_fingerprint``) -- the evidence a category-drift repair (``library_category_drift``) is bound to.  A report
+without it (an earlier version's) stays review only.
 """
 from __future__ import annotations
 
@@ -265,6 +270,11 @@ def normalized_title(title) -> str:
 def track_fingerprint(row: dict) -> dict:
     """The Track fields a relink depends on, as the scan saw them."""
     return {key: row.get(key) for key in ("filepath", "filename", "format", "waveform_path", "cue_marker_revision")}
+
+
+def drift_fingerprint(row: dict) -> dict:
+    """The Track fields a category-drift repair depends on, as the scan saw them."""
+    return {key: row.get(key) for key in ("filepath", "filename", "category_id")}
 
 
 def _errno_name(exc: OSError) -> str:
@@ -535,6 +545,7 @@ class Scanner:
         path_owner, track_owner = _protection_predicates()
         self.path_owner = path_owner
         fields = ("id", "filepath", "filename", "title", "artist__name", "artist_id", "album__title", "category__code",
+                  "category_id",
                   "duration_seconds", "format", "file_hash", "waveform_path", "ready2air", "isrc", "remote_url",
                   "cue_marker_revision", "cue_marker_state", *cue_markers.MARKERS)
         by_inode = defaultdict(list)
@@ -633,8 +644,13 @@ class Scanner:
         parts = entry.rel.split(os.sep)
         folder = parts[0] if len(parts) > 1 else ""
         if row["category__code"] and folder != row["category__code"]:
+            # ``drift``: the evidence a repair (library_category_drift) is bound to -- the walked file's path and
+            # six-field witness, and the Track fields the repair depends on.  Recorded only; nothing is changed.
             self.add("category_drift", f"the file is in '{folder or '(Library root)'}', the primary category is "
-                     f"'{row['category__code']}'", track=summary, file=entry.describe())
+                     f"'{row['category__code']}'", track=summary, file=entry.describe(),
+                     drift={"folder": folder, "category": row["category__code"], "category_id": row["category_id"],
+                            "path": entry.path, "rel": entry.rel, "witness": entry.witness(),
+                            "fingerprint": drift_fingerprint(row)})
 
     # -- 4. unregistered files and storage sanity
     def unregistered(self):

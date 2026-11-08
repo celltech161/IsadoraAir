@@ -752,13 +752,16 @@ class UnregisteredDuplicateVisibilityTests(_Recon):
         # The page calls exactly the reconciliation endpoints: no import, cleanup or merge action, and no action on
         # a file. (3.11: plus Run reconciliation, which starts the same read-only scan. 3.12: plus the previewed
         # duplicate resolution, which deletes only a registered Track of an exact two-Track pair, never an
-        # unregistered file -- library.tests.test_library_duplicate_resolution.)
+        # unregistered file -- library.tests.test_library_duplicate_resolution. 3.11 category drift: plus the
+        # previewed drift repair, which moves a registered Track's own file or changes its primary Category, never
+        # an unregistered file -- library.tests.test_library_category_drift.)
         endpoints = set(re.findall(r"'(/api/[^'?]+)", html))
         self.assertEqual(endpoints, {
             "/api/tracks/reconciliation/", "/api/tracks/reconciliation/findings/",
             "/api/tracks/reconciliation/relink/preview/", "/api/tracks/reconciliation/relink/apply/",
             "/api/tracks/reconciliation/duplicates/not-duplicate/", "/api/tracks/reconciliation/run/",
-            "/api/tracks/reconciliation/duplicates/preview/", "/api/tracks/reconciliation/duplicates/apply/"})
+            "/api/tracks/reconciliation/duplicates/preview/", "/api/tracks/reconciliation/duplicates/apply/",
+            "/api/tracks/reconciliation/drift/preview/", "/api/tracks/reconciliation/drift/apply/"})
 
 
 class _RelinkSetup:

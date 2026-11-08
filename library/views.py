@@ -1741,6 +1741,24 @@ def api_reconciliation_findings(request):
     items = [f for f in report["findings"]
              if (not kind or f["type"] == kind) and (not open_only or f["type"] != "duplicate" or f.get("open"))
              and _finding_matches(f, q)]
+    # Category drift (3.11): filter by the file's current folder and/or the primary Category, grouped and sorted
+    # by that mismatch. The groups count every drift finding the type and search select, before those filters.
+    from library.services import library_category_drift as category_drift
+    drift_groups = None
+    if kind == "category_drift":
+        tally = {}
+        for f in items:
+            tally[category_drift.keys(f)] = tally.get(category_drift.keys(f), 0) + 1
+        drift_groups = [{"folder": k[0], "category": k[1], "count": n}
+                        for k, n in sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[:100]]
+    if "folder" in request.GET or "category" in request.GET:
+        folder, category = request.GET.get("folder"), request.GET.get("category")
+        items = [f for f in items if f["type"] == "category_drift"
+                 and (folder is None or category_drift.keys(f)[0] == folder)
+                 and (category is None or category_drift.keys(f)[1] == category)]
+    if request.GET.get("sort") == "mismatch":
+        items = sorted(items, key=lambda f: (f["type"] != "category_drift", *category_drift.keys(f),
+                                             ((f.get("track") or {}).get("title") or "").casefold(), f["id"]))
     total = len(items)
     pages = max(1, -(-total // per_page))
     page = min(page, pages)
@@ -1811,13 +1829,25 @@ def api_reconciliation_findings(request):
             # apply recheck it). The scan's per-member file witnesses stay on the server.
             f["manual"] = duplicate_resolution.manual_summary(original, complete=report.get("status") == "complete")
             f.pop("member_files", None)
+    for f in window:
+        if f["type"] == "category_drift":
+            original = next((o for o in report["findings"] if o.get("id") == f["id"]), f)
+            # Which repairs the page may offer (display only; preview and apply recheck everything). The scan's
+            # file witness stays on the server.
+            f["drift_review"] = category_drift.summary(original, complete=report.get("status") == "complete")
+            if isinstance(f.get("drift"), dict):
+                f["drift"] = {k: v for k, v in f["drift"].items() if k not in ("witness", "fingerprint")}
     if member_ids:
         details = _track_review_details(member_ids, limit=reconciliation.DUPLICATE_DETAIL_RESPONSE_LIMIT)
         for f in window:
             if f["type"] == "duplicate":
                 f["tracks"] = [details.get(t, {"id": t, "deleted": True}) for t in f.get("members", [])]
-    return JsonResponse({"items": window, "total": total, "page": page, "pages": pages, "per_page": per_page,
-                         "scan_id": report["scan_id"]})
+    body = {"items": window, "total": total, "page": page, "pages": pages, "per_page": per_page,
+            "scan_id": report["scan_id"]}
+    if drift_groups is not None:
+        body["drift_groups"] = drift_groups
+        body["drift_max_selections"] = category_drift.MAX_SELECTIONS
+    return JsonResponse(body)
 
 
 @require_http_methods(["POST"])
@@ -1894,6 +1924,50 @@ def api_reconciliation_duplicates_apply(request):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     return _duplicate_resolution_response(lambda: duplicate_resolution.apply(
         body.get("token"), body.get("choice"), confirm=body.get("confirm"), user=request.user))
+
+
+def _category_drift_response(call):
+    from library.services import library_category_drift as category_drift
+    try:
+        return JsonResponse(call())
+    except category_drift.DriftRefused as exc:
+        return JsonResponse({"result": "refused", "error": str(exc)}, status=exc.status)
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_drift_preview(request):
+    """3.11: what repairing the selected category-drift findings (at most one findings page) would do now -- move
+    the file to the primary Category's folder, or change the primary Category to the folder's -- and one
+    single-use token per repair that can be applied. Writes nothing. See library.services.library_category_drift."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_category_drift as category_drift
+    try:
+        body = json.loads(request.body)
+        scan_id, selections = str(body["scan_id"]), body["selections"]
+    except (ValueError, KeyError, TypeError):
+        return JsonResponse({"error": "scan_id and selections are required"}, status=400)
+    return _category_drift_response(lambda: category_drift.preview(scan_id, selections, user=request.user))
+
+
+@require_http_methods(["POST"])
+def api_reconciliation_drift_apply(request):
+    """3.11: apply ONE previewed category-drift repair (its own single-use token), after confirmation, through the
+    shared guarded relocation service; its outcome and any file-cleanup result are reported. The page sends a
+    confirmed batch one repair per request and stops on an uncertain answer."""
+    denied = _require_track_manager(request)
+    if denied is not None:
+        return denied
+    from library.services import library_category_drift as category_drift
+    try:
+        body = json.loads(request.body)
+        if not isinstance(body, dict):
+            raise TypeError
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    return _category_drift_response(lambda: category_drift.apply(
+        body.get("token"), confirm=body.get("confirm"), user=request.user))
 
 
 def _relink_response(call):
