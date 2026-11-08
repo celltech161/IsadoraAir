@@ -220,6 +220,19 @@ class EvidenceAndTokenTests(_Drift):
         self.assertEqual(body["item"]["outcome"], m.STALE)
         self.assertEqual(self.row(track).category_id, self.jazz.pk)
 
+    def test_b9b_additional_categories_changed_after_the_preview_are_stale(self):
+        # Not part of the scan's evidence: only the preview's fingerprint (bound to the token) catches it.
+        for direction in drift.DIRECTIONS:
+            with self.subTest(direction=direction):
+                track = self.drifted(f"POP/members-{direction}.flac", self.rock)
+                self.scanned()
+                token = self.token(track, direction)
+                track.additional_categories.add(self.jazz)
+                status, body = self.apply(token)
+                self.assertEqual(body["item"]["outcome"], m.STALE, body)
+                row = self.row(track)
+                self.assertEqual((row.filepath, row.category_id), (track.filepath, self.rock.pk))
+
     def test_b10_a_source_file_changed_after_the_scan_or_the_preview_is_stale(self):
         track = self.drifted("POP/touched.flac", self.rock)
         self.scanned()
