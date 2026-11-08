@@ -576,8 +576,9 @@ changes. One Track, one short transaction (`durable`), in this order:
    * the destination folder and entry are still the staged object.
 5. **Commit.**
    * A failure before commit rolls back; the staged entry is removed only through the identity-safe removal
-     below, never when it is the recording's last remaining name, and the original is never touched. Anything
-     not removable is kept and reported (`destination_retained`).
+     below, and the original is never touched. Removal is withheld when the check finds the staged entry to be
+     the recording's last remaining name (see the limitation below). Anything not removable is kept and
+     reported (`destination_retained`).
    * A failure at commit leaves the outcome unknown: both entries are kept and the result is `uncertain`.
 6. **Cleanup.** In its own transaction, holding the old path's lock (2 s), with no Track naming the old path
    and the committed destination still naming the moved recording, the old entry is removed through the
@@ -604,6 +605,16 @@ changes. One Track, one short transaction (`durable`), in this order:
   * a process running as IsadoraAir's own user that deliberately works inside that private quarantine;
   * a writer that rewrites a recording's bytes and then restores its size and modification time before the
     link is made (the scan's witness is metadata, not a hash).
+* **Limitation: what is and is not guaranteed.**
+  * IsadoraAir serializes its own, cooperating operations with transaction-scoped path locks.
+  * Its relocation cleanup never knowingly deletes a substituted, unrelated file.
+  * A writer that does not cooperate can independently delete a registered recording at any time; nothing in
+    IsadoraAir prevents that.
+  * The last-remaining-name check reads the moved entry's link count and then unlinks it. If such a writer
+    unlinks the recording's other name between that check and the unlink, the recording can be left with no
+    filesystem name.
+  * No atomic guarantee against that external action is claimed (Linux has no "unlink only if another name
+    remains" primitive). Backups remain the protection against external deletion.
 
 **Recovering a retained object.**
 * *Where it is.* Every object kept in the quarantine is at `.relocation-quarantine/<time>-<random>/entry`,

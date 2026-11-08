@@ -44,8 +44,9 @@ Category is right.
    descriptor is unchanged and its path still names it, and that the destination directory and entry are
    still the staged object.
 5. **Commit.**  Before commit any failure rolls back; the staged entry is removed only through the
-   identity-safe removal (``remove_entry``), never a recording's last remaining name, and the original is never
-   touched (``failed_before_commit``; whatever cannot be removed safely is kept and reported,
+   identity-safe removal (``remove_entry``), which withholds removal when it finds the entry to be the
+   recording's last remaining name (a check, not an atomic guarantee: see "Limitation" below), and the original
+   is never touched (``failed_before_commit``; whatever cannot be removed safely is kept and reported,
    ``destination_retained``).  A failure *at* commit leaves the outcome unknown: both entries are kept and the
    result is ``uncertain`` -- the database names one of them either way.
 6. **Cleanup** after commit: in its own short transaction, holding the old path's lock (bounded), with no Track
@@ -177,6 +178,14 @@ class Result:
 # Out of scope, as for every other IsadoraAir component: a process running as the same user that deliberately
 # operates inside IsadoraAir's private quarantine directory, or rewrites a recording's bytes and then restores its
 # size and modification time before the link is made (the recorded six-field witness is metadata, not a hash).
+#
+# Limitation (no atomic guarantee is claimed).  Cooperating IsadoraAir operations are serialized by the
+# transaction-scoped path locks (``library.services.source_paths``), and the removal above never knowingly deletes
+# a substituted, unrelated file.  A writer that does not cooperate can independently delete a registered
+# recording at any time.  The last-remaining-name check (``keep_last_link``) reads the link count of the moved
+# entry and then unlinks it: if such a writer unlinks the recording's other name between that check and the
+# unlink, the recording can be left with no filesystem name.  Linux offers no primitive that makes "unlink only if
+# another name remains" atomic, and IsadoraAir does not claim one.
 
 QUARANTINE_DIRNAME = ".relocation-quarantine"
 RENAME_NOREPLACE = 1
@@ -272,8 +281,10 @@ def _write_manifest(directory_fd, manifest) -> None:
 
 def remove_entry(root, root_fd, dir_fd, name, expected, *, context, keep_last_link=False) -> tuple[str, str, str | None]:
     """Remove the entry ``name`` of directory ``dir_fd`` only if it is the object ``expected`` (device, inode), which
-    the caller holds open.  ``keep_last_link``: never remove the recording's last remaining name (a hard-linked
-    relocation whose other name another writer removed or replaced).  Returns (outcome, explanation, quarantine
+    the caller holds open.  ``keep_last_link``: withhold the removal when the moved entry is found to be the
+    recording's last remaining name (a hard-linked relocation whose other name another writer removed or
+    replaced).  That is a check followed by an unlink, not an atomic guarantee: see "Limitation" in the threat
+    model.  Returns (outcome, explanation, quarantine
     location or None); see the threat model."""
     try:
         quarantine_fd = _open_quarantine(root_fd)
