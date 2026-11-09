@@ -1106,6 +1106,13 @@ class PlaylistLog(models.Model):
         ScheduleProfile, on_delete=models.PROTECT, null=True, blank=True,
         related_name="playlist_logs",
     )
+    # [P0] 1.21: the actual UTC start of the DST fall-back successor hour for
+    # which this approved log's single replay was authorized -- set once by the
+    # engine, under this row's lock, in the same transaction as the replay
+    # occurrences (LogItem origin "dst_replay"). Once set, the log is never
+    # authorized again, whatever later happens to those occurrences. NULL on
+    # every other log. See library.services.dst_fallback.
+    dst_replay_hour_start = models.DateTimeField(null=True, blank=True, editable=False)
 
     class Meta:
         ordering = ["-date", "hour"]
@@ -1155,10 +1162,10 @@ class LogItem(models.Model):
     # Roadmap 2.27 Phase C: a guarded hour-refill install. Never
     # generated_schedule, so it can never itself become an Eject cause.
     ORIGIN_REFILL_INSTALLED = "refill_installed"
-    # [P0] 1.21: a new occurrence of a DST fall-back replay pass -- a second
-    # physical airing of approved scheduled programming, authorized by a
-    # DstFallbackReplayPass (replay_pass). Not generated programming (never an
-    # Hour Refill cause), not an urgent/operator insert.
+    # [P0] 1.21: a new occurrence created by the single DST fall-back replay
+    # (authorized by PlaylistLog.dst_replay_hour_start) -- a second physical
+    # airing of approved scheduled programming. Not generated programming
+    # (never an Hour Refill cause), not an urgent/operator insert.
     ORIGIN_DST_REPLAY = "dst_replay"
     ORIGIN_CHOICES = [
         (ORIGIN_GENERATED_SCHEDULE, "Generated schedule"),
@@ -1171,79 +1178,12 @@ class LogItem(models.Model):
     ]
     origin = models.CharField(max_length=24, choices=ORIGIN_CHOICES, null=True, blank=True, editable=False)
 
-    # [P0] 1.21 replay provenance, set once at creation by the engine and
-    # never editable: the pass that authorized this occurrence, and the id of
-    # the original occurrence it replays (a scalar snapshot, so it survives
-    # deletion of the original). Both NULL on every other row; nullable with
-    # no database default so code from before this migration keeps inserting.
-    # RESTRICT: a pass cannot be deleted while its occurrences exist, except
-    # together with its PlaylistLog (whose deletion cascades to both).
-    replay_pass = models.ForeignKey(
-        "DstFallbackReplayPass", on_delete=models.RESTRICT, null=True, blank=True,
-        editable=False, related_name="replay_items",
-    )
-    replay_source_id_snapshot = models.BigIntegerField(null=True, blank=True, editable=False)
-
     class Meta:
         ordering = ["playlist_log", "position"]
         unique_together = [("playlist_log", "position")]
-        constraints = [
-            # One replay occurrence per original occurrence per pass.
-            models.UniqueConstraint(
-                fields=["replay_pass", "replay_source_id_snapshot"],
-                condition=models.Q(replay_pass__isnull=False),
-                name="library_logitem_one_replay_per_source",
-            ),
-            # Replay provenance is all-or-nothing and only on a dst_replay row. (The
-            # converse is deliberately not enforced: a dst_replay row whose pass
-            # columns are gone exists only after reversing migration 0100, is an
-            # ordinary row to every reader -- authority and PlayEvent source key on
-            # replay_pass -- and must not block re-applying the migration.)
-            models.CheckConstraint(
-                condition=models.Q(replay_pass__isnull=True, replay_source_id_snapshot__isnull=True)
-                | models.Q(replay_pass__isnull=False, replay_source_id_snapshot__isnull=False, origin="dst_replay"),
-                name="library_logitem_dst_replay_provenance",
-            ),
-        ]
 
     def __str__(self):
         return f"{self.playlist_log.date} #{self.position}: {self.track_title or self.track}"
-
-
-class DstFallbackReplayPass(models.Model):
-    """[P0] 1.21: the single authorized DST fall-back replay pass of one
-    approved PlaylistLog for one physical successor hour (see
-    library.services.dst_fallback and docs/DST_FALLBACK_CONTINUITY.md).
-
-    The durable authority that a pass was authorized: committed in the same
-    transaction as its occurrences (LogItem.replay_pass), unique per
-    (playlist_log, successor_hour_start) in the database, and independent of
-    every mutable field of those occurrences -- editing or deleting any or all
-    of them never makes the hour eligible for another pass. It lives as long
-    as its PlaylistLog. ``source_log_item_ids`` and ``replay_count`` record
-    exactly what was authorized, so a damaged pass (an occurrence deleted or
-    changed later) can be reported, never silently re-created."""
-    playlist_log = models.ForeignKey(PlaylistLog, on_delete=models.CASCADE, related_name="dst_replay_passes")
-    # The actual (UTC) start of the physical hour the pass serves, and the
-    # instant the clock went back: the transition identity, not wall labels.
-    successor_hour_start = models.DateTimeField()
-    transition_at = models.DateTimeField()
-    time_zone = models.CharField(max_length=64)
-    authorized_at = models.DateTimeField()
-    reason = models.CharField(max_length=32, blank=True, default="")
-    source_log_item_ids = models.JSONField(default=list)
-    replay_count = models.PositiveIntegerField()
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["playlist_log", "successor_hour_start"],
-                name="library_dst_replay_pass_once_per_log_hour",
-            ),
-        ]
-
-    def __str__(self):
-        return f"DST replay pass for log {self.playlist_log_id} at {self.successor_hour_start.isoformat()}"
 
 
 # ---------------------------------------------------------------

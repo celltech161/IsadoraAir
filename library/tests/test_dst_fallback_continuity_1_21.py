@@ -35,7 +35,7 @@ MAR8 = date(2026, 3, 8)
 NOV2 = date(2026, 11, 2)
 GENERATED = LogItem.ORIGIN_GENERATED_SCHEDULE
 ENGINE_INSERTED = LogItem.ORIGIN_ENGINE_INSERTED
-# 1.21 corrections: replay occurrences carry their own origin and pass (getattr keeps this module importable at r0130).
+# 1.21: replay occurrences carry their own origin (getattr keeps this module importable at r0130).
 DST_REPLAY = getattr(LogItem, "ORIGIN_DST_REPLAY", "dst_replay")
 
 
@@ -180,7 +180,7 @@ class FallBackTimelineTests(_DstFixture):
         engine._try_extend_live_log_async.assert_called()
         self.assertEqual(len(self.rows(self.log02)), 4)
 
-        # 01:59:40 CST (window open: hour start 08:00 UTC minus the 30 s lookahead): one replay pass.
+        # 01:59:40 CST (window open: hour start 08:00 UTC minus the 30 s lookahead): one replay.
         with self.at(utc(7, 59, 40), engine):
             self.tick(engine)
         rows = self.rows(self.log02)
@@ -190,8 +190,8 @@ class FallBackTimelineTests(_DstFixture):
                          [(r.track_id, r.category_id, r.scheduled_time) for r in originals])
         self.assertTrue(all(r.origin == DST_REPLAY and r.played_at is None and r.playback_claimed_at is None
                             for r in replay))
-        self.assertEqual({r.replay_pass_id for r in replay}, {replay[0].replay_pass_id})
-        self.assertEqual([r.replay_source_id_snapshot for r in replay], [r.id for r in originals])
+        # The authority: the approved log's marker, the real hour's UTC start (committed with the rows).
+        self.assertEqual(getattr(PlaylistLog.objects.get(pk=self.log02.pk), "dst_replay_hour_start", None), utc(8))
         self.assertEqual([r.position for r in replay], [4, 5, 6, 7])
         self.assertEqual(engine._queue_cursor, 4)
         engine._start_next_track.assert_called()                 # idle recovery resumes with the replay pass
@@ -343,7 +343,7 @@ class RestartAndRecoveryTests(_DstFixture):
             self.tick(partial)
         self.assertEqual(len(self.rows(self.log02)), 6)
         self.assertEqual(list(self.replay_events(self.log02).values_list("detail__outcome", flat=True)
-                              .order_by("id")), ["authorized", "already_handled"])
+                              .order_by("id")), ["authorized"])          # the restart found the marker: no event
         for minute in (26, 40):
             self.air(partial, self.next_item(partial, utc(8, minute)), utc(8, minute))
 

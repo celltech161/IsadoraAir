@@ -1,9 +1,9 @@
-"""[P0] 1.21 corrections (Codex review): durable replay identity and PlayEvent provenance.
+"""[P0] 1.21: the replay's single authorization and its PlayEvent accounting.
 
-BLOCKER 1 -- the replay pass is a database record (DstFallbackReplayPass, unique per log and physical successor
-hour) committed with its occurrences; replay occurrences carry origin ``dst_replay``, their pass and the id of the
-original they replay.  Foreign inserts, edited or deleted replay rows and duplicate originals can no longer suppress
-the pass or authorize another.  BLOCKER 2 -- a replay occurrence's PlayEvent is ``scheduled`` at any position.
+The authority is one marker on the approved PlaylistLog (``dst_replay_hour_start``: the real hour's UTC start),
+set under the log's row lock in the same transaction as the ``dst_replay`` occurrences.  It is never inferred from
+LogItems: foreign inserts, edited or deleted replay rows and duplicate originals can neither suppress the replay
+nor authorize another.  A replay occurrence's PlayEvent is ``scheduled`` at any position.
 
 Real PostgreSQL transactions (TransactionTestCase; the concurrency cases use separate connections), temporary media,
 a controlled clock; no station resource."""
@@ -13,10 +13,9 @@ import threading
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-from django.db import IntegrityError, close_old_connections, connection, connections, transaction
-from django.db.models import RestrictedError
+from django.db import close_old_connections, connection, connections, transaction
 
-from library.models import DstFallbackReplayPass, LogItem, PlayEvent, PlayEventSegment, PlaylistLog, Track
+from library.models import LogItem, PlayEvent, PlayEventSegment, PlaylistLog, Track
 from library.services import dst_fallback, royalty_reports
 from library.services.engine import Deck
 from library.tests.test_dst_fallback_continuity_1_21 import (
@@ -41,16 +40,29 @@ class _Identity(_DstFixture):
 
     def ensure(self, now=utc(8, 0, 5)):
         with self.at(now):
-            return dst_fallback.ensure_replay(self.log02.id, T, now=now, reason="test")
+            return dst_fallback.ensure_replay(self.log02.id, T, now=now)
 
     def replay_rows(self):
-        return list(LogItem.objects.filter(playlist_log=self.log02, replay_pass__isnull=False).order_by("position"))
+        return list(LogItem.objects.filter(playlist_log=self.log02, origin=DST_REPLAY).order_by("position"))
 
-    def passes(self):
-        return DstFallbackReplayPass.objects.filter(playlist_log=self.log02).count()
+    def marker(self):
+        return PlaylistLog.objects.get(pk=self.log02.pk).dst_replay_hour_start
+
+    def restart_ticks(self, minutes):
+        for minute in minutes:
+            engine = make_engine()                                # each a restart without any state snapshot
+            with self.at(utc(8, minute, 30), engine):
+                engine._load_current_hour_log()
+                self.tick(engine)
+                self.tick(engine)
+        return engine
+
+    def outcomes(self):
+        return list(SystemEvent.objects.filter(dedupe_key__startswith=f"engine|dst-fallback-replay|{self.log02.id}|")
+                    .values_list("detail__outcome", flat=True))
 
 
-class ReplayIdentityTests(_Identity):
+class ReplayAuthorizationTests(_Identity):
     def test_01_an_identical_foreign_engine_insert_does_not_suppress_the_replay(self):
         self.first_pass()
         a = self.originals[0]
@@ -58,7 +70,8 @@ class ReplayIdentityTests(_Identity):
                                category=a.category, origin=LogItem.ORIGIN_ENGINE_INSERTED)
         result = self.ensure()
         self.assertEqual(result.outcome, dst_fallback.AUTHORIZED)
-        self.assertEqual([r.replay_source_id_snapshot for r in self.replay_rows()], [r.id for r in self.originals])
+        self.assertEqual([r.track_id for r in self.replay_rows()], [r.track_id for r in self.originals])
+        self.assertEqual([r.position for r in self.replay_rows()], [4, 5, 6])
 
     def test_02_duplicate_originals_are_each_replayed(self):
         a = self.originals[0]
@@ -68,11 +81,41 @@ class ReplayIdentityTests(_Identity):
         self.first_pass(self.originals + [twin])
         self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
         replay = self.replay_rows()
-        self.assertEqual([r.replay_source_id_snapshot for r in replay], [r.id for r in self.originals] + [twin.id])
-        self.assertEqual(len({(r.track_id, r.category_id, r.scheduled_time) for r in replay}), 3)   # twins kept
-        self.assertEqual(DstFallbackReplayPass.objects.get().replay_count, 4)
+        self.assertEqual([(r.track_id, r.category_id, r.scheduled_time) for r in replay],
+                         [(r.track_id, r.category_id, r.scheduled_time) for r in self.originals + [twin]])
 
-    def test_03_to_05_edited_replay_rows_never_authorize_another_pass(self):
+    def test_03_the_marker_and_the_occurrences_commit_together(self):
+        self.first_pass()
+        generated_at = PlaylistLog.objects.get(pk=self.log02.pk).generated_at
+        self.assertIsNone(self.marker())
+        result = self.ensure()
+        self.assertEqual(result.outcome, dst_fallback.AUTHORIZED)
+        self.assertEqual(self.marker(), utc(8))                   # the real hour's UTC start, not a wall label
+        self.assertEqual(result.replay_ids, [r.id for r in self.replay_rows()])
+        self.assertTrue(all(r.played_at is None and r.playback_claimed_at is None for r in self.replay_rows()))
+        self.assertEqual(PlaylistLog.objects.get(pk=self.log02.pk).generated_at, generated_at)   # only the marker
+        self.assertFalse(PlaylistLog._meta.get_field("dst_replay_hour_start").editable)
+
+    def test_04_nothing_aired_early_commits_no_marker(self):
+        result = self.ensure()
+        self.assertEqual(result.outcome, dst_fallback.NOT_ELIGIBLE)
+        self.assertEqual((self.marker(), len(self.replay_rows())), (None, 0))
+        self.first_pass()                                         # later evidence of an early airing still counts
+        self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
+
+    def test_05_the_marker_decides_never_the_rows(self):
+        self.first_pass()
+        # A stray dst_replay row without the marker does not count as an authorization ...
+        LogItem.objects.create(playlist_log=self.log02, position=3, scheduled_time=utc(8), track=self.originals[0].track,
+                               category=self.originals[0].category, origin=DST_REPLAY)
+        self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
+        self.assertEqual(len(self.replay_rows()), 4)
+        # ... and a set marker with no dst_replay rows at all is a completed authorization.
+        LogItem.objects.filter(playlist_log=self.log02, origin=DST_REPLAY).delete()
+        self.assertEqual(self.ensure().outcome, dst_fallback.ALREADY_HANDLED)
+        self.assertEqual(len(self.replay_rows()), 0)
+
+    def test_06_edited_replay_rows_never_authorize_again(self):
         self.first_pass()
         self.ensure()
         other = self.track("other")
@@ -81,66 +124,44 @@ class ReplayIdentityTests(_Identity):
         for (name, change), row in zip(edits.items(), self.replay_rows()):
             with self.subTest(edit=name):
                 LogItem.objects.filter(pk=row.pk).update(**change)
-                result = self.ensure()
-                self.assertIn(result.outcome, (dst_fallback.ALREADY_HANDLED, dst_fallback.DAMAGED))
-                self.assertEqual((self.passes(), len(self.replay_rows())), (1, 3))
-        result = self.ensure()
-        self.assertEqual(result.outcome, dst_fallback.DAMAGED)
-        self.assertEqual(len(result.changed_replay_ids), 2)                 # Track and Category edits are reported
+                self.assertEqual(self.ensure().outcome, dst_fallback.ALREADY_HANDLED)
+                self.assertEqual(len(self.replay_rows()), 3)
+        LogItem.objects.filter(origin=DST_REPLAY).update(origin=LogItem.ORIGIN_OPERATOR_INSERTED)   # even the origin
+        self.assertEqual(self.ensure().outcome, dst_fallback.ALREADY_HANDLED)
+        self.assertEqual(LogItem.objects.filter(playlist_log=self.log02).count(), 6)
 
-    def test_06_deleting_one_replay_row_never_authorizes_another_pass(self):
+    def test_07_deleting_one_replay_row_never_authorizes_again(self):
         self.first_pass()
         self.ensure()
-        gone = self.replay_rows()[1]
-        gone.delete()
-        result = self.ensure()
-        self.assertEqual((result.outcome, result.missing_source_ids), (dst_fallback.DAMAGED, [self.originals[1].id]))
-        self.assertEqual((self.passes(), len(self.replay_rows())), (1, 2))
+        self.replay_rows()[1].delete()
+        self.assertEqual(self.ensure().outcome, dst_fallback.ALREADY_HANDLED)
+        self.restart_ticks((2, 3))
+        self.assertEqual(len(self.replay_rows()), 2)
+        self.assertEqual(self.marker(), utc(8))
 
-    def test_07_deleting_every_replay_row_leaves_the_durable_pass(self):
+    def test_08_deleting_every_replay_row_never_authorizes_again(self):
         self.first_pass()
         self.ensure()
-        LogItem.objects.filter(replay_pass__isnull=False).delete()
-        result = self.ensure()
-        self.assertEqual(result.outcome, dst_fallback.DAMAGED)
-        self.assertEqual(result.missing_source_ids, [r.id for r in self.originals])
-        self.assertEqual((self.passes(), len(self.replay_rows())), (1, 0))
-        engine = make_engine()                                    # the operator's deletion is honoured on air too
-        with self.at(utc(8, 5), engine):
-            engine._load_current_hour_log()
-            self.tick(engine)
-        self.assertIsNone(self.next_item(engine, utc(8, 5, 5)))
-        self.assertEqual(len(self.replay_rows()), 0)
+        LogItem.objects.filter(origin=DST_REPLAY).delete()
+        self.assertEqual(self.ensure().outcome, dst_fallback.ALREADY_HANDLED)
+        engine = self.restart_ticks((5,))                         # the operator's deletion is honoured on air too
+        self.assertIsNone(self.next_item(engine, utc(8, 5, 35)))
+        self.assertEqual((len(self.replay_rows()), self.marker()), (0, utc(8)))
 
-    def test_08_and_09_repeated_ticks_and_restarts_never_add_a_pass(self):
+    def test_09_repeated_ticks_and_restarts_authorize_once(self):
         self.first_pass()
-        for minute in range(5):
-            engine = make_engine()                                # each a restart without any state snapshot
-            with self.at(utc(8, minute, 30), engine):
-                engine._load_current_hour_log()
-                self.tick(engine)
-                self.tick(engine)
-        self.assertEqual((self.passes(), len(self.replay_rows())), (1, 3))
-        outcomes = set(SystemEvent.objects.filter(dedupe_key__startswith=f"engine|dst-fallback-replay|{self.log02.id}|")
-                       .values_list("detail__outcome", flat=True))
-        self.assertEqual(outcomes, {"already_handled", "authorized"})
+        self.restart_ticks(range(5))
+        self.assertEqual((len(self.replay_rows()), self.marker()), (3, utc(8)))
+        self.assertEqual(self.outcomes(), ["authorized"])         # a restart that finds the marker emits nothing
 
-    def test_10_the_database_refuses_a_second_pass_for_the_same_log_and_hour(self):
-        self.first_pass()
-        self.ensure()
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            DstFallbackReplayPass.objects.create(
-                playlist_log=self.log02, successor_hour_start=T.hour_start, transition_at=T.transition_at,
-                time_zone=T.zone, authorized_at=utc(8, 1), source_log_item_ids=[], replay_count=0)
-
-    def test_10b_two_concurrent_creators_commit_one_pass(self):
+    def test_10_two_concurrent_creators_commit_one_authorization(self):
         self.first_pass()
         barrier, out = threading.Barrier(2, timeout=10), {}
 
         def create(key):
             try:
                 barrier.wait()
-                out[key] = dst_fallback.ensure_replay(self.log02.id, T, now=utc(8, 0, 5), reason=key).outcome
+                out[key] = dst_fallback.ensure_replay(self.log02.id, T, now=utc(8, 0, 5)).outcome
             except BaseException as exc:
                 out[key] = exc
             finally:
@@ -155,7 +176,36 @@ class ReplayIdentityTests(_Identity):
         self.assertIn(dst_fallback.AUTHORIZED, out.values())
         self.assertTrue(set(out.values()) <= {dst_fallback.AUTHORIZED, dst_fallback.ALREADY_HANDLED, dst_fallback.BUSY},
                         out)
-        self.assertEqual((self.passes(), len(self.replay_rows())), (1, 3))
+        self.assertEqual(list(out.values()).count(dst_fallback.AUTHORIZED), 1, out)
+        self.assertEqual((len(self.replay_rows()), self.marker()), (3, utc(8)))
+
+    def test_10b_a_creator_waiting_on_the_lock_sees_the_committed_marker(self):
+        self.first_pass()
+        held, release, out = threading.Event(), threading.Event(), {}
+
+        def first():
+            try:
+                with transaction.atomic():
+                    PlaylistLog.objects.select_for_update().get(pk=self.log02.pk)
+                    held.set()
+                    release.wait(10)
+                    out["first"] = dst_fallback.ensure_replay(self.log02.id, T, now=utc(8, 0, 5)).outcome
+            finally:
+                connections.close_all()
+
+        worker = threading.Thread(target=first, daemon=True)
+        worker.start()
+        self.assertTrue(held.wait(10))
+        with patch.object(dst_fallback, "LOCK_TIMEOUT", "10s"):
+            waiter = threading.Thread(
+                target=lambda: (out.__setitem__("second", dst_fallback.ensure_replay(
+                    self.log02.id, T, now=utc(8, 0, 6)).outcome), connections.close_all()), daemon=True)
+            waiter.start()
+            release.set()
+            worker.join(15)
+            waiter.join(15)
+        self.assertEqual((out.get("first"), out.get("second")), (dst_fallback.AUTHORIZED, dst_fallback.ALREADY_HANDLED))
+        self.assertEqual(len(self.replay_rows()), 3)
 
     def test_11_a_lock_timeout_commits_nothing_and_a_retry_succeeds(self):
         self.first_pass()
@@ -176,13 +226,13 @@ class ReplayIdentityTests(_Identity):
         self.assertTrue(held.wait(10))
         try:
             self.assertEqual(self.ensure().outcome, dst_fallback.BUSY)
-            self.assertEqual((self.passes(), len(self.replay_rows())), (0, 0))
+            self.assertEqual((self.marker(), len(self.replay_rows())), (None, 0))
         finally:
             release.set()
             worker.join(10)
         self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
 
-    def test_12_a_failure_partway_through_rolls_back_the_whole_pass(self):
+    def test_12_a_failure_partway_through_rolls_back_marker_and_rows(self):
         self.first_pass()
         real_create, calls = LogItem.objects.create, {"n": 0}
 
@@ -195,7 +245,7 @@ class ReplayIdentityTests(_Identity):
         with patch.object(LogItem.objects, "create", side_effect=failing):
             result = self.ensure()
         self.assertEqual(result.outcome, dst_fallback.FAILED)
-        self.assertEqual((self.passes(), len(self.replay_rows())), (0, 0))
+        self.assertEqual((self.marker(), len(self.replay_rows())), (None, 0))
         self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
 
     def test_13_ordinary_engine_inserts_and_ordinary_days_are_unaffected(self):
@@ -209,42 +259,7 @@ class ReplayIdentityTests(_Identity):
             self.tick(engine)
         self.air(engine, urgent, utc(19, 5, 10, day=NOV2))
         self.assertEqual(PlayEvent.objects.get(log_item_id_snapshot=urgent.id).source, "scheduled")  # position rule
-        self.assertFalse(DstFallbackReplayPass.objects.exists())
-        # The provenance is all-or-nothing in the database and only on a dst_replay row.
-        self.first_pass()
-        self.ensure()
-        replay_pass = DstFallbackReplayPass.objects.get()
-        for change in ({"replay_pass": replay_pass, "replay_source_id_snapshot": urgent.id},   # wrong origin
-                       {"replay_source_id_snapshot": urgent.id},                               # no pass
-                       {"replay_pass": replay_pass}):                                          # no source
-            with self.subTest(change=sorted(change)), self.assertRaises(IntegrityError), transaction.atomic():
-                LogItem.objects.filter(pk=urgent.pk).update(**change)
-
-    def test_14_a_damaged_pass_is_reported_once_and_never_recreated(self):
-        self.first_pass()
-        self.ensure()
-        self.replay_rows()[0].delete()
-        for minute in (5, 6):
-            engine = make_engine()
-            with self.at(utc(8, minute), engine):
-                engine._load_current_hour_log()
-                self.tick(engine)
-                self.tick(engine)
-        damaged = SystemEvent.objects.filter(dedupe_key=f"engine|dst-fallback-replay|{self.log02.id}|damaged")
-        self.assertTrue(damaged.exists())
-        detail = damaged.first().detail
-        self.assertEqual((detail["outcome"], detail["missing_source_log_item_ids"]),
-                         ("damaged", [self.originals[0].id]))
-        self.assertEqual((self.passes(), len(self.replay_rows())), (1, 2))
-
-    def test_the_pass_lives_and_dies_with_its_log(self):
-        self.first_pass()
-        self.ensure()
-        replay_pass = DstFallbackReplayPass.objects.get()
-        with self.assertRaises(RestrictedError):
-            replay_pass.delete()                                   # never while its occurrences exist
-        self.log02.delete()                                       # the log takes both with it
-        self.assertFalse(DstFallbackReplayPass.objects.exists())
+        self.assertFalse(PlaylistLog.objects.filter(dst_replay_hour_start__isnull=False).exists())
         self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
 
 
@@ -265,7 +280,7 @@ class HighPositionAccountingTests(_Identity):
         self.assertEqual(self.ensure().outcome, dst_fallback.AUTHORIZED)
         replay = self.replay_rows()
         self.assertEqual([r.position for r in replay], [10000, 10001, 10002])
-        self.assertTrue(all(r.replay_source_id_snapshot != self.insert.id for r in replay))   # an insert: not replayed
+        self.assertEqual([r.track_id for r in replay], [r.track_id for r in self.originals])   # the insert: not replayed
 
         # A claim, a queue installation or a prepared deck is not an airing.
         with self.at(utc(8, 0, 5), engine):
