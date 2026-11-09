@@ -675,7 +675,7 @@ class ScheduleProfileMigrationTests(TransactionTestCase):
             key: (b.day_of_week, b.specific_date, b.start_time, b.end_time, b.rotation_id, b.playlist_id)
             for key, b in rows.items()
         }
-        self.migrate(self.final)
+        final_apps = self.migrate(self.final)
 
         profiles = ScheduleProfile.objects.all()
         self.assertEqual([p.name for p in profiles], ["Default Schedule"])
@@ -697,8 +697,9 @@ class ScheduleProfileMigrationTests(TransactionTestCase):
         self.assertEqual(resolve_schedule_block(date(2027, 3, 5), 20).pk, rows["weekly_playlist"].pk)
         self.assertIsNone(resolve_schedule_block(TUESDAY, 6))
 
-        legacy = PlaylistLog.objects.get(date=MONDAY, hour=6)
-        self.assertIsNone(legacy.schedule_profile)
+        # The historical model at 0088: the current one may have later columns (e.g. library.0100).
+        legacy = final_apps.get_model("library", "PlaylistLog").objects.get(date=MONDAY, hour=6)
+        self.assertIsNone(legacy.schedule_profile_id)
         self.assertEqual(legacy.status, "approved")
 
     def test_an_empty_schedule_still_gets_a_default_profile_and_state(self):
