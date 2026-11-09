@@ -666,6 +666,9 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # analysis request timestamp -- three AddFields, no data migration). The two
             # NOT NULL fields carry a database default so pre-restart processes can still
             # insert Tracks; the probe classifies a database default as manual.
+            # 1.21 (P0): and library.0100 (DstFallbackReplayPass CreateModel, two nullable
+            # LogItem AddFields, a choices-only origin AlterField, and two AddConstraints --
+            # the replay-per-source uniqueness and the provenance CHECK, manual).
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -680,6 +683,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0097_hour_refill_start_next_cause",
                               "library.0098_hour_refill_automatic_failure_cause",
                               "library.0099_track_cue_marker_authority",
+                              "library.0100_dst_fallback_replay_pass",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
@@ -708,6 +712,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               ("library.0098_hour_refill_automatic_failure_cause", "AddConstraint"),
                               ("library.0099_track_cue_marker_authority", "AddField"),
                               ("library.0099_track_cue_marker_authority", "AddField"),
+                              ("library.0100_dst_fallback_replay_pass", "AddConstraint"),
+                              ("library.0100_dst_fallback_replay_pass", "AddConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "RemoveConstraint"),
                               ("produced_content.0003_recipe_key_leading_digit", "AlterField"),
                               ("produced_content.0003_recipe_key_leading_digit", "AddConstraint"),
