@@ -201,6 +201,7 @@ controlled on-air acceptance plan. Phase B alone is not a deployable release.
 ## DST fall-back replay pass (1.21)
 
 On a DST fall-back night the approved programming of the hour after the repeated hour can air twice, once per
-physical hour. The second airing uses new LogItem occurrences (one replay pass, materialized by the engine), so
-every invariant above still holds per occurrence: one claim, one `played_at`, one PlayEvent. See
-[DST_FALLBACK_CONTINUITY.md](DST_FALLBACK_CONTINUITY.md).
+physical hour. The second airing uses new LogItem occurrences (`origin = dst_replay`, authorized by a
+`DstFallbackReplayPass` record), so every invariant above still holds per occurrence: one claim, one `played_at`,
+one PlayEvent. That PlayEvent's `source` is `scheduled` at any position: provenance decides before the position >= 9999
+insert rule, which still applies to every other row. See [DST_FALLBACK_CONTINUITY.md](DST_FALLBACK_CONTINUITY.md).

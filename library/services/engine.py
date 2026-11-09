@@ -5471,9 +5471,11 @@ class PlaybackEngine:
         during the repeated hour (``library.services.dst_fallback``).  Returns True when a pass exists now.
 
         Cheap when it cannot apply: one memoized time-zone lookup per call.  Inside the window, the database is
-        consulted (bounded row lock) until the pass exists or is found; then this process stops asking.  The pass
-        itself -- new unplayed LogItems in the approved log -- is the durable authority, so a restart neither
-        repeats nor loses it, and the ~3 s queue reload positions the cursor on it like any unplayed item."""
+        consulted (bounded row lock) until the pass exists or is found; then this process stops asking.  The
+        durable authority is the pass's DstFallbackReplayPass record (unique per log and successor hour), committed
+        together with its new unplayed LogItems: a restart never repeats it, and editing or deleting its occurrences
+        never authorizes another pass (a damaged pass is reported, not re-created).  The ~3 s queue reload positions
+        the cursor on the remaining occurrences like any unplayed item."""
         log = self.current_log
         transition = self._dst_fallback_transition(log)
         if transition is None:
@@ -5484,27 +5486,47 @@ class PlaybackEngine:
         handled = self.__dict__.setdefault("_dst_replay_handled", set())
         if log.id in handled:
             return False
-        result = dst_fallback.ensure_replay(log.id, transition, now=now)
-        if result.outcome not in (dst_fallback.AUTHORIZED, dst_fallback.ALREADY_HANDLED):
-            if result.outcome == dst_fallback.BUSY:
-                print(f"  DST fall-back replay deferred: {result.reason}")
+        result = dst_fallback.ensure_replay(log.id, transition, now=now, reason=reason)
+        if result.outcome not in dst_fallback.HANDLED:
+            if result.outcome in (dst_fallback.BUSY, dst_fallback.FAILED):
+                # Nothing was committed; a later tick inside the window retries.
+                print(f"  DST fall-back replay deferred ({result.outcome}): {result.reason}")
+            if result.outcome == dst_fallback.FAILED:
+                try:
+                    emit_event(
+                        category="engine", level="error",
+                        title="DST fall-back: replay pass creation failed (nothing committed)",
+                        detail={**transition.as_detail(), "playlist_log_id": log.id, "outcome": result.outcome,
+                                "reason": result.reason[:500], "trigger": reason},
+                        dedupe_key=f"engine|dst-fallback-replay|{log.id}|failed",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  DST fall-back event not recorded (non-fatal): {exc}")
             return False
         handled.add(log.id)
         authorized = result.outcome == dst_fallback.AUTHORIZED
+        damaged = result.outcome == dst_fallback.DAMAGED
         print(
-            f"  DST fall-back: {'replay pass authorized' if authorized else 'replay pass already handled'} for "
-            f"log {log.date} {log.hour:02d}:00 ({len(result.replay_ids)} occurrence(s), {result.unplayed} unplayed)"
+            f"  DST fall-back: replay pass {result.outcome.replace('_', ' ')} for log {log.date} {log.hour:02d}:00 "
+            f"(pass {result.pass_id}; {len(result.replay_ids)} occurrence(s), {result.unplayed} unplayed"
+            + (f"; {len(result.missing_source_ids)} missing, {len(result.changed_replay_ids)} changed" if damaged else "")
+            + ")"
         )
         try:
             emit_event(
-                category="engine", level="warning" if authorized else "info",
-                title=("DST fall-back: approved hour replay pass authorized" if authorized
-                       else "DST fall-back: approved hour replay pass already handled"),
+                category="engine", level="warning" if authorized or damaged else "info",
+                title={dst_fallback.AUTHORIZED: "DST fall-back: approved hour replay pass authorized",
+                       dst_fallback.ALREADY_HANDLED: "DST fall-back: approved hour replay pass already handled",
+                       dst_fallback.DAMAGED: "DST fall-back: replay pass damaged (occurrences deleted or changed; "
+                                             "not re-created)"}[result.outcome],
                 detail={
-                    **transition.as_detail(), "playlist_log_id": log.id, "outcome": result.outcome,
-                    "reason": reason, "observed_at_utc": now.astimezone(dst_fallback.UTC).isoformat(),
+                    **transition.as_detail(), "playlist_log_id": log.id, "replay_pass_id": result.pass_id,
+                    "outcome": result.outcome, "reason": result.reason, "trigger": reason,
+                    "observed_at_utc": now.astimezone(dst_fallback.UTC).isoformat(),
                     "replay_log_item_ids": result.replay_ids[:50], "replay_occurrences": len(result.replay_ids),
                     "source_log_item_ids": result.source_ids[:50], "unplayed": result.unplayed,
+                    "missing_source_log_item_ids": result.missing_source_ids[:50],
+                    "changed_replay_log_item_ids": result.changed_replay_ids[:50],
                 },
                 dedupe_key=f"engine|dst-fallback-replay|{log.id}|{result.outcome}",
             )
@@ -7153,8 +7175,13 @@ class PlaybackEngine:
                     )
                     if not is_dedication_play:
                         track = locked_item.track
+                        # [P0] 1.21: a DST fall-back replay occurrence (authorized by its
+                        # DstFallbackReplayPass) is a new airing of scheduled programming,
+                        # whatever position it was appended at; every other row keeps the
+                        # established position rule.
                         pe_source = (
-                            "insert" if getattr(locked_item, "position", 0) >= 9999
+                            "scheduled" if locked_item.replay_pass_id is not None
+                            else "insert" if getattr(locked_item, "position", 0) >= 9999
                             else "scheduled"
                         )
                         pe_category_kind = ""

@@ -102,8 +102,8 @@ class TransitionIdentityTests(SimpleTestCase):
 
 
 class _Row:
-    def __init__(self, id, position, origin, track_id=1, category_id=1, scheduled=0, played=None):
-        self.id, self.position, self.origin = id, position, origin
+    def __init__(self, id, position, origin, track_id=1, category_id=1, scheduled=0, played=None, replay_pass_id=None):
+        self.id, self.position, self.origin, self.replay_pass_id = id, position, origin, replay_pass_id
         self.track_id, self.category_id = track_id, category_id
         self.scheduled_time = utc(8) + timedelta(minutes=scheduled)
         self.played_at = played
@@ -112,12 +112,12 @@ class _Row:
 
 
 class ReplayRecognitionTests(SimpleTestCase):
-    def test_a_replay_row_matches_an_original_and_other_inserts_never_do(self):
+    def test_replay_identity_is_the_pass_never_the_programming_fields(self):
         G, E = "generated_schedule", "engine_inserted"
-        rows = [_Row(1, 0, G, track_id=1, scheduled=0), _Row(2, 1, G, track_id=2, scheduled=4),
-                _Row(3, 2, E, track_id=9, scheduled=7),        # an urgent insert: its own Track and instant
-                _Row(4, 3, E, track_id=1, scheduled=0)]        # the replay of row 1
-        self.assertEqual([r.id for r in dst_fallback.replay_rows(rows)], [4])
+        original = _Row(1, 0, G, track_id=1, scheduled=0)
+        twin_insert = _Row(2, 1, E, track_id=1, scheduled=0)          # identical Track/Category/time, no pass
+        replay = _Row(3, 2, "dst_replay", track_id=7, scheduled=9, replay_pass_id=5)   # edited, still a replay
+        self.assertEqual([dst_fallback.is_replay(r) for r in (original, twin_insert, replay)], [False, False, True])
 
     def test_only_ordinary_programming_that_aired_before_the_real_hour_is_a_source(self):
         t = dst_fallback.fallback_successor(FALL_BACK, 2, tz=CHICAGO)
@@ -134,6 +134,7 @@ class ReplayRecognitionTests(SimpleTestCase):
             _Row(9, 8, None, played=early),                          # unknown writer (Play Now, admin)
             _Row(10, 10000, "generated_schedule", played=early),     # legacy insert position
             _Row(11, 9, "generated_schedule", played=early),         # a web request is attached
+            _Row(12, 11, "generated_schedule", played=early, replay_pass_id=4),   # already a replay (never a source)
         ]
         sources = dst_fallback.replay_sources(rows, t, linked_ids=frozenset({11}))
         self.assertEqual([r.id for r in sources], [1, 2, 3])

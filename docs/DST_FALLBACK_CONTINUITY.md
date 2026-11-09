@@ -43,24 +43,28 @@ The replay window is `[08:00 UTC − 30 s, 09:00 UTC)`: from the moment an ordin
 
 `dst_fallback.ensure_replay`, called by the engine (`_ensure_dst_fallback_replay`):
 * **When:** on its 10 s scheduler tick before idle recovery, and when the queue runs out.
-* **Lock:** under the approved PlaylistLog's row lock, with a 250 ms bound. If the lock is busy, it retries on the next tick.
-* **What it adds:** for every ordinary programming occurrence of the log that aired *before the real hour began*, one new LogItem in the same approved log:
-  * the same Track, Category, title/artist snapshot and `scheduled_time`;
-  * appended after every existing row, in order;
-  * `origin = engine_inserted`, the engine's existing marker for occurrences it adds to an approved log.
+* **Lock:** under the approved PlaylistLog's row lock, with a 250 ms bound. If the lock is busy, nothing is committed and it retries on the next tick.
+* **What it creates, in one transaction:**
+  * a `DstFallbackReplayPass` record: the authorization itself (see "Durable replay authority" below);
+  * for every ordinary programming occurrence of the log that aired *before the real hour began*, one new LogItem in the same approved log:
+    * the same Track, Category, title/artist snapshot and `scheduled_time`;
+    * appended after every existing row, in order;
+    * `origin = dst_replay`, `replay_pass` = the pass, and `replay_source_id_snapshot` = the id of the original occurrence it replays.
+* **All or nothing:** any failure before commit (`failed`) or a lock timeout (`busy`) leaves neither the pass nor any occurrence behind.
 * **What it never does:** it never rebuilds, edits or deletes the approved programming. Original rows, their `played_at` and their PlayEvents are not touched.
 
 **4. Everything else is existing machinery**
 
 The new rows are ordinary unplayed occurrences:
 * each is claimed when a deck is prepared;
-* each gets its own `played_at`, play count and PlayEvent (`source = scheduled`) at its own first real output buffer, exactly once, through the existing transaction;
+* each gets its own `played_at`, play count and PlayEvent at its own first real output buffer, exactly once, through the existing transaction;
+* that PlayEvent's `source` is `scheduled` even when the occurrence was appended at position ≥ 9999: the engine classifies by provenance first (`replay_pass` set means it is scheduled programming), then by the established position rule for every other row. So a replay appended after a position-9999 insert is `scheduled`, and the insert itself stays `insert`;
 * the ~3 s queue reload and every restart (`_load_log_for`: first unplayed) put the cursor on them;
 * duplicate air-start callbacks cannot count twice.
 
 **5. No third airing**
 
-The replay rows are the durable authority. Once a pass exists, no process ever adds another, and an existing pass is found again after any restart (`already_handled`). A completed pass leaves nothing unplayed.
+The pass record is the durable authority. Once it exists, no process ever creates another for that log and hour, whatever happens to the occurrences. After any restart it is found again: `already_handled`, or `damaged` if occurrences were deleted or changed. A completed pass leaves nothing unplayed.
 
 **6. Two narrow queue-safety corrections that apply everywhere**
 
@@ -78,30 +82,68 @@ These keep their single first-pass airing, so no one-shot action is credited twi
 * Active Messages aggregate Tracks;
 * rows a web request or its dedication intro is attached to.
 
-### Durable marker without a schema change
+### Durable replay authority (migration `library/0100_dst_fallback_replay_pass`)
 
-A replay row is an `engine_inserted` row whose (Track, Category, `scheduled_time`) equals an original programming row of the same log. Other engine inserts carry their own insertion instant as `scheduled_time` and their own Track, so they never match.
+The first implementation (`dc8432b`, `1c3ae46`) inferred a replay from an `engine_inserted` row matching an original's (Track, Category, `scheduled_time`). Codex showed that inference was not authoritative:
+* an unrelated identical engine insert suppressed the pass;
+* edited or deleted replay rows let a new pass be authorized;
+* duplicate originals collapsed into one tuple.
 
-There is no migration.
+**What replaced it:**
+* **`DstFallbackReplayPass`** (new table): one row per approved PlaylistLog and physical successor hour.
+  * *Database-enforced:* the unique constraint `library_dst_replay_pass_once_per_log_hour` on `(playlist_log, successor_hour_start)`, where `successor_hour_start` is the real UTC start (08:00 UTC).
+  * *Contents:* the transition instant, time zone, authorization instant and trigger, and exactly what it authorized (`source_log_item_ids`, `replay_count`).
+  * *Lifetime:* cascades with its PlaylistLog. While any of its occurrences exist it cannot be deleted on its own (`RESTRICT`).
+* **LogItem provenance** (new nullable, non-editable columns):
+  * `replay_pass` and `replay_source_id_snapshot` are set once by the engine.
+  * The id snapshot survives deletion of the original.
+  * A partial unique constraint (`library_logitem_one_replay_per_source`) gives one replay per original per pass, so duplicate originals with identical fields stay two sources.
+  * A check constraint (`library_logitem_dst_replay_provenance`) makes `origin = dst_replay` and the provenance columns exist only together.
+
+**Why mutable fields no longer decide anything:**
+* Authorization is decided by the pass record alone, never by any LogItem field.
+* An identical foreign insert is just another row.
+* Editing a replay occurrence's Track, Category or time leaves the pass in place. A request swap is an edit of this kind and a legitimate new fulfilment of a real airing.
+* Deleting one, several or all replay occurrences also leaves the pass in place.
+* A pass whose occurrences were deleted or had their Track or Category changed is reported as **`damaged`** (one SystemEvent per process, with the missing source ids and the changed replay ids). It is never re-created: an operator who deleted replay rows keeps them off the air.
+
+**Origin.**
+* `dst_replay` is a new `LogItem.origin` value: a special, engine-authorized new occurrence derived from approved scheduled programming.
+* *Hour Refill:* its causality code treats only `generated_schedule` as scheduled programming and every other origin as a non-cause source. A replay is therefore never an Eject cause, exactly like an `engine_inserted` row.
+* *Other consumers:* no other code interprets `origin`. Log building, live fill, web-request substitution, dedications, Active Messages and urgent inserts do not.
+* *Admin:* the provenance columns are `editable=False`, so the LogItem admin inline does not expose them.
+* *Origin versus PlayEvent source:* `origin` and the PlayEvent `source` serve different purposes. The origin says who created the occurrence; the source says it aired as scheduled programming.
+
+**Schema and release implications.**
+* The migration is additive: a new table, two nullable LogItem columns with no database default (so r0130 code keeps inserting LogItems during an upgrade), the `dst_replay` choice (no column change), and two constraints that every existing row satisfies.
+* Nothing is backfilled or inferred from historical rows.
+* Reverting to r0130 code leaves the new table and columns unused and harmless. Removing them requires reversing the migration (`migrate library 0099`), which drops the table and columns; DST replay occurrences would then become ordinary rows.
+* The r0131 release must authorize this migration through the trusted Update Center plan.
 
 ### Event
 
 The first time a process authorizes or finds a pass, it emits one `engine` SystemEvent:
-* *Titles:* "DST fall-back: approved hour replay pass authorized" (warning) or "… already handled" (info).
+* *Titles:*
+  * "DST fall-back: approved hour replay pass authorized" (warning);
+  * "… already handled" (info);
+  * "… replay pass damaged (occurrences deleted or changed; not re-created)" (warning).
+
+  A creation that failed before commit emits "… replay pass creation failed (nothing committed)" (error). A busy lock emits nothing and retries.
 * *Dedupe key:* `engine|dst-fallback-replay|<log id>|<outcome>`.
 * *Detail:*
   * the time zone;
   * the repeated local hour, transition instant, real hour start and UTC offsets;
   * the replay window;
   * the PlaylistLog id;
-  * the source and replay LogItem ids;
-  * the reason and the observed instant.
+  * the pass id, the source and replay LogItem ids, and for a damaged pass the missing source ids and the changed replay ids;
+  * the reason, the trigger and the observed instant.
 
 There is no per-tick event.
 
 ## Deliberate exceptions to existing invariants
 
 * **Occurrences added to an approved log.** The engine adds replay occurrences to an approved log, as it already does for urgent alerts and dedication intros. The approved programming is reused, never rebuilt.
+* **A PlayEvent source decided by provenance.** A replay occurrence's PlayEvent is `scheduled` regardless of its position. Every other row keeps the position ≥ 9999 rule.
 * **One programmed item airs twice.** A programmed item can air twice on the fall-back night, once per physical hour. Each airing is its own LogItem occurrence with its own evidence. No occurrence airs twice, and no non-DST hour is affected.
 
 ## Limitations

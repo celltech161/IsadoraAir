@@ -26,26 +26,34 @@ broader:
   next-hour lookahead, 30 s): the same moment an ordinary next hour's queue would be installed early, through the
   end of the real hour.  Before it, during the repeated hour, the first pass plays as before; after it, ordinary
   forward progression owns the queue.
-* ``ensure_replay`` -- under the approved PlaylistLog's row lock (bounded wait), idempotently materializes one
-  *replay pass*: for every ordinary programming occurrence of that log that actually aired *before* the real hour
-  began (``played_at < hour_start``), a new LogItem in the same approved log -- same Track, Category, title/artist
-  snapshot and ``scheduled_time`` -- appended after every existing row, in original order, with
-  ``origin = engine_inserted`` (the engine's existing marker for occurrences it adds to an approved log).  The
-  originals and their history are never modified.  The new rows are ordinary unplayed occurrences: the engine's
-  existing claim / first-real-buffer / PlayEvent path gives each its own ``played_at`` and PlayEvent exactly once,
-  the ~3 s queue reload and every restart position the cursor on them (first unplayed), and no further pass can
-  follow (the rows themselves are the durable authority: once a pass exists, none is ever added again, in any
-  process).
+* ``ensure_replay`` -- under the approved PlaylistLog's row lock (bounded wait), and only if no pass exists for this
+  log and successor hour, materializes the single replay pass in ONE transaction: a ``DstFallbackReplayPass`` record
+  (unique per ``(playlist_log, successor_hour_start)`` in the database) and, for every ordinary programming
+  occurrence of that log that actually aired *before* the real hour began (``played_at < hour_start``), a new
+  LogItem in the same approved log -- same Track, Category, title/artist snapshot and ``scheduled_time``, appended
+  after every existing row in original order -- with ``origin = dst_replay``, ``replay_pass`` = the pass and
+  ``replay_source_id_snapshot`` = the id of the original occurrence it replays.  The originals and their history
+  are never modified.  The new rows are ordinary unplayed occurrences: the engine's existing claim /
+  first-real-buffer / PlayEvent path gives each its own ``played_at`` and PlayEvent exactly once (``source =
+  scheduled`` whatever its position: it is scheduled programming), and the ~3 s queue reload and every restart
+  position the cursor on them (first unplayed).
+
+**Durable authority.**  Whether a pass was authorized is decided by the ``DstFallbackReplayPass`` record alone, never
+by inspecting LogItem fields: an unrelated engine insert identical to an original can never count as a replay, and
+editing (Track, Category, time) or deleting any or all replay occurrences never makes the hour eligible again -- no
+replacement or third pass, in any process, after any restart.  The pass records which originals it replayed
+(``source_log_item_ids``, ``replay_count``), so duplicate originals with identical fields stay distinct (one replay
+per original id, unique in the database), and a pass whose occurrences were later deleted or changed is reported as
+*damaged* (deduplicated SystemEvent) and never silently re-created: an operator's deletion of replay rows keeps them
+from playing.  Creation is all-or-nothing: a lock timeout (``busy``) or any failure (``failed``) commits nothing and
+a later tick may retry; a concurrent creator that slipped past the lock would hit the unique constraint and find the
+committed pass.
 
 Not replayed (they keep their single, first-pass airing): rows that never aired or aired in the real hour,
 operator/engine inserts (urgent alerts, native Active Messages, dedication intros, Play Now: any origin other than
 generated schedule / build-time fill / live fill), Hour Refill installs, positions >= 9999, the Dedications
 category, Active Messages aggregate Tracks, and rows a web request or its dedication intro is attached to -- so no
 one-shot fulfilment is credited twice.
-
-A replay row is recognised durably, without a schema change, as an ``engine_inserted`` row whose (Track, Category,
-``scheduled_time``) equals that of an original programming row of the same log.  Other engine inserts carry their
-own insertion instant as ``scheduled_time`` and their own Track, so they never match.
 """
 from __future__ import annotations
 
@@ -53,7 +61,7 @@ import functools
 from dataclasses import dataclass, field
 from datetime import date as date_type, datetime, time, timedelta, timezone as dt_timezone
 
-from django.db import OperationalError, connection, transaction
+from django.db import IntegrityError, OperationalError, connection, transaction
 from django.utils import timezone
 
 UTC = dt_timezone.utc
@@ -67,7 +75,10 @@ AUTHORIZED = "authorized"            # a replay pass was materialized now
 ALREADY_HANDLED = "already_handled"  # a replay pass exists (this or an earlier process made it)
 NOT_ELIGIBLE = "not_eligible"        # nothing of this hour aired before its real start
 WINDOW_CLOSED = "window_closed"      # not inside the bounded replay window
-BUSY = "busy"                        # the approved log was locked; retried on a later tick
+BUSY = "busy"                        # the approved log was locked; nothing committed; retried on a later tick
+DAMAGED = "damaged"                  # a pass exists, but occurrences it authorized were deleted or changed
+FAILED = "failed"                    # creation failed before commit; nothing committed; retried on a later tick
+HANDLED = (AUTHORIZED, ALREADY_HANDLED, DAMAGED)
 
 
 def _replay_source_origins():
@@ -171,15 +182,9 @@ def fallback_successor(log_date, log_hour, *, tz=None, lead_seconds=30) -> Fallb
 
 # --------------------------------------------------------------------------- the replay pass
 
-def _replay_key(row):
-    return (row.track_id, row.category_id, row.scheduled_time)
-
-
-def replay_rows(rows) -> list:
-    """The rows of one log that form its replay pass (see the module docstring)."""
-    from library.models import LogItem
-    originals = {_replay_key(r) for r in rows if r.origin != LogItem.ORIGIN_ENGINE_INSERTED}
-    return [r for r in rows if r.origin == LogItem.ORIGIN_ENGINE_INSERTED and _replay_key(r) in originals]
+def is_replay(row) -> bool:
+    """A replay occurrence: authorized by a DstFallbackReplayPass (never inferred from Track, Category or time)."""
+    return getattr(row, "replay_pass_id", None) is not None
 
 
 def _active_message_track(track) -> bool:
@@ -195,7 +200,8 @@ def replay_sources(rows, transition, *, linked_ids=frozenset()) -> list:
     origins = _replay_source_origins()
     sources = []
     for row in rows:
-        if row.origin not in origins or row.position >= INSERT_POSITION_FLOOR or row.track_id is None:
+        if is_replay(row) or row.origin not in origins or row.position >= INSERT_POSITION_FLOOR \
+                or row.track_id is None:
             continue
         if row.played_at is None or row.played_at >= transition.hour_start:
             continue
@@ -211,14 +217,44 @@ def replay_sources(rows, transition, *, linked_ids=frozenset()) -> list:
 class ReplayResult:
     outcome: str
     reason: str = ""
+    pass_id: int | None = None
     replay_ids: list = field(default_factory=list)
     source_ids: list = field(default_factory=list)
     unplayed: int = 0
+    missing_source_ids: list = field(default_factory=list)
+    changed_replay_ids: list = field(default_factory=list)
 
 
-def ensure_replay(log_id, transition, *, now) -> ReplayResult:
-    """Materialize the log's single replay pass if it is due and does not exist (see the module docstring)."""
-    from library.models import LogItem, PlaylistLog
+def pass_state(replay_pass) -> ReplayResult:
+    """A committed pass as it is now: ``already_handled``, or ``damaged`` when occurrences it authorized were deleted
+    (their original's id no longer has a replay row) or changed (a replay row's Track or Category differs from its
+    original's).  Read only; nothing is ever re-created."""
+    from library.models import LogItem
+    rows = list(LogItem.objects.filter(replay_pass=replay_pass).order_by("position")
+                .only("id", "track_id", "category_id", "played_at", "replay_source_id_snapshot"))
+    authorized = [int(i) for i in replay_pass.source_log_item_ids]
+    present = {r.replay_source_id_snapshot for r in rows}
+    missing = [i for i in authorized if i not in present]
+    originals = {o.id: o for o in LogItem.objects.filter(id__in=authorized).only("id", "track_id", "category_id")}
+    changed = [r.id for r in rows if r.replay_source_id_snapshot in originals
+               and (r.track_id, r.category_id) != (originals[r.replay_source_id_snapshot].track_id,
+                                                   originals[r.replay_source_id_snapshot].category_id)]
+    damaged = bool(missing or changed or len(rows) != replay_pass.replay_count)
+    return ReplayResult(
+        DAMAGED if damaged else ALREADY_HANDLED,
+        ("the authorized pass exists but " + "; ".join(filter(None, [
+            f"{len(missing)} of its {replay_pass.replay_count} occurrence(s) no longer exist" if missing else "",
+            f"{len(changed)} occurrence(s) were changed" if changed else ""])) + "; nothing is re-created")
+        if damaged else "a replay pass already exists for this log and hour",
+        pass_id=replay_pass.id, replay_ids=[r.id for r in rows], source_ids=authorized,
+        unplayed=sum(1 for r in rows if r.played_at is None), missing_source_ids=missing, changed_replay_ids=changed,
+    )
+
+
+def ensure_replay(log_id, transition, *, now, reason="") -> ReplayResult:
+    """The log's single replay pass for this transition: found (``already_handled`` / ``damaged``) or, if due and
+    absent, created atomically with its occurrences (``authorized``).  See the module docstring."""
+    from library.models import DstFallbackReplayPass, LogItem, PlaylistLog
     from webrequests.models import SongRequest
 
     if not transition.window_open(now):
@@ -230,13 +266,12 @@ def ensure_replay(log_id, transition, *, now) -> ReplayResult:
             log = PlaylistLog.objects.select_for_update().filter(pk=log_id, status="approved").first()
             if log is None or (log.date, log.hour) != (transition.log_date, transition.log_hour):
                 return ReplayResult(NOT_ELIGIBLE, "the approved log is not this transition's log")
+            existing = DstFallbackReplayPass.objects.filter(
+                playlist_log=log, successor_hour_start=transition.hour_start).first()
+            if existing is not None:
+                return pass_state(existing)
             rows = list(LogItem.objects.filter(playlist_log=log).select_related("category", "track")
                         .order_by("position"))
-            existing = replay_rows(rows)
-            if existing:
-                return ReplayResult(ALREADY_HANDLED, "a replay pass already exists for this log",
-                                    replay_ids=[r.id for r in existing],
-                                    unplayed=sum(1 for r in existing if r.played_at is None))
             ids = [r.id for r in rows]
             linked = set(SongRequest.objects.filter(log_item_id__in=ids).values_list("log_item_id", flat=True))
             linked |= set(SongRequest.objects.filter(intro_log_item_id__in=ids)
@@ -250,16 +285,31 @@ def ensure_replay(log_id, transition, *, now) -> ReplayResult:
             sources = replay_sources(rows, transition, linked_ids=frozenset(linked))
             if not sources:
                 return ReplayResult(NOT_ELIGIBLE, "none of this log's programming aired before its real hour")
+            replay_pass = DstFallbackReplayPass.objects.create(
+                playlist_log=log, successor_hour_start=transition.hour_start, transition_at=transition.transition_at,
+                time_zone=transition.zone, authorized_at=now, reason=reason[:32],
+                source_log_item_ids=[r.id for r in sources], replay_count=len(sources),
+            )
             position = max(r.position for r in rows) + 1
             created = []
             for offset, source in enumerate(sources):
                 created.append(LogItem.objects.create(
                     playlist_log=log, position=position + offset, scheduled_time=source.scheduled_time,
                     track_id=source.track_id, track_title=source.track_title, track_artist=source.track_artist,
-                    category_id=source.category_id, origin=LogItem.ORIGIN_ENGINE_INSERTED,
+                    category_id=source.category_id, origin=LogItem.ORIGIN_DST_REPLAY,
+                    replay_pass=replay_pass, replay_source_id_snapshot=source.id,
                 ))
             return ReplayResult(AUTHORIZED, "the approved programming aired during the repeated hour",
-                                replay_ids=[r.id for r in created], source_ids=[r.id for r in sources],
-                                unplayed=len(created))
+                                pass_id=replay_pass.id, replay_ids=[r.id for r in created],
+                                source_ids=[r.id for r in sources], unplayed=len(created))
     except OperationalError as exc:
-        return ReplayResult(BUSY, f"the approved log is busy ({type(exc).__name__}); retried on the next tick")
+        return ReplayResult(BUSY, f"the approved log is busy ({type(exc).__name__}); nothing committed, retried later")
+    except IntegrityError:
+        # A creator that slipped past the row lock met the database's uniqueness: the committed pass is the authority.
+        existing = DstFallbackReplayPass.objects.filter(
+            playlist_log_id=log_id, successor_hour_start=transition.hour_start).first()
+        if existing is not None:
+            return pass_state(existing)
+        return ReplayResult(FAILED, "a database constraint refused the pass; nothing committed")
+    except Exception as exc:  # noqa: BLE001 -- the whole attempt rolled back; playout continues without it
+        return ReplayResult(FAILED, f"creation failed before commit ({type(exc).__name__}: {exc}); nothing committed")

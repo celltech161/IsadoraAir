@@ -35,6 +35,8 @@ MAR8 = date(2026, 3, 8)
 NOV2 = date(2026, 11, 2)
 GENERATED = LogItem.ORIGIN_GENERATED_SCHEDULE
 ENGINE_INSERTED = LogItem.ORIGIN_ENGINE_INSERTED
+# 1.21 corrections: replay occurrences carry their own origin and pass (getattr keeps this module importable at r0130).
+DST_REPLAY = getattr(LogItem, "ORIGIN_DST_REPLAY", "dst_replay")
 
 
 def utc(hour, minute=0, second=0, day=NOV1):
@@ -165,7 +167,7 @@ class FallBackTimelineTests(_DstFixture):
         with self.at(utc(6, 59, 30), engine):
             self.tick(engine)
         self.assertEqual((engine.current_log.id, engine._queue_cursor), (self.log02.id, 0))
-        self.assertFalse(LogItem.objects.filter(origin=ENGINE_INSERTED).exists())
+        self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
 
         # The repeated 01:00 CST hour (07:00-08:00 UTC): the 02:00 programming supplies playout -- first pass.
         first = self.play_through(engine, utc(7, 0, 10), 4)
@@ -186,8 +188,10 @@ class FallBackTimelineTests(_DstFixture):
         self.assertEqual(len(replay), 4)
         self.assertEqual([(r.track_id, r.category_id, r.scheduled_time) for r in replay],
                          [(r.track_id, r.category_id, r.scheduled_time) for r in originals])
-        self.assertTrue(all(r.origin == ENGINE_INSERTED and r.played_at is None and r.playback_claimed_at is None
+        self.assertTrue(all(r.origin == DST_REPLAY and r.played_at is None and r.playback_claimed_at is None
                             for r in replay))
+        self.assertEqual({r.replay_pass_id for r in replay}, {replay[0].replay_pass_id})
+        self.assertEqual([r.replay_source_id_snapshot for r in replay], [r.id for r in originals])
         self.assertEqual([r.position for r in replay], [4, 5, 6, 7])
         self.assertEqual(engine._queue_cursor, 4)
         engine._start_next_track.assert_called()                 # idle recovery resumes with the replay pass
@@ -255,7 +259,7 @@ class FallBackTimelineTests(_DstFixture):
             self.tick(engine)                                    # 02:00:10 CST scheduler tick
         item = self.next_item(engine, utc(8, 0, 15))
         self.assertIsNotNone(item, "the real 02:00 CST hour has nothing to play")
-        self.assertEqual((item.playlist_log_id, item.origin, item.played_at), (self.log02.id, ENGINE_INSERTED, None))
+        self.assertEqual((item.playlist_log_id, item.origin, item.played_at), (self.log02.id, DST_REPLAY, None))
 
     def test_a_first_pass_still_playing_at_the_window_continues_then_the_replay_follows(self):
         engine = make_engine()
@@ -299,7 +303,7 @@ class RestartAndRecoveryTests(_DstFixture):
                 self.assertEqual(engine.current_log.id, self.log01.id)
                 with self.at(instant, engine):
                     self.tick(engine)
-                self.assertFalse(LogItem.objects.filter(origin=ENGINE_INSERTED).exists())
+                self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
 
     def test_restart_during_the_repeated_hour_never_restarts_the_aired_first_pass(self):
         self.first_pass_aired(items=2)
@@ -309,7 +313,7 @@ class RestartAndRecoveryTests(_DstFixture):
         self.assertEqual(engine.current_log.id, self.log01.id)
         item = self.next_item(engine, utc(7, 45, 5))             # 01 exhausted -> 02 at its first unplayed
         self.assertEqual(item.id, self.rows(self.log02)[2].id)
-        self.assertFalse(LogItem.objects.filter(origin=ENGINE_INSERTED).exists())
+        self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
 
     def test_restart_just_before_0200_cst_installs_the_replay_once(self):
         self.first_pass_aired()
@@ -377,7 +381,7 @@ class RestartAndRecoveryTests(_DstFixture):
         with self.at(utc(7, 59, 40), engine):
             self.tick(engine)
         self.assertEqual(engine._queue_cursor, 3)                 # after the on-deck item, at the first replay
-        self.assertEqual(engine.log_items[3].origin, ENGINE_INSERTED)
+        self.assertEqual(engine.log_items[3].origin, DST_REPLAY)
         engine._start_next_track.assert_not_called()             # a playing deck is never doubled
 
     def test_a_busy_log_defers_and_a_later_tick_installs(self):
@@ -485,7 +489,7 @@ class SpringForwardAndNormalTimeTests(_DstFixture):
         self.assertEqual(engine.current_log.id, log03.id)
         self.play_through(engine, utc(8, 0, 10, day=MAR8), 2, step=timedelta(minutes=30))
         self.assertIsNone(self.next_item(engine, utc(8, 59, day=MAR8)))
-        self.assertFalse(LogItem.objects.filter(origin=ENGINE_INSERTED).exists())
+        self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
         self.assertFalse(SystemEvent.objects.filter(dedupe_key__startswith="engine|dst-fallback-replay|").exists())
 
     def test_an_ordinary_day_keeps_rollover_early_rollover_and_exhaustion_unchanged(self):
@@ -510,7 +514,7 @@ class SpringForwardAndNormalTimeTests(_DstFixture):
             restarted._load_current_hour_log()
             self.tick(restarted)
         self.assertEqual(restarted._queue_cursor, 2)
-        self.assertFalse(LogItem.objects.filter(origin=ENGINE_INSERTED).exists())
+        self.assertFalse(LogItem.objects.filter(origin=DST_REPLAY).exists())
         self.assertFalse(SystemEvent.objects.filter(dedupe_key__startswith="engine|dst-fallback-replay|").exists())
         # Early rollover by the lookahead still installs the next hour ahead of its top, at cursor 0.
         log15 = self.log(NOV2, 15, ["n15-a"], start=utc(21, day=NOV2))
