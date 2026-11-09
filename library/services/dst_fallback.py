@@ -1,0 +1,265 @@
+"""[P0] 1.21: playout continuity through a daylight-saving fall-back repeated hour.
+
+The November 1, 2026 outage (America/Chicago, CDT -> CST at 07:00 UTC):
+
+1. At 01:59:30 CDT the engine built and approved the 02:00 log and, by its established early-rollover policy,
+   installed it as the active queue.
+2. The clock then returned to 01:00 CST.  The approved 02:00 programming kept playing through the repeated hour,
+   so its occurrences aired -- ``played_at`` set, PlayEvents written -- before the real 02:00 CST hour began.
+3. From 02:00 CST that same approved log is the current hour's authority, but every occurrence is already
+   played: the queue cursor (first unplayed item) is past its end and nothing schedules the next hour until the
+   03:00 lookahead.  About an hour of silence followed.
+
+The approved programming may be reused for the real hour; it must not be rebuilt.  A LogItem is one logical
+occurrence -- ``played_at`` is its one-way actual-air gate and ``PlayEvent.log_item_id_snapshot`` is unique -- so
+a second, truthfully counted airing needs occurrences of its own.  This module provides exactly that and nothing
+broader:
+
+* ``fallback_successor`` -- the transition identity, from the station time zone and actual instants only.  A log
+  ``(date, hour)`` is a *fall-back successor* when the whole preceding local wall hour is repeated (its two
+  instances have UTC offsets exactly one hour apart, the earlier one larger) and the log's own ``hour:00`` is
+  unambiguous.  For America/Chicago that is only ``(2026-11-01, 2)``: repeated 01:00 CDT (06:00 UTC) and 01:00 CST
+  (07:00 UTC), real hour start 02:00 CST (08:00 UTC).  Recognition never relies on ``now.fold``: 02:00 CST itself
+  is not ambiguous.  Spring-forward gaps, ordinary days, other hours and zones whose shift is not one whole hour
+  never qualify.
+* The **replay window** is ``[hour_start - lead, hour_start + 1 hour)`` in actual instants (``lead`` = the engine's
+  next-hour lookahead, 30 s): the same moment an ordinary next hour's queue would be installed early, through the
+  end of the real hour.  Before it, during the repeated hour, the first pass plays as before; after it, ordinary
+  forward progression owns the queue.
+* ``ensure_replay`` -- under the approved PlaylistLog's row lock (bounded wait), idempotently materializes one
+  *replay pass*: for every ordinary programming occurrence of that log that actually aired *before* the real hour
+  began (``played_at < hour_start``), a new LogItem in the same approved log -- same Track, Category, title/artist
+  snapshot and ``scheduled_time`` -- appended after every existing row, in original order, with
+  ``origin = engine_inserted`` (the engine's existing marker for occurrences it adds to an approved log).  The
+  originals and their history are never modified.  The new rows are ordinary unplayed occurrences: the engine's
+  existing claim / first-real-buffer / PlayEvent path gives each its own ``played_at`` and PlayEvent exactly once,
+  the ~3 s queue reload and every restart position the cursor on them (first unplayed), and no further pass can
+  follow (the rows themselves are the durable authority: once a pass exists, none is ever added again, in any
+  process).
+
+Not replayed (they keep their single, first-pass airing): rows that never aired or aired in the real hour,
+operator/engine inserts (urgent alerts, native Active Messages, dedication intros, Play Now: any origin other than
+generated schedule / build-time fill / live fill), Hour Refill installs, positions >= 9999, the Dedications
+category, Active Messages aggregate Tracks, and rows a web request or its dedication intro is attached to -- so no
+one-shot fulfilment is credited twice.
+
+A replay row is recognised durably, without a schema change, as an ``engine_inserted`` row whose (Track, Category,
+``scheduled_time``) equals that of an original programming row of the same log.  Other engine inserts carry their
+own insertion instant as ``scheduled_time`` and their own Track, so they never match.
+"""
+from __future__ import annotations
+
+import functools
+from dataclasses import dataclass, field
+from datetime import date as date_type, datetime, time, timedelta, timezone as dt_timezone
+
+from django.db import OperationalError, connection, transaction
+from django.utils import timezone
+
+UTC = dt_timezone.utc
+ONE_HOUR = timedelta(hours=1)
+#: Bounded wait for the approved log's row lock; this runs on the engine's single GLib thread.
+LOCK_TIMEOUT = "250ms"
+INSERT_POSITION_FLOOR = 9999
+DEDICATIONS_CATEGORY_CODE = "Dedications"
+
+AUTHORIZED = "authorized"            # a replay pass was materialized now
+ALREADY_HANDLED = "already_handled"  # a replay pass exists (this or an earlier process made it)
+NOT_ELIGIBLE = "not_eligible"        # nothing of this hour aired before its real start
+WINDOW_CLOSED = "window_closed"      # not inside the bounded replay window
+BUSY = "busy"                        # the approved log was locked; retried on a later tick
+
+
+def _replay_source_origins():
+    from library.models import LogItem
+    return (LogItem.ORIGIN_GENERATED_SCHEDULE, LogItem.ORIGIN_GENERATED_FILL, LogItem.ORIGIN_LIVE_FILL)
+
+
+def _format_offset(offset: timedelta) -> str:
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    return f"UTC{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+@dataclass(frozen=True)
+class FallbackTransition:
+    """The identity of one fall-back repeated hour and the log that follows it (all instants in UTC)."""
+    zone: str
+    log_date: date_type
+    log_hour: int
+    repeated_date: date_type
+    repeated_hour: int
+    first_instance_start: datetime     # the repeated wall hour's first instance (before the change)
+    transition_at: datetime            # its second instance: the instant the clock went back
+    hour_start: datetime               # the log's real hour start (unambiguous)
+    offset_before: timedelta
+    offset_after: timedelta
+    lead: timedelta = field(default=timedelta(seconds=30))
+
+    @property
+    def window_start(self) -> datetime:
+        return self.hour_start - self.lead
+
+    @property
+    def window_end(self) -> datetime:
+        return self.hour_start + ONE_HOUR
+
+    def window_open(self, now: datetime) -> bool:
+        instant = now.astimezone(UTC)          # compare instants, never same-tzinfo wall times
+        return self.window_start <= instant < self.window_end
+
+    @property
+    def identity(self) -> str:
+        return (f"{self.zone} fall-back {self.repeated_date.isoformat()} {self.repeated_hour:02d}:00 "
+                f"{_format_offset(self.offset_before)}->{_format_offset(self.offset_after)} at "
+                f"{self.transition_at.isoformat()}; log {self.log_date.isoformat()} {self.log_hour:02d}:00 "
+                f"starts {self.hour_start.isoformat()}")
+
+    def as_detail(self) -> dict:
+        return {
+            "transition": self.identity, "time_zone": self.zone,
+            "log_date": self.log_date.isoformat(), "log_hour": self.log_hour,
+            "repeated_local_hour": f"{self.repeated_date.isoformat()} {self.repeated_hour:02d}:00",
+            "repeated_first_instance_utc": self.first_instance_start.isoformat(),
+            "transition_utc": self.transition_at.isoformat(),
+            "log_hour_start_utc": self.hour_start.isoformat(),
+            "utc_offset_before": _format_offset(self.offset_before),
+            "utc_offset_after": _format_offset(self.offset_after),
+            "replay_window_utc": [self.window_start.isoformat(), self.window_end.isoformat()],
+        }
+
+
+def _offsets(naive: datetime, tz):
+    return naive.replace(tzinfo=tz, fold=0).utcoffset(), naive.replace(tzinfo=tz, fold=1).utcoffset()
+
+
+@functools.lru_cache(maxsize=256)
+def _successor(log_date, log_hour, tz, lead_seconds):
+    naive_start = datetime.combine(log_date, time(log_hour))
+    previous = naive_start - ONE_HOUR
+    before, after = _offsets(previous, tz)
+    # The whole preceding wall hour is repeated: ambiguous at its start and its last instant, with the earlier
+    # instance exactly one hour ahead of the later (a fall-back; a spring-forward gap has the opposite sign).
+    if before is None or after is None or before - after != ONE_HOUR:
+        return None
+    end_before, end_after = _offsets(naive_start - timedelta(microseconds=1), tz)
+    if end_before - end_after != ONE_HOUR:
+        return None
+    start_before, start_after = _offsets(naive_start, tz)
+    if start_before != start_after:                    # the log's own hour start must be unambiguous
+        return None
+    hour_start = naive_start.replace(tzinfo=tz).astimezone(UTC)
+    transition_at = previous.replace(tzinfo=tz, fold=1).astimezone(UTC)
+    first_instance = previous.replace(tzinfo=tz, fold=0).astimezone(UTC)
+    if hour_start - transition_at != ONE_HOUR or transition_at - first_instance != ONE_HOUR:
+        return None
+    return FallbackTransition(
+        zone=getattr(tz, "key", str(tz)), log_date=log_date, log_hour=log_hour,
+        repeated_date=previous.date(), repeated_hour=previous.hour, first_instance_start=first_instance,
+        transition_at=transition_at, hour_start=hour_start, offset_before=before, offset_after=after,
+        lead=timedelta(seconds=lead_seconds),
+    )
+
+
+def fallback_successor(log_date, log_hour, *, tz=None, lead_seconds=30) -> FallbackTransition | None:
+    """The fall-back transition whose repeated hour immediately precedes the log ``(log_date, log_hour)``, or None
+    for every ordinary, spring-forward or partially repeated hour.  Pure time-zone arithmetic (memoized)."""
+    if not isinstance(log_hour, int) or not 0 <= log_hour <= 23:
+        return None
+    return _successor(log_date, log_hour, tz or timezone.get_current_timezone(), int(lead_seconds))
+
+
+# --------------------------------------------------------------------------- the replay pass
+
+def _replay_key(row):
+    return (row.track_id, row.category_id, row.scheduled_time)
+
+
+def replay_rows(rows) -> list:
+    """The rows of one log that form its replay pass (see the module docstring)."""
+    from library.models import LogItem
+    originals = {_replay_key(r) for r in rows if r.origin != LogItem.ORIGIN_ENGINE_INSERTED}
+    return [r for r in rows if r.origin == LogItem.ORIGIN_ENGINE_INSERTED and _replay_key(r) in originals]
+
+
+def _active_message_track(track) -> bool:
+    try:
+        from active_messages import playout
+        return bool(playout.is_candidate(track))
+    except Exception:                                  # undecidable: treat as protected, never replay it
+        return True
+
+
+def replay_sources(rows, transition, *, linked_ids=frozenset()) -> list:
+    """The ordinary programming occurrences of the log that aired before its real hour began, in order."""
+    origins = _replay_source_origins()
+    sources = []
+    for row in rows:
+        if row.origin not in origins or row.position >= INSERT_POSITION_FLOOR or row.track_id is None:
+            continue
+        if row.played_at is None or row.played_at >= transition.hour_start:
+            continue
+        if row.category_id and row.category is not None and row.category.code == DEDICATIONS_CATEGORY_CODE:
+            continue
+        if row.id in linked_ids or _active_message_track(row.track):
+            continue
+        sources.append(row)
+    return sources
+
+
+@dataclass
+class ReplayResult:
+    outcome: str
+    reason: str = ""
+    replay_ids: list = field(default_factory=list)
+    source_ids: list = field(default_factory=list)
+    unplayed: int = 0
+
+
+def ensure_replay(log_id, transition, *, now) -> ReplayResult:
+    """Materialize the log's single replay pass if it is due and does not exist (see the module docstring)."""
+    from library.models import LogItem, PlaylistLog
+    from webrequests.models import SongRequest
+
+    if not transition.window_open(now):
+        return ReplayResult(WINDOW_CLOSED, "outside the bounded fall-back replay window")
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'")
+            log = PlaylistLog.objects.select_for_update().filter(pk=log_id, status="approved").first()
+            if log is None or (log.date, log.hour) != (transition.log_date, transition.log_hour):
+                return ReplayResult(NOT_ELIGIBLE, "the approved log is not this transition's log")
+            rows = list(LogItem.objects.filter(playlist_log=log).select_related("category", "track")
+                        .order_by("position"))
+            existing = replay_rows(rows)
+            if existing:
+                return ReplayResult(ALREADY_HANDLED, "a replay pass already exists for this log",
+                                    replay_ids=[r.id for r in existing],
+                                    unplayed=sum(1 for r in existing if r.played_at is None))
+            ids = [r.id for r in rows]
+            linked = set(SongRequest.objects.filter(log_item_id__in=ids).values_list("log_item_id", flat=True))
+            linked |= set(SongRequest.objects.filter(intro_log_item_id__in=ids)
+                          .values_list("intro_log_item_id", flat=True))
+            try:
+                from active_messages.models import ActiveBroadcastInsertion
+                linked |= set(ActiveBroadcastInsertion.objects.filter(log_item_id__in=ids)
+                              .values_list("log_item_id", flat=True))
+            except (ImportError, LookupError):
+                pass
+            sources = replay_sources(rows, transition, linked_ids=frozenset(linked))
+            if not sources:
+                return ReplayResult(NOT_ELIGIBLE, "none of this log's programming aired before its real hour")
+            position = max(r.position for r in rows) + 1
+            created = []
+            for offset, source in enumerate(sources):
+                created.append(LogItem.objects.create(
+                    playlist_log=log, position=position + offset, scheduled_time=source.scheduled_time,
+                    track_id=source.track_id, track_title=source.track_title, track_artist=source.track_artist,
+                    category_id=source.category_id, origin=LogItem.ORIGIN_ENGINE_INSERTED,
+                ))
+            return ReplayResult(AUTHORIZED, "the approved programming aired during the repeated hour",
+                                replay_ids=[r.id for r in created], source_ids=[r.id for r in sources],
+                                unplayed=len(created))
+    except OperationalError as exc:
+        return ReplayResult(BUSY, f"the approved log is busy ({type(exc).__name__}); retried on the next tick")

@@ -63,6 +63,7 @@ from library.services.remote_dj_stats import (
 )
 from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
+from library.services import dst_fallback
 from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
@@ -5440,16 +5441,79 @@ class PlaybackEngine:
         # independently validated resume record is applied afterward by
         # _install_resume_occurrence and may deliberately settle this
         # cursor to the exact interrupted, already-started occurrence.
-        self._queue_cursor = 0
-        for i, item in enumerate(self.log_items):
-            if item.played_at is None:
-                self._queue_cursor = i
-                break
-        else:
-            self._queue_cursor = len(self.log_items)
+        self._queue_cursor = self._first_unplayed_index(self.log_items)
         skipped = self._queue_cursor
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items "
               f"({'resuming at position ' + str(skipped) if skipped else 'from top'})")
+        return True
+
+    @staticmethod
+    def _first_unplayed_index(items):
+        """Index of the first item whose ``played_at`` is NULL (``len(items)`` when all aired).
+
+        Every path that installs an approved queue starts here (1.21): an occurrence that already began airing
+        is never handed out again as a fresh queue entry.  For a queue with nothing aired -- every ordinary
+        next-hour install -- this is 0, exactly the former behaviour of the rollover/advance paths."""
+        for index, item in enumerate(items):
+            if item.played_at is None:
+                return index
+        return len(items)
+
+    def _dst_fallback_transition(self, log):
+        """The fall-back transition whose repeated hour precedes ``log`` (1.21), or None (memoized, no I/O)."""
+        if log is None:
+            return None
+        return dst_fallback.fallback_successor(log.date, log.hour, lead_seconds=NEXT_HOUR_LOOKAHEAD_SECONDS)
+
+    def _ensure_dst_fallback_replay(self, now=None, *, reason):
+        """[P0] 1.21: give the active approved log its single replay pass when, and only when, it is the log that
+        follows a fall-back repeated hour, the bounded replay window is open, and its programming actually aired
+        during the repeated hour (``library.services.dst_fallback``).  Returns True when a pass exists now.
+
+        Cheap when it cannot apply: one memoized time-zone lookup per call.  Inside the window, the database is
+        consulted (bounded row lock) until the pass exists or is found; then this process stops asking.  The pass
+        itself -- new unplayed LogItems in the approved log -- is the durable authority, so a restart neither
+        repeats nor loses it, and the ~3 s queue reload positions the cursor on it like any unplayed item."""
+        log = self.current_log
+        transition = self._dst_fallback_transition(log)
+        if transition is None:
+            return False
+        now = now or timezone.localtime()
+        if not transition.window_open(now):
+            return False
+        handled = self.__dict__.setdefault("_dst_replay_handled", set())
+        if log.id in handled:
+            return False
+        result = dst_fallback.ensure_replay(log.id, transition, now=now)
+        if result.outcome not in (dst_fallback.AUTHORIZED, dst_fallback.ALREADY_HANDLED):
+            if result.outcome == dst_fallback.BUSY:
+                print(f"  DST fall-back replay deferred: {result.reason}")
+            return False
+        handled.add(log.id)
+        authorized = result.outcome == dst_fallback.AUTHORIZED
+        print(
+            f"  DST fall-back: {'replay pass authorized' if authorized else 'replay pass already handled'} for "
+            f"log {log.date} {log.hour:02d}:00 ({len(result.replay_ids)} occurrence(s), {result.unplayed} unplayed)"
+        )
+        try:
+            emit_event(
+                category="engine", level="warning" if authorized else "info",
+                title=("DST fall-back: approved hour replay pass authorized" if authorized
+                       else "DST fall-back: approved hour replay pass already handled"),
+                detail={
+                    **transition.as_detail(), "playlist_log_id": log.id, "outcome": result.outcome,
+                    "reason": reason, "observed_at_utc": now.astimezone(dst_fallback.UTC).isoformat(),
+                    "replay_log_item_ids": result.replay_ids[:50], "replay_occurrences": len(result.replay_ids),
+                    "source_log_item_ids": result.source_ids[:50], "unplayed": result.unplayed,
+                },
+                dedupe_key=f"engine|dst-fallback-replay|{log.id}|{result.outcome}",
+            )
+        except Exception as exc:  # noqa: BLE001 -- the event never decides playout
+            print(f"  DST fall-back event not recorded (non-fatal): {exc}")
+        # Bring the new occurrences into the in-memory queue now (not in up to 3 s): the reload keeps the cursor
+        # after whatever aired or is on a deck, i.e. on the first unplayed occurrence.
+        self._last_queue_reload = 0
+        self._reload_queue_if_changed()
         return True
 
     def _active_log_has_committed_playout(self):
@@ -5769,6 +5833,11 @@ class PlaybackEngine:
         # warning-free states. In particular, an older active log is only
         # accepted here when _active_log_has_committed_playout() proved it.
 
+        # [P0] 1.21: the bounded DST fall-back replay pass of the active log, before idle recovery below so an
+        # idle engine resumes with it. A no-op (one memoized lookup) in every hour that does not follow a
+        # fall-back repeated hour.
+        self._ensure_dst_fallback_replay(now, reason="scheduler_tick")
+
         # Checked every tick, not just the tick that built the log —
         # otherwise if the one attempt to start playback right after a
         # build doesn't land (or the log already existed for some
@@ -5872,7 +5941,7 @@ class PlaybackEngine:
 
         self.current_log = log
         self.log_items = items
-        self._queue_cursor = 0
+        self._queue_cursor = self._first_unplayed_index(items)
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
         self._next_hour_peek_key = None
@@ -6128,6 +6197,8 @@ class PlaybackEngine:
             if self._next_hour_peek is _NO_PEEK_CANDIDATE:
                 return None  # cached: nothing approved/playable for the target
             log, items = self._next_hour_peek
+            if self._is_active_log(log):
+                return None
             eligible, _takeover_at = self._log_queue_eligibility(log, items, wall_now)
             return self._next_hour_peek if eligible else None
 
@@ -6137,10 +6208,20 @@ class PlaybackEngine:
         self._next_hour_peek_at = monotonic_now
         self._next_hour_peek_key = target_key
         if result:
+            if self._is_active_log(log):
+                return None
             eligible, _takeover_at = self._log_queue_eligibility(log, items, wall_now)
             if not eligible:
                 return None
         return result
+
+    def _is_active_log(self, log):
+        """[P0] 1.21: the active queue is never its own "next hour".  Only during a DST fall-back repeated hour
+        does the following wall hour resolve back to the active log (the 02:00 log installed early at 01:59:30
+        CDT is still "next" at 01:xx CST); re-installing it would replay its aired occurrences from position 0.
+        In every ordinary hour the next wall hour is a different log, so this never applies."""
+        current = getattr(self, "current_log", None)
+        return current is not None and log is not None and log.id == current.id
 
     def _committed_future_runway_seconds(self):
         """Authoritative "how much airtime is already committed to play
@@ -6560,13 +6641,21 @@ class PlaybackEngine:
         gap until `_install_live_fill` lands, which in the common case
         (proactive dispatch already well underway from `_poll_position`
         before actual exhaustion) has already happened by the time
-        this reactive path is even reached."""
+        this reactive path is even reached.
+
+        [P0] 1.21: when the active log is the one that follows a DST fall-back repeated hour and its programming
+        was consumed early, its single replay pass (``_ensure_dst_fallback_replay``) continues the queue first.
+        A rollover never re-installs the active log itself, and an installed queue starts at its first unplayed
+        occurrence."""
+        if self._ensure_dst_fallback_replay(reason="queue_exhausted") and self._queue_cursor < len(self.log_items):
+            print("  Continuing with the DST fall-back replay pass of the active log")
+            return True
         peek = self._peek_next_hour()
         if peek:
             log, items = peek
             self.current_log = log
             self.log_items = items
-            self._queue_cursor = 0
+            self._queue_cursor = self._first_unplayed_index(items)
             self._next_hour_peek = None
             self._next_hour_peek_at = 0.0
             self._next_hour_peek_key = None
