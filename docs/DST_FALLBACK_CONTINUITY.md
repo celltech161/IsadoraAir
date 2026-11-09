@@ -98,7 +98,8 @@ The first implementation (`dc8432b`, `1c3ae46`) inferred a replay from an `engin
   * `replay_pass` and `replay_source_id_snapshot` are set once by the engine.
   * The id snapshot survives deletion of the original.
   * A partial unique constraint (`library_logitem_one_replay_per_source`) gives one replay per original per pass, so duplicate originals with identical fields stay two sources.
-  * A check constraint (`library_logitem_dst_replay_provenance`) makes `origin = dst_replay` and the provenance columns exist only together.
+  * A check constraint (`library_logitem_dst_replay_provenance`) sets the provenance columns together, and only on a `dst_replay` row.
+  * The converse is deliberately not enforced. A `dst_replay` row without a pass exists only after reversing the migration; it is an ordinary row to every reader, since authority and PlayEvent source key on `replay_pass`, and it must not block re-applying the migration.
 
 **Why mutable fields no longer decide anything:**
 * Authorization is decided by the pass record alone, never by any LogItem field.
@@ -117,7 +118,8 @@ The first implementation (`dc8432b`, `1c3ae46`) inferred a replay from an `engin
 **Schema and release implications.**
 * The migration is additive: a new table, two nullable LogItem columns with no database default (so r0130 code keeps inserting LogItems during an upgrade), the `dst_replay` choice (no column change), and two constraints that every existing row satisfies.
 * Nothing is backfilled or inferred from historical rows.
-* Reverting to r0130 code leaves the new table and columns unused and harmless. Removing them requires reversing the migration (`migrate library 0099`), which drops the table and columns; DST replay occurrences would then become ordinary rows.
+* Reverting to r0130 code leaves the new table and columns unused and harmless.
+* Removing them requires reversing the migration (`migrate library 0099`), which drops the table and columns. Any DST replay occurrence then keeps `origin = dst_replay` as an ordinary row, and the pass records are lost. The migration re-applies over such rows (tested: forward, reverse, forward again).
 * The r0131 release must authorize this migration through the trusted Update Center plan.
 
 ### Event

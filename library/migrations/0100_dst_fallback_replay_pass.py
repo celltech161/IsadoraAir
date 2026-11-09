@@ -9,9 +9,11 @@
 #   this migration keeps inserting LogItems during an upgrade;
 # * the new LogItem origin choice "dst_replay" (choices only: no column change);
 # * a partial unique constraint (one replay occurrence per original occurrence
-#   per pass) and a check constraint tying origin "dst_replay" to the
-#   provenance columns. Every existing row satisfies both (provenance NULL and
-#   no row has origin "dst_replay").
+#   per pass) and a check constraint: the provenance columns are set together
+#   and only on an origin "dst_replay" row. Every existing row satisfies both
+#   (provenance NULL). Reversal (to 0099) drops the table and the two columns;
+#   any "dst_replay" row then stays an ordinary row, and re-applying this
+#   migration accepts it (the check does not require a pass for that origin).
 import django.db.models.deletion
 from django.db import migrations, models
 
@@ -77,10 +79,7 @@ class Migration(migrations.Migration):
             model_name="logitem",
             constraint=models.CheckConstraint(
                 condition=models.Q(
-                    models.Q(
-                        ("replay_pass__isnull", True), ("replay_source_id_snapshot__isnull", True),
-                        models.Q(("origin", "dst_replay"), _negated=True),
-                    ),
+                    models.Q(("replay_pass__isnull", True), ("replay_source_id_snapshot__isnull", True)),
                     models.Q(("origin", "dst_replay"), ("replay_pass__isnull", False),
                              ("replay_source_id_snapshot__isnull", False)),
                     _connector="OR",

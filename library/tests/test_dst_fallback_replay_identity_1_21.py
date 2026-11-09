@@ -210,15 +210,15 @@ class ReplayIdentityTests(_Identity):
         self.air(engine, urgent, utc(19, 5, 10, day=NOV2))
         self.assertEqual(PlayEvent.objects.get(log_item_id_snapshot=urgent.id).source, "scheduled")  # position rule
         self.assertFalse(DstFallbackReplayPass.objects.exists())
-        # The provenance is all-or-nothing in the database: no dst_replay row without a pass, no pass on another row.
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            LogItem.objects.create(playlist_log=normal, position=2, scheduled_time=utc(19, day=NOV2),
-                                   track=urgent.track, origin=DST_REPLAY)
+        # The provenance is all-or-nothing in the database and only on a dst_replay row.
         self.first_pass()
         self.ensure()
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            LogItem.objects.filter(pk=urgent.pk).update(replay_pass=DstFallbackReplayPass.objects.get(),
-                                                        replay_source_id_snapshot=urgent.id)
+        replay_pass = DstFallbackReplayPass.objects.get()
+        for change in ({"replay_pass": replay_pass, "replay_source_id_snapshot": urgent.id},   # wrong origin
+                       {"replay_source_id_snapshot": urgent.id},                               # no pass
+                       {"replay_pass": replay_pass}):                                          # no source
+            with self.subTest(change=sorted(change)), self.assertRaises(IntegrityError), transaction.atomic():
+                LogItem.objects.filter(pk=urgent.pk).update(**change)
 
     def test_14_a_damaged_pass_is_reported_once_and_never_recreated(self):
         self.first_pass()

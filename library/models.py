@@ -1194,14 +1194,14 @@ class LogItem(models.Model):
                 condition=models.Q(replay_pass__isnull=False),
                 name="library_logitem_one_replay_per_source",
             ),
-            # dst_replay origin <=> replay provenance: neither can exist without the other.
+            # Replay provenance is all-or-nothing and only on a dst_replay row. (The
+            # converse is deliberately not enforced: a dst_replay row whose pass
+            # columns are gone exists only after reversing migration 0100, is an
+            # ordinary row to every reader -- authority and PlayEvent source key on
+            # replay_pass -- and must not block re-applying the migration.)
             models.CheckConstraint(
-                condition=(
-                    models.Q(replay_pass__isnull=True, replay_source_id_snapshot__isnull=True)
-                    & ~models.Q(origin="dst_replay")
-                ) | models.Q(
-                    replay_pass__isnull=False, replay_source_id_snapshot__isnull=False, origin="dst_replay",
-                ),
+                condition=models.Q(replay_pass__isnull=True, replay_source_id_snapshot__isnull=True)
+                | models.Q(replay_pass__isnull=False, replay_source_id_snapshot__isnull=False, origin="dst_replay"),
                 name="library_logitem_dst_replay_provenance",
             ),
         ]
