@@ -1,4 +1,6 @@
+import io
 import tempfile
+import wave
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +10,20 @@ from django.core.management.base import CommandError
 from django.test import TestCase
 
 from library.models import Category, CategoryKind, Track
+
+
+def _real_audio():
+    """A tenth of a second of genuine PCM audio: import_songs registers only decodable audio (r0131)."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(8000)
+        out.writeframes(b"\x00\x10" * 800)
+    return buffer.getvalue()
+
+
+REAL_AUDIO = _real_audio()
 
 
 class ImportSongsCategoryOverrideTests(TestCase):
@@ -25,7 +41,7 @@ class ImportSongsCategoryOverrideTests(TestCase):
             code="SomeOtherFolder", name="Some Other Folder", kind=kind
         )
 
-    def _write_file(self, relative_path, contents=b"not really an mp3"):
+    def _write_file(self, relative_path, contents=REAL_AUDIO):
         path = self.root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
@@ -86,7 +102,7 @@ class ImportSongsCategoryOverrideTests(TestCase):
         self.assertNotEqual(track.category_id, self.other.id)
 
     def test_reimport_refreshes_existing_track_metadata(self):
-        path = self._write_file("fsn_bulletin.mp3", b"old bulletin")
+        path = self._write_file("fsn_bulletin.mp3")
         self._import(
             str(self.root), "--category", "LocalNews",
             parsed=self._parsed(
@@ -97,7 +113,7 @@ class ImportSongsCategoryOverrideTests(TestCase):
         original = Track.objects.get(filepath=str(path))
         original_id = original.id
 
-        path.write_bytes(b"fresh replacement bulletin")
+        path.write_bytes(REAL_AUDIO)  # a valid replacement (r0131: only decodable audio registers)
         self._import(
             str(self.root), "--category", "LocalNews",
             parsed=self._parsed(
@@ -117,7 +133,7 @@ class ImportSongsCategoryOverrideTests(TestCase):
         self.assertEqual(refreshed.bit_depth, 24)
 
     def test_invalid_override_fails_before_mutating_tracks(self):
-        existing_path = self._write_file("fsn_bulletin.mp3", b"old bulletin")
+        existing_path = self._write_file("fsn_bulletin.mp3")
         self._import(
             str(self.root), "--category", "LocalNews",
             parsed=self._parsed(title="Old Bulletin", duration=302.3),

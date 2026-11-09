@@ -1,4 +1,5 @@
 import os
+import stat
 import struct
 import re
 from pathlib import Path
@@ -8,10 +9,56 @@ from django.core.management.base import BaseCommand, CommandError
 from mutagen import File as MutagenFile
 
 from library.models import Album, Artist, Category, Genre, Track
+from library.services import audio_identity
 from library.services.related_artists import resolve_fallback_metadata
 
 _PROJECTED_SPOKEN = re.compile(r"spoken-[0-9a-f]{32}\.flac")
 SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2", ".alac"}
+# r0131: macOS archive/packaging metadata, never audio -- AppleDouble "._*"
+# companions and the directories that carry them (zip "__MACOSX", netatalk
+# ".AppleDouble"). Their names often end in a supported extension.
+_PACKAGING_DIRS = {"__MACOSX", ".AppleDouble"}
+
+
+def _packaging_artifact(relative_path):
+    return (relative_path.name.startswith("._")
+            or any(part in _PACKAGING_DIRS for part in relative_path.parts[:-1]))
+
+
+def _content_witness(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def read_decodable(path):
+    """r0131: ``(tags, info, "")`` for a regular file whose audio decodes
+    cleanly, or ``(None, None, reason)``. An extension or readable tags never
+    establish that a file is audio; the strict decoder of
+    library.services.audio_identity does (one probe and one full decode of
+    the open file). The tags are read while the file stays the same: if it
+    disappears, is replaced or changes during validation, it is refused."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as exc:
+        return None, None, f"cannot be opened ({exc.strerror})"
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None, None, "not a regular file"
+        identity, problem = audio_identity.compute_fd_or_none(fd)
+        if identity is None:
+            return None, None, f"not decodable audio ({problem})"
+        tags, info = parse_tags(path)
+        after = os.fstat(fd)
+        try:
+            current = os.stat(path)
+        except OSError:
+            return None, None, "disappeared during validation"
+    finally:
+        os.close(fd)
+    if (_content_witness(before) != _content_witness(after)
+            or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)):
+        return None, None, "changed during validation"
+    return tags, info, ""
 
 # WAV files can carry metadata in either an ID3 chunk (which mutagen
 # reads) OR a LIST INFO chunk (which mutagen does NOT), and some CD
@@ -244,6 +291,11 @@ class Command(BaseCommand):
                     skipped += 1
                     continue
 
+                if _packaging_artifact(filepath.relative_to(root)):
+                    self.stderr.write(f"  [WARN] Skipping {filepath}: macOS archive metadata, not audio")
+                    skipped += 1
+                    continue
+
                 try:
                     ok, status = self._process_file(
                         filepath, root, dry_run, category_override
@@ -274,7 +326,17 @@ class Command(BaseCommand):
         )
 
     def _process_file(self, filepath, root, dry_run, category_override=None):
-        tags, info = parse_tags(filepath)
+        # The same eligibility for --dry-run and a real import, before any
+        # database write: an invalid file never creates or updates a Track
+        # (an existing Track keeps its metadata, relationships and readiness).
+        tags, info, problem = read_decodable(filepath)
+        if problem:
+            existing = Track.objects.filter(filepath=str(filepath)).exists()
+            self.stderr.write(
+                f"  [WARN] Skipping {filepath}: {problem}"
+                + ("; the existing Track is left unchanged" if existing else "")
+            )
+            return False, "skipped"
 
         def clean(val):
             return val.replace("\x00", "").strip() if val else val
