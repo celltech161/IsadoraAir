@@ -6651,6 +6651,13 @@ class PlaybackEngine:
             print("  Continuing with the DST fall-back replay pass of the active log")
             return True
         peek = self._peek_next_hour()
+        if peek and self._first_unplayed_index(peek[1]) >= len(peek[1]):
+            # Nothing in that queue is still unplayed (only possible after a DST fall-back repeated hour or a
+            # restart inside it): installing it would hand _next_queue_item another exhausted queue, and its
+            # loop would ask again forever. The lookahead (_advance_to_next_hour_log) still installs it at the
+            # hour boundary, where its replay pass can follow.
+            print(f"  Not rolling over to {peek[0].date} {peek[0].hour:02d}:00: every occurrence already aired")
+            peek = None
         if peek:
             log, items = peek
             self.current_log = log

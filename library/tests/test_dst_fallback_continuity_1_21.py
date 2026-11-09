@@ -518,6 +518,18 @@ class SpringForwardAndNormalTimeTests(_DstFixture):
             self.tick(engine)
         self.assertEqual((engine.current_log.id, engine._queue_cursor), (log15.id, 0))
 
+    def test_a_rollover_never_installs_a_queue_with_nothing_unplayed(self):
+        log01 = self.log(NOV1, 1, ["a"], start=utc(6))
+        log02 = self.log(NOV1, 2, ["b", "c"], start=utc(8))
+        LogItem.objects.filter(playlist_log__in=[log01, log02]).update(played_at=utc(6, 10))
+        engine = make_engine()
+        with self.at(utc(7, 30), engine):
+            engine._load_log_for(NOV1, 1)
+        # The peek offers the fully aired 02:00 log; the walk must end (live fill), never spin or hand it out.
+        self.assertIsNone(self.next_item(engine, utc(7, 30, 5)))
+        self.assertEqual(engine.current_log.id, log01.id)
+        engine._try_extend_live_log_async.assert_called()
+
     def test_the_active_log_is_never_its_own_next_hour(self):
         log02 = self.log(NOV1, 2, ["a", "b"], start=utc(8))
         engine = make_engine()
