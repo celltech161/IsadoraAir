@@ -185,5 +185,8 @@ class TimeBoundaryEdgeCaseTests(TestCase):
         self.assertIsNone(error)
         items = list(LogItem.objects.filter(playlist_log=log).order_by("position"))
         self.assertEqual(len(items), 0)
-        event = SystemEvent.objects.get(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}")
-        self.assertEqual(event.detail["pool_exhausted_picks"], 2)
+        # r0132: 10 s is within DURATION_FIT_MARGIN and the pool is not
+        # empty, so both slots are legitimately unused (landed), not a
+        # pool problem -- no Monitoring warning.
+        self.assertFalse(SystemEvent.objects.filter(
+            dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}").exists())
