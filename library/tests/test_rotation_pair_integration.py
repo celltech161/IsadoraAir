@@ -24,6 +24,7 @@ from library.services.log_builder import (
     PAIR_LANDING_THRESHOLD_SECONDS,
     SelectionDiagnostics,
     _build_from_rotation,
+    _is_music_slot,
     _pick_best_fit,
     fill_remaining_hour,
 )
@@ -81,7 +82,8 @@ class DirectTrackBlocksPairingTests(TestCase):
         # past the direct-track slot, it would try to pair slot 0 with
         # slot 2 instead of falling back, which this test would catch
         # via the direct track's position.
-        log, error = _build_from_rotation(date(2027, 4, 1), 5, rotation, target_duration_seconds=500)
+        with patch("library.services.log_builder.print") as mock_print:
+            log, error = _build_from_rotation(date(2027, 4, 1), 5, rotation, target_duration_seconds=500)
 
         self.assertIsNone(error)
         items = list(LogItem.objects.filter(playlist_log=log).order_by("position"))
@@ -90,6 +92,17 @@ class DirectTrackBlocksPairingTests(TestCase):
         # It must be the SECOND item (position 1) -- proves slot order
         # was preserved, not reordered around the pairing attempt.
         self.assertEqual(direct_positions[0], 1)
+        # r0132: slot 0 is a genuinely NON-music slot in the landing zone
+        # whose next slot is a direct insert -> r0131's single-track
+        # duration-aware fallback, never a pair and never the lookahead.
+        slot0 = rotation.slots.select_related("category__kind").get(position=0)
+        self.assertFalse(_is_music_slot(slot0))
+        detail = _find_healthy_diagnostics_print(mock_print)
+        self.assertEqual(
+            (detail["landing_pairs"], detail["landing_pair_fallbacks"], detail["lookahead_picks"]), (0, 1, 0),
+        )
+        self.assertEqual(items[0].category_id, self.category.id)
+        self.assertEqual(items[0].track.duration_seconds, 180)
 
 
 class LandingPairConsumesTwoSlotsTests(TestCase):
@@ -126,6 +139,50 @@ class LandingPairConsumesTwoSlotsTests(TestCase):
         # Both tracks distinct -- never the same track played twice as
         # "a pair".
         self.assertNotEqual(items[0].track_id, items[1].track_id)
+
+    def test_non_music_slot_pairs_with_the_next_category_slot_in_order(self):
+        """r0132 A3: a genuinely NON-music slot in the 361-720 s landing
+        zone keeps r0131's jointly evaluated two-slot matched pair with the
+        immediately following category slot -- here a real music-kind
+        category, as r0131 allowed. Only one (A, B) pair lands within the
+        fit margin, so a joint decision is the only way to get it."""
+        music_kind, _ = CategoryKind.objects.get_or_create(code="music", defaults={"name": "Music"})
+        music = Category.objects.create(code="LANDINGPAIR-MUSIC", name="LANDINGPAIR-MUSIC", kind=music_kind,
+                                        artist_separation=0, title_separation=0)
+        music_b = make_track("Landing Music B", "Artist MB", music, 300)
+        make_track("Music Decoy Short", "Artist ME", music, 30)
+        make_track("Music Decoy Long", "Artist MF", music, 850)
+        rotation = Rotation.objects.create(name="Non-music Pair Rotation")
+        RotationSlot.objects.create(rotation=rotation, position=0, category=self.category)
+        RotationSlot.objects.create(rotation=rotation, position=1, category=music)
+        slot_a, slot_b = rotation.slots.select_related("category__kind").order_by("position")
+        self.assertFalse(_is_music_slot(slot_a))             # A is genuinely non-music
+        self.assertTrue(_is_music_slot(slot_b))              # B is an eligible category slot, not direct
+        target = 500
+        self.assertTrue(EXACT_FIT_THRESHOLD_SECONDS < target <= PAIR_LANDING_THRESHOLD_SECONDS)
+
+        random.seed(7)
+        with patch("library.services.log_builder.print") as mock_print:
+            log, error = _build_from_rotation(date(2027, 4, 3), 6, rotation, target_duration_seconds=target)
+
+        self.assertIsNone(error)
+        items = list(LogItem.objects.filter(playlist_log=log).select_related("track").order_by("position"))
+        detail = _find_healthy_diagnostics_print(mock_print)
+        self.assertEqual(detail["landing_pairs"], 1)
+        self.assertEqual((detail["lookahead_picks"], detail["landing_pair_fallbacks"], detail["exact_fit_picks"]), (0, 0, 0))
+        self.assertEqual(len(detail["landing_errors"]), 1)
+        self.assertLessEqual(detail["landing_errors"][0], DURATION_FIT_MARGIN)
+        # The one pair that lands: A's 200 s + B's 300 s = 500 s exactly.
+        self.assertEqual(len(items), 2)
+        self.assertIn(items[0].track_id, {self.track_a.id, self.track_b.id})
+        self.assertEqual(items[1].track_id, music_b.id)
+        # Persisted in original slot order, each from its own slot's pool.
+        self.assertEqual([i.position for i in items], [0, 1])
+        self.assertEqual([i.category_id for i in items], [self.category.id, music.id])
+        self.assertEqual(items[0].track.category_id, self.category.id)
+        self.assertEqual(items[1].track.category_id, music.id)
+        self.assertEqual(items[1].scheduled_time - items[0].scheduled_time,
+                         django_timezone.timedelta(seconds=items[0].track.duration_seconds))
 
 
 def _find_healthy_diagnostics_print(mock_print):
@@ -291,8 +348,7 @@ class ModeThresholdBoundaryTests(TestCase):
     threshold, i.e. the threshold value itself is NOT normal mode)."""
 
     def setUp(self):
-        # r0132: the end-of-hour landing planner covers music slots only.
-        self.category = make_category("BOUNDARYTEST", kind_code="music")
+        self.category = make_category("BOUNDARYTEST")
         for i in range(6):
             make_track(f"Boundary Track {i}", f"Boundary Artist {i}", self.category, 180)
 

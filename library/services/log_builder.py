@@ -1734,17 +1734,74 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
         elif remaining <= EXACT_FIT_THRESHOLD_SECONDS:
             mode = "exact_fit"
         else:
-            # Landing zone, single slot (a non-music slot, or a music slot
-            # with no later music slot in its run): one duration-aware
-            # (force_fit_mode) pick, r0131's own no-pair fallback.
+            # Landing zone, not lookahead: a non-music slot attempts r0131's
+            # two-slot matched pair below; otherwise (or if no pair forms)
+            # one duration-aware (force_fit_mode) pick, r0131's fallback.
             mode = "landing"
-            diagnostics.landing_pair_fallbacks += 1
 
         # Each slot resolves its own context (and holiday dice) exactly
         # once, at its own turn -- the lookahead never rolls for later slots.
         artist_sep, title_sep, pool_override_qs, pool_key, exclude_holiday_codes = (
             _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
         )
+        if mode == "landing":
+            next_slot = slots[idx + 1] if idx + 1 < len(slots) else None
+            if window == 0 and next_slot is not None and not next_slot.track_id:
+                # r0131 matched pair, unchanged, for a NON-MUSIC slot A and
+                # the immediately following category slot B (never a direct).
+                category_b = next_slot.category
+                ctx_b = _resolve_slot_pool_context(category_b, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
+                artist_sep_b, title_sep_b, pool_override_qs_b, pool_key_b, exclude_holiday_codes_b = ctx_b
+
+                hard_exclude_track_ids = {t.id for t in picked_tracks}
+                hard_exclude_identity_keys = set(picked_identity_keys)
+
+                exclude_track_ids_a, exclude_identity_keys_a = get_recent_exclusions(
+                    target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
+                )
+                exclude_track_ids_b, exclude_identity_keys_b = get_recent_exclusions(
+                    target_datetime, artist_sep_b, title_sep_b, picked_tracks, picked_identity_keys,
+                )
+
+                candidates_a = _landing_slot_candidates(
+                    category, target_datetime, pool_override_qs, exclude_holiday_codes,
+                    exclude_track_ids_a, exclude_identity_keys_a,
+                    hard_exclude_track_ids, hard_exclude_identity_keys,
+                    identity_cache, pool_key, active_holiday_codes,
+                )
+                candidates_b = _landing_slot_candidates(
+                    category_b, target_datetime, pool_override_qs_b, exclude_holiday_codes_b,
+                    exclude_track_ids_b, exclude_identity_keys_b,
+                    hard_exclude_track_ids, hard_exclude_identity_keys,
+                    identity_cache, pool_key_b, active_holiday_codes,
+                )
+
+                pair_result = find_matched_pair(candidates_a, candidates_b, remaining_seconds=remaining)
+                if pair_result is not None:
+                    # Batch-resolve BOTH chosen ids to real Track objects in
+                    # one query -- never one .get() per candidate scored.
+                    resolved = {
+                        t.id: t for t in Track.objects.select_related("artist", "category").filter(
+                            id__in=[pair_result.candidate_a.track_id, pair_result.candidate_b.track_id],
+                        )
+                    }
+                    track_a = resolved.get(pair_result.candidate_a.track_id)
+                    track_b = resolved.get(pair_result.candidate_b.track_id)
+                    if track_a is not None and track_b is not None:
+                        _append_pick(track_a, category, _slot_label(idx, category))
+                        _append_pick(track_b, category_b, _slot_label(idx + 1, category_b))
+                        diagnostics.landing_pairs += 1
+                        diagnostics.landing_errors.append(pair_result.landing_error)
+                        idx += 2
+                        if accumulated_seconds >= target_duration_seconds:
+                            break
+                        continue
+                    # Resolved ids vanished between selection and lookup --
+                    # fall through to the single-track fallback below.
+            # No pair formed (music slot, structurally blocked, or no valid
+            # pair): the single duration-aware fallback below, reusing this
+            # slot's already-resolved context.
+            diagnostics.landing_pair_fallbacks += 1
         track = None
         if mode == "lookahead":
             lookahead_engaged = landing_open = True

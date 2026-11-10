@@ -303,8 +303,7 @@ class MatchedPairLandingUsesEffectiveAirtimeTests(TestCase):
     (230 + 200 = 430), not raw next_start (238 + 205 = 443)."""
 
     def test_pair_lands_against_effective_airtime_total_not_raw_next_start(self):
-        # r0132: the end-of-hour landing planner covers music slots only.
-        category = make_category("PAIRAIRTIME", kind_code="music")
+        category = make_category("PAIRAIRTIME")
         track_a = make_track(
             "Pair A", "Pair Airtime Artist A", category,
             cue_in_seconds=8.0, next_start_seconds=238.0, duration_seconds=250.0,
