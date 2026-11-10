@@ -762,6 +762,120 @@ def find_matched_pair(candidates_a, candidates_b, remaining_seconds, rng=None):
     return rng.choices(finalists, weights=weights, k=1)[0]
 
 
+# r0132 end-of-hour lookahead. With at most PAIR_LANDING_THRESHOLD_SECONDS
+# left and two or more consecutive category slots ahead (or a landing already
+# under way), each slot is filled by ONE weighted pick whose weight is scaled
+# by the best landing the rest of the window (at most
+# LANDING_LOOKAHEAD_MAX_SLOTS slots, a maximum, not a target) could still
+# achieve. LANDING_TOLERANCE_SECONDS absorbs the 2 s duration binning, so
+# landings that close count as equally good.
+LANDING_LOOKAHEAD_MAX_SLOTS = 4
+LANDING_BIN_SECONDS = 2.0
+LANDING_TOLERANCE_SECONDS = 5.0
+LANDING_OVERRUN_DECAY_SECONDS = 5.0
+LANDING_SHORTFALL_DECAY_SECONDS = 10.0
+
+
+def _landing_quality(runway):
+    """Quality in [0, 1] of ending a landing with `runway` seconds unfilled
+    (negative = overrun). An overrun beyond DURATION_FIT_MARGIN is never
+    acceptable; anything within LANDING_TOLERANCE_SECONDS is perfect."""
+    if runway < -DURATION_FIT_MARGIN:
+        return 0.0
+    miss = abs(runway) - LANDING_TOLERANCE_SECONDS
+    if miss <= 0:
+        return 1.0
+    return math.exp(-miss / (LANDING_OVERRUN_DECAY_SECONDS if runway < 0 else LANDING_SHORTFALL_DECAY_SECONDS))
+
+
+def _landing_lookahead_table(later_pools, max_runway, deadline=None):
+    """Best achievable landing quality for every runway left after the current
+    pick, given the candidate pools of the later slots in the window.
+
+    Deliberately a MAXIMUM over completions, not a sum or a count: a track is
+    preferred only for whether the hour can still land well after it, never
+    for how many ways it can. Recursion over the later slots, right to left:
+    runway <= DURATION_FIT_MARGIN ends the landing; otherwise the slot takes
+    its best admissible duration (overrun <= DURATION_FIT_MARGIN), or is
+    skipped when none is admissible, as the walk itself would; whatever is
+    still unfilled after the last window slot is judged as a shortfall. The
+    window is a maximum: a landing reached after fewer slots ends there and
+    counts exactly as much as one reached later. Durations are
+    binned to LANDING_BIN_SECONDS, so the cost is bounded by
+    len(later_pools) x runway bins x duration bins whatever the pool size.
+    Returns a lookup function, or None if `deadline` (monotonic) passes."""
+    margin_bins = int(DURATION_FIT_MARGIN // LANDING_BIN_SECONDS)
+    top = int(math.ceil(max(max_runway, 0.0) / LANDING_BIN_SECONDS)) + 1
+    span = range(-margin_bins, top + 1)
+    landed = [_landing_quality(r * LANDING_BIN_SECONDS) for r in span]
+    table = landed
+    for pool in reversed(later_pools):
+        if deadline is not None and monotonic() > deadline:
+            return None
+        bins = sorted({max(0, int(round(c.duration_seconds / LANDING_BIN_SECONDS))) for c in pool})
+        nxt, table = table, []
+        for r in span:
+            if r <= margin_bins:
+                table.append(landed[r + margin_bins])
+                continue
+            best = None
+            for b in bins:
+                if r - b < -margin_bins:
+                    break
+                value = nxt[r - b + margin_bins]
+                if best is None or value > best:
+                    best = value
+                    if best >= 1.0:
+                        break
+            table.append(nxt[r + margin_bins] if best is None else best)
+
+    def lookup(runway):
+        if runway <= DURATION_FIT_MARGIN:
+            return _landing_quality(runway)
+        r = min(top, int(round(runway / LANDING_BIN_SECONDS)))
+        return table[r + margin_bins]
+    return lookup
+
+
+def _landing_weights(candidates, remaining_seconds, lookup, more_slots_follow=False):
+    """(admissible candidates ordered by track_id, selection weights).
+    Admissible = overshoot <= DURATION_FIT_MARGIN. Landing is a constraint
+    first, then a preference: when some candidate can still land at least
+    as well as a DURATION_FIT_MARGIN shortfall, only such candidates are
+    eligible, weighted effective_weight x lookup(runway after the pick) --
+    so many poor options can never outweigh a few that land. When none can,
+    the landing is not yet in reach of the window: plain effective weights
+    while later slots follow it (no preference for length), otherwise the
+    best effort, effective_weight x lookup."""
+    admissible = sorted(
+        (c for c in candidates if c.duration_seconds <= remaining_seconds + DURATION_FIT_MARGIN),
+        key=lambda c: c.track_id,
+    )
+    plain = [max(0.0, c.effective_weight) for c in admissible]
+    quality = [lookup(remaining_seconds - c.duration_seconds) for c in admissible]
+    reach = _landing_quality(DURATION_FIT_MARGIN)
+    if max(quality, default=0.0) >= reach:
+        weights = [w * q if q >= reach else 0.0 for w, q in zip(plain, quality)]
+    elif more_slots_follow:
+        return admissible, plain
+    else:
+        weights = [w * q for w, q in zip(plain, quality)]
+    return admissible, (weights if sum(weights) > 0 else plain)
+
+
+def _choose_landing_candidate(candidates, remaining_seconds, lookup, more_slots_follow=False, rng=None):
+    """Weighted choice per _landing_weights; ordered by track_id first, so
+    pool/database order never changes a seeded result. None if no
+    candidate is admissible."""
+    rng = rng if rng is not None else random
+    admissible, weights = _landing_weights(candidates, remaining_seconds, lookup, more_slots_follow)
+    if not admissible:
+        return None
+    if sum(weights) <= 0:
+        return rng.choice(admissible)
+    return rng.choices(admissible, weights=weights, k=1)[0]
+
+
 @dataclass
 class SelectionDiagnostics:
     """Forward-compatible structured summary of how a build's category-
@@ -782,6 +896,11 @@ class SelectionDiagnostics:
     exact_fit_picks: int = 0
     direct_track_inserts: int = 0
     pool_exhausted_picks: int = 0  # pick_track returned None (slot skipped)
+    # r0132: slots filled by the end-of-hour lookahead, and category slots
+    # left unused because the walk had already landed within
+    # DURATION_FIT_MARGIN (nothing fits; not a pool problem, never alarms).
+    lookahead_picks: int = 0
+    landed_unused_slots: int = 0
     landing_errors: list = field(default_factory=list)  # seconds, one per successful landing pair
     target_duration_seconds: float = NOMINAL_HOUR_SECONDS
     # How much shorter than a nominal hour this build's target was --
@@ -801,6 +920,8 @@ class SelectionDiagnostics:
             "exact_fit_picks": self.exact_fit_picks,
             "direct_track_inserts": self.direct_track_inserts,
             "pool_exhausted_picks": self.pool_exhausted_picks,
+            "lookahead_picks": self.lookahead_picks,
+            "landed_unused_slots": self.landed_unused_slots,
             "landing_errors": [round(e, 1) for e in self.landing_errors],
             "target_duration_seconds": round(self.target_duration_seconds, 1),
             "late_offset_seconds": round(self.late_offset_seconds, 1),
@@ -1446,12 +1567,53 @@ def _slot_label(idx, category):
     return f"Slot {idx + 1} ({category.name if category else '?'})"
 
 
+def _lookahead_pick(ctx, slots, idx, window, category, remaining, artist_sep, title_sep,
+                    pool_override_qs, pool_key, exclude_holiday_codes):
+    """r0132: one lookahead pick for slots[idx] (see _landing_lookahead_table).
+    The current slot uses its own resolved pool and exclusions; the later
+    window slots use their ordinary category pools under the same exclusions
+    (their holiday dice are rolled only at their own turn). Returns a Track,
+    or None so the caller falls back to the ordinary duration-aware pick."""
+    hard_ids = {t.id for t in ctx.picked_tracks}
+    hard_keys = set(ctx.picked_identity_keys)
+    exclude_ids, exclude_keys = get_recent_exclusions(
+        ctx.target_datetime, artist_sep, title_sep, ctx.picked_tracks, ctx.picked_identity_keys,
+    )
+    candidates = _landing_slot_candidates(
+        category, ctx.target_datetime, pool_override_qs, exclude_holiday_codes, exclude_ids, exclude_keys,
+        hard_ids, hard_keys, ctx.identity_cache, pool_key, ctx.active_holiday_codes,
+    )
+    pools = {} if pool_override_qs is not None else {category.id: candidates}
+    later_pools = []
+    for later in slots[idx + 1:idx + window]:
+        if later.category_id not in pools:
+            later_artist_sep, later_title_sep = get_separation(later.category, ctx.recency_cfg)
+            later_ids, later_keys = get_recent_exclusions(
+                ctx.target_datetime, later_artist_sep, later_title_sep, ctx.picked_tracks, ctx.picked_identity_keys,
+            )
+            no_holiday = ctx.active_holiday_codes if later.category.kind.code == "music" else None
+            pools[later.category_id] = _landing_slot_candidates(
+                later.category, ctx.target_datetime, None, no_holiday or None, later_ids, later_keys,
+                hard_ids, hard_keys, ctx.identity_cache, ("category", later.category_id), ctx.active_holiday_codes,
+            )
+        later_pools.append(pools[later.category_id])
+    more_slots_follow = idx + window < len(slots) and not slots[idx + window].track_id
+    lookup = _landing_lookahead_table(
+        later_pools, remaining, deadline=monotonic() + PAIR_SOLVER_BUDGET_MS / 1000.0,
+    )
+    chosen = _choose_landing_candidate(candidates, remaining, lookup, more_slots_follow) if lookup is not None else None
+    if chosen is None:
+        return None
+    return Track.objects.select_related("artist", "category").filter(id=chosen.track_id).first()
+
+
 def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
     """Walk one rotation's slots into the shared context until the segment's
-    budget is reached. The picking logic is the original single-hour loop,
-    unchanged: `segment_end_seconds` plays the role the hour's
-    target_duration_seconds always had, so landing pairs / exact-fit engage
-    as the SEGMENT boundary approaches (boundary landing, never a hard cut)."""
+    budget is reached. `segment_end_seconds` plays the role the hour's
+    target_duration_seconds always had, so the end-of-hour lookahead /
+    exact-fit engage as the SEGMENT boundary approaches (boundary landing,
+    never a hard cut). Every pick is an ordinary, independent LogItem: the
+    lookahead is a build-time planning aid only and persists nothing."""
     ctx.rotation_walked = True
     recency_cfg = ctx.recency_cfg
     target_datetime = ctx.target_datetime
@@ -1518,6 +1680,7 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             force_fit_mode=force_fit_mode,
         )
 
+    lookahead_engaged = False
     idx = 0
     while idx < len(slots):
         slot = slots[idx]
@@ -1530,11 +1693,8 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             # makes it count as "recently played" for any category slots
             # that come after it, in this build or future ones. NEVER
             # replaced/reordered/skipped/treated-as-a-candidate-pool by
-            # pair planning -- it is never eligible to be slot A or slot
-            # B of a landing pair (see the landing-zone branch below,
-            # which only ever looks at slots[idx+1] to decide whether a
-            # pair is even attemptable, and always falls back to a plain
-            # single pick if that neighbor is direct-track).
+            # landing planning -- the lookahead window below always stops
+            # before a direct-track slot.
             _append_pick(slot.track, slot.track.category, _slot_label(idx, slot.track.category))
             diagnostics.direct_track_inserts += 1
             idx += 1
@@ -1544,128 +1704,73 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
 
         category = slot.category
         remaining = target_duration_seconds - accumulated_seconds
+        # Consecutive category slots from here, stopping before any
+        # direct-track slot (never planned through, replaced or reordered).
+        window = 1
+        while (window < LANDING_LOOKAHEAD_MAX_SLOTS and idx + window < len(slots)
+               and not slots[idx + window].track_id):
+            window += 1
 
         if remaining > PAIR_LANDING_THRESHOLD_SECONDS:
             # Normal mode: unchanged sequential weighted-random picking.
             mode = "normal"
+        elif remaining > DURATION_FIT_MARGIN and (window >= 2 or lookahead_engaged):
+            # A landing sequence, once started, is finished by the same
+            # planner, so its last slot takes the landing it planned for.
+            mode = "lookahead"
         elif remaining <= EXACT_FIT_THRESHOLD_SECONDS:
             mode = "exact_fit"
         else:
+            # Landing zone with no later category slot before a direct
+            # track or the end: one duration-aware (force_fit_mode) pick.
             mode = "landing"
-
-        if mode in ("normal", "exact_fit"):
-            artist_sep, title_sep, pool_override_qs, pool_key, exclude_holiday_codes = (
-                _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
-            )
-            track = _sequential_pick(category, artist_sep, title_sep, pool_override_qs, pool_key,
-                                      exclude_holiday_codes, remaining)
-            if track is None:
-                diagnostics.pool_exhausted_picks += 1
-                if observer is not None:
-                    observer.on_pool_exhausted(idx, category)
-                idx += 1
-                continue
-            _append_pick(track, category, _slot_label(idx, category))
-            if mode == "normal":
-                diagnostics.normal_picks += 1
-            else:
-                diagnostics.exact_fit_picks += 1
-            idx += 1
-
-        else:
-            # Landing zone: EXACT_FIT_THRESHOLD_SECONDS < remaining <=
-            # PAIR_LANDING_THRESHOLD_SECONDS. Attempt a two-slot matched
-            # pair with the IMMEDIATELY next slot -- never skip past a
-            # direct-track slot to reach a category-random one further
-            # ahead (that slot's own turn comes next iteration,
-            # untouched by this decision).
-            ctx_a = _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
-            artist_sep_a, title_sep_a, pool_override_qs_a, pool_key_a, exclude_holiday_codes_a = ctx_a
-
-            next_slot = slots[idx + 1] if idx + 1 < len(slots) else None
-            pair_result = None
-
-            if next_slot is not None and not next_slot.track_id:
-                category_b = next_slot.category
-                ctx_b = _resolve_slot_pool_context(category_b, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
-                artist_sep_b, title_sep_b, pool_override_qs_b, pool_key_b, exclude_holiday_codes_b = ctx_b
-
-                hard_exclude_track_ids = {t.id for t in picked_tracks}
-                hard_exclude_identity_keys = set(picked_identity_keys)
-
-                exclude_track_ids_a, exclude_identity_keys_a = get_recent_exclusions(
-                    target_datetime, artist_sep_a, title_sep_a, picked_tracks, picked_identity_keys,
-                )
-                exclude_track_ids_b, exclude_identity_keys_b = get_recent_exclusions(
-                    target_datetime, artist_sep_b, title_sep_b, picked_tracks, picked_identity_keys,
-                )
-
-                candidates_a = _landing_slot_candidates(
-                    category, target_datetime, pool_override_qs_a, exclude_holiday_codes_a,
-                    exclude_track_ids_a, exclude_identity_keys_a,
-                    hard_exclude_track_ids, hard_exclude_identity_keys,
-                    identity_cache, pool_key_a, active_holiday_codes,
-                )
-                candidates_b = _landing_slot_candidates(
-                    category_b, target_datetime, pool_override_qs_b, exclude_holiday_codes_b,
-                    exclude_track_ids_b, exclude_identity_keys_b,
-                    hard_exclude_track_ids, hard_exclude_identity_keys,
-                    identity_cache, pool_key_b, active_holiday_codes,
-                )
-
-                pair_result = find_matched_pair(candidates_a, candidates_b, remaining_seconds=remaining)
-
-            if pair_result is not None:
-                # Batch-resolve BOTH chosen ids to real Track objects in
-                # one query -- never one .get() per candidate scored.
-                resolved = {
-                    t.id: t for t in Track.objects.select_related("artist", "category").filter(
-                        id__in=[pair_result.candidate_a.track_id, pair_result.candidate_b.track_id],
-                    )
-                }
-                track_a = resolved.get(pair_result.candidate_a.track_id)
-                track_b = resolved.get(pair_result.candidate_b.track_id)
-                if track_a is not None and track_b is not None:
-                    _append_pick(track_a, category, _slot_label(idx, category))
-                    _append_pick(track_b, category_b, _slot_label(idx + 1, category_b))
-                    diagnostics.landing_pairs += 1
-                    diagnostics.landing_errors.append(pair_result.landing_error)
-                    idx += 2
-                    if accumulated_seconds >= target_duration_seconds:
-                        break
-                    continue
-                # Resolved ids vanished between selection and lookup
-                # (e.g. deleted mid-build) -- fall through to the
-                # single-track fallback below rather than silently
-                # dropping the slot.
-
-            # No pair formed (structurally blocked, or find_matched_pair
-            # found nothing, or the rare resolve-race above) -- fall
-            # back to a single DURATION-AWARE (force_fit_mode=True) pick
-            # for slot A alone, reusing its already-resolved context (no
-            # re-rolling its holiday dice a second time). Second-pass
-            # correction: `remaining` here is still in the landing zone
-            # (> EXACT_FIT_THRESHOLD_SECONDS), so without forcing fit
-            # mode this would silently fall through to pick_track's
-            # ordinary unconstrained weighted selection -- exactly the
-            # "immediately degrade to unconstrained normal selection"
-            # behavior the pair-window fallback hierarchy must avoid.
             diagnostics.landing_pair_fallbacks += 1
-            track = _sequential_pick(category, artist_sep_a, title_sep_a, pool_override_qs_a, pool_key_a,
-                                      exclude_holiday_codes_a, remaining, force_fit_mode=True)
-            if track is None:
+
+        # Each slot resolves its own context (and holiday dice) exactly
+        # once, at its own turn -- the lookahead never rolls for later slots.
+        artist_sep, title_sep, pool_override_qs, pool_key, exclude_holiday_codes = (
+            _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
+        )
+        track = None
+        if mode == "lookahead":
+            lookahead_engaged = True
+            track = _lookahead_pick(
+                ctx, slots, idx, window, category, remaining, artist_sep, title_sep,
+                pool_override_qs, pool_key, exclude_holiday_codes,
+            )
+        picked_mode = "lookahead" if track is not None else ("exact_fit" if mode == "lookahead" else mode)
+        if track is None:
+            track = _sequential_pick(category, artist_sep, title_sep, pool_override_qs, pool_key,
+                                      exclude_holiday_codes, remaining,
+                                      force_fit_mode=mode in ("landing", "lookahead"))
+        if track is None:
+            base_pool = pool_override_qs if pool_override_qs is not None else _tracks_for_category(
+                category, target_datetime=target_datetime,
+            )
+            if remaining <= DURATION_FIT_MARGIN and base_pool.exists():
+                # Already landed within tolerance and nothing fits: the slot
+                # is legitimately unused, not a programming problem.
+                diagnostics.landed_unused_slots += 1
+            else:
                 diagnostics.pool_exhausted_picks += 1
                 if observer is not None:
                     observer.on_pool_exhausted(idx, category)
-                idx += 1
-                continue
-            _append_pick(track, category, _slot_label(idx, category))
-            diagnostics.exact_fit_picks += 1
             idx += 1
+            continue
+        _append_pick(track, category, _slot_label(idx, category))
+        if picked_mode == "normal":
+            diagnostics.normal_picks += 1
+        elif picked_mode == "lookahead":
+            diagnostics.lookahead_picks += 1
+        else:
+            diagnostics.exact_fit_picks += 1
+        idx += 1
 
         if accumulated_seconds >= target_duration_seconds:
             break
 
+    if lookahead_engaged:
+        diagnostics.landing_errors.append(abs(target_duration_seconds - accumulated_seconds))
     ctx.accumulated_seconds = accumulated_seconds
 
 

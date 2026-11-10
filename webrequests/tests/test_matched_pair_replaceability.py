@@ -34,7 +34,7 @@ from library.models import (
 )
 from library.services.log_builder import _build_from_rotation
 from webrequests.models import SongRequest, WebRequestConfig
-from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request
+from webrequests.services import SCHEDULING_CONTENDED, mark_song_requests_aired, maybe_schedule_song_request
 import webrequests.services as services_module
 
 
@@ -255,3 +255,157 @@ class MatchedPairReplaceableByOperatorSwapTests(_PairFixtureMixin, TestCase):
 
         item_a.refresh_from_db()
         self.assertEqual(item_a.track_id, track_a.id)
+
+
+# r0132 Package A: the end-of-hour lookahead (up to four tracks) is likewise
+# a build-time planning aid only. Every member of a lookahead-built sequence
+# is persisted as an ordinary, independent LogItem.
+class _SequenceFixtureMixin(_PairFixtureMixin):
+    def build_sequence(self, target_date, hour, seed=42):
+        """Four 150 s tracks land a 600 s, four-slot rotation exactly; neither the
+        20 s nor the 900 s decoy can. Built through the real _build_from_rotation
+        lookahead, which plans all four picks."""
+        tracks = [self.make_track(f"Seq {i}", f"Seq Artist {i}", duration=150) for i in range(4)]
+        self.make_track("Decoy Short", "Decoy Artist S", duration=20)
+        self.make_track("Decoy Long", "Decoy Artist L", duration=900)
+        rotation = Rotation.objects.create(name=f"Sequence Rotation {target_date} {hour}")
+        for position in range(4):
+            RotationSlot.objects.create(rotation=rotation, position=position, category=self.category)
+        random.seed(seed)
+        with patch("library.services.log_builder.print") as mock_print:
+            log, error = _build_from_rotation(target_date, hour, rotation, target_duration_seconds=600)
+        self.assertIsNone(error)
+        detail = next(c.args[1] for c in mock_print.call_args_list
+                      if len(c.args) == 2 and "Hour log selection" in str(c.args[0]))
+        self.assertEqual((detail["lookahead_picks"], detail["exact_fit_picks"]), (4, 0),
+                         f"setup must exercise the lookahead: {detail}")
+        items = list(LogItem.objects.filter(playlist_log=log).order_by("position"))
+        self.assertEqual({i.track_id for i in items}, {t.id for t in tracks})
+        return log, items
+
+    @staticmethod
+    def snapshot(log):
+        return [(i.id, i.track_id, i.position, i.scheduled_time)
+                for i in LogItem.objects.filter(playlist_log=log).order_by("position")]
+
+
+class FourTrackSequenceReplaceableByWebRequestTests(_SequenceFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        WebRequestConfig.objects.all().delete()
+        WebRequestConfig.objects.create(
+            enabled=True, open_slots=list(range(168)), max_fulfilled_per_hour=4,
+            lookahead_warning_minutes=60, expire_after_hours=6,
+        )
+        self.state_path = Path(self._tmpdir.name) / "engine_state.json"
+        patcher = patch.object(services_module, "ENGINE_STATE_PATH", self.state_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def approved_sequence(self, day, hour, seed=42):
+        log, items = self.build_sequence(date(2027, 6, day), hour, seed=seed)
+        log.status = "approved"
+        log.save(update_fields=["status"])
+        return log, items
+
+    def request(self, ext_id, duration):
+        track = self.make_track(f"Requested {ext_id}", f"Requester Artist {ext_id}", duration=duration)
+        return track, SongRequest.objects.create(
+            external_request_id=ext_id, track=track, requester_name="Listener",
+            status="pending", submitted_at=django_timezone.now(),
+        )
+
+    def assert_only_target_replaced(self, log, before, index, requested_track, request):
+        result = maybe_schedule_song_request(LogItem.objects.get(pk=before[index][0]))
+        self.assertIsNot(result, SCHEDULING_CONTENDED)
+        after = self.snapshot(log)
+        self.assertEqual(len(after), len(before))
+        for k, (row_before, row_after) in enumerate(zip(before, after)):
+            if k == index:
+                self.assertEqual((row_after[0], row_after[2], row_after[3]), (row_before[0], row_before[2], row_before[3]))
+                self.assertEqual(row_after[1], requested_track.id)
+            else:
+                self.assertEqual(row_after, row_before)        # same id, track, position and scheduled time
+        self.assertFalse(LogItem.objects.filter(playlist_log=log, track_id=before[index][1]).exists())
+        request.refresh_from_db()
+        self.assertEqual((request.status, request.log_item_id), ("scheduled", before[index][0]))
+
+    def test_request_replaces_the_first_member_with_a_longer_recording(self):
+        log, _ = self.approved_sequence(1, 9)
+        track, request = self.request("seq-first", 420)
+        self.assert_only_target_replaced(log, self.snapshot(log), 0, track, request)
+
+    def test_request_replaces_an_interior_member_with_a_shorter_recording(self):
+        log, _ = self.approved_sequence(2, 10, seed=7)
+        track, request = self.request("seq-interior", 45)
+        self.assert_only_target_replaced(log, self.snapshot(log), 2, track, request)
+
+    def test_request_replaces_the_final_member_with_a_much_longer_recording(self):
+        log, _ = self.approved_sequence(3, 11, seed=99)
+        track, request = self.request("seq-final", 600)
+        self.assert_only_target_replaced(log, self.snapshot(log), 3, track, request)
+
+    def test_lifecycle_queue_reload_and_first_buffer_fulfillment_are_unchanged(self):
+        from library.services.engine import PlaybackEngine
+        log, items = self.approved_sequence(4, 12, seed=5)
+        before = self.snapshot(log)
+        track, request = self.request("seq-lifecycle", 200)
+        self.assert_only_target_replaced(log, before, 1, track, request)
+
+        engine = object.__new__(PlaybackEngine)
+        engine.current_log = log
+        engine.log_items = items                       # the queue as loaded before the substitution
+        engine.decks = {"A": None, "B": None}
+        engine._queue_cursor = 0
+        engine._last_queue_reload = 0.0
+        engine._reload_queue_if_changed()
+        self.assertEqual([(i.id, i.track_id) for i in engine.log_items],
+                         [(row[0], track.id if k == 1 else row[1]) for k, row in enumerate(before)])
+
+        # No rebuild and no restoration: the approved log and its other rows are untouched.
+        self.assertEqual(PlaylistLog.objects.filter(date=log.date, hour=log.hour).get().pk, log.pk)
+        aired_at = django_timezone.now()
+        swapped = LogItem.objects.get(pk=before[1][0])
+        mark_song_requests_aired(swapped, aired_at)
+        request.refresh_from_db()
+        self.assertEqual((request.status, request.fulfilled_at), ("fulfilled", aired_at))
+        self.assertEqual(SongRequest.objects.exclude(log_item_id=swapped.id).exclude(log_item__isnull=True).count(), 0)
+
+    def test_played_claimed_and_reserved_members_keep_the_existing_refusal(self):
+        log, items = self.approved_sequence(5, 13, seed=3)
+        played, claimed, reserved = items[0], items[1], items[2]
+        LogItem.objects.filter(pk=played.pk).update(played_at=django_timezone.now())
+        LogItem.objects.filter(pk=claimed.pk).update(playback_claimed_at=django_timezone.now())
+        first_track, first = self.request("seq-reserve-1", 150)
+        maybe_schedule_song_request(reserved)
+        first.refresh_from_db()
+        self.assertEqual((first.status, first.log_item_id), ("scheduled", reserved.id))
+
+        _second_track, second = self.request("seq-reserve-2", 150)
+        before = self.snapshot(log)
+        for item in (played, claimed, reserved):
+            maybe_schedule_song_request(LogItem.objects.get(pk=item.pk))
+        self.assertEqual(self.snapshot(log), before)
+        second.refresh_from_db()
+        self.assertEqual((second.status, second.log_item_id), ("pending", None))
+        self.assertEqual(LogItem.objects.get(pk=reserved.pk).track_id, first_track.id)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class FourTrackSequenceOperatorSwapTests(_SequenceFixtureMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_superuser("seqswap", "seqswap@example.invalid", "password")
+        self.client.force_login(self.staff)
+
+    def test_operator_swap_of_an_interior_member_touches_nothing_else(self):
+        log, items = self.build_sequence(date(2027, 6, 6), 14, seed=11)
+        self.assertEqual(log.status, "draft")
+        before = self.snapshot(log)
+        replacement = self.make_track("Operator Swap-In", "Operator Seq Artist", duration=330)
+        response = self.client.patch(f"/api/log/item/{items[1].id}/swap/", data={"track_id": replacement.id},
+                                     content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        after = self.snapshot(log)
+        self.assertEqual(after[1][1], replacement.id)
+        self.assertEqual([row for k, row in enumerate(after) if k != 1], [row for k, row in enumerate(before) if k != 1])
