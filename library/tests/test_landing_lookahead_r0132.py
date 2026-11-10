@@ -365,3 +365,137 @@ class LookaheadWalkTests(TestCase):
         self.assertEqual(detail["lookahead_picks"], 0)
         self.assertGreaterEqual(detail["exact_fit_picks"], 1)
         self.assertLessEqual(self.assert_timeline(log, items) - 600, DURATION_FIT_MARGIN)
+
+
+class LookaheadDirectTrackTests(TestCase):
+    """r0132 review corrections: in the landing zone a pending direct-track slot
+    is mandatory -- its airtime is reserved out of the category runway, a landing
+    never skips it, and its own overrun is never reported as a landing error."""
+
+    def setUp(self):
+        self.pool = music_category("R0132DPOOL")
+        for i in range(30):
+            make_track(f"DPool {i}", f"DPool Artist {i}", self.pool, 100 + i * 4)
+        self.ident = music_category("R0132DID")
+
+    build = LookaheadWalkTests.build
+    assert_timeline = LookaheadWalkTests.assert_timeline
+
+    def uniform(self, code, duration, count=6):
+        category = music_category(code)
+        for i in range(count):
+            make_track(f"{code} {i}", f"{code} Artist {i}", category, duration)
+        return category
+
+    def test_exact_pre_direct_landing_no_longer_omits_the_direct(self):
+        """Codex finding 1: 600 s, [music, music, 30 s direct, music], 300 s music.
+        Package A landed 300+300 = 600 and the boundary break skipped the direct."""
+        music = self.uniform("R0132D300", 300)
+        direct = make_track("Legal ID 30", "Station", self.ident, 30)
+        rotation = rotation_of("F1", music, music, direct, music)
+        for seed in range(4):
+            random.seed(seed)
+            log, items, detail, event = self.build(rotation, 600, day=seed + 1)
+            self.assertEqual([i.track_id for i in items][2:], [direct.id])
+            self.assertEqual(items[2].position, 2)
+            self.assertEqual(items[2].category_id, self.ident.id)
+            self.assertEqual(self.assert_timeline(log, items), 630)   # no shorter music fits ahead of it
+            self.assertEqual(detail["landing_errors"], [30.0])         # runway 570 overshot by 30
+            self.assertEqual(detail["direct_overrun_seconds"], 30.0)
+            self.assertIsNone(event, detail)
+
+    def test_reserved_direct_airtime_lets_the_direct_air_without_overrun(self):
+        """Before: 250+250 landed 500 exactly and the 240 s direct was skipped."""
+        mixed = self.uniform("R0132D250", 250, 3)
+        for i in range(3):
+            make_track(f"R0132D130 {i}", f"R0132D130 Artist {i}", mixed, 130)
+        direct = make_track("Feature 240", "Feature", self.ident, 240)
+        rotation = rotation_of("Reserve", mixed, mixed, direct)
+        for seed in range(6):
+            random.seed(seed)
+            log, items, detail, event = self.build(rotation, 500, day=seed + 1)
+            self.assertEqual(items[-1].track_id, direct.id)
+            self.assertEqual(items[-1].position, len(items) - 1)
+            self.assertIn(sorted(i.track.duration_seconds for i in items[:-1]), ([250], [130, 130]))
+            self.assertLessEqual(abs(self.assert_timeline(log, items) - 500), 10)
+            self.assertEqual(detail["direct_overrun_seconds"], 0.0)
+            self.assertIsNone(event, detail)
+
+    def test_a_direct_longer_than_the_runway_still_airs_and_owns_its_overrun(self):
+        music = self.uniform("R0132D200", 200)
+        direct = make_track("Show segment 600", "Show", self.ident, 600)
+        rotation = rotation_of("Unavoidable", music, music, direct)
+        random.seed(1)
+        log, items, detail, event = self.build(rotation, 500)
+        self.assertEqual([i.track_id for i in items], [direct.id])   # discretionary music yields
+        self.assertEqual(self.assert_timeline(log, items), 600)
+        self.assertEqual(detail["direct_overrun_seconds"], 100.0)
+        self.assertEqual(detail["landing_errors"], [])
+        self.assertEqual(detail["pool_exhausted_picks"], 0)
+        self.assertIsNone(event, detail)
+
+    def test_landing_error_measures_the_lookahead_runway_not_mandatory_airtime(self):
+        """Codex finding 2: 500 s, two 200 s tracks then a 240 s direct = 640 s,
+        reported by Package A as a 140 s landing error."""
+        music = self.uniform("R0132D200B", 200)
+        direct = make_track("Feature 240 B", "Feature B", self.ident, 240)
+        rotation = rotation_of("F2", music, music, direct)
+        random.seed(2)
+        log, items, detail, event = self.build(rotation, 500)
+        self.assertEqual([i.track.duration_seconds for i in items], [200, 240])
+        self.assertEqual(self.assert_timeline(log, items), 440)       # no overrun at all
+        self.assertEqual(detail["landing_errors"], [60.0])            # runway 260, 200 fits: genuine
+        self.assertEqual(detail["direct_overrun_seconds"], 0.0)
+        self.assertIsNotNone(event)                                   # a 60 s miss still warns
+        self.assertNotIn("140", " ".join(event.detail["reasons"]))
+
+    def test_category_slots_on_both_sides_of_a_direct(self):
+        direct = make_track("Legal ID B", "Station B", self.ident, 30)
+        rotation = rotation_of("Around", self.pool, self.pool, self.pool, direct, self.pool, self.pool, self.pool)
+        for seed in range(6):
+            random.seed(seed)
+            log, items, detail, event = self.build(rotation, 900, day=seed + 1)
+            at = [i.track_id for i in items].index(direct.id)
+            self.assertEqual(items[at].position, at)
+            self.assertTrue(all(i.category_id == self.pool.id for i in items if i.track_id != direct.id))
+            self.assertEqual(len({i.track_id for i in items}), len(items))
+            self.assertLessEqual(abs(self.assert_timeline(log, items) - 900), DURATION_FIT_MARGIN)
+            self.assertEqual(detail["direct_track_inserts"], 1)
+            self.assertIsNone(event, detail)
+
+    def test_segment_boundary_and_scheduled_times_include_the_reserved_direct(self):
+        direct = make_track("Legal ID C", "Station C", self.ident, 30)
+        first = rotation_of("Seg A", *[self.pool] * 20, direct)
+        second = rotation_of("Seg B", *[self.pool] * 20)
+        random.seed(6)
+        plans = [SegmentPlan(kind="rotation", source=first, start_minute=0),
+                 SegmentPlan(kind="rotation", source=second, start_minute=30)]
+        with patch("library.services.log_builder.print"):
+            ctx, records, error = _plan_hour(date(2027, 6, 9), 6, plans, 3600)
+        self.assertIsNone(error)
+        picks = ctx.picks
+        end_a = records[0]["items"]
+        self.assertEqual(picks[end_a - 1]["track"].id, direct.id)    # the segment's last item is the direct
+        self.assertLessEqual(abs(records[0]["actual_end_seconds"] - 1800), DURATION_FIT_MARGIN)
+        for before, after in zip(picks, picks[1:]):
+            self.assertEqual(after["scheduled_time"] - before["scheduled_time"],
+                             django_timezone.timedelta(seconds=effective_airtime_seconds(before["track"])))
+        self.assertEqual(ctx.diagnostics.direct_overrun_seconds, 0.0)
+
+    def test_rotation_without_direct_slots_reserves_nothing(self):
+        rotation = rotation_of("Plain", *[self.pool] * 6)
+        seen = []
+        real = log_builder._pending_direct_airtime
+
+        def spy(slots, idx, runway):
+            result = real(slots, idx, runway)
+            seen.append(result)
+            return result
+        random.seed(77)
+        with patch.object(log_builder, "_pending_direct_airtime", side_effect=spy):
+            log, items, detail, event = self.build(rotation, 700)
+        self.assertTrue(seen)
+        self.assertTrue(all(r == (0.0, 6, 6) for r in seen))          # budget is always the segment end
+        self.assertLessEqual(abs(self.assert_timeline(log, items) - 700), DURATION_FIT_MARGIN)
+        self.assertEqual(detail["direct_overrun_seconds"], 0.0)
+        self.assertIsNone(event, detail)
