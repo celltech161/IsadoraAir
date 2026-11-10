@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0131",
+  "previous_release_id": "r0130",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P0 roadmap 1.21 DST fall-back continuity replays eligible ordinary material that aired early during the repeated hour so the following real hour cannot be silent, while preserving first-buffer accounting and restart identity. import_songs now rejects undecodable audio and macOS archive artifacts before database writes. Apply additive library.0100, then restart Gunicorn and the engine; no static, unit, package, nginx or protected-runtime change.",
+  "migrations_required": [
+    "library.0100_dst_fallback_replay_pass"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
