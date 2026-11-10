@@ -291,7 +291,8 @@ class ModeThresholdBoundaryTests(TestCase):
     threshold, i.e. the threshold value itself is NOT normal mode)."""
 
     def setUp(self):
-        self.category = make_category("BOUNDARYTEST")
+        # r0132: the end-of-hour landing planner covers music slots only.
+        self.category = make_category("BOUNDARYTEST", kind_code="music")
         for i in range(6):
             make_track(f"Boundary Track {i}", f"Boundary Artist {i}", self.category, 180)
 

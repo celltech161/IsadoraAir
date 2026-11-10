@@ -901,13 +901,7 @@ class SelectionDiagnostics:
     # DURATION_FIT_MARGIN (nothing fits; not a pool problem, never alarms).
     lookahead_picks: int = 0
     landed_unused_slots: int = 0
-    # Seconds; one per landing pair (fill) or per segment whose landing the
-    # lookahead planned, measured against the runway it was given -- the
-    # segment end less any reserved direct-track airtime (never that airtime).
-    landing_errors: list = field(default_factory=list)
-    # r0132: direct-track (mandatory) airtime scheduled past the segment end.
-    # Reported for visibility only; never a landing error, never alarms.
-    direct_overrun_seconds: float = 0.0
+    landing_errors: list = field(default_factory=list)  # seconds, one per successful landing pair
     target_duration_seconds: float = NOMINAL_HOUR_SECONDS
     # How much shorter than a nominal hour this build's target was --
     # derived, not independently supplied; a genuine 0 and "no clock-
@@ -929,7 +923,6 @@ class SelectionDiagnostics:
             "lookahead_picks": self.lookahead_picks,
             "landed_unused_slots": self.landed_unused_slots,
             "landing_errors": [round(e, 1) for e in self.landing_errors],
-            "direct_overrun_seconds": round(self.direct_overrun_seconds, 1),
             "target_duration_seconds": round(self.target_duration_seconds, 1),
             "late_offset_seconds": round(self.late_offset_seconds, 1),
         }
@@ -1614,25 +1607,9 @@ def _lookahead_pick(ctx, slots, idx, window, category, remaining, artist_sep, ti
     return Track.objects.select_related("artist", "category").filter(id=chosen.track_id).first()
 
 
-def _pending_direct_airtime(slots, idx, runway):
-    """r0132: (airtime, next_direct, end) for the category slot slots[idx].
-    next_direct is the first direct-track slot after idx's run of category
-    slots (len(slots) if none). airtime totals the direct slots from there to
-    the segment's last slot, in order, while the total so far is short of
-    `runway` -- so the one that crosses the boundary is included and later
-    ones are not, exactly what the boundary break airs. end is one past the
-    last direct slot counted. runway <= 0 reserves nothing."""
-    next_direct = idx
-    while next_direct < len(slots) and not slots[next_direct].track_id:
-        next_direct += 1
-    airtime, end = 0.0, next_direct
-    for j in range(next_direct, len(slots)):
-        if airtime >= runway:
-            break
-        if slots[j].track_id:
-            airtime += effective_airtime_seconds(slots[j].track)
-            end = j + 1
-    return airtime, next_direct, end
+def _is_music_slot(slot):
+    """r0132: the lookahead plans only consecutive music-category slots."""
+    return not slot.track_id and slot.category is not None and slot.category.kind.code == "music"
 
 
 def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
@@ -1640,10 +1617,8 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
     budget is reached. `segment_end_seconds` plays the role the hour's
     target_duration_seconds always had, so the end-of-hour lookahead /
     exact-fit engage as the SEGMENT boundary approaches (boundary landing,
-    never a hard cut). In that landing zone the pending direct-track slots
-    are mandatory: their airtime is reserved and they always air. Every pick
-    is an ordinary, independent LogItem: the lookahead is a build-time
-    planning aid only and persists nothing."""
+    never a hard cut). Every pick is an ordinary, independent LogItem: the
+    lookahead is a build-time planning aid only and persists nothing."""
     ctx.rotation_walked = True
     recency_cfg = ctx.recency_cfg
     target_datetime = ctx.target_datetime
@@ -1711,12 +1686,16 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
         )
 
     lookahead_engaged = False
-    landing_budget = None  # runway of the lookahead-planned category run in progress
-    landing_error = None  # that runway's miss, kept for the segment's final landing only
-    reserved_end = 0  # direct slots before this index were reserved: always aired
+    landing_open = False  # a lookahead-planned music run is in progress
+    landing_error = None
     idx = 0
     while idx < len(slots):
         slot = slots[idx]
+        if landing_open and not _is_music_slot(slot):
+            # The planned music run ends here. Later direct/non-music airtime
+            # can only improve its landing error, never inflate it.
+            landing_error = abs(target_duration_seconds - accumulated_seconds)
+            landing_open = False
 
         if slot.track_id:
             # Direct track insert — the hybrid rotation/playlist ask.
@@ -1727,57 +1706,37 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             # that come after it, in this build or future ones. NEVER
             # replaced/reordered/skipped/treated-as-a-candidate-pool by
             # landing planning -- the lookahead window below always stops
-            # before a direct-track slot, and in the landing zone its
-            # airtime is reserved out of the planned runway.
-            if landing_budget is not None:
-                landing_error = abs(landing_budget - accumulated_seconds)
-                landing_budget = None
-            aired_from = max(accumulated_seconds, target_duration_seconds)
+            # before a direct-track or non-music slot.
             _append_pick(slot.track, slot.track.category, _slot_label(idx, slot.track.category))
             diagnostics.direct_track_inserts += 1
-            diagnostics.direct_overrun_seconds += max(0.0, accumulated_seconds - aired_from)
             idx += 1
-            if accumulated_seconds >= target_duration_seconds and idx >= reserved_end:
+            if accumulated_seconds >= target_duration_seconds:
                 break
             continue
 
         category = slot.category
-        raw_remaining = target_duration_seconds - accumulated_seconds
-        # r0132: in the landing zone the pending direct-track slots are
-        # mandatory -- their airtime is reserved out of the category runway
-        # (a direct that alone crosses the boundary still airs). Normal mode
-        # reserves nothing, so earlier fixed content (IDs, underwriting
-        # before a long show segment) keeps its ordinary turn.
-        reserve, next_direct, end = _pending_direct_airtime(
-            slots, idx, raw_remaining if raw_remaining <= PAIR_LANDING_THRESHOLD_SECONDS else 0.0,
-        )
-        reserved_end = max(reserved_end, end)
-        budget = target_duration_seconds - reserve
-        remaining = budget - accumulated_seconds
-        if remaining <= 0:
-            # The reserved direct tracks fill the rest: the discretionary
-            # category slots before them are skipped, never the directs.
-            idx = next_direct
-            continue
-        # Consecutive category slots from here, stopping before any
-        # direct-track slot (never planned through, replaced or reordered).
-        window = 1
+        remaining = target_duration_seconds - accumulated_seconds
+        # Consecutive MUSIC slots from here (0 for a non-music slot), stopping
+        # before any direct-track or non-music slot: those are never planned
+        # through, replaced, reordered or reserved around.
+        window = 0
         while (window < LANDING_LOOKAHEAD_MAX_SLOTS and idx + window < len(slots)
-               and not slots[idx + window].track_id):
+               and _is_music_slot(slots[idx + window])):
             window += 1
 
         if remaining > PAIR_LANDING_THRESHOLD_SECONDS:
             # Normal mode: unchanged sequential weighted-random picking.
             mode = "normal"
-        elif remaining > DURATION_FIT_MARGIN and (window >= 2 or lookahead_engaged):
+        elif remaining > DURATION_FIT_MARGIN and window and (window >= 2 or lookahead_engaged):
             # A landing sequence, once started, is finished by the same
             # planner, so its last slot takes the landing it planned for.
             mode = "lookahead"
         elif remaining <= EXACT_FIT_THRESHOLD_SECONDS:
             mode = "exact_fit"
         else:
-            # Landing zone with no later category slot before a direct
-            # track or the end: one duration-aware (force_fit_mode) pick.
+            # Landing zone, single slot (a non-music slot, or a music slot
+            # with no later music slot in its run): one duration-aware
+            # (force_fit_mode) pick, r0131's own no-pair fallback.
             mode = "landing"
             diagnostics.landing_pair_fallbacks += 1
 
@@ -1787,10 +1746,8 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
         )
         track = None
-        lookahead_engaged = lookahead_engaged or mode == "lookahead"
-        if lookahead_engaged:
-            landing_budget = budget
         if mode == "lookahead":
+            lookahead_engaged = landing_open = True
             track = _lookahead_pick(
                 ctx, slots, idx, window, category, remaining, artist_sep, title_sep,
                 pool_override_qs, pool_key, exclude_holiday_codes,
@@ -1821,13 +1778,14 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             diagnostics.lookahead_picks += 1
         else:
             diagnostics.exact_fit_picks += 1
-        # Runway used up: go straight to the next direct-track slot (the
-        # segment end when none follows -- the boundary break).
-        idx = next_direct if accumulated_seconds >= budget else idx + 1
+        idx += 1
 
-    if landing_budget is not None:
-        landing_error = abs(landing_budget - accumulated_seconds)
-    if landing_error is not None:
+        if accumulated_seconds >= target_duration_seconds:
+            break
+
+    final_error = abs(target_duration_seconds - accumulated_seconds)
+    if landing_open or landing_error is not None:
+        landing_error = final_error if landing_open else min(landing_error, final_error)
         diagnostics.landing_errors.append(landing_error)
     ctx.accumulated_seconds = accumulated_seconds
 
