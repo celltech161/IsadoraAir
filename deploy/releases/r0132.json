@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0132",
+  "previous_release_id": "r0131",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fairer end-of-hour music: lookahead plans up to four consecutive music slots by effective rotation weight; non-music pairing, direct inserts, requests and hour termination unchanged. Remote DJ: a failed session is muted at once and cleaned up off its callback thread by one bounded worker; only successful cleanup frees the slot; failure quarantines Remote DJ until an engine restart (never automatic). No migration, static, unit, package or protected-runtime change; restart Gunicorn and engine.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
