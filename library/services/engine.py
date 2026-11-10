@@ -899,6 +899,10 @@ START_NEXT_ANCHOR_MAX_WAIT_MS = 200
 FIRST_REAL_POST_PRIMER_MILESTONE = "REAL_CONTENT_CROSSED_POST_PRIMER_BOUNDARY"
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
 DECK_TEARDOWN_TIMEOUT_SECONDS = 10.0
+# r0132 B: bounded NULL of a finished Remote DJ session's detached
+# ephemeral elements (same budget as a deck), polled from the GLib thread.
+REMOTE_DJ_TEARDOWN_TIMEOUT_SECONDS = 10.0
+REMOTE_DJ_TEARDOWN_POLL_MS = 100
 DECK_WATCHDOG_WINDOW_SECONDS = 10 * 60
 DECK_WATCHDOG_ESCALATION_COUNT = 3
 
@@ -1439,6 +1443,11 @@ class RemoteDJSlot:
         self.master_mixer_pad = master_mixer_pad  # never released
         self.silence_src = silence_src       # audiotestsrc wave=silence
         self.session = None                  # the RemoteDJSession currently occupying this slot, or None
+        # r0132 B: while a finished session's detached ephemeral elements are
+        # being NULLed on the bounded worker, {"generation", "attempt_id",
+        # "started", "state": "cleaning"|"quarantined"}; None otherwise. The
+        # slot stays occupied (session kept) until that cleanup completes.
+        self.teardown = None
 
 
 class RemoteDJSession:
@@ -2265,6 +2274,11 @@ class PlaybackEngine:
             coordinator.stop()
         if self.remote_dj_session:
             self._remote_dj_session_stop()
+        # r0132 B: the session's elements are already out of main_pipeline;
+        # never join a worker that may be wedged in their NULL.
+        remote_dj_teardowns = getattr(self, "_remote_dj_teardowns", None)
+        if remote_dj_teardowns is not None:
+            remote_dj_teardowns.stop()
         if self.main_pipeline:
             self.main_pipeline.set_state(Gst.State.NULL)
         # Audio is already NULL: a short bounded drain of queued refill
@@ -11638,6 +11652,128 @@ class PlaybackEngine:
             dedupe_key=f"engine|remote_dj|failure|attempt={attempt.attempt_id}",
         )
 
+    def _remote_dj_defer_off_glib_thread(self, session, attempt_id, method, *args):
+        """r0132 B (WRJE 2026-11-08). Remote DJ teardown must run on the GLib
+        thread. notify::connection-state and GstPromise replies arrive on the
+        webrtcbin's own "<name>:pc" thread, and set_state(NULL) of that same
+        webrtcbin from there never returns (its READY->NULL _quit_pc_loop
+        waits for the very loop it is running in), stranding the slot and
+        later hanging shutdown on the element's state lock. Off that thread
+        this only mutes the exact session's physical gate (a property set) and
+        re-dispatches the call, still bound to the same attempt; it returns
+        True when it did so."""
+        if threading.current_thread() is threading.main_thread():
+            return False
+        slots = getattr(self, "dj_slots", None) or []
+        slot_id = getattr(session, "slot_id", None)
+        slot = slots[slot_id] if slot_id is not None and slot_id < len(slots) else None
+        gate_closed = slot is not None and session is not None and slot.session is session
+        if gate_closed:
+            slot.remote_gate.set_property("volume", 0.0)
+        line = (
+            f"teardown_deferred_to_glib thread={threading.current_thread().name} "
+            f"gate_closed={gate_closed}"
+        )
+        print(f"  Remote DJ [{attempt_id or 'untracked'}]: {line}")
+        if session is not None:
+            _dj_diag(session, line)
+        GLib.idle_add(method, *args)
+        return True
+
+    def _remote_dj_teardown_coordinator(self):
+        coordinator = getattr(self, "_remote_dj_teardowns", None)
+        if coordinator is None:
+            coordinator = audio_recovery.BoundedTeardownCoordinator(
+                "remote-dj-teardown",
+                timeout_s=REMOTE_DJ_TEARDOWN_TIMEOUT_SECONDS,
+                queue_capacity=1,
+            )
+            self._remote_dj_teardowns = coordinator
+        return coordinator
+
+    def _remote_dj_release_slot(self, slot, session, attempt_id, detail=""):
+        """The one place a persistent slot is handed back to the pool, after
+        every ephemeral element of `session` is NULL (or there were none)."""
+        if slot is not None and slot.session is session:
+            slot.session = None
+            slot.teardown = None
+            _dj_diag(session, f"slot {slot.slot_id} released back to pool{detail}")
+        _dj_diag(session, "session_stop")
+        _close_remote_dj_diagnostics(session)
+        _close_remote_dj_pcm(session)
+        print(f"  Remote DJ [{attempt_id}]: session stopped{detail}")
+
+    def _remote_dj_teardown_tick(self, context):
+        """GLib poll for one submitted native cleanup (bounded by the
+        coordinator's timeout). Only a "completed" outcome releases the slot;
+        "failed" (an exception or a FAILURE return), a timeout or an abandoned
+        run quarantines it: the elements are already out of main_pipeline and
+        the selector is on silence, so on-air audio is unaffected, but the slot
+        is never advertised as reusable while its old elements may not be NULL."""
+        slot, session, generation, attempt_id = context
+        coordinator = self._remote_dj_teardown_coordinator()
+        coordinator.tick()
+        outcome = None
+        for event in coordinator.drain_events():
+            if event.get("generation") == generation and event["kind"] in (
+                "completed", "failed", "timed_out", "abandoned_without_start",
+            ):
+                outcome = event
+        if outcome is None:
+            return True
+        teardown = slot.teardown if slot is not None else None
+        if teardown is None or teardown.get("generation") != generation:
+            return False
+        if outcome["kind"] == "completed":
+            elapsed_ms = round((outcome.get("elapsed_s") or 0.0) * 1000)
+            self._remote_dj_release_slot(
+                slot, session, attempt_id, f" (native cleanup {elapsed_ms} ms)"
+            )
+            return False
+        self._remote_dj_quarantine_slot(
+            slot, session, attempt_id, outcome["kind"], outcome.get("elapsed_s"),
+            error=outcome.get("error"),
+        )
+        return False
+
+    def _remote_dj_quarantine_slot(self, slot, session, attempt_id, kind, elapsed_s, error=None):
+        """Native cleanup failed, did not finish within its bound, or the
+        worker is already wedged: keep the slot occupied, say so loudly, and
+        leave the recovery to an engine restart. Bounded: the one worker is
+        never replaced and the failed cleanup is never retried, so nothing
+        further is spawned or queued for this slot."""
+        coordinator = self._remote_dj_teardown_coordinator()
+        slot.teardown = dict(slot.teardown or {}, state="quarantined")
+        failed = kind == "failed"
+        line = (
+            f"native_cleanup_{'failed' if failed else 'blocked'} event={kind} "
+            f"elapsed_ms={round((elapsed_s or 0.0) * 1000)} slot={slot.slot_id} quarantined"
+            + (f" error={error}" if error else "")
+        )
+        print(f"  Remote DJ [{attempt_id}]: {line} -- engine restart required to reuse Remote DJ")
+        _dj_diag(session, line)
+        _close_remote_dj_diagnostics(session)
+        _close_remote_dj_pcm(session)
+        emit_event(
+            category="engine",
+            level="critical",
+            title=(
+                f"Remote DJ cleanup {'failed' if failed else 'blocked'}; "
+                "Remote DJ unavailable until engine restart"
+            ),
+            detail={
+                "attempt_id": attempt_id,
+                "slot": slot.slot_id,
+                "teardown_event": kind,
+                "error": error,
+                "elapsed_seconds": elapsed_s,
+                "coordinator": coordinator.snapshot(),
+                "detached_from_program_audio": True,
+                "restart_required_to_reuse_remote_dj": True,
+            },
+            dedupe_key=f"engine|remote_dj|teardown_blocked|attempt={attempt_id}",
+        )
+
     def _remote_dj_fail_active_session(self, failure_class, reason):
         session = self.remote_dj_session
         if session is None:
@@ -11653,6 +11789,11 @@ class PlaybackEngine:
     def _remote_dj_fail_bound_session(
         self, expected_session, attempt_id, failure_class, reason
     ):
+        if self._remote_dj_defer_off_glib_thread(
+            expected_session, attempt_id, self._remote_dj_fail_bound_session,
+            expected_session, attempt_id, failure_class, reason,
+        ):
+            return False
         session = self._remote_dj_session_for_attempt(
             attempt_id,
             "session_failure",
@@ -11712,10 +11853,16 @@ class PlaybackEngine:
         slot = self._dj_slot_available()
         if slot is None:
             print("  Remote DJ session start requested but all DJ slots are occupied — ignoring")
+            states = {(s.teardown or {}).get("state") for s in self.dj_slots}
+            reason = "all persistent Remote DJ slots are occupied"
+            if "quarantined" in states:
+                reason += " (previous session cleanup failed or blocked; engine restart required)"
+            elif "cleaning" in states:
+                reason += " (previous session cleanup in progress)"
             self._remote_dj_emit_failure(
                 attempt,
                 FAILURE_SIGNALING_SESSION_BUSY,
-                "all persistent Remote DJ slots are occupied",
+                reason,
             )
             return False
 
@@ -13143,7 +13290,7 @@ class PlaybackEngine:
                 FAILURE_ICE_STATE, "WebRTC peer connection entered failed state"
             )
         elif state == GstWebRTC.WebRTCPeerConnectionState.CLOSED:
-            self._remote_dj_session_stop()
+            self._remote_dj_session_stop(getattr(attempt, "attempt_id", None))
 
     def _remote_dj_on_recovery_deadline(self, callback_context):
         """P1 1.5 Pass B1 -- fires once, RemoteDJConfig.reconnect_grace_
@@ -13502,6 +13649,16 @@ class PlaybackEngine:
         )
 
     def _remote_dj_session_stop(self, attempt_id=None):
+        if threading.current_thread() is not threading.main_thread():
+            active = getattr(self, "remote_dj_session", None)
+            active_attempt = getattr(active, "connection_attempt", None)
+            bound_id = attempt_id or getattr(active_attempt, "attempt_id", None)
+            if attempt_id is not None and getattr(active_attempt, "attempt_id", None) != attempt_id:
+                active = None
+            self._remote_dj_defer_off_glib_thread(
+                active, bound_id, self._remote_dj_session_stop, bound_id,
+            )
+            return False
         if attempt_id is None:
             session = self.remote_dj_session
         else:
@@ -13525,6 +13682,7 @@ class PlaybackEngine:
         # the same operation is an idempotent no-op on that path.
         if self._remote_dj_server and attempt is not None:
             self._remote_dj_server.retire_attempt_threadsafe(attempt_id)
+            _dj_diag(session, "signaling_retired")
 
         # Cancel the small post-ICE stats burst. Completed one-shots no
         # longer have a source; generation guards also make any callback
@@ -13608,7 +13766,8 @@ class PlaybackEngine:
         # (2) Unlink the ephemeral WebRTC decode chain from the slot's
         #     webrtc_pad. The pad itself stays -- pre-allocated,
         #     ready for the next session.
-        # (3) THEN set the ephemeral elements to NULL and remove them.
+        # (3) THEN detach the ephemeral elements from main_pipeline; their
+        #     NULL runs on the bounded teardown worker (r0132 B, below).
         # (4) Same monitor-tee handling as before.
         # NOTE: no master_mixer touching at any point. The slot's
         # master_mixer pad has never been released and never will be
@@ -13629,32 +13788,69 @@ class PlaybackEngine:
                 session.local_mic_tee_pad.unlink(peer)
             self.local_mic_tee.release_request_pad(session.local_mic_tee_pad)
 
-        for el in session.elements:
-            el.set_state(Gst.State.NULL)
-        for el in session.elements:
+        if slot is not None:
+            _dj_diag(session, "gate_closed selector=silence")
+
+        # r0132 B -- detach first, NULL off the GLib thread (the deck and
+        # mic-generation discipline): every ephemeral element leaves
+        # main_pipeline now, so neither this thread nor the pipeline's own
+        # shutdown NULL ever waits on a session element's state lock. Only
+        # the NULL transitions themselves -- the proven hang risk -- run on
+        # the single bounded teardown worker.
+        elements = list(session.elements)
+        for el in elements:
             if el.get_parent() is self.main_pipeline:
                 self.main_pipeline.remove(el)
 
-        # Release the slot back to the pool -- the ONLY per-session
-        # bookkeeping we do on the persistent audio path. The slot's
-        # elements (silence source, selector, gain, gate, master_mixer
-        # pad) stay intact; they'll continue driving silence into the
-        # mixer until the next session claims this slot.
-        if slot is not None:
-            slot.session = None
-            _dj_diag(session, f"slot {slot.slot_id} released back to pool")
-
-        # Close diagnostic sinks -- files stay on disk (not truncated
-        # here) so a user reporting "static during that last session"
-        # has something to inspect. Next session start truncates them.
+        # Logically the session is over now. Diagnostic sinks stay open until
+        # the native outcome is recorded; files stay on disk (not truncated)
+        # and the next session start truncates them.
         self._remote_dj_mark(session, "session_stopped")
         if attempt is not None:
             attempt.end()
-        _dj_diag(session, "session_stop")
-        _close_remote_dj_diagnostics(session)
-        _close_remote_dj_pcm(session)
 
-        print(f"  Remote DJ [{attempt_id}]: session stopped")
+        if not elements:
+            # Nothing native to wait for: release the slot immediately.
+            self._remote_dj_release_slot(slot, session, attempt_id)
+            return False
+
+        # The slot stays occupied (slot.session is still this session) until
+        # the worker reports every element NULL -- never reused early.
+        generation = getattr(self, "_remote_dj_teardown_generation", 0) + 1
+        self._remote_dj_teardown_generation = generation
+        coordinator = self._remote_dj_teardown_coordinator()
+
+        def _null_detached_elements():
+            # A FAILURE return is a failed cleanup, never a success: raising
+            # makes the coordinator report "failed" (r0132 B1).
+            for el in elements:
+                if el.set_state(Gst.State.NULL) == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError(f"{el.get_name()}: set_state(NULL) returned FAILURE")
+
+        result = coordinator.submit(
+            generation, _null_detached_elements,
+            metadata={"attempt_id": attempt_id, "elements": len(elements)},
+        )
+        _dj_diag(session, f"native_cleanup {result} generation={generation} elements={len(elements)}")
+        if slot is None:
+            print(f"  Remote DJ [{attempt_id}]: session stopped (no slot; native cleanup {result})")
+            _close_remote_dj_diagnostics(session)
+            _close_remote_dj_pcm(session)
+            return False
+        slot.teardown = {
+            "generation": generation,
+            "attempt_id": attempt_id,
+            "started": time.monotonic(),
+            "state": "cleaning",
+        }
+        if result == "queued":
+            GLib.timeout_add(
+                REMOTE_DJ_TEARDOWN_POLL_MS, self._remote_dj_teardown_tick,
+                (slot, session, generation, attempt_id),
+            )
+        elif result != "rejected_stopping":
+            # The one worker is already wedged on an earlier cleanup.
+            self._remote_dj_quarantine_slot(slot, session, attempt_id, result, None)
         return False
 
     def _start_duck_ramp(self, target):

@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -310,6 +311,10 @@ class RemoteDJBuildRollbackTests(TestCase):
         self.diag_patch = patch.object(eng_module, "DJ_DIAG_LOG", self.diag_path)
         self.diag_patch.start()
         self.addCleanup(self.diag_patch.stop)
+        # Session start resets the PCM dump artifact; keep it in the sandbox.
+        pcm_patch = patch.object(eng_module, "DJ_DUMP_PCM", Path(self.tmp_dir.name) / "remote-dj.pcm")
+        pcm_patch.start()
+        self.addCleanup(pcm_patch.stop)
 
     def _stand_in(self):
         selector = MagicMock()
@@ -403,6 +408,7 @@ class RemoteDJBuildRollbackTests(TestCase):
             )
 
         engine._remote_dj_build_session = fail_build
+        polls = []
         with (
             patch.object(
                 eng_module.RemoteDJAudioInput,
@@ -410,17 +416,29 @@ class RemoteDJBuildRollbackTests(TestCase):
                 return_value=SimpleNamespace(gain_db=0.0),
             ),
             patch.object(eng_module, "emit_event"),
+            patch.object(
+                eng_module.GLib, "timeout_add",
+                side_effect=lambda _ms, fn, *args: polls.append((fn, args)) or 1,
+            ),
         ):
             engine._remote_dj_session_start(
                 ATTEMPT_ID, 1_700_000_000_000
             )
 
-        partial_element.set_state.assert_called_once_with(Gst.State.NULL)
+        # r0132 B: detached from main_pipeline at once; its NULL runs on the
+        # bounded teardown worker and the slot is released when that completes.
         engine.main_pipeline.remove.assert_called_once_with(partial_element)
         engine.remote_dj_tee.release_request_pad.assert_called_once_with(
             monitor_pad
         )
         self.assertIsNone(engine.remote_dj_session)
+        self.assertEqual(len(polls), 1)
+        fn, args = polls[0]
+        deadline = time.monotonic() + 5
+        while fn(*args):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        partial_element.set_state.assert_called_once_with(Gst.State.NULL)
         self.assertIsNone(slot.session)
 
     def test_config_read_failure_after_slot_claim_uses_normal_rollback(self):
