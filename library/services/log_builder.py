@@ -1695,7 +1695,7 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
             # The planned music run ends here. Later direct/non-music airtime
             # can only improve its landing error, never inflate it.
             landing_error = abs(target_duration_seconds - accumulated_seconds)
-            landing_open = False
+            lookahead_engaged = landing_open = False
 
         if slot.track_id:
             # Direct track insert — the hybrid rotation/playlist ask.

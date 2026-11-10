@@ -446,10 +446,39 @@ class LookaheadMusicOnlyScopeTests(TestCase):
         log, items, detail, event = self.build(rotation, 460)
         self.assertEqual([i.category_id for i in items], [music.id, music.id, self.legal.id, music.id])
         self.assertEqual(items[2].track.duration_seconds, 5)          # ordinary pick, in place
-        self.assertEqual((detail["lookahead_picks"], detail["exact_fit_picks"]), (3, 1))
+        self.assertEqual((detail["lookahead_picks"], detail["exact_fit_picks"]), (2, 2))
         self.assertEqual(self.assert_timeline(log, items), 455)
         self.assertEqual(detail["landing_errors"], [5.0])
         self.assertIsNone(event, detail)
+
+    def test_a_direct_ends_the_lookahead_sequence_for_a_later_isolated_music_slot(self):
+        """Codex A3 reproduction: [150, 150, 5 s direct, isolated music], 460 s,
+        seed 17. The direct ends the planned run, so the isolated music slot
+        takes the ordinary duration-aware pick (weight-led: 120 s), not a
+        lookahead pick left over from the earlier sequence (150 s)."""
+        music = self.uniform("R0132R150", 150)
+        isolated = music_category("R0132ISO")
+        make_track("Iso 150", "Iso Artist A", isolated, 150, rotation_weight=0)
+        make_track("Iso 120", "Iso Artist B", isolated, 120, rotation_weight=30000)
+        direct = make_track("Legal ID 5", "Station D", self.legal, 5)
+        rotation = rotation_of("Stale state", music, music, direct, isolated)
+        windows, spy = self.spy_windows()
+        random.seed(17)
+        with spy:
+            log, items, detail, event = self.build(rotation, 460)
+        self.assertEqual([idx for _slots, idx, _window in windows], [0, 1])   # never the isolated slot
+        self.assertEqual([i.track.duration_seconds for i in items], [150, 150, 5, 120])
+        self.assertEqual((items[2].track_id, items[2].position), (direct.id, 2))
+        self.assertEqual(items[3].category_id, isolated.id)
+        self.assertEqual((detail["lookahead_picks"], detail["exact_fit_picks"]), (2, 1))
+        self.assertEqual(self.assert_timeline(log, items), 425)
+        # A later run of two or more music slots still starts its own lookahead.
+        rotation = rotation_of("Second run", music, music, direct, music, music)
+        windows, spy = self.spy_windows()
+        random.seed(17)
+        with spy:
+            self.build(rotation, 760, day=2)
+        self.assertIn(3, [idx for _slots, idx, _window in windows])
 
     def test_mixed_sequence_keeps_slot_order_for_slots_reached(self):
         direct = make_track("Promo 30 B", "Promo B", self.legal, 30)
