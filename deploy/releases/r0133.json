@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0133",
+  "previous_release_id": "r0132",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Update Center migration-history consistency hardening (Roadmap 1.22): a database whose applied migrations lack a recorded prerequisite is now reported as inconsistent_migration_history, non-actionable, and the protected migration probe fails before emitting a plan or digest. Healthy histories are unchanged. No migration, static, unit, package or protected-runtime change; restart Gunicorn only.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
