@@ -54,13 +54,21 @@ def _probe_duration(path: Path) -> float:
     return duration
 
 
-def _convert_wav_to_flac(source: Path, destination: Path) -> None:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(source), str(destination)],
-        check=True,
-        timeout=30,
-        capture_output=True,
-    )
+def _convert_wav_to_flac(source: Path, destination: Path, peak_ceiling: float | None = None) -> None:
+    """Convert the synthesis WAV to FLAC. Native rate and channels are preserved.
+
+    ``peak_ceiling`` (linear, 0 < c <= 1; ``None`` = off) adds only a look-ahead true-peak limiter, with no gain
+    change: ``level=false`` disables the limiter's automatic make-up gain and ``latency=1`` compensates its
+    look-ahead so the audio stays time-aligned (its default shifts it 5 ms and would put the cue markers, which
+    are derived from the final file, off the speech). The output is 16-bit, as the converted synthesis already is.
+    """
+    command = ["ffmpeg", "-y", "-i", str(source)]
+    if peak_ceiling is not None:
+        if isinstance(peak_ceiling, bool) or not isinstance(peak_ceiling, (int, float)) or not 0.0 < float(peak_ceiling) <= 1.0:
+            raise ValueError(f"peak_ceiling must be in (0, 1], got {peak_ceiling!r}")
+        command += ["-af", f"alimiter=limit={float(peak_ceiling)}:level=false:latency=1", "-sample_fmt", "s16"]
+    command.append(str(destination))
+    subprocess.run(command, check=True, timeout=30, capture_output=True)
 
 
 def _analyze_track(
@@ -250,7 +258,10 @@ class AnnouncementRenderer:
                     output_path=wav_path,
                     timeout_seconds=spec.timeout_seconds,
                 )
-                _convert_wav_to_flac(wav_path, candidate)
+                if spec.peak_ceiling is None:
+                    _convert_wav_to_flac(wav_path, candidate)
+                else:
+                    _convert_wav_to_flac(wav_path, candidate, peak_ceiling=spec.peak_ceiling)
                 duration = _probe_duration(candidate)
 
                 if destination.exists():

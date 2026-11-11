@@ -936,7 +936,7 @@ def _trigger_wx_alert():
         if result.returncode != 0:
             log.error(
                 "wx_alert.py exited %d (failure) -- watch/warning audio was NOT published "
-                "this cycle; the previous wx_alert.mp3 (if any) remains in place.",
+                "this cycle; the previous wx_alert.flac (if any) remains in place.",
                 result.returncode,
             )
         else:

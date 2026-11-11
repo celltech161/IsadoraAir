@@ -125,6 +125,10 @@ def _report_policy_suppression_if_due(req, exc):
         )
 
 DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
+# Linear true-peak ceiling for generated dedication intros (about -1.5 dBFS). Calibrated 2026-11-11 on the 28
+# intros then on the station: 9 exceeded -1 dBTP and 3 reached 0 dBTP; at this ceiling every one was at or below
+# -1.3 dBTP with at most 0.1 LU of loudness change.
+DEDICATION_PEAK_CEILING = 0.84
 
 # Same path engine.py's STATE_PATH writes to -- redefined here rather
 # than imported, since library.services.engine imports FROM this module
@@ -668,6 +672,9 @@ def synthesize_dedication_intro(req):
                     category_code="Dedications",
                     ready2air=True,
                 ),
+                # Level is already on target (a native mono intro plays about -16 LUFS once the pipeline duplicates
+                # it into both channels); the safeguard is peaks only: a -1.5 dBFS limiter and no gain change.
+                peak_ceiling=DEDICATION_PEAK_CEILING,
             )
         )
         intro_track = rendered.track

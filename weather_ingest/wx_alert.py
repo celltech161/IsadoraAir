@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from isadoraair.engine_commands import enqueue_engine_command
 from delivery import deliver
+import speech_audio
 import voices
 from voices import VoiceResolutionError, resolve_voice
 from wxconfig import load_weather_config, resolve_weather_data_dir
@@ -55,10 +56,10 @@ DATA_DIR = resolve_weather_data_dir()
 WX_WATCHWARN_FILE = DATA_DIR / "active_watches_warnings.json"
 
 TMP_DIR = "/tmp/syndicated-wx-alert"
-COMBINED_OUTPUT = os.path.join(TMP_DIR, "wx_alert.mp3")
+COMBINED_OUTPUT = os.path.join(TMP_DIR, "wx_alert.flac")
 
 CATEGORY_CODE = "WxAlert"
-DEST_FILENAME = "wx_alert.mp3"
+DEST_FILENAME = "wx_alert.flac"
 
 LOCKFILE = "/tmp/syndicated-wx-alert.lock"
 
@@ -97,8 +98,8 @@ def synthesize_clip(text, voice, out_path):
     return voices.synthesize(text, out_path, voice)
 
 
-def concat_clips(clip_paths, output_path):
-    """Concatenate the per-alert WAV clips into one MP3 via ffmpeg."""
+def concat_clips(clip_paths, output_path, voice=None):
+    """Concatenate the per-alert WAV clips into one calibrated FLAC via ffmpeg."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     list_path = output_path + ".list.txt"
 
@@ -113,25 +114,16 @@ def concat_clips(clip_paths, output_path):
         log.error("Failed to write concat list %s: %s", list_path, e)
         return False
 
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-y", "-f", "concat", "-safe", "0",
-        "-i", list_path,
-        # Piper's own audio starts right at sample 0 with no lead-in, which
-        # reads as clipped on air -- 1s of silence up front (once, ahead of
-        # the whole concatenated clip) gives the on-air chain room to
-        # fade/cue in cleanly.
-        "-af", "adelay=1000:all=1",
-        "-acodec", "libmp3lame",
-        "-ar", "44100", "-ac", "2", "-b:a", "320k",
-        "-metadata", "artist=Weather Alert",
-        "-metadata", "title=Weather Alert",
-        output_path,
-    ]
     try:
-        subprocess.run(cmd, check=True)
+        # One calibrated encode for the whole concatenated alert: gain + peak limiter, then the 1 s lead-in
+        # once ahead of everything (see lib/speech_audio.py).
+        speech_audio.encode_flac(
+            ["-f", "concat", "-safe", "0", "-i", list_path], output_path,
+            speech_audio.gain_db_for("alert", voice),
+            {"artist": "Weather Alert", "title": "Weather Alert"},
+        )
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.error("ffmpeg concat failed building %s: %s", output_path, e)
         return False
     finally:
@@ -153,7 +145,7 @@ def fire_insert_urgent():
 def _main_body():
     """All-or-nothing at the synthesis-set level: if ANY qualifying
     entry fails to synthesize, this aborts before concat/delivery/
-    insert_urgent entirely -- the previous final wx_alert.mp3 (if any)
+    insert_urgent entirely -- the previous final wx_alert.flac (if any)
     is left completely untouched, and nothing is published from an
     incomplete clip set. Only when EVERY qualifying entry synthesizes
     successfully does concatenation/delivery/insertion proceed.
@@ -186,15 +178,15 @@ def _main_body():
             # insert_urgent. The previous final file is untouched.
             log.error(
                 "Synthesis failed for %s (%s) -- aborting entire alert publication; "
-                "the previous wx_alert.mp3 (if any) is left untouched.",
+                "the previous wx_alert.flac (if any) is left untouched.",
                 entry.get("event", "?"), result.reason,
             )
             return False
         clip_paths.append(wav_path)
         log.info("Synthesized: %s -> %s", entry.get("event", "?"), wav_path)
 
-    if not concat_clips(clip_paths, COMBINED_OUTPUT):
-        log.error("Concat failed; nothing to insert. Previous wx_alert.mp3 (if any) is untouched.")
+    if not concat_clips(clip_paths, COMBINED_OUTPUT, voice):
+        log.error("Concat failed; nothing to insert. Previous wx_alert.flac (if any) is untouched.")
         return False
 
     dest = deliver(

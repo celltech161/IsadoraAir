@@ -194,7 +194,7 @@ class FirstGenerationTests(PublicationTestCase):
         # file every future publish attempt for this destination must
         # find and flock(), not a scratch artifact to clean up.
         leftovers = [p for p in (self.library_root / "WxTemp").iterdir() if p.name.startswith(".")]
-        self.assertEqual(leftovers, [self.library_root / "WxTemp" / ".current_temp.mp3.publish.lock"])
+        self.assertEqual(leftovers, [self.library_root / "WxTemp" / ".current_temp.asset.publish.lock"])
 
     def test_unrelated_waveform_is_never_touched_by_a_failed_first_generation_publish(self):
         """P1 2.4 Pass G correction: rollback must never scan/delete

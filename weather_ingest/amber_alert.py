@@ -9,8 +9,8 @@ wx_alert.py's shape:
       -> synthesize each alert's `text` field via the canonical shared
          IsadoraAir TTS CLI (on-duty logical voice picked by weather
          config's voice_schedule -- see lib/voices.py)
-      -> concatenate + convert to MP3
-      -> deliver to /srv/isadoraair/music/WxAlert/wx_alert.mp3 via
+      -> concatenate + convert to calibrated FLAC
+      -> deliver to /srv/isadoraair/music/WxAlert/wx_alert.flac via
          lib/delivery.py
       -> fire engine.py's insert_urgent command for WxAlert category
 
@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from isadoraair.engine_commands import enqueue_engine_command  # noqa: E402
 from delivery import deliver  # noqa: E402
+import speech_audio  # noqa: E402
 import voices  # noqa: E402
 from voices import VoiceResolutionError, resolve_voice  # noqa: E402
 from wxconfig import load_weather_config, resolve_weather_data_dir  # noqa: E402
@@ -48,12 +49,12 @@ DATA_DIR = resolve_weather_data_dir()
 ACTIVE_FILE = DATA_DIR / "active_amber_alerts.json"
 
 TMP_DIR = "/tmp/amber-alert"
-COMBINED_OUTPUT = os.path.join(TMP_DIR, "wx_alert.mp3")
+COMBINED_OUTPUT = os.path.join(TMP_DIR, "wx_alert.flac")
 
 # Reuse WxAlert category deliberately -- same on-air pattern as weather
 # alerts. See AmberAlertConfig docstring's design decision.
 CATEGORY_CODE = "WxAlert"
-DEST_FILENAME = "wx_alert.mp3"
+DEST_FILENAME = "wx_alert.flac"
 
 LOCKFILE = "/tmp/amber-alert.lock"
 
@@ -81,7 +82,7 @@ def _load_active():
     return data if isinstance(data, list) else []
 
 
-def _concat_clips(clip_paths, output_path):
+def _concat_clips(clip_paths, output_path, voice=None):
     """Same ffmpeg concat approach wx_alert.py uses, kept identical so
     the on-air perceived timing/level is consistent between weather
     and AMBER urgent inserts."""
@@ -99,23 +100,16 @@ def _concat_clips(clip_paths, output_path):
         log.error("Failed to write concat list %s: %s", list_path, exc)
         return False
 
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-y", "-f", "concat", "-safe", "0",
-        "-i", list_path,
-        # 1s of leading silence so the on-air chain can fade/cue in
-        # cleanly -- matches wx_alert's setting exactly.
-        "-af", "adelay=1000:all=1",
-        "-acodec", "libmp3lame",
-        "-ar", "44100", "-ac", "2", "-b:a", "320k",
-        "-metadata", "artist=AMBER Alert",
-        "-metadata", "title=AMBER Alert",
-        output_path,
-    ]
     try:
-        subprocess.run(cmd, check=True)
+        # Identical calibrated encode to wx_alert.py (lib/speech_audio.py), so watch/warning and AMBER urgent
+        # inserts share one on-air level and one lead-in.
+        speech_audio.encode_flac(
+            ["-f", "concat", "-safe", "0", "-i", list_path], output_path,
+            speech_audio.gain_db_for("alert", voice),
+            {"artist": "AMBER Alert", "title": "AMBER Alert"},
+        )
         return True
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         log.error("ffmpeg concat failed building %s: %s", output_path, exc)
         return False
     finally:
@@ -136,7 +130,7 @@ def _main_body():
     """All-or-nothing at the synthesis-set level -- mirrors wx_alert.py's
     own _main_body() exactly (see that function's docstring): any
     failed segment aborts the whole publication attempt before concat/
-    delivery/insert_urgent, leaving the previous final wx_alert.mp3
+    delivery/insert_urgent, leaving the previous final wx_alert.flac
     untouched. Returns True on success (including the benign "nothing
     to insert" no-op), False on a real failure that left nothing
     published."""
@@ -166,15 +160,15 @@ def _main_body():
             # own identical comment.
             log.error(
                 "Synthesis failed for %s (%s) -- aborting entire AMBER publication; "
-                "the previous wx_alert.mp3 (if any) is left untouched.",
+                "the previous wx_alert.flac (if any) is left untouched.",
                 entry.get("event", "?"), result.reason,
             )
             return False
         clip_paths.append(wav_path)
         log.info("Synthesized: %s -> %s", entry.get("event", "?"), wav_path)
 
-    if not _concat_clips(clip_paths, COMBINED_OUTPUT):
-        log.error("Concat failed; nothing to insert. Previous wx_alert.mp3 (if any) is untouched.")
+    if not _concat_clips(clip_paths, COMBINED_OUTPUT, voice):
+        log.error("Concat failed; nothing to insert. Previous wx_alert.flac (if any) is untouched.")
         return False
 
     dest = deliver(

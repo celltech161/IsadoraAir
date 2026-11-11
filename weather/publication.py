@@ -1,9 +1,10 @@
 """Weather asset last-known-good publication -- P1 2.4 Pass G.
 
-Weather's routine generated assets (WxTemp/current_temp.mp3, WxObs/
-current_obs.mp3, WxForecast/forecast.mp3, WxAlert/wx_alert.mp3) are
-rendered as MP3 by weather_ingest's isolated venv (current_temp.py,
-wx_forecast.py, wx_alert.py, amber_alert.py), which then hands the
+Weather's routine generated assets (WxTemp/current_temp.flac, WxObs/
+current_obs.flac, WxForecast/forecast.flac, WxAlert/wx_alert.flac) are
+rendered as calibrated FLAC by weather_ingest's isolated venv (current_temp.py,
+wx_forecast.py, wx_alert.py, amber_alert.py; before r0134 they were MP3, and an
+MP3 candidate is still accepted), which then hands the
 already-rendered candidate file to `manage.py publish_weather_asset`
 in the main IsadoraAir app -- see weather_ingest/lib/delivery.py's
 `deliver()`. This module is that command's actual implementation
@@ -11,7 +12,7 @@ in the main IsadoraAir app -- see weather_ingest/lib/delivery.py's
 weather/management/commands/publish_weather_asset.py).
 
 Deliberately NOT built on isadoraair/announcements (the r0055 generic
-renderer): Weather's asset is already fully rendered as MP3 before
+renderer): Weather's asset is already fully rendered before
 this runs (no TTS/ffmpeg happens here), and the renderer's contract is
 about producing an artifact from text, not about publishing an
 already-produced file. Extending the renderer to "also accept a
@@ -22,16 +23,18 @@ filesystem/DB approach (scratch dir, backup-then-replace, roll back on
 failure) without touching that module at all.
 
 Publish sequence:
-  1. Validate the candidate (exists, is a file, non-empty, .mp3) and
+  1. Validate the candidate (exists, is a file, non-empty, .flac or .mp3 and
+     the same extension as the destination filename) and
      resolve the destination Category (must already exist) -- neither
      step touches the destination itself, so neither needs the
      destination lock below.
-  2. Acquire an exclusive, cross-process lock keyed by the canonical
-     final destination path (see _destination_lock) -- held from here
+  2. Acquire an exclusive, cross-process lock keyed by the ASSET -- its
+     category and file stem, so wx_alert.flac and wx_alert.mp3 are one
+     asset (see _destination_lock) -- held from here
      through the end of step 6. Two publish attempts for the SAME
-     final destination (e.g. wx_alert.py and amber_alert.py, which
+     asset (e.g. wx_alert.py and amber_alert.py, which
      have entirely separate producer-side lockfiles but both publish
-     WxAlert/wx_alert.mp3) can never interleave their backup/replace/
+     WxAlert/wx_alert.flac) can never interleave their backup/replace/
      Track/waveform/provenance sequence; unrelated destinations are
      completely unaffected. The lock is an flock() on a hidden
      sidecar file next to the destination, released automatically on
@@ -39,7 +42,14 @@ Publish sequence:
   3. Stage: back up the current final file (if any) into scratch, copy
      the candidate into scratch, then replace() into place -- atomic
      on the destination filesystem.
-  4. transaction.atomic(): sync_track_file(dest_path, wave_dir=<a
+  4. transaction.atomic(): FIRST, if the asset's Track still sits at the
+     other extension (the pre-r0134 .mp3 Track), ADOPT it -- the same Track
+     row (same id, so every playlist, rotation, log and play-history
+     reference follows) is re-pointed at the new file path, under the path
+     locks and a row lock. Never a second Track: the engine's urgent insert
+     takes the first ready Track of a category, so a second one would leave
+     the stale file in service. The previous file is not touched or deleted.
+     Then: sync_track_file(dest_path, wave_dir=<a
      scratch waveform directory private to this publish attempt>) --
      creates/updates the Track row (STABLE id/filepath across
      regenerations, same identity every time, exactly like today) and
@@ -77,7 +87,8 @@ Publish sequence:
 
      and that file exists on disk.
   5. On any failure in step 4 (including the missing-scratch-waveform
-     case above, or the final waveform-publish move itself): restore
+     case above, or the final waveform-publish move itself; the adoption
+     rolls back with the transaction): restore
      the previous final file (or remove it, for a brand-new asset), let
      the DB transaction itself roll back the Track mutation (including
      any waveform_path rewrite), and restore/remove the real waveform
@@ -116,15 +127,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from django.conf import settings
-from django.db import transaction
+from django.db import router, transaction
 from django.utils import timezone
 
 from library.management.commands.analyze_tracks import get_waveforms_dir
 from library.management.commands.sync_track_file import sync_track_file
-from library.services import waveform_cache
+from library.services import source_paths, waveform_cache
 from library.models import Category, Track
 
 from . import provenance as provenance_mod
+
+
+#: Audio formats a Weather asset may be published in (FLAC is the standard; MP3 remains accepted).
+PUBLISHABLE_SUFFIXES = (".flac", ".mp3")
 
 
 class PublicationError(RuntimeError):
@@ -141,6 +156,8 @@ class PublicationResult:
     final_path: Path
     provenance_path: Path | None
     provenance_error: str | None
+    adopted_from: Path | None = None
+    warnings: tuple = ()
 
 
 def _restore_final_file(dest_path: Path, backup: Path | None) -> None:
@@ -155,12 +172,14 @@ def _restore_final_file(dest_path: Path, backup: Path | None) -> None:
 
 @contextmanager
 def _destination_lock(dest_path: Path):
-    """Exclusive, cross-process lock keyed by the canonical final
-    destination path -- serializes every publish_weather_asset() call
-    targeting the SAME LIBRARY_ROOT/<category>/<filename>, while
-    leaving unrelated destinations completely independent. Two
+    """Exclusive, cross-process lock keyed by the ASSET -- the destination
+    directory (category) plus the file stem, so ``wx_alert.flac`` and
+    ``wx_alert.mp3`` are one asset and can never be published, or have
+    their Track adopted, at the same time. Serializes every
+    publish_weather_asset() call for the SAME asset, while leaving
+    unrelated assets completely independent. Two
     producers with entirely separate producer-side lockfiles (wx_alert.
-    py and amber_alert.py both publish WxAlert/wx_alert.mp3) are
+    py and amber_alert.py both publish WxAlert/wx_alert.flac) are
     exactly the case this exists to cover -- neither producer's own
     lock protects the shared destination they both write to.
 
@@ -172,7 +191,7 @@ def _destination_lock(dest_path: Path):
     lock (this must work even before the destination Category/Track
     exist), and not per-producer (must work across processes with no
     shared Python state at all)."""
-    lock_path = dest_path.parent / f".{dest_path.name}.publish.lock"
+    lock_path = dest_path.parent / f".{dest_path.stem}.asset.publish.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -183,6 +202,53 @@ def _destination_lock(dest_path: Path):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def _sibling_paths(dest_path: Path) -> list[Path]:
+    """The same asset at its other publishable extensions."""
+    return [dest_path.with_suffix(suffix) for suffix in PUBLISHABLE_SUFFIXES if suffix != dest_path.suffix.lower()]
+
+
+def adopt_asset_track(dest_path, category_code: str):
+    """Re-point the asset's existing Track at ``dest_path`` (same row, same id), if it still sits at the
+    asset's other extension. MUST run inside the caller's ``transaction.atomic()``, after the destination
+    file exists and before ``sync_track_file`` registers it.
+
+    Returns ``(adopted_from_path_or_None, warnings)``. Adopts only when there is a Track at the
+    asset's other extension, in ``category_code``, and none at ``dest_path`` already. The one ambiguous state
+    (a Track at both extensions) adopts nothing and returns a warning: the publisher still publishes, never
+    guessing which row is the real one."""
+    dest_path = Path(dest_path)
+    using = router.db_for_write(Track)
+    siblings = _sibling_paths(dest_path)
+    # Order: path locks (sorted), then the Track row -- the library's documented lock order.
+    for path in sorted({str(dest_path), *(str(p) for p in siblings)}):
+        source_paths.acquire(path, using, timeout_ms=source_paths.REGISTRATION_LOCK_TIMEOUT_MS)
+
+    sibling_strings = [str(p) for p in siblings]
+    # of=("self",): Track.category is a nullable FK, and PostgreSQL refuses FOR UPDATE over its outer join.
+    rows = list(
+        Track.objects.select_for_update(of=("self",))
+        .filter(filepath__in=[str(dest_path), *sibling_strings], category__code=category_code)
+        .order_by("id")
+    )
+    at_dest = [t for t in rows if t.filepath == str(dest_path)]
+    at_siblings = [t for t in rows if t.filepath in sibling_strings]
+    if not at_siblings:
+        return None, ()
+    if at_dest:
+        return None, (
+            f"{category_code}: Tracks exist at both {dest_path.name} and "
+            f"{', '.join(Path(t.filepath).name for t in at_siblings)}; nothing was adopted -- resolve the "
+            f"duplicate asset manually (the engine may choose either Track)",
+        )
+    track = at_siblings[0]
+    previous = Path(track.filepath)
+    track.filepath = str(dest_path)
+    track.filename = dest_path.name
+    track.format = dest_path.suffix.lstrip(".").lower()
+    track.save(update_fields=["filepath", "filename", "format"])
+    return previous, ()
 
 
 def publish_weather_asset(
@@ -197,7 +263,7 @@ def publish_weather_asset(
     used_fallback: bool = False,
     alert_family: str | None = None,
 ) -> PublicationResult:
-    """Publish an already-rendered Weather MP3 with last-known-good
+    """Publish an already-rendered Weather FLAC (or MP3) with last-known-good
     rollback. Raises PublicationError on any failure that leaves the
     previous artifact untouched (or, for a first-generation asset,
     leaves nothing behind at all). See module docstring for the full
@@ -205,10 +271,14 @@ def publish_weather_asset(
     candidate = Path(candidate_path)
     if not candidate.is_file():
         raise PublicationError(f"candidate is not a file: {candidate}")
-    if candidate.suffix.lower() != ".mp3":
+    if candidate.suffix.lower() not in PUBLISHABLE_SUFFIXES:
         raise PublicationError(
-            f"candidate must be an MP3 (Weather's established audio format is unchanged "
-            f"by this pass) -- got {candidate.suffix!r}: {candidate}"
+            f"candidate must be FLAC (Weather's standard) or MP3 -- got {candidate.suffix!r}: {candidate}"
+        )
+    if Path(filename).name != filename or Path(filename).suffix.lower() != candidate.suffix.lower():
+        raise PublicationError(
+            f"destination filename {filename!r} must be a plain name with the candidate's extension "
+            f"({candidate.suffix.lower()})"
         )
     try:
         candidate_size = candidate.stat().st_size
@@ -240,15 +310,16 @@ def publish_weather_asset(
 
             try:
                 if dest_path.exists():
-                    backup = scratch / "previous.mp3"
+                    backup = scratch / f"previous{dest_path.suffix.lower()}"
                     shutil.copy2(dest_path, backup)
-                candidate_copy = scratch / "candidate.mp3"
+                candidate_copy = scratch / f"candidate{dest_path.suffix.lower()}"
                 shutil.copy2(candidate, candidate_copy)
                 candidate_copy.replace(dest_path)
                 published = True
 
                 try:
                     with transaction.atomic():
+                        adopted_from, warnings = adopt_asset_track(dest_path, category_code)
                         track, created = sync_track_file(str(dest_path), wave_dir=scratch_wave_dir)
 
                         scratch_waveform_path = scratch_wave_dir / f"{track.id}.json"
@@ -335,4 +406,5 @@ def publish_weather_asset(
         return PublicationResult(
             track=track, created=created, final_path=dest_path,
             provenance_path=provenance_written_path, provenance_error=provenance_error,
+            adopted_from=adopted_from, warnings=tuple(warnings),
         )

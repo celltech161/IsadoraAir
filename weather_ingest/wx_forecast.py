@@ -4,13 +4,13 @@
 # WX Forecast Announcer
 # ---------------------
 # Generates a current-conditions snapshot plus an NWS-driven forecast,
-# rendered as MP3 via the canonical shared IsadoraAir TTS CLI (see
+# rendered as FLAC via the canonical shared IsadoraAir TTS CLI (see
 # lib/voices.py) for broadcast.
 #
 # Ported from /home/jreed/wx_scripts/wx_forecast.py (originally on the
 # kogr-sc box, delivered via a Samba/webroot copy that NextKast polled
 # as a remote URL stream). Delivered here via lib/delivery.py straight
-# into the existing WxForecast/forecast.mp3 and WxObs/current_obs.mp3
+# into the existing WxForecast/forecast.flac and WxObs/current_obs.flac
 # categories instead -- see current_temp.py's header comment for why
 # the old urgent_mix-append trick is no longer needed. All forecast
 # fetch/cache/precip-merge/pronunciation logic below is unchanged --
@@ -48,6 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from delivery import deliver
+import speech_audio
 from notify import notify
 import voices
 from voices import VoiceResolutionError, resolve_voice
@@ -103,14 +104,16 @@ MODES = {
         "id3_prefix": "3-Day Forecast",
         "intro": "Looking ahead over the next three days:",
         "category_code": "WxForecast",
-        "dest_filename": "forecast.mp3",
+        "dest_filename": "forecast.flac",
+        "product": "forecast",
     },
     "1day": {
         "periods": 2,
         "id3_prefix": "Current Observation",
         "intro": "Looking ahead",
         "category_code": "WxObs",
-        "dest_filename": "current_obs.mp3",
+        "dest_filename": "current_obs.flac",
+        "product": "obs",
     },
 }
 
@@ -180,7 +183,7 @@ class ForecastUnavailableError(Exception):
     malformed/empty, or older than FORECAST_CACHE_STALE_HOURS. Callers
     (main(), via build_announcement()) must abort the ENTIRE run
     without synthesizing or publishing anything, leaving whichever
-    artifact this invocation targets (current_obs.mp3 or forecast.mp3)
+    artifact this invocation targets (current_obs.flac or forecast.flac)
     exactly as it was."""
 
 
@@ -669,39 +672,25 @@ def generate_wav_with_piper(text, wav_path, voice):
         log(f"WAV file generated: {wav_path}")
     return ok
 
-def convert_to_mp3(wav_file, mp3_file, id3_title):
+def convert_to_flac(wav_file, flac_file, id3_title, product, voice=None):
+    """WAV -> calibrated 44.1 kHz stereo FLAC (gain + peak limiter + 1 s lead-in): see lib/speech_audio.py."""
     if not os.path.exists(wav_file):
         log(f"ERROR: Missing WAV file: {wav_file}")
         return False
     try:
-        os.remove(mp3_file)
+        os.remove(flac_file)
     except FileNotFoundError:
         pass
     except OSError as e:
-        log(f"Could not clear stale MP3 at {mp3_file}: {e}")
+        log(f"Could not clear stale FLAC at {flac_file}: {e}")
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-hide_banner", "-loglevel", "error",
-                "-i", wav_file,
-                # Piper's own audio starts right at sample 0 with no lead-in,
-                # which reads as clipped on air -- 1s of silence up front
-                # gives the on-air chain room to fade/cue in cleanly.
-                "-af", "adelay=1000:all=1",
-                "-ar", "44100",
-                "-ac", "2",
-                "-codec:a", "libmp3lame",
-                "-b:a", "320k",
-                "-metadata", f"artist={ID3_ARTIST}",
-                "-metadata", f"title={id3_title}",
-                mp3_file
-            ],
-            check=True
+        speech_audio.encode_flac(
+            ["-i", wav_file], flac_file, speech_audio.gain_db_for(product, voice),
+            {"artist": ID3_ARTIST, "title": id3_title},
         )
-        log(f"Converted WAV to MP3 (44.1 kHz, stereo, 320 kbps): {mp3_file}")
+        log(f"Converted WAV to FLAC (44.1 kHz, stereo, calibrated): {flac_file}")
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log(f"FFmpeg conversion failed: {e}")
         return False
 
@@ -728,7 +717,7 @@ def parse_args():
 def main():
     """Returns True on success, False on any real synthesis-generation
     failure (voice resolution, unusable forecast data, canonical CLI,
-    MP3 conversion, or delivery)."""
+    FLAC conversion, or delivery)."""
     args = parse_args()
     mode = MODES[args.mode]
     try:
@@ -743,7 +732,7 @@ def main():
 
     tmp_dir = f"/tmp/syndicated-wx-forecast-{args.mode}"
     output_wav = os.path.join(tmp_dir, f"{args.mode}.wav")
-    output_mp3 = os.path.join(tmp_dir, f"{args.mode}.mp3")
+    output_flac = os.path.join(tmp_dir, f"{args.mode}.flac")
 
     try:
         log(f"=== WX Forecast Announcer Started (mode={args.mode} voice={voice_key}) ===")
@@ -769,13 +758,13 @@ def main():
             )
             return False
 
-        if not convert_to_mp3(output_wav, output_mp3, id3_title):
-            notify(f"wx_forecast ({args.mode}) FAILED", "MP3 conversion failed.")
+        if not convert_to_flac(output_wav, output_flac, id3_title, mode["product"], voice):
+            notify(f"wx_forecast ({args.mode}) FAILED", "FLAC conversion failed.")
             return False
 
         try:
             dest = deliver(
-                output_mp3, mode["category_code"], mode["dest_filename"],
+                output_flac, mode["category_code"], mode["dest_filename"],
                 producer="wx_forecast.py", voice=voice["name"],
                 source_kind=forecast_meta["source_kind"],
                 source_age_seconds=forecast_meta["source_age_seconds"],

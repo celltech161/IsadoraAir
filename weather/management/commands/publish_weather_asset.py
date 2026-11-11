@@ -25,12 +25,12 @@ class Command(BaseCommand):
     calling Weather script's own log as a visible warning without
     treating a clean run's silence on stderr as anything to report."""
 
-    help = "Publish an already-rendered Weather MP3 with last-known-good rollback."
+    help = "Publish an already-rendered Weather FLAC (or MP3) with last-known-good rollback."
 
     def add_arguments(self, parser):
-        parser.add_argument("candidate_path", help="Path to the already-rendered candidate MP3.")
+        parser.add_argument("candidate_path", help="Path to the already-rendered candidate (.flac or .mp3).")
         parser.add_argument("category_code", help="Library Category code, e.g. WxTemp.")
-        parser.add_argument("filename", help="Final filename under LIBRARY_ROOT/<category_code>/.")
+        parser.add_argument("filename", help="Final filename under LIBRARY_ROOT/<category_code>/ (same extension as the candidate).")
         parser.add_argument("--producer", default="", help="Producing script, e.g. wx_forecast.py.")
         parser.add_argument("--voice", default="", help="Logical StationTTSVoice name used.")
         parser.add_argument(
@@ -65,6 +65,13 @@ class Command(BaseCommand):
             f"{'Created' if result.created else 'Updated'} track {result.track.id} "
             f"({options['category_code']}/{result.final_path.name})."
         )
+        if result.adopted_from is not None:
+            self.stdout.write(
+                f"Adopted track {result.track.id}: {result.adopted_from.name} -> {result.final_path.name} "
+                f"(same Track; the previous file was left in place)."
+            )
+        for warning in result.warnings:
+            self.stderr.write(f"WARNING: {warning}")
         if result.provenance_error:
             # Deliberately self.stderr, not self.stdout -- see the
             # class docstring. Plain text (no self.style.WARNING

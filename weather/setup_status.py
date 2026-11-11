@@ -117,7 +117,7 @@ _FRIENDLY_LABELS = {
     "forecast_cache": "Forecast Cache",
     "watch_warnings": "Active Watches/Warnings",
     "amber_alerts_data": "Active AMBER-Family Alerts",
-    "generated_artifact:wx_alert": "WxAlert Audio (wx_alert.mp3)",
+    "generated_artifact:wx_alert": "WxAlert Audio (wx_alert)",
     "generated_artifact:wx_temp": "Current Temperature Audio",
     "generated_artifact:wx_obs": "Current Conditions Audio",
     "generated_artifact:wx_forecast": "Forecast Audio",

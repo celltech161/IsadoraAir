@@ -268,6 +268,25 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         self.assertEqual(req.intro_track.category_id, self.dedication_category.id)
         self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds)
 
+    def test_dedication_conversion_carries_the_peak_limiter_and_no_gain(self):
+        """Dedication intros are converted with the 0.84 true-peak limiter (and nothing else): no gain, no
+        resample, no remix -- the intro keeps its native mono sample rate."""
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 5, 1), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        synthesize_dedication_intro(req)
+
+        conversions = [c.args[0] for c in announcement_renderer_module.subprocess.run.call_args_list
+                       if c.args and c.args[0][0] == "ffmpeg" and str(c.args[0][-1]).endswith(".flac")]
+        self.assertEqual(len(conversions), 1)
+        argv = conversions[0]
+        self.assertEqual(argv[argv.index("-af") + 1], "alimiter=limit=0.84:level=false:latency=1")
+        self.assertEqual(services_module.DEDICATION_PEAK_CEILING, 0.84)
+        for forbidden in ("volume", "-ar", "-ac", "loudnorm"):
+            self.assertFalse(any(forbidden in str(part) for part in argv), forbidden)
+
     def test_synthesis_generates_waveform_and_reasserts_cue_points(self):
         """next_start_seconds is pre-set specifically to opt this Track
         OUT of isadoraair-analyze.timer's periodic sweep (that sweep's

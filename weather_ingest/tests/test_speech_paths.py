@@ -110,50 +110,97 @@ class FilenameCategoryMetadataUnchangedTests(unittest.TestCase):
 
     def test_current_temp_category_and_filename(self):
         self.assertEqual(current_temp.CATEGORY_CODE, "WxTemp")
-        self.assertEqual(current_temp.DEST_FILENAME, "current_temp.mp3")
+        self.assertEqual(current_temp.DEST_FILENAME, "current_temp.flac")
         self.assertEqual(current_temp.ID3_ARTIST, "Oak Grove Radio")
 
     def test_wx_alert_category_and_filename(self):
         self.assertEqual(wx_alert.CATEGORY_CODE, "WxAlert")
-        self.assertEqual(wx_alert.DEST_FILENAME, "wx_alert.mp3")
+        self.assertEqual(wx_alert.DEST_FILENAME, "wx_alert.flac")
 
     def test_amber_alert_reuses_wxalert_category_and_filename(self):
         self.assertEqual(amber_alert.CATEGORY_CODE, "WxAlert")
-        self.assertEqual(amber_alert.DEST_FILENAME, "wx_alert.mp3")
+        self.assertEqual(amber_alert.DEST_FILENAME, "wx_alert.flac")
 
     def test_forecast_modes_category_and_filenames(self):
         self.assertEqual(wx_forecast.MODES["1day"]["category_code"], "WxObs")
-        self.assertEqual(wx_forecast.MODES["1day"]["dest_filename"], "current_obs.mp3")
+        self.assertEqual(wx_forecast.MODES["1day"]["dest_filename"], "current_obs.flac")
         self.assertEqual(wx_forecast.MODES["3day"]["category_code"], "WxForecast")
-        self.assertEqual(wx_forecast.MODES["3day"]["dest_filename"], "forecast.mp3")
+        self.assertEqual(wx_forecast.MODES["3day"]["dest_filename"], "forecast.flac")
 
 
-class PostprocessingArgumentsUnchangedTests(unittest.TestCase):
-    """The ffmpeg invocation itself (1s leading silence, 44.1kHz stereo
-    320kbps MP3) is untouched by this migration -- verified directly
-    against the real argv each conversion function builds."""
+class PostprocessingArgumentsTests(unittest.TestCase):
+    """The ffmpeg invocation every producer builds (calibrated gain, peak limiter, 1 s leading silence,
+    44.1 kHz stereo 16-bit FLAC) -- verified directly against the real argv each conversion function builds.
+    The chain itself is specified in lib/speech_audio.py and measured in test_speech_audio.py."""
+
+    def _assert_flac_chain(self, argv, gain_db):
+        self.assertEqual(argv[0], "ffmpeg")
+        chain = argv[argv.index("-af") + 1]
+        self.assertIn("aresample=44100", chain)
+        self.assertIn(f"volume={gain_db:.3f}dB", chain)
+        self.assertIn("alimiter=limit=0.84:level=false:latency=1", chain)
+        self.assertTrue(chain.endswith("adelay=1000:all=1"))
+        self.assertLess(chain.index("alimiter"), chain.index("adelay"))
+        self.assertEqual(argv[argv.index("-c:a") + 1], "flac")
+        self.assertEqual(argv[argv.index("-sample_fmt") + 1], "s16")
+        self.assertNotIn("libmp3lame", argv)
+        self.assertNotIn("320k", argv)
 
     def test_current_temp_ffmpeg_args(self):
+        voice = {"logical_voice": "Max_Weatherly"}
         with patch.object(current_temp.os.path, "exists", return_value=True), \
-             patch.object(current_temp, "subprocess") as mock_subprocess:
+             patch.object(current_temp.speech_audio, "subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock()
-            current_temp.convert_to_mp3("/tmp/in.wav", "/tmp/out.mp3", "Title")
+            ok = current_temp.convert_to_flac("/tmp/in.wav", "/tmp/out.flac", "Title", voice)
+        self.assertTrue(ok)
         argv = mock_subprocess.run.call_args.args[0]
-        self.assertIn("adelay=1000:all=1", argv)
-        self.assertIn("44100", argv)
-        self.assertIn("320k", argv)
-        self.assertIn("libmp3lame", argv)
+        self._assert_flac_chain(argv, 4.75)
+        self.assertIn("title=Title", argv)
+        self.assertEqual(argv[-1], "/tmp/out.flac")
+
+    def test_forecast_and_obs_use_their_own_product_gain(self):
+        voice = {"logical_voice": "Max_Weatherly"}
+        for product in ("forecast", "obs"):
+            with self.subTest(product=product), \
+                 patch.object(wx_forecast.os.path, "exists", return_value=True), \
+                 patch.object(wx_forecast.speech_audio, "subprocess") as mock_subprocess:
+                mock_subprocess.run.return_value = MagicMock()
+                self.assertTrue(wx_forecast.convert_to_flac("/tmp/in.wav", "/tmp/out.flac", "T", product, voice))
+                self._assert_flac_chain(mock_subprocess.run.call_args.args[0], 6.0)
 
     def test_wx_alert_concat_ffmpeg_args(self):
         with patch.object(wx_alert.os, "makedirs"), \
              patch.object(wx_alert, "open", create=True), \
              patch.object(wx_alert.os, "remove"), \
-             patch.object(wx_alert, "subprocess") as mock_subprocess:
+             patch.object(wx_alert.speech_audio, "subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock()
-            wx_alert.concat_clips(["/tmp/a.wav", "/tmp/b.wav"], "/tmp/out.mp3")
+            ok = wx_alert.concat_clips(["/tmp/a.wav", "/tmp/b.wav"], "/tmp/out.flac", {"logical_voice": "Max_Weatherly"})
+        self.assertTrue(ok)
         argv = mock_subprocess.run.call_args.args[0]
-        self.assertIn("adelay=1000:all=1", argv)
-        self.assertIn("320k", argv)
+        self._assert_flac_chain(argv, 6.0)
+        self.assertIn("concat", argv)
+        self.assertIn("artist=Weather Alert", argv)
+
+    def test_amber_alert_concat_ffmpeg_args_match_wx_alert(self):
+        with patch.object(amber_alert.os, "makedirs"), \
+             patch.object(amber_alert, "open", create=True), \
+             patch.object(amber_alert.os, "remove"), \
+             patch.object(amber_alert.speech_audio, "subprocess") as mock_subprocess:
+            mock_subprocess.run.return_value = MagicMock()
+            ok = amber_alert._concat_clips(["/tmp/a.wav"], "/tmp/out.flac", {"logical_voice": "Max_Weatherly"})
+        self.assertTrue(ok)
+        argv = mock_subprocess.run.call_args.args[0]
+        self._assert_flac_chain(argv, 6.0)
+        self.assertIn("artist=AMBER Alert", argv)
+
+    def test_encode_failure_reports_failure_and_never_raises(self):
+        err = subprocess.CalledProcessError(1, "ffmpeg")
+        with patch.object(current_temp.os.path, "exists", return_value=True), \
+             patch.object(current_temp.speech_audio, "subprocess") as mock_subprocess:
+            mock_subprocess.run.side_effect = err
+            mock_subprocess.CalledProcessError = subprocess.CalledProcessError
+            mock_subprocess.TimeoutExpired = subprocess.TimeoutExpired
+            self.assertFalse(current_temp.convert_to_flac("/tmp/in.wav", "/tmp/out.flac", "T", None))
 
 
 class ForecastVoiceAutoTests(unittest.TestCase):
@@ -193,7 +240,7 @@ class ForecastVoiceAutoTests(unittest.TestCase):
         with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "auto"]), \
              patch.object(wx_forecast, "build_announcement", return_value=("Test announcement.", FAKE_FORECAST_META)), \
              patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_ok()) as mock_gen, \
-             patch.object(wx_forecast, "convert_to_mp3", return_value=True), \
+             patch.object(wx_forecast, "convert_to_flac", return_value=True), \
              patch.object(wx_forecast, "deliver", return_value="/srv/dest.mp3"), \
              patch.object(wx_forecast.shutil, "rmtree"), \
              patch.object(wx_forecast.os, "makedirs"):
@@ -212,14 +259,14 @@ class ForecastVoiceAutoTests(unittest.TestCase):
         -- see the corrective-review report), so this is the actual
         production-critical path, not auto. Mirrors the auto test
         above end-to-end through main(): resolve_voice -> generate_wav
-        -> convert_to_mp3 -> deliver, for both explicit slots."""
+        -> convert_to_flac -> deliver, for both explicit slots."""
         expected_logical = {"day": "Claira_Sky", "night": "Max_Weatherly"}
         for voice_arg in ("day", "night"):
             with self.subTest(voice=voice_arg):
                 with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", voice_arg]), \
                      patch.object(wx_forecast, "build_announcement", return_value=("Test announcement.", FAKE_FORECAST_META)), \
                      patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_ok()) as mock_gen, \
-                     patch.object(wx_forecast, "convert_to_mp3", return_value=True), \
+                     patch.object(wx_forecast, "convert_to_flac", return_value=True), \
                      patch.object(wx_forecast, "deliver", return_value="/srv/dest.mp3"), \
                      patch.object(wx_forecast.shutil, "rmtree"), \
                      patch.object(wx_forecast.os, "makedirs"):
@@ -344,7 +391,7 @@ class FailedCliOutputCannotProceedTests(unittest.TestCase):
         with patch.object(current_temp, "load_weather_config", return_value=FAKE_CFG), \
              patch.object(current_temp, "load_weather", return_value={"tempf": "50", "humidity": "40"}), \
              patch.object(current_temp.voices, "synthesize", return_value=voices_fail()), \
-             patch.object(current_temp, "convert_to_mp3") as mock_convert, \
+             patch.object(current_temp, "convert_to_flac") as mock_convert, \
              patch.object(current_temp, "deliver") as mock_deliver, \
              patch.object(current_temp, "notify"), \
              patch.object(current_temp.fcntl, "flock"), \
@@ -359,7 +406,7 @@ class FailedCliOutputCannotProceedTests(unittest.TestCase):
         with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "day"]), \
              patch.object(wx_forecast, "build_announcement", return_value=("Test.", FAKE_FORECAST_META)), \
              patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_fail()), \
-             patch.object(wx_forecast, "convert_to_mp3") as mock_convert, \
+             patch.object(wx_forecast, "convert_to_flac") as mock_convert, \
              patch.object(wx_forecast, "deliver") as mock_deliver, \
              patch.object(wx_forecast, "notify"), \
              patch.object(wx_forecast.shutil, "rmtree"), \

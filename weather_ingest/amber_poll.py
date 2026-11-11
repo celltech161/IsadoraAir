@@ -171,7 +171,7 @@ def _build_active_entries(cfg):
 
 
 def _trigger_amber_alert():
-    """Run amber_alert.py synchronously so the urgent-insert MP3 is
+    """Run amber_alert.py synchronously so the urgent-insert FLAC is
     delivered before this cycle considers the alert broadcast. 120s
     timeout matches wx_alert's; a few short clips + ffmpeg concat
     comfortably fit.
@@ -189,7 +189,7 @@ def _trigger_amber_alert():
         if result.returncode != 0:
             log.error(
                 "amber_alert.py exited %d (failure) -- AMBER audio was NOT published this cycle; "
-                "the previous wx_alert.mp3 (if any) remains in place.",
+                "the previous wx_alert.flac (if any) remains in place.",
                 result.returncode,
             )
         else:

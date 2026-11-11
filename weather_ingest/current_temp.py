@@ -11,7 +11,7 @@
 # Ported from /home/jreed/wx_scripts/current_temp.py (originally on the
 # kogr-sc box, delivered via a Samba/webroot copy that NextKast polled
 # as a remote URL stream). Delivered here via lib/delivery.py straight
-# into the existing WxTemp category/current_temp.mp3 filename instead --
+# into the existing WxTemp category/current_temp.flac filename instead --
 # the engine reads the file fresh off local disk at play time (same
 # proven pattern as every ported syndicated show), so there's no need
 # for the old urgent_mix-append trick that worked around NextKast not
@@ -53,6 +53,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from delivery import deliver
+import speech_audio
 from notify import notify
 import voices
 from voices import VoiceResolutionError, resolve_voice
@@ -75,10 +76,10 @@ ALERT_DESCRIPTION_FILE = DATA_DIR / "warn.txt"
 
 TMP_DIR = "/tmp/syndicated-current-temp"
 OUTPUT_WAV = os.path.join(TMP_DIR, "current_temp.wav")
-OUTPUT_MP3 = os.path.join(TMP_DIR, "current_temp.mp3")
+OUTPUT_FLAC = os.path.join(TMP_DIR, "current_temp.flac")
 
 CATEGORY_CODE = "WxTemp"
-DEST_FILENAME = "current_temp.mp3"
+DEST_FILENAME = "current_temp.flac"
 
 # Best-effort with LOCK_NB: if a run is in progress, the second
 # invocation exits cleanly. The trigger from update_local_wx_data.py
@@ -91,39 +92,25 @@ ID3_ARTIST = "Oak Grove Radio"
 
 # ---------------- HELPERS ----------------
 
-def convert_to_mp3(wav_file, mp3_file, id3_title):
+def convert_to_flac(wav_file, flac_file, id3_title, voice=None):
+    """WAV -> calibrated 44.1 kHz stereo FLAC (gain + peak limiter + 1 s lead-in): see lib/speech_audio.py."""
     if not os.path.exists(wav_file):
         log.error("WAV file missing: %s", wav_file)
         return False
     try:
-        os.remove(mp3_file)
+        os.remove(flac_file)
     except FileNotFoundError:
         pass
     except OSError as e:
-        log.error("Could not clear stale MP3 at %s: %s", mp3_file, e)
+        log.error("Could not clear stale FLAC at %s: %s", flac_file, e)
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-hide_banner", "-loglevel", "error",
-                "-i", wav_file,
-                # Piper's own audio starts right at sample 0 with no lead-in,
-                # which reads as clipped on air -- 1s of silence up front
-                # gives the on-air chain room to fade/cue in cleanly.
-                "-af", "adelay=1000:all=1",
-                "-ar", "44100",
-                "-ac", "2",
-                "-codec:a", "libmp3lame",
-                "-b:a", "320k",
-                "-metadata", f"artist={ID3_ARTIST}",
-                "-metadata", f"title={id3_title}",
-                mp3_file
-            ],
-            check=True,
+        speech_audio.encode_flac(
+            ["-i", wav_file], flac_file, speech_audio.gain_db_for("temp", voice),
+            {"artist": ID3_ARTIST, "title": id3_title},
         )
-        log.info("Converted WAV to MP3 (44.1 kHz, stereo, 320 kbps): %s", mp3_file)
+        log.info("Converted WAV to FLAC (44.1 kHz, stereo, calibrated): %s", flac_file)
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.error("FFmpeg conversion failed: %s", e)
         return False
 
@@ -272,7 +259,7 @@ def parse_args():
 def main():
     """Returns True on success, False on any real synthesis-generation
     failure (config missing, slot/persona/logical-voice unresolvable,
-    canonical CLI failure, MP3 conversion failure, delivery failure).
+    canonical CLI failure, FLAC conversion failure, delivery failure).
     A lock-contention no-op (another instance already running) is
     treated as a benign, non-failing exit -- see __main__ below."""
     args = parse_args()
@@ -314,8 +301,8 @@ def main():
             )
             return False
 
-        if not convert_to_mp3(OUTPUT_WAV, OUTPUT_MP3, id3_title):
-            notify("current_temp FAILED", "MP3 conversion failed.")
+        if not convert_to_flac(OUTPUT_WAV, OUTPUT_FLAC, id3_title, voice):
+            notify("current_temp FAILED", "FLAC conversion failed.")
             return False
 
         try:
@@ -325,7 +312,7 @@ def main():
             except OSError:
                 pass  # provenance is best-effort; publish proceeds either way
             dest = deliver(
-                OUTPUT_MP3, CATEGORY_CODE, DEST_FILENAME,
+                OUTPUT_FLAC, CATEGORY_CODE, DEST_FILENAME,
                 producer="current_temp.py", voice=voice["name"],
                 source_kind="derived_local", source_age_seconds=source_age_seconds,
             )

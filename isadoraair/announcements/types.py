@@ -48,6 +48,9 @@ class SpeechSpliceAnnouncement:
     destination: Path
     timeout_seconds: float
     metadata: AnnouncementTrackMetadata
+    # Optional true-peak safeguard (linear, 0 < ceiling <= 1) applied while the synthesis is converted to FLAC.
+    # None (the default) leaves the conversion exactly as it always was.
+    peak_ceiling: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,7 @@ class RotationAssetAnnouncement:
     destination: Path
     timeout_seconds: float
     metadata: AnnouncementTrackMetadata
+    peak_ceiling: float | None = None   # see SpeechSpliceAnnouncement.peak_ceiling
 
 
 AnnouncementSpec = PreviewAnnouncement | SpeechSpliceAnnouncement | RotationAssetAnnouncement

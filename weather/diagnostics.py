@@ -106,11 +106,34 @@ _SIMPLE_DATA_FILES = ["processed_weather.json", "sky_condition.json"]
 
 GENERATED_ARTIFACTS = [
     # (fact key suffix, category code, filename, event_driven)
-    ("wx_temp", "WxTemp", "current_temp.mp3", False),
-    ("wx_obs", "WxObs", "current_obs.mp3", False),
-    ("wx_forecast", "WxForecast", "forecast.mp3", False),
-    ("wx_alert", "WxAlert", "wx_alert.mp3", True),
+    # The filename is the preferred (current) one; _resolve_artifact_filename() also recognizes the same asset at
+    # its other extension, so a station still holding the pre-r0134 .mp3 Track is reported correctly until its
+    # first FLAC publication adopts that Track.
+    ("wx_temp", "WxTemp", "current_temp.flac", False),
+    ("wx_obs", "WxObs", "current_obs.flac", False),
+    ("wx_forecast", "WxForecast", "forecast.flac", False),
+    ("wx_alert", "WxAlert", "wx_alert.flac", True),
 ]
+
+_ARTIFACT_SUFFIXES = (".flac", ".mp3")
+
+
+def _resolve_artifact_filename(library_root: Path, category_code: str, filename: str, category) -> str:
+    """The filename the asset is CURRENTLY published as: the one a Track points at (FLAC preferred), else the one
+    present on disk (FLAC preferred), else the preferred name. Read-only."""
+    stem = Path(filename).stem
+    ordered = [filename] + [f"{stem}{suffix}" for suffix in _ARTIFACT_SUFFIXES if f"{stem}{suffix}" != filename]
+    paths = {name: str(library_root / category_code / name) for name in ordered}
+    if category is not None:
+        tracked = set(Track.objects.filter(category=category, filepath__in=list(paths.values()))
+                      .values_list("filepath", flat=True))
+        for name in ordered:
+            if paths[name] in tracked:
+                return name
+    for name in ordered:
+        if Path(paths[name]).is_file():
+            return name
+    return filename
 
 _NWS_ZONE_RE = re.compile(r"^[A-Z]{2}[CZ]\d{3}$")
 
@@ -923,10 +946,11 @@ def _check_generated_artifact(
     SECONDS) and the provenance sidecar comparison (all artifacts,
     including wx_alert -- see _apply_provenance_overlay)."""
     key = f"generated_artifact:{suffix}"
+    category = Category.objects.filter(code=category_code).first()
+    filename = _resolve_artifact_filename(library_root, category_code, filename, category)
     expected_path = library_root / category_code / filename
     file_exists = expected_path.is_file()
 
-    category = Category.objects.filter(code=category_code).first()
     track = None
     if category is not None:
         track = Track.objects.filter(category=category, filepath=str(expected_path)).first()
@@ -986,7 +1010,7 @@ def _check_routine_generated_artifact(key, suffix, filename, expected_path, file
 
 
 def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, age, evidence, applicability) -> DiagnosticFact:
-    """WxAlert/wx_alert.mp3 is the urgent spoken watch/warning and
+    """WxAlert/wx_alert.flac (or its pre-r0134 .mp3) is the urgent spoken watch/warning and
     AMBER-family statement (built by weather_ingest/wx_alert.py and
     amber_alert.py) -- NOT the FX "alert beep" tracked separately by
     `alert_fx_cart`. It is shared by both source types and, being
@@ -1007,9 +1031,9 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
 
     if applicability == "no_active":
         if file_exists or track is not None:
-            summary = "No active Weather/AMBER alert; historical wx_alert.mp3 is present."
+            summary = f"No active Weather/AMBER alert; historical {expected_path.name} is present."
         else:
-            summary = "No active Weather/AMBER alert; wx_alert.mp3 has never been generated."
+            summary = "No active Weather/AMBER alert; the alert audio has never been generated."
         return DiagnosticFact(
             key=key, state="not_applicable", summary=summary,
             path=str(expected_path) if file_exists else None,
@@ -1020,31 +1044,31 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
     if file_exists and track is not None and track.ready2air:
         return DiagnosticFact(
             key=key, state="ready",
-            summary="An alert is active and wx_alert.mp3 is present with its Track Ready to Air.",
+            summary=f"An alert is active and {expected_path.name} is present with its Track Ready to Air.",
             path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
         )
     if not file_exists and track is None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary="An alert is active but wx_alert.mp3 has never been generated.",
+            summary=f"An alert is active but {expected_path.name} has never been generated.",
             evidence=evidence,
         )
     if file_exists and track is None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary="An alert is active but wx_alert.mp3 has no matching Track -- delivery may have been interrupted.",
+            summary=f"An alert is active but {expected_path.name} has no matching Track -- delivery may have been interrupted.",
             path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
         )
     if not file_exists and track is not None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary="An alert is active but wx_alert.mp3 is missing on disk (a Track still references it).",
+            summary=f"An alert is active but {expected_path.name} is missing on disk (a Track still references it).",
             evidence=evidence,
         )
     # file_exists and track is not None and not track.ready2air
     return DiagnosticFact(
         key=key, state="needs_attention",
-        summary="An alert is active but wx_alert.mp3's Track is not marked Ready to Air.",
+        summary=f"An alert is active but {expected_path.name}'s Track is not marked Ready to Air.",
         path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
     )
 

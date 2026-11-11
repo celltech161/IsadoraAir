@@ -229,7 +229,7 @@ class SpokenAlertIndependenceTests(unittest.TestCase):
 class AmberFamilyIndependenceTests(unittest.TestCase):
     """Required regression coverage (r0053 amendment section 7): AMBER/
     BLU/MEP alerts must not start triggering the Weather Alert Beep FX
-    Cart merely because they share WxAlert/wx_alert.mp3 for spoken
+    Cart merely because they share WxAlert/wx_alert.flac for spoken
     urgent insertion. A static source-text check on the actual AMBER
     scripts (never imported -- they have their own real IPAWS-calling
     import-time behavior, same reasoning as update_local_wx_data.py's
