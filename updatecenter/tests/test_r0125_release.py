@@ -29,6 +29,8 @@ import tempfile
 from pathlib import Path
 
 from django.core.management import call_command
+from django.db import connection
+from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
 from django.test import SimpleTestCase, TestCase
 
@@ -53,6 +55,7 @@ from protected_bootstrap.policy import parse_policy_dict
 from updatecenter import cross_check
 from updatecenter import manifest as manifest_mod
 from updatecenter import migration_authorization, planner, release_chain
+from updatecenter import schema_health as schema_health_mod
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -520,10 +523,24 @@ class R0125ApplicationPlannerTests(TestCase):
         self.assertEqual(self.build(R0124_RELEASE).safety_status, S.READY_TO_PLAN)   # clean again: planable
 
     def test_unexpected_migration_state_is_schema_drift_not_a_plan(self):
-        MigrationRecorder.Migration.objects.filter(app="library", name="0099_track_cue_marker_authority").delete()
+        # Simulate drift by removing the record of library's CURRENT applied leaf migration, chosen from the
+        # loaded graph. check_schema_health() plans to the graph's leaf nodes, and Django does not walk the
+        # ancestors of an applied leaf, so removing a non-leaf record (r0125 originally hardcoded library.0099,
+        # which stopped being the leaf when r0131 added library.0100) would not register as a pending migration.
+        self.assertEqual(schema_health_mod.check_schema_health().status,
+                         schema_health_mod.SchemaHealthStatus.SCHEMA_CURRENT)
+        loader = MigrationLoader(connection)
+        leaves = loader.graph.leaf_nodes("library")
+        self.assertEqual(len(leaves), 1, f"library must have exactly one leaf migration, found {leaves!r}")
+        app, name = leaves[0]
+        self.assertIn((app, name), loader.applied_migrations)
+        deleted, _ = MigrationRecorder.Migration.objects.filter(app=app, name=name).delete()
+        self.assertEqual(deleted, 1)
         built = self.build(R0124_RELEASE)
-        self.assertEqual(built.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
+        self.assertEqual(built.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED, built.safety_detail)
         self.assertNotIn(built.safety_status, planner.SafetyStatus.ACTIONABLE)
+        self.assertEqual(built.schema_health_status, schema_health_mod.SchemaHealthStatus.UNAPPLIED_MIGRATIONS_DETECTED)
+        self.assertEqual(built.schema_pending_migrations, (f"{app}.{name}",))
 
     def test_a_tampered_published_declaration_is_refused_by_both_planners(self):
         clone = _Clone(Path(self.temp.name) / "tamper-target", self.release)
