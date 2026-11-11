@@ -23,6 +23,7 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand
 from django.db import connection
+from django.db.migrations.exceptions import InconsistentMigrationHistory
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models import NOT_PROVIDED
 
@@ -287,6 +288,15 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
                         recovery_plan_refs: list[str] | None = None):
     executor = MigrationExecutor(connection)
     loader = executor.loader
+    # Roadmap 1.22: the leaf-only plan below cannot see a missing recorder row
+    # for an interior migration whose dependent is still recorded as applied.
+    # Ask Django's own validator FIRST and fail before any plan, hash, digest or
+    # manual-operation list exists for the invalid history. The protected
+    # updater already classifies a failed probe as PROBE_FAILED.
+    try:
+        loader.check_consistent_history(connection)
+    except InconsistentMigrationHistory as exc:
+        raise RuntimeError(f"migration history in the database is inconsistent: {exc}") from exc
     conflicts = loader.detect_conflicts()
     targets = loader.graph.leaf_nodes()
     raw_plan = executor.migration_plan(targets)

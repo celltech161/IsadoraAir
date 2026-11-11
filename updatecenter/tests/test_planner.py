@@ -924,6 +924,71 @@ class SchemaDriftDetectionTests(TestCase):
             )
 
 
+class InconsistentMigrationHistoryPlanningTests(TestCase):
+    """Roadmap 1.22 -- the planning boundary. A missing recorder row for a
+    NON-leaf migration whose dependent is still recorded as applied used to be
+    invisible here (the leaf-only plan saw nothing pending), so the planner
+    returned READY_TO_PLAN. The existing non-current schema path must now
+    refuse it as SCHEMA_DRIFT_DETECTED. Nothing is installed; no job exists."""
+
+    def _plan_with_missing_interior(self, *, newer_release):
+        from .test_schema_health import _interior
+        (app, _leaf_name), (_, parent_name) = _interior("library")
+        recorder = MigrationRecorder(connection)
+        recorder.record_unapplied(app, parent_name)
+        try:
+            with FakeRepo() as repo:
+                releases_dir = repo.work / "deploy" / "releases"
+                _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+                after_bootstrap_sha = repo.commit("bootstrap", push=True)
+                if newer_release:
+                    _write_manifest(releases_dir, _followup("r0002", "r0001"))   # migration-free release
+                    repo.commit("r0002", push=True)
+                    repo.reset_local_to(after_bootstrap_sha)
+                return planner.build_plan(repo.work, "deploy/releases"), f"{app}.{parent_name}"
+        finally:
+            recorder.record_applied(app, parent_name)
+
+    def test_missing_nonleaf_record_is_schema_drift_not_actionable(self):
+        from updatecenter.models import UpdateJob
+        jobs_before = UpdateJob.objects.count()
+        plan, missing = self._plan_with_missing_interior(newer_release=False)
+        self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
+        self.assertNotIn(plan.safety_status, planner.SafetyStatus.ACTIONABLE)
+        self.assertEqual(plan.schema_health_status, schema_health.SchemaHealthStatus.INCONSISTENT_MIGRATION_HISTORY)
+        self.assertEqual(plan.schema_pending_migrations, ())
+        # Useful operator-visible diagnostic: Django's own description, carried to the page.
+        self.assertIn(missing, plan.schema_health_detail)
+        self.assertIn("applied before its dependency", plan.schema_health_detail)
+        self.assertEqual(UpdateJob.objects.count(), jobs_before)
+
+    def test_migration_free_newer_release_is_not_silently_advanced(self):
+        plan, _missing = self._plan_with_missing_interior(newer_release=True)
+        self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
+        self.assertNotEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+        self.assertIsNone(plan.target_release_id)          # refused before even considering r0002
+
+    def test_start_is_blocked_on_the_update_page(self):
+        from types import SimpleNamespace
+        from updatecenter.views import _execution_blockers
+        plan, _missing = self._plan_with_missing_interior(newer_release=True)
+        blockers = _execution_blockers(
+            SimpleNamespace(user=SimpleNamespace(is_superuser=True)), plan, {"ready": True, "detail": ""}, None)
+        self.assertIn("The current Django schema is not healthy.", blockers)
+
+    def test_consistent_history_control_is_unchanged(self):
+        """Control: the same repo with nothing unapplied still plans normally (UP_TO_DATE)."""
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
+            repo.reset_local_to(bootstrap_sha)
+            plan = planner.build_plan(repo.work, "deploy/releases")
+        self.assertEqual(plan.safety_status, planner.SafetyStatus.UP_TO_DATE)
+        self.assertEqual(plan.schema_health_status, schema_health.SchemaHealthStatus.SCHEMA_CURRENT)
+
+
 class FeatureActivationRemainsSeparateFromSchemaTests(TestCase):
     """[P0] 1.1 correction §4/§8 item 7: applying additive schema must
     not itself activate any feature -- proven directly against the

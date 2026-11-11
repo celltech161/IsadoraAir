@@ -36,12 +36,24 @@ Uses `django.db.migrations.executor.MigrationExecutor.migration_plan()`
 -- the exact mechanism `manage.py migrate --check`/`showmigrations`
 already use internally to answer "what would `migrate` do right now."
 Pure computation: reads `django_migrations` and the loaded migration
-graph, executes nothing, writes nothing."""
+graph, executes nothing, writes nothing.
+
+Roadmap 1.22: a plan to the graph's LEAF nodes skips a leaf Django already
+believes applied without looking at that leaf's dependencies, so a missing
+`django_migrations` row for an INTERIOR migration whose dependent is still
+recorded as applied reads as "nothing pending" -- a healthy schema -- while
+`manage.py migrate` itself refuses the same database with
+InconsistentMigrationHistory. Django's own authoritative validator,
+`MigrationLoader.check_consistent_history()`, is therefore consulted BEFORE the
+plan. A violation is its own status (INCONSISTENT_MIGRATION_HISTORY), never a
+"pending migration" (nothing is to be applied: a recorder row is missing) and
+never SCHEMA_CURRENT. Nothing here repairs the recorder."""
 from __future__ import annotations
 
 import dataclasses
 
 from django.db import connection
+from django.db.migrations.exceptions import InconsistentMigrationHistory
 from django.db.migrations.executor import MigrationExecutor
 
 
@@ -49,6 +61,9 @@ class SchemaHealthStatus:
     SCHEMA_CURRENT = "schema_current"
     UNAPPLIED_MIGRATIONS_DETECTED = "unapplied_migrations_detected"
     MIGRATION_STATE_INDETERMINATE = "migration_state_indeterminate"
+    # An applied migration whose prerequisite has no applied record (Django's
+    # InconsistentMigrationHistory). Not pending work and never healthy.
+    INCONSISTENT_MIGRATION_HISTORY = "inconsistent_migration_history"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,13 +75,29 @@ class SchemaHealth:
 
 def check_schema_health() -> SchemaHealth:
     """Never raises -- any failure to even compute the plan (unusual
-    DB connectivity issue, a genuinely broken migration graph) yields
+    DB connectivity issue, a genuinely broken migration graph, an
+    unexpected failure of the consistency check itself) yields
     MIGRATION_STATE_INDETERMINATE with the pending list empty, never
     SCHEMA_CURRENT by default. An indeterminate answer must never be
     silently treated as "fine" by any caller -- see planner.py's own
-    handling."""
+    handling. An inconsistent recorder history yields
+    INCONSISTENT_MIGRATION_HISTORY (empty pending list, Django's own
+    description in `detail`); the planner already maps every non-current
+    status to the non-actionable SCHEMA_DRIFT_DETECTED."""
     try:
         executor = MigrationExecutor(connection)
+        try:
+            executor.loader.check_consistent_history(connection)
+        except InconsistentMigrationHistory as exc:
+            return SchemaHealth(
+                status=SchemaHealthStatus.INCONSISTENT_MIGRATION_HISTORY,
+                pending_migrations=(),
+                detail=(
+                    f"the Django migration history recorded in the database is inconsistent with the "
+                    f"migration graph: {exc} A missing recorder row is not a pending migration; no repair "
+                    f"was attempted."
+                ),
+            )
         targets = executor.loader.graph.leaf_nodes()
         plan = executor.migration_plan(targets)
     except Exception as exc:  # noqa: BLE001 -- any failure here must fail safe, not crash /updates/
