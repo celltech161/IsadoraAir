@@ -313,12 +313,32 @@ its database schema is behind — that combination is exactly what broke
 production, and the two signals must be visibly separate so an
 operator (or Phase B) can't mistake "source is current" for "database
 is current." Values: `schema_current`, `unapplied_migrations_detected`,
-`migration_state_indeterminate` (never silently treated as "fine" —
-see `schema_health.check_schema_health`'s own docstring). Computed via
+`inconsistent_migration_history` and `migration_state_indeterminate`
+(never silently treated as "fine" — see
+`schema_health.check_schema_health`'s own docstring). Computed via
 Django's `MigrationExecutor.migration_plan()` — read-only, the same
 mechanism `migrate --check` uses internally, never mutates anything,
 computed unconditionally on every `/updates/` page load regardless of
 git state.
+
+`inconsistent_migration_history` is distinct from an ordinarily pending
+migration. Django's `check_consistent_history()` runs *before* forward
+migration planning, and it fails when an applied migration's
+prerequisite has no applied record (a missing recorder row for an older
+migration while a later dependent migration is still recorded as
+applied). Planning alone cannot see this: it skips a leaf Django
+believes applied without examining that leaf's dependencies, so such a
+database used to read as `schema_current`. The inconsistent status
+carries no pending-migration list, because the missing row is not
+pending work. The Update Center fails closed: the planner maps it, like
+every non-current status, to the non-actionable
+`SCHEMA_DRIFT_DETECTED`, and the interface displays Django's own
+diagnostic. The check never attempts any automatic repair of the
+recorder. An unexpected failure of the validation itself still yields
+`migration_state_indeterminate`, never `schema_current`. The trusted
+migration probe (`updatecenter_probe`) applies the same check and fails
+before it emits a plan or a plan digest, which the protected updater
+already treats as `PROBE_FAILED`.
 
 The UI separately reports
 `TARGET_SCHEMA_PLAN_VALIDATION_PENDING` when a newer release exists.
