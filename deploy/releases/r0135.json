@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0135",
+  "previous_release_id": "r0134",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Playout continuity (KOGR 2026-11-11): legacy live fill survives deleted-Track history and keeps the configured LogFillConfig PSA fallback; exhausted-log recovery has one retry owner that never starts over a live deck or during Manual; unplayable successor logs wait instead of recursing; aired items never replay and pending urgent/native insertions survive restart. No migration, static, unit, package or protected-runtime change; restart Gunicorn then the engine.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
