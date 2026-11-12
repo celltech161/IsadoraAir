@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0134",
+  "previous_release_id": "r0133",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Weather speech standardized on calibrated FLAC (current_temp/current_obs/forecast/wx_alert.flac): fixed per-voice, per-product gain, peak limiter, same 1 s lead-in and title/artist; FLAC registers as an ordinary new Track. Dedication intros get a no-gain peak limiter. KanDrive unchanged. Existing MP3 Tracks and files are never touched; the operator retires them. No migration, static, unit, package or protected-runtime change; restart Gunicorn and Monitoring.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
