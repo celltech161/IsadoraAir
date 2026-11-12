@@ -2041,6 +2041,9 @@ class PlaybackEngine:
         self._deck_watchdog_times = deque()
         self._cache_warm_item_id = None
         self._last_queue_reload = 0
+        # r0135: GLib source id of the ONE pending exhausted-log retry
+        # (_arm_exhausted_retry / _try_load_next_hour), or None.
+        self._exhausted_retry_source = None
         # [P0] 1.8 -- policy-restart machinery. See _request_restart /
         # _apply_poison_skip / _is_poison_guarded and their tests.
         # `restart_required` is checked by run_engine after start() returns
@@ -2233,6 +2236,8 @@ class PlaybackEngine:
                 self._stop_started = True
 
         self.running = False
+        # r0135: no exhausted-log retry survives teardown.
+        self._cancel_exhausted_retry()
         # 2.27 Phase D: no new refill evaluation from here on (signal only).
         runner = getattr(self, "_hour_refill_runner", None)
         if runner is not None:
@@ -16016,7 +16021,7 @@ class PlaybackEngine:
                 self._start_next_track(slot=slot)
             else:
                 print("Eligible partial-hour log is not ready. Waiting...")
-                GLib.timeout_add_seconds(30, self._try_load_next_hour)
+                self._arm_exhausted_retry()
             return
         if (
             (not hour_state["has_hour_schedule"] or hour_state["state"] == "partial_before_takeover")
@@ -16029,7 +16034,7 @@ class PlaybackEngine:
             # the already-dispatched live-fill proposal stale by design.
             self._try_extend_live_log_async()
             print("Unscheduled hour exhausted. Waiting for live fill...")
-            GLib.timeout_add_seconds(30, self._try_load_next_hour)
+            self._arm_exhausted_retry()
             return
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         self._load_log_for(next_hour.date(), next_hour.hour)
@@ -16037,11 +16042,71 @@ class PlaybackEngine:
             self._start_next_track(slot=slot)
         else:
             print("No approved log for next hour. Waiting...")
-            GLib.timeout_add_seconds(30, self._try_load_next_hour)
+            self._arm_exhausted_retry()
+
+    def _arm_exhausted_retry(self):
+        """r0135: arm THE exhausted-log retry -- at most one per engine.
+
+        Every exhaustion (deck end, a scheduler tick's idle recovery, Start
+        Next to silence, the retry itself) used to add its own perpetual 30 s
+        chain; KOGR 2026-11-11 had one more per 10 s tick, and the surplus
+        stale chains later started next-hour items over a live deck. A
+        retry already pending covers every later caller."""
+        if getattr(self, "_exhausted_retry_source", None) is not None:
+            return
+        self._exhausted_retry_source = GLib.timeout_add_seconds(30, self._try_load_next_hour)
+
+    def _cancel_exhausted_retry(self):
+        """r0135: retire the pending retry (engine teardown)."""
+        source = getattr(self, "_exhausted_retry_source", None)
+        self._exhausted_retry_source = None
+        if source is not None:
+            try:
+                GLib.source_remove(source)
+            except Exception:
+                pass
 
     @_glib_safe(default_return=True)
     def _try_load_next_hour(self):
+        """GLib timer armed only by _arm_exhausted_retry (r0135 single owner).
+
+        A firing source that is not the registered owner is a superseded
+        chain and retires without acting. The owner consumes its registration
+        first, so an exhaustion inside this firing arms exactly one successor;
+        when it keeps polling it re-registers itself instead. A direct call
+        (no current GLib source) keeps the historical semantics."""
+        current = GLib.main_current_source()
+        source_id = current.get_id() if current is not None else None
+        if not isinstance(source_id, int):
+            source_id = None
+        if source_id is not None and getattr(self, "_exhausted_retry_source", None) != source_id:
+            return False
+        if source_id is not None:
+            self._exhausted_retry_source = None
+        try:
+            keep_polling = bool(self._try_load_next_hour_once())
+        except Exception:
+            # _glib_safe keeps this source scheduled: keep it the one owner.
+            if source_id is not None and self._exhausted_retry_source is None and self.running:
+                self._exhausted_retry_source = source_id
+            raise
+        if keep_polling and source_id is not None:
+            if self._exhausted_retry_source is None and self.running:
+                self._exhausted_retry_source = source_id
+            else:
+                keep_polling = False
+        return keep_polling
+
+    def _try_load_next_hour_once(self):
         if not self.running:
+            return False
+        with self._lock:
+            idle = self.decks["A"] is None and self.decks["B"] is None
+        if not idle:
+            # r0135: a live deck owns the next start -- its crossfade trigger or
+            # natural end re-enters _start_next_track, which re-arms this retry
+            # if the queue is still exhausted. Starting the free deck from here
+            # is an unowned second program start (KOGR 2026-11-11 21:59:43).
             return False
         now = timezone.localtime()
         hour_state = self._current_hour_schedule_state(now)
@@ -16061,6 +16126,14 @@ class PlaybackEngine:
             if hour_state["has_committed_playout"]:
                 return False
             self._try_extend_live_log_async()
+            return True
+        if hour_state["active_key"] is not None and hour_state["active_key"] > hour_state["now_key"]:
+            # r0135: an early rollover already installed a LATER hour's queue
+            # (same rule as _ensure_upcoming_logs' idle recovery): never move
+            # the queue backward by reloading the wall-clock hour.
+            if self._queue_cursor < len(self.log_items):
+                self._start_next_track()
+                return False
             return True
         self._load_log_for(now.date(), now.hour)
         if self.log_items:

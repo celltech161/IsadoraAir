@@ -1270,8 +1270,11 @@ def _identity_keys_for_picks(picks):
     these Track objects (pick_track's own Track.objects.get(), a
     playlist item, or a rotation slot's direct-track insert may not
     have select_related('artist')), which would otherwise be one lazy
-    query per pick for a fully-populated hour (~15-20 items)."""
-    track_ids = [p["track"].id for p in picks]
+    query per pick for a fully-populated hour (~15-20 items).
+
+    r0135: a pick whose Track was deleted (an approved LogItem kept with
+    track=None by on_delete=SET_NULL) has no identity to contribute."""
+    track_ids = [p["track"].id for p in picks if p.get("track") is not None]
     if not track_ids:
         return set()
     rows = Track.objects.filter(id__in=track_ids).values_list("id", "artist__name", "related_artists")
@@ -1325,7 +1328,11 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
 
     identity_cache = identity_cache if identity_cache is not None else TrackIdentityCache()
     recency_cfg = RecencyConfig.load()
-    picked_tracks = [p["track"] for p in picks]
+    # r0135: the engine's live fill passes its whole in-memory queue, which can
+    # hold approved rows whose Track was later deleted (track=None). They stay
+    # in `picks` -- the caller slices new picks off by the original length --
+    # but exclude nothing; every remaining Track keeps its separation weight.
+    picked_tracks = [p["track"] for p in picks if p.get("track") is not None]
     picked_identity_keys = _identity_keys_for_picks(picks)
 
     # Playlist branch and other callers may not thread state through --
