@@ -21,18 +21,24 @@ replaced by deterministic stand-ins. Nothing here writes a PlayEvent.
 import tempfile
 import threading
 from datetime import date, datetime, time as dt_time, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.db import connection
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 import library.services.engine as eng_module
 from library.models import (
     Artist, Category, CategoryKind, LogFillConfig, LogItem, PlaylistLog, Rotation, ScheduleBlock, Track,
 )
+from library.services.engine import Deck
 from library.services.log_builder import effective_airtime_seconds, fill_remaining_hour
 from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
+from library.tests.test_engine_restart_resume import TwoHourFixture   # fixture only: it defines no tests
+from library.tests.test_engine_runtime_commit import make_minimal_stand_in
 from monitoring.models import SystemEvent
 
 
@@ -825,3 +831,301 @@ class ManualHoldRetryTests(_RolloverFixture, TransactionTestCase):
         self.assertEqual(sim.starts[0][4], "release")
         self.assertTrue(all(not st[5] for st in sim.starts))
         self.assertLessEqual(sim.max_retry_chains, 1)
+
+
+# --------------------------------------------------------------------------- Codex second review
+
+_QUEUE_RELATED = ("track", "track__artist", "track__album", "track__category", "track__category__kind",
+                  "category", "category__kind")
+
+
+class UrgentOccurrenceRestartTests(TwoHourFixture):
+    """Correction A (second review): a pending urgent insertion survives a restart; aired rows never replay.
+
+    Old hour 00:00: N (17) on air, N+1 (18) armed as a forced follow-up (cursor on it, exactly as a dedication
+    leaves it), N+2 (19). Urgent A, then urgent B, go through the real _insert_urgent_next_inner: both are
+    spliced at the cursor and B is prepended ahead of A in _forced_next_items, so B (persisted AFTER A) airs
+    first. The process then dies before A airs."""
+
+    def setUp(self):
+        super().setUp()
+        self.urgent_a = self.make_urgent("R135URGA", "Urgent A (older)")
+        self.urgent_b = self.make_urgent("R135URGB", "Urgent B (newer)")
+
+    def make_urgent(self, code, title):
+        category = Category.objects.create(code=code, name=title, kind=self.category.kind)
+        track = self.make_track(title)
+        Track.objects.filter(id=track.id).update(category=category)
+        return category
+
+    @staticmethod
+    def queue(log):
+        return list(log.items.select_related(*_QUEUE_RELATED).order_by("position"))
+
+    def first_process(self):
+        """Run the previous process up to B on air; return (engine, A row, B row)."""
+        engine = make_minimal_stand_in()
+        engine._engine_session_id = "previous-engine-session"
+        engine._urgent_retry_counts = {}
+        engine._resume_item = None
+        engine._resume_hint = None
+        engine._poison_skip_identities = []
+        engine.current_log = self.log
+        engine.log_items = self.queue(self.log)
+        engine._queue_cursor = 1
+        engine._forced_next_items = [engine.log_items[1]]           # N+1 armed as a forced follow-up
+        with patch.object(eng_module.timezone, "localtime", return_value=timezone.now()):
+            engine._insert_urgent_next_inner(self.urgent_a.code)
+            engine._insert_urgent_next_inner(self.urgent_b.code)
+        a_row, b_row = engine.log_items[1], engine.log_items[2]
+        self.assertEqual((a_row.track.category_id, b_row.track.category_id), (self.urgent_a.id, self.urgent_b.id))
+        self.assertEqual([i.id for i in engine._forced_next_items], [b_row.id, a_row.id, self.item_next.id])
+        # N ends: the real selection hands out B first.
+        engine._create_deck = MagicMock()
+        item, forced = engine._next_queue_item()
+        self.assertEqual((item.id, forced), (b_row.id, True))
+        b_row.played_at = timezone.now() - timedelta(seconds=3)    # first real buffer committed
+        LogItem.objects.filter(id=b_row.id).update(played_at=b_row.played_at)
+        deck = Deck("A", b_row.track, b_row, MagicMock(), MagicMock(), generation=4)
+        deck.media_buffer_count = 120
+        engine.decks = {"A": deck, "B": None}
+        engine._get_deck_position = lambda deck: 3.0
+        return engine, a_row, b_row
+
+    def restart(self, *, resume):
+        engine, a_row, b_row = self.first_process()
+        if resume:
+            engine._write_state(transport="PLAYING")              # the real snapshot, B actually on air
+        fresh = self.engine()
+        self.recover(fresh)
+        return fresh, a_row, b_row
+
+    def assert_order(self, created, expected):
+        ids = [i for i, _ in created]
+        self.assertEqual(ids, [i.id for i in expected])
+        self.assertEqual(len(ids), len(set(ids)), "an occurrence was handed out twice")
+
+    def test_restart_while_newer_urgent_is_on_air_resumes_it_then_airs_the_older_urgent_once(self):
+        fresh, a_row, b_row = self.restart(resume=True)
+        self.assertEqual(fresh._resume_item.id, b_row.id)
+        created = self.start_tracks(fresh, 4)
+        self.assertEqual(created[0], (b_row.id, True))             # exact resume hint still honoured
+        self.assert_order(created, [b_row, a_row, self.item_next, self.item_n2])
+
+    def test_restart_after_newer_urgent_aired_airs_the_older_urgent_once(self):
+        fresh, a_row, b_row = self.restart(resume=False)
+        self.assertIsNone(fresh._resume_hint)
+        created = self.start_tracks(fresh, 3)
+        self.assert_order(created, [a_row, self.item_next, self.item_n2])
+        self.assertNotIn(b_row.id, [i for i, _ in created])
+
+    def test_periodic_queue_reload_between_restart_and_selection_keeps_the_pending_urgent(self):
+        fresh, a_row, b_row = self.restart(resume=False)
+        fresh._last_queue_reload = 0
+        fresh._reload_queue_if_changed()
+        self.assertEqual(fresh.log_items[fresh._queue_cursor].id, a_row.id)
+        self.assertEqual([i.id for i in fresh._get_upcoming_preview()][:2], [a_row.id, self.item_next.id])
+        self.assertTrue(fresh._has_playable_at_cursor())
+        self.assert_order(self.start_tracks(fresh, 3), [a_row, self.item_next, self.item_n2])
+
+    def test_queue_reload_while_the_resumed_occurrence_occupies_a_deck_keeps_the_pending_urgent(self):
+        fresh, a_row, b_row = self.restart(resume=True)
+        item, forced = fresh._next_queue_item()                    # the resume item goes to a deck ...
+        self.assertEqual((item.id, forced), (b_row.id, True))
+        fresh.decks = {"A": SimpleNamespace(log_item=item, track=item.track), "B": None}
+        fresh._last_queue_reload = 0
+        fresh._reload_queue_if_changed()                           # ... and the ~3 s reload runs under it
+        self.assertEqual(fresh.log_items[fresh._queue_cursor].id, a_row.id)
+        self.assertEqual(fresh._peek_playable_at_cursor().id, a_row.id)
+        item, forced = fresh._next_queue_item()
+        self.assertEqual((item.id, forced), (a_row.id, False))
+        fresh.decks = {"A": None, "B": SimpleNamespace(log_item=item, track=item.track)}
+        fresh._last_queue_reload = 0
+        fresh._reload_queue_if_changed()
+        self.assertEqual(fresh._peek_playable_at_cursor().id, self.item_next.id)   # B passed over, not replayed
+        self.assertEqual(fresh._next_queue_item()[0].id, self.item_next.id)
+
+    def test_queue_reload_with_a_deck_occupied_never_jumps_a_pending_row(self):
+        """The reload in isolation: cursor on pending A, aired B on a deck after it."""
+        _engine, a_row, b_row = self.first_process()
+        fresh = self.engine()
+        fresh._poison_skip_identities = []
+        fresh.current_log = self.log
+        fresh.log_items = self.queue(self.log)
+        fresh._queue_cursor = [i.id for i in fresh.log_items].index(a_row.id)
+        on_deck = next(i for i in fresh.log_items if i.id == b_row.id)
+        fresh.decks = {"A": SimpleNamespace(log_item=on_deck, track=on_deck.track), "B": None}
+        fresh._last_queue_reload = 0
+        fresh._reload_queue_if_changed()
+        self.assertEqual(fresh.log_items[fresh._queue_cursor].id, a_row.id)
+
+    def test_queue_reload_still_moves_past_rows_that_aired_or_are_on_a_deck(self):
+        """Ordinary forward correction is unchanged: the cursor never rests on an aired/on-deck row."""
+        engine = self.engine()
+        engine._poison_skip_identities = []
+        engine.current_log = self.log
+        engine.log_items = self.queue(self.log)
+        engine._queue_cursor = 0                                   # stale: N (aired) is on a deck
+        engine.decks = {"A": SimpleNamespace(log_item=engine.log_items[0], track=self.track_n), "B": None}
+        engine._last_queue_reload = 0
+        engine._reload_queue_if_changed()
+        self.assertEqual(engine.log_items[engine._queue_cursor].id, self.item_next.id)
+
+    def test_pending_native_insertion_behind_a_newer_emergency_survives_restart(self):
+        """Engine side only (domain admission/recording stubbed; the active_messages suites cannot run here:
+        dev media validation rejects their fixtures, identically on 622033f). The real splice + forced-order
+        path: native M is queued behind nothing, a later WxAlert W keeps emergency priority ahead of it, W airs,
+        the process dies before M airs."""
+        wx, _ = Category.objects.get_or_create(code="WxAlert", defaults={"name": "WxAlert", "kind": self.category.kind})
+        Track.objects.filter(id=self.make_track("Weather Alert").id).update(category=wx)
+        native_track = self.make_track("Native Active Message")
+        engine = make_minimal_stand_in()
+        engine._urgent_retry_counts = {}
+        engine._resume_item = None
+        engine._poison_skip_identities = []
+        engine.current_log = self.log
+        engine.log_items = self.queue(self.log)
+        engine._queue_cursor = 1
+        engine._forced_next_items = [engine.log_items[1]]
+        admission = SimpleNamespace(track=native_track, category=self.category, attempt="r0135-attempt")
+        with patch("active_messages.playout.admit", return_value=admission), \
+                patch("active_messages.playout.record_insertion"), \
+                patch.object(eng_module.timezone, "localtime", return_value=timezone.now()):
+            engine._insert_active_message_inner({"attempt": "r0135-attempt", "active_execution": 1})
+            engine._insert_urgent_next_inner("WxAlert")
+        native_row, wx_row = engine.log_items[1], engine.log_items[2]
+        self.assertEqual([i.id for i in engine._forced_next_items], [wx_row.id, native_row.id, self.item_next.id])
+        self.assertEqual(engine._next_queue_item()[0].id, wx_row.id)
+        LogItem.objects.filter(id=wx_row.id).update(played_at=timezone.now())
+        fresh = self.engine()
+        self.recover(fresh)
+        self.assert_order(self.start_tracks(fresh, 3), [native_row, self.item_next, self.item_n2])
+
+    def add_history(self, rows):
+        """rows: (position, track, aired) placed before N (17)."""
+        made = []
+        for position, track, aired in rows:
+            made.append(self.make_item(position, track, played_at=timezone.now() - timedelta(minutes=30 - position)
+                                       if aired else None,
+                                       scheduled_time=timezone.now() - timedelta(minutes=30 - position)))
+        return made
+
+    def gone(self, title):
+        track = self.make_track(title)
+        Path(track.filepath).unlink()
+        return track
+
+    def test_unplayable_earlier_row_before_an_aired_valid_row_never_replays_it(self):
+        unplayable, aired = self.add_history([(15, self.gone("Gone Weather"), False),
+                                              (16, self.make_track("Aired Valid"), True)])
+        engine = self.engine()
+        self.recover(engine)
+        created = self.start_tracks(engine, 2)
+        self.assert_order(created, [self.item_next, self.item_n2])
+
+    def test_several_skipped_historical_rows_cause_no_repeated_playback(self):
+        history = self.add_history([(10, self.gone("Gone 1"), False), (11, self.make_track("Aired 1"), True),
+                                    (12, self.gone("Gone 2"), False), (13, self.make_track("Aired 2"), True),
+                                    (14, self.make_track("Skipped Ordinary"), False),
+                                    (15, self.make_track("Aired 3"), True)])
+        handed = []
+        with patch.object(eng_module, "emit_event") as emitted:
+            for _restart in range(3):
+                engine = self.engine()
+                self.recover(engine)
+                engine._last_queue_reload = 0
+                engine._reload_queue_if_changed()
+                self.assertTrue(all(i.played_at is None for i in engine._get_upcoming_preview()))
+                handed += [i for i, _ in self.start_tracks(engine, 1)]
+        self.assertEqual(handed, [self.item_next.id] * 3)          # never a historical row
+        self.assertFalse(set(handed) & {row.id for row in history})
+        self.assertFalse([c for c in emitted.call_args_list if "Skipped log item" in c.kwargs.get("title", "")])
+
+    def test_ordinary_consecutive_playback_stays_in_order_through_reloads(self):
+        LogItem.objects.filter(id=self.item_n.id).update(played_at=None)
+        engine = self.engine()
+        self.recover(engine)
+        handed = []
+        for _ in range(3):
+            engine._last_queue_reload = 0
+            engine._reload_queue_if_changed()
+            handed += [i for i, _ in self.start_tracks(engine, 1)]
+        self.assertEqual(handed, [self.item_n.id, self.item_next.id, self.item_n2.id])
+
+    def test_valid_unaired_rows_after_aired_rows_remain_eligible(self):
+        engine = self.engine()
+        self.recover(engine)
+        self.assertEqual([i.id for i in engine._get_upcoming_preview()][:2], [self.item_next.id, self.item_n2.id])
+        self.assert_order(self.start_tracks(engine, 2), [self.item_next, self.item_n2])
+
+
+class NonReportingPoisonProbeTests(_RolloverFixture, TransactionTestCase):
+    """Correction B (second review): the eligibility probe is membership only."""
+
+    def poisoned_engine(self):
+        log = self.make_log(22, self.next_rows[:2], played=False)
+        engine = object.__new__(eng_module.PlaybackEngine)
+        engine.decks = {"A": None, "B": None}
+        engine.current_log = log
+        engine.log_items = self.reload_items(log)
+        engine._queue_cursor = 0
+        engine._forced_next_items = []
+        engine._resume_item = None
+        engine._poison_skip_identities = [(log.id, engine.log_items[0].id)]
+        engine._offer_automatic_skip_evidence = MagicMock()
+        engine._note_active_message_discard = MagicMock()
+        engine._try_extend_live_log_async = MagicMock(return_value=False)
+        return engine
+
+    def test_probe_refuses_a_poisoned_item_without_any_side_effect(self):
+        engine = self.poisoned_engine()
+        engine.log_items = engine.log_items[:1]                    # only the poisoned occurrence
+        engine._forced_next_items = list(engine.log_items)          # and a forced copy of it
+        before = (engine._queue_cursor, [i.id for i in engine.log_items], [i.id for i in engine._forced_next_items])
+        with patch.object(eng_module, "emit_event") as emitted, \
+                CaptureQueriesContext(connection) as queries:
+            self.assertFalse(engine._has_playable_at_cursor())
+        emitted.assert_not_called()
+        self.assertEqual(len(queries), 0, [q["sql"] for q in queries])
+        self.assertEqual(before, (engine._queue_cursor, [i.id for i in engine.log_items],
+                                  [i.id for i in engine._forced_next_items]))
+        self.assertFalse(getattr(engine, "_poison_reported_identities", set()))
+        engine._offer_automatic_skip_evidence.assert_not_called()
+
+    def test_normal_selection_still_refuses_and_reports_the_poisoned_item_once(self):
+        engine = self.poisoned_engine()
+        poisoned, valid = engine.log_items
+        with patch.object(eng_module, "emit_event") as probed:
+            for _ in range(3):
+                self.assertTrue(engine._has_playable_at_cursor())   # the valid row behind it
+        probed.assert_not_called()                                   # the probe never spends the once-only report
+        with patch.object(eng_module, "emit_event") as emitted:
+            self.assertEqual(engine._peek_playable_at_cursor().id, valid.id)
+            engine._queue_cursor = 0
+            self.assertEqual(engine._next_queue_item()[0].id, valid.id)
+            engine._queue_cursor = 0
+            engine._peek_playable_at_cursor()
+        poison_events = [c.kwargs for c in emitted.call_args_list
+                         if c.kwargs.get("title") == "Refused poison-guarded LogItem after policy restart"]
+        self.assertEqual(len(poison_events), 1)                      # once-only, first REAL encounter
+        self.assertEqual(poison_events[0]["detail"]["log_item_id"], poisoned.id)
+
+    def test_only_poisoned_and_unplayable_successor_stays_bounded(self):
+        rows = [self.next_rows[0], (None, self.weather)]
+
+        def install_poisoned(sim, engine):
+            self.next_log = self.make_log(22, rows, played=False)
+            first = self.next_log.items.order_by("position").first()
+            engine._poison_skip_identities = [(self.next_log.id, first.id)]
+            engine._apply_poison_skip = lambda items: items      # keep it materialized: the selection gate must act
+            sim.call("install", engine._install_built_hour, WEDNESDAY, 22)
+
+        sim = self.simulate(approve_at=None, start=at(21, 58, 50), last_song_ends=None, end=at(22, 2, 0),
+                            events=[(at(21, 58, 51), install_poisoned)])
+        self.assertEqual(sim.runaway, [])
+        self.assertLessEqual(sim.max_exhaust_depth, 1)
+        self.assertEqual(sim.starts, [])
+        self.assertLessEqual(sim.max_retry_chains, 1)
+        self.assertLessEqual(sim.timer_firings, 10)
+        self.assertEqual(len([e for e in sim.emitted
+                              if e.get("title") == "Refused poison-guarded LogItem after policy restart"]), 1)

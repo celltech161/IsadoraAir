@@ -1983,6 +1983,7 @@ class PolicyRestartForcedItemGateTests(SimpleTestCase):
         item.id = item_id
         item.playlist_log_id = playlist_log_id
         item.position = item_id
+        item.played_at = None  # an unaired occurrence (a bare MagicMock attribute would read as aired)
         item.category_id = None
         item.category = None
         item.track = MagicMock()

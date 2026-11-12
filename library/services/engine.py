@@ -5468,19 +5468,52 @@ class PlaybackEngine:
 
     @staticmethod
     def _first_unplayed_index(items):
-        """Index just after the last item whose ``played_at`` is set (0 when nothing aired, ``len(items)`` when the
-        last item aired).
+        """Where an installed approved queue resumes: just after the last item whose ``played_at`` is set (0 when
+        nothing aired, ``len(items)`` when the last item aired and nothing is pending) -- but never past an
+        engine insertion that has not aired (``_first_pending_insertion_index``).
 
-        Every path that installs an approved queue starts here (1.21): an occurrence that already began airing
-        is never handed out again as a fresh queue entry.  For a queue with nothing aired -- every ordinary
-        next-hour install -- this is 0, exactly the former behaviour of the rollover/advance paths.  r0135: a
-        never-aired row BEFORE aired ones (an unplayable item that was skipped) no longer rewinds the cursor
-        behind them -- reloading such a log used to replay every aired item after it."""
+        Every path that installs an approved queue starts here (1.21).  For a queue with nothing aired -- every
+        ordinary next-hour install -- this is 0, exactly the former behaviour of the rollover/advance paths.
+
+        r0135: an ORDINARY row that never aired before an aired one was passed by the previous cursor (skipped
+        as unplayable or poison-guarded) and is not offered again; resuming at the first unaired row used to
+        re-walk it and replay every aired item after it.  An engine insertion (urgent, native active message,
+        dedication intro) is different: it is spliced at the cursor and may air out of its persisted order
+        through ``_forced_next_items`` (a newer urgent prepended ahead of an older one), so an unaired one
+        behind an aired row is still PENDING and the cursor starts at it.  Selection then passes over the rows
+        that already aired (``_occurrence_handed_out``) -- never the cursor alone."""
         last_aired = -1
         for index, item in enumerate(items):
             if item.played_at is not None:
                 last_aired = index
-        return last_aired + 1
+        resume_at = last_aired + 1
+        pending = PlaybackEngine._first_pending_insertion_index(items)
+        return pending if pending is not None and pending < resume_at else resume_at
+
+    @staticmethod
+    def _first_pending_insertion_index(items):
+        """r0135: index of the first engine insertion (``LogItem.ORIGIN_ENGINE_INSERTED``) that has not aired,
+        or None."""
+        return next(
+            (
+                index for index, item in enumerate(items)
+                if item.played_at is None and getattr(item, "origin", None) == LogItem.ORIGIN_ENGINE_INSERTED
+            ),
+            None,
+        )
+
+    def _occurrence_handed_out(self, item):
+        """r0135: True when ``item`` already aired (``played_at`` set) or is on a deck now. Ordinary queue
+        selection, the crossfade look-ahead, exhausted-log recovery and the queue preview pass over such a row
+        whatever the cursor says. In memory only. Never applied to the exact resume occurrence or to
+        ``_forced_next_items``: those keep their own authority."""
+        if item.played_at is not None:
+            return True
+        decks = getattr(self, "decks", None) or {}
+        return any(
+            deck is not None and getattr(deck, "log_item", None) is not None and deck.log_item.id == item.id
+            for deck in decks.values()
+        )
 
     def _dst_fallback_transition(self, log):
         """The fall-back transition whose repeated hour precedes ``log`` (1.21), or None (memoized, no I/O)."""
@@ -5569,7 +5602,9 @@ class PlaybackEngine:
                 return True
 
         return any(
-            item.playlist_log_id == active_log_id and _log_item_playable(item)[0]
+            item.playlist_log_id == active_log_id
+            and item.played_at is None  # r0135: an aired row behind a pending insertion is not runway
+            and _log_item_playable(item)[0]
             for item in items
         )
 
@@ -6296,6 +6331,8 @@ class PlaybackEngine:
         runway = self._leading_deck_eta_seconds()
         cursor = self._queue_cursor
         for item in self.log_items[cursor:]:
+            if item.played_at is not None:
+                continue  # r0135: aired (a pending insertion can hold the cursor behind it)
             track = item.track
             if track is None:
                 # Deleted-track ghost -- _next_queue_item will skip it,
@@ -6727,6 +6764,9 @@ class PlaybackEngine:
             if self._is_poison_guarded(item):
                 self._queue_cursor += 1
                 continue
+            if self._occurrence_handed_out(item):
+                self._queue_cursor += 1  # r0135: aired or on a deck -- never a next occurrence
+                continue
             playable, reason = _log_item_playable(item)
             if playable:
                 return item
@@ -6834,6 +6874,8 @@ class PlaybackEngine:
             # forgets to route through the filter).
             if self._is_poison_guarded(item):
                 continue
+            if self._occurrence_handed_out(item):
+                continue  # r0135: aired or on a deck -- the cursor alone never re-authorizes it
             playable, reason = _log_item_playable(item)
             if playable:
                 return item, False
@@ -6910,6 +6952,7 @@ class PlaybackEngine:
             it for it in items
             if it.id not in forced_ids
             and not self._is_poison_guarded(it)
+            and not self._occurrence_handed_out(it)
             and _log_item_playable(it)[0]
         ]
 
@@ -8031,16 +8074,20 @@ class PlaybackEngine:
         selected without a fresh DB read.
 
         getattr-defensive for the same reason as _apply_poison_skip."""
+        if not self._is_poison_member(item):
+            return False
+        self._report_poison_hit_once(item, "selection")
+        return True
+
+    def _is_poison_member(self, item):
+        """r0135: the membership test behind _is_poison_guarded, without reporting -- no event, no database, no
+        state change. For eligibility probes only; selection keeps _is_poison_guarded."""
         if item is None:
             return False
         skip_identities = getattr(self, "_poison_skip_identities", None)
         if not skip_identities:
             return False
-        identity = (item.playlist_log_id, item.id)
-        if identity not in skip_identities:
-            return False
-        self._report_poison_hit_once(item, "selection")
-        return True
+        return (item.playlist_log_id, item.id) in skip_identities
 
     def _request_restart(self, reason, detail):
         """Ask the process to exit non-zero so systemd's Restart=on-failure
@@ -8921,6 +8968,13 @@ class PlaybackEngine:
             cursor, source = max(previous, occurrence_index + 1), "after_occurrence"
         else:
             cursor, source = previous, "unplayed_default"
+        # r0135: the saved / after-occurrence cursor tracks the previous process's ORDINARY cursor, which an
+        # engine insertion still waiting in its _forced_next_items had already passed. Never settle beyond such
+        # a pending insertion; selection passes over the rows after it that already aired.
+        pending = self._first_pending_insertion_index(log_items)
+        if pending is not None and pending < cursor:
+            print(f"  Resume keeps pending engine insertion log_item {log_items[pending].id} (index {pending})")
+            cursor = pending
         self._queue_cursor = cursor
         hint["queue_source"] = source
         self._resume_item = item
@@ -15322,6 +15376,27 @@ class PlaybackEngine:
             for i, item in enumerate(fresh_items):
                 if item.id in occupied_ids or item.played_at is not None:
                     new_cursor = i + 1
+            # r0135: but never carry the cursor forward past a row it has not reached that is still pending
+            # (not aired, not on a deck). After a restart the cursor can sit on an unaired engine insertion
+            # behind an aired or resumed row (_first_unplayed_index); jumping to "after the last aired" would
+            # silently discard it. Rows the cursor already passed are unaffected.
+            at_cursor = (
+                self.log_items[self._queue_cursor]
+                if 0 <= self._queue_cursor < len(self.log_items)
+                else None
+            )
+            start = (
+                next((i for i, item in enumerate(fresh_items) if item.id == at_cursor.id), None)
+                if at_cursor is not None else None
+            )
+            if start is not None:
+                new_cursor = next(
+                    (
+                        i for i in range(start, new_cursor)
+                        if fresh_items[i].played_at is None and fresh_items[i].id not in occupied_ids
+                    ),
+                    new_cursor,
+                )
         else:
             # Nothing on either deck (e.g. manual-mode hold, or a brief
             # idle window between tracks). The deck-based rule above
@@ -16054,11 +16129,19 @@ class PlaybackEngine:
 
     def _has_playable_at_cursor(self):
         """r0135: is there a playable next occurrence? The side-effect-free twin of
-        _peek_playable_at_cursor -- the same poison-guard and playability rules, but no cursor move, no skip
-        event and no skip evidence. Gates _on_log_exhausted's start so an entirely unplayable successor can no
-        longer recurse (_start_next_track -> skip all -> _on_log_exhausted -> reload -> ...)."""
-        for item in [*self._forced_next_items, *self.log_items[self._queue_cursor:]]:
-            if not self._is_poison_guarded(item) and _log_item_playable(item)[0]:
+        _peek_playable_at_cursor -- the same poison membership, handed-out and playability rules, but no cursor
+        move, no skip or poison event, no database access and no skip evidence. Gates _on_log_exhausted's start
+        so an entirely unplayable successor can no longer recurse (_start_next_track -> skip all ->
+        _on_log_exhausted -> reload -> ...)."""
+        for item in self._forced_next_items:
+            if not self._is_poison_member(item) and _log_item_playable(item)[0]:
+                return True
+        for item in self.log_items[self._queue_cursor:]:
+            if (
+                not self._is_poison_member(item)
+                and not self._occurrence_handed_out(item)
+                and _log_item_playable(item)[0]
+            ):
                 return True
         return False
 
