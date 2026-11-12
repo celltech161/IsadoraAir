@@ -73,12 +73,13 @@ class _Fixture:
             pk=1, defaults={"strategy": "fixed_category", "fallback_category": self.psa},
         )
 
-    def make_log(self, hour, rows, *, played=True, day=WEDNESDAY):
+    def make_log(self, hour, rows, *, played=True, day=WEDNESDAY, minute=0):
         """rows: list of (track_or_None, category). Track None == a deleted Track (SET_NULL)."""
         log = PlaylistLog.objects.create(date=day, hour=hour, status="approved")
         for position, (track, category) in enumerate(rows):
             LogItem.objects.create(
-                playlist_log=log, position=position, scheduled_time=at(hour, 0, day=day) + timedelta(seconds=60 * position),
+                playlist_log=log, position=position,
+                scheduled_time=at(hour, minute, day=day) + timedelta(seconds=60 * position),
                 track=track, track_title=track.title if track else "Deleted Weather",
                 category=category, played_at=timezone.now() if played else None,
             )
@@ -296,6 +297,10 @@ class FakeGLib:
                 if getattr(fn, "__name__", "") == "_try_load_next_hour"]
 
 
+class RunawayRecursion(BaseException):
+    """Raised by the instrumentation (BaseException: _glib_safe must not swallow it)."""
+
+
 class RolloverSim:
     """Discrete-event driver: deck EOS, scheduler ticks, GLib timers, scripted build install."""
 
@@ -309,6 +314,12 @@ class RolloverSim:
         self.authority = None
         self.scripted = []
         self.poll = None
+        self.runaway = []           # (time, authority, nested reloads) for every bounded-recursion trip
+        self.loads = 0
+        self.call_loads = 0
+        self.exhaust_depth = 0
+        self.max_exhaust_depth = 0
+        self.timer_firings = 0
         self.next_tick = start + timedelta(seconds=4)
 
     def fake_create_deck(self, slot, log_item):
@@ -323,10 +334,34 @@ class RolloverSim:
         self.starts.append((self.now, slot, log_item.id, log_item.track.title, self.authority, other is not None))
         return deck
 
+    def instrument(self, engine):
+        load, exhausted = engine._load_log_for, engine._on_log_exhausted
+
+        def counted_load(*args):
+            self.loads += 1
+            self.call_loads += 1
+            if self.call_loads > 12:
+                raise RunawayRecursion(self.call_loads)
+            return load(*args)
+
+        def nested_exhausted(*args):
+            self.exhaust_depth += 1
+            self.max_exhaust_depth = max(self.max_exhaust_depth, self.exhaust_depth)
+            try:
+                return exhausted(*args)
+            finally:
+                self.exhaust_depth -= 1
+        engine._load_log_for = counted_load
+        engine._on_log_exhausted = nested_exhausted
+
     def call(self, authority, fn, *args):
         self.authority = authority
+        self.call_loads = 0
         try:
             return fn(*args)
+        except RunawayRecursion as exc:
+            self.runaway.append((self.now, authority, exc.args[0]))
+            return False
         finally:
             self.authority = None
             if self.engine.current_log is not None:
@@ -356,6 +391,7 @@ class RolloverSim:
                     continue
                 _due, interval, fn, args = entry
                 self.glib.current = _Source(sid)
+                self.timer_firings += 1
                 try:
                     keep = self.call(f"timer:{getattr(fn, '__name__', fn)}", fn, *args)
                 finally:
@@ -393,6 +429,8 @@ def _rollover_engine(sim):
     engine._resume_hint = None
     engine._active_message_held = {}
     engine._next_triggered = False
+    engine._manual_from_mic = False
+    engine._manual_hold_pending = False
     engine._hour_refill_evidence = None
     engine._refill_coordinator = None
     engine._try_extend_live_log_async = MagicMock(return_value=False)
@@ -414,6 +452,7 @@ class _RolloverFixture(_Fixture):
         self.build_library()
         media = tempfile.TemporaryDirectory()
         self.addCleanup(media.cleanup)
+        self.media = media.name
         for track in Track.objects.filter(category__in=(self.blues, self.psa)):
             path = f"{media.name}/{track.filename}"
             open(path, "wb").close()
@@ -440,10 +479,12 @@ class _RolloverFixture(_Fixture):
                 duration_seconds=seconds, next_start_seconds=seconds), category))
 
     def simulate(self, *, approve_at=at(21, 59, 34), end=at(22, 0, 40), last_song_ends=at(21, 56, 39),
-                 old_log=None, real_live_fill=False):
-        sim = RolloverSim(self, None, at(21, 54, 49))
+                 old_log=None, real_live_fill=False, start=at(21, 54, 49), next_rows=None, next_hour=22,
+                 next_minute=0, events=(), setup=None):
+        sim = RolloverSim(self, None, start)
         engine = _rollover_engine(sim)
         sim.engine = engine
+        sim.instrument(engine)
         if old_log is not None:
             self.old_log = old_log
         if real_live_fill:
@@ -462,14 +503,21 @@ class _RolloverFixture(_Fixture):
         engine.log_items = self.reload_items(self.old_log)
         engine._queue_cursor = len(engine.log_items)
         last = engine.log_items[-1]
-        engine.decks["B"] = SimpleNamespace(log_item=last, track=last.track, paused=False, finished=False,
-                                            ends_at=last_song_ends)
+        if last_song_ends is not None:
+            engine.decks["B"] = SimpleNamespace(log_item=last, track=last.track, paused=False, finished=False,
+                                                ends_at=last_song_ends)
+        rows = self.next_rows if next_rows is None else next_rows
 
         def approve_next_hour():
-            self.next_log = self.make_log(22, self.next_rows, played=False)
-            sim.call("install", engine._install_built_hour, WEDNESDAY, 22)
+            self.next_log = self.make_log(next_hour, rows, played=False, minute=next_minute)
+            sim.call("install", engine._install_built_hour, WEDNESDAY, next_hour)
 
-        sim.scripted.append((approve_at, approve_next_hour))
+        if approve_at is not None:
+            sim.scripted.append((approve_at, approve_next_hour))
+        for when, fn in events:
+            sim.scripted.append((when, lambda fn=fn: fn(sim, engine)))
+        if setup is not None:
+            setup(sim, engine)
         real_localtime = timezone.localtime
 
         def localtime(value=None, *args, **kwargs):
@@ -568,14 +616,212 @@ class CombinedIncidentRegressionTests(_RolloverFixture, TransactionTestCase):
         self.assertTrue(all(not s[5] for s in sim.starts), "overlapping program starts:\n" + report)
         self.assertLessEqual(sim.max_retry_chains, 1, report)
         self.assertEqual(sim.glib.retry_timers(sim.engine), [])
-        # Continuous air from the final song to the end of the run (no gap > 1 s).
+        # Continuous air from the final song onward. The PSA selection is random and legacy fill
+        # lands within DURATION_FIT_MARGIN of the boundary by design, so the ONLY gap allowed is a
+        # short one (<= that margin) ending at the next hour's first item; none anywhere else.
+        first_next = next(item_id for _t, _s, item_id, title, *_ in sim.starts if title == "Station ID")
         intervals = sorted((t, t + timedelta(seconds=effective_airtime_seconds(
-            LogItem.objects.select_related("track").get(id=item_id).track))) for t, _s, item_id, *_ in sim.starts)
+            LogItem.objects.select_related("track").get(id=item_id).track)), item_id)
+            for t, _s, item_id, *_ in sim.starts)
         covered_until = at(21, 56, 39)
-        for begin, finish in intervals:
-            self.assertLessEqual((begin - covered_until).total_seconds(), 1.0, "dead air before %s\n%s" % (begin, report))
+        for begin, finish, item_id in intervals:
+            gap = (begin - covered_until).total_seconds()
+            if item_id == first_next:
+                self.assertLessEqual(gap, eng_module.DURATION_FIT_MARGIN, "dead air before %s\n%s" % (begin, report))
+            else:
+                self.assertLessEqual(gap, 1.0, "dead air before %s\n%s" % (begin, report))
             covered_until = max(covered_until, finish)
         # 2.27 stays observation-only: no policy change, no causal install, no refill rows.
         self.assertEqual(list(HourRefillPolicy.objects.values()), policies)
         self.assertEqual(HourRefillInstall.objects.count(), installs)
         self.assertFalse(LogItem.objects.filter(origin=LogItem.ORIGIN_REFILL_INSTALLED).exists())
+
+
+# --------------------------------------------------------------------------- Codex corrective pass
+
+class UnplayableSuccessorTests(_RolloverFixture, TransactionTestCase):
+    """Correction A: a nonempty but entirely unplayable successor must never recurse."""
+
+    def missing(self, title):
+        artist, _ = Artist.get_or_create_ci(f"R135 missing {title}")
+        return Track.objects.create(filepath=f"{self.media}/never-written-{title}.flac", filename=f"{title}.flac",
+                                    title=title, artist=artist, category=self.weather, ready2air=True,
+                                    duration_seconds=20.0, next_start_seconds=20.0)
+
+    def cleared(self, title):
+        track = self.missing(title)
+        Track.objects.filter(id=track.id).update(filepath="")
+        return Track.objects.get(id=track.id)
+
+    def at_the_boundary(self, rows, **kwargs):
+        # The previous hour is exhausted and idle; the successor is installed early.
+        kwargs.setdefault("start", at(21, 58, 50))
+        kwargs.setdefault("approve_at", at(21, 58, 51))
+        kwargs.setdefault("end", at(21, 59, 30))
+        return self.simulate(next_rows=rows, last_song_ends=None, **kwargs)
+
+    def assert_bounded(self, sim, *, starts=()):
+        report = "\n".join(f"{t:%H:%M:%S.%f} {slot} {title!r} by {who}" for t, slot, _i, title, who, _o in sim.starts)
+        self.assertEqual(sim.runaway, [], f"recursive successor reloads: {sim.runaway}")
+        self.assertLessEqual(sim.max_exhaust_depth, 1, "_on_log_exhausted re-entered itself")
+        self.assertEqual([st[3] for st in sim.starts], list(starts), report)
+        self.assertLessEqual(sim.max_retry_chains, 1)
+        self.assertTrue(all(not st[5] for st in sim.starts), report)
+
+    def test_ordinary_successor_of_only_deleted_tracks(self):
+        sim = self.at_the_boundary([(None, self.weather)] * 4)
+        self.assert_bounded(sim)
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)              # still waiting, one owner
+        self.assertIn("Approved log has no playable item", [e.get("title") for e in sim.emitted])
+
+    def test_successor_whose_files_are_missing_from_disk(self):
+        sim = self.at_the_boundary([(self.missing(f"m{i}"), self.weather) for i in range(3)])
+        self.assert_bounded(sim)
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)
+
+    def test_mix_of_deleted_missing_and_cleared_tracks(self):
+        rows = [(None, self.weather), (self.missing("a"), self.weather), (self.cleared("b"), self.weather), (None, self.psa)]
+        self.assert_bounded(self.at_the_boundary(rows))
+
+    def test_partial_hour_successor_with_no_playable_entries(self):
+        ScheduleBlock.objects.filter(specific_date=WEDNESDAY, start_time=dt_time(22, 0)).delete()
+        ScheduleBlock.objects.create(profile=ensure_schedule_profile_state().active_profile, specific_date=WEDNESDAY,
+                                     start_time=dt_time(22, 30), end_time=dt_time(23, 0),
+                                     rotation=Rotation.objects.first())
+        sim = self.at_the_boundary([(None, self.weather), (self.missing("p"), self.weather)],
+                                   start=at(22, 30, 1), approve_at=at(22, 30, 2), end=at(22, 31, 10), next_minute=30)
+        self.assert_bounded(sim)
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)
+
+    def test_one_valid_item_after_several_unplayable_starts_once(self):
+        rows = [(None, self.weather), (self.missing("x"), self.weather), self.next_rows[1], self.next_rows[2]]
+        sim = self.at_the_boundary(rows, end=at(22, 0, 30))
+        self.assert_bounded(sim, starts=("1990 Intro", "Calendar of Events"))
+
+    def test_already_aired_items_are_never_replayed(self):
+        def mark_first_aired(sim, engine):
+            LogItem.objects.filter(playlist_log__hour=22, position=0).update(played_at=timezone.now())
+        rows = [self.next_rows[0], (None, self.weather), self.next_rows[2]]
+        sim = self.at_the_boundary(rows, approve_at=None, end=at(21, 59, 40),
+                                   events=[(at(21, 58, 51), lambda sim, engine: (
+                                       setattr(self, "next_log", self.make_log(22, rows, played=False)),
+                                       mark_first_aired(sim, engine),
+                                       sim.call("install", engine._install_built_hour, WEDNESDAY, 22)))])
+        self.assert_bounded(sim, starts=("Calendar of Events",))
+
+    def test_repeated_retries_while_the_successor_stays_unplayable(self):
+        sim = self.simulate(next_rows=[(None, self.weather)] * 3, end=at(22, 3, 0))
+        self.assert_bounded(sim)
+        self.assertLessEqual(sim.timer_firings, 15)                           # one 30 s owner, nothing runaway
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)
+
+    def test_recovery_when_a_playable_item_becomes_available(self):
+        late = self.missing("late-media")
+
+        def restore_media(sim, engine):
+            open(late.filepath, "wb").close()
+        sim = self.simulate(next_rows=[(None, self.weather), (late, self.weather)], end=at(22, 1, 30),
+                            events=[(at(22, 0, 20), restore_media)])
+        self.assert_bounded(sim, starts=("late-media",))
+        self.assertGreaterEqual(sim.starts[0][0], at(22, 0, 20))
+
+    def test_recovery_when_a_later_valid_successor_is_installed(self):
+        ScheduleBlock.objects.create(profile=ensure_schedule_profile_state().active_profile, specific_date=WEDNESDAY,
+                                     start_time=dt_time(23, 0), end_time=dt_time(0, 0), rotation=Rotation.objects.first())
+        dead = self.make_log(22, [(None, self.weather), (self.missing("d"), self.weather)], played=False)
+        sim = self.simulate(old_log=dead, start=at(22, 58, 50), last_song_ends=None, approve_at=at(22, 59, 34),
+                            next_hour=23, end=at(23, 0, 10))
+        self.assert_bounded(sim, starts=("Station ID", "1990 Intro"))
+        self.assertEqual([st[4] for st in sim.starts], ["install", "eos"])
+
+
+class ManualHoldRetryTests(_RolloverFixture, TransactionTestCase):
+    """Correction B: an exhausted-log retry never starts scheduled playback during Manual."""
+
+    @staticmethod
+    def manual(on):
+        def toggle(sim, engine):
+            engine.manual_mode = on
+        return toggle
+
+    def assert_held(self, sim, *, flags=None):
+        report = "\n".join(f"{t:%H:%M:%S.%f} {slot} {title!r} by {who}" for t, slot, _i, title, who, _o in sim.starts)
+        self.assertEqual(sim.starts, [], "a retry started playback during Manual:\n" + report)
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)            # recovery kept, one owner
+        self.assertLessEqual(sim.max_retry_chains, 1)
+        self.assertFalse(LogItem.objects.filter(playlist_log__hour=22, played_at__isnull=False).exists())
+        if flags is not None:
+            engine = sim.engine
+            self.assertEqual((engine.manual_mode, engine._manual_from_mic, engine._manual_hold_pending), flags)
+
+    def test_retry_armed_in_auto_then_manual_before_it_fires(self):
+        def ownership(sim, engine):
+            engine._manual_from_mic = True                                 # a mic-owned hold
+        sim = self.simulate(approve_at=at(21, 57, 30), end=at(21, 59, 0),
+                            events=[(at(21, 57, 0), self.manual(True)), (at(21, 57, 0), ownership)])
+        self.assertGreaterEqual(sim.timer_firings, 3)                       # several intervals in Manual
+        self.assert_held(sim, flags=(True, True, False))
+        engine = sim.engine
+        # Nothing handed out: either the exhausted 21:00 queue, or the approved
+        # 22:00 queue installed (not started) by the build path, at its first row.
+        if engine.current_log.hour == 22:
+            self.assertEqual(engine._queue_cursor, 0)
+        else:
+            self.assertEqual(engine._queue_cursor, len(engine.log_items))
+
+    def test_retry_armed_while_a_manual_hold_already_exists(self):
+        def hold(sim, engine):
+            engine.manual_mode = True
+            engine._manual_hold_pending = True
+        sim = self.simulate(approve_at=at(21, 57, 30), end=at(21, 59, 0), last_song_ends=None,
+                            setup=hold,
+                            events=[(at(21, 56, 40), lambda sim, engine: sim.call("exhausted", engine._on_log_exhausted, "A"))])
+        self.assert_held(sim, flags=(True, False, True))
+
+    def test_return_to_auto_with_a_playable_queue_resumes_once(self):
+        sim = self.simulate(approve_at=at(21, 57, 30), end=at(21, 59, 10),
+                            events=[(at(21, 57, 0), self.manual(True)), (at(21, 58, 20), self.manual(False))])
+        titles = [st[3] for st in sim.starts]
+        self.assertEqual(titles, ["Station ID", "1990 Intro"])
+        self.assertGreaterEqual(sim.starts[0][0], at(21, 58, 20))
+        self.assertTrue(all(not st[5] for st in sim.starts))
+        self.assertLessEqual(sim.max_retry_chains, 1)
+
+    def test_return_to_auto_while_the_successor_is_unavailable(self):
+        sim = self.simulate(approve_at=None, end=at(21, 59, 0),
+                            events=[(at(21, 57, 0), self.manual(True)), (at(21, 58, 0), self.manual(False))])
+        self.assertEqual(sim.starts, [])
+        self.assertEqual(len(sim.glib.retry_timers(sim.engine)), 1)
+
+    def test_manual_toggled_around_a_retry_firing(self):
+        # Armed at 21:56:39.25 by the final song's end -> fires 21:57:09.25 inside a hold
+        # that began before approval (so the install path itself cannot start) and ends
+        # 0.25 s after that firing.
+        sim = self.simulate(approve_at=at(21, 56, 50), end=at(21, 58, 10),
+                            events=[(at(21, 56, 45), self.manual(True)), (at(21, 57, 9, 500000), self.manual(False))])
+        self.assertTrue(sim.starts)
+        self.assertGreater(sim.starts[0][0], at(21, 57, 9, 500000))         # nothing started inside the hold
+        titles = [st[3] for st in sim.starts]
+        self.assertEqual(titles[:2], ["Station ID", "1990 Intro"])
+        self.assertEqual(len(titles), len(set(titles)))                      # no duplicate start
+        self.assertTrue(all(not st[5] for st in sim.starts))
+
+    def test_shutdown_with_a_pending_retry_during_manual(self):
+        def stop(sim, engine):
+            engine.running = False
+            engine._cancel_exhausted_retry()
+        sim = self.simulate(approve_at=at(21, 57, 30), end=at(21, 59, 0),
+                            events=[(at(21, 57, 0), self.manual(True)), (at(21, 57, 20), stop)])
+        self.assertEqual(sim.starts, [])
+        self.assertEqual(sim.glib.retry_timers(sim.engine), [])
+
+    def test_manual_release_start_and_retry_never_double_start(self):
+        def hold(sim, engine):
+            engine.manual_mode = True
+            engine._manual_hold_pending = True
+        sim = self.simulate(approve_at=at(21, 57, 30), end=at(21, 58, 40), setup=hold,
+                            events=[(at(21, 58, 5), lambda sim, engine: sim.call("release", engine._set_manual_mode, False))])
+        self.assertEqual([st[3] for st in sim.starts], ["Station ID", "1990 Intro"])
+        self.assertEqual(sim.starts[0][4], "release")
+        self.assertTrue(all(not st[5] for st in sim.starts))
+        self.assertLessEqual(sim.max_retry_chains, 1)

@@ -5468,15 +5468,19 @@ class PlaybackEngine:
 
     @staticmethod
     def _first_unplayed_index(items):
-        """Index of the first item whose ``played_at`` is NULL (``len(items)`` when all aired).
+        """Index just after the last item whose ``played_at`` is set (0 when nothing aired, ``len(items)`` when the
+        last item aired).
 
         Every path that installs an approved queue starts here (1.21): an occurrence that already began airing
         is never handed out again as a fresh queue entry.  For a queue with nothing aired -- every ordinary
-        next-hour install -- this is 0, exactly the former behaviour of the rollover/advance paths."""
+        next-hour install -- this is 0, exactly the former behaviour of the rollover/advance paths.  r0135: a
+        never-aired row BEFORE aired ones (an unplayable item that was skipped) no longer rewinds the cursor
+        behind them -- reloading such a log used to replay every aired item after it."""
+        last_aired = -1
         for index, item in enumerate(items):
-            if item.played_at is None:
-                return index
-        return len(items)
+            if item.played_at is not None:
+                last_aired = index
+        return last_aired + 1
 
     def _dst_fallback_transition(self, log):
         """The fall-back transition whose repeated hour precedes ``log`` (1.21), or None (memoized, no I/O)."""
@@ -16017,8 +16021,10 @@ class PlaybackEngine:
             # the following wall hour. If its build is still missing, wait
             # and retry instead of skipping an entire programming boundary.
             self._load_log_for(now.date(), now.hour)
-            if self.log_items:
+            if self.log_items and self._has_playable_at_cursor():
                 self._start_next_track(slot=slot)
+            elif self.log_items:
+                self._wait_for_unplayable_queue()
             else:
                 print("Eligible partial-hour log is not ready. Waiting...")
                 self._arm_exhausted_retry()
@@ -16038,11 +16044,34 @@ class PlaybackEngine:
             return
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         self._load_log_for(next_hour.date(), next_hour.hour)
-        if self.log_items:
+        if self.log_items and self._has_playable_at_cursor():
             self._start_next_track(slot=slot)
+        elif self.log_items:
+            self._wait_for_unplayable_queue()
         else:
             print("No approved log for next hour. Waiting...")
             self._arm_exhausted_retry()
+
+    def _has_playable_at_cursor(self):
+        """r0135: is there a playable next occurrence? The side-effect-free twin of
+        _peek_playable_at_cursor -- the same poison-guard and playability rules, but no cursor move, no skip
+        event and no skip evidence. Gates _on_log_exhausted's start so an entirely unplayable successor can no
+        longer recurse (_start_next_track -> skip all -> _on_log_exhausted -> reload -> ...)."""
+        for item in [*self._forced_next_items, *self.log_items[self._queue_cursor:]]:
+            if not self._is_poison_guarded(item) and _log_item_playable(item)[0]:
+                return True
+        return False
+
+    def _wait_for_unplayable_queue(self):
+        """r0135: an approved queue with nothing playable left -- report it and wait on the one retry."""
+        log = self.current_log
+        print(f"  Approved log {log.date} {log.hour:02d}:00 has no playable item left. Waiting...")
+        emit_event(
+            category="engine", level="warning", title="Approved log has no playable item",
+            detail={"log_id": log.id, "date": str(log.date), "hour": log.hour, "items": len(self.log_items)},
+            dedupe_key=f"engine|unplayable-log|{log.id}",
+        )
+        self._arm_exhausted_retry()
 
     def _arm_exhausted_retry(self):
         """r0135: arm THE exhausted-log retry -- at most one per engine.
@@ -16108,6 +16137,12 @@ class PlaybackEngine:
             # if the queue is still exhausted. Starting the free deck from here
             # is an unowned second program start (KOGR 2026-11-11 21:59:43).
             return False
+        if self.manual_mode:
+            # r0135: never start scheduled playback over a Manual hold. Keep
+            # polling as the one owner so Auto resumes without a restart; the
+            # Manual release path and the scheduler tick remain the other
+            # (idle-checked) starters, so nothing is duplicated.
+            return True
         now = timezone.localtime()
         hour_state = self._current_hour_schedule_state(now)
         if (
