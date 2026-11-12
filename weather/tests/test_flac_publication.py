@@ -1,27 +1,30 @@
-"""Weather FLAC standardization (r0134): publishing .flac, and adopting the pre-existing .mp3 Track in place.
-
-Why adoption and not "a new Track at the .flac path": the engine's urgent insert takes the first ready Track of
-a category with no ordering, approved logs and rotations reference Track rows, and PlaylistItem.track is PROTECT.
-A second Track would leave the old MP3 in service (stale, never regenerated), duplicate eligibility, and orphan
-play history. The same Track row, re-pointed at the new file, keeps every one of those references working.
-"""
+"""Weather FLAC publication (r0134): a FLAC is an ordinary new library asset published by the same last-known-good
+publisher as before. There is deliberately NO cross-format Track adoption -- the station operator retires the legacy
+MP3 Tracks by hand -- so these tests prove the opposite: a FLAC publication creates or updates the FLAC's own Track
+and never touches an MP3 Track or file."""
 import shutil
+import subprocess
+import sys
 import threading
-from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import skipUnless
 from unittest.mock import patch
 
 from django.core.management import call_command
-from django.test import TransactionTestCase
-from django.utils import timezone
+from django.test import TransactionTestCase, override_settings
 
 from library.management.commands.analyze_tracks import get_waveforms_dir
 from library.management.commands.sync_track_file import sync_track_file as real_sync_track_file
-from library.models import Category, LogItem, Playlist, PlaylistItem, PlaylistLog, Track
+from library.models import Artist, Category, CategoryKind, Track
+from weather import provenance as provenance_mod
 from weather.publication import PublicationError, publish_weather_asset
 
 from .test_publication import PublicationTestCase, _generated_waveform
+
+SPEECH_LIB = Path(__file__).resolve().parents[2] / "weather_ingest" / "lib"
+HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
 class FlacPublicationTests(PublicationTestCase):
@@ -30,157 +33,91 @@ class FlacPublicationTests(PublicationTestCase):
         with self._patch_analyze(succeed=True):
             return publish_weather_asset(str(candidate), "WxTemp", filename, **kwargs)
 
-    # -- fresh install ------------------------------------------------------------------------------------------
+    # -- ordinary registration ----------------------------------------------------------------------------------
 
-    def test_first_publication_as_flac_creates_the_track_at_the_flac_path(self):
+    def test_new_flac_creates_a_new_track_at_its_own_path(self):
         result = self._publish("c.flac", "current_temp.flac", producer="current_temp.py", voice="Max")
         dest = self.library_root / "WxTemp" / "current_temp.flac"
         self.assertTrue(dest.is_file())
         self.assertTrue(result.created)
-        self.assertIsNone(result.adopted_from)
-        self.assertEqual(result.warnings, ())
+        self.assertEqual(result.final_path, dest)
         self.assertEqual(result.track.filepath, str(dest))
         self.assertEqual(result.track.filename, "current_temp.flac")
         self.assertEqual(result.track.format, "flac")
+        self.assertTrue(result.track.ready2air)
+        self.assertEqual(Track.objects.filter(category=self.category).count(), 1)
+
+    def test_regenerating_the_same_flac_updates_the_same_track(self):
+        first = self._publish("a.flac", "current_temp.flac", content=b"A")
+        second = self._publish("b.flac", "current_temp.flac", content=b"B")
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(first.track.id, second.track.id)
+        self.assertEqual((self.library_root / "WxTemp" / "current_temp.flac").read_bytes(), b"B")
         self.assertEqual(Track.objects.filter(category=self.category).count(), 1)
 
     def test_an_mp3_candidate_is_still_accepted(self):
         result = self._publish("c.mp3", "current_temp.mp3")
         self.assertEqual(result.track.format, "mp3")
 
-    # -- adoption -----------------------------------------------------------------------------------------------
+    # -- the legacy MP3 is left strictly alone ------------------------------------------------------------------
 
-    def test_flac_publication_adopts_the_existing_mp3_track_keeping_its_identity(self):
+    def test_publishing_a_flac_leaves_an_existing_mp3_track_and_file_untouched(self):
         old = self._publish("old.mp3", "current_temp.mp3", content=b"OLD-MP3")
-        old_id = old.track.id
         old_path = self.library_root / "WxTemp" / "current_temp.mp3"
+        before = Track.objects.filter(id=old.track.id).values().get()
 
-        result = self._publish("new.flac", "current_temp.flac", content=b"NEW-FLAC")
+        new = self._publish("new.flac", "current_temp.flac", content=b"NEW-FLAC")
 
-        new_path = self.library_root / "WxTemp" / "current_temp.flac"
-        self.assertEqual(result.track.id, old_id, "adoption must keep the Track id (every reference follows it)")
-        self.assertEqual(result.adopted_from, old_path)
-        self.assertFalse(result.created)
-        self.assertEqual(Track.objects.filter(category=self.category).count(), 1)
-        track = Track.objects.get(id=old_id)
-        self.assertEqual((track.filepath, track.filename, track.format), (str(new_path), "current_temp.flac", "flac"))
-        self.assertTrue(track.ready2air)
-        self.assertEqual(new_path.read_bytes(), b"NEW-FLAC")
-        # the previous file is left exactly as it was -- never deleted by publication
+        self.assertNotEqual(new.track.id, old.track.id)
+        self.assertTrue(new.created)
+        self.assertEqual(Track.objects.filter(id=old.track.id).values().get(), before)
         self.assertEqual(old_path.read_bytes(), b"OLD-MP3")
-        # the waveform follows the same Track id
-        self.assertEqual(track.waveform_path, str(get_waveforms_dir() / f"{old_id}.json"))
-        self.assertTrue(Path(track.waveform_path).is_file())
+        # An operator-managed, temporary condition: both Tracks exist until the operator retires the MP3.
+        self.assertEqual(Track.objects.filter(category=self.category).count(), 2)
 
-    def test_references_to_the_track_survive_adoption(self):
-        old = self._publish("old.mp3", "current_temp.mp3")
-        track_id = old.track.id
-        playlist = Playlist.objects.create(name="Weather pl")
-        item = PlaylistItem.objects.create(playlist=playlist, position=0, track=old.track)
-        log = PlaylistLog.objects.create(date=timezone.localdate(), hour=9)
-        log_item = LogItem.objects.create(
-            playlist_log=log, position=0, scheduled_time=timezone.now() + timedelta(hours=1),
-            track=old.track, track_title="Temp", category=self.category,
-        )
-
-        self._publish("new.flac", "current_temp.flac")
-
-        item.refresh_from_db()
-        log_item.refresh_from_db()
-        self.assertEqual(item.track_id, track_id)
-        self.assertEqual(log_item.track_id, track_id)
-        self.assertEqual(log_item.track.filepath, str(self.library_root / "WxTemp" / "current_temp.flac"))
-
-    def test_the_engines_unordered_first_ready_track_is_the_adopted_one(self):
-        """The urgent-insert shape (`ready Track in category .first()`): after adoption there is exactly one
-        candidate and it points at the FLAC."""
-        self._publish("old.mp3", "current_temp.mp3")
-        self._publish("new.flac", "current_temp.flac")
-        ready = list(Track.objects.filter(category__code="WxTemp", ready2air=True))
-        self.assertEqual([t.filepath for t in ready], [str(self.library_root / "WxTemp" / "current_temp.flac")])
-
-    def test_a_later_flac_publication_just_updates_the_adopted_track(self):
-        self._publish("old.mp3", "current_temp.mp3")
-        first = self._publish("a.flac", "current_temp.flac", content=b"A")
-        second = self._publish("b.flac", "current_temp.flac", content=b"B")
-        self.assertEqual(first.track.id, second.track.id)
-        self.assertIsNone(second.adopted_from)
-        self.assertEqual((self.library_root / "WxTemp" / "current_temp.flac").read_bytes(), b"B")
-
-    def test_rollback_to_mp3_adopts_back_the_same_track(self):
-        old = self._publish("old.mp3", "current_temp.mp3", content=b"OLD")
-        self._publish("new.flac", "current_temp.flac", content=b"NEW")
-        back = self._publish("again.mp3", "current_temp.mp3", content=b"AGAIN")
-        self.assertEqual(back.track.id, old.track.id)
-        self.assertEqual(back.adopted_from, self.library_root / "WxTemp" / "current_temp.flac")
-        self.assertEqual(Track.objects.get(id=old.track.id).format, "mp3")
-
-    def test_the_retained_mp3_can_be_published_in_place_to_roll_the_track_back(self):
-        """The documented rollback: the old MP3 file is still on disk; publishing it (as its own candidate) re-points
-        the same Track at the MP3 before a source rollback."""
-        old = self._publish("old.mp3", "current_temp.mp3", content=b"RETAINED-MP3")
-        self._publish("new.flac", "current_temp.flac", content=b"NEW")
-        retained = self.library_root / "WxTemp" / "current_temp.mp3"
-        with self._patch_analyze(succeed=True):
-            back = publish_weather_asset(str(retained), "WxTemp", "current_temp.mp3")
-        self.assertEqual(back.track.id, old.track.id)
-        self.assertEqual(Track.objects.get(id=old.track.id).filepath, str(retained))
-        self.assertEqual(retained.read_bytes(), b"RETAINED-MP3")
-
-    def test_other_assets_tracks_are_never_adopted(self):
-        other = Category.objects.create(code="WxObs", name="WxObs", kind=self.category.kind)
-        (self.library_root / "WxObs").mkdir()
-        obs_file = self.library_root / "WxObs" / "current_temp.mp3"      # same stem, different category
-        obs_file.write_bytes(b"OBS")
-        obs_track = Track.objects.create(filepath=str(obs_file), filename="current_temp.mp3", format="mp3",
-                                         title="obs", artist=self.artist, category=other)
-        result = self._publish("new.flac", "current_temp.flac")
-        self.assertTrue(result.created)
-        self.assertIsNone(result.adopted_from)
-        obs_track.refresh_from_db()
-        self.assertEqual(obs_track.filepath, str(obs_file))
-
-    def test_tracks_at_both_extensions_adopt_nothing_and_warn(self):
-        old = self._publish("old.mp3", "current_temp.mp3")
-        flac_path = self.library_root / "WxTemp" / "current_temp.flac"
-        flac_path.write_bytes(b"PRE-EXISTING")
-        stray = Track.objects.create(filepath=str(flac_path), filename="current_temp.flac", format="flac",
-                                     title="stray", artist=self.artist, category=self.category)
-        result = self._publish("new.flac", "current_temp.flac")
-        self.assertIsNone(result.adopted_from)
-        self.assertEqual(len(result.warnings), 1)
-        self.assertIn("both", result.warnings[0])
-        self.assertEqual(result.track.id, stray.id)
-        self.assertTrue(Track.objects.filter(id=old.track.id, format="mp3").exists())
+    def test_the_legacy_mp3_is_not_rewritten_when_the_flac_is_regenerated(self):
+        self._publish("old.mp3", "current_temp.mp3", content=b"OLD-MP3")
+        old_path = self.library_root / "WxTemp" / "current_temp.mp3"
+        stamp = old_path.stat().st_mtime_ns
+        self._publish("a.flac", "current_temp.flac", content=b"A")
+        self._publish("b.flac", "current_temp.flac", content=b"B")
+        self.assertEqual((old_path.read_bytes(), old_path.stat().st_mtime_ns), (b"OLD-MP3", stamp))
 
     # -- failure ------------------------------------------------------------------------------------------------
 
-    def test_failed_analysis_rolls_back_the_adoption_and_leaves_the_mp3_track_untouched(self):
-        old = self._publish("old.mp3", "current_temp.mp3", content=b"OLD-MP3")
-        old_path = self.library_root / "WxTemp" / "current_temp.mp3"
-        candidate = self.make_candidate(name="new.flac", content=b"NEW-FLAC")
+    def test_failed_analysis_keeps_the_previously_published_flac_and_its_track(self):
+        good = self._publish("good.flac", "current_temp.flac", content=b"LAST-KNOWN-GOOD")
+        dest = self.library_root / "WxTemp" / "current_temp.flac"
+        candidate = self.make_candidate(name="bad.flac", content=b"BAD")
         with self._patch_analyze(succeed=False):
             with self.assertRaises(PublicationError):
                 publish_weather_asset(str(candidate), "WxTemp", "current_temp.flac")
-
-        track = Track.objects.get(id=old.track.id)
-        self.assertEqual((track.filepath, track.format), (str(old_path), "mp3"))
+        self.assertEqual(dest.read_bytes(), b"LAST-KNOWN-GOOD")
         self.assertEqual(Track.objects.filter(category=self.category).count(), 1)
-        self.assertEqual(old_path.read_bytes(), b"OLD-MP3")
-        self.assertFalse((self.library_root / "WxTemp" / "current_temp.flac").exists())
-        self.assertTrue(Path(track.waveform_path).is_file())
+        self.assertEqual(Track.objects.get().id, good.track.id)
+        self.assertTrue(Path(Track.objects.get().waveform_path).is_file())
 
-    def test_failure_after_adoption_but_before_commit_rolls_the_track_back(self):
-        old = self._publish("old.mp3", "current_temp.mp3")
-        old_path = self.library_root / "WxTemp" / "current_temp.mp3"
-        candidate = self.make_candidate(name="new.flac", content=b"NEW-FLAC")
+    def test_failed_first_flac_publication_leaves_nothing_and_the_mp3_alone(self):
+        old = self._publish("old.mp3", "current_temp.mp3", content=b"OLD-MP3")
+        candidate = self.make_candidate(name="new.flac", content=b"NEW")
+        with self._patch_analyze(succeed=False):
+            with self.assertRaises(PublicationError):
+                publish_weather_asset(str(candidate), "WxTemp", "current_temp.flac")
+        self.assertFalse((self.library_root / "WxTemp" / "current_temp.flac").exists())
+        self.assertEqual(list(Track.objects.filter(category=self.category).values_list("id", flat=True)),
+                         [old.track.id])
+        self.assertEqual((self.library_root / "WxTemp" / "current_temp.mp3").read_bytes(), b"OLD-MP3")
+
+    def test_waveform_publish_failure_rolls_the_flac_back(self):
+        good = self._publish("good.flac", "current_temp.flac", content=b"GOOD")
+        candidate = self.make_candidate(name="bad.flac", content=b"BAD")
         with self._patch_analyze(succeed=True), \
              patch("weather.publication.waveform_cache.install_file", side_effect=OSError("disk full")):
             with self.assertRaises(PublicationError):
                 publish_weather_asset(str(candidate), "WxTemp", "current_temp.flac")
-        track = Track.objects.get(id=old.track.id)
-        self.assertEqual(track.filepath, str(old_path))
-        self.assertFalse((self.library_root / "WxTemp" / "current_temp.flac").exists())
+        self.assertEqual((self.library_root / "WxTemp" / "current_temp.flac").read_bytes(), b"GOOD")
+        self.assertEqual(Track.objects.get().id, good.track.id)
 
     # -- validation ---------------------------------------------------------------------------------------------
 
@@ -190,10 +127,13 @@ class FlacPublicationTests(PublicationTestCase):
             publish_weather_asset(str(candidate), "WxTemp", "current_temp.wav")
 
     def test_destination_extension_must_match_the_candidate(self):
-        candidate = self.make_candidate(name="c.flac")
-        with self.assertRaisesRegex(PublicationError, "extension"):
-            publish_weather_asset(str(candidate), "WxTemp", "current_temp.mp3")
-        self.assertFalse((self.library_root / "WxTemp" / "current_temp.mp3").exists())
+        for name, filename in (("c.flac", "current_temp.mp3"), ("c.mp3", "current_temp.flac")):
+            with self.subTest(candidate=name, destination=filename):
+                candidate = self.make_candidate(name=name)
+                with self.assertRaisesRegex(PublicationError, "extension"):
+                    publish_weather_asset(str(candidate), "WxTemp", filename)
+                self.assertFalse((self.library_root / "WxTemp" / filename).exists())
+        self.assertEqual(Track.objects.count(), 0)
 
     def test_destination_filename_must_be_a_plain_name(self):
         candidate = self.make_candidate(name="c.flac")
@@ -202,30 +142,64 @@ class FlacPublicationTests(PublicationTestCase):
 
     # -- lock ---------------------------------------------------------------------------------------------------
 
-    def test_both_extensions_share_one_asset_lock_file(self):
-        self._publish("old.mp3", "current_temp.mp3")
-        self._publish("new.flac", "current_temp.flac")
+    def test_the_lock_is_the_ordinary_per_destination_lock(self):
+        self._publish("a.flac", "current_temp.flac")
         locks = sorted(p.name for p in (self.library_root / "WxTemp").iterdir() if p.name.endswith(".lock"))
-        self.assertEqual(locks, [".current_temp.asset.publish.lock"])
+        self.assertEqual(locks, [".current_temp.flac.publish.lock"])
 
-    # -- command ------------------------------------------------------------------------------------------------
+    # -- provenance, waveform, command --------------------------------------------------------------------------
 
-    def test_command_reports_the_adoption(self):
-        from io import StringIO
-        self._publish("old.mp3", "current_temp.mp3")
+    def test_provenance_and_waveform_are_generated_for_a_flac(self):
+        result = self._publish("c.flac", "current_temp.flac", producer="current_temp.py", voice="Max_Weatherly")
+        self.assertIsNone(result.provenance_error)
+        prov, error = provenance_mod.read_provenance(self.data_dir, "WxTemp")
+        self.assertIsNone(error)
+        self.assertEqual(prov.get("filename"), "current_temp.flac")
+        self.assertEqual(prov.get("final_path"), str(self.library_root / "WxTemp" / "current_temp.flac"))
+        self.assertEqual(result.track.waveform_path, str(get_waveforms_dir() / f"{result.track.id}.json"))
+        self.assertTrue(Path(result.track.waveform_path).is_file())
+
+    def test_command_publishes_a_flac_like_any_other_asset(self):
         candidate = self.make_candidate(name="new.flac")
         out = StringIO()
         with self._patch_analyze(succeed=True):
             call_command("publish_weather_asset", str(candidate), "WxTemp", "current_temp.flac", stdout=out)
-        text = out.getvalue()
-        self.assertIn("Updated track", text)
-        self.assertIn("Adopted track", text)
-        self.assertIn("current_temp.mp3 -> current_temp.flac", text)
+        self.assertIn("Created track", out.getvalue())
+        self.assertIn("WxTemp/current_temp.flac", out.getvalue())
 
 
-class AssetLockSerializationTests(TransactionTestCase):
-    """The asset lock is keyed by category + stem, so a FLAC and an MP3 publication of the same asset (NWS vs AMBER
-    during a cutover, or a producer on old code) can never interleave their file + adoption + Track sequence."""
+@skipUnless(HAVE_FFMPEG, "ffmpeg is required")
+class FlacMetadataTests(PublicationTestCase):
+    """A real ffmpeg-encoded FLAC (the producers' own encode) registers with the operator-visible title and artist
+    the MP3 carried: Django's tag extraction reads FLAC Vorbis comments."""
+
+    def test_vorbis_comments_populate_the_track(self):
+        sys.path.insert(0, str(SPEECH_LIB))
+        try:
+            import speech_audio
+        finally:
+            sys.path.remove(str(SPEECH_LIB))
+        wav = Path(self.temporary.name) / "in.wav"
+        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "anoisesrc=d=2:c=pink:r=24000:a=0.05:seed=1", "-ac", "1", "-sample_fmt", "s16", str(wav)],
+                       check=True)
+        flac = Path(self.temporary.name) / "current_temp.flac"
+        speech_audio.encode_flac(["-i", str(wav)], flac, 4.75,
+                                 {"artist": "Oak Grove Radio", "title": "Current Temp (Max)"})
+
+        with self._patch_analyze(succeed=True):
+            result = publish_weather_asset(str(flac), "WxTemp", "current_temp.flac")
+
+        track = Track.objects.get(id=result.track.id)
+        self.assertEqual(track.title, "Current Temp (Max)")
+        self.assertEqual(track.artist.name, "Oak Grove Radio")
+        self.assertEqual((track.format, track.filename), ("flac", "current_temp.flac"))
+        self.assertAlmostEqual(track.duration_seconds, 3.0, delta=0.1)     # 2 s speech + the 1 s lead-in
+
+
+class SameDestinationLockTests(TransactionTestCase):
+    """Two publications of the SAME destination (NWS and AMBER alerts both publish WxAlert/wx_alert.flac) never
+    interleave their stage / Track / waveform sequence."""
 
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -234,20 +208,18 @@ class AssetLockSerializationTests(TransactionTestCase):
         self.data_dir = Path(self.temporary.name) / "weather-data"
         self.library_root.mkdir()
         self.data_dir.mkdir()
-        from django.test import override_settings
         patcher = override_settings(
             LIBRARY_ROOT=str(self.library_root), WEATHER_DATA_DIR=str(self.data_dir),
             WAVEFORMS_DIR=str(Path(self.temporary.name) / "waveforms"),
         )
         patcher.enable()
         self.addCleanup(patcher.disable)
-        from library.models import Artist, CategoryKind
         kind, _ = CategoryKind.objects.get_or_create(code="imaging", defaults={"name": "Imaging"})
         self.category, _ = Category.objects.get_or_create(code="WxAlert", defaults={"name": "WxAlert", "kind": kind})
         Artist.get_or_create_ci("Oak Grove Radio")
         self.addCleanup(shutil.rmtree, get_waveforms_dir(), ignore_errors=True)
 
-    def test_flac_and_mp3_publications_of_one_asset_never_overlap(self):
+    def test_concurrent_publications_of_one_destination_never_overlap(self):
         active = {"count": 0}
         seen = []
         guard = threading.Lock()
@@ -269,15 +241,16 @@ class AssetLockSerializationTests(TransactionTestCase):
             Track.objects.filter(id=row[0]).update(waveform_path=str(scratch_path))
             return True
 
-        mp3 = Path(self.temporary.name) / "a.mp3"
-        flac = Path(self.temporary.name) / "b.flac"
-        mp3.write_bytes(b"MP3")
-        flac.write_bytes(b"FLAC")
+        candidates = []
+        for name in ("nws.flac", "amber.flac"):
+            path = Path(self.temporary.name) / name
+            path.write_bytes(name.encode())
+            candidates.append(path)
         errors = []
 
-        def worker(candidate, filename):
+        def worker(candidate):
             try:
-                publish_weather_asset(str(candidate), "WxAlert", filename)
+                publish_weather_asset(str(candidate), "WxAlert", "wx_alert.flac")
             except Exception as exc:  # pragma: no cover
                 errors.append(exc)
             finally:
@@ -286,17 +259,15 @@ class AssetLockSerializationTests(TransactionTestCase):
 
         with patch("weather.publication.sync_track_file", side_effect=instrumented_sync), \
              patch("library.management.commands.sync_track_file.analyze_one_track", side_effect=fake_analyze):
-            threads = [threading.Thread(target=worker, args=(mp3, "wx_alert.mp3")),
-                       threading.Thread(target=worker, args=(flac, "wx_alert.flac"))]
+            threads = [threading.Thread(target=worker, args=(c,)) for c in candidates]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join(timeout=20)
 
         self.assertEqual(errors, [])
-        self.assertEqual(max(seen), 1, "the two extensions were published concurrently")
-        # one asset, one Track, whichever extension ran last
+        self.assertEqual(max(seen), 1, "two publications of one destination ran concurrently")
         tracks = list(Track.objects.filter(category=self.category))
         self.assertEqual(len(tracks), 1)
-        self.assertIn(tracks[0].format, ("mp3", "flac"))
+        self.assertEqual(tracks[0].format, "flac")
         self.assertTrue(Path(tracks[0].filepath).is_file())

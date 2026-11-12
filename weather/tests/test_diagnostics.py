@@ -607,7 +607,7 @@ class DiagnosticsGeneratedArtifactTests(TestCase):
         return get_weather_diagnostics(now=NOW, data_dir=self.data_dir, library_root=self.library_root)
 
     def _artifact_path(self):
-        path = self.library_root / "WxTemp" / "current_temp.mp3"
+        path = self.library_root / "WxTemp" / "current_temp.flac"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -653,7 +653,7 @@ class DiagnosticsGeneratedArtifactTests(TestCase):
         # wrong -- e.g. the artifact was moved/renamed outside
         # publish_weather_asset since provenance was last recorded.
         payload = json.loads(sidecar.read_text())
-        payload["final_path"] = "/some/other/path/current_temp.mp3"
+        payload["final_path"] = "/some/other/path/current_temp.flac"
         sidecar.write_text(json.dumps(payload))
         snap = self.snapshot()
         fact = snap.get("generated_artifact:wx_temp")
@@ -689,7 +689,7 @@ class DiagnosticsGeneratedArtifactTests(TestCase):
 
 
 class DiagnosticsWxAlertApplicabilityTests(TestCase):
-    """r0051: WxAlert/wx_alert.mp3 is the urgent spoken statement shared
+    """r0051: WxAlert/wx_alert.flac is the urgent spoken statement shared
     by BOTH ordinary NWS watch/warning alerts and AMBER-family alerts
     (never the FX "alert beep", which is `alert_fx_cart`). A historical
     file/Track surviving after an alert ends must not be reported as a
@@ -718,7 +718,7 @@ class DiagnosticsWxAlertApplicabilityTests(TestCase):
             write_json(self.data_dir / "active_amber_alerts.json", entries)
 
     def _make_artifact(self, ready2air=True):
-        path = self.library_root / "WxAlert" / "wx_alert.mp3"
+        path = self.library_root / "WxAlert" / "wx_alert.flac"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"id3")
         make_track(path, self.category, ready2air=ready2air)
@@ -763,7 +763,7 @@ class DiagnosticsWxAlertApplicabilityTests(TestCase):
 
     def test_active_alert_and_track_missing_is_needs_attention(self):
         self._write_watch_warnings([{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
-        path = self.library_root / "WxAlert" / "wx_alert.mp3"
+        path = self.library_root / "WxAlert" / "wx_alert.flac"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"id3")  # file present, no Track
         snap = self.snapshot()
@@ -866,13 +866,13 @@ class DiagnosticsFreshnessTests(TestCase):
 
     def test_fresh_wx_temp_artifact_is_ready(self):
         from weather.freshness import WX_TEMP_FRESHNESS_SECONDS
-        self._generated_artifact("WxTemp", "current_temp.mp3", WX_TEMP_FRESHNESS_SECONDS - 60)
+        self._generated_artifact("WxTemp", "current_temp.flac", WX_TEMP_FRESHNESS_SECONDS - 60)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_temp").state, "ready")
 
     def test_stale_wx_temp_artifact_is_degraded(self):
         from weather.freshness import WX_TEMP_FRESHNESS_SECONDS
-        self._generated_artifact("WxTemp", "current_temp.mp3", WX_TEMP_FRESHNESS_SECONDS + 60)
+        self._generated_artifact("WxTemp", "current_temp.flac", WX_TEMP_FRESHNESS_SECONDS + 60)
         snap = self.snapshot()
         fact = snap.get("generated_artifact:wx_temp")
         self.assertEqual(fact.state, "degraded")
@@ -880,25 +880,25 @@ class DiagnosticsFreshnessTests(TestCase):
 
     def test_fresh_wx_obs_artifact_is_ready(self):
         from weather.freshness import WX_OBS_FRESHNESS_SECONDS
-        self._generated_artifact("WxObs", "current_obs.mp3", WX_OBS_FRESHNESS_SECONDS - 60)
+        self._generated_artifact("WxObs", "current_obs.flac", WX_OBS_FRESHNESS_SECONDS - 60)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_obs").state, "ready")
 
     def test_stale_wx_obs_artifact_is_degraded(self):
         from weather.freshness import WX_OBS_FRESHNESS_SECONDS
-        self._generated_artifact("WxObs", "current_obs.mp3", WX_OBS_FRESHNESS_SECONDS + 60)
+        self._generated_artifact("WxObs", "current_obs.flac", WX_OBS_FRESHNESS_SECONDS + 60)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_obs").state, "degraded")
 
     def test_fresh_wx_forecast_artifact_is_ready(self):
         from weather.freshness import WX_FORECAST_FRESHNESS_SECONDS
-        self._generated_artifact("WxForecast", "forecast.mp3", WX_FORECAST_FRESHNESS_SECONDS - 60)
+        self._generated_artifact("WxForecast", "forecast.flac", WX_FORECAST_FRESHNESS_SECONDS - 60)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_forecast").state, "ready")
 
     def test_stale_wx_forecast_artifact_is_degraded(self):
         from weather.freshness import WX_FORECAST_FRESHNESS_SECONDS
-        self._generated_artifact("WxForecast", "forecast.mp3", WX_FORECAST_FRESHNESS_SECONDS + 60)
+        self._generated_artifact("WxForecast", "forecast.flac", WX_FORECAST_FRESHNESS_SECONDS + 60)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_forecast").state, "degraded")
 
@@ -911,7 +911,7 @@ class DiagnosticsFreshnessTests(TestCase):
         write_json(self.data_dir / "active_watches_warnings.json", [
             {"event": "Tornado Warning", "text": "...", "text_core": "..."},
         ])
-        self._generated_artifact("WxAlert", "wx_alert.mp3", WX_FORECAST_FRESHNESS_SECONDS * 10)
+        self._generated_artifact("WxAlert", "wx_alert.flac", WX_FORECAST_FRESHNESS_SECONDS * 10)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
 

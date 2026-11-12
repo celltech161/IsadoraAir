@@ -36,7 +36,7 @@ State vocabulary (`DiagnosticFact.state`):
                           file with no matching Track)
     not_applicable    -- deliberate 5th state, added in Pass B: evidence
                           for an EVENT-DRIVEN artifact (WxAlert/
-                          wx_alert.mp3, the urgent spoken watch/warning
+                          wx_alert.flac, the urgent spoken watch/warning
                           and AMBER-family statement -- NOT the FX
                           "alert beep", which is a separate, always-
                           available cart tracked by `alert_fx_cart`)
@@ -106,34 +106,11 @@ _SIMPLE_DATA_FILES = ["processed_weather.json", "sky_condition.json"]
 
 GENERATED_ARTIFACTS = [
     # (fact key suffix, category code, filename, event_driven)
-    # The filename is the preferred (current) one; _resolve_artifact_filename() also recognizes the same asset at
-    # its other extension, so a station still holding the pre-r0134 .mp3 Track is reported correctly until its
-    # first FLAC publication adopts that Track.
     ("wx_temp", "WxTemp", "current_temp.flac", False),
     ("wx_obs", "WxObs", "current_obs.flac", False),
     ("wx_forecast", "WxForecast", "forecast.flac", False),
     ("wx_alert", "WxAlert", "wx_alert.flac", True),
 ]
-
-_ARTIFACT_SUFFIXES = (".flac", ".mp3")
-
-
-def _resolve_artifact_filename(library_root: Path, category_code: str, filename: str, category) -> str:
-    """The filename the asset is CURRENTLY published as: the one a Track points at (FLAC preferred), else the one
-    present on disk (FLAC preferred), else the preferred name. Read-only."""
-    stem = Path(filename).stem
-    ordered = [filename] + [f"{stem}{suffix}" for suffix in _ARTIFACT_SUFFIXES if f"{stem}{suffix}" != filename]
-    paths = {name: str(library_root / category_code / name) for name in ordered}
-    if category is not None:
-        tracked = set(Track.objects.filter(category=category, filepath__in=list(paths.values()))
-                      .values_list("filepath", flat=True))
-        for name in ordered:
-            if paths[name] in tracked:
-                return name
-    for name in ordered:
-        if Path(paths[name]).is_file():
-            return name
-    return filename
 
 _NWS_ZONE_RE = re.compile(r"^[A-Z]{2}[CZ]\d{3}$")
 
@@ -261,7 +238,7 @@ def get_weather_diagnostics(now=None, data_dir=None, library_root=None) -> Weath
     amber_data_fact = _check_amber_alerts_data(amber_cfg, data_dir / "active_amber_alerts.json", now)
     facts.append(amber_data_fact)
 
-    # WxAlert/wx_alert.mp3 is shared by both source types and, being
+    # WxAlert/wx_alert.flac is shared by both source types and, being
     # event-driven, needs to know whether an alert is CURRENTLY active
     # before file/Track presence can be interpreted at all -- see
     # _classify_alert_applicability() and _check_generated_artifact().
@@ -828,7 +805,7 @@ def _confirmed_active_count(fact: DiagnosticFact, disabled_counts_as_zero: bool)
 def _classify_alert_applicability(watch_fact: DiagnosticFact, amber_data_fact: DiagnosticFact) -> str:
     """Combines the already-collected watch/warning and AMBER-family
     active-alert evidence into one verdict for the shared, event-driven
-    WxAlert/wx_alert.mp3 artifact -- never re-reads or reinterprets the
+    WxAlert/wx_alert.flac artifact -- never re-reads or reinterprets the
     source files itself (see _check_generated_artifact()). One of:
 
       "active"    -- either source confidently shows count > 0
@@ -946,11 +923,10 @@ def _check_generated_artifact(
     SECONDS) and the provenance sidecar comparison (all artifacts,
     including wx_alert -- see _apply_provenance_overlay)."""
     key = f"generated_artifact:{suffix}"
-    category = Category.objects.filter(code=category_code).first()
-    filename = _resolve_artifact_filename(library_root, category_code, filename, category)
     expected_path = library_root / category_code / filename
     file_exists = expected_path.is_file()
 
+    category = Category.objects.filter(code=category_code).first()
     track = None
     if category is not None:
         track = Track.objects.filter(category=category, filepath=str(expected_path)).first()
@@ -1010,7 +986,7 @@ def _check_routine_generated_artifact(key, suffix, filename, expected_path, file
 
 
 def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, age, evidence, applicability) -> DiagnosticFact:
-    """WxAlert/wx_alert.flac (or its pre-r0134 .mp3) is the urgent spoken watch/warning and
+    """WxAlert/wx_alert.flac is the urgent spoken watch/warning and
     AMBER-family statement (built by weather_ingest/wx_alert.py and
     amber_alert.py) -- NOT the FX "alert beep" tracked separately by
     `alert_fx_cart`. It is shared by both source types and, being
@@ -1031,9 +1007,9 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
 
     if applicability == "no_active":
         if file_exists or track is not None:
-            summary = f"No active Weather/AMBER alert; historical {expected_path.name} is present."
+            summary = "No active Weather/AMBER alert; historical wx_alert.flac is present."
         else:
-            summary = "No active Weather/AMBER alert; the alert audio has never been generated."
+            summary = "No active Weather/AMBER alert; wx_alert.flac has never been generated."
         return DiagnosticFact(
             key=key, state="not_applicable", summary=summary,
             path=str(expected_path) if file_exists else None,
@@ -1044,31 +1020,31 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
     if file_exists and track is not None and track.ready2air:
         return DiagnosticFact(
             key=key, state="ready",
-            summary=f"An alert is active and {expected_path.name} is present with its Track Ready to Air.",
+            summary="An alert is active and wx_alert.flac is present with its Track Ready to Air.",
             path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
         )
     if not file_exists and track is None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary=f"An alert is active but {expected_path.name} has never been generated.",
+            summary="An alert is active but wx_alert.flac has never been generated.",
             evidence=evidence,
         )
     if file_exists and track is None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary=f"An alert is active but {expected_path.name} has no matching Track -- delivery may have been interrupted.",
+            summary="An alert is active but wx_alert.flac has no matching Track -- delivery may have been interrupted.",
             path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
         )
     if not file_exists and track is not None:
         return DiagnosticFact(
             key=key, state="needs_attention",
-            summary=f"An alert is active but {expected_path.name} is missing on disk (a Track still references it).",
+            summary="An alert is active but wx_alert.flac is missing on disk (a Track still references it).",
             evidence=evidence,
         )
     # file_exists and track is not None and not track.ready2air
     return DiagnosticFact(
         key=key, state="needs_attention",
-        summary=f"An alert is active but {expected_path.name}'s Track is not marked Ready to Air.",
+        summary="An alert is active but wx_alert.flac's Track is not marked Ready to Air.",
         path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
     )
 

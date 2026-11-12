@@ -65,13 +65,6 @@ class Command(BaseCommand):
             f"{'Created' if result.created else 'Updated'} track {result.track.id} "
             f"({options['category_code']}/{result.final_path.name})."
         )
-        if result.adopted_from is not None:
-            self.stdout.write(
-                f"Adopted track {result.track.id}: {result.adopted_from.name} -> {result.final_path.name} "
-                f"(same Track; the previous file was left in place)."
-            )
-        for warning in result.warnings:
-            self.stderr.write(f"WARNING: {warning}")
         if result.provenance_error:
             # Deliberately self.stderr, not self.stdout -- see the
             # class docstring. Plain text (no self.style.WARNING

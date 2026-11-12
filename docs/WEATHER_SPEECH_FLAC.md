@@ -5,7 +5,7 @@
 | Area | Before | Now |
 |---|---|---|
 | Weather speech (Temp, Obs, Forecast, Alert) | MP3 (libmp3lame 320 kbps), no level processing, about -22 LUFS | 44.1 kHz stereo 16-bit **FLAC**, calibrated gain + true-peak limiter, 1 s lead-in unchanged |
-| Weather publication | `.mp3` only | `.flac` (standard) or `.mp3`; the asset's existing Track is **adopted in place** |
+| Weather publication | `.mp3` only | `.flac` (standard) or `.mp3`; a FLAC is an ordinary new library asset |
 | Dedication intros | native 24 kHz mono FLAC, no peak control (9 of 28 above -1 dBTP) | same file format, plus a no-gain 0.84 peak limiter |
 | KanDrive (road conditions) | two-pass loudnorm to -16 LUFS / -1 dBTP | **unchanged** |
 | Shared TTS runtime, engine, schema, packages, protected runtime | | **unchanged** |
@@ -53,61 +53,71 @@ duration, still line up with the speech). Applying the stereo -16 target to a mo
 `peak_ceiling` is an optional field on the Speech Splice and Rotation Asset specs, default `None`: every other
 caller of the renderer produces exactly the command it always did.
 
-## Track identity and cutover
+## Publication and Track registration
 
-Why a Weather FLAC must **adopt** the MP3's Track instead of registering a new one:
+This is an encoder and filename transition, not a media migration. The publisher (`weather/publication.py`) accepts a
+`.flac` (or `.mp3`) candidate whose extension matches the destination filename, and otherwise behaves exactly as
+before: per-destination lock, atomic replacement, last-known-good rollback, normal `sync_track_file` registration,
+waveform promotion, provenance sidecar, failure notification. A FLAC is registered by its own file path:
 
-- The engine's urgent insert takes the first ready Track of `WxAlert` with no ordering. With two Tracks the lowest id
-  (the stale MP3) wins forever and a new alert never airs.
-- Scheduling would pool two Tracks per category; approved logs would keep airing a stale file nothing regenerates.
-- `PlaylistItem.track` and `RotationSlot.track` are PROTECT, and `LogItem`/`PlayEvent` hold history; deleting the old
-  Track is not possible without detaching about 8,500 log items and 7,158 play events.
+- first publication creates a new Track (whatever id Django assigns); later publications of the same file update it;
+- an existing MP3 Track or file is **never** read, re-pointed, rewritten or deleted by a FLAC publication;
+- there is no cross-format conversion, fallback or migration, and no change to the engine, schema or `delivery.py`.
 
-`publish_weather_asset` therefore, inside its existing atomic transaction and under the asset lock, re-points the
-asset's existing Track (same row, same id) at the new file, then runs the normal sync and analysis. Locks, in the
-library's documented order: the asset flock (category + stem), the path locks of both files (sorted), then the Track
-row (`select_for_update(of=("self",))`). The previous file is never touched or deleted.
+Permanent destinations (unchanged on every generation; NWS and AMBER alerts share the alert file):
 
-### States a station can be in
-
-| State | Behavior |
+| Category | File |
 |---|---|
-| Before install | MP3 Tracks. Nothing changes. |
-| Installed, no producer has run | MP3 Tracks, still valid and airing; diagnostics report the `.mp3`. |
-| First FLAC publication of an asset | The Track is adopted; the asset now plays the FLAC. Other assets stay MP3 until their own first run. |
-| FLAC publication fails (encode, sync, analysis, waveform) | Rolled back: the Track stays at the MP3, the new FLAC is removed, the MP3 is untouched. Same as any current failed publication. |
-| Fresh install (no previous Track) | The Track is created at the `.flac` path. |
-| Alert asset with no active alert | Stays MP3 until the first FLAC alert converts it. |
+| WxTemp | `current_temp.flac` |
+| WxObs | `current_obs.flac` |
+| WxForecast | `forecast.flac` |
+| WxAlert | `wx_alert.flac` |
 
-Tracks at both extensions (a hand-made duplicate): nothing is adopted, publication proceeds, a warning is returned
-and logged by the producer; resolve the duplicate asset manually.
+Metadata: the FLAC carries the same title and artist values the MP3 carried (as Vorbis comments); the library's tag
+reader populates the Track from them (covered by a real-ffmpeg test).
 
-### Operator cutover
+Diagnostics check the `.flac` files only. A legacy MP3 left in a category is not evidence that the FLAC workflow is
+healthy. WxAlert remains event-driven: with no active alert the FLAC legitimately does not exist yet.
 
-Installation is a normal Update Center install (no restart beyond what the release manifest declares). There is no
-manual migration step. Afterwards:
+## Operator-managed MP3 retirement (required)
 
-1. Run no TTS or alert by hand. The next scheduled producer runs perform each asset's adoption.
-2. After each product's first FLAC publication, confirm in Weather Setup Status that the artifact reports the `.flac`
-   and `ready`, and that the Library shows the same Track id with format `flac`.
-3. Listen to each product once on air; compare level to a KanDrive segment.
-4. Leave the old `.mp3` files in place. They are no longer referenced; remove them only as a separate, deliberate
-   cleanup after the cutover has been accepted. (Do not re-import the directory first: a library scan would register
-   the orphaned MP3 as a second Track and recreate the duplicate-asset problem.)
+The old MP3 Tracks and files are the operator's to retire. Nothing here deletes them, rewrites playlists, logs or
+rotations, or changes their readiness. After the first FLAC publication of an asset, **the old MP3 Track and the new
+FLAC Track are both in the same category** until the operator retires the MP3. That is a temporary, operator-managed
+condition with real consequences; do not leave both eligible:
 
-### Rollback
+- **Scheduling and rotations** may pool both Tracks, and approved logs or playlists keep referencing the old MP3 Track,
+  which nothing regenerates any more (it will air stale). Review playlists, rotations and scheduled references and
+  switch them to the FLAC Track before retiring the MP3.
+- **WxAlert urgent insert** takes the first ready Track of the `WxAlert` category with no ordering (engine behavior,
+  deliberately unchanged). While the old `wx_alert.mp3` Track is eligible it can be chosen instead of the new FLAC.
 
-Rolling the source back to r0133 after any asset has been adopted is **not** self-contained: r0133's publisher would
-create a new Track at the `.mp3` path next to the adopted FLAC Track. Before rolling back, for each adopted asset
-publish the retained old MP3 back through this release's publisher (adoption works in both directions), e.g.
-`manage.py publish_weather_asset /srv/isadoraair/music/WxTemp/current_temp.mp3 WxTemp current_temp.mp3`, which
-re-points the same Track at the MP3. Do not roll back source with FLAC Tracks in service without doing this
-(or a reviewed manual re-point). This is a reason not to delete the old MP3 files until the cutover is accepted.
+### Cutover checklist
 
-## Open decisions for review
+1. Confirm no alert transition or urgent insertion is underway; if one is, defer the cutover.
+2. Install the release normally (no migration, package or unit change; see the release manifest for restarts).
+3. Before the new workflow is in operational service, retire the old **`WxAlert/wx_alert.mp3`** Track from urgent
+   selection (clear Ready to Air or remove it from rotation, as the operator prefers).
+4. Let the scheduled producers run. Each product's FLAC appears at its first publication; confirm in Weather Setup
+   Status that it reports the `.flac` as `ready`, and in the Library that a FLAC Track exists at the permanent path.
+5. For WxTemp, WxObs and WxForecast, move playlist and rotation references from the old MP3 Track to the FLAC Track,
+   then retire the MP3 Track. Listen once on air and compare the level to a KanDrive segment.
+6. WxAlert: the FLAC does not exist until a qualifying alert occurs. Until then the category has no ready alert Track
+   (the old MP3 is retired by step 3); there is no automatic fallback. When the first real alert is generated, verify
+   the FLAC Track is registered and is the one selected. Do not generate a test alert on the live station.
+7. Delete the old MP3 files only as a separate decision after acceptance. Do not re-import the directory while the
+   retired MP3 Tracks are still wanted gone: a library scan would register any MP3 left on disk.
 
-1. **No cross-format fallback for urgent alerts.** If the alert FLAC publication fails, the previous MP3 keeps airing
-   (as today). There is no attempt to publish an MP3 instead.
-2. **Fixed gains.** A new voice, or a significantly different phrasing style, needs a calibration row; until then the
-   default row (Max's values) applies with a warning.
-3. **Old MP3 cleanup** is deliberately not automated.
+### Rolling back the encoder
+
+Roll back the source to r0133 and re-enable the old MP3 Tracks; r0133 publishes `*.mp3`. The FLAC Tracks and files are
+ordinary library assets that the operator can retire the same way.
+
+## Open items
+
+1. Claira's alert gain (+6.5 dB) is provisional: no Claira alert sample exists. Claira's output was measured, not
+   auditioned.
+2. Fixed gains: a new voice or a very different phrasing style needs a calibration row; until then the default row
+   (Max's values) applies with a logged warning.
+3. The `help_text` of `WeatherConfig.alert_sound_trigger_events` (`weather/models.py`) still names `wx_alert.mp3`; changing
+   it needs a migration, so it is a separate cosmetic follow-up.
