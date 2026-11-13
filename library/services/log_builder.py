@@ -577,7 +577,7 @@ def _weighted_choice_by(items, weight_fn):
     return random.choices(items, weights=weights, k=1)[0]
 
 
-def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None):
+def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None, max_overshoot_seconds=DURATION_FIT_MARGIN):
     """Exact-fit selection (1.1 spec): from the FULL pool of eligible
     tracks (no top-200 truncation), weighted-random choice among the
     FIT_NEAR_MATCH_COUNT closest-duration candidates that don't
@@ -601,13 +601,17 @@ def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None):
     (pick_track's loosening ladder, _build_from_rotation,
     fill_remaining_hour) already treat None gracefully -- loosen
     further, skip the slot, or stop the fill loop -- so this is a safe,
-    already-supported return value, not a new failure mode."""
+    already-supported return value, not a new failure mode.
+
+    `max_overshoot_seconds` is DURATION_FIT_MARGIN for every scheduler
+    path; only the engine's end-of-hour closing fill passes 0 (see
+    fill_remaining_hour's `closing_fill`)."""
     candidates = _extract_fit_candidates(qs, active_holiday_codes=active_holiday_codes)
     if not candidates:
         return None
 
     scored = [(abs(remaining_seconds - c.duration_seconds), c) for c in candidates]
-    within_margin = [(diff, c) for diff, c in scored if remaining_seconds - c.duration_seconds >= -DURATION_FIT_MARGIN]
+    within_margin = [(diff, c) for diff, c in scored if remaining_seconds - c.duration_seconds >= -max_overshoot_seconds]
     if not within_margin:
         return None
     within_margin.sort(key=lambda pair: pair[0])
@@ -1050,7 +1054,8 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
                hard_exclude_track_ids=None, hard_exclude_identity_keys=None,
                active_holiday_codes=None,
                pool_override_qs=None, exclude_holiday_codes=None,
-               identity_cache=None, pool_key=None, force_fit_mode=False):
+               identity_cache=None, pool_key=None, force_fit_mode=False,
+               fit_max_overshoot_seconds=DURATION_FIT_MARGIN, relax_separation=True):
     """`exclude_*` are RECENCY-HISTORY exclusions -- they get progressively
     dropped by the loosening loop below if no candidate can be found.
 
@@ -1110,6 +1115,13 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
     up "no" for a music-kind slot on a holiday day -- prevents holiday-
     tagged tracks from leaking through the SLOT'S normal category
     filing and inflating the effective share beyond the target.
+
+    `fit_max_overshoot_seconds` / `relax_separation` exist only for the
+    engine's end-of-hour closing fill (fill_remaining_hour's
+    `closing_fill`): an exact-fit pick that may not end after the
+    remaining time at all, and that is skipped rather than chosen by
+    loosening separation or repeating a track. Every other caller keeps
+    the defaults, which are the historical behaviour.
     """
     # EXACT_FIT_THRESHOLD_SECONDS (1.1 spec) supersedes the historical
     # single-tier DURATION_FIT_THRESHOLD as the exact-fit engagement
@@ -1180,12 +1192,15 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
     for attempt in range(max_loosening + 1):
         qs = _build_qs()
         if fit_mode:
-            track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
+            track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes,
+                                   max_overshoot_seconds=fit_max_overshoot_seconds)
         else:
             track = _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
 
         if track:
             return track
+        if not relax_separation:
+            return None
 
         artist_sep = artist_sep / 2.0
         title_sep = title_sep / 2.0
@@ -1237,7 +1252,8 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
     hard_exclude_identity_keys = set()
     qs = _build_qs()
     if fit_mode:
-        track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
+        track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes,
+                               max_overshoot_seconds=fit_max_overshoot_seconds)
     else:
         track = _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
     if track is not None:
@@ -1256,7 +1272,8 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
     hard_exclude_track_ids = set()
     qs = _build_qs()
     if fit_mode:
-        return _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
+        return _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes,
+                              max_overshoot_seconds=fit_max_overshoot_seconds)
     return _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
 
 
@@ -1288,7 +1305,7 @@ def _identity_keys_for_picks(picks):
 def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
                         active_holiday_codes=None, daily_shares=None,
                         identity_cache=None, target_duration_seconds=NOMINAL_HOUR_SECONDS,
-                        scheduled_time_offset_seconds=0.0):
+                        scheduled_time_offset_seconds=0.0, closing_fill=False):
     """Top up `picks` with fallback-category tracks (admin-configured via
     LogFillConfig) until `target_duration_seconds` is filled, or as
     tightly as duration-fit allows. Called after any build path in case
@@ -1313,9 +1330,16 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     `identity_cache`: pass the same TrackIdentityCache the caller's
     other pick_track() calls in this build are using, so the fallback
     category's pool data is reused rather than reloaded. Defaults to a
-    fresh one if not given."""
+    fresh one if not given.
+
+    `closing_fill` (engine live fill only; every build path leaves it
+    False): fill a remainder at or below DURATION_FIT_MARGIN, which this
+    function otherwise leaves alone. Each pick must END within the
+    remaining time (zero overshoot) and keeps full separation -- no
+    loosening, no repeated track; when nothing fits, nothing is added."""
     remaining = target_duration_seconds - accumulated_seconds
-    if remaining <= DURATION_FIT_MARGIN:
+    stop_at = 0.0 if closing_fill else DURATION_FIT_MARGIN
+    if remaining <= stop_at:
         return picks, accumulated_seconds
 
     cfg = LogFillConfig.load()
@@ -1376,7 +1400,7 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
         return track_duration
 
     for _ in range(MAX_FILL_TRACKS):
-        if remaining <= DURATION_FIT_MARGIN:
+        if remaining <= stop_at:
             break
         artist_sep, title_sep = get_separation(category, recency_cfg)
         exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
@@ -1409,7 +1433,7 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
         # exact-fit pick. Mirrors _build_from_rotation's landing-mode
         # branch, adapted for one repeating pool instead of two
         # independently-resolved rotation slots.
-        if EXACT_FIT_THRESHOLD_SECONDS < remaining <= PAIR_LANDING_THRESHOLD_SECONDS:
+        if not closing_fill and EXACT_FIT_THRESHOLD_SECONDS < remaining <= PAIR_LANDING_THRESHOLD_SECONDS:
             hard_exclude_track_ids = {t.id for t in picked_tracks}
             hard_exclude_identity_keys = set(picked_identity_keys)
             candidates = _landing_slot_candidates(
@@ -1455,7 +1479,9 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
             exclude_holiday_codes=exclude_holiday_codes,
             identity_cache=identity_cache,
             pool_key=pool_key,
-            force_fit_mode=remaining <= PAIR_LANDING_THRESHOLD_SECONDS,
+            force_fit_mode=closing_fill or remaining <= PAIR_LANDING_THRESHOLD_SECONDS,
+            fit_max_overshoot_seconds=0.0 if closing_fill else DURATION_FIT_MARGIN,
+            relax_separation=not closing_fill,
         )
         if track is None:
             break  # nothing eligible even after loosening — stop gracefully

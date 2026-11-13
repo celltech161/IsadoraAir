@@ -11,7 +11,7 @@ import time
 import traceback
 import uuid
 from collections import OrderedDict, deque
-from datetime import datetime as datetime_cls, time as datetime_time, timedelta
+from datetime import datetime as datetime_cls, time as datetime_time, timedelta, timezone as dt_timezone
 from pathlib import Path
 
 import gi
@@ -851,6 +851,16 @@ REMOTE_DJ_AUTHZ_TICK_SECONDS = 5
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
+# End-of-hour closing fill (legacy live fill): a remaining deficit at or below DURATION_FIT_MARGIN is
+# filled only with fallback items that end at or before the top of the hour, and only when it is longer
+# than this. The next hour's build is started by the first scheduler tick inside the lookahead window,
+# i.e. no later than this many seconds before the hour; a queue that runs out after that is covered by
+# the early rollover into the approved next hour, so filling it would only extend the old hour with an
+# item the rollover supersedes before it airs.
+LIVE_FILL_CLOSING_MIN_SECONDS = float(NEXT_HOUR_LOOKAHEAD_SECONDS - AUTO_BUILD_CHECK_SECONDS)
+# Install-time allowance for deck-position jitter when re-checking that a closing proposal still ends
+# by the top of the hour.
+LIVE_FILL_CLOSING_TOLERANCE_SECONDS = 1.0
 # Clock-drift recovery (1.1 spec): one-way cap on how much shorter than a
 # nominal hour the upcoming build's target_duration_seconds can be
 # shrunk to compensate for a projected-late takeover. Protects against a
@@ -2074,6 +2084,7 @@ class PlaybackEngine:
         self._last_live_extend_attempt = 0.0
         self._live_fill_in_progress = False  # guarded by self._lock -- see _try_extend_live_log_async
         self._live_fill_generation = 0  # guarded by self._lock -- bumped on every dispatch, see _try_extend_live_log_async
+        self._live_fill_closing_no_fit = None  # guarded by self._lock -- (log id, queue length) a closing fill found nothing for
         self.running = False
         self._orderly_shutdown_requested = False
         self._stop_started = False
@@ -6449,10 +6460,21 @@ class PlaybackEngine:
         # exactly the false-fill case this suppresses.
         committed_runway = self._committed_future_runway_seconds()
         deficit = seconds_left - committed_runway
+        closing_until = None
         if deficit <= DURATION_FIT_MARGIN:
+            # End-of-hour closing fill: a remainder the ordinary fill leaves alone, too long for the
+            # next-hour lookahead to cover (see LIVE_FILL_CLOSING_MIN_SECONDS), is filled only with
+            # items that end by the top of the hour (absolute instant, exact to the microsecond); a
+            # queue state that already found nothing is not retried.
+            exact_left = 3600 - (wall_now.minute * 60 + wall_now.second + wall_now.microsecond / 1e6)
+            deficit = exact_left - committed_runway
             with self._lock:
-                self._live_fill_in_progress = False
-            return False
+                no_fit = getattr(self, "_live_fill_closing_no_fit", None) == (self.current_log.id, len(self.log_items))
+            if deficit <= LIVE_FILL_CLOSING_MIN_SECONDS or no_fit:
+                with self._lock:
+                    self._live_fill_in_progress = False
+                return False
+            closing_until = wall_now.astimezone(dt_timezone.utc) + timedelta(seconds=exact_left)
 
         # Capture an IMMUTABLE snapshot of everything the worker needs --
         # never hand the worker thread self.current_log/self.log_items
@@ -6480,11 +6502,12 @@ class PlaybackEngine:
         threading.Thread(
             target=self._live_fill_worker,
             args=(log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds),
+            kwargs={"closing_until": closing_until} if closing_until is not None else {},
             daemon=True,
         ).start()
         return False
 
-    def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+    def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds=NOMINAL_HOUR_SECONDS, closing_until=None):
         """Runs on a background thread -- READ-ONLY with respect to the
         database. Computes a PROPOSED set of fill picks via
         fill_remaining_hour (which issues real SELECT queries, e.g.
@@ -6509,7 +6532,13 @@ class PlaybackEngine:
         docstring for the "false-deficit suppression" derivation) --
         NOT a hardcoded 3600. This is what makes fill_remaining_hour
         target the real remaining window rather than assuming a full
-        hour is empty."""
+        hour is empty.
+
+        `closing_until` (the top of the hour as an absolute instant) marks
+        an end-of-hour closing fill: fill_remaining_hour runs with
+        closing_fill=True, the deadline travels to the install callback,
+        and an empty result is remembered for this queue state so the
+        dispatcher does not retry it."""
         try:
             _close_old_connections()
             # fill_remaining_hour appends onto `existing_picks` in place
@@ -6518,9 +6547,13 @@ class PlaybackEngine:
             all_picks, _ = fill_remaining_hour(
                 existing_picks, accumulated, hour_start,
                 target_duration_seconds=target_duration_seconds,
+                **({"closing_fill": True} if closing_until is not None else {}),
             )
             new_picks = all_picks[original_count:]
             if not new_picks:
+                if closing_until is not None:
+                    with self._lock:
+                        self._live_fill_closing_no_fit = (log_id, original_count)
                 return
             if self.running:  # don't schedule queue mutations mid-teardown
                 # 2.27 Phase C: the install stays "pending" from here until
@@ -6532,7 +6565,8 @@ class PlaybackEngine:
                         coordinator.mark_legacy_pending(generation)
                 try:
                     GLib.idle_add(self._install_live_fill, log_id, generation, new_picks,
-                                  original_count, start_position)
+                                  original_count, start_position,
+                                  *((closing_until,) if closing_until is not None else ()))
                 except Exception:
                     # Scheduling failed, so no callback exists to clear this
                     # generation. Do it here before the outer handler records
@@ -6555,7 +6589,7 @@ class PlaybackEngine:
                     self._live_fill_in_progress = False
 
     @_glib_safe(default_return=False)
-    def _install_live_fill(self, log_id, generation, new_picks, expected_prior_count, start_position):
+    def _install_live_fill(self, log_id, generation, new_picks, expected_prior_count, start_position, closing_until=None):
         """2.27 Phase C arbitration wrapper (memory only): discard while a
         causal refill's committed rows await reload, and always clear the
         pending-callback mark."""
@@ -6567,14 +6601,14 @@ class PlaybackEngine:
                         coordinator.legacy_discards += 1
                         return False
             return self._install_live_fill_checked(
-                log_id, generation, new_picks, expected_prior_count, start_position,
+                log_id, generation, new_picks, expected_prior_count, start_position, closing_until,
             )
         finally:
             if coordinator is not None:
                 with self._lock:
                     coordinator.clear_legacy_pending(generation)
 
-    def _install_live_fill_checked(self, log_id, generation, new_picks, expected_prior_count, start_position):
+    def _install_live_fill_checked(self, log_id, generation, new_picks, expected_prior_count, start_position, closing_until=None):
         """One-shot GLib.idle_add callback -- runs on the main thread,
         so it's safe to touch engine state here, and is the ONLY place
         a live-fill proposal is allowed to touch the database. A stale
@@ -6605,6 +6639,11 @@ class PlaybackEngine:
              past the real hour boundary (or close enough that the gap
              this proposal was computed for no longer exists) even if
              current_log/log_items look unchanged.
+          6. A closing fill (`closing_until` set) must still END by that
+             top of the hour, given what is committed to play now: a
+             callback delayed past the hour, or air time taken by
+             something outside the queue (an urgent item), discards it.
+             In memory only -- no query.
 
         Only once every check passes does the DB append
         (append_fill_items, transactional) happen, and only after that
@@ -6632,6 +6671,13 @@ class PlaybackEngine:
         if seconds_left_now <= DURATION_FIT_MARGIN:
             print(f"  Discarding stale live-fill proposal for log id={log_id} -- real hour boundary reached since dispatch")
             return False
+        if closing_until is not None:
+            airtime = sum(effective_airtime_seconds(pick["track"]) for pick in new_picks)
+            budget = (closing_until - wall_now).total_seconds() - self._committed_future_runway_seconds()
+            if airtime > budget + LIVE_FILL_CLOSING_TOLERANCE_SECONDS:
+                print(f"  Discarding closing live-fill proposal for log id={log_id} -- {airtime:.1f}s would not end "
+                      f"by the top of the hour ({budget:.1f}s left)")
+                return False
 
         _close_old_connections()
         try:
@@ -6658,8 +6704,8 @@ class PlaybackEngine:
         # without going through _apply_poison_skip" simple and provable.
         new_items = self._apply_poison_skip(new_items)
         self.log_items.extend(new_items)
-        print(f"  Installed {len(new_items)} live-filled track(s) onto the active queue "
-              f"({seconds_left_now:.0f}s left in the real hour)")
+        print(f"  Installed {len(new_items)} {'closing ' if closing_until is not None else ''}live-filled track(s) "
+              f"onto the active queue ({seconds_left_now:.0f}s left in the real hour)")
         # Informational, lower severity than the "log not ready" warnings
         # in _ensure_upcoming_logs -- this path fires for two different
         # reasons (ordinary early exhaustion mid-hour, e.g. a DJ skipped
