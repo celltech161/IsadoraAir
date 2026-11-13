@@ -92,16 +92,20 @@ class _EndOfHourFixture(_RolloverFixture):
         final_end = TOH - timedelta(seconds=deficit)
         if approve_at is None and lead is not None:
             approve_at = TOH - timedelta(seconds=lead)
-        holder = {"workers": 0}
+        holder = {"workers": 0, "delivered": 0}
 
         def hook(sim, engine):
             holder["sim"] = sim
-            real_worker = engine._live_fill_worker
+            real_worker, real_install = engine._live_fill_worker, engine._install_live_fill
 
             def counted_worker(*args, **kwargs):
                 holder["workers"] += 1
                 return real_worker(*args, **kwargs)
-            engine._live_fill_worker = counted_worker
+
+            def counted_install(*args):
+                holder["delivered"] += 1
+                return real_install(*args)
+            engine._live_fill_worker, engine._install_live_fill = counted_worker, counted_install
             if setup is not None:
                 setup(sim, engine)
 
@@ -114,7 +118,7 @@ class _EndOfHourFixture(_RolloverFixture):
                 start=final_end - timedelta(seconds=lead_in, milliseconds=250),
                 end=end, setup=hook, events=events,
             )
-        sim.workers = holder["workers"]
+        sim.workers, sim.delivered = holder["workers"], holder["delivered"]
         return sim, self.measure(sim, final_end)
 
     def measure(self, sim, final_end):
@@ -271,6 +275,48 @@ class EndOfHourClosingFillTests(_EndOfHourFixture, TransactionTestCase):
         self.assertEqual(m.silence, 0.0, m.report)
         self.assertLessEqual(sim.workers, 3)
 
+    def test_s16_final_item_dequeued_inside_the_last_30s(self):
+        """A short final item started 29 s before the hour leaves a 26 s shortage the dispatcher first sees
+        inside the final 30 s (ba3f8a4: suppressed by the wall-clock gate; 3 s of silence at a 23 s lead)."""
+        self.use_pool(*KOGR_POOL)
+        for lead, before in ((23.0, 3.0), (15.0, 11.0)):
+            with self.subTest(lead=lead):
+                LogItem.objects.filter(playlist_log__hour=22).delete()
+                PlaylistLog.objects.filter(hour=22).delete()
+                LogItem.objects.filter(playlist_log__hour=21, origin=LogItem.ORIGIN_LIVE_FILL).delete()
+                sim, m = self.simulate_eoh(26.0, lead=lead, lead_in=3.0)
+                self.assert_clean_boundary(sim, m)
+                print(f"\nS16 lead={lead} silence={m.silence} (r0135/ba3f8a4: {before}) next_offset={m.next_offset} "
+                      f"aired_fill={m.aired_fill} rows={len(m.fill_rows)} workers={sim.workers}")
+                self.assertEqual(m.aired_fill, [25.8], m.report)
+                self.assertEqual((m.silence, len(m.fill_rows)), (0.0, 1), m.report)
+                self.assertLessEqual(m.fill_overrun, 0.0, m.report)
+
+    def test_s17_final_song_cut_short_with_nothing_queued(self):
+        """Measured, not improved: the final song would have carried the hour (it ends 5 s after it) and is cut
+        short with nothing queued, so the shortage appears only at that moment, on the reactive end-of-queue
+        path. That path dispatches through _roll_over_to_next_hour and then runs r0135's _on_log_exhausted,
+        which reloads the (not yet approved) next hour and clears the active queue, so any proposal --
+        closing or ordinary -- is discarded as stale. The 120 s row shows the same for an ordinary fill."""
+        self.use_pool(*KOGR_POOL)
+        for cut_left, lead in ((27.0, 23.0), (27.0, 15.0), (120.0, 23.0)):
+            with self.subTest(cut_left=cut_left, lead=lead):
+                LogItem.objects.filter(playlist_log__hour=22).delete()
+                PlaylistLog.objects.filter(hour=22).delete()
+                LogItem.objects.filter(playlist_log__hour=21, origin=LogItem.ORIGIN_LIVE_FILL).delete()
+                cut = TOH - timedelta(seconds=cut_left)
+
+                def cut_short(sim, engine):
+                    engine.decks["B"] = None
+                    sim.call("eos", engine._start_next_track)
+                sim, _m = self.simulate_eoh(-5.0, lead=lead, lead_in=cut_left + 30.0, events=[(cut, cut_short)])
+                m = self.measure(sim, cut)
+                self.assert_clean_boundary(sim, m)
+                print(f"\nS17 cut_left={cut_left} lead={lead} silence={m.silence} next_offset={m.next_offset} "
+                      f"workers={sim.workers} delivered={sim.delivered} rows={len(m.fill_rows)} aired={m.aired_fill}")
+                self.assertEqual(len(m.fill_rows), len(m.aired_fill), m.report)   # no unaired old-hour row
+                self.assertLessEqual(m.silence, cut_left - lead, m.report)        # never longer than waiting
+
     def test_gap_table_before_and_after(self):
         """Measured silence (s) / next-hour start offset (s) for a KOGR-shaped PSA pool."""
         self.use_pool(*KOGR_POOL)
@@ -337,6 +383,40 @@ class _UnitFixture(_RolloverFixture):
     def fill_rows(self):
         return list(LogItem.objects.filter(playlist_log=self.old_log, origin=LogItem.ORIGIN_LIVE_FILL))
 
+    def date_old_log(self, day, hour):
+        """Give the active (old) log the wall-clock hour a test closes (the fixture's own is 2027-03-03 21:00)."""
+        self.old_log.date, self.old_log.hour = day, hour
+        self.old_log.save(update_fields=["date", "hour"])
+
+    def idle_engine(self, left, *, now=None):
+        """An idle engine (both decks empty) whose current-hour queue is exhausted `left` s before the hour."""
+        engine, now, _ = self.engine_with_final_song(remaining=0.0, deficit=left, now=now)
+        engine.decks["B"] = None
+        return engine, now
+
+    def adopt_next_hour(self, engine, when):
+        """The real next-hour adoption (_advance_to_next_hour_log) of an approved 22:00 log; returns its item ids."""
+        if not PlaylistLog.objects.filter(date=WEDNESDAY, hour=22).exists():
+            self.make_log(22, self.next_rows, played=False)
+        engine._next_hour_peek, engine._next_hour_peek_at, engine._next_hour_peek_key = None, 0.0, None
+        engine._poison_skip_identities = []
+        with patch.object(eng_module.timezone, "localtime", return_value=when):
+            engine._advance_to_next_hour_log(WEDNESDAY, 22)
+        self.assertEqual(engine.current_log.hour, 22)
+        return [i.id for i in engine.log_items]
+
+    def classify(self, engine, now):
+        """Dispatch once; returns (worker kwargs or None when nothing was dispatched, idle callbacks)."""
+        seen = {}
+        real_worker = engine._live_fill_worker
+
+        def worker(*args, **kwargs):
+            seen.update(args=args, kwargs=kwargs)
+            return real_worker(*args, **kwargs)
+        engine._live_fill_worker = worker
+        calls = self.dispatch(engine, now)
+        return (seen.get("kwargs") if seen else None), seen.get("args"), calls
+
 
 class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
     """Scenarios 10-13 and 15, GLib-thread database work, DST and the unchanged ordinary contracts."""
@@ -371,18 +451,34 @@ class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
         self.assertEqual(self.fill_rows(), [])
 
     def test_delayed_delivery_while_idle(self):
+        # A safe closing proposal delivered inside the final 30 s, while the current hour is still the active
+        # queue and nothing else holds the air: installed and handed to playback at once.
         engine, now, _state = self.engine_with_final_song(remaining=40.0, deficit=29.0)
         calls = self.dispatch(engine, now)                 # 29 s deficit -> the 29 s PSA
         self.assertEqual([p["track"].id for p in calls[0][1][2]], [self.pool[1].id])
         engine.decks["B"] = None                           # the song was cut short (e.g. Start Next)
         self.deliver(calls[0], TOH - timedelta(seconds=30))
-        self.assertEqual(self.fill_rows(), [])             # the last 30 s belong to the next-hour lookahead
+        self.assertEqual([r.track_id for r in self.fill_rows()], [self.pool[1].id])
+        self.assertEqual([i.track_id for i in engine.log_items[4:]], [self.pool[1].id])
+        engine._start_next_track.assert_called_once_with()
+        LogItem.objects.filter(origin=LogItem.ORIGIN_LIVE_FILL).delete()
+        # The same delivery after the next hour's queue was adopted: no row, no in-memory item, no start.
         engine2, now2, _ = self.engine_with_final_song(remaining=40.0, deficit=29.0)
         calls2 = self.dispatch(engine2, now2)
         engine2.decks["B"] = None
-        self.deliver(calls2[0], TOH - timedelta(seconds=45))
-        self.assertEqual(len(self.fill_rows()), 1)         # still fits: installed and started at once
-        engine2._start_next_track.assert_called_once_with()
+        adopted = self.adopt_next_hour(engine2, TOH - timedelta(seconds=31))
+        self.deliver(calls2[0], TOH - timedelta(seconds=30))
+        self.assertEqual(self.fill_rows(), [])
+        self.assertEqual([i.id for i in engine2.log_items], adopted)
+        engine2._start_next_track.assert_not_called()
+        # A delivery too late for the 29 s PSA to end by the hour: no row, no in-memory item, no start.
+        engine3, now3, _ = self.engine_with_final_song(remaining=40.0, deficit=29.0)
+        calls3 = self.dispatch(engine3, now3)
+        engine3.decks["B"] = None
+        self.deliver(calls3[0], TOH - timedelta(seconds=20))
+        self.assertEqual(self.fill_rows(), [])
+        self.assertEqual(len(engine3.log_items), 4)
+        engine3._start_next_track.assert_not_called()
 
     def test_s11_stale_callback_after_rollover(self):
         engine, now, _state = self.engine_with_final_song()
@@ -490,6 +586,7 @@ class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
     def test_dst_fall_back_deadline_is_an_absolute_instant(self):
         chicago = ZoneInfo(settings.TIME_ZONE)
         fall_back = datetime(2026, 11, 1, 1, 58, 50, tzinfo=chicago)               # 01:58:50 CDT, fold 0
+        self.date_old_log(fall_back.date(), 1)
         engine, _now, _state = self.engine_with_final_song(now=fall_back, remaining=45.0, deficit=25.0)
         calls = self.dispatch(engine, fall_back)
         self.assertEqual(calls[0][1][5], datetime(2026, 11, 1, 7, 0, tzinfo=ZoneInfo("UTC")))
@@ -497,6 +594,18 @@ class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
         repeated = datetime(2026, 11, 1, 1, 0, 5, fold=1, tzinfo=chicago)          # 01:00:05 CST, after the hour
         self.deliver(calls[0], repeated)
         self.assertEqual(self.fill_rows(), [])
+        # Inside the repeated hour the 02:00 log installed early (01:59:30 CDT) is the active queue: a closing
+        # fill at 01:59:35 CST never extends it.
+        late_in_repeat = datetime(2026, 11, 1, 1, 59, 35, fold=1, tzinfo=chicago)
+        self.date_old_log(late_in_repeat.date(), 2)
+        engine2, _ = self.idle_engine(25.0, now=late_in_repeat)
+        self.assertEqual(self.dispatch(engine2, late_in_repeat), [])
+        self.assertFalse(engine2._live_fill_in_progress)
+        # With the repeated hour's own log active, its deadline is 02:00 CST (08:00 UTC), not 02:00 CDT.
+        self.date_old_log(late_in_repeat.date(), 1)
+        engine3, _ = self.idle_engine(25.0, now=late_in_repeat)
+        calls3 = self.dispatch(engine3, late_in_repeat)
+        self.assertEqual(calls3[0][1][5], datetime(2026, 11, 1, 8, 0, tzinfo=ZoneInfo("UTC")))
 
     def test_ordinary_dispatch_contract_is_unchanged(self):
         engine, now, _state = self.engine_with_final_song(remaining=60.0, deficit=120.0)
@@ -511,6 +620,124 @@ class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
         engine._live_fill_in_progress = False              # the stand-in worker did not clear it
         calls = self.dispatch(engine, now + timedelta(seconds=6))
         self.assertEqual(len(calls[0][1]), 5)              # the ordinary callback shape
+
+
+class ClosingFillTimingTests(_UnitFixture, TransactionTestCase):
+    """Codex timing findings on ba3f8a4: (A) the installer's final-30 s gate, (B) the dispatcher's final-30 s
+    gate and (C) the whole-second classification of a closing deficit."""
+
+    def test_a_closing_callback_at_29_to_30s_before_and_after_next_hour_adoption(self):
+        for left in (30.0, 29.5, 29.0):
+            with self.subTest(left=left):
+                LogItem.objects.filter(origin=LogItem.ORIGIN_LIVE_FILL).delete()
+                PlaylistLog.objects.filter(hour=22).delete()
+                engine, now, _ = self.engine_with_final_song(remaining=40.0, deficit=29.0)
+                calls = self.dispatch(engine, now)          # the 29 s PSA, deadline TOH
+                engine.decks["B"] = None
+                self.deliver(calls[0], TOH - timedelta(seconds=left))
+                self.assertEqual([r.track_id for r in self.fill_rows()], [self.pool[1].id])
+                self.assertEqual(engine._start_next_track.call_count, 1)
+                # The identical callback after the next hour's queue is adopted changes nothing.
+                LogItem.objects.filter(origin=LogItem.ORIGIN_LIVE_FILL).delete()
+                engine2, now2, _ = self.engine_with_final_song(remaining=40.0, deficit=29.0)
+                calls2 = self.dispatch(engine2, now2)
+                engine2.decks["B"] = None
+                adopted = self.adopt_next_hour(engine2, TOH - timedelta(seconds=left + 0.5))
+                self.deliver(calls2[0], TOH - timedelta(seconds=left))
+                self.assertEqual(self.fill_rows(), [])
+                self.assertEqual([i.id for i in engine2.log_items], adopted)
+                engine2._start_next_track.assert_not_called()
+
+    def test_b_reactive_closing_dispatch_with_21_to_30s_of_actual_shortage(self):
+        for left in (30.0, 29.5, 25.0, 21.0):
+            with self.subTest(left=left):
+                LogItem.objects.filter(origin=LogItem.ORIGIN_LIVE_FILL).delete()
+                engine, now = self.idle_engine(left)
+                kwargs, args, calls = self.classify(engine, now)
+                self.assertEqual(kwargs, {"closing_until": TOH})
+                self.assertEqual(args[7], left)            # the exact shortage
+                self.assertEqual(len(calls), 1)
+                picks = calls[0][1][2]
+                self.assertLessEqual(sum(effective_airtime_seconds(p["track"]) for p in picks), left)
+                # A second dispatch inside the 5 s throttle, or while a worker is in flight, starts nothing.
+                started = []
+                with patch.object(eng_module.timezone, "localtime", return_value=now + timedelta(seconds=1)), \
+                        patch.object(eng_module.threading, "Thread", side_effect=lambda **k: started.append(k)):
+                    engine._try_extend_live_log_async()
+                self.assertEqual(started, [])
+                engine._live_fill_in_progress = True
+                self.assertEqual(self.dispatch(engine, now + timedelta(seconds=2)), [])
+                engine._live_fill_in_progress = False
+                self.deliver(calls[0], now + timedelta(milliseconds=500))
+                self.assertEqual([r.track_id for r in self.fill_rows()], [p["track"].id for p in picks])
+                engine._start_next_track.assert_called_once_with()
+        # The adopted next hour is never extended by an obsolete current-hour fill -- even when (as this
+        # runway stand-in reports, like an adopted queue that is almost empty) it commits no runway at all.
+        engine, now = self.idle_engine(25.0)
+        self.adopt_next_hour(engine, now)
+        before = len(engine.log_items)
+        kwargs, _args, calls = self.classify(engine, now)
+        self.assertEqual((kwargs, calls, len(engine.log_items)), (None, [], before))
+        self.assertFalse(LogItem.objects.filter(playlist_log__hour=22, origin=LogItem.ORIGIN_LIVE_FILL).exists())
+        # A causal refill owner still blocks a final-30 s closing dispatch outright.
+        engine, now = self.idle_engine(25.0)
+        engine._refill_coordinator = RefillCoordinator()
+        engine._refill_coordinator.refill_owner = object()
+        self.assertEqual(self.classify(engine, now)[0::2], (None, []))
+        self.assertFalse(engine._live_fill_in_progress)
+
+    def test_c_classification_thresholds(self):
+        """remaining wall time has a fractional second; runway 40.5 s; the deficit decides alone."""
+        cases = (
+            (20.0, None),            # the floor itself: left to the next-hour lookahead
+            (20.25, "closing"),
+            (29.75, "closing"),      # Codex: 70.25 s left - 40.50 s runway (whole-second reading: 30.50)
+            (30.0, "closing"),       # the margin itself
+            (30.25, "ordinary"),
+            (31.0, "ordinary"),
+        )
+        for deficit, expected in cases:
+            with self.subTest(deficit=deficit):
+                engine, now, _ = self.engine_with_final_song(remaining=40.5, deficit=deficit)
+                kwargs, args, _calls = self.classify(engine, now)
+                kind = None if kwargs is None else ("closing" if kwargs.get("closing_until") == TOH else "ordinary")
+                self.assertEqual(kind, expected)
+                if kwargs is not None:
+                    self.assertAlmostEqual(args[7], deficit, places=6)
+
+    def test_c_subsecond_29_75s_shortage_rejects_a_too_long_fallback(self):
+        # Only items longer than the 29.75 s shortage are Ready to Air: the ordinary fill (30 s tolerance)
+        # would take one and run past the hour; the closing fill takes none and does not retry.
+        self.use_pool(30.0, 45.0)                          # replaces the 15 s / 29 s pool
+        engine, now, _ = self.engine_with_final_song(remaining=40.5, deficit=29.75)
+        self.assertEqual(now.microsecond, 750000)
+        kwargs, _args, calls = self.classify(engine, now)
+        proposed = [effective_airtime_seconds(p["track"]) for c in calls for p in c[1][2]]
+        print(f"\nC29.75 classified={'closing' if kwargs and kwargs.get('closing_until') else 'ordinary'} "
+              f"proposed={proposed} would end {40.5 + sum(proposed) - 70.25:+.2f}s from the hour")
+        self.assertEqual(kwargs, {"closing_until": TOH})
+        self.assertEqual(calls, [])
+        self.assertEqual(getattr(engine, "_live_fill_closing_no_fit", None), (self.old_log.id, 4))
+        self.assertEqual(self.fill_rows(), [])
+        # With a fitting item Ready to Air the same shortage is closed, ending before the hour.
+        fits = self.use_pool(29.0)
+        engine2, now2, _ = self.engine_with_final_song(remaining=40.5, deficit=29.75)
+        _kwargs, _args, calls2 = self.classify(engine2, now2)
+        self.assertEqual([p["track"].id for p in calls2[0][1][2]], [fits[0].id])
+        self.deliver(calls2[0], now2 + timedelta(seconds=1))
+        self.assertEqual([r.track_id for r in self.fill_rows()], [fits[0].id])
+
+    def test_midnight_deadline_and_dispatch_inside_the_final_30s(self):
+        chicago = ZoneInfo(settings.TIME_ZONE)
+        before_midnight = datetime(2026, 11, 11, 23, 59, 35, 500000, tzinfo=chicago)
+        self.date_old_log(before_midnight.date(), 23)
+        engine, now = self.idle_engine(24.5, now=before_midnight)
+        kwargs, args, calls = self.classify(engine, now)
+        self.assertEqual(kwargs, {"closing_until": datetime(2026, 11, 12, 0, 0, tzinfo=chicago)})
+        self.assertEqual(args[5], datetime(2026, 11, 11, 23, 0, tzinfo=chicago))   # the hour being closed
+        self.deliver(calls[0], datetime(2026, 11, 12, 0, 0, 0, 100000, tzinfo=chicago))   # just past midnight
+        self.assertEqual(self.fill_rows(), [])
+        engine._start_next_track.assert_not_called()
 
 
 class SchedulerFitSemanticsUnchangedTests(_UnitFixture, TransactionTestCase):

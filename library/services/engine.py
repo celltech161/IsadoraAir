@@ -6409,9 +6409,10 @@ class PlaybackEngine:
         remaining playout of the leading deck + effective airtime of
         every FUTURE queued item, cursor-aware), compare to
         wall-clock-remaining-in-hour, and dispatch only when the
-        deficit is genuinely positive beyond DURATION_FIT_MARGIN. TOH
-        itself is the authoritative target ceiling here regardless of
-        the built hour's clock-drift-adjusted target -- rollover at
+        deficit is genuinely positive beyond DURATION_FIT_MARGIN (or,
+        for an end-of-hour closing fill, beyond
+        LIVE_FILL_CLOSING_MIN_SECONDS). TOH itself is the
+        authoritative target ceiling here regardless of the built hour's clock-drift-adjusted target -- rollover at
         _advance_to_next_hour_log's ~30s-before-TOH mark discards
         whatever's left unplayed anyway, so scheduling PAST TOH is
         pointless (and passing target_duration_seconds=wall_remaining
@@ -6438,14 +6439,13 @@ class PlaybackEngine:
             self._live_fill_generation += 1
             generation = self._live_fill_generation
 
+        # The one authoritative wall-clock remainder, exact to the
+        # microsecond: the deficit computed from it alone classifies an
+        # ordinary versus a closing fill (a whole-second reading overstates
+        # it by up to 1 s, enough to hand a closing shortage to the
+        # ordinary fill and its DURATION_FIT_MARGIN overshoot tolerance).
         wall_now = timezone.localtime()
-        seconds_left = 3600 - (wall_now.minute * 60 + wall_now.second)
-        if seconds_left <= DURATION_FIT_MARGIN:
-            # Basically at the real boundary anyway -- clear the guard
-            # we just took, since no worker is being dispatched.
-            with self._lock:
-                self._live_fill_in_progress = False
-            return False
+        seconds_left = 3600 - (wall_now.minute * 60 + wall_now.second + wall_now.microsecond / 1e6)
 
         # Authoritative committed-runway check (see this function's
         # own docstring for the full "false-deficit suppression"
@@ -6461,20 +6461,30 @@ class PlaybackEngine:
         committed_runway = self._committed_future_runway_seconds()
         deficit = seconds_left - committed_runway
         closing_until = None
-        if deficit <= DURATION_FIT_MARGIN:
-            # End-of-hour closing fill: a remainder the ordinary fill leaves alone, too long for the
-            # next-hour lookahead to cover (see LIVE_FILL_CLOSING_MIN_SECONDS), is filled only with
-            # items that end by the top of the hour (absolute instant, exact to the microsecond); a
-            # queue state that already found nothing is not retried.
-            exact_left = 3600 - (wall_now.minute * 60 + wall_now.second + wall_now.microsecond / 1e6)
-            deficit = exact_left - committed_runway
-            with self._lock:
-                no_fit = getattr(self, "_live_fill_closing_no_fit", None) == (self.current_log.id, len(self.log_items))
-            if deficit <= LIVE_FILL_CLOSING_MIN_SECONDS or no_fit:
+        if deficit > DURATION_FIT_MARGIN:
+            if seconds_left <= DURATION_FIT_MARGIN:
+                # An ordinary fill never starts this close to the real
+                # boundary -- clear the guard we just took, since no
+                # worker is being dispatched.
                 with self._lock:
                     self._live_fill_in_progress = False
                 return False
-            closing_until = wall_now.astimezone(dt_timezone.utc) + timedelta(seconds=exact_left)
+        else:
+            # End-of-hour closing fill: a shortage the ordinary fill leaves alone, too long for the
+            # next-hour lookahead to cover (see LIVE_FILL_CLOSING_MIN_SECONDS), is filled only with
+            # items that end by the top of the hour (an absolute instant). That deadline, not the
+            # ordinary final-30 s wall-clock gate, bounds it -- here and in the installer -- so a
+            # shortage first seen inside the last 30 s still qualifies. A queue state that already
+            # found nothing is not retried, and a LATER hour's queue that has already been adopted
+            # (an early rollover) is never extended with items that must end before it even starts.
+            with self._lock:
+                no_fit = getattr(self, "_live_fill_closing_no_fit", None) == (self.current_log.id, len(self.log_items))
+                adopted_later = (self.current_log.date, self.current_log.hour) > (wall_now.date(), wall_now.hour)
+            if deficit <= LIVE_FILL_CLOSING_MIN_SECONDS or no_fit or adopted_later:
+                with self._lock:
+                    self._live_fill_in_progress = False
+                return False
+            closing_until = wall_now.astimezone(dt_timezone.utc) + timedelta(seconds=seconds_left)
 
         # Capture an IMMUTABLE snapshot of everything the worker needs --
         # never hand the worker thread self.current_log/self.log_items
@@ -6632,18 +6642,22 @@ class PlaybackEngine:
              proposal was computed; appending on top of an assumption
              that's no longer true risks either duplicating coverage or
              mis-positioning items.
-          5. Real wall-clock "seconds left in the real hour" is
-             recomputed fresh (not reused from dispatch time) and must
-             still be above DURATION_FIT_MARGIN -- a slow worker or a
-             delayed idle-callback scheduling could have carried us
+          5. An ordinary fill: real wall-clock "seconds left in the real
+             hour" is recomputed fresh (not reused from dispatch time)
+             and must still be above DURATION_FIT_MARGIN -- a slow worker
+             or a delayed idle-callback scheduling could have carried us
              past the real hour boundary (or close enough that the gap
              this proposal was computed for no longer exists) even if
              current_log/log_items look unchanged.
-          6. A closing fill (`closing_until` set) must still END by that
-             top of the hour, given what is committed to play now: a
-             callback delayed past the hour, or air time taken by
-             something outside the queue (an urgent item), discards it.
-             In memory only -- no query.
+          6. A closing fill (`closing_until` set) is bounded by its own
+             deadline instead of check 5, so it may install inside the
+             final 30 s: that top of the hour must not have passed, and
+             the proposal must still END by it given what is committed
+             to play now -- a callback delayed too long, or air time
+             taken by something outside the queue (an urgent item),
+             discards it. In memory only -- no query. Checks 1-4 still
+             apply first, so a proposal for an hour whose next-hour
+             queue has been adopted (current_log changed) never lands.
 
         Only once every check passes does the DB append
         (append_fill_items, transactional) happen, and only after that
@@ -6668,10 +6682,14 @@ class PlaybackEngine:
 
         wall_now = timezone.localtime()
         seconds_left_now = 3600 - (wall_now.minute * 60 + wall_now.second)
-        if seconds_left_now <= DURATION_FIT_MARGIN:
-            print(f"  Discarding stale live-fill proposal for log id={log_id} -- real hour boundary reached since dispatch")
-            return False
-        if closing_until is not None:
+        if closing_until is None:
+            if seconds_left_now <= DURATION_FIT_MARGIN:
+                print(f"  Discarding stale live-fill proposal for log id={log_id} -- real hour boundary reached since dispatch")
+                return False
+        else:
+            if wall_now >= closing_until:
+                print(f"  Discarding closing live-fill proposal for log id={log_id} -- its top of the hour has passed")
+                return False
             airtime = sum(effective_airtime_seconds(pick["track"]) for pick in new_picks)
             budget = (closing_until - wall_now).total_seconds() - self._committed_future_runway_seconds()
             if airtime > budget + LIVE_FILL_CLOSING_TOLERANCE_SECONDS:
