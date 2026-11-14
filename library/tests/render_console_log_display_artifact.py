@@ -15,12 +15,24 @@ from library.models import UITheme
 class RenderArtifact(TestCase):
     def test_render(self):
         self.client.force_login(get_user_model().objects.create_superuser("render_su", "r@example.invalid", "pw"))
-        for flag in (False, True):
+        variants = (
+            ("OFF", dict(show_played_items=False)),
+            ("ON", dict(show_played_items=True)),
+            # r0139: non-default appearance, to prove the settings reach the page.
+            ("CUSTOM", dict(show_played_items=True, played_item_darkening=0.8,
+                            current_item_outline_color="rgba(255, 0, 0, 1.00)")),
+        )
+        for suffix, values in variants:
             theme = UITheme.load()
-            theme.show_played_items = flag
+            for field, value in values.items():
+                setattr(theme, field, value)
             theme.save()
             for name, path in (("console", "/"), ("remote_dj", "/remote-dj/")):
                 page = self.client.get(path).content.decode()
-                label = f"{name.upper()}-{'ON' if flag else 'OFF'}"
+                label = f"{name.upper()}-{suffix}"
                 print(f"\n=====BEGIN-{label}=====\n{page}\n=====END-{label}=====")
-                self.assertIn(f"const SHOW_PLAYED_ITEMS = {'true' if flag else 'false'};", page)
+                self.assertIn(f"const SHOW_PLAYED_ITEMS = {'true' if values['show_played_items'] else 'false'};", page)
+        # Another page on the shared base template (navigation clock / menu).
+        page = self.client.get("/library/").content.decode()
+        print(f"\n=====BEGIN-LIBRARY=====\n{page}\n=====END-LIBRARY=====")
+        self.assertIn('id="navClock"', page)

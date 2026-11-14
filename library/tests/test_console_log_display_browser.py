@@ -11,6 +11,7 @@ rather than assumed.
 """
 import io
 import json
+import re
 import time
 import unittest
 from urllib.parse import urlparse
@@ -88,9 +89,11 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.history_requests = []
         self.state = console_state(queue=standard_queue())
 
-    def set_flag(self, on):
+    def set_flag(self, on, **appearance):
         theme = UITheme.load()
         theme.show_played_items = on
+        for field, value in appearance.items():        # r0139: played_item_darkening, current_item_outline_color
+            setattr(theme, field, value)
         theme.save()
 
     def _route(self, route, request):
@@ -104,8 +107,8 @@ class _LogDisplayBase(_ConsoleBrowserBase):
                                  body=json.dumps({"log_id": log_id, "items": self.history}))
         return super()._route(route, request)
 
-    def console(self, *, flag=True, user=None, path="/", **kw):
-        self.set_flag(flag)
+    def console(self, *, flag=True, user=None, path="/", appearance=None, **kw):
+        self.set_flag(flag, **(appearance or {}))
         page = self.open_console(user or self.superuser, path=path, **kw)
         if flag:
             self.wait_rows(page)
@@ -553,6 +556,216 @@ class _LogDisplayBase(_ConsoleBrowserBase):
             self.advance(page, 10_000)
         self.assertEqual(self.history_requests, [])
         self.assertEqual(self.console_errors, [])
+
+    # ------------------------------------------------------------ r0139 refinements
+    def edge_pixels(self, page, selector):
+        cell = self.box(page, selector)
+        x = cell["left"] + cell["width"] / 2
+        return [self.pixel(page, x, cell["top"] + d) for d in (0, 1)]
+
+    def test_default_appearance_is_r0138s(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.assertEqual(page.evaluate(
+            "() => { const c = getComputedStyle(document.documentElement);"
+            " return [c.getPropertyValue('--played-item-darkening').trim(),"
+            " c.getPropertyValue('--current-item-outline').trim()]; }"), ["0.550000", "rgba(255, 255, 255, 1.00)"])
+
+    def test_played_item_darkening_setting_scales_the_overlay_and_keeps_the_hue(self):
+        self.history[1] = hist(902, 2, "Played Two", fill=RED, played=AIRED - 300)
+        for darkening, factor in ((0.0, 1.0), (0.8, 0.2), (1.0, 0.0), (0.55, 0.45)):
+            with self.subTest(darkening=darkening):
+                page = self.console(flag=True, appearance={"played_item_darkening": darkening})
+                self.wait_states(page, GOLD)
+                self.reveal_queue(page)
+                played = self.box(page, '#queueList tr[data-item-id="901"] td')
+                upcoming = self.box(page, '#queueList tr[data-item-id="905"] td')
+                px = self.pixel(page, played["left"] + 3, played["top"] + 4)
+                for got, base in zip(px, (200, 60, 60)):
+                    self.assertAlmostEqual(got, base * factor, delta=8)
+                self.assertEqual(self.pixel(page, upcoming["left"] + 3, upcoming["top"] + 4), (200, 60, 60))
+
+    def test_current_outline_colour_setting(self):
+        page = self.console(flag=True, appearance={"current_item_outline_color": "rgba(255, 0, 0, 1.00)"})
+        self.wait_states(page, GOLD)
+        self.reveal_queue(page)
+        self.assertIn("rgb(255, 0, 0)", page.evaluate(
+            "() => getComputedStyle(document.querySelector('tr.qt-current td:nth-child(3)')).boxShadow"))
+        self.assertTrue(any(p[0] >= 240 and p[1] <= 30 and p[2] <= 30
+                            for p in self.edge_pixels(page, "tr.qt-current td:nth-child(3)")))
+        self.assertFalse(any(p[0] >= 240 and p[1] <= 30
+                             for p in self.edge_pixels(page, 'tr[data-item-id="905"] td:nth-child(3)')))
+
+    def playing_ids(self, page):
+        return page.evaluate("() => Array.from(document.querySelectorAll('#queueList tr'))"
+                             ".filter(tr => tr.querySelector('.qt-playing-icon')).map(tr => tr.dataset.itemId)")
+
+    def test_play_icon_only_on_rows_the_engine_says_are_playing(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.assertEqual(self.playing_ids(page), ["903"])
+        icon = page.evaluate("""() => { const i = document.querySelector('.qt-playing-icon');
+          return {label: i.getAttribute('aria-label'), title: i.title, svg: !!i.querySelector('svg'),
+                  interactive: !!i.closest('td').querySelector('button, a, input'), handle: !!i.closest('.qt-drag-handle'),
+                  ref: ICON_PLAY.includes(i.querySelector('path').getAttribute('d'))}; }""")
+        self.assertEqual(icon, {"label": "Currently playing", "title": "Currently playing", "svg": True,
+                                "interactive": False, "handle": False, "ref": True})
+        # A genuine crossfade: both decks actually playing -> both rows.
+        state = console_state(current=903, claimed=904, queue=[queued(905, "Upcoming Five", 250.0)])
+        state["decks"]["B"].update(actually_playing=True, air_started_at=AIRED + 100)
+        history = standard_history()
+        history[3]["played_at"] = AIRED + 100
+        self.refresh(page, state, history=history)
+        self.wait_states(page, [(901, "played"), (902, "played"), (903, "current"), (904, "current"), (905, "upcoming")])
+        self.assertEqual(self.playing_ids(page), ["903", "904"])
+        # A claimed / preloaded deck is not playing: no icon on it.
+        self.refresh(page, console_state(current=903, claimed=904, queue=[queued(905, "Upcoming Five", 250.0)]),
+                     history=standard_history())
+        self.wait_states(page, [(901, "played"), (902, "played"), (903, "current"), (904, "ondeck"), (905, "upcoming")])
+        self.assertEqual(self.playing_ids(page), ["903"])
+        # A paused / not-actually-playing deck: no icon at all.
+        paused = console_state(current=903, queue=standard_queue())
+        paused["decks"]["A"]["actually_playing"] = False
+        self.refresh(page, paused)
+        self.wait_states(page, [(901, "played"), (902, "played"), (903, "ondeck"), (904, "upcoming"), (905, "upcoming")])
+        self.assertEqual(self.playing_ids(page), [])
+
+    def test_play_icon_never_appears_with_show_played_items_off(self):
+        page = self.console(flag=False)
+        self.assertEqual(page.locator(".qt-playing-icon").count(), 0)
+
+    def test_sort_icon_is_an_svg_only_on_draggable_rows(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        rows = page.evaluate("""() => Array.from(document.querySelectorAll('#queueList tr')).map(tr => {
+          const h = tr.querySelector('.qt-drag-handle'); const i = h && h.querySelector('.qt-sort-icon svg');
+          return {id: tr.dataset.itemId, handle: !!h, svg: !!i, paths: i ? i.querySelectorAll('path').length : 0,
+                  text: h ? h.textContent.trim() : null, h: i ? i.getBoundingClientRect().height : 0}; })""")
+        for row in rows:
+            draggable = row["id"] in ("904", "905")
+            self.assertEqual((row["handle"], row["svg"]), (draggable, draggable), row["id"])
+            if draggable:
+                self.assertEqual((row["paths"], row["text"]), (2, ""))
+                self.assertGreaterEqual(row["h"], 12)
+
+    def test_headers_align_with_their_cells(self):
+        want = ["center", "right", "left", "left", "left", "right", "right", "right", "left"]
+        probe = """() => { const norm = v => (v === 'start' ? 'left' : v);
+          const ths = Array.from(document.querySelectorAll('.queue-table thead th'));
+          const rows = {};
+          document.querySelectorAll('#queueList tr[data-row-state]').forEach(tr => {
+            rows[tr.dataset.rowState] = Array.from(tr.children).map(td => norm(getComputedStyle(td).textAlign)); });
+          return {headers: ths.map(th => norm(getComputedStyle(th).textAlign)), rows,
+                  sticky: getComputedStyle(ths[0]).position, texts: ths.map(th => th.textContent.trim().toLowerCase())}; }"""
+        for name, viewport in (("desktop", DESKTOP), ("tablet", TABLET), ("mobile", MOBILE_PORTRAIT)):
+            with self.subTest(viewport=name):
+                page = self.console(flag=True, viewport=viewport)
+                self.wait_states(page, GOLD)
+                got = page.evaluate(probe)
+                self.assertEqual(got["headers"], want)
+                self.assertEqual(set(got["rows"]), {"played", "current", "upcoming"})
+                for state, cells in got["rows"].items():
+                    self.assertEqual(cells, want, state)
+                self.assertEqual(got["sticky"], "sticky")
+                self.assertEqual(got["texts"][1:8], ["#", "artist", "title", "cat", "dur", "intro", "time on"])
+        page = self.console(flag=False)
+        self.assertEqual(page.evaluate(probe)["headers"], want)
+
+    def test_touch_drag_with_the_new_sort_handle(self):
+        if self.BROWSER != "chromium":
+            self.skipTest("touch input is driven through Chromium's DevTools protocol")
+        self.set_flag(True)
+        client = Client()
+        client.force_login(self.superuser)
+        context = self.browser.new_context(viewport=DESKTOP, has_touch=True)
+        self.addCleanup(context.close)
+        context.add_cookies([{"name": "sessionid", "value": client.cookies["sessionid"].value,
+                              "url": self.live_server_url}])
+        page = context.new_page()
+        page.route("**/*", self._route)
+        page.clock.install(time=T0_MS / 1000)
+        page.goto(self.live_server_url + "/")
+        page.clock.pause_at((T0_MS + 2_000) / 1000)
+        self.wait_rows(page)
+        self.wait_states(page, GOLD)
+        self.reveal_queue(page)
+        cdp = context.new_cdp_session(page)
+        src = self.box(page, '#queueList tr[data-item-id="905"] .qt-drag-handle')
+        dst = self.box(page, '#queueList tr[data-item-id="904"] td:nth-child(3)')
+        sx, sy = src["left"] + src["width"] / 2, src["top"] + src["height"] / 2
+        dx, dy = dst["left"] + 10, dst["top"] + dst["height"] / 2
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": sx, "y": sy}]})
+        for k in range(1, 7):
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [
+                {"x": sx + (dx - sx) * k / 6, "y": sy + (dy - sy) * k / 6}]})
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        self.assertEqual(json.loads(self.wait_post(page, "/api/log/77/reorder/")[0]), {"order": [905, 904]})
+
+    # ------------------------------------------------------------ shared navigation
+    NAV = """() => ({open: document.getElementById('navLinks').classList.contains('open'),
+      clock: document.getElementById('navClock').getAttribute('aria-expanded'),
+      toggle: document.getElementById('navToggle').getAttribute('aria-expanded')})"""
+
+    def check_nav(self, page, label):
+        def state(open_):
+            return {"open": open_, "clock": str(open_).lower(), "toggle": str(open_).lower()}
+        self.assertEqual(page.evaluate(self.NAV), state(False), f"{label} initial")
+        for selector, expected in (("#navToggle", True), ("#navClock", False), ("#navClock", True),
+                                   ("#navToggle", False), ("#navToggle", True), ("#navClock", False)):
+            page.locator(selector).click()
+            self.assertEqual(page.evaluate(self.NAV), state(expected), f"{label} after {selector}")
+        for selector in ("#navClock", "#navToggle"):          # keyboard: Enter opens, Space closes
+            page.focus(selector)
+            page.keyboard.press("Enter")
+            self.assertEqual(page.evaluate(self.NAV), state(True), f"{label} {selector} Enter")
+            page.keyboard.press("Space")
+            self.assertEqual(page.evaluate(self.NAV), state(False), f"{label} {selector} Space")
+        page.locator("#navClock").click()                      # one click is exactly one toggle
+        self.assertEqual(page.evaluate(self.NAV), state(True))
+        page.locator("#navClock").click()
+        self.assertEqual(page.locator("#navLinks .nav-logout-btn").count(), 1)
+        self.assertEqual(page.locator("#navClock button, #navToggle button, button #navClock, button #navToggle").count(), 0)
+
+    def test_clock_and_hamburger_toggle_one_menu_on_both_console_pages(self):
+        for label, user, path in (("console", self.superuser, "/"), ("remote_dj", self.host, "/remote-dj/")):
+            with self.subTest(page=label):
+                page = self.console(flag=True, user=user, path=path)
+                self.check_nav(page, label)
+                before = page.evaluate("() => document.getElementById('navClock').textContent")
+                page.clock.run_for(2_000)
+                after = page.evaluate("() => document.getElementById('navClock').textContent")
+                self.assertNotEqual(before, after)
+                self.assertRegex(after, r"^\d{1,2}:\d\d:\d\d (AM|PM)$")
+                self.assertEqual(after, page.evaluate("() => window.stationFormatTime(new Date())"))
+
+    def test_clock_and_hamburger_work_on_a_non_console_page(self):
+        client = Client()
+        client.force_login(self.superuser)
+        context = self.browser.new_context(viewport=DESKTOP)
+        self.addCleanup(context.close)
+        context.add_cookies([{"name": "sessionid", "value": client.cookies["sessionid"].value,
+                              "url": self.live_server_url}])
+        page = context.new_page()
+        page.route("**/*", self._route)
+        page.goto(self.live_server_url + "/library/")
+        page.wait_for_selector("#navClock")
+        self.check_nav(page, "library")
+        first = page.evaluate("() => document.getElementById('navClock').textContent")
+        page.wait_for_function("(t) => document.getElementById('navClock').textContent !== t", arg=first, timeout=5_000)
+
+    def test_clock_and_hamburger_stay_on_screen_on_narrow_phones(self):
+        for width in (375, 320):
+            with self.subTest(width=width):
+                page = self.console(flag=True, viewport={"width": width, "height": 700})
+                rect = page.evaluate("""() => { const b = id => document.getElementById(id).getBoundingClientRect();
+                  return {w: window.innerWidth, clock: b('navClock').right, toggle: b('navToggle').right,
+                          left: b('navToggle').left, scroll: document.documentElement.scrollWidth}; }""")
+                self.assertLessEqual(rect["clock"], rect["w"], rect)
+                self.assertLessEqual(rect["toggle"], rect["w"], rect)
+                self.assertGreaterEqual(rect["left"], 0, rect)
+                self.assertLessEqual(rect["scroll"], rect["w"], rect)
+                page.locator("#navClock").click()
+                self.assertTrue(page.evaluate(self.NAV)["open"])
 
     # ------------------------------------------------------ queue-control safety
     def drag(self, page, source_id, target_id):

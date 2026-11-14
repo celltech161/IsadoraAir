@@ -178,6 +178,29 @@
       color: {{ ui_theme.nav_clock_color }};
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
+      /* The clock is also a menu toggle (a button, so it is keyboard
+         operable); strip the button chrome so it still reads as the clock. */
+      background: transparent;
+      border: none;
+      padding: 0.25rem 0.1rem;
+      font-family: inherit;
+      line-height: inherit;
+      cursor: pointer;
+    }
+
+    nav.topbar .nav-clock:focus-visible,
+    nav.topbar .nav-toggle:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: 4px;
+    }
+
+    /* Narrow phones: keep the clock AND the menu button on screen. */
+    @media (max-width: 480px) {
+      nav.topbar { padding: 0 0.75rem; }
+      nav.topbar .brand { flex-shrink: 1; min-width: 0; }
+      nav.topbar .brand img { max-width: 100%; }
+      nav.topbar .nav-right { gap: 0.5rem; flex-shrink: 0; }
     }
 
     nav.topbar .nav-toggle {
@@ -237,7 +260,7 @@
       {% endif %}
     </div>
     <div class="nav-right">
-      <span class="nav-clock" id="navClock"></span>
+      <button type="button" class="nav-clock" id="navClock" aria-label="Toggle navigation (station clock)" aria-expanded="false" aria-controls="navLinks"></button>
       <button type="button" class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="navLinks">
         <span></span><span></span><span></span>
       </button>
@@ -305,13 +328,17 @@
     updateNavClock();
     setInterval(updateNavClock, 1000);
 
+    // One menu, two controls: the hamburger and the clock both toggle it, and
+    // both report the same aria-expanded state.
     const navToggle = document.getElementById('navToggle');
+    const navClockToggle = document.getElementById('navClock');
     const navLinks = document.getElementById('navLinks');
-    if (navToggle && navLinks) {
-      navToggle.addEventListener('click', () => {
+    if (navLinks) {
+      const toggleNav = () => {
         const isOpen = navLinks.classList.toggle('open');
-        navToggle.setAttribute('aria-expanded', isOpen);
-      });
+        [navToggle, navClockToggle].forEach(el => { if (el) el.setAttribute('aria-expanded', isOpen); });
+      };
+      [navToggle, navClockToggle].forEach(el => { if (el) el.addEventListener('click', toggleNav); });
     }
   </script>
   <main>

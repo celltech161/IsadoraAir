@@ -320,6 +320,53 @@ class RGBAColorWidget(forms.TextInput):
         return mark_safe(html)
 
 
+class OpacitySliderWidget(forms.Widget):
+    """A 0-100% slider for a 0.0-1.0 opacity/fraction field, in the same
+    vanilla-JS, no-dependency style as RGBAColorWidget's opacity slider.
+
+    The hidden input carries the real stored value (0.0-1.0) and is rewritten
+    ONLY when the slider is moved, so an existing value such as 0.333 survives
+    a save that never touched the slider. The slider and label show the whole
+    percentage. ``low_label``/``high_label`` say what the two ends mean."""
+
+    _TEMPLATE = """
+<input type="hidden" name="__NAME__" id="__ID__" value="__VALUE__">
+<input type="range" id="__ID___slider" min="0" max="100" step="1" style="vertical-align:middle; width:220px;" aria-label="__LABEL__">
+<span id="__ID___pct" style="display:inline-block; width:3em; font-size:0.85em; margin-left:6px;"></span>
+<span style="font-size:0.8em; color:#666;">0% = __LOW__ &middot; 100% = __HIGH__</span>
+<script>
+(function () {
+    var hidden = document.getElementById('__ID__');
+    var slider = document.getElementById('__ID___slider');
+    var label = document.getElementById('__ID___pct');
+    var v = parseFloat(hidden.value);
+    if (isNaN(v)) { v = 0; }
+    slider.value = Math.max(0, Math.min(100, Math.round(v * 100)));
+    label.textContent = slider.value + '%';
+    slider.addEventListener('input', function () {
+        hidden.value = (slider.value / 100).toFixed(2);
+        label.textContent = slider.value + '%';
+    });
+})();
+</script>
+"""
+
+    def __init__(self, attrs=None, *, low_label="invisible", high_label="fully opaque", aria_label="Opacity"):
+        super().__init__(attrs)
+        self.low_label, self.high_label, self.aria_label = low_label, high_label, aria_label
+
+    def render(self, name, value, attrs=None, renderer=None):
+        widget_id = (attrs or {}).get("id", f"id_{name}")
+        html = self._TEMPLATE
+        for token, text in (
+            ("__NAME__", name), ("__ID__", widget_id),
+            ("__VALUE__", "" if value is None else str(value)),
+            ("__LABEL__", self.aria_label), ("__LOW__", self.low_label), ("__HIGH__", self.high_label),
+        ):
+            html = html.replace(token, escape(text))
+        return mark_safe(html)
+
+
 @admin.register(CategoryKind)
 class CategoryKindAdmin(admin.ModelAdmin):
     list_display = ["name", "code", "fill_color", "sort_order", "send_to_tunein_air"]
@@ -764,6 +811,7 @@ _UITHEME_COLOR_FIELDS = {
     "bg_dark", "bg_darker", "panel_bg", "accent", "accent_soft",
     "text_main", "text_muted", "danger", "border_subtle", "nav_clock_color",
     "deck_text_shadow_color", "deck_startsat_color", "deck_pill_text_color",
+    "current_item_outline_color",
 }
 
 
@@ -805,7 +853,7 @@ class UIThemeAdmin(admin.ModelAdmin):
                             "deck when nothing in the lookup chain matches.",
         }),
         ("Console / Remote DJ — Log Display", {
-            "fields": ["show_played_items"],
+            "fields": ["show_played_items", "played_item_darkening", "current_item_outline_color"],
             "description": "Station-wide; applies to both the Console and the "
                             "Remote DJ page on their next reload.",
         }),
@@ -821,6 +869,12 @@ class UIThemeAdmin(admin.ModelAdmin):
     def formfield_for_dbfield(self, db_field, request, **kwargs):
         if db_field.name in _UITHEME_COLOR_FIELDS:
             kwargs["widget"] = RGBAColorWidget
+        elif db_field.name == "played_item_darkening":
+            kwargs["widget"] = OpacitySliderWidget(
+                low_label="original category colour", high_label="black", aria_label="Played item darkening")
+        elif db_field.name == "deck_transport_disabled_opacity":
+            kwargs["widget"] = OpacitySliderWidget(
+                low_label="invisible", high_label="fully opaque", aria_label="Disabled transport button opacity")
         # r0083 -- display-only labels distinguishing the two logo roles.
         # Admin-form `label`, never the model's own verbose_name: a
         # verbose_name change shows up in AlterField's deconstruct() and

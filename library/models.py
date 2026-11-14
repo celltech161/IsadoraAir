@@ -3,7 +3,7 @@ import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MaxValueValidator, MinValueValidator, URLValidator
+from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator, URLValidator
 from django.db import models, router, transaction
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
@@ -1741,6 +1741,23 @@ class UITheme(models.Model):
                    "(darker) and outline the item on air, above the upcoming "
                    "items. Display only -- it never changes what plays or what "
                    "can be reordered. Takes effect when the page is reloaded.",
+    )
+
+    played_item_darkening = models.FloatField(
+        default=0.55,
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text="How dark already-aired rows are when Show played items is on: a black "
+                   "overlay of this opacity over each row's own category colour. 0% leaves "
+                   "the category colour untouched, 100% makes the row black. Takes effect "
+                   "when the page is reloaded.",
+    )
+    current_item_outline_color = models.CharField(
+        max_length=50, default="rgba(255, 255, 255, 1.00)",
+        validators=[RegexValidator(
+            r"^(#[0-9a-fA-F]{3,8}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(,\s*(0|1|0?\.\d+|1\.0+)\s*)?\))$",
+            "Enter a hex colour or an rgb()/rgba() value.")],
+        help_text="Outline drawn around the row(s) actually on air when Show played items "
+                   "is on (default opaque white). Colour and opacity.",
     )
 
     class Meta:

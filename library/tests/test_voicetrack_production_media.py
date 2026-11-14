@@ -670,6 +670,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # a choices-only origin AlterField -- both additive, no manual operation).
             # Console log display: and library.0101 (the UITheme.show_played_items
             # BooleanField, a non-null AddField with a literal default -- additive).
+            # r0139: and library.0102 (UITheme.played_item_darkening / current_item_outline_color,
+            # two non-null AddFields with literal defaults -- additive).
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -686,6 +688,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0099_track_cue_marker_authority",
                               "library.0100_dst_fallback_replay_pass",
                               "library.0101_uitheme_show_played_items",
+                              "library.0102_uitheme_log_display_appearance",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",

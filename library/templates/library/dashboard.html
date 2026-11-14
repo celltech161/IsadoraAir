@@ -9,6 +9,8 @@
     --deck-startsat-color: {{ ui_theme.deck_startsat_color }};
     --deck-pill-text-color: {{ ui_theme.deck_pill_text_color }};
     --deck-transport-disabled-opacity: {{ ui_theme.deck_transport_disabled_opacity }};
+    --played-item-darkening: {{ ui_theme.played_item_darkening|stringformat:"f" }};
+    --current-item-outline: {{ ui_theme.current_item_outline_color }};
   }
 
   .playnow-bar {
@@ -881,10 +883,22 @@
   }
 
   td.qt-pos { color: var(--text-muted); text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.qt-num { color: var(--text-muted); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.qt-dur, td.qt-intro, td.qt-time { color: var(--text-muted); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.qt-cat { color: var(--text-muted); font-size: 0.75rem; }
-  th.qt-th-pos { text-align: center; }
-  th.qt-th-dur, th.qt-th-intro, th.qt-th-time { text-align: right; }
+  /* Headers share their column's alignment. These carry the table's own
+     selector so they outrank `table.queue-table th { text-align: left }`
+     (the plain th.qt-th-* rules they replace lost that specificity contest,
+     leaving Dur / Intro / Time On headers left over right-aligned cells). */
+  table.queue-table th.qt-th-handle { text-align: center; }
+  table.queue-table th.qt-th-num,
+  table.queue-table th.qt-th-dur,
+  table.queue-table th.qt-th-intro,
+  table.queue-table th.qt-th-time { text-align: right; }
+  /* Drag / playing indicator column. */
+  .qt-sort-icon, .qt-playing-icon { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; pointer-events: none; }
+  .qt-sort-icon svg { width: 0.8rem; height: 1.05rem; display: block; }
+  .qt-playing-icon svg { width: 0.85rem; height: 0.85rem; display: block; }
   .qt-track-link { color: inherit; text-decoration: none; }
   .qt-track-link:hover { color: var(--accent); text-decoration: underline; }
 
@@ -925,22 +939,23 @@
   }
   table.queue-table.qt-history th { position: sticky; top: 0; z-index: 1; }
   table.queue-table tr.qt-played td {
-    background-image: linear-gradient(rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.55));
+    background-image: linear-gradient(rgba(0, 0, 0, var(--played-item-darkening)), rgba(0, 0, 0, var(--played-item-darkening)));
     color: #e5e7eb;
   }
   table.queue-table tr.qt-played td.qt-pos,
+  table.queue-table tr.qt-played td.qt-num,
   table.queue-table tr.qt-played td.qt-dur,
   table.queue-table tr.qt-played td.qt-intro,
   table.queue-table tr.qt-played td.qt-cat,
   table.queue-table tr.qt-played td.qt-time { color: #b6bcc6; }
   table.queue-table tr.qt-current td {
-    box-shadow: inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+    box-shadow: inset 0 1px 0 var(--current-item-outline), inset 0 -1px 0 var(--current-item-outline);
   }
   table.queue-table tr.qt-current td:first-child {
-    box-shadow: inset 1px 0 0 #fff, inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+    box-shadow: inset 1px 0 0 var(--current-item-outline), inset 0 1px 0 var(--current-item-outline), inset 0 -1px 0 var(--current-item-outline);
   }
   table.queue-table tr.qt-current td:last-child {
-    box-shadow: inset -1px 0 0 #fff, inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+    box-shadow: inset -1px 0 0 var(--current-item-outline), inset 0 1px 0 var(--current-item-outline), inset 0 -1px 0 var(--current-item-outline);
   }
 
   .queue-empty {
@@ -1694,8 +1709,8 @@
       <table class="queue-table">
         <thead>
           <tr>
-            <th></th>
-            <th class="qt-th-pos">#</th>
+            <th class="qt-th-handle"></th>
+            <th class="qt-th-num">#</th>
             <th>Artist</th>
             <th>Title</th>
             <th>Cat</th>
@@ -1933,6 +1948,10 @@ const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#
 // because their glyph metrics vary enough by platform/font that they
 // never centered reliably in the fixed-size button box across devices.
 const ICON_PLAY = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M8 7l22 11L8 29z"/></svg>';
+// Drag-to-reorder indicator: two solid, rounded triangles (up / down) with a
+// gap, from the supplied reference. Stroked round joins on the inset triangles
+// give the rounded corners; currentColor inherits the cell's colour.
+const ICON_SORT = '<svg viewBox="240 120 720 960" fill="currentColor" stroke="currentColor" stroke-width="80" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M600 160L920 480H280Z"/><path d="M280 720H920L600 1040Z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M20 7h5v22h-5zm-9 0h5v22h-5z"/></svg>';
 const ICON_EJECT = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M6 29v-5h24v5zM18 6L6 20h24z"/></svg>';
 
@@ -4683,8 +4702,10 @@ function renderQueue(data) {
       : r.state === 'ondeck' ? ' class="qt-ondeck"' : '';
     return `
     <tr${cls} data-item-id="${r.itemId}" data-row-state="${r.state}"${upcoming ? ' data-queue-row="1"' : ''} style="background-color: ${r.fillColor || 'transparent'};">
-      ${upcoming ? '<td class="qt-pos qt-drag-handle">&#9776;</td>' : '<td class="qt-pos"></td>'}
-      <td class="qt-pos">${i + 1}</td>
+      ${upcoming ? `<td class="qt-pos qt-drag-handle" title="Drag to reorder"><span class="qt-sort-icon">${ICON_SORT}</span></td>`
+        : r.state === 'current' ? `<td class="qt-pos"><span class="qt-playing-icon" role="img" aria-label="Currently playing" title="Currently playing">${ICON_PLAY}</span></td>`
+        : '<td class="qt-pos"></td>'}
+      <td class="qt-num">${i + 1}</td>
       <td>${artistCell}</td>
       <td>${titleCell}</td>
       <td class="qt-cat">${esc(r.category)}</td>
