@@ -176,6 +176,7 @@ def fetch_and_parse_cap(link):
     """Fetch a full CAP 1.2 message and return the fields we use downstream:
         {"identifier", "sent", "expires", "sender", "sender_name",
          "status", "msg_type", "references": [<identifier>, ...],
+         "reference_identities": [(<sender>, <identifier>, <sent in UTC>), ...],
          "event", "event_code", "headline", "description", "instruction",
          "areas": [<SAME code>, ...]}
     Raises CapFetchError when the message could not be retrieved and
@@ -185,7 +186,9 @@ def fetch_and_parse_cap(link):
       * root (always): identifier, sender, sent, status, msgType, scope present
         and non-empty; identifier/sender without whitespace, commas or "<"/"&";
         sent a dateTime; status/msgType/scope defined values; <references>
-        well-formed sender,identifier,sent triplets.
+        well-formed sender,identifier,sent triplets (each with the same
+        sender/identifier restriction and a valid sent dateTime -- a single
+        malformed entry rejects the whole message).
       * a non-Actual message has no authority over Actual alerts, so its <info>
         is not judged: it is returned for completeness and ignored downstream.
       * an Actual Alert/Update must carry an <info> block whose mandatory
@@ -220,9 +223,10 @@ def fetch_and_parse_cap(link):
     status, msg_type = fields["status"].lower(), fields["msgType"].lower()
     references_text = _text(root.find(f"{CAP12_NS}references"))
     try:
-        references = parse_references(references_text)
+        reference_identities = parse_references(references_text)
     except ValueError as exc:
         raise CapParseError(f"{label} has malformed references: {exc}") from exc
+    references = [identifier for _sender, identifier, _sent in reference_identities]
 
     # Multiple <info> blocks are legal (one per language). Pick English if
     # present, else the first.
@@ -268,7 +272,8 @@ def fetch_and_parse_cap(link):
         "sent":        fields["sent"],
         "status":      fields["status"],
         "msg_type":    fields["msgType"],
-        "references":  references,
+        "references":  references,                    # referenced identifiers only (informational)
+        "reference_identities": reference_identities,  # (sender, identifier, sent UTC): what authority uses
         "expires":     info_text("expires"),
         "sender":      fields["sender"],
         "sender_name": info_text("senderName"),
@@ -281,16 +286,52 @@ def fetch_and_parse_cap(link):
     }
 
 
+def message_identity(sender, identifier, sent, what="message"):
+    """The CAP 1.2 extended message identity: (sender, identifier, sent).
+
+    CAP 1.2 (OASIS CAP-v1.2-os, 3.2.1) identifies a message by the three
+    together; an identifier alone is unique only per sender. The tuple is:
+
+      * sender, identifier -- compared EXACTLY (case-sensitive, as sent). Both
+        must be non-empty without whitespace, commas, "<" or "&" (the CAP
+        restriction already applied to a message's own fields).
+      * sent -- a CAP dateTime (explicit numeric offset), compared as the INSTANT
+        it denotes and stored as that instant in UTC ("...+00:00"). Two
+        spellings of one instant (16:00-06:00 / 22:00+00:00) are one identity;
+        two different instants are never conflated. CAP times have whole-second
+        resolution, so no precision is lost.
+
+    The result is hashable, comparable, and idempotent under this function.
+    Raises CapParseError for anything that is not a well-formed identity."""
+    for name, value in (("sender", sender), ("identifier", identifier)):
+        if not isinstance(value, str) or not value or _CAP_RESTRICTED.search(value):
+            raise CapParseError(f"{what}: {name} is missing or contains whitespace, a comma or a restricted "
+                                f"character: {value!r}")
+    if not isinstance(sent, str):
+        raise CapParseError(f"{what}: sent is not a CAP dateTime: {sent!r}")
+    _require_cap_datetime(sent, f"{what} sent")
+    instant = parse_iso_datetime(sent).astimezone(timezone.utc)
+    return (sender, identifier, instant.isoformat())
+
+
 def parse_references(text):
     """CAP <references>: whitespace-separated "sender,identifier,sent" triplets.
-    Returns the referenced identifiers (an Update/Cancel supersedes them).
-    Raises ValueError for a triplet that is not exactly sender,identifier,sent."""
+
+    Returns one message_identity() tuple per referenced message, in order (an
+    Update/Cancel supersedes the messages they name). Raises ValueError for
+    ANY entry that is not exactly three well-formed, non-empty parts -- an
+    unusable sender or identifier (restricted characters), or a missing or
+    invalid sent dateTime. A malformed entry is never skipped: the caller must
+    treat the whole message as uninterpretable."""
     out = []
     for triplet in (text or "").split():
         parts = triplet.split(",")
         if len(parts) != 3 or not all(parts):
             raise ValueError(f"not a sender,identifier,sent triplet: {triplet!r}")
-        out.append(parts[1])
+        try:
+            out.append(message_identity(*parts, what=f"reference {triplet!r}"))
+        except CapParseError as exc:
+            raise ValueError(str(exc)) from exc
     return out
 
 
@@ -301,17 +342,39 @@ def current_alerts(caps):
     message never airs AND never cancels or supersedes anything. Among Actual
     messages, a Cancel retires every message it references and never airs;
     an Update supersedes every message it references (chains included, in
-    any feed order); Ack/Error never air. Order of survivors is preserved."""
+    any feed order); Ack/Error never air. Order of survivors is preserved.
+
+    A reference names a message by its complete identity (sender, identifier,
+    sent) -- see message_identity() -- using the sender and sent inside the
+    reference, NOT the referencing message's own. An identifier shared by
+    another sender, or by the same sender at another time, is a different
+    message and is never retired by it.
+
+    Raises CapParseError (callers keep the previous snapshot) when a
+    message that can air has no well-formed identity, or an Update/Cancel
+    has references but no parsed reference identities: authority is never
+    inferred from an identifier alone."""
     actual = [cap for cap in caps if (cap.get("status") or "").lower() == "actual"]
     superseded = set()
     for cap in actual:
         if (cap.get("msg_type") or "").lower() in ("update", "cancel"):
-            superseded.update(cap.get("references") or [])
-    return [
-        cap for cap in actual
-        if (cap.get("msg_type") or "").lower() in ("alert", "update")
-        and cap.get("identifier") not in superseded
-    ]
+            identities = cap.get("reference_identities")
+            if identities is None:
+                if cap.get("references"):
+                    raise CapParseError(f"CAP {cap.get('identifier')!r} names references without complete "
+                                        f"sender/identifier/sent identities")
+                identities = []
+            for identity in identities:
+                superseded.add(message_identity(*identity, what=f"CAP {cap.get('identifier')!r} reference"))
+    survivors = []
+    for cap in actual:
+        if (cap.get("msg_type") or "").lower() not in ("alert", "update"):
+            continue
+        own = message_identity(cap.get("sender"), cap.get("identifier"), cap.get("sent"),
+                               what=f"CAP {cap.get('identifier')!r}")
+        if own not in superseded:
+            survivors.append(cap)
+    return survivors
 
 
 def alert_covers_any(alert, same_codes):

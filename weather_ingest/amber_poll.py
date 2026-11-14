@@ -170,7 +170,11 @@ def _build_active_entries(cfg, previous_ids=()):
                 f"limit; a cancellation among them could not be ruled out")
         caps += _fetch_caps(unclassified)
 
-    current_ids = {id(cap) for cap in current_alerts([cap for _entry, cap in caps])}
+    try:
+        current_ids = {id(cap) for cap in current_alerts([cap for _entry, cap in caps])}
+    except CapParseError as exc:
+        # No complete message identity to resolve authority with: never guess from an identifier.
+        raise SnapshotUnavailable(str(exc)) from exc
     active = []
     for entry, cap in caps:
         if id(cap) not in current_ids:

@@ -175,11 +175,19 @@ class NwsSnapshotTests(NwsHarness):
         self.assertEqual(order, ["coord", "coord", "coord", "temp"])
 
 
-def cap(identifier, *, status="Actual", msg_type="Alert", references=(), expires=None, description="Child taken."):
+CAP_SENT = (NOW - timedelta(minutes=5)).replace(microsecond=0)      # a CAP dateTime has whole seconds
+
+
+def cap(identifier, *, status="Actual", msg_type="Alert", references=(), expires=None, description="Child taken.",
+        sender="test", sent=None):
+    """A parsed CAP message as fetch_and_parse_cap returns it. ``references`` are identifiers of messages by the
+    same sender sent at the same time (the helper's default), expressed as complete reference identities."""
+    sent = sent or CAP_SENT
     return {
-        "identifier": identifier, "sent": iso(NOW - timedelta(minutes=5)),
-        "expires": iso(expires or NOW + timedelta(hours=4)), "sender": "test", "sender_name": "KBI",
+        "identifier": identifier, "sent": iso(sent),
+        "expires": iso(expires or NOW + timedelta(hours=4)), "sender": sender, "sender_name": "KBI",
         "status": status, "msg_type": msg_type, "references": list(references),
+        "reference_identities": [ipaws.message_identity(sender, r, iso(sent)) for r in references],
         "event": "Child Abduction Emergency", "event_code": "CAE", "headline": "AMBER Alert",
         "description": description, "instruction": "Call 911.", "areas": ["020169"],
     }
@@ -313,11 +321,11 @@ INFO_DEFAULTS = {"category": "Rescue", "event": "Child Abduction Emergency", "ur
 
 def cap_xml(identifier, *, status="Actual", msg_type="Alert", references=None, info=True, sent=True,
             expires="2026-11-14T16:00:00-06:00", description="Child taken.", scope="Public",
-            info_fields=None, raw_info=None):
+            info_fields=None, raw_info=None, sender="kbi@ks", sent_at="2026-11-13T16:00:00-06:00"):
     """A CAP 1.2 message. info_fields overrides mandatory <info> elements (None drops one, "" empties it);
     raw_info replaces the whole <info> block (e.g. "<info/>")."""
     refs = f"<references>{references}</references>" if references is not None else ""
-    sent_el = "<sent>2026-11-13T16:00:00-06:00</sent>" if sent else ""
+    sent_el = f"<sent>{sent_at}</sent>" if sent else ""
     scope_el = f"<scope>{scope}</scope>" if scope is not None else ""
     fields = dict(INFO_DEFAULTS, **(info_fields or {}))
     mandatory = "".join(f"<{k}>{v}</{k}>" for k, v in fields.items() if v is not None)
@@ -329,14 +337,15 @@ def cap_xml(identifier, *, status="Actual", msg_type="Alert", references=None, i
   </info>""" if info else "")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
-  <identifier>{identifier}</identifier><sender>kbi@ks</sender>{sent_el}
+  <identifier>{identifier}</identifier><sender>{sender}</sender>{sent_el}
   <status>{status}</status><msgType>{msg_type}</msgType>{scope_el}{refs}
   {info_el}
 </alert>""".encode()
 
 
-def ref(*identifiers):
-    return " ".join(f"kbi@ks,{i},2026-11-13T15:00:00-06:00" for i in identifiers)
+def ref(*identifiers, sender="kbi@ks", sent="2026-11-13T16:00:00-06:00"):
+    """<references> text naming each identifier by the complete identity cap_xml gives its default message."""
+    return " ".join(f"{sender},{i},{sent}" for i in identifiers)
 
 
 class CapAuthorityTests(unittest.TestCase):
@@ -651,6 +660,287 @@ class CapParsingTests(unittest.TestCase):
         with patch.object(ipaws, "_http_get", return_value=b"<not-cap"):
             with self.assertRaises(ipaws.CapParseError):
                 ipaws.fetch_and_parse_cap("https://example.invalid/cap")
+
+
+SENDER_A, SENDER_B = "kbi@ks", "other@ks"
+T_1600 = "2026-11-13T16:00:00-06:00"
+T_1700 = "2026-11-13T17:00:00-06:00"
+T_1600_UTC = "2026-11-13T22:00:00+00:00"          # the same instant as T_1600
+
+
+class CapReferenceIdentityTests(unittest.TestCase):
+    """Final correction: a reference names a message by its complete CAP 1.2 identity (sender, identifier, sent);
+    an identifier alone is never enough, and a malformed reference is never skipped."""
+
+    def parse(self, xml):
+        with patch.object(ipaws, "_http_get", return_value=xml):
+            return ipaws.fetch_and_parse_cap("https://example.invalid/cap")
+
+    def survivors(self, *xmls):
+        """[(sender, identifier, sent)] of the alerts still in effect."""
+        return [(c["sender"], c["identifier"], c["sent"])
+                for c in ipaws.current_alerts([self.parse(x) for x in xmls])]
+
+    def assert_rejected(self, xml):
+        with self.assertRaises(ipaws.CapParseError):
+            self.parse(xml)
+
+    def cancel(self, references, *, sender="fema@ipaws", identifier="CAN-1"):
+        return cap_xml(identifier, msg_type="Cancel", references=references, info=False, sender=sender)
+
+    # -- 1-3: single, update and multiple references -------------------------------------------------------------
+
+    def test_a_valid_single_reference_cancel_retires_exactly_the_referenced_message(self):
+        parsed = self.parse(self.cancel(ref("CAP-1")))
+        self.assertEqual(parsed["reference_identities"], [(SENDER_A, "CAP-1", T_1600_UTC)])
+        self.assertEqual(parsed["references"], ["CAP-1"])
+        self.assertEqual(self.survivors(cap_xml("CAP-1"), cap_xml("CAP-2"), self.cancel(ref("CAP-1"))),
+                         [(SENDER_A, "CAP-2", T_1600)])
+
+    def test_an_update_supersedes_the_prior_issuance_it_references(self):
+        update = cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"), sent_at=T_1700)
+        self.assertEqual(self.survivors(cap_xml("CAP-1"), update), [(SENDER_A, "CAP-2", T_1700)])
+
+    def test_multiple_references_in_one_message_are_each_honored(self):
+        update = cap_xml("CAP-4", msg_type="Update", sent_at=T_1700,
+                         references=" ".join([ref("CAP-1"), ref("CAP-2", sender=SENDER_B)]))
+        parsed = self.parse(update)
+        self.assertEqual([r[:2] for r in parsed["reference_identities"]], [(SENDER_A, "CAP-1"), (SENDER_B, "CAP-2")])
+        alerts = [cap_xml("CAP-1"), cap_xml("CAP-2", sender=SENDER_B), cap_xml("CAP-2"), cap_xml("CAP-3")]
+        self.assertEqual(sorted(self.survivors(*alerts, update)),
+                         sorted([(SENDER_A, "CAP-2", T_1600), (SENDER_A, "CAP-3", T_1600), (SENDER_A, "CAP-4", T_1700)]))
+
+    # -- 4-7: sender and sent are part of the identity -------------------------------------------------------------
+
+    def test_a_cancel_retires_only_the_sender_it_references_when_two_senders_share_an_identifier(self):
+        a = cap_xml("CAP-1", sender=SENDER_A)
+        b = cap_xml("CAP-1", sender=SENDER_B)                                   # same identifier AND same sent
+        for order in ((a, b), (b, a)):
+            with self.subTest(retired=SENDER_A, order=[o[60:90] for o in order]):
+                self.assertEqual(self.survivors(*order, self.cancel(ref("CAP-1", sender=SENDER_A))),
+                                 [(SENDER_B, "CAP-1", T_1600)])
+        self.assertEqual(self.survivors(a, b, self.cancel(ref("CAP-1", sender=SENDER_B))),
+                         [(SENDER_A, "CAP-1", T_1600)])
+
+    def test_an_update_supersedes_only_the_sender_it_references(self):
+        update = cap_xml("CAP-9", msg_type="Update", references=ref("CAP-1", sender=SENDER_B), sent_at=T_1700)
+        self.assertEqual(sorted(self.survivors(cap_xml("CAP-1", sender=SENDER_A),
+                                               cap_xml("CAP-1", sender=SENDER_B), update)),
+                         sorted([(SENDER_A, "CAP-1", T_1600), (SENDER_A, "CAP-9", T_1700)]))
+
+    def test_the_cancelling_sender_need_not_be_the_referenced_sender(self):
+        for canceller in (SENDER_A, SENDER_B, "fema@ipaws"):
+            with self.subTest(canceller=canceller):
+                self.assertEqual(
+                    self.survivors(cap_xml("CAP-1", sender=SENDER_A),
+                                   self.cancel(ref("CAP-1", sender=SENDER_A), sender=canceller)), [])
+
+    def test_same_sender_and_identifier_at_different_times_are_different_messages(self):
+        early = cap_xml("CAP-1", sent_at=T_1600)
+        late = cap_xml("CAP-1", sent_at=T_1700)
+        self.assertEqual(self.survivors(early, late, self.cancel(ref("CAP-1", sent=T_1600))),
+                         [(SENDER_A, "CAP-1", T_1700)])
+        self.assertEqual(self.survivors(early, late, self.cancel(ref("CAP-1", sent=T_1700))),
+                         [(SENDER_A, "CAP-1", T_1600)])
+        self.assertEqual(self.survivors(early, late, self.cancel(ref("CAP-1", sent="2026-11-13T16:00:01-06:00"))),
+                         [(SENDER_A, "CAP-1", T_1600), (SENDER_A, "CAP-1", T_1700)])     # no such message
+
+    def test_sent_is_compared_as_an_instant_so_equivalent_offsets_match_and_distinct_instants_do_not(self):
+        alert = cap_xml("CAP-1", sent_at=T_1600)
+        self.assertEqual(self.survivors(alert, self.cancel(ref("CAP-1", sent=T_1600_UTC))), [])
+        self.assertEqual(self.survivors(alert, self.cancel(ref("CAP-1", sent="2026-11-13T23:00:00+01:00"))), [])
+        self.assertEqual(len(self.survivors(alert, self.cancel(ref("CAP-1", sent="2026-11-13T22:00:00+01:00")))), 1)
+        self.assertEqual(len(self.survivors(alert, self.cancel(ref("CAP-1", sent="2026-11-13T16:00:00+00:00")))), 1)
+
+    def test_sender_and_identifier_are_compared_exactly(self):
+        alert = cap_xml("CAP-1")
+        for sender, identifier in (("KBI@ks", "CAP-1"), ("kbi@ks", "cap-1"), ("kbi@ks", "CAP-1x")):
+            with self.subTest(sender=sender, identifier=identifier):
+                self.assertEqual(len(self.survivors(alert, self.cancel(f"{sender},{identifier},{T_1600}"))), 1)
+
+    # -- 8-12: malformed references are rejected, never skipped ------------------------------------------------------
+
+    def test_an_invalid_reference_timestamp_is_rejected(self):
+        for bad in ("yesterday", "2026-11-13 16:00:00-06:00", "2026-13-45T16:00:00-06:00", "2026-11-13T16:00:00",
+                    "2026-11-13T25:00:00-06:00", "2026-11-13T16:00:00-0600", "2026-11-13T16:00:00.5-06:00",
+                    "2026-11-13T16:00:00Z", "16:00:00-06:00", "0", "null"):
+            for build in (lambda r: self.cancel(r), lambda r: cap_xml("CAP-2", msg_type="Update", references=r)):
+                with self.subTest(timestamp=bad):
+                    self.assert_rejected(build(f"{SENDER_A},CAP-1,{bad}"))
+
+    def test_a_missing_or_empty_reference_component_is_rejected(self):
+        for bad in (f"{SENDER_A},CAP-1", f"{SENDER_A},CAP-1,", f",CAP-1,{T_1600}", f"{SENDER_A},,{T_1600}",
+                    ",,", "CAP-1", f"{SENDER_A},CAP-1,{T_1600},extra"):
+            with self.subTest(reference=bad):
+                self.assert_rejected(self.cancel(bad))
+
+    def test_restricted_characters_in_a_referenced_sender_are_rejected(self):
+        for sender in ("kb&amp;i@ks", "kb&lt;i@ks", "a,b"):          # "&", "<", and a comma (a fourth component)
+            with self.subTest(sender=sender):
+                self.assert_rejected(self.cancel(f"{sender},CAP-1,{T_1600}"))
+
+    def test_restricted_characters_in_a_referenced_identifier_are_rejected(self):
+        for identifier in ("CAP&amp;1", "CAP&lt;1", "CAP,1"):
+            with self.subTest(identifier=identifier):
+                self.assert_rejected(self.cancel(f"{SENDER_A},{identifier},{T_1600}"))
+
+    def test_a_malformed_entry_among_valid_references_rejects_the_whole_message(self):
+        good = ref("CAP-1")
+        for bad in (f"{good} {SENDER_A};CAP-2;{T_1600}", f"{good} {SENDER_A},CAP-2,not-a-time",
+                    f"{SENDER_A},CAP-2 {T_1600} {good}", f"{good} {SENDER_A},CAP-2", f"{good} ,,"):
+            for build in (lambda r: self.cancel(r), lambda r: cap_xml("CAP-3", msg_type="Update", references=r)):
+                with self.subTest(references=bad):
+                    self.assert_rejected(build(bad))
+
+    def test_parse_references_returns_complete_identities_and_raises_value_error_uniformly(self):
+        self.assertEqual(ipaws.parse_references(f"{ref('A-1')}  \n {ref('B-2', sender=SENDER_B, sent=T_1700)}"),
+                         [(SENDER_A, "A-1", T_1600_UTC), (SENDER_B, "B-2", "2026-11-13T23:00:00+00:00")])
+        self.assertEqual(ipaws.parse_references(""), [])
+        self.assertEqual(ipaws.parse_references(None), [])
+        for bad in ("a,b", f"a,b,{T_1600}x", "a,b,2026-02-30T00:00:00+00:00"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ipaws.parse_references(bad)
+
+    def test_message_identity_is_idempotent_and_never_conflates_distinct_instants(self):
+        once = ipaws.message_identity(SENDER_A, "CAP-1", T_1600)
+        self.assertEqual(once, ipaws.message_identity(*once))
+        self.assertNotEqual(once, ipaws.message_identity(SENDER_A, "CAP-1", T_1700))
+        self.assertNotEqual(once, ipaws.message_identity(SENDER_B, "CAP-1", T_1600))
+
+    # -- 14-16: authority rules that must survive ---------------------------------------------------------------------
+
+    def test_an_info_less_actual_cancel_retains_its_authority_with_a_complete_reference(self):
+        cancel = self.cancel(ref("CAP-1"))
+        self.assertNotIn(b"<info", cancel)
+        self.assertEqual(self.survivors(cap_xml("CAP-1"), cancel), [])
+        self.assertEqual(self.survivors(cancel, cap_xml("CAP-1")), [])
+
+    def test_a_test_or_exercise_message_with_an_exact_reference_still_cancels_nothing(self):
+        alert = cap_xml("CAP-1")
+        for status in ("Test", "Exercise", "System", "Draft"):
+            for msg_type, info in (("Cancel", False), ("Update", True)):
+                with self.subTest(status=status, msg_type=msg_type):
+                    other = cap_xml("X-1", status=status, msg_type=msg_type, references=ref("CAP-1"), info=info)
+                    self.assertEqual(self.survivors(alert, other), [(SENDER_A, "CAP-1", T_1600)])
+
+    def test_update_chains_with_distinct_senders_and_times_resolve_in_every_feed_order(self):
+        import itertools
+        original = cap_xml("CAP-1", sender=SENDER_A, sent_at=T_1600)
+        first = cap_xml("CAP-2", sender=SENDER_B, msg_type="Update", sent_at=T_1700,
+                        references=ref("CAP-1", sender=SENDER_A, sent=T_1600))
+        second = cap_xml("CAP-3", sender=SENDER_A, msg_type="Update", sent_at="2026-11-13T18:00:00-06:00",
+                         references=ref("CAP-2", sender=SENDER_B, sent=T_1700))
+        for order in itertools.permutations((original, first, second)):
+            with self.subTest(order=[xml.split(b"<identifier>")[1][:5] for xml in order]):
+                self.assertEqual(self.survivors(*order), [(SENDER_A, "CAP-3", "2026-11-13T18:00:00-06:00")])
+
+    # -- fail closed when only an identifier is available ----------------------------------------------------------------
+
+    def test_authority_is_never_inferred_from_an_identifier_alone(self):
+        alert = cap("CAP-1")
+        legacy_cancel = dict(cap("CAN-1", msg_type="Cancel", references=["CAP-1"]))
+        del legacy_cancel["reference_identities"]
+        with self.assertRaises(ipaws.CapParseError):
+            ipaws.current_alerts([alert, legacy_cancel])
+
+    def test_a_message_that_can_air_without_a_valid_identity_is_not_guessed_at(self):
+        for field, value in (("sender", ""), ("sender", None), ("identifier", "A B"), ("sent", "yesterday"),
+                             ("sent", None)):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ipaws.CapParseError):
+                    ipaws.current_alerts([dict(cap("CAP-1"), **{field: value})])
+
+
+class ReferenceIdentityEndToEndTests(unittest.TestCase):
+    """Atom feed -> CAP retrieval -> reference parsing -> active-set reduction -> authoritative snapshot ->
+    combined-alert playback eligibility, with only the HTTP transport, the config bridge and the coordinator doubled."""
+
+    BASE = AtomToSnapshotTests.BASE
+    CFG = AtomToSnapshotTests.CFG
+    setUp = AtomToSnapshotTests.setUp
+    _http_get = AtomToSnapshotTests._http_get
+    publish = AtomToSnapshotTests.publish
+    poll = AtomToSnapshotTests.poll
+
+    @property
+    def future(self):
+        return (NOW + timedelta(days=1)).astimezone(timezone(timedelta(hours=-6))).strftime("%Y-%m-%dT%H:%M:%S-06:00")
+
+    def alert_xml(self, identifier, sender, description):
+        return cap_xml(identifier, sender=sender, description=description, expires=self.future)
+
+    def eligibility(self):
+        """Would a combined announcement built from the CURRENT snapshots be allowed to air now?"""
+        from isadoraair import wx_alert_state
+        now = datetime.now(timezone.utc)
+        alerts, _sources, _excluded = wx_alert_state.effective_alerts(self.tmp, now)
+        audio = self.tmp / "wx_alert.flac"
+        audio.write_bytes(b"combined announcement")
+        state = {"schema": 1, "generation": 1, "active": True, "fingerprint": wx_alert_state.content_fingerprint(alerts),
+                 "valid_until": wx_alert_state.format_ts(now + timedelta(hours=1)),
+                 "published_at": wx_alert_state.format_ts(now), "audio": wx_alert_state.audio_identity(audio),
+                 "sources": {"nws": "ok", "amber": "ok"}}
+        decision = wx_alert_state.playback_decision(state, wx_alert_state.audio_identity(audio), now, self.tmp)
+        return alerts, decision
+
+    def test_a_cancel_for_one_sender_leaves_another_senders_same_identifier_alert_eligible(self):
+        from isadoraair import wx_alert_state
+        self.feed = [self.publish("a", self.alert_xml("CAP-1", SENDER_A, "Child taken from Salina.")),
+                     self.publish("b", self.alert_xml("CAP-1", SENDER_B, "Child taken from Abilene."))]
+        held = self.poll()
+        self.assertEqual(sorted((e["identifier"], e["text"]) for e in held),
+                         [("CAP-1", "Child taken from Abilene. Call 911."), ("CAP-1", "Child taken from Salina. Call 911.")])
+        alerts, _ = self.eligibility()
+        self.assertEqual(len(alerts), 2)                                    # the coordinator keeps both issuances
+
+        cancel = self.publish("c", cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1", sender=SENDER_A),
+                                           info=False, sender="fema@ipaws"), event=None, statefips=None)
+        for feed in ([*self.feed, cancel], [cancel, *self.feed]):           # feed order must not matter
+            self.feed = feed
+            snapshot = self.poll()
+            self.assertEqual([e["text"] for e in snapshot], ["Child taken from Abilene. Call 911."])
+            alerts, decision = self.eligibility()
+            self.assertEqual([a["text"] for a in alerts], ["Child taken from Abilene. Call 911."])
+            self.assertTrue(decision.allowed, decision.reason)              # the unrelated alert is not withdrawn
+
+    def test_a_cancel_naming_the_wrong_sent_time_withdraws_nothing(self):
+        self.feed = [self.publish("a", self.alert_xml("CAP-1", SENDER_A, "Child taken.")),
+                     self.publish("c", cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1", sent=T_1700),
+                                               info=False), event=None, statefips=None)]
+        self.assertEqual([e["identifier"] for e in self.poll()], ["CAP-1"])
+        self.assertTrue(self.eligibility()[1].allowed)
+
+    def test_an_exact_identity_cancel_still_retires_the_announcement(self):
+        self.feed = [self.publish("a", self.alert_xml("CAP-1", SENDER_A, "Child taken."))]
+        self.assertEqual(len(self.poll()), 1)
+        self.feed.append(self.publish("c", cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1"), info=False),
+                                      event=None, statefips=None))
+        self.assertEqual(self.poll(), [])
+
+    def test_a_malformed_reference_keeps_the_previous_snapshot_byte_for_byte(self):
+        self.feed = [self.publish("a", self.alert_xml("CAP-1", SENDER_A, "Child taken."))]
+        self.poll()
+        before = self.active.read_bytes()
+        runs = amber_poll._run_alert_coordinator.call_count
+        malformed = {
+            "invalid timestamp": f"{SENDER_A},CAP-1,2026-13-45T16:00:00-06:00",
+            "missing timestamp": f"{SENDER_A},CAP-1",
+            "bad referenced sender": f"kb&amp;i@ks,CAP-1,{T_1600}",
+            "bad entry among good ones": f"{ref('CAP-0')} {SENDER_A},CAP-1,soon",
+        }
+        for label, references in malformed.items():
+            for kind, info in (("Update", True), ("Cancel", False)):
+                with self.subTest(case=label, msg_type=kind):
+                    xml = cap_xml("CAP-2", msg_type=kind, references=references, info=info, expires=self.future)
+                    self.feed = [self.publish("a", self.alert_xml("CAP-1", SENDER_A, "Child taken.")),
+                                 self.publish("m", xml, event="CAE" if info else None, statefips="20" if info else None)]
+                    with self.assertLogs(amber_poll.log, "WARNING") as logged:
+                        self.poll()
+                    self.assertEqual(self.active.read_bytes(), before)       # no supersession, no partial commit
+                    self.assertIn("previous snapshot kept", "\n".join(logged.output))
+                    runs += 1
+                    self.assertEqual(amber_poll._run_alert_coordinator.call_count, runs)
+        self.assertTrue(self.eligibility()[1].allowed)                      # still the same authoritative alert
 
 
 class CoordinatorInvocationTests(unittest.TestCase):
