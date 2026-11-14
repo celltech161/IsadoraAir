@@ -61,9 +61,16 @@ class FormatterSourceTests(SimpleTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.pw = sync_playwright().start()
-        cls.browser = cls.pw.chromium.launch()
-        cls.page = cls.browser.new_page()
-        cls.page.set_content('<span id="displayDuration"></span>')
+        try:
+            cls.browser = cls.pw.chromium.launch()
+            cls.page = cls.browser.new_page()
+            cls.page.set_content('<span id="displayDuration"></span>')
+        except Exception:
+            # tearDownClass never runs when setUpClass raises: stop Playwright
+            # here, or its still-running event loop makes every later database
+            # test in the process fail its safety guard (SynchronousOnlyOperation).
+            cls.pw.stop()
+            raise
 
     @classmethod
     def tearDownClass(cls):
