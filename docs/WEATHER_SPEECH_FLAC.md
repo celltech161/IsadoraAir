@@ -89,8 +89,9 @@ condition with real consequences; do not leave both eligible:
 - **Scheduling and rotations** may pool both Tracks, and approved logs or playlists keep referencing the old MP3 Track,
   which nothing regenerates any more (it will air stale). Review playlists, rotations and scheduled references and
   switch them to the FLAC Track before retiring the MP3.
-- **WxAlert urgent insert** takes the first ready Track of the `WxAlert` category with no ordering (engine behavior,
-  deliberately unchanged). While the old `wx_alert.mp3` Track is eligible it can be chosen instead of the new FLAC.
+- **WxAlert urgent insert** (r0137): the engine now resolves the exact `WxAlert/wx_alert.flac` Track and never the
+  first ready Track of the category, so an eligible old `wx_alert.mp3` Track can no longer be chosen (an occurrence of
+  it is refused at deck open). Retire it anyway; see `docs/WEATHER_ALERT_COMBINED.md` for the read-only preflight.
 
 ### Cutover checklist
 
