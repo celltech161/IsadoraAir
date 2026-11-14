@@ -27,6 +27,7 @@ voices.resolve_voice = lambda *args, **kwargs: None
 voices.synthesize = lambda *args, **kwargs: None
 wxconfig = types.ModuleType("wxconfig")
 wxconfig.load_weather_config = lambda: {}
+wxconfig.load_amber_alert_config = lambda: {"enabled": False}
 wxconfig.resolve_weather_data_dir = lambda: Path("/tmp")
 sys.modules.update(delivery=delivery, voices=voices, wxconfig=wxconfig)
 

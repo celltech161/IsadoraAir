@@ -8,9 +8,11 @@ The announcement is ONE canonical file and Track, rebuilt in place (atomic renam
   retired ``wx_alert.mp3``).
 * ``authorize_open()`` -- the binding check at deck open: holds the publication's own lock SHARED (never
   blocking) through the file open, requires an active, unexpired generation whose recorded audio is the file on
-  disk, refreshes the Track row (duration/next-start of the audio that will actually open) and refuses a
-  generation another occurrence already claimed.
-* ``generation_claimed()`` -- delivery truth for idempotent synchronization, from persisted playback claims.
+  disk and whose content is still what the current source snapshots produce, refreshes the Track row
+  (duration/next-start of the audio that will actually open) and refuses a generation another occurrence already
+  aired or a live deck is already playing.
+* ``generation_delivery()`` -- delivery truth for idempotent synchronization: persisted claims attribute an
+  occurrence to a generation, its ``played_at`` proves it actually aired.
 
 Local file reads and bounded indexed queries only: never a network request or audio work on the engine thread.
 """
@@ -32,8 +34,12 @@ def audio_path() -> Path:
     return wx_alert_state.audio_path(root)
 
 
+def data_dir() -> Path:
+    return Path(getattr(settings, "WEATHER_DATA_DIR", "/var/lib/isadoraair/weather"))
+
+
 def state_path() -> Path:
-    return wx_alert_state.state_path(getattr(settings, "WEATHER_DATA_DIR", "/var/lib/isadoraair/weather"))
+    return wx_alert_state.state_path(data_dir())
 
 
 def read_state():
@@ -64,25 +70,34 @@ def current_decision(now=None):
     if state is None:
         return wx_alert_state.PlaybackDecision(False, f"combined alert state {error}"), None
     identity = wx_alert_state.audio_identity(audio_path())
-    return wx_alert_state.playback_decision(state, identity, now or timezone.now()), state
+    return wx_alert_state.playback_decision(state, identity, now or timezone.now(), data_dir()), state
 
 
-def generation_claimed(track_id, published_at, *, exclude_pk=None) -> bool:
-    """Did any occurrence of the announcement Track claim playback at/after this generation's publication?
+def generation_delivery(track_id, published_at, *, exclude_pk=None):
+    """``(aired, claimed_unaired_ids)`` for the generation published at ``published_at``.
 
-    Exact under the deck-open lock: a deck opens the file only while the state record names that file and while
-    the publication lock is held shared, so an earlier generation's claim always precedes the next generation's
-    ``published_at``.  Persisted, so it survives an engine restart."""
+    Generation attribution uses the CLAIM time, never ``played_at``: a deck is authorized and claimed only while
+    holding the publication lock shared and only while the state record names the file on disk, and a later
+    generation's ``published_at`` is stamped after its publication finished -- so every occurrence claimed at or
+    after ``published_at`` opened this generation (or a newer one), and every earlier claim opened an earlier
+    one, whenever its first buffer (``played_at``) happened to arrive.
+
+    Delivery itself requires the authoritative air-start evidence of that occurrence (``played_at``): a claim
+    whose deck failed or vanished before its first real buffer is NOT delivery.  Claimed-but-unaired occurrences
+    are returned so the caller can tell one still owned by a live deck (in progress) from an abandoned one
+    (retryable).  Persisted, so it survives an engine restart."""
     qs = LogItem.objects.filter(track_id=track_id, playback_claimed_at__gte=published_at)
     if exclude_pk is not None:
         qs = qs.exclude(pk=exclude_pk)
-    return qs.exists()
+    rows = list(qs.values_list("pk", "played_at"))
+    return any(played is not None for _pk, played in rows), {pk for pk, played in rows if played is None}
 
 
-def authorize_open(log_item, scope):
+def authorize_open(log_item, scope, live_occurrence_ids=()):
     """The final WxAlert deck-open authority.  Returns None when the occurrence may open (``log_item.track`` is
     then the freshly read Track), else the refusal reason.  ``scope`` (an ExitStack) receives the shared
-    publication lock and must stay open until the deck's filesrc has opened the file."""
+    publication lock and must stay open until the deck's filesrc has opened the file.  ``live_occurrence_ids``
+    are the LogItems currently owned by a live (not completed/retired) deck."""
     from weather.publication import destination_lock_path
 
     path = audio_path()
@@ -102,7 +117,8 @@ def authorize_open(log_item, scope):
         return "the announcement Track no longer exists"
     if fresh.filepath != str(path):
         return f"not the canonical announcement Track ({fresh.filepath})"
-    decision = wx_alert_state.playback_decision(state, wx_alert_state.audio_identity(path), timezone.now())
+    decision = wx_alert_state.playback_decision(state, wx_alert_state.audio_identity(path), timezone.now(),
+                                                data_dir())
     if not decision.allowed:
         return decision.reason
     claimed_at = getattr(log_item, "playback_claimed_at", None)
@@ -110,7 +126,10 @@ def authorize_open(log_item, scope):
         # A recreation (resume/seek) of an occurrence that began an EARLIER generation must never continue
         # into the newer audio now at the same path.
         return f"occurrence was claimed for an earlier announcement than generation {decision.generation}"
-    if generation_claimed(fresh.pk, decision.published_at, exclude_pk=log_item.pk):
-        return f"announcement generation {decision.generation} was already claimed by another occurrence"
+    aired, claimed_unaired = generation_delivery(fresh.pk, decision.published_at, exclude_pk=log_item.pk)
+    if aired:
+        return f"announcement generation {decision.generation} already aired"
+    if claimed_unaired & set(live_occurrence_ids):
+        return f"announcement generation {decision.generation} is already on a deck"
     log_item.track = fresh
     return None

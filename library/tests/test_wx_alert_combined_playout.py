@@ -90,6 +90,13 @@ class WxAlertPlayoutFixture(TwoHourFixture):
         self.assertTrue(engine._claim_playback_occurrence(row))
         return LogItem.objects.get(pk=row.pk).playback_claimed_at
 
+    def air(self, engine, row, at=None):
+        """Claim, then the authoritative first-real-buffer evidence (played_at)."""
+        self.claim(engine, row)
+        played = at or timezone.now()
+        LogItem.objects.filter(pk=row.pk).update(played_at=played)
+        row.played_at = played
+
 
 class SynchronizationTests(WxAlertPlayoutFixture):
     def test_repeated_nudges_leave_exactly_one_pending_occurrence(self):
@@ -127,12 +134,12 @@ class SynchronizationTests(WxAlertPlayoutFixture):
         self.nudge(engine)
         self.assertEqual(self.wx_rows(), [])
 
-    def test_a_claimed_generation_is_never_queued_again_and_a_restart_does_not_repeat_it(self):
+    def test_an_aired_generation_is_never_queued_again_and_a_restart_does_not_repeat_it(self):
         self.announce(1)
         engine = self.live_engine()
         self.nudge(engine)
         row, = self.wx_rows()
-        self.claim(engine, row)
+        self.air(engine, row)
         self.nudge(engine)
         fresh = self.live_engine()                     # a restarted engine: no in-memory bookkeeping
         self.nudge(fresh)
@@ -144,7 +151,7 @@ class SynchronizationTests(WxAlertPlayoutFixture):
         self.nudge(engine)
         airing = engine._next_queue_item()[0]
         self.assertIsNone(self.open_row(airing)[1])
-        self.claim(engine, airing)
+        self.air(engine, airing)
         engine.decks["A"] = SimpleNamespace(log_item=airing, track=self.wx_track)
         self.announce(2, b"second")
         self.nudge(engine)
@@ -165,7 +172,7 @@ class SynchronizationTests(WxAlertPlayoutFixture):
             track, reason = self.open_row(row)
             self.assertIsNone(reason, generation)
             self.assertEqual(Path(track.filepath).read_bytes(), payload)
-            self.claim(engine, row)
+            self.air(engine, row)
         self.assertEqual(len(self.wx_rows()), 3)
 
     def test_a_failed_insertion_is_retried_without_duplicates(self):
@@ -201,6 +208,121 @@ class SynchronizationTests(WxAlertPlayoutFixture):
             engine._insert_urgent_next_inner("UrgentPA")
             engine._insert_urgent_next_inner("UrgentPA")
         self.assertEqual(LogItem.objects.filter(track=pa_track).count(), 2)   # no idempotence imposed
+
+
+class DeliverySemanticsTests(WxAlertPlayoutFixture):
+    """Finding 1: a claim is deck preparation, not delivery. Only the occurrence's own played_at (first real
+    buffer) delivers its generation; a claim whose deck failed or vanished before that is retryable, while a
+    claim still owned by a live deck is in progress and must not be duplicated."""
+
+    def claimed_then(self, engine, *, deck=None):
+        self.announce(1)
+        self.nudge(engine)
+        row = engine._next_queue_item()[0]
+        self.assertIsNone(self.open_row(row)[1])
+        self.claim(engine, row)
+        engine.decks["A"] = deck(row) if deck else None
+        return row
+
+    @staticmethod
+    def deck(row, **state):
+        values = dict(log_item=row, finished=False, retirement_started=False, completion_claimed=False)
+        values.update(state)
+        return SimpleNamespace(**values)
+
+    def test_claimed_then_deck_creation_failed_is_retried_and_the_retry_opens(self):
+        engine = self.live_engine()
+        failed = self.claimed_then(engine)                     # _create_deck raised after the claim: no deck
+        self.nudge(engine)
+        rows = self.wx_rows()
+        self.assertEqual(len(rows), 2)
+        retry = engine._next_queue_item()[0]
+        self.assertEqual(retry.id, rows[-1].id)
+        self.assertNotEqual(retry.id, failed.id)
+        self.assertIsNone(self.open_row(retry)[1])
+
+    def test_claimed_then_media_open_or_sync_failure_or_decoder_error_is_retried(self):
+        for reason in ("error", "eos"):                         # sync/open failure and decoder failure complete
+            with self.subTest(completion=reason):               # the generation without a first real buffer
+                LogItem.objects.filter(track=self.wx_track).delete()
+                engine = self.live_engine()
+                row = self.claimed_then(engine, deck=lambda r: self.deck(r, completion_claimed=True))
+                self.nudge(engine)
+                self.assertEqual(len(self.wx_rows()), 2, reason)
+                self.assertIsNone(self.open_row(engine._next_queue_item()[0])[1])
+
+    def test_an_actively_owned_deck_is_never_duplicated(self):
+        engine = self.live_engine()
+        row = self.claimed_then(engine, deck=self.deck)
+        for _ in range(3):
+            self.nudge(engine)
+        self.assertEqual(len(self.wx_rows()), 1)
+        engine.decks["A"] = None                                # ...until that deck disappears unheard
+        self.nudge(engine)
+        self.assertEqual(len(self.wx_rows()), 2)
+        self.assertIsNotNone(row)
+
+    def test_a_genuinely_aired_announcement_is_not_repeated_by_unchanged_nudges(self):
+        engine = self.live_engine()
+        row = self.claimed_then(engine, deck=self.deck)
+        LogItem.objects.filter(pk=row.pk).update(played_at=timezone.now())
+        engine.decks["A"] = None                                # finished normally
+        for _ in range(3):
+            self.nudge(engine)
+        self.nudge(self.live_engine())                          # and after an engine restart
+        self.assertEqual(len(self.wx_rows()), 1)
+
+    def test_an_earlier_generations_late_air_start_never_delivers_a_newer_generation(self):
+        engine = self.live_engine()
+        old = self.claimed_then(engine, deck=self.deck)         # claimed for generation 1 ...
+        self.announce(2, b"newer")
+        LogItem.objects.filter(pk=old.pk).update(played_at=timezone.now())   # ... first buffer after gen 2
+        engine.decks["A"] = None
+        self.nudge(engine)
+        rows = self.wx_rows()
+        self.assertEqual(len(rows), 2)                          # generation 2 is still owed
+        track, reason = self.open_row(engine._next_queue_item()[0])
+        self.assertIsNone(reason)
+        self.assertEqual(Path(track.filepath).read_bytes(), b"newer")
+
+
+class SourceAuthorityTests(WxAlertPlayoutFixture):
+    """Finding 2 at the engine: once a poller commits newer source content, the published generation gets no new
+    authorization (deck open or sync) until the coordinator republishes; an open deck is untouched."""
+
+    def test_a_committed_cancellation_refuses_the_pending_occurrence_before_the_coordinator_runs(self):
+        self.announce(1, content="Tornado warning.")
+        engine = self.live_engine()
+        self.nudge(engine)
+        row = engine._next_queue_item()[0]
+        wx_alert_support.write_sources(self.data_dir, [], [])        # NWS poller: cancelled
+        track, reason = self.open_row(row)
+        self.assertIsNone(track)
+        self.assertIn("sources changed", reason)
+
+    def test_a_committed_update_blocks_new_queueing_of_the_obsolete_generation(self):
+        self.announce(1, content="Tornado warning.")
+        wx_alert_support.write_sources(self.data_dir, [wx_alert_support.nws_entry("Tornado, now larger.")], [])
+        engine = self.live_engine()
+        self.nudge(engine)
+        self.nudge(engine)
+        self.assertEqual(self.wx_rows(), [])
+
+    def test_unverifiable_sources_never_authorize(self):
+        self.announce(1)
+        engine = self.live_engine()
+        self.nudge(engine)
+        row = engine._next_queue_item()[0]
+        (self.data_dir / "active_amber_alerts.json").unlink()
+        self.assertIn("cannot be verified", self.open_row(row)[1])
+
+    def test_an_irrelevant_snapshot_rewrite_keeps_authorization(self):
+        self.announce(1, content="Tornado warning.")
+        entry = wx_alert_support.nws_entry("Tornado warning.", valid_for=timedelta(hours=3))   # extended expiry
+        wx_alert_support.write_sources(self.data_dir, [entry], [])
+        engine = self.live_engine()
+        self.nudge(engine)
+        self.assertIsNone(self.open_row(engine._next_queue_item()[0])[1])
 
 
 class DeckOpenAuthorityTests(WxAlertPlayoutFixture):
@@ -263,15 +385,19 @@ class DeckOpenAuthorityTests(WxAlertPlayoutFixture):
         self.assertEqual((track.duration_seconds, track.next_start_seconds), (95.0, 93.5))
         self.assertIs(item.track, track)                  # what _create_deck hands to the Deck
 
-    def test_a_second_occurrence_of_an_already_claimed_generation_never_opens(self):
+    def test_a_second_occurrence_of_an_aired_or_live_generation_never_opens(self):
         engine, row = self.pending()
         duplicate = engine._splice_log_item_db_at(engine._queue_cursor + 1, self.wx_track, self.wx)  # legacy duplicate
         self.claim(engine, row)
-        self.assertIn("already claimed", self.open_row(duplicate)[1])
+        with eng_module._deck_open_authority(duplicate, {row.id}) as (track, reason):   # row's deck is live
+            self.assertIn("already on a deck", reason)
+        self.assertIsNone(self.open_row(duplicate)[1])            # its deck vanished unheard: a retry may open
+        LogItem.objects.filter(pk=row.pk).update(played_at=timezone.now())
+        self.assertIn("already aired", self.open_row(duplicate)[1])
 
     def test_a_recreated_occurrence_never_continues_into_a_newer_generation(self):
         engine, row = self.pending(1, b"first")
-        self.claim(engine, row)
+        self.air(engine, row)
         self.assertIsNone(self.open_row(row)[1])          # same generation: a resume/seek may reopen it
         self.announce(2, b"second")
         self.assertIn("earlier announcement", self.open_row(row)[1])
@@ -341,7 +467,7 @@ class HourRolloverTests(WxAlertPlayoutFixture):
         engine = self.live_engine()
         self.nudge(engine)
         row, = self.wx_rows()
-        self.claim(engine, engine.log_items[engine._queue_cursor])
+        self.air(engine, engine.log_items[engine._queue_cursor])
         engine.log_items = self.queue(self.log)            # the 3 s reload picks up the claim
         self.adopt(engine)
         self.assertEqual(engine._forced_next_items, [])

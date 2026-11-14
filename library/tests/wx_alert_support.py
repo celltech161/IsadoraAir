@@ -7,6 +7,7 @@ directories that are also installed as ``LIBRARY_ROOT`` / ``WEATHER_DATA_DIR``.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from datetime import timedelta
@@ -32,25 +33,50 @@ def publish_file(library_root, payload: bytes | None = None, *, source: Path | N
     return path
 
 
+def write_sources(data_dir, nws_entries=(), amber_entries=()):
+    """Write both source snapshots the way the pollers do (atomic replace)."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for source, entries in (("nws", nws_entries), ("amber", amber_entries)):
+        path = data_dir / wx_alert_state.SOURCE_FILES[source]
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(list(entries)))
+        tmp.replace(path)
+
+
+def nws_entry(text, *, key="KTOP.TO.W.0001", event="Tornado Warning", valid_for=timedelta(hours=1)):
+    expires = wx_alert_state.format_ts(timezone.now() + valid_for)
+    return {"event": event, "text": text, "text_core": text, "key": key, "expires": expires, "ends": None}
+
+
 def write_state(data_dir, library_root, *, generation=1, active=True, valid_for=timedelta(hours=1),
-                published_at=None, audio="current", **extra):
-    """The coordinator's record for the file currently at the canonical path (``audio="current"``)."""
+                published_at=None, audio="current", content=None, **extra):
+    """The coordinator's record for the file currently at the canonical path (``audio="current"``), with
+    source snapshots whose effective content is exactly what that record was rendered from (``content``:
+    the one NWS alert text; default "generation N").  Inactive: both sources confirmed empty."""
     now = timezone.now()
+    entries = [nws_entry(content or f"generation {generation}", valid_for=valid_for)] if active else []
+    write_sources(data_dir, entries, [])
+    alerts, _sources, _excluded = wx_alert_state.effective_alerts(data_dir, now)
     identity = (
         wx_alert_state.audio_identity(wx_alert_state.audio_path(Path(library_root).resolve()))
         if audio == "current" else audio
     )
     state = {
         "generation": generation,
-        "fingerprint": f"fp-{generation}" if active else "",
+        "fingerprint": wx_alert_state.content_fingerprint(alerts or []) if active else "",
         "active": active,
         "baseline": False,
         "alerts": [],
         "valid_until": wx_alert_state.format_ts(now + valid_for) if active and valid_for is not None else None,
         "published_at": wx_alert_state.format_ts(published_at or now) if active else None,
         "audio": identity if active else None,
+        "sources": {"nws": wx_alert_state.OK, "amber": wx_alert_state.OK},
         "last_error": None,
     }
+    if active and not alerts:            # an already-expired generation: keep the recorded content identity
+        state["fingerprint"] = wx_alert_state.content_fingerprint(
+            [{"source": "nws", "key": entries[0]["key"], "text": entries[0]["text"]}])
     state.update(extra)
     wx_alert_state.write_state(wx_alert_state.state_path(data_dir), state)
     return state

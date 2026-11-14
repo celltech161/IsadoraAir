@@ -20,8 +20,8 @@ Pipeline:
      cycle -- it alone decides whether the effective spoken content changed,
      publishes ONE combined WxAlert/wx_alert.flac and nudges the engine.
 
-A retrieval failure (the feed, or ANY individual CAP message) is not a
-cancellation: the previous snapshot is kept untouched for that cycle, and
+A retrieval or interpretation failure (the feed, or ANY qualifying CAP
+message that cannot be fetched or reliably parsed) is not a cancellation: the previous snapshot is kept untouched for that cycle, and
 the coordinator still runs so authoritative <expires> times keep applying
 during an outage.
 
@@ -43,6 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from ipaws import (  # noqa: E402
     CapFetchError,
+    CapParseError,
     alert_covers_any,
     clean_body_text,
     current_alerts,
@@ -121,12 +122,11 @@ def _build_active_entries(cfg):
     for entry in candidates:
         try:
             cap = fetch_and_parse_cap(entry["link"])
-        except CapFetchError as exc:
+        except (CapFetchError, CapParseError) as exc:
             # A partial set must never be committed as authoritative: the
-            # missing message may be a still-active alert.
+            # message that could not be retrieved or interpreted may be a
+            # still-active alert, or the Cancel/Update that retires one.
             raise SnapshotUnavailable(str(exc)) from exc
-        if cap is None:
-            continue  # retrieved but unusable (malformed) -- never airable
         caps.append((entry, cap))
 
     current_ids = {id(cap) for cap in current_alerts([cap for _entry, cap in caps])}

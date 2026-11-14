@@ -250,6 +250,14 @@ class AmberSnapshotTests(AmberHarness):
         self.assertEqual(self.poll(), [])
         self.assertEqual(self.coordinator.call_count, 2)
 
+    def test_an_actual_cancel_without_info_removes_the_alert_through_the_poller(self):
+        self.caps = {"l1": cap("CAP-1")}
+        self.assertEqual(len(self.poll()), 1)
+        cancel = dict(cap("CAN-1", msg_type="Cancel", references=["CAP-1"]),
+                      event="", event_code="", areas=[], expires="", description="", instruction="")
+        self.caps = {"cancel": cancel, "l1": cap("CAP-1")}
+        self.assertEqual(self.poll(), [])
+
     def test_cancel_update_supersession_and_non_actual_status(self):
         self.caps = {
             "orig": cap("CAP-1", description="Original text."),
@@ -260,14 +268,28 @@ class AmberSnapshotTests(AmberHarness):
             "exercise": cap("CAP-6", status="Exercise"),
             "ack": cap("CAP-7", msg_type="Ack"),
             "expired": cap("CAP-8", expires=NOW - timedelta(minutes=1)),
+            "test-cancel": cap("CAP-9", status="Test", msg_type="Cancel", references=["CAP-2"]),
         }
         entries = self.poll()
         self.assertEqual([e["identifier"] for e in entries], ["CAP-2"])
         self.assertIn("Updated text.", entries[0]["text"])
 
-    def test_an_unparseable_message_is_skipped_without_blocking_the_rest(self):
-        self.caps = {"l1": None, "l2": cap("CAP-2")}
-        self.assertEqual([e["identifier"] for e in self.poll()], ["CAP-2"])
+    def test_an_uninterpretable_qualifying_message_keeps_the_previous_complete_snapshot(self):
+        """Finding 4 (replaces the r0137 test that skipped it): a retrieved but unusable qualifying CAP message
+        may be the active alert or the Cancel that retires one -- never commit the rest as authoritative."""
+        self.caps = {"l1": cap("CAP-1"), "l2": cap("CAP-2")}
+        before = self.poll()
+        for label, failure in (("malformed XML", ipaws.CapParseError("unparseable")),
+                               ("missing mandatory field", ipaws.CapParseError("lacks mandatory")),
+                               ("malformed references", ipaws.CapParseError("malformed references"))):
+            with self.subTest(case=label):
+                self.caps = {"l1": cap("CAP-1"), "l2": failure, "l3": cap("CAP-3")}
+                self.assertEqual(self.poll(), before)
+        self.assertEqual(self.coordinator.call_count, 4)          # still runs: known expirations keep applying
+
+    def test_an_irrelevant_parsed_message_does_not_block_the_snapshot(self):
+        self.caps = {"l1": cap("CAP-1"), "test": cap("CAP-9", status="Test")}
+        self.assertEqual([e["identifier"] for e in self.poll()], ["CAP-1"])
 
 
 CAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -284,6 +306,88 @@ CAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
 </alert>"""
 
 
+def cap_xml(identifier, *, status="Actual", msg_type="Alert", references=None, info=True, sent=True,
+            expires="2026-11-14T16:00:00-06:00", description="Child taken."):
+    refs = f"<references>{references}</references>" if references is not None else ""
+    sent_el = "<sent>2026-11-13T16:00:00-06:00</sent>" if sent else ""
+    info_el = f"""<info><language>en-US</language><event>Child Abduction Emergency</event>
+    <eventCode><valueName>SAME</valueName><value>CAE</value></eventCode>
+    <expires>{expires}</expires><senderName>KBI</senderName><headline>AMBER Alert</headline>
+    <description>{description}</description><instruction>Call 911.</instruction>
+    <area><areaDesc>Saline</areaDesc><geocode><valueName>SAME</valueName><value>020169</value></geocode></area>
+  </info>""" if info else ""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>{identifier}</identifier><sender>kbi@ks</sender>{sent_el}
+  <status>{status}</status><msgType>{msg_type}</msgType><scope>Public</scope>{refs}
+  {info_el}
+</alert>""".encode()
+
+
+def ref(*identifiers):
+    return " ".join(f"kbi@ks,{i},2026-11-13T15:00:00-06:00" for i in identifiers)
+
+
+class CapAuthorityTests(unittest.TestCase):
+    """Finding 3: root fields are parsed without <info>; only Actual messages cancel or supersede."""
+
+    def parse(self, xml):
+        with patch.object(ipaws, "_http_get", return_value=xml):
+            return ipaws.fetch_and_parse_cap("https://example.invalid/cap")
+
+    def current(self, *xmls):
+        return [c["identifier"] for c in ipaws.current_alerts([self.parse(x) for x in xmls])]
+
+    def test_an_actual_cancel_without_info_is_parsed_from_its_root_fields(self):
+        parsed = self.parse(cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1"), info=False))
+        self.assertEqual((parsed["identifier"], parsed["status"], parsed["msg_type"], parsed["references"]),
+                         ("CAN-1", "Actual", "Cancel", ["CAP-1"]))
+        self.assertEqual((parsed["event_code"], parsed["areas"], parsed["expires"]), ("", [], ""))
+
+    def test_an_actual_cancel_retires_the_referenced_alert_in_either_feed_order(self):
+        alert = cap_xml("CAP-1")
+        cancel = cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1"), info=False)
+        self.assertEqual(self.current(alert, cancel), [])
+        self.assertEqual(self.current(cancel, alert), [])
+
+    def test_an_actual_update_supersedes_the_earlier_issuance(self):
+        self.assertEqual(self.current(cap_xml("CAP-1"), cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"))),
+                         ["CAP-2"])
+
+    def test_a_test_cancel_or_exercise_update_never_removes_an_actual_alert(self):
+        alert = cap_xml("CAP-1")
+        test_cancel = cap_xml("CAN-T", status="Test", msg_type="Cancel", references=ref("CAP-1"), info=False)
+        exercise_update = cap_xml("UPD-X", status="Exercise", msg_type="Update", references=ref("CAP-1"))
+        self.assertEqual(self.current(alert, test_cancel), ["CAP-1"])
+        self.assertEqual(self.current(exercise_update, alert), ["CAP-1"])
+
+    def test_chained_updates_in_any_order_leave_only_the_newest(self):
+        orig = cap_xml("CAP-1")
+        u1 = cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"))
+        u2 = cap_xml("CAP-3", msg_type="Update", references=ref("CAP-2"))
+        for order in ((orig, u1, u2), (u2, orig, u1), (u1, u2, orig)):
+            with self.subTest(order=[o[100:140] for o in order]):
+                self.assertEqual(self.current(*order), ["CAP-3"])
+
+    def test_messages_that_cannot_be_interpreted_raise_cap_parse_error(self):
+        cases = {
+            "malformed XML": b"<alert><identifier>x",
+            "missing sent": cap_xml("CAP-1", sent=False),
+            "unknown status": cap_xml("CAP-1", status="Bogus"),
+            "malformed references": cap_xml("CAP-2", msg_type="Update", references="kbi@ks;CAP-1"),
+            "actual alert without info": cap_xml("CAP-1", info=False),
+            "actual cancel referencing nothing": cap_xml("CAN-1", msg_type="Cancel", info=False),
+        }
+        for label, xml in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ipaws.CapParseError):
+                    self.parse(xml)
+
+    def test_a_non_actual_message_without_info_is_parsed_and_irrelevant(self):
+        parsed = self.parse(cap_xml("T-1", status="Test", info=False))
+        self.assertEqual(ipaws.current_alerts([parsed]), [])
+
+
 class CapParsingTests(unittest.TestCase):
     def test_status_msgtype_and_references_are_parsed(self):
         with patch.object(ipaws, "_http_get", return_value=CAP_XML.encode()):
@@ -296,9 +400,10 @@ class CapParsingTests(unittest.TestCase):
             with self.assertRaises(ipaws.CapFetchError):
                 ipaws.fetch_and_parse_cap("https://example.invalid/cap")
 
-    def test_unparseable_xml_is_none(self):
+    def test_unparseable_xml_raises_instead_of_looking_like_absence(self):
         with patch.object(ipaws, "_http_get", return_value=b"<not-cap"):
-            self.assertIsNone(ipaws.fetch_and_parse_cap("https://example.invalid/cap"))
+            with self.assertRaises(ipaws.CapParseError):
+                ipaws.fetch_and_parse_cap("https://example.invalid/cap")
 
 
 class CoordinatorInvocationTests(unittest.TestCase):

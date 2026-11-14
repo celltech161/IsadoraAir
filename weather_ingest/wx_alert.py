@@ -40,7 +40,6 @@
 # Author: Justin Reed
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -59,7 +58,7 @@ from delivery import deliver
 import speech_audio
 import voices
 from voices import VoiceResolutionError, resolve_voice
-from wxconfig import load_weather_config, resolve_weather_data_dir
+from wxconfig import load_amber_alert_config, load_weather_config, resolve_weather_data_dir
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,8 +71,6 @@ log = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = resolve_weather_data_dir()
 
-WX_WATCHWARN_FILE = DATA_DIR / "active_watches_warnings.json"
-AMBER_FILE = DATA_DIR / "active_amber_alerts.json"
 STATE_FILE = wx_alert_state.state_path(DATA_DIR)
 # In the shared data directory (not /tmp), and never unlinked: a waiter
 # must always contend on the same inode as the holder.
@@ -87,7 +84,6 @@ CATEGORY_CODE = wx_alert_state.CATEGORY_CODE
 DEST_FILENAME = wx_alert_state.AUDIO_FILENAME
 TITLE = "Weather Alert"
 
-SOURCE_ORDER = ("nws", "amber")
 
 
 class CoordinatorLockTimeout(RuntimeError):
@@ -111,99 +107,44 @@ def acquire_lock(path, wait_seconds=LOCK_WAIT_SECONDS):
             time.sleep(0.5)
 
 # ---------------- SOURCES ----------------
+#
+# Source states (isadoraair/wx_alert_state.py): only a readable snapshot (a
+# confirmed list, possibly empty) or an explicitly disabled AMBER source
+# (AmberAlertConfig.enabled=False) is known. A missing, malformed or
+# pre-r0137 snapshot is UNKNOWN: it never counts as "no alerts", the
+# first-run baseline waits for it, and an existing announcement state is
+# left as it is (the engine refuses to start an occurrence it cannot verify
+# against the current sources, and known expirations still apply).
 
-LEGACY = "legacy"
+SOURCE_DIR = DATA_DIR
 
 
-def read_snapshot(path, source=None):
-    """(entries, status): status "ok" for a readable list, "missing" for a
-    source that has never produced a snapshot (no known alerts),
-    "malformed: ..." with entries None (unknown -- nothing may change), or
-    LEGACY with entries None: an NWS snapshot written before r0137 (entries
-    without identity/validity), which the next NWS poll rewrites."""
+def _disabled_sources():
+    """("amber",) when the AMBER snapshot is absent because AMBER is explicitly
+    disabled. Asked only when the snapshot is missing (the AMBER poller
+    writes a confirmed-empty [] while disabled)."""
+    if (Path(SOURCE_DIR) / wx_alert_state.SOURCE_FILES["amber"]).exists():
+        return ()
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return [], "missing"
+        cfg = load_amber_alert_config()
     except Exception as e:
-        return None, f"malformed: {e}"
-    if not isinstance(data, list):
-        return None, "malformed: not a list"
-    if source == "nws" and any(isinstance(e, dict) and "key" not in e for e in data):
-        return None, LEGACY
-    return data, "ok"
+        log.error("Could not read AmberAlertConfig (%s); AMBER source state unknown.", e)
+        return ()
+    return () if cfg.get("enabled") else ("amber",)
 
 
-def _parse_deadline(value):
-    parsed = wx_alert_state.parse_ts(value) if isinstance(value, str) else None
-    return parsed
-
-
-def _entry_deadline(source, entry):
-    """The authoritative end of validity, or None when the source gave none."""
-    if source == "nws":
-        candidates = [_parse_deadline(entry.get("expires")), _parse_deadline(entry.get("ends"))]
-    else:
-        candidates = [_parse_deadline(entry.get("expires"))]
-    candidates = [c for c in candidates if c is not None]
-    return min(candidates) if candidates else None
-
-
-def _entry_key(source, entry):
-    if source == "nws":
-        return str(entry.get("key") or entry.get("event") or "")
-    return str(entry.get("identifier") or entry.get("event") or "")
-
-
-def effective_alerts(now):
-    """(alerts, sources, excluded). alerts is None when any snapshot is
-    unreadable (nothing may change until it is readable again)."""
-    sources = {}
-    raw = {}
-    for source, path in (("nws", WX_WATCHWARN_FILE), ("amber", AMBER_FILE)):
-        entries, status = read_snapshot(path, source)
-        sources[source] = status
-        raw[source] = entries
-    if any(entries is None for entries in raw.values()):
-        return None, sources, []
-
-    alerts, excluded = [], []
-    for source in SOURCE_ORDER:
-        picked = []
-        for entry in raw[source]:
-            if not isinstance(entry, dict):
-                continue
-            text = (entry.get("text") or "").strip()
-            if not text:
-                continue
-            key = _entry_key(source, entry)
-            deadline = _entry_deadline(source, entry)
-            if deadline is None:
-                excluded.append((source, key, "no authoritative expiration"))
-                continue
-            if deadline <= now:
-                excluded.append((source, key, f"expired {wx_alert_state.format_ts(deadline)}"))
-                continue
-            picked.append({
-                "source": source, "key": key, "event": entry.get("event") or "",
-                "text": text, "deadline": deadline,
-            })
-        if source == "amber":
-            # Feed order is not meaningful; NWS order is already the
-            # poller's deterministic severity order.
-            picked.sort(key=lambda a: (a["event"], a["key"]))
-        alerts.extend(picked)
+def effective_alerts(now, disabled=None):
+    """(alerts, sources, excluded); alerts is None while any source is unknown."""
+    if disabled is None:
+        disabled = _disabled_sources()
+    alerts, sources, excluded = wx_alert_state.effective_alerts(SOURCE_DIR, now, disabled=disabled)
     for source, key, why in excluded:
         log.warning("Excluded %s alert %s from the spoken announcement: %s", source, key, why)
     return alerts, sources, excluded
 
 
 def content_fingerprint(alerts):
-    if not alerts:
-        return ""
-    canonical = json.dumps([[a["source"], a["key"], a["text"]] for a in alerts], separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return wx_alert_state.content_fingerprint(alerts)
 
 
 def _alert_summary(alerts):
@@ -330,17 +271,21 @@ def coordinate(now=None):
     now = now or wx_alert_state.now_utc()
     state, state_error = wx_alert_state.read_state(STATE_FILE)
     alerts, sources, excluded = effective_alerts(now)
-    if alerts is None and LEGACY in sources.values():
-        # Upgrade window: the NWS snapshot predates r0137. Deciding now would
-        # drop its alerts (no expirations) and announce them moments later,
-        # breaking the first-run baseline; the next NWS poll rewrites it.
-        log.info("NWS snapshot predates the combined coordinator; waiting for the next NWS poll.")
-        return True
     if alerts is None:
-        message = f"source snapshot unreadable: {sources}"
-        log.error("%s -- the announcement state is left unchanged.", message)
-        _note_error(state, message)
-        return False
+        unreadable = {k: v for k, v in sources.items() if v.startswith("malformed")}
+        if unreadable:
+            message = f"source snapshot unreadable: {unreadable}"
+            log.error("%s -- the announcement state is left unchanged.", message)
+            _note_error(state, message)
+            return False
+        # Missing (never produced, or lost) or pre-r0137: unknown, never empty.
+        # A first-run baseline waits for every source; an existing state is
+        # left unchanged (an upgrade-window LEGACY snapshot is rewritten by the
+        # next NWS poll; a lost snapshot is reported).
+        log.info("Alert source state not yet known (%s); announcement state unchanged.", sources)
+        if state is not None and wx_alert_state.MISSING in sources.values():
+            _note_error(state, f"source snapshot missing: {sources}")
+        return True
 
     fingerprint = content_fingerprint(alerts)
     base = {"sources": sources, "excluded": [list(x) for x in excluded]}
@@ -399,9 +344,10 @@ def _publish(state, generation, alerts, fingerprint, base, now=None):
         return False
 
     # Stale-render guard: the sources may have changed while we synthesized.
-    # (An alert expiring meanwhile is caught by valid_until at the engine and
-    # by the next pass.)
-    latest, _sources, _excluded = effective_alerts(now or wx_alert_state.now_utc())
+    # (A change DURING publication below is caught by the engine, which
+    # authorizes playback only while the current sources still produce this
+    # generation's fingerprint; the next pass then republishes.)
+    latest, _sources, _excluded = effective_alerts(now or wx_alert_state.now_utc(), disabled=_disabled(base))
     if latest is None or content_fingerprint(latest) != fingerprint:
         log.info("Alert sources changed during synthesis; this candidate is discarded unpublished -- "
                  "the next coordinator pass publishes the latest content.")
@@ -431,12 +377,24 @@ def _publish(state, generation, alerts, fingerprint, base, now=None):
            audio=identity, last_error=None, **base)
     log.info("Published announcement generation %d (%d alert(s): %s) to %s", new_generation, len(alerts),
              ", ".join(f"{a['source']}:{a['event'] or a['key']}" for a in alerts), dest)
+    after, _sources, _excluded = effective_alerts(wx_alert_state.now_utc(), disabled=_disabled(base))
+    if after is None or content_fingerprint(after) != fingerprint:
+        # A poller committed newer source content while publication ran. The
+        # engine already refuses this generation (its fingerprint no longer
+        # matches the sources); the pass that poller started replaces it.
+        log.info("Alert sources changed during publication of generation %d; it is not authorized for "
+                 "playback and will be replaced by the next coordinator pass.", new_generation)
+        return True
     try:
         fire_insert_urgent()
     except Exception as e:
         log.error("Engine synchronization nudge failed (%s); retried next cycle.", e)
         return False
     return True
+
+
+def _disabled(base):
+    return tuple(k for k, v in (base.get("sources") or {}).items() if v == wx_alert_state.DISABLED)
 
 
 def _alert_family(alerts):

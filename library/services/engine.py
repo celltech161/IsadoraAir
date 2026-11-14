@@ -1137,7 +1137,7 @@ def _close_old_connections():
 
 
 @contextmanager
-def _deck_open_authority(log_item):
+def _deck_open_authority(log_item, live_occurrence_ids=()):
     """Hold spoken projection authority through actual deck construction.
 
     Order: recycle the connection (outermost scope only) -> legacy
@@ -1171,7 +1171,7 @@ def _deck_open_authority(log_item):
         wx_scope = ExitStack()
         if isinstance(log_item, LogItem) and wx_alert_playout.is_occurrence(log_item):
             try:
-                refusal = wx_alert_playout.authorize_open(log_item, wx_scope)
+                refusal = wx_alert_playout.authorize_open(log_item, wx_scope, live_occurrence_ids)
             except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
                 refusal = f"Weather/AMBER alert authority unavailable: {exc}"
             if refusal is not None:
@@ -1234,6 +1234,21 @@ def _deck_open_still_authorized():
     return playout.lease_intact()
 
 
+def _live_occurrence_ids(engine):
+    """LogItem ids currently owned by a live deck: present in a slot and not
+    completed (EOS/error), failed to start, finished or retiring.  In memory
+    only."""
+    out = set()
+    for deck in (getattr(engine, "decks", None) or {}).values():
+        if deck is None or getattr(deck, "log_item", None) is None:
+            continue
+        if getattr(deck, "finished", False) or getattr(deck, "retirement_started", False) \
+                or getattr(deck, "completion_claimed", False) or getattr(deck, "start_failed", False):
+            continue
+        out.add(deck.log_item.id)
+    return out
+
+
 def _require_deck_open_authority(method):
     """Keep projection authority held until ``method`` finishes opening."""
     @functools.wraps(method)
@@ -1248,7 +1263,7 @@ def _require_deck_open_authority(method):
         # its barrier/rename concurrently; a deck authorized first retains A's
         # already-open inode, while a promotion authorized first makes this
         # attempt fail fast or observe the new committed edition.
-        with _deck_open_authority(log_item) as (track, reason):
+        with _deck_open_authority(log_item, _live_occurrence_ids(self)) as (track, reason):
             if track is None:
                 item_id = log_item.id if log_item is not None else "None"
                 print(f"  Cannot create deck for log item id={item_id}: {reason}")
@@ -7969,7 +7984,16 @@ class PlaybackEngine:
         # ordinary deck creation remains unchanged.
         if before_sync is not None:
             before_sync(deck)
-        deck_bin.sync_state_with_parent()
+        if not deck_bin.sync_state_with_parent():
+            # The bin could not start (e.g. filesrc could not open the file or
+            # typefind failed). Completion and retirement stay with the existing
+            # bus ERROR path (_on_deck_error, which also records media-failure
+            # evidence); this generation just stops counting as the live owner
+            # of its occurrence, so a WxAlert generation it was meant to air is
+            # retryable (see _live_occurrence_ids).
+            print(f"  [{slot}] Deck for log item {log_item.id} failed to start (state change failure)")
+            deck.mark_milestone("SYNC_STATE_FAILED")
+            deck.start_failed = True
 
         if air_start_eligible:
             print(
@@ -10854,12 +10878,13 @@ class PlaybackEngine:
             is the published file;
           * no unclaimed occurrence of the announcement is already pending
             (that one will open the newest audio -- the file is shared);
-          * no occurrence has claimed playback since this generation was
-            published (already on a deck, or already aired -- persisted, so an
-            engine restart does not repeat it).
+          * no occurrence of this generation has aired (authoritative
+            ``played_at``; persisted, so an engine restart does not repeat it)
+            and none is owned by a live deck right now.
 
-        A generation that was never inserted, or whose insertion failed, is
-        still unclaimed, so the next nudge (every poll cycle) inserts it."""
+        A generation that was never inserted, whose insertion failed, or whose
+        claimed deck failed/vanished before its first real buffer is still
+        undelivered, so the next nudge (every poll cycle) queues it again."""
         decision, _state = wx_alert_playout.current_decision()
         if not decision.allowed:
             print(f"  WxAlert sync: nothing to queue ({decision.reason})")
@@ -10872,9 +10897,16 @@ class PlaybackEngine:
             print(f"  WxAlert sync: generation {decision.generation} will play through pending "
                   f"occurrence {pending.id}")
             return None
-        if wx_alert_playout.generation_claimed(track.id, decision.published_at):
-            print(f"  WxAlert sync: generation {decision.generation} already claimed; nothing to queue")
+        aired, claimed_unaired = wx_alert_playout.generation_delivery(track.id, decision.published_at)
+        if aired:
+            print(f"  WxAlert sync: generation {decision.generation} already aired; nothing to queue")
             return None
+        if claimed_unaired & _live_occurrence_ids(self):
+            print(f"  WxAlert sync: generation {decision.generation} is on a deck; nothing to queue")
+            return None
+        if claimed_unaired:
+            print(f"  WxAlert sync: generation {decision.generation} was claimed but never aired "
+                  f"(deck failed or vanished: {sorted(claimed_unaired)}); queueing a retry")
         print(f"  WxAlert sync: queueing announcement generation {decision.generation}")
         return track
 

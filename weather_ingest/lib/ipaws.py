@@ -102,14 +102,28 @@ class CapFetchError(RuntimeError):
     active -- the caller must not treat the alert as gone."""
 
 
+class CapParseError(RuntimeError):
+    """A CAP message was retrieved but cannot be interpreted reliably enough
+    to decide its validity or authority (unparseable XML, a missing or
+    unknown mandatory field, malformed references, an Actual Alert/Update
+    without <info>, an Actual Cancel without references). Like a retrieval
+    failure, this is never evidence that an alert ended."""
+
+
+CAP_STATUSES = ("actual", "exercise", "system", "test", "draft")
+CAP_MSG_TYPES = ("alert", "update", "cancel", "ack", "error")
+
+
 def fetch_and_parse_cap(link):
     """Fetch a full CAP 1.2 message and return the fields we use downstream:
         {"identifier", "sent", "expires", "sender", "sender_name",
          "status", "msg_type", "references": [<identifier>, ...],
          "event", "event_code", "headline", "description", "instruction",
          "areas": [<SAME code>, ...]}
-    Raises CapFetchError when the message could not be retrieved; returns None
-    if the retrieved XML doesn't parse or lacks the mandatory fields."""
+    Root fields are parsed independently of <info>: a Cancel (or any non-Alert
+    message) may legitimately carry no <info>, and then every info-derived
+    field is empty. Raises CapFetchError when the message could not be
+    retrieved and CapParseError when it cannot be interpreted reliably."""
     try:
         xml = _http_get(link)
     except requests.RequestException as exc:
@@ -117,8 +131,22 @@ def fetch_and_parse_cap(link):
     try:
         root = ET.fromstring(xml)
     except ET.ParseError as exc:
-        log.warning("IPAWS CAP message unparseable for %s: %s", link, exc)
-        return None
+        raise CapParseError(f"IPAWS CAP message unparseable for {link}: {exc}") from exc
+
+    fields = {name: _text(root.find(f"{CAP12_NS}{name}"))
+              for name in ("identifier", "sender", "sent", "status", "msgType")}
+    missing = [name for name, value in fields.items() if not value]
+    if missing:
+        raise CapParseError(f"IPAWS CAP message {link} lacks mandatory {missing}")
+    status, msg_type = fields["status"].lower(), fields["msgType"].lower()
+    if status not in CAP_STATUSES or msg_type not in CAP_MSG_TYPES:
+        raise CapParseError(f"IPAWS CAP message {link} has unknown status/msgType "
+                            f"{fields['status']!r}/{fields['msgType']!r}")
+    references_text = _text(root.find(f"{CAP12_NS}references"))
+    try:
+        references = parse_references(references_text)
+    except ValueError as exc:
+        raise CapParseError(f"IPAWS CAP message {link} has malformed references: {exc}") from exc
 
     # Multiple <info> blocks are legal (one per language). Pick English if
     # present, else the first.
@@ -131,75 +159,81 @@ def fetch_and_parse_cap(link):
             break
     if info is None and infos:
         info = infos[0]
-    if info is None:
-        return None
+
+    if status == "actual":
+        if msg_type in ("alert", "update") and info is None:
+            raise CapParseError(f"IPAWS CAP {msg_type} {fields['identifier']} has no <info> to evaluate")
+        if msg_type == "cancel" and not references:
+            raise CapParseError(f"IPAWS CAP Cancel {fields['identifier']} references nothing to cancel")
 
     event_code = ""
-    for ec in info.findall(f"{CAP12_NS}eventCode"):
-        vn = _text(ec.find(f"{CAP12_NS}valueName")).upper()
-        if vn == "SAME":
-            event_code = _text(ec.find(f"{CAP12_NS}value")).upper()
-            break
-
     areas = []
-    for area in info.findall(f"{CAP12_NS}area"):
-        for gc in area.findall(f"{CAP12_NS}geocode"):
-            vn = _text(gc.find(f"{CAP12_NS}valueName")).upper()
+    if info is not None:
+        for ec in info.findall(f"{CAP12_NS}eventCode"):
+            vn = _text(ec.find(f"{CAP12_NS}valueName")).upper()
             if vn == "SAME":
-                v = _text(gc.find(f"{CAP12_NS}value"))
-                if v:
-                    areas.append(v)
+                event_code = _text(ec.find(f"{CAP12_NS}value")).upper()
+                break
+        for area in info.findall(f"{CAP12_NS}area"):
+            for gc in area.findall(f"{CAP12_NS}geocode"):
+                vn = _text(gc.find(f"{CAP12_NS}valueName")).upper()
+                if vn == "SAME":
+                    v = _text(gc.find(f"{CAP12_NS}value"))
+                    if v:
+                        areas.append(v)
+
+    def info_text(name):
+        return _text(info.find(f"{CAP12_NS}{name}")) if info is not None else ""
 
     return {
-        "identifier":  _text(root.find(f"{CAP12_NS}identifier")),
-        "sent":        _text(root.find(f"{CAP12_NS}sent")),
-        "status":      _text(root.find(f"{CAP12_NS}status")),
-        "msg_type":    _text(root.find(f"{CAP12_NS}msgType")),
-        "references":  parse_references(_text(root.find(f"{CAP12_NS}references"))),
-        "expires":     _text(info.find(f"{CAP12_NS}expires")),
-        "sender":      _text(root.find(f"{CAP12_NS}sender")),
-        "sender_name": _text(info.find(f"{CAP12_NS}senderName")),
-        "event":       _text(info.find(f"{CAP12_NS}event")),
+        "identifier":  fields["identifier"],
+        "sent":        fields["sent"],
+        "status":      fields["status"],
+        "msg_type":    fields["msgType"],
+        "references":  references,
+        "expires":     info_text("expires"),
+        "sender":      fields["sender"],
+        "sender_name": info_text("senderName"),
+        "event":       info_text("event"),
         "event_code":  event_code,
-        "headline":    _text(info.find(f"{CAP12_NS}headline")),
-        "description": _text(info.find(f"{CAP12_NS}description")),
-        "instruction": _text(info.find(f"{CAP12_NS}instruction")),
+        "headline":    info_text("headline"),
+        "description": info_text("description"),
+        "instruction": info_text("instruction"),
         "areas":       areas,
     }
 
 
 def parse_references(text):
     """CAP <references>: whitespace-separated "sender,identifier,sent" triplets.
-    Returns the referenced identifiers (an Update/Cancel supersedes them)."""
+    Returns the referenced identifiers (an Update/Cancel supersedes them).
+    Raises ValueError for a triplet that is not exactly sender,identifier,sent."""
     out = []
     for triplet in (text or "").split():
         parts = triplet.split(",")
-        if len(parts) >= 2 and parts[1]:
-            out.append(parts[1])
+        if len(parts) != 3 or not all(parts):
+            raise ValueError(f"not a sender,identifier,sent triplet: {triplet!r}")
+        out.append(parts[1])
     return out
 
 
 def current_alerts(caps):
-    """Reduce parsed CAP messages to the ones that are still in effect:
-      * only status Actual (Test/Exercise/System/Draft never air);
-      * Cancel messages never air and retire every message they reference;
-      * an Update supersedes every message it references;
-      * Ack/Error messages never air.
-    Order of the survivors is preserved."""
+    """Reduce parsed CAP messages to the Actual alerts still in effect.
+
+    Only status Actual messages have authority: a Test/Exercise/System/Draft
+    message never airs AND never cancels or supersedes anything. Among Actual
+    messages, a Cancel retires every message it references and never airs;
+    an Update supersedes every message it references (chains included, in
+    any feed order); Ack/Error never air. Order of survivors is preserved."""
+    actual = [cap for cap in caps if (cap.get("status") or "").lower() == "actual"]
     superseded = set()
-    for cap in caps:
+    for cap in actual:
         if (cap.get("msg_type") or "").lower() in ("update", "cancel"):
             superseded.update(cap.get("references") or [])
-    out = []
-    for cap in caps:
-        if (cap.get("status") or "").lower() != "actual":
-            continue
-        if (cap.get("msg_type") or "alert").lower() not in ("alert", "update"):
-            continue
-        if cap.get("identifier") in superseded:
-            continue
-        out.append(cap)
-    return out
+    return [
+        cap for cap in actual
+        if (cap.get("msg_type") or "").lower() in ("alert", "update")
+        and cap.get("identifier") not in superseded
+    ]
 
 
 def alert_covers_any(alert, same_codes):

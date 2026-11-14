@@ -9,16 +9,20 @@ nothing is mixed over, ducked or interrupted, and the Weather Alert Beep is unch
 | Piece | Role |
 |---|---|
 | `weather_ingest/update_local_wx_data.py` | NWS poll (every 5 min). Writes `active_watches_warnings.json` on a successful fetch only: Watch/Warning entries in effect (not `status` Test/Exercise, not `messageType` Cancel, not VTEC CAN/EXP/UPG, not a non-operational product), with `key` (VTEC office.phen.sig.etn), `expires`, `ends`, and the unchanged `text`/`text_core`, sorted most severe first. Then runs the coordinator, then (only on a headline change, as before) `current_temp.py`. |
-| `weather_ingest/amber_poll.py` | IPAWS poll (every 5 min). Writes `active_amber_alerts.json` only when the feed AND every candidate CAP message were retrieved (a retrieval failure keeps the previous snapshot); keeps only `status` Actual Alert/Update messages and drops everything a Cancel or Update references; writes `[]` when AMBER is disabled. Then runs the coordinator. |
+| `weather_ingest/amber_poll.py` | IPAWS poll (every 5 min). Writes `active_amber_alerts.json` only when the feed AND every candidate CAP message were retrieved AND interpreted (a transport failure, unparseable XML, a missing/unknown mandatory root field, malformed `<references>`, an Actual Alert/Update without `<info>` or an Actual Cancel referencing nothing keeps the previous snapshot). Root fields are parsed without `<info>` (a Cancel may have none). Only `status` Actual messages have authority: an Actual Cancel retires what it references, an Actual Update supersedes what it references (chains, any feed order); Test/Exercise/System/Draft messages never air and never cancel or supersede anything. Writes `[]` when AMBER is disabled. Then runs the coordinator. |
 | `weather_ingest/wx_alert.py` | **The coordinator** and the only producer of `wx_alert.flac`. `amber_alert.py` is a wrapper that runs it. |
 | `WEATHER_DATA_DIR/wx_alert_state.json` | The coordinator's record (`isadoraair/wx_alert_state.py`): `generation`, content `fingerprint`, `active`, `valid_until`, `published_at`, the published file's `audio` identity, `sources`, `excluded`, `last_error`. |
 | `library/services/wx_alert_playout.py` + engine | Idempotent synchronization of `insert_urgent` WxAlert nudges, the final deck-open check, and carrying a pending occurrence across hour adoption. |
 
 ## Coordinator pass (under `WEATHER_DATA_DIR/.wx_alert_coordinator.lock`, bounded wait)
 
-1. Read both snapshots. A missing snapshot means "no known alerts from that source"; an unreadable one stops the pass
-   with nothing changed (`last_error` recorded). An NWS snapshot written before r0137 (entries without `key`) also
-   stops the pass, benignly, until the next NWS poll rewrites it -- so the first-run baseline is not decided from it.
+1. Read both snapshots. Source states: a readable list (possibly a confirmed-empty one) is known; an AMBER snapshot that
+   is absent because `AmberAlertConfig.enabled` is False is known and empty (`disabled`). Everything else is
+   UNKNOWN and never means "no alerts": a missing file (never produced yet, or lost), a pre-r0137 NWS snapshot
+   (entries without `key`; rewritten by the next NWS poll), or a malformed one. While any source is unknown the pass
+   changes nothing: no first-run baseline is recorded (it waits for every source), and an existing announcement is
+   neither withdrawn nor shrunk (`last_error` records a missing/unreadable snapshot). The engine refuses to start an
+   occurrence it cannot verify against the current sources (below), so nothing obsolete is authorized meanwhile.
 2. Drop entries past their authoritative end (NWS: earliest of `expires`/`ends`; AMBER: `expires`) -- this keeps
    working during a feed outage -- and entries with no authoritative end at all (conservatively excluded and listed
    in `excluded`; there is no arbitrary validity extension).
@@ -32,21 +36,47 @@ nothing is mixed over, ducked or interrupted, and the Weather Alert Beep is unch
    * **Changed**: synthesize every clip (all-or-nothing), concatenate one calibrated FLAC, re-check that the sources
      did not change meanwhile (else discard the candidate unpublished; the next pass publishes the latest), publish
      through `publish_weather_asset` (atomic rename, last-known-good rollback), record the new generation
-     (`published_at`, `audio`, `valid_until` = earliest end), nudge the engine.
-   A failed synthesis, publication or nudge never advances the record; the next poll cycle retries.
+     (`published_at`, `audio`, `valid_until` = earliest end, `fingerprint`, `sources`), then nudge the engine --
+     unless the sources changed while publication ran, in which case no nudge is sent (the generation is already
+     refused by the engine) and the pass the changing poller started replaces it.
+
+   The steps are separate, and each failure is retried differently:
+
+   | Step | On success | On failure |
+   |---|---|---|
+   | Synthesis + concatenation | candidate FLAC | nothing published, record unchanged (`last_error`); next cycle retries |
+   | Publication (`publish_weather_asset`) | file + Track committed | previous file restored, record unchanged (`last_error`); next cycle retries |
+   | State persistence | new generation recorded | the file is ahead of the record: the engine refuses it (audio mismatch) and the next cycle republishes |
+   | Command enqueue (nudge) | queued for the engine | the generation STAYS recorded (publication succeeded); every later unchanged cycle re-sends the nudge |
+   | Engine insertion | one LogItem queued | the engine retries briefly; every later nudge re-checks |
+   | On-air start | the occurrence's `played_at` | a claimed occurrence whose deck failed before its first real buffer is retried by the next nudge |
 
 ## Engine
 
+* **Authorization** (both synchronization and deck open): the generation must be active and unexpired, its recorded
+  audio must be the file on disk, AND the current source snapshots must still produce exactly this generation's
+  content fingerprint (`isadoraair.wx_alert_state.playback_decision`, local file reads only). A cancellation, update
+  or expiry committed by a poller therefore takes effect immediately -- also while publication runs and in the
+  interval before the coordinator has replaced the announcement -- without any lock shared between pollers and the
+  coordinator (snapshots are replaced atomically and read whole). Unknown sources never authorize.
+* **Delivery**: an occurrence belongs to the generation published at or before its CLAIM (`playback_claimed_at`); this
+  is exact because a deck is authorized and claimed only under the shared publication lock and only while the record
+  names the file on disk, and a newer generation's `published_at` is stamped after its publication finished. A
+  generation is delivered only when such an occurrence has its own authoritative air-start evidence (`played_at`,
+  the first real buffer) -- an earlier generation's late first buffer never counts. A claimed occurrence still owned
+  by a live deck (not completed/finished/retiring) is in progress; one whose deck failed or vanished before its
+  first real buffer (deck creation error, a bin that cannot start -- `sync_state_with_parent()` failure is completed
+  as an error immediately -- media or decoder error) is retryable.
 * **Synchronization** (`insert_urgent` with category `WxAlert`): the payload is ignored; the engine reads the record.
-  It queues one occurrence of the exact `wx_alert.flac` Track only if the generation is active, unexpired and its
-  recorded audio is the file on disk, no unclaimed occurrence is already pending (that one will play the newest audio),
-  and no occurrence has claimed playback since `published_at` (persisted claims: an engine restart does not repeat
-  an announcement that already started). Other `insert_urgent` categories are unchanged.
+  It queues one occurrence of the exact `wx_alert.flac` Track only if the generation is authorized, no unclaimed
+  occurrence is already pending (that one will play the newest audio), the generation has not aired (persisted: an
+  engine restart does not repeat it) and no live deck owns one of its occurrences. Other `insert_urgent` categories
+  are unchanged.
 * **Deck open** (`_deck_open_authority`, WxAlert occurrences only): takes the publication's own lock
   (`.wx_alert.flac.publish.lock`) SHARED and non-blocking and holds it until `filesrc` has opened the file; refuses
   while a publication is in progress, when the record is missing/inactive/expired, when the file on disk is not the
-  recorded generation's audio, for any Track other than the canonical FLAC, for a second occurrence of an already
-  claimed generation, and for a recreation (resume/seek) of an occurrence that began an earlier generation. It re-reads
+  recorded generation's audio, when the sources changed or cannot be verified, for any Track other than the canonical
+  FLAC, for a second occurrence of a generation that already aired or is on a live deck, and for a recreation (resume/seek) of an occurrence that began an earlier generation. It re-reads
   the Track so the deck uses the duration/next-start of the audio it actually opens. A refused occurrence is skipped
   (info event "Weather/AMBER announcement occurrence not opened"); the next nudge queues a current one if still due.
 * **Hour adoption**: `_advance_to_next_hour_log` moves a pending, unclaimed occurrence into `_forced_next_items` (same
@@ -59,10 +89,17 @@ Already opened or airing audio is never touched: the deck keeps the file it open
 ## Known limitations
 
 * An occurrence carried into `_forced_next_items` from a previous hour's log is not restored after an engine crash or
-  restart (no new persistence); the next coordinator nudge re-queues a still-valid generation only if no occurrence
-  claimed it.
-* A claim followed by a deck that fails to open counts that generation as delivered.
-* Validity follows the snapshot with up to one poll interval of lag (5 minutes), bounded by `valid_until`.
+  restart (no new persistence); the next coordinator nudge re-queues a still-valid generation unless it already aired.
+* Generation attribution relies on one host clock (claims and `published_at` are both wall-clock stamps on the
+  station); a backwards clock step during an alert could misattribute a claim.
+* While a source snapshot is missing or unreadable, a pending announcement is refused (it cannot be verified); it is
+  re-queued by the next nudge once the source is readable again. A permanently unparseable qualifying CAP message
+  holds the AMBER snapshot at its last complete state (known expirations still apply) until it is fixed or leaves
+  the feed.
+* An Actual Cancel that the IPAWS Atom feed lists without the configured event code/state is filtered out before its
+  CAP message is fetched (feed prefilter, unchanged); the alert it cancels still ends at its `expires`.
+* Validity follows the upstream feeds with up to one poll interval of lag (5 minutes); within that, the engine applies
+  each committed snapshot and every known expiration immediately.
 * Alerts present at the first run after installation are recorded as the baseline and are not announced until the
   effective content changes.
 

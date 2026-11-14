@@ -54,9 +54,11 @@ class CoordinatorHarness(unittest.TestCase):
         self.nudges = 0
         self.publish_error = None
         self.on_render = None
+        self.during_deliver = None
+        self.amber_cfg = {"enabled": True}
         patches = [
-            patch.object(wx_alert, "WX_WATCHWARN_FILE", self.tmp / "active_watches_warnings.json"),
-            patch.object(wx_alert, "AMBER_FILE", self.tmp / "active_amber_alerts.json"),
+            patch.object(wx_alert, "SOURCE_DIR", self.tmp),
+            patch.object(wx_alert, "load_amber_alert_config", side_effect=lambda: self.amber_cfg),
             patch.object(wx_alert, "STATE_FILE", self.tmp / "wx_alert_state.json"),
             patch.object(wx_alert, "LOCKFILE", self.tmp / ".lock"),
             patch.object(wx_alert, "TMP_DIR", str(self.tmp / "render")),
@@ -80,6 +82,8 @@ class CoordinatorHarness(unittest.TestCase):
         return str(out), {"name": "Max"}
 
     def _deliver(self, local_path, category_code, filename, **kwargs):
+        if self.during_deliver:
+            self.during_deliver()          # another poller commits while publication runs
         if self.publish_error:
             raise self.publish_error
         self.dest.parent.mkdir(parents=True, exist_ok=True)
@@ -106,6 +110,13 @@ class CoordinatorHarness(unittest.TestCase):
 
     def run_pass(self, now=None):
         return wx_alert.coordinate(now=now)
+
+    def engine_may_play(self, now=None):
+        """What the engine's deck-open/sync decision says about the published generation right now."""
+        state = self.state()
+        decision = wx_alert_state.playback_decision(
+            state, wx_alert_state.audio_identity(self.dest), now or datetime.now(timezone.utc), self.tmp)
+        return decision
 
     def baseline(self):
         self.sources([], [])
@@ -251,11 +262,31 @@ class FailureAndConcurrencyTests(CoordinatorHarness):
         self.assertEqual((state["generation"], state["active"]), (1, True))
         self.assertIn("source snapshot unreadable", state["last_error"])
 
-    def test_a_missing_amber_snapshot_means_no_known_amber_alerts(self):
-        (self.tmp / "active_amber_alerts.json").unlink()
-        self.sources([nws("TOP.TO.W.1", "Tornado text.")], None)
+    def test_a_lost_amber_snapshot_after_a_publication_changes_nothing_and_blocks_new_playback(self):
+        self.sources([nws("TOP.TO.W.1", "Tornado text.")], [amber("CAP-1", "Amber text.")])
+        self.run_pass()
+        before = self.state()
+        (self.tmp / "active_amber_alerts.json").unlink()          # unexpected local loss, AMBER enabled
         self.assertTrue(self.run_pass())
-        self.assertEqual(self.state()["sources"], {"nws": "ok", "amber": "missing"})
+        after = self.state()
+        self.assertEqual({k: after[k] for k in ("generation", "fingerprint", "active", "audio")},
+                         {k: before[k] for k in ("generation", "fingerprint", "active", "audio")})
+        self.assertIn("source snapshot missing", after["last_error"])
+        self.assertFalse(self.engine_may_play().allowed)          # unverifiable -> never authorized
+        self.sources(None, [amber("CAP-1", "Amber text.")])       # restored, unchanged content
+        self.run_pass()
+        self.assertEqual(len(self.published), 1)                  # no replay
+        self.assertIsNone(self.state()["last_error"])
+        self.assertTrue(self.engine_may_play().allowed)
+
+    def test_a_lost_nws_snapshot_never_withdraws_or_shrinks_the_announcement(self):
+        self.sources([nws("TOP.TO.W.1", "Tornado text.")], [amber("CAP-1", "Amber text.")])
+        self.run_pass()
+        (self.tmp / "active_watches_warnings.json").unlink()
+        self.run_pass()
+        self.assertEqual(len(self.published), 1)                  # not republished as AMBER-only
+        self.assertTrue(self.state()["active"])
+        self.assertFalse(self.engine_may_play().allowed)
 
     def test_publication_failure_keeps_the_previous_generation_and_retries_next_pass(self):
         self.sources([nws("TOP.TO.W.1", "First.")], [])
@@ -347,6 +378,152 @@ class FirstRunTests(CoordinatorHarness):
         self.sources([nws("TOP.TO.W.1", "Tornado text.")], [])
         self.run_pass()
         self.assertEqual(self.published, [["Tornado text."]])
+
+
+
+class SourceChangeDuringPublicationTests(CoordinatorHarness):
+    """Finding 2: a poller commits newer source content while deliver() publishes (or right after), so the
+    generation being recorded is already obsolete. It must never receive playback authorization."""
+
+    def setUp(self):
+        super().setUp()
+        self.baseline()
+
+    def publish_while(self, change, *, nws_entries, amber_entries):
+        self.sources(nws_entries, amber_entries)
+        self.during_deliver = change
+        self.assertTrue(self.run_pass())
+        self.during_deliver = None
+        return self.state()
+
+    def test_an_nws_cancellation_during_publication(self):
+        state = self.publish_while(lambda: self.sources([], None),
+                                   nws_entries=[nws("TOP.TO.W.1", "Tornado text.")], amber_entries=[])
+        self.assertTrue(state["active"])                          # the file + record describe what was published
+        decision = self.engine_may_play()
+        self.assertFalse(decision.allowed)
+        self.assertIn("sources changed", decision.reason)
+        self.assertEqual(self.nudges, 0)
+        self.run_pass()                                           # the pass the cancelling poller started
+        self.assertFalse(self.state()["active"])
+        self.assertFalse(self.engine_may_play().allowed)
+
+    def test_an_amber_cancellation_during_publication(self):
+        self.publish_while(lambda: self.sources(None, []),
+                           nws_entries=[nws("TOP.TO.W.1", "Tornado text.")],
+                           amber_entries=[amber("CAP-1", "Amber text.")])
+        self.assertFalse(self.engine_may_play().allowed)
+        self.run_pass()
+        self.assertEqual(self.published[-1], ["Tornado text."])
+        self.assertTrue(self.engine_may_play().allowed)
+
+    def test_a_meaningful_text_update_during_publication(self):
+        self.publish_while(lambda: self.sources([nws("TOP.TO.W.1", "Tornado, now a large tornado.")], None),
+                           nws_entries=[nws("TOP.TO.W.1", "Tornado text.")], amber_entries=[])
+        self.assertFalse(self.engine_may_play().allowed)
+        self.run_pass()
+        self.assertEqual(self.published[-1], ["Tornado, now a large tornado."])
+        self.assertTrue(self.engine_may_play().allowed)
+        self.assertEqual(self.nudges, 1)                          # only the current generation was nudged
+
+    def test_an_update_after_publication_commits_but_before_its_replacement(self):
+        self.sources([nws("TOP.TO.W.1", "Tornado text.")], [])
+        self.run_pass()
+        self.assertTrue(self.engine_may_play().allowed)
+        self.sources([nws("TOP.TO.W.1", "Tornado text."), nws("TOP.SV.W.2", "Severe storm.")], None)
+        decision = self.engine_may_play()                         # coordinator has not run yet
+        self.assertFalse(decision.allowed)
+        self.assertIn("replacement pending", decision.reason)
+
+    def test_expiry_between_coordinator_passes_is_refused_without_waiting_for_the_record(self):
+        soon = NOW + timedelta(minutes=5)
+        self.sources([nws("TOP.TO.W.1", "Short.", expires=soon), nws("TOP.BZ.W.2", "Blizzard.")], [])
+        self.run_pass(now=NOW)
+        self.assertTrue(self.engine_may_play(now=NOW).allowed)
+        self.assertFalse(self.engine_may_play(now=soon + timedelta(seconds=1)).allowed)
+
+    def test_multiple_pollers_updating_near_simultaneously(self):
+        changes = iter([lambda: self.sources(None, [amber("CAP-1", "Amber.")]),
+                        lambda: self.sources([nws("TOP.TO.W.1", "Tornado v2.")], None)])
+        self.sources([nws("TOP.TO.W.1", "Tornado v1.")], [])
+        self.during_deliver = lambda: next(changes, lambda: None)()
+        self.run_pass()                          # publishes v1 while AMBER commits
+        self.run_pass()                          # publishes v1+AMBER while NWS commits v2
+        self.during_deliver = None
+        self.assertFalse(self.engine_may_play().allowed)
+        self.run_pass()
+        self.assertEqual(self.published[-1], ["Tornado v2.", "Amber."])
+        self.assertTrue(self.engine_may_play().allowed)
+
+    def test_an_unchanged_or_retried_pass_during_the_transition_never_nudges_obsolete_audio(self):
+        self.publish_while(lambda: self.sources([], None),
+                           nws_entries=[nws("TOP.TO.W.1", "Tornado text.")], amber_entries=[])
+        nudges = self.nudges
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.nudges, nudges)
+        self.assertFalse(self.engine_may_play().allowed)
+
+
+class SourceStateInitializationTests(CoordinatorHarness):
+    """Finding 5: a missing snapshot is unknown, never an authoritative empty set."""
+
+    def remove(self, source):
+        (self.tmp / wx_alert_state.SOURCE_FILES[source]).unlink(missing_ok=True)
+
+    def test_both_sources_present_initialize_the_baseline(self):
+        self.sources([nws("TOP.TO.W.1", "At install.")], [amber("CAP-1", "Amber at install.")])
+        self.run_pass()
+        self.assertTrue(self.state()["baseline"])
+        self.assertEqual(self.state()["sources"], {"nws": "ok", "amber": "ok"})
+
+    def test_nws_present_amber_missing_waits(self):
+        self.sources([nws("TOP.TO.W.1", "At install.")], None)
+        self.remove("amber")
+        self.assertTrue(self.run_pass())
+        self.assertFalse((self.tmp / "wx_alert_state.json").exists())
+
+    def test_amber_present_nws_missing_waits(self):
+        self.sources(None, [amber("CAP-1", "Amber at install.")])
+        self.remove("nws")
+        self.assertTrue(self.run_pass())
+        self.assertFalse((self.tmp / "wx_alert_state.json").exists())
+
+    def test_explicitly_disabled_amber_is_an_authoritative_empty_source(self):
+        self.amber_cfg = {"enabled": False}
+        self.sources([nws("TOP.TO.W.1", "At install.")], None)
+        self.remove("amber")
+        self.run_pass()
+        self.assertEqual(self.state()["sources"], {"nws": "ok", "amber": "disabled"})
+        self.sources([nws("TOP.TO.W.1", "At install."), nws("TOP.SV.W.2", "New storm.")], None)
+        self.run_pass()
+        self.assertEqual(self.published, [["At install.", "New storm."]])
+        self.assertTrue(self.engine_may_play().allowed)            # the engine honours the recorded "disabled"
+
+    def test_a_late_second_source_never_replays_preexisting_alerts(self):
+        self.sources([nws("TOP.TO.W.1", "At install.")], None)
+        self.remove("amber")
+        self.run_pass()                                            # AMBER unknown: no baseline yet
+        self.sources(None, [amber("CAP-1", "Amber at install.")])
+        self.run_pass()                                            # now complete: silent baseline
+        self.run_pass()
+        self.assertEqual((self.published, self.nudges), ([], 0))
+        self.assertTrue(self.state()["baseline"])
+
+    def test_a_malformed_snapshot_is_unknown(self):
+        self.sources([nws("TOP.TO.W.1", "At install.")], [])
+        (self.tmp / "active_amber_alerts.json").write_text("[{broken")
+        self.assertFalse(self.run_pass())
+        self.assertFalse((self.tmp / "wx_alert_state.json").exists())
+
+    def test_first_genuine_change_after_a_complete_baseline_is_announced_once(self):
+        self.sources([nws("TOP.TO.W.1", "At install.")], [amber("CAP-1", "Amber at install.")])
+        self.run_pass()
+        self.sources(None, [amber("CAP-1", "Amber at install."), amber("CAP-2", "Second child.")])
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(self.published, [["At install.", "Amber at install.", "Second child."]])
+        self.assertEqual(self.nudges, 2)                           # publication + one idempotent re-nudge
 
 
 if __name__ == "__main__":

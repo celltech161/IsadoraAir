@@ -25,12 +25,19 @@ The record is the authority for WHAT should air:
   copies with ``shutil.copy2`` (mtime preserved) and rolls back by restoring that copy, so a rollback keeps the
   identity while a new publication changes it.
 
+* ``fingerprint`` / ``sources`` -- the effective spoken content the generation was rendered from.  Playback is
+  authorized only while the CURRENT source snapshots still produce that fingerprint (``playback_decision`` with
+  ``data_dir``), so a cancellation, update or expiry a poller commits takes effect at once -- during publication
+  and before the replacement exists -- with no lock shared between the pollers and the coordinator (snapshots are
+  replaced atomically and read whole).  A missing or unreadable source is unknown and never authorizes.
+
 Delivery (whether a generation aired) is deliberately NOT recorded here: the engine derives it from its own
-persisted playback claims, which survive an engine restart.
+persisted playback claims (generation attribution) and ``played_at`` (actual air start), which survive a restart.
 """
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -42,6 +49,13 @@ SCHEMA_VERSION = 1
 STATE_FILENAME = "wx_alert_state.json"
 CATEGORY_CODE = "WxAlert"
 AUDIO_FILENAME = "wx_alert.flac"
+
+
+# Source snapshots (written atomically by the pollers) and their states.
+SOURCE_FILES = {"nws": "active_watches_warnings.json", "amber": "active_amber_alerts.json"}
+SOURCE_ORDER = ("nws", "amber")
+OK, DISABLED, MISSING, LEGACY = "ok", "disabled", "missing", "legacy"   # plus "malformed: ..."
+KNOWN_STATES = (OK, DISABLED)
 
 
 def state_path(data_dir) -> Path:
@@ -119,6 +133,94 @@ def audio_identity(path):
     return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
+# ---------------- effective spoken content (coordinator AND engine) ----------------
+
+def read_snapshot(path, source=None):
+    """``(entries, status)``.  Only ``OK`` (a readable list -- possibly a confirmed-empty one) is authoritative.
+    ``MISSING`` (no file: never produced, or lost) and ``"malformed: ..."`` are unknown, never "empty";
+    ``LEGACY`` is an NWS snapshot written before r0137 (entries without identity/validity)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, MISSING
+    except (OSError, ValueError) as exc:
+        return None, f"malformed: {exc}"
+    if not isinstance(data, list):
+        return None, "malformed: not a list"
+    if source == "nws" and any(isinstance(e, dict) and "key" not in e for e in data):
+        return None, LEGACY
+    return data, OK
+
+
+def _entry_deadline(source, entry):
+    """The authoritative end of validity, or None when the source gave none."""
+    names = ("expires", "ends") if source == "nws" else ("expires",)
+    candidates = [parse_ts(entry.get(name)) for name in names]
+    candidates = [c for c in candidates if c is not None]
+    return min(candidates) if candidates else None
+
+
+def _entry_key(source, entry):
+    if source == "nws":
+        return str(entry.get("key") or entry.get("event") or "")
+    return str(entry.get("identifier") or entry.get("event") or "")
+
+
+def effective_alerts(data_dir, now, *, disabled=()):
+    """``(alerts, sources, excluded)`` from the snapshots in ``data_dir`` at ``now``.
+
+    ``alerts`` is None unless every source is known: a readable snapshot, or a source listed in ``disabled``
+    whose snapshot is absent (an explicitly disabled source is authoritatively empty).  Entries past their
+    authoritative end, or with none, are excluded (listed in ``excluded``)."""
+    sources, raw = {}, {}
+    for source in SOURCE_ORDER:
+        entries, status = read_snapshot(Path(data_dir) / SOURCE_FILES[source], source)
+        if status == MISSING and source in disabled:
+            entries, status = [], DISABLED
+        sources[source], raw[source] = status, entries
+    if any(status not in KNOWN_STATES for status in sources.values()):
+        return None, sources, []
+    alerts, excluded = [], []
+    for source in SOURCE_ORDER:
+        picked = []
+        for entry in raw[source]:
+            if not isinstance(entry, dict):
+                continue
+            text = (entry.get("text") or "").strip()
+            if not text:
+                continue
+            key = _entry_key(source, entry)
+            deadline = _entry_deadline(source, entry)
+            if deadline is None:
+                excluded.append((source, key, "no authoritative expiration"))
+                continue
+            if deadline <= now:
+                excluded.append((source, key, f"expired {format_ts(deadline)}"))
+                continue
+            picked.append({"source": source, "key": key, "event": entry.get("event") or "",
+                           "text": text, "deadline": deadline})
+        if source == "amber":
+            # Feed order is not meaningful; NWS order is the poller's deterministic severity order.
+            picked.sort(key=lambda a: (a["event"], a["key"]))
+        alerts.extend(picked)
+    return alerts, sources, excluded
+
+
+def content_fingerprint(alerts):
+    """Identity of the spoken content: [source, alert identity, exact text] in spoken order ("" = nothing)."""
+    if not alerts:
+        return ""
+    canonical = json.dumps([[a["source"], a["key"], a["text"]] for a in alerts], separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def disabled_sources(state):
+    """Sources the coordinator recorded as explicitly disabled for the current generation."""
+    recorded = state.get("sources") if isinstance(state, dict) else None
+    return tuple(s for s, status in (recorded or {}).items() if status == DISABLED)
+
+
 @dataclass(frozen=True)
 class PlaybackDecision:
     allowed: bool
@@ -127,11 +229,13 @@ class PlaybackDecision:
     generation: int | None = None
 
 
-def playback_decision(state, identity, now: datetime) -> PlaybackDecision:
+def playback_decision(state, identity, now: datetime, data_dir=None) -> PlaybackDecision:
     """May the CURRENT published announcement begin playback now?  Database- and network-free.
 
-    Fails closed: a missing/unknown record, an inactive or expired generation, or a file that is not the one
-    the record describes never authorizes playback."""
+    Fails closed: a missing/unknown record, an inactive or expired generation, a file that is not the one the
+    record describes, or -- when ``data_dir`` is given -- source snapshots whose effective spoken content at
+    ``now`` is unknown or is no longer the content this generation was rendered from (a cancellation, update or
+    expiry committed by a poller and not yet republished) never authorizes playback."""
     if not isinstance(state, dict) or state.get("schema") != SCHEMA_VERSION:
         return PlaybackDecision(False, "no combined Weather/AMBER alert state")
     generation = state.get("generation")
@@ -152,6 +256,14 @@ def playback_decision(state, identity, now: datetime) -> PlaybackDecision:
         return PlaybackDecision(
             False, f"published alert audio is not the audio of generation {generation} (publication pending)"
         )
+    if data_dir is not None:
+        alerts, sources, _excluded = effective_alerts(data_dir, now, disabled=disabled_sources(state))
+        if alerts is None:
+            return PlaybackDecision(False, f"alert sources cannot be verified ({sources})")
+        if content_fingerprint(alerts) != state.get("fingerprint"):
+            return PlaybackDecision(
+                False, f"alert sources changed since generation {generation} was published (replacement pending)"
+            )
     return PlaybackDecision(True, None, published_at, generation)
 
 

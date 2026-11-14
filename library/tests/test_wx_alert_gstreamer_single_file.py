@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -237,6 +238,52 @@ class SingleFileDeckTests(SimpleTestCase):
         self.assertAlmostEqual(seconds, 3.0, delta=0.1)
 
 
+@unittest.skipUnless(_GST_OK, "GStreamer unavailable")
+class DeckFailureBeforeAirTests(SimpleTestCase):
+    """Finding 1, real engine deck path (transport harness: the real _create_deck/_start_next_track and bus
+    error retirement; database seams stubbed).  A claimed occurrence whose deck cannot start, or whose decoder
+    fails before its first real buffer, completes without air-start evidence and stops owning a live deck --
+    which is what lets the WxAlert synchronization retry its generation."""
+
+    def setUp(self):
+        from library.tests._transport_harness import TransportHarness
+        self.harness = TransportHarness(self)
+        self.engine = self.harness.engine
+        self.air_starts = []
+        self.engine._schedule_occurrence_air_start_from_probe = (
+            lambda deck: self.air_starts.append(deck.log_item.id))
+        self.harness.play()
+
+    def item(self, item_id, path):
+        from library.tests._transport_harness import make_item, make_track
+        return make_item(make_track(path, 9000 + item_id, duration=2.0), item_id)
+
+    def test_a_deck_that_fails_to_start_never_owns_its_occurrence(self):
+        import library.services.engine as eng_module
+        good = self.harness.media("good", seconds=2.0)
+        item = self.item(1, good)
+        with unittest.mock.patch.object(Gst.Bin, "sync_state_with_parent", return_value=False):
+            deck = self.engine._create_deck("A", item)
+        self.assertIn(1, self.harness.claims)                     # the claim happened ...
+        self.assertTrue(deck.start_failed)                        # ... the bin never started ...
+        self.assertFalse(deck.completion_claimed)                 # (completion stays with the bus ERROR path)
+        self.assertNotIn(1, eng_module._live_occurrence_ids(self.engine))   # ... so it owns nothing
+        # (Only the return value is simulated here -- the bin itself is real and may still start later; a real
+        # start failure never airs: see the decoder-failure test below for the real error path.)
+
+    def test_a_decoder_failure_before_the_first_real_buffer_retires_the_unaired_occurrence(self):
+        import library.services.engine as eng_module
+        from library.tests._transport_harness import pump, wait_until
+        corrupt = self.harness.root / "corrupt.wav"
+        corrupt.write_bytes(b"RIFF\x00\x00\x00\x00WAVEnot really audio" * 64)
+        deck = self.engine._create_deck("A", self.item(2, corrupt))
+        self.assertIn(2, self.harness.claims)
+        self.assertTrue(wait_until(lambda: deck.completion_claimed, timeout=5.0))
+        pump(0.5)
+        self.assertEqual(self.air_starts, [])
+        self.assertNotIn(2, eng_module._live_occurrence_ids(self.engine))
+
+
 class EngineDeckConstructionUnchangedTests(SimpleTestCase):
     """The GStreamer evidence above mirrors engine._create_deck; fail loudly if that construction changes."""
 
@@ -246,10 +293,10 @@ class EngineDeckConstructionUnchangedTests(SimpleTestCase):
         import library.services.engine as eng_module
         source = inspect.getsource(eng_module.PlaybackEngine._create_deck)
         for needle in ('Gst.ElementFactory.make("filesrc", None)', 'src.set_property("location", filepath)',
-                       'Gst.ElementFactory.make("decodebin", None)', "deck_bin.sync_state_with_parent()"):
+                       'Gst.ElementFactory.make("decodebin", None)', "if not deck_bin.sync_state_with_parent():"):
             self.assertIn(needle, source)
         self.assertLess(source.index("self._claim_playback_occurrence(log_item)"),
                         source.index("deck_bin.sync_state_with_parent()"))
         wrapper = inspect.getsource(eng_module._require_deck_open_authority)
-        self.assertIn("with _deck_open_authority(log_item)", wrapper)
+        self.assertIn("with _deck_open_authority(log_item, _live_occurrence_ids(self))", wrapper)
         self.assertIn("return method(", wrapper)
