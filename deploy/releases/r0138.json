@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0138",
+  "previous_release_id": "r0137",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Console and Remote DJ add an Intro column from existing cue metadata and an optional default-Off full-hour log display. Historical rows are read-only, upcoming queue authority is unchanged, and history fetches are bounded against stalled or late responses. Apply additive library.0101, then restart Gunicorn and the engine; no package, static, unit, nginx or protected-runtime change.",
+  "migrations_required": [
+    "library.0101_uitheme_show_played_items"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
