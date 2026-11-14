@@ -2,31 +2,37 @@
 """IPAWS OPEN poller for AMBER (CAE) / Blue (BLU) / Missing-Endangered
 (MEP) alerts. Runs on the amber-alert-poll.timer cadence.
 
-Pipeline (matches wx_alert.py's fingerprint-triggered pattern):
+Pipeline:
 
-  1. Config-gated: exits immediately if AmberAlertConfig.enabled=False.
+  1. Config-gated: AmberAlertConfig.enabled=False writes a CONFIRMED-EMPTY
+     active_amber_alerts.json ([]), so a previously active AMBER alert can
+     never linger in the combined announcement or the forecast append.
   2. Fetch IPAWS OPEN /rest/feed (Atom summary).
   3. Filter entries by configured event codes + state FIPS.
   4. For each survivor, fetch the full CAP 1.2 XML.
-  5. Filter by SAME area code overlap with configured county list.
-  6. Drop expired alerts.
-  7. Write active_amber_alerts.json (both text and text_core variants,
+  5. Keep only current messages: status Actual, Alert/Update (a Cancel or
+     Update retires every message it references).
+  6. Filter by SAME area code overlap with configured county list.
+  7. Drop expired alerts.
+  8. Write active_amber_alerts.json (both text and text_core variants,
      matching the weather pipeline's shape).
-  8. Compare fingerprint to the last stored one; if changed and the
-     new set isn't empty, trigger amber_alert.py subprocess for the
-     urgent insert. Fingerprint gate matches update_wx_alerts()'s
-     'first run silent' safety guard.
+  9. Run the combined Weather/AMBER alert coordinator (wx_alert.py), every
+     cycle -- it alone decides whether the effective spoken content changed,
+     publishes ONE combined WxAlert/wx_alert.flac and nudges the engine.
+
+A retrieval failure (the feed, or ANY individual CAP message) is not a
+cancellation: the previous snapshot is kept untouched for that cycle, and
+the coordinator still runs so authoritative <expires> times keep applying
+during an outage.
 
 Signature verification is intentionally skipped -- see AmberAlertConfig
 docstring for the trust-HTTPS decision.
 
-Idempotent: a run with the same active set writes the same JSON + same
-fingerprint, and doesn't re-trigger amber_alert.py. Safe to run more
-frequently than needed if we ever want to tighten latency.
+Idempotent: a run with the same active set writes the same JSON; the
+coordinator speaks only when the effective combined content changes.
 """
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -36,8 +42,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from ipaws import (  # noqa: E402
+    CapFetchError,
     alert_covers_any,
     clean_body_text,
+    current_alerts,
     fetch_and_parse_cap,
     fetch_feed_entries,
     filter_feed_entries,
@@ -55,8 +63,9 @@ log = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = resolve_weather_data_dir()
 ACTIVE_FILE = DATA_DIR / "active_amber_alerts.json"
-FINGERPRINT_FILE = DATA_DIR / "amber_fingerprint.txt"
-AMBER_ALERT_SCRIPT = str(BASE_DIR / "amber_alert.py")
+COORDINATOR_SCRIPT = str(BASE_DIR / "wx_alert.py")
+# Covers the coordinator's own bounded lock wait plus one synthesis/publication.
+COORDINATOR_TIMEOUT_SECONDS = 330
 LOCKFILE = "/tmp/amber-alert-poll.lock"
 
 
@@ -80,28 +89,9 @@ def _safe_write_json(path, data):
     tmp.replace(path)
 
 
-def _safe_write_text(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-
-def _read_prior_fingerprint():
-    try:
-        return Path(FINGERPRINT_FILE).read_text(encoding="utf-8").strip() or None
-    except FileNotFoundError:
-        return None
-
-
-def _fingerprint(active):
-    """Hash the identifiers of active alerts. Any add/remove/rewording
-    that changes the identifier set produces a new fingerprint. CAP
-    identifiers are stable per issuance."""
-    ids = sorted(entry["identifier"] for entry in active if entry.get("identifier"))
-    joined = "\n".join(ids)
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+class SnapshotUnavailable(RuntimeError):
+    """This cycle could not establish the complete active set (feed or CAP
+    retrieval failure). The previous snapshot stays authoritative."""
 
 
 def _statefips_prefixes_from(same_codes):
@@ -127,10 +117,22 @@ def _build_active_entries(cfg):
         len(candidates), sorted(cfg["event_codes"]), sorted(statefips),
     )
 
-    active = []
+    caps = []
     for entry in candidates:
-        cap = fetch_and_parse_cap(entry["link"])
+        try:
+            cap = fetch_and_parse_cap(entry["link"])
+        except CapFetchError as exc:
+            # A partial set must never be committed as authoritative: the
+            # missing message may be a still-active alert.
+            raise SnapshotUnavailable(str(exc)) from exc
         if cap is None:
+            continue  # retrieved but unusable (malformed) -- never airable
+        caps.append((entry, cap))
+
+    current_ids = {id(cap) for cap in current_alerts([cap for _entry, cap in caps])}
+    active = []
+    for entry, cap in caps:
+        if id(cap) not in current_ids:
             continue
         if is_expired(cap):
             continue
@@ -170,34 +172,43 @@ def _build_active_entries(cfg):
     return active
 
 
-def _trigger_amber_alert():
-    """Run amber_alert.py synchronously so the urgent-insert FLAC is
-    delivered before this cycle considers the alert broadcast. 120s
-    timeout matches wx_alert's; a few short clips + ffmpeg concat
-    comfortably fit.
-
-    check=False is intentional -- an amber_alert.py failure must not
-    raise here and disrupt this cycle's own polling/retry semantics,
-    but its exit status IS now inspected and logged (previously
-    discarded entirely) so a real synthesis/publication failure is
-    observable rather than silently invisible."""
-    if not os.path.exists(AMBER_ALERT_SCRIPT):
-        log.warning("Fingerprint changed but %s not found; nothing delivered.", AMBER_ALERT_SCRIPT)
+def _run_alert_coordinator():
+    """Run the combined Weather/AMBER coordinator (wx_alert.py) and wait for
+    it. It is idempotent: unchanged effective content neither re-synthesizes
+    nor queues another announcement. Its failure must not disturb this poll
+    cycle; the next cycle retries."""
+    if not os.path.exists(COORDINATOR_SCRIPT):
+        log.warning("%s not found; combined alert state not synchronized.", COORDINATOR_SCRIPT)
         return
     try:
-        result = subprocess.run([sys.executable, AMBER_ALERT_SCRIPT], check=False, timeout=120)
+        result = subprocess.run([sys.executable, COORDINATOR_SCRIPT], check=False,
+                                timeout=COORDINATOR_TIMEOUT_SECONDS)
         if result.returncode != 0:
-            log.error(
-                "amber_alert.py exited %d (failure) -- AMBER audio was NOT published this cycle; "
-                "the previous wx_alert.flac (if any) remains in place.",
-                result.returncode,
-            )
-        else:
-            log.info("Triggered amber_alert.py for updated AMBER audio.")
+            log.error("Alert coordinator (wx_alert.py) exited %d; it retries next cycle.", result.returncode)
     except subprocess.TimeoutExpired:
-        log.error("amber_alert.py timed out after 120s.")
+        log.error("Alert coordinator (wx_alert.py) timed out after %ss.", COORDINATOR_TIMEOUT_SECONDS)
     except Exception as e:
-        log.error("Failed to trigger amber_alert.py: %s", e)
+        log.error("Failed to run the alert coordinator: %s", e)
+
+
+def _refresh_snapshot():
+    """Update active_amber_alerts.json for this cycle. Returns a short
+    outcome string for the log."""
+    cfg = load_amber_alert_config()
+    if not cfg.get("enabled"):
+        _safe_write_json(ACTIVE_FILE, [])
+        log.info("AmberAlertConfig disabled; active AMBER set confirmed empty.")
+        return "disabled"
+    try:
+        active = _build_active_entries(cfg)
+    except SnapshotUnavailable as exc:
+        log.warning("AMBER retrieval incomplete (%s); previous snapshot kept.", exc)
+        return "unavailable"
+    except Exception as exc:  # feed transport/parse failure -- not a cancellation
+        log.warning("AMBER feed retrieval failed (%s); previous snapshot kept.", exc)
+        return "unavailable"
+    _safe_write_json(ACTIVE_FILE, active)
+    return "updated"
 
 
 def main():
@@ -208,32 +219,11 @@ def main():
         return
 
     try:
-        cfg = load_amber_alert_config()
-        if not cfg.get("enabled"):
-            log.info("AmberAlertConfig disabled; nothing to do.")
-            return
-
-        active = _build_active_entries(cfg)
-        _safe_write_json(ACTIVE_FILE, active)
-
-        new_fp = _fingerprint(active)
-        prior_fp = _read_prior_fingerprint()
-
-        if new_fp == prior_fp:
-            log.info("Fingerprint unchanged; no urgent insert this cycle.")
-            return
-
-        _safe_write_text(FINGERPRINT_FILE, new_fp + "\n")
-
-        if prior_fp is None:
-            log.info("First-run fingerprint stored (no urgent insert this cycle).")
-            return
-
-        if not active:
-            log.info("Alert set is now empty; fingerprint updated, no insert.")
-            return
-
-        _trigger_amber_alert()
+        try:
+            _refresh_snapshot()
+        except Exception as exc:  # config bridge failure: snapshot untouched
+            log.error("AMBER snapshot not refreshed this cycle: %s", exc)
+        _run_alert_coordinator()
     finally:
         try:
             lock.close()

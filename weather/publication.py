@@ -157,6 +157,14 @@ def _restore_final_file(dest_path: Path, backup: Path | None) -> None:
         pass
 
 
+def destination_lock_path(dest_path: Path) -> Path:
+    """The hidden sidecar every publication of ``dest_path`` locks exclusively (see _destination_lock).
+    The playback engine takes the same file SHARED while it opens WxAlert/wx_alert.flac
+    (isadoraair.wx_alert_state.shared_publication_lock), so a deck never opens a file whose Track row is not
+    yet committed or is about to be rolled back."""
+    return Path(dest_path).parent / f".{Path(dest_path).name}.publish.lock"
+
+
 @contextmanager
 def _destination_lock(dest_path: Path):
     """Exclusive, cross-process lock keyed by the canonical final
@@ -176,7 +184,7 @@ def _destination_lock(dest_path: Path):
     lock (this must work even before the destination Category/Track
     exist), and not per-producer (must work across processes with no
     shared Python state at all)."""
-    lock_path = dest_path.parent / f".{dest_path.name}.publish.lock"
+    lock_path = destination_lock_path(dest_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     try:

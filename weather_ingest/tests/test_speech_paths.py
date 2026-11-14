@@ -77,12 +77,14 @@ class UrgentInsertQueueProducerTests(unittest.TestCase):
             {"command": "insert_urgent", "category": "WxAlert"}
         )
 
-    def test_amber_urgent_insert_uses_shared_queue(self):
-        with patch.object(amber_alert, "enqueue_engine_command") as enqueue:
-            amber_alert._fire_insert_urgent()
-        enqueue.assert_called_once_with(
-            {"command": "insert_urgent", "category": "WxAlert"}
-        )
+    def test_amber_entry_point_runs_the_combined_coordinator(self):
+        """r0137: amber_alert.py no longer renders or publishes on its own --
+        it only runs the one combined Weather/AMBER coordinator."""
+        with patch.object(wx_alert, "main", return_value=True) as coordinator:
+            self.assertTrue(amber_alert.main())
+        coordinator.assert_called_once_with()
+        for name in ("deliver", "enqueue_engine_command", "voices", "speech_audio"):
+            self.assertFalse(hasattr(amber_alert, name), name)
 
     def test_weather_queue_failure_is_not_reported_as_success(self):
         with patch.object(
@@ -93,14 +95,9 @@ class UrgentInsertQueueProducerTests(unittest.TestCase):
             with self.assertRaises(EngineCommandQueueFull):
                 wx_alert.fire_insert_urgent()
 
-    def test_amber_queue_failure_is_not_reported_as_success(self):
-        with patch.object(
-            amber_alert,
-            "enqueue_engine_command",
-            side_effect=EngineCommandQueueFull("queue full"),
-        ):
-            with self.assertRaises(EngineCommandQueueFull):
-                amber_alert._fire_insert_urgent()
+    def test_amber_coordinator_failure_is_not_reported_as_success(self):
+        with patch.object(wx_alert, "main", return_value=False):
+            self.assertFalse(amber_alert.main())
 
 
 class FilenameCategoryMetadataUnchangedTests(unittest.TestCase):
@@ -180,18 +177,6 @@ class PostprocessingArgumentsTests(unittest.TestCase):
         self._assert_flac_chain(argv, 6.0)
         self.assertIn("concat", argv)
         self.assertIn("artist=Weather Alert", argv)
-
-    def test_amber_alert_concat_ffmpeg_args_match_wx_alert(self):
-        with patch.object(amber_alert.os, "makedirs"), \
-             patch.object(amber_alert, "open", create=True), \
-             patch.object(amber_alert.os, "remove"), \
-             patch.object(amber_alert.speech_audio, "subprocess") as mock_subprocess:
-            mock_subprocess.run.return_value = MagicMock()
-            ok = amber_alert._concat_clips(["/tmp/a.wav"], "/tmp/out.flac", {"logical_voice": "Max_Weatherly"})
-        self.assertTrue(ok)
-        argv = mock_subprocess.run.call_args.args[0]
-        self._assert_flac_chain(argv, 6.0)
-        self.assertIn("artist=AMBER Alert", argv)
 
     def test_encode_failure_reports_failure_and_never_raises(self):
         err = subprocess.CalledProcessError(1, "ffmpeg")
@@ -289,98 +274,40 @@ def voices_fail(reason="nonzero_exit"):
 
 
 class WxAlertAtomicityTests(unittest.TestCase):
-    """Part 5: all-or-nothing publication. One failed segment must
-    prevent concat/delivery/insert_urgent entirely; a fully-successful
-    set must still publish normally."""
+    """Part 5: all-or-nothing rendering of the ONE combined announcement
+    (r0137: NWS and AMBER clips together). One failed segment must prevent
+    concatenation (and therefore publication) entirely; a fully-successful
+    set must still render normally."""
 
-    def _entries(self, n):
-        return [{"event": f"EVT{i}", "text": f"Alert text {i}"} for i in range(n)]
+    def _alerts(self, n):
+        return [{"source": "nws" if i % 2 == 0 else "amber", "key": f"K{i}", "event": f"EVT{i}",
+                 "text": f"Alert text {i}"} for i in range(n)]
 
     def test_one_failed_clip_prevents_complete_publication(self):
-        with patch.object(wx_alert, "load_watchwarn_entries", return_value=self._entries(3)), \
-             patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
+        with patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
              patch.object(wx_alert, "synthesize_clip", side_effect=[voices_ok(), voices_fail(), voices_ok()]), \
              patch.object(wx_alert, "concat_clips") as mock_concat, \
-             patch.object(wx_alert, "deliver") as mock_deliver, \
-             patch.object(wx_alert, "fire_insert_urgent") as mock_fire, \
              patch.object(wx_alert.os, "makedirs"):
-            ok = wx_alert._main_body()
-        self.assertFalse(ok)
+            output, voice = wx_alert.render(self._alerts(3))
+        self.assertIsNone(output)
         mock_concat.assert_not_called()
-        mock_deliver.assert_not_called()
-        mock_fire.assert_not_called()
 
     def test_successful_multi_alert_set_still_publishes_normally(self):
-        with patch.object(wx_alert, "load_watchwarn_entries", return_value=self._entries(3)), \
-             patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
-             patch.object(wx_alert, "synthesize_clip", return_value=voices_ok()), \
+        with patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
+             patch.object(wx_alert, "synthesize_clip", return_value=voices_ok()) as mock_synth, \
              patch.object(wx_alert, "concat_clips", return_value=True) as mock_concat, \
-             patch.object(wx_alert, "deliver", return_value="/srv/dest.mp3") as mock_deliver, \
-             patch.object(wx_alert, "fire_insert_urgent") as mock_fire, \
              patch.object(wx_alert.os, "makedirs"):
-            ok = wx_alert._main_body()
-        self.assertTrue(ok)
+            output, voice = wx_alert.render(self._alerts(3))
+        self.assertEqual(output, wx_alert.COMBINED_OUTPUT)
+        self.assertEqual([c.args[0] for c in mock_synth.call_args_list], ["Alert text 0", "Alert text 1", "Alert text 2"])
         mock_concat.assert_called_once()
-        mock_deliver.assert_called_once()
-        mock_fire.assert_called_once()
-
-    def test_no_qualifying_entries_is_a_benign_success_no_op(self):
-        with patch.object(wx_alert, "load_watchwarn_entries", return_value=[]), \
-             patch.object(wx_alert, "concat_clips") as mock_concat:
-            ok = wx_alert._main_body()
-        self.assertTrue(ok)
-        mock_concat.assert_not_called()
 
     def test_voice_resolution_failure_aborts_before_any_synthesis(self):
-        with patch.object(wx_alert, "load_watchwarn_entries", return_value=self._entries(1)), \
-             patch.object(wx_alert, "load_weather_config", return_value={"voice_schedule": [], "voice_personas": {}}), \
+        with patch.object(wx_alert, "load_weather_config", return_value={"voice_schedule": [], "voice_personas": {}}), \
              patch.object(wx_alert, "synthesize_clip") as mock_synth:
-            ok = wx_alert._main_body()
-        self.assertFalse(ok)
+            output, voice = wx_alert.render(self._alerts(1))
+        self.assertIsNone(output)
         mock_synth.assert_not_called()
-
-
-class AmberAlertAtomicityTests(unittest.TestCase):
-    """Same all-or-nothing contract as WxAlertAtomicityTests, applied to
-    amber_alert.py's own _main_body()."""
-
-    def _entries(self, n):
-        return [{"event": f"AMBER{i}", "text": f"Alert text {i}"} for i in range(n)]
-
-    def test_one_failed_clip_prevents_complete_publication(self):
-        with patch.object(amber_alert, "_load_active", return_value=self._entries(2)), \
-             patch.object(amber_alert, "load_weather_config", return_value=FAKE_CFG), \
-             patch.object(amber_alert.voices, "synthesize", side_effect=[voices_fail(), voices_ok()]), \
-             patch.object(amber_alert, "_concat_clips") as mock_concat, \
-             patch.object(amber_alert, "deliver") as mock_deliver, \
-             patch.object(amber_alert, "_fire_insert_urgent") as mock_fire, \
-             patch.object(amber_alert.os, "makedirs"):
-            ok = amber_alert._main_body()
-        self.assertFalse(ok)
-        mock_concat.assert_not_called()
-        mock_deliver.assert_not_called()
-        mock_fire.assert_not_called()
-
-    def test_successful_multi_alert_set_still_publishes_normally(self):
-        with patch.object(amber_alert, "_load_active", return_value=self._entries(2)), \
-             patch.object(amber_alert, "load_weather_config", return_value=FAKE_CFG), \
-             patch.object(amber_alert.voices, "synthesize", return_value=voices_ok()), \
-             patch.object(amber_alert, "_concat_clips", return_value=True) as mock_concat, \
-             patch.object(amber_alert, "deliver", return_value="/srv/dest.mp3") as mock_deliver, \
-             patch.object(amber_alert, "_fire_insert_urgent") as mock_fire, \
-             patch.object(amber_alert.os, "makedirs"):
-            ok = amber_alert._main_body()
-        self.assertTrue(ok)
-        mock_concat.assert_called_once()
-        mock_deliver.assert_called_once()
-        mock_fire.assert_called_once()
-
-    def test_no_qualifying_entries_is_a_benign_success_no_op(self):
-        with patch.object(amber_alert, "_load_active", return_value=[]), \
-             patch.object(amber_alert, "_concat_clips") as mock_concat:
-            ok = amber_alert._main_body()
-        self.assertTrue(ok)
-        mock_concat.assert_not_called()
 
 
 class FailedCliOutputCannotProceedTests(unittest.TestCase):
@@ -424,24 +351,16 @@ class ExistingFinalFileUntouchedTests(unittest.TestCase):
     the live srv path; see lib/delivery.py)."""
 
     def test_wx_alert_failure_never_calls_deliver(self):
-        with patch.object(wx_alert, "load_watchwarn_entries",
-                           return_value=[{"event": "E", "text": "t"}]), \
-             patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
+        alerts = [{"source": "nws", "key": "K", "event": "E", "text": "t", "deadline": None}]
+        with patch.object(wx_alert, "load_weather_config", return_value=FAKE_CFG), \
              patch.object(wx_alert, "synthesize_clip", return_value=voices_fail()), \
              patch.object(wx_alert, "deliver") as mock_deliver, \
+             patch.object(wx_alert, "fire_insert_urgent") as mock_fire, \
              patch.object(wx_alert.os, "makedirs"):
-            wx_alert._main_body()
+            ok = wx_alert._publish(None, 0, alerts, "fp", {})
+        self.assertFalse(ok)
         mock_deliver.assert_not_called()
-
-    def test_amber_alert_failure_never_calls_deliver(self):
-        with patch.object(amber_alert, "_load_active",
-                           return_value=[{"event": "E", "text": "t"}]), \
-             patch.object(amber_alert, "load_weather_config", return_value=FAKE_CFG), \
-             patch.object(amber_alert.voices, "synthesize", return_value=voices_fail()), \
-             patch.object(amber_alert, "deliver") as mock_deliver, \
-             patch.object(amber_alert.os, "makedirs"):
-            amber_alert._main_body()
-        mock_deliver.assert_not_called()
+        mock_fire.assert_not_called()
 
 
 class ExitStatusTests(unittest.TestCase):

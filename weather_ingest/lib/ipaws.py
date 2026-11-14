@@ -96,17 +96,28 @@ def _text(el):
     return (el.text or "").strip() if el is not None else ""
 
 
+class CapFetchError(RuntimeError):
+    """A CAP message could not be RETRIEVED (transport/HTTP failure). Unlike an
+    unparseable message, this says nothing about whether the alert is still
+    active -- the caller must not treat the alert as gone."""
+
+
 def fetch_and_parse_cap(link):
     """Fetch a full CAP 1.2 message and return the fields we use downstream:
         {"identifier", "sent", "expires", "sender", "sender_name",
+         "status", "msg_type", "references": [<identifier>, ...],
          "event", "event_code", "headline", "description", "instruction",
          "areas": [<SAME code>, ...]}
-    Returns None if the XML doesn't parse or lacks the mandatory fields."""
+    Raises CapFetchError when the message could not be retrieved; returns None
+    if the retrieved XML doesn't parse or lacks the mandatory fields."""
     try:
         xml = _http_get(link)
+    except requests.RequestException as exc:
+        raise CapFetchError(f"IPAWS CAP fetch failed for {link}: {exc}") from exc
+    try:
         root = ET.fromstring(xml)
-    except (requests.RequestException, ET.ParseError) as exc:
-        log.warning("IPAWS CAP fetch failed for %s: %s", link, exc)
+    except ET.ParseError as exc:
+        log.warning("IPAWS CAP message unparseable for %s: %s", link, exc)
         return None
 
     # Multiple <info> blocks are legal (one per language). Pick English if
@@ -142,6 +153,9 @@ def fetch_and_parse_cap(link):
     return {
         "identifier":  _text(root.find(f"{CAP12_NS}identifier")),
         "sent":        _text(root.find(f"{CAP12_NS}sent")),
+        "status":      _text(root.find(f"{CAP12_NS}status")),
+        "msg_type":    _text(root.find(f"{CAP12_NS}msgType")),
+        "references":  parse_references(_text(root.find(f"{CAP12_NS}references"))),
         "expires":     _text(info.find(f"{CAP12_NS}expires")),
         "sender":      _text(root.find(f"{CAP12_NS}sender")),
         "sender_name": _text(info.find(f"{CAP12_NS}senderName")),
@@ -152,6 +166,40 @@ def fetch_and_parse_cap(link):
         "instruction": _text(info.find(f"{CAP12_NS}instruction")),
         "areas":       areas,
     }
+
+
+def parse_references(text):
+    """CAP <references>: whitespace-separated "sender,identifier,sent" triplets.
+    Returns the referenced identifiers (an Update/Cancel supersedes them)."""
+    out = []
+    for triplet in (text or "").split():
+        parts = triplet.split(",")
+        if len(parts) >= 2 and parts[1]:
+            out.append(parts[1])
+    return out
+
+
+def current_alerts(caps):
+    """Reduce parsed CAP messages to the ones that are still in effect:
+      * only status Actual (Test/Exercise/System/Draft never air);
+      * Cancel messages never air and retire every message they reference;
+      * an Update supersedes every message it references;
+      * Ack/Error messages never air.
+    Order of the survivors is preserved."""
+    superseded = set()
+    for cap in caps:
+        if (cap.get("msg_type") or "").lower() in ("update", "cancel"):
+            superseded.update(cap.get("references") or [])
+    out = []
+    for cap in caps:
+        if (cap.get("status") or "").lower() != "actual":
+            continue
+        if (cap.get("msg_type") or "alert").lower() not in ("alert", "update"):
+            continue
+        if cap.get("identifier") in superseded:
+            continue
+        out.append(cap)
+    return out
 
 
 def alert_covers_any(alert, same_codes):

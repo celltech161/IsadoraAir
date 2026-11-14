@@ -210,13 +210,14 @@ class SpokenAlertIndependenceTests(unittest.TestCase):
         self.assertFalse(update_local_wx_data._is_watch_or_warning(event))
 
     def test_alert_status_write_branch_only_reads_severe_active_never_watch_or_warning(self):
-        """Static source check on update_wx_alerts(): the branch that
+        """Static source check on _refresh_wx_alerts() (update_wx_alerts'
+        snapshot half since r0137): the branch that
         writes/removes ALERT_STATUS (alert.txt) must key off
         `severe_active` only -- never off _is_watch_or_warning() or the
         watchwarn_entries list -- so the two paths cannot become
         coupled by a future edit without this test catching it."""
         import inspect
-        source = inspect.getsource(update_local_wx_data.update_wx_alerts)
+        source = inspect.getsource(update_local_wx_data._refresh_wx_alerts)
         branch_start = source.index("if severe_active:")
         branch_end = source.index("new_fp = _alert_fingerprint", branch_start)
         branch_region = source[branch_start:branch_end]

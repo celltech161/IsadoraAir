@@ -15,7 +15,8 @@ import wxconfig  # noqa: E402
 
 ENTRY_POINTS = (
     "amber_poll.py",
-    "amber_alert.py",
+    # amber_alert.py (r0137) is only a wrapper around wx_alert.py and
+    # resolves nothing itself.
     "wx_forecast.py",
     "wx_alert.py",
     "current_temp.py",

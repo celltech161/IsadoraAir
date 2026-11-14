@@ -249,6 +249,7 @@ def get_weather_diagnostics(now=None, data_dir=None, library_root=None) -> Weath
             suffix, category_code, filename, event_driven, library_root, data_dir, now, applicability,
         ))
 
+    facts.append(_check_wx_alert_state(data_dir, now))
     facts.append(_check_rbds_weather_provenance(data_dir))
 
     return WeatherDiagnosticsSnapshot(generated_at=_iso(now), facts=tuple(facts))
@@ -987,8 +988,8 @@ def _check_routine_generated_artifact(key, suffix, filename, expected_path, file
 
 def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, age, evidence, applicability) -> DiagnosticFact:
     """WxAlert/wx_alert.flac is the urgent spoken watch/warning and
-    AMBER-family statement (built by weather_ingest/wx_alert.py and
-    amber_alert.py) -- NOT the FX "alert beep" tracked separately by
+    AMBER-family statement (one combined announcement built by the
+    coordinator weather_ingest/wx_alert.py) -- NOT the FX "alert beep" tracked separately by
     `alert_fx_cart`. It is shared by both source types and, being
     event-driven, a file/Track surviving from a past alert must not be
     read as a currently `ready` artifact once that alert has ended --
@@ -1046,6 +1047,72 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
         key=key, state="needs_attention",
         summary="An alert is active but wx_alert.flac's Track is not marked Ready to Air.",
         path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
+    )
+
+
+def _check_wx_alert_state(data_dir: Path, now) -> DiagnosticFact:
+    """r0137: the combined Weather/AMBER announcement record written by the
+    coordinator (weather_ingest/wx_alert.py) -- what the engine is allowed to
+    start playing. Read-only; see isadoraair.wx_alert_state."""
+    from isadoraair import wx_alert_state
+
+    key = "wx_alert_state"
+    path = wx_alert_state.state_path(data_dir)
+    state, error = wx_alert_state.read_state(path)
+    if error == "missing":
+        return DiagnosticFact(
+            key=key, state="degraded",
+            summary="The combined Weather/AMBER alert coordinator has not recorded a state yet.",
+            detail="It records one on its first run after a weather or AMBER poll; until then no "
+                   "announcement may start.",
+            path=str(path), evidence={"exists": False},
+        )
+    if state is None:
+        return DiagnosticFact(
+            key=key, state="needs_attention",
+            summary="The combined Weather/AMBER alert state is unreadable; no announcement may start.",
+            detail=error, path=str(path), evidence={"exists": True},
+        )
+    timestamp, age = _mtime_evidence(path, now)
+    alerts = state.get("alerts") or []
+    evidence = {
+        "generation": state.get("generation"),
+        "active": bool(state.get("active")),
+        "baseline": bool(state.get("baseline")),
+        "alerts": [f"{a.get('source')}:{a.get('event') or a.get('key')}" for a in alerts if isinstance(a, dict)],
+        "valid_until": state.get("valid_until"),
+        "published_at": state.get("published_at"),
+        "sources": state.get("sources"),
+        "excluded": state.get("excluded"),
+        "last_error": state.get("last_error"),
+    }
+    common = dict(key=key, path=str(path), count=len(alerts), timestamp=timestamp, age_seconds=age, evidence=evidence)
+    if state.get("last_error"):
+        return DiagnosticFact(
+            state="needs_attention",
+            summary=f"The last alert coordinator pass failed: {state['last_error']} (retried every poll).",
+            **common,
+        )
+    if not state.get("active"):
+        summary = (
+            "Alerts present at first run were recorded as an un-announced baseline."
+            if state.get("baseline") and alerts else
+            f"No Weather/AMBER announcement is active (generation {state.get('generation')})."
+        )
+        return DiagnosticFact(state="ready", summary=summary, **common)
+    valid_until = wx_alert_state.parse_ts(state.get("valid_until"))
+    if valid_until is None or now >= valid_until:
+        return DiagnosticFact(
+            state="needs_attention",
+            summary="The published announcement passed its validity deadline but the coordinator has not "
+                    "retired it -- pending occurrences are refused; check the weather/AMBER pollers.",
+            **common,
+        )
+    return DiagnosticFact(
+        state="ready",
+        summary=f"Announcement generation {state.get('generation')} active with {len(alerts)} alert(s) "
+                f"until {state.get('valid_until')}.",
+        **common,
     )
 
 

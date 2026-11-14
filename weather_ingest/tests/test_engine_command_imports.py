@@ -30,9 +30,12 @@ wxconfig.load_weather_config = lambda: {}
 wxconfig.resolve_weather_data_dir = lambda: Path("/tmp")
 sys.modules.update(delivery=delivery, voices=voices, wxconfig=wxconfig)
 
-for script in ("wx_alert.py", "amber_alert.py"):
-    namespace = runpy.run_path(script, run_name="standalone_import_smoke")
-    assert namespace["enqueue_engine_command"].__module__ == "isadoraair.engine_commands"
+namespace = runpy.run_path("wx_alert.py", run_name="standalone_import_smoke")
+assert namespace["enqueue_engine_command"].__module__ == "isadoraair.engine_commands"
+assert namespace["wx_alert_state"].__name__ == "isadoraair.wx_alert_state"
+# r0137: amber_alert.py is only a wrapper around the combined coordinator.
+namespace = runpy.run_path("amber_alert.py", run_name="standalone_import_smoke")
+assert namespace["wx_alert"].enqueue_engine_command.__module__ == "isadoraair.engine_commands"
 '''
         result = subprocess.run(
             [sys.executable, "-I", "-c", code],

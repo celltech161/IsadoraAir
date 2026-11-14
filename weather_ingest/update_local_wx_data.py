@@ -95,13 +95,17 @@ ALERT_DESCRIPTION = DATA_DIR / "warn.txt"
 ALERT_FINGERPRINT_FILE = DATA_DIR / "alert_fingerprint.txt"
 CURRENT_TEMP_SCRIPT = str(BASE_DIR / "current_temp.py")
 
-# Structured Watch/Warning data for wx_alert.py, which turns it into
-# Piper TTS audio and inserts it directly into the live on-air queue.
-# Written every cycle by update_wx_alerts(); wx_alert.py is only
-# actually triggered (see _trigger_wx_alert) when the alert fingerprint
-# changes, same as the current_temp.py trigger below.
+# Structured Watch/Warning data: written on every SUCCESSFUL fetch cycle
+# by update_wx_alerts() (a failed fetch leaves the previous snapshot in
+# place -- a retrieval failure is not a cancellation). wx_alert.py, the
+# combined Weather/AMBER coordinator, runs after EVERY cycle and alone
+# decides whether the effective spoken content changed (see
+# _run_alert_coordinator); the headline fingerprint above keeps driving
+# only the current_temp.py trigger.
 WX_WATCHWARN_FILE = DATA_DIR / "active_watches_warnings.json"
 WX_ALERT_SCRIPT = str(BASE_DIR / "wx_alert.py")
+# Covers the coordinator's own bounded lock wait plus one synthesis/publication.
+COORDINATOR_TIMEOUT_SECONDS = 330
 
 # Location
 LAT = CFG["station_lat"]
@@ -167,12 +171,12 @@ def event_triggers_alert_beep(event, configured_triggers):
 VERBOSE = True
 
 # Prevents overlapping cron runs of this script. Matters more now than it
-# used to: update_wx_alerts() can block for up to 120s waiting on
-# wx_alert.py (see _trigger_wx_alert), so a slow cycle could still be
-# running when the next 5-minute cron tick fires. Without this, two
-# overlapping instances could race on ALERT_FINGERPRINT_FILE (both read
-# the same prior value before either writes) and both decide to trigger
-# wx_alert.py/current_temp.py at once.
+# used to: update_wx_alerts() can block for several minutes waiting on
+# the wx_alert.py coordinator (see _run_alert_coordinator), so a slow
+# cycle could still be running when the next 5-minute cron tick fires.
+# Without this, two overlapping instances could race on
+# ALERT_FINGERPRINT_FILE (both read the same prior value before either
+# writes) and both decide to trigger current_temp.py at once.
 LOCKFILE = "/tmp/syndicated-wx-updater.lock"
 
 def acquire_lock(path):
@@ -914,50 +918,93 @@ def _trigger_current_temp():
         log.error("Failed to trigger current_temp.py: %s", e)
 
 
-def _trigger_wx_alert():
-    """Run wx_alert.py and WAIT for it to finish -- it delivers a fresh
-    clip into the WxAlert category and fires engine.py's insert_urgent
-    command, both of which need to land before this cron cycle
-    considers the alert state "broadcast". A 120s timeout is generous
-    for a few short clips + one ffmpeg concat; if it's ever hit,
-    something is actually stuck.
+def _run_alert_coordinator():
+    """Run wx_alert.py -- the combined Weather/AMBER spoken-alert
+    coordinator -- and WAIT for it, on every cycle (success or failure of
+    this cycle's own fetch). It is idempotent: unchanged effective content
+    neither re-synthesizes nor queues another announcement, while a
+    previously failed publication or engine nudge is retried, and known
+    alert expirations keep applying during an upstream outage.
 
-    check=False is intentional -- a wx_alert.py failure must not raise
-    here and disrupt this cycle's own ingestion/retry semantics (no
-    retry storm), but its exit status IS now inspected and logged
-    (previously discarded entirely) so a real synthesis/publication
-    failure is observable rather than silently invisible."""
+    check=False is intentional -- a coordinator failure must not raise
+    here and disrupt this cycle's own ingestion; its exit status is
+    logged so a real synthesis/publication failure stays observable."""
     if not os.path.exists(WX_ALERT_SCRIPT):
-        log.warning("Alert state changed but %s not found - skipping wx alert insertion.",
-                    WX_ALERT_SCRIPT)
+        log.warning("%s not found - combined alert state not synchronized.", WX_ALERT_SCRIPT)
         return
     try:
-        result = subprocess.run([sys.executable, WX_ALERT_SCRIPT], check=False, timeout=120)
+        result = subprocess.run([sys.executable, WX_ALERT_SCRIPT], check=False,
+                                timeout=COORDINATOR_TIMEOUT_SECONDS)
         if result.returncode != 0:
             log.error(
-                "wx_alert.py exited %d (failure) -- watch/warning audio was NOT published "
-                "this cycle; the previous wx_alert.flac (if any) remains in place.",
+                "wx_alert.py (alert coordinator) exited %d -- it retries next cycle; the "
+                "previously published announcement state is unchanged.",
                 result.returncode,
             )
-        else:
-            log.info("Triggered wx_alert.py for updated watch/warning audio.")
     except subprocess.TimeoutExpired:
-        log.error("wx_alert.py timed out after 120s; proceeding without it this cycle.")
+        log.error("wx_alert.py (alert coordinator) timed out after %ss.", COORDINATOR_TIMEOUT_SECONDS)
     except Exception as e:
-        log.error("Failed to trigger wx_alert.py: %s", e)
+        log.error("Failed to run wx_alert.py (alert coordinator): %s", e)
 
 _VTEC_PATTERN = re.compile(r"^/[OTX]\.(\w+)\.([A-Z]{4})\.([A-Z]{2})\.([A-Z])\.(\d{4})\.")
 
-def _vtec_identity(props):
+def _vtec_match(props):
     params = props.get("parameters") or {}
     vtec_list = params.get("VTEC")
     if not isinstance(vtec_list, list) or not vtec_list:
         return None
-    m = _VTEC_PATTERN.match(vtec_list[0].strip())
+    return _VTEC_PATTERN.match(str(vtec_list[0]).strip())
+
+
+def _vtec_identity(props):
+    m = _vtec_match(props)
     if not m:
         return None
     _, office, phenomena, significance, tracking = m.groups()
     return (office, phenomena, significance, tracking)
+
+
+# VTEC actions meaning "this event is no longer in effect" (cancelled,
+# expired, or upgraded into a different product).
+_ENDED_VTEC_ACTIONS = frozenset({"CAN", "EXP", "UPG"})
+
+
+def _spoken_alert_ended(props):
+    """Why a watch/warning message must not be spoken as in effect, or None.
+    Applied to the NEWEST message per (event, VTEC) identity, so a Cancel
+    supersedes the earlier issuance of the same event."""
+    status = (props.get("status") or "Actual").strip()
+    if status.lower() != "actual":
+        return f"status {status}"
+    message_type = (props.get("messageType") or "").strip()
+    if message_type.lower() == "cancel":
+        return "messageType Cancel"
+    m = _vtec_match(props)
+    if m:
+        product_class = m.group(0)[1]
+        if product_class != "O":
+            return f"VTEC product class {product_class}"
+        if m.group(1) in _ENDED_VTEC_ACTIONS:
+            return f"VTEC action {m.group(1)}"
+    return None
+
+
+def _alert_key(props):
+    """Stable identity of one NWS event across its updates: the VTEC
+    office.phenomenon.significance.event-number, else the feature id."""
+    vtec = _vtec_identity(props)
+    if vtec:
+        return ".".join(vtec)
+    return str(props.get("id") or props.get("@id") or props.get("event") or "")
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
 
 
 def _alert_sent_dt(props):
@@ -972,10 +1019,24 @@ def _alert_sent_dt(props):
     return None
 
 def update_wx_alerts():
+    """Refresh the NWS snapshots, then run the combined alert coordinator on
+    EVERY cycle (also after a failed fetch, which keeps the previous
+    snapshot), then -- only when the headline fingerprint changed -- the
+    current_temp.py blurb. The coordinator runs first so a new spoken
+    alert is queued before current_temp's routine short blurb."""
+    headlines_changed = _refresh_wx_alerts()
+    _run_alert_coordinator()
+    if headlines_changed:
+        _trigger_current_temp()
+
+
+def _refresh_wx_alerts():
+    """Returns True when the cleaned-headline fingerprint changed (after the
+    first run), which only drives the current_temp.py trigger."""
     try:
         r = session.get(ALERT_URL, timeout=10)
         if r.status_code != 200:
-            return
+            return False
         alerts = r.json().get("features", [])
 
         latest_by_event = {}
@@ -1005,11 +1066,24 @@ def update_wx_alerts():
         all_alerts = [clean_alert_text(v["headline"]) for v in latest_by_event.values()]
 
         watchwarn_entries = []
+        now_utc = datetime.now(timezone.utc)
         for info in latest_by_event.values():
             event = info["event"]
             if not _is_watch_or_warning(event):
                 continue
-            composed = build_watch_warning_text(info["props"])
+            props = info["props"]
+            ended = _spoken_alert_ended(props)
+            if ended:
+                log.info("Watch/warning %s (%s) is not in effect (%s); omitted.", event, _alert_key(props), ended)
+                continue
+            expires = props.get("expires")
+            ends = props.get("ends")
+            deadlines = [d for d in (_parse_iso(expires), _parse_iso(ends)) if d is not None and d.tzinfo]
+            if deadlines and min(deadlines) <= now_utc:
+                log.info("Watch/warning %s (%s) already ended at %s; omitted.", event, _alert_key(props),
+                         min(deadlines).isoformat())
+                continue
+            composed = build_watch_warning_text(props)
             if not composed:
                 log.warning("No usable text extracted for active %s; omitting from wx statement.", event)
                 continue
@@ -1017,8 +1091,17 @@ def update_wx_alerts():
                 "event": event,
                 "text": composed["text"],
                 "text_core": composed["text_core"],
+                # Additive (r0137): identity + authoritative validity for the
+                # combined announcement coordinator; text/text_core unchanged.
+                "key": _alert_key(props),
+                "expires": expires,
+                "ends": ends,
             })
         watchwarn_entries = _dedup_similar_bodies(watchwarn_entries)
+        # Deterministic spoken order (most severe first), independent of
+        # the feed's own ordering, so a reordered feed never reads as a
+        # content change.
+        watchwarn_entries.sort(key=lambda e: (-_alert_severity(e), e.get("event") or "", e.get("key") or ""))
         safe_write_json(WX_WATCHWARN_FILE, watchwarn_entries)
 
         warn_text = ", ".join(all_alerts) + "\n" if all_alerts else ""
@@ -1031,6 +1114,7 @@ def update_wx_alerts():
             except OSError as e:
                 log.error("Could not remove %s: %s", ALERT_STATUS, e)
 
+        changed = False
         new_fp = _alert_fingerprint(all_alerts)
         prior_fp = _read_prior_fingerprint()
         if new_fp != prior_fp:
@@ -1038,18 +1122,15 @@ def update_wx_alerts():
                 safe_write_text(ALERT_FINGERPRINT_FILE, new_fp + "\n")
             except Exception as e:
                 log.error("Could not write alert fingerprint: %s", e)
-            if prior_fp is not None:
-                # wx_alert.py runs (and is waited on) FIRST so the live
-                # queue insertion lands before current_temp.py's routine
-                # short blurb goes out for this same cycle.
-                _trigger_wx_alert()
-                _trigger_current_temp()
+            changed = prior_fp is not None
 
         if VERBOSE:
             log.info("Updated alerts: %d total, severe active: %s",
                      len(all_alerts), severe_active)
+        return changed
     except Exception as e:
         log.error("Alert update error: %s", e)
+    return False
 
 # ---------------- RDS & PROCESSED WEATHER ----------------
 
