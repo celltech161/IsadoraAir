@@ -26,7 +26,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.db import connection
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -39,6 +39,7 @@ from library.services.log_builder import effective_airtime_seconds, fill_remaini
 from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.tests.test_engine_restart_resume import TwoHourFixture   # fixture only: it defines no tests
 from library.tests.test_engine_runtime_commit import make_minimal_stand_in
+from library.tests import wx_alert_support
 from monitoring.models import SystemEvent
 
 
@@ -977,7 +978,14 @@ class UrgentOccurrenceRestartTests(TwoHourFixture):
         path: native M is queued behind nothing, a later WxAlert W keeps emergency priority ahead of it, W airs,
         the process dies before M airs."""
         wx, _ = Category.objects.get_or_create(code="WxAlert", defaults={"name": "WxAlert", "kind": self.category.kind})
-        Track.objects.filter(id=self.make_track("Weather Alert").id).update(category=wx)
+        # r0137: the combined Weather/AMBER announcement is the canonical wx_alert.flac Track, queued by the
+        # idempotent synchronization when the coordinator's record is active.
+        library_root, data_dir = Path(self.temp_dir.name) / "music", Path(self.temp_dir.name) / "weather"
+        override = override_settings(LIBRARY_ROOT=str(library_root), WEATHER_DATA_DIR=str(data_dir))
+        override.enable()
+        self.addCleanup(override.disable)
+        wx_alert_support.make_track(library_root, wx, self.artist)
+        wx_alert_support.write_state(data_dir, library_root)
         native_track = self.make_track("Native Active Message")
         engine = make_minimal_stand_in()
         engine._urgent_retry_counts = {}

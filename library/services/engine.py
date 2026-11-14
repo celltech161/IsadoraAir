@@ -64,6 +64,7 @@ from library.services.remote_dj_stats import (
 from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
 from library.services import dst_fallback
+from library.services import wx_alert_playout
 from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
@@ -1162,33 +1163,67 @@ def _deck_open_authority(log_item):
         if not isinstance(track, Track):
             yield track, None
             return
-        from spoken import playout
-        scope = ExitStack()
-        try:
-            authority = scope.enter_context(playout.authorized_open(track))
-        except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
-            scope.close()
-            yield None, f"spoken projection authority unavailable: {exc}"
-            return
-        with scope:
-            if not authority.allowed:
-                yield None, authority.reason
-                return
-            log_item.track = authority.track
-            # iPortal D2B: a native urgent/PA aggregate opens only for its current
-            # insertion attempt of a still-current execution (claimed here), or as
-            # this process's own continuation. None for every ordinary Track.
-            from active_messages import playout as active_playout
+        # r0137: the combined Weather/AMBER announcement (one mutable file).
+        # The shared publication lock taken by authorize_open stays held
+        # until this whole scope ends -- after construction has opened the
+        # file -- and the Track is re-read under it, so the deck gets the
+        # timing of exactly the audio it opens.
+        wx_scope = ExitStack()
+        if isinstance(log_item, LogItem) and wx_alert_playout.is_occurrence(log_item):
             try:
-                native = active_playout.authorize_open(log_item, ENGINE_INSTANCE)
+                refusal = wx_alert_playout.authorize_open(log_item, wx_scope)
             except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
-                native = active_playout.Decision(False, f"active-message authority unavailable: {exc}")
-            if native is not None and not native.allowed:
-                yield None, native.reason
+                refusal = f"Weather/AMBER alert authority unavailable: {exc}"
+            if refusal is not None:
+                wx_scope.close()
+                _report_wx_alert_refusal(log_item, refusal)
+                yield None, refusal
                 return
-            yield authority.track, None
+            track = log_item.track
+        with wx_scope:
+            from spoken import playout
+            scope = ExitStack()
+            try:
+                authority = scope.enter_context(playout.authorized_open(track))
+            except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
+                scope.close()
+                yield None, f"spoken projection authority unavailable: {exc}"
+                return
+            with scope:
+                if not authority.allowed:
+                    yield None, authority.reason
+                    return
+                log_item.track = authority.track
+                # iPortal D2B: a native urgent/PA aggregate opens only for its current
+                # insertion attempt of a still-current execution (claimed here), or as
+                # this process's own continuation. None for every ordinary Track.
+                from active_messages import playout as active_playout
+                try:
+                    native = active_playout.authorize_open(log_item, ENGINE_INSTANCE)
+                except Exception as exc:  # noqa: BLE001 -- fail safe, never airable
+                    native = active_playout.Decision(False, f"active-message authority unavailable: {exc}")
+                if native is not None and not native.allowed:
+                    yield None, native.reason
+                    return
+                yield authority.track, None
     finally:
         _DECK_OPEN.depth -= (1 if real else 0)
+
+
+def _report_wx_alert_refusal(log_item, reason):
+    """A refused Weather/AMBER occurrence is not an error: it is invalid,
+    superseded or briefly unpublishable; the coordinator's next nudge queues
+    a current one if an announcement is still due."""
+    item_id = getattr(log_item, "id", None)
+    print(f"  Weather/AMBER announcement occurrence id={item_id} not opened: {reason}")
+    try:
+        emit_event(
+            category="engine", level="info", title="Weather/AMBER announcement occurrence not opened",
+            detail={"log_item_id": item_id, "reason": reason},
+            dedupe_key=f"engine|wx-alert-refused|{item_id}",
+        )
+    except Exception:
+        pass
 
 
 def _deck_open_still_authorized():
@@ -6005,6 +6040,7 @@ class PlaybackEngine:
             )
             return
 
+        self._carry_pending_wx_alerts()
         self.current_log = log
         self.log_items = items
         self._queue_cursor = self._first_unplayed_index(items)
@@ -6781,6 +6817,9 @@ class PlaybackEngine:
             peek = None
         if peek:
             log, items = peek
+            # Exhausted queue: nothing is ahead of the cursor, so this carries
+            # nothing in practice; kept so no queue replacement can strand one.
+            self._carry_pending_wx_alerts()
             self.current_log = log
             self.log_items = items
             self._queue_cursor = self._first_unplayed_index(items)
@@ -10758,14 +10797,24 @@ class PlaybackEngine:
         if not self.current_log or not self.log_items:
             raise RuntimeError("No live log loaded")
         _close_old_connections()
-        category = Category.objects.get(code=category_code)
-        track = (
-            Track.objects.filter(category=category, ready2air=True)
-            .select_related("artist")
-            .first()
-        )
-        if track is None:
-            raise RuntimeError(f"No ready2air track in category {category_code!r}")
+        if category_code == wx_alert_playout.CATEGORY_CODE:
+            # r0137: the combined Weather/AMBER announcement -- an idempotent
+            # synchronization of the exact canonical Track, never "insert one
+            # more occurrence of the first ready Track in the category".
+            track = self._wx_alert_track_to_queue()
+            if track is None:
+                self._urgent_retry_counts[category_code] = 0
+                return
+            category = track.category or Category.objects.get(code=category_code)
+        else:
+            category = Category.objects.get(code=category_code)
+            track = (
+                Track.objects.filter(category=category, ready2air=True)
+                .select_related("artist")
+                .first()
+            )
+            if track is None:
+                raise RuntimeError(f"No ready2air track in category {category_code!r}")
 
         with transaction.atomic():
             with self._locked_playlist_log():
@@ -10793,6 +10842,85 @@ class PlaybackEngine:
             self._forced_next_items.insert(0, urgent_item)  # safety-first: ahead of a pending dedication follow-up
         print(f"  Inserted urgent track ({category_code}) at queue position {insert_at}: {track.title}")
         self._urgent_retry_counts[category_code] = 0
+
+    def _wx_alert_track_to_queue(self):
+        """Reconcile the live queue with the combined Weather/AMBER announcement
+        state (an ``insert_urgent`` WxAlert nudge): the Track to splice, or
+        None.  The command carries no content: the engine reads the coordinator's current record, so a
+        delayed, repeated or retried nudge can only converge on the newest
+        generation.  Queues at most ONE occurrence, and only when:
+
+          * the current generation is active, unexpired and its recorded audio
+            is the published file;
+          * no unclaimed occurrence of the announcement is already pending
+            (that one will open the newest audio -- the file is shared);
+          * no occurrence has claimed playback since this generation was
+            published (already on a deck, or already aired -- persisted, so an
+            engine restart does not repeat it).
+
+        A generation that was never inserted, or whose insertion failed, is
+        still unclaimed, so the next nudge (every poll cycle) inserts it."""
+        decision, _state = wx_alert_playout.current_decision()
+        if not decision.allowed:
+            print(f"  WxAlert sync: nothing to queue ({decision.reason})")
+            return None
+        track = wx_alert_playout.audio_track()
+        if track is None:
+            raise RuntimeError(f"No ready2air Track for {wx_alert_playout.audio_path()}")
+        pending = self._pending_wx_alert_occurrence(track)
+        if pending is not None:
+            print(f"  WxAlert sync: generation {decision.generation} will play through pending "
+                  f"occurrence {pending.id}")
+            return None
+        if wx_alert_playout.generation_claimed(track.id, decision.published_at):
+            print(f"  WxAlert sync: generation {decision.generation} already claimed; nothing to queue")
+            return None
+        print(f"  WxAlert sync: queueing announcement generation {decision.generation}")
+        return track
+
+    def _pending_wx_alert_occurrence(self, track):
+        """The unclaimed, not-yet-handed-out occurrence of the announcement
+        Track that the queue will reach (forced list first), or None."""
+        candidates = list(self._forced_next_items) + list(self.log_items[self._queue_cursor:])
+        for item in candidates:
+            if item.track_id != track.id:
+                continue
+            if item.played_at is not None or item.playback_claimed_at is not None:
+                continue
+            if self._occurrence_handed_out(item) or self._is_poison_guarded(item):
+                continue
+            return item
+        return None
+
+    def _carry_pending_wx_alerts(self):
+        """Before the active queue is replaced by another hour's log, move every
+        pending (unclaimed, unaired, not on a deck) engine-inserted Weather/AMBER
+        occurrence still ahead of the cursor into ``_forced_next_items`` -- the
+        same LogItem, unchanged -- so the next boundary still plays it instead of
+        silently discarding it.  Placed ahead of any other forced item, as an
+        urgent insertion is.  Validity is decided at deck open, as for any
+        occurrence."""
+        candidates = [
+            item for item in (getattr(self, "log_items", None) or [])[self._queue_cursor:]
+            if getattr(item, "origin", None) == LogItem.ORIGIN_ENGINE_INSERTED
+            and getattr(item, "played_at", None) is None
+            and getattr(item, "playback_claimed_at", None) is None
+            and wx_alert_playout.is_occurrence(item)
+        ]
+        if not candidates:
+            return
+        forced = list(getattr(self, "_forced_next_items", None) or [])
+        forced_ids = {item.id for item in forced}
+        carried = [
+            item for item in candidates
+            if item.id not in forced_ids
+            and not self._occurrence_handed_out(item)
+            and not self._is_poison_guarded(item)
+        ]
+        if carried:
+            self._forced_next_items = carried + forced
+            print(f"  Carried pending Weather/AMBER occurrence(s) {[i.id for i in carried]} "
+                  f"across the queue change (forced next)")
 
     def _schedule_urgent_retry(self, category_code, exc):
         """Per-category retry count/timer -- not one shared counter, so

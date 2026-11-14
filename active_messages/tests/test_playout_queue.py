@@ -11,13 +11,14 @@ import uuid
 from datetime import timedelta
 from unittest import mock
 
-from django.test import TransactionTestCase
+from django.test import TransactionTestCase, override_settings
 from django.utils import timezone
 
 import library.services.engine as eng_module
 from active_messages import playout, services
 from active_messages.models import ActiveBroadcastExecution, ActiveBroadcastInsertion
 from library.models import LogItem, Track
+from library.tests import wx_alert_support
 from production.tests.support import ffmpeg_available
 
 from .d2b_support import Playout, engine_stand_in
@@ -40,6 +41,18 @@ class InsertionTests(Playout, TransactionTestCase):
 
     def queue_walk(self, count):
         return [self.engine._next_queue_item()[0] for _ in range(count)]
+
+    def weather_announcement(self):
+        """r0137: the combined Weather/AMBER announcement -- the canonical
+        WxAlert/wx_alert.flac Track with an active coordinator record."""
+        data_dir = self.library_root.parent / "weather-data"
+        override = override_settings(WEATHER_DATA_DIR=str(data_dir))
+        override.enable()
+        self.addCleanup(override.disable)
+        track = wx_alert_support.make_track(self.library_root, self.wxalert, self.song_artist,
+                                            duration=1.0, next_start=1.0)
+        wx_alert_support.write_state(data_dir, self.library_root)
+        return track
 
     def test_the_exact_track_is_spliced_by_the_existing_urgent_path(self):
         execution, publication, command = self.dispatched()
@@ -94,8 +107,8 @@ class InsertionTests(Playout, TransactionTestCase):
     def test_a_weather_alert_arriving_later_still_goes_first(self):
         _execution, _publication, command = self.dispatched()
         self.insert(command)
-        weather_track = self.song("Weather Alert", category=self.wxalert)
-        self.engine._insert_urgent_next_inner("WxAlert")         # the unchanged category-only path
+        weather_track = self.weather_announcement()
+        self.engine._insert_urgent_next_inner("WxAlert")         # the combined announcement's synchronization
         native = LogItem.objects.get(category__code="UrgentPA")
         walked = self.queue_walk(3)
         self.assertEqual([item.track_id for item in walked], [weather_track.id, native.track_id, self.song_b.track_id])
@@ -104,7 +117,7 @@ class InsertionTests(Playout, TransactionTestCase):
         follow_up = self.song_b
         self.engine._forced_next_items = [follow_up]
         self.engine._queue_cursor = 2                            # the follow-up was already taken by the walk
-        weather_track = self.song("Weather Alert", category=self.wxalert)
+        weather_track = self.weather_announcement()
         self.engine._insert_urgent_next_inner("WxAlert")
         _execution, _publication, command = self.dispatched()
         self.insert(command)
