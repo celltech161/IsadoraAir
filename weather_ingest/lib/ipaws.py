@@ -66,7 +66,11 @@ def fetch_feed_entries(base_url):
             elif label == "statefips":
                 statefips = term  # 2-digit string, keep leading zero
 
-        if not (eid and link and event):
+        # An entry needs only identity and a CAP link to be kept: an
+        # authoritative Cancel may legitimately carry no event/statefips
+        # classification (CAP permits a Cancel without <info>). Missing
+        # classifications stay None for the callers' prefilters.
+        if not (eid and link):
             continue
 
         entries.append({
@@ -92,6 +96,24 @@ def filter_feed_entries(entries, event_codes, statefips_prefixes):
     ]
 
 
+def unclassified_feed_entries(entries, event_codes, statefips_prefixes):
+    """Entries the classified prefilter cannot decide: a classification is
+    MISSING (not merely different) and every classification present is
+    compatible with ours -- e.g. an info-less Cancel whose summary carries no
+    event and/or statefips. Their full CAP may be a cancellation (or update)
+    of an alert we hold, so callers fetch them while they hold any Actual
+    alert of interest. An entry classified with another event or another
+    state is never unclassified (and never fetched)."""
+    event_codes = {c.upper() for c in event_codes}
+    statefips_prefixes = {s for s in statefips_prefixes if s}
+    return [
+        e for e in entries
+        if (e["event"] is None or e["statefips"] is None)
+        and (e["event"] is None or e["event"] in event_codes)
+        and (e["statefips"] is None or e["statefips"] in statefips_prefixes)
+    ]
+
+
 def _text(el):
     return (el.text or "").strip() if el is not None else ""
 
@@ -110,8 +132,44 @@ class CapParseError(RuntimeError):
     failure, this is never evidence that an alert ended."""
 
 
-CAP_STATUSES = ("actual", "exercise", "system", "test", "draft")
-CAP_MSG_TYPES = ("alert", "update", "cancel", "ack", "error")
+# CAP 1.2 enumerations (OASIS CAP-v1.2-os, section 3.2; values are case-sensitive).
+CAP_STATUSES = ("Actual", "Exercise", "System", "Test", "Draft")
+CAP_MSG_TYPES = ("Alert", "Update", "Cancel", "Ack", "Error")
+CAP_SCOPES = ("Public", "Restricted", "Private")
+CAP_CATEGORIES = ("Geo", "Met", "Safety", "Security", "Rescue", "Fire", "Health", "Env", "Transport", "Infra",
+                  "CBRNE", "Other")
+CAP_URGENCIES = ("Immediate", "Expected", "Future", "Past", "Unknown")
+CAP_SEVERITIES = ("Extreme", "Severe", "Moderate", "Minor", "Unknown")
+CAP_CERTAINTIES = ("Observed", "Likely", "Possible", "Unlikely", "Unknown")
+_CAP_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[-+]\d{2}:\d{2}$")
+_CAP_RESTRICTED = re.compile(r"[\s,<&]")
+
+
+def _require_cap_datetime(value, what):
+    """CAP 1.2 dateTime: YYYY-MM-DDThh:mm:ss with an explicit numeric offset."""
+    if not _CAP_DATETIME.match(value) or parse_iso_datetime(value) is None:
+        raise CapParseError(f"{what} is not a CAP dateTime: {value!r}")
+
+
+def _validate_info(info, label):
+    """Mandatory <info> elements (CAP 1.2 section 3.2.2): one or more category,
+    event, urgency, severity, certainty -- present, non-empty and, for the
+    enumerated ones, a defined value. Optional elements (headline,
+    description, instruction, expires, area...) are not required; an
+    expires that IS present must be a valid dateTime."""
+    categories = [_text(c) for c in info.findall(f"{CAP12_NS}category")]
+    if not categories or any(c not in CAP_CATEGORIES for c in categories):
+        raise CapParseError(f"{label} <info> has a missing or invalid category: {categories!r}")
+    if not _text(info.find(f"{CAP12_NS}event")):
+        raise CapParseError(f"{label} <info> has no event")
+    for name, allowed in (("urgency", CAP_URGENCIES), ("severity", CAP_SEVERITIES),
+                          ("certainty", CAP_CERTAINTIES)):
+        value = _text(info.find(f"{CAP12_NS}{name}"))
+        if value not in allowed:
+            raise CapParseError(f"{label} <info> has a missing or invalid {name}: {value!r}")
+    expires = _text(info.find(f"{CAP12_NS}expires"))
+    if expires:
+        _require_cap_datetime(expires, f"{label} <info> expires")
 
 
 def fetch_and_parse_cap(link):
@@ -120,10 +178,23 @@ def fetch_and_parse_cap(link):
          "status", "msg_type", "references": [<identifier>, ...],
          "event", "event_code", "headline", "description", "instruction",
          "areas": [<SAME code>, ...]}
-    Root fields are parsed independently of <info>: a Cancel (or any non-Alert
-    message) may legitimately carry no <info>, and then every info-derived
-    field is empty. Raises CapFetchError when the message could not be
-    retrieved and CapParseError when it cannot be interpreted reliably."""
+    Raises CapFetchError when the message could not be retrieved and
+    CapParseError when it cannot be interpreted reliably.
+
+    Validation (CAP 1.2, focused -- no schema framework):
+      * root (always): identifier, sender, sent, status, msgType, scope present
+        and non-empty; identifier/sender without whitespace, commas or "<"/"&";
+        sent a dateTime; status/msgType/scope defined values; <references>
+        well-formed sender,identifier,sent triplets.
+      * a non-Actual message has no authority over Actual alerts, so its <info>
+        is not judged: it is returned for completeness and ignored downstream.
+      * an Actual Alert/Update must carry an <info> block whose mandatory
+        elements (category, event, urgency, severity, certainty) are present
+        and valid -- an incomplete one (e.g. <info/>) can never supersede the
+        issuance it references;
+      * an Actual Cancel may have no <info> (CAP permits it; it is parsed from
+        its root fields) but must reference what it cancels; an <info> it does
+        carry must be valid."""
     try:
         xml = _http_get(link)
     except requests.RequestException as exc:
@@ -134,19 +205,24 @@ def fetch_and_parse_cap(link):
         raise CapParseError(f"IPAWS CAP message unparseable for {link}: {exc}") from exc
 
     fields = {name: _text(root.find(f"{CAP12_NS}{name}"))
-              for name in ("identifier", "sender", "sent", "status", "msgType")}
+              for name in ("identifier", "sender", "sent", "status", "msgType", "scope")}
     missing = [name for name, value in fields.items() if not value]
     if missing:
         raise CapParseError(f"IPAWS CAP message {link} lacks mandatory {missing}")
+    label = f"IPAWS CAP {fields['msgType']} {fields['identifier']} ({link})"
+    for name in ("identifier", "sender"):
+        if _CAP_RESTRICTED.search(fields[name]):
+            raise CapParseError(f"{label}: {name} contains whitespace, a comma or a restricted character")
+    _require_cap_datetime(fields["sent"], f"{label} sent")
+    for name, allowed in (("status", CAP_STATUSES), ("msgType", CAP_MSG_TYPES), ("scope", CAP_SCOPES)):
+        if fields[name] not in allowed:
+            raise CapParseError(f"{label} has an undefined {name} {fields[name]!r}")
     status, msg_type = fields["status"].lower(), fields["msgType"].lower()
-    if status not in CAP_STATUSES or msg_type not in CAP_MSG_TYPES:
-        raise CapParseError(f"IPAWS CAP message {link} has unknown status/msgType "
-                            f"{fields['status']!r}/{fields['msgType']!r}")
     references_text = _text(root.find(f"{CAP12_NS}references"))
     try:
         references = parse_references(references_text)
     except ValueError as exc:
-        raise CapParseError(f"IPAWS CAP message {link} has malformed references: {exc}") from exc
+        raise CapParseError(f"{label} has malformed references: {exc}") from exc
 
     # Multiple <info> blocks are legal (one per language). Pick English if
     # present, else the first.
@@ -162,9 +238,11 @@ def fetch_and_parse_cap(link):
 
     if status == "actual":
         if msg_type in ("alert", "update") and info is None:
-            raise CapParseError(f"IPAWS CAP {msg_type} {fields['identifier']} has no <info> to evaluate")
+            raise CapParseError(f"{label} has no <info> to evaluate")
         if msg_type == "cancel" and not references:
-            raise CapParseError(f"IPAWS CAP Cancel {fields['identifier']} references nothing to cancel")
+            raise CapParseError(f"{label} references nothing to cancel")
+        if info is not None:
+            _validate_info(info, label)
 
     event_code = ""
     areas = []

@@ -9,7 +9,11 @@ Pipeline:
      never linger in the combined announcement or the forecast append.
   2. Fetch IPAWS OPEN /rest/feed (Atom summary).
   3. Filter entries by configured event codes + state FIPS.
-  4. For each survivor, fetch the full CAP 1.2 XML.
+  4. For each survivor, fetch the full CAP 1.2 XML. While an Actual alert
+     of interest is held, also fetch the (bounded) entries whose summary
+     LACKS an event/statefips classification -- an info-less Cancel can
+     look like that (MAX_UNCLASSIFIED_CAP_FETCHES; above it the cycle keeps
+     the previous snapshot).
   5. Keep only current messages: status Actual, Alert/Update (a Cancel or
      Update retires every message it references).
   6. Filter by SAME area code overlap with configured county list.
@@ -51,6 +55,7 @@ from ipaws import (  # noqa: E402
     fetch_feed_entries,
     filter_feed_entries,
     is_expired,
+    unclassified_feed_entries,
 )
 from wxconfig import load_amber_alert_config, resolve_weather_data_dir  # noqa: E402
 
@@ -68,6 +73,13 @@ COORDINATOR_SCRIPT = str(BASE_DIR / "wx_alert.py")
 # Covers the coordinator's own bounded lock wait plus one synthesis/publication.
 COORDINATOR_TIMEOUT_SECONDS = 330
 LOCKFILE = "/tmp/amber-alert-poll.lock"
+# Upper bound on full-CAP fetches of UNCLASSIFIED feed entries (no event
+# and/or statefips classification) per cycle. They are fetched only while an
+# Actual alert of interest is held (an info-less Cancel can matter only then).
+# More than this cannot be examined completely, so the cycle keeps the
+# previous snapshot (fail-safe; known expirations still apply) instead of
+# committing a set whose cancellations were not all seen.
+MAX_UNCLASSIFIED_CAP_FETCHES = 25
 
 
 def _acquire_lock(path):
@@ -107,19 +119,9 @@ def _statefips_prefixes_from(same_codes):
     return out
 
 
-def _build_active_entries(cfg):
-    entries = fetch_feed_entries(cfg["ipaws_base_url"])
-    log.info("IPAWS feed returned %d entries", len(entries))
-
-    statefips = _statefips_prefixes_from(cfg["same_codes"])
-    candidates = filter_feed_entries(entries, cfg["event_codes"], statefips)
-    log.info(
-        "%d entries survived event+state prefilter (events=%s statefips=%s)",
-        len(candidates), sorted(cfg["event_codes"]), sorted(statefips),
-    )
-
+def _fetch_caps(entries):
     caps = []
-    for entry in candidates:
+    for entry in entries:
         try:
             cap = fetch_and_parse_cap(entry["link"])
         except (CapFetchError, CapParseError) as exc:
@@ -128,12 +130,53 @@ def _build_active_entries(cfg):
             # still-active alert, or the Cancel/Update that retires one.
             raise SnapshotUnavailable(str(exc)) from exc
         caps.append((entry, cap))
+    return caps
+
+
+def _holds_actual_alert(caps, previous_ids):
+    if previous_ids:
+        return True
+    return any((cap.get("status") or "").lower() == "actual"
+               and (cap.get("msg_type") or "").lower() in ("alert", "update")
+               for _entry, cap in caps)
+
+
+def _build_active_entries(cfg, previous_ids=()):
+    """previous_ids: identifiers in the previous committed snapshot (None if
+    it could not be read -- then treated as possibly non-empty)."""
+    entries = fetch_feed_entries(cfg["ipaws_base_url"])
+    log.info("IPAWS feed returned %d entries", len(entries))
+
+    event_codes = {c.upper() for c in cfg["event_codes"]}
+    statefips = _statefips_prefixes_from(cfg["same_codes"])
+    candidates = filter_feed_entries(entries, event_codes, statefips)
+    log.info(
+        "%d entries survived event+state prefilter (events=%s statefips=%s)",
+        len(candidates), sorted(cfg["event_codes"]), sorted(statefips),
+    )
+    caps = _fetch_caps(candidates)
+
+    # An authoritative Cancel may carry no <info>, so its Atom summary may lack
+    # the event and/or statefips classification the prefilter relies on.
+    # While we hold (or are about to hold) an Actual alert, fetch those
+    # unclassified entries too -- bounded -- so such a Cancel is seen.
+    unclassified = unclassified_feed_entries(entries, event_codes, statefips)
+    if unclassified and _holds_actual_alert(caps, previous_ids if previous_ids is not None else ("?",)):
+        log.info("%d unclassified feed entr%s examined for cancellations (limit %d)", len(unclassified),
+                 "y" if len(unclassified) == 1 else "ies", MAX_UNCLASSIFIED_CAP_FETCHES)
+        if len(unclassified) > MAX_UNCLASSIFIED_CAP_FETCHES:
+            raise SnapshotUnavailable(
+                f"{len(unclassified)} unclassified feed entries exceed the {MAX_UNCLASSIFIED_CAP_FETCHES}-fetch "
+                f"limit; a cancellation among them could not be ruled out")
+        caps += _fetch_caps(unclassified)
 
     current_ids = {id(cap) for cap in current_alerts([cap for _entry, cap in caps])}
     active = []
     for entry, cap in caps:
         if id(cap) not in current_ids:
             continue
+        if (cap["event_code"] or entry["event"] or "").upper() not in event_codes:
+            continue  # e.g. an unclassified entry that is an alert of another event
         if is_expired(cap):
             continue
         if not alert_covers_any(cap, cfg["same_codes"]):
@@ -191,6 +234,20 @@ def _run_alert_coordinator():
         log.error("Failed to run the alert coordinator: %s", e)
 
 
+def _previous_identifiers():
+    """Identifiers in the previous committed snapshot; None when it exists but
+    cannot be read (callers then assume it may hold an alert)."""
+    try:
+        data = json.loads(Path(ACTIVE_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return tuple(e.get("identifier") for e in data if isinstance(e, dict) and e.get("identifier"))
+
+
 def _refresh_snapshot():
     """Update active_amber_alerts.json for this cycle. Returns a short
     outcome string for the log."""
@@ -200,7 +257,7 @@ def _refresh_snapshot():
         log.info("AmberAlertConfig disabled; active AMBER set confirmed empty.")
         return "disabled"
     try:
-        active = _build_active_entries(cfg)
+        active = _build_active_entries(cfg, _previous_identifiers())
     except SnapshotUnavailable as exc:
         log.warning("AMBER retrieval incomplete (%s); previous snapshot kept.", exc)
         return "unavailable"

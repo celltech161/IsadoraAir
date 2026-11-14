@@ -297,7 +297,8 @@ CAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <identifier>CAP-2</identifier><sender>kbi@ks</sender><sent>2026-11-13T16:00:00-06:00</sent>
   <status>Actual</status><msgType>Update</msgType><scope>Public</scope>
   <references>kbi@ks,CAP-1,2026-11-13T15:00:00-06:00 kbi@ks,CAP-0,2026-11-13T14:00:00-06:00</references>
-  <info><language>en-US</language><event>Child Abduction Emergency</event>
+  <info><language>en-US</language><category>Rescue</category><event>Child Abduction Emergency</event>
+    <urgency>Immediate</urgency><severity>Severe</severity><certainty>Likely</certainty>
     <eventCode><valueName>SAME</valueName><value>CAE</value></eventCode>
     <expires>2026-11-14T16:00:00-06:00</expires><senderName>KBI</senderName><headline>AMBER Alert</headline>
     <description>Child taken.</description><instruction>Call 911.</instruction>
@@ -306,20 +307,30 @@ CAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
 </alert>"""
 
 
+INFO_DEFAULTS = {"category": "Rescue", "event": "Child Abduction Emergency", "urgency": "Immediate",
+                 "severity": "Severe", "certainty": "Likely"}
+
+
 def cap_xml(identifier, *, status="Actual", msg_type="Alert", references=None, info=True, sent=True,
-            expires="2026-11-14T16:00:00-06:00", description="Child taken."):
+            expires="2026-11-14T16:00:00-06:00", description="Child taken.", scope="Public",
+            info_fields=None, raw_info=None):
+    """A CAP 1.2 message. info_fields overrides mandatory <info> elements (None drops one, "" empties it);
+    raw_info replaces the whole <info> block (e.g. "<info/>")."""
     refs = f"<references>{references}</references>" if references is not None else ""
     sent_el = "<sent>2026-11-13T16:00:00-06:00</sent>" if sent else ""
-    info_el = f"""<info><language>en-US</language><event>Child Abduction Emergency</event>
+    scope_el = f"<scope>{scope}</scope>" if scope is not None else ""
+    fields = dict(INFO_DEFAULTS, **(info_fields or {}))
+    mandatory = "".join(f"<{k}>{v}</{k}>" for k, v in fields.items() if v is not None)
+    info_el = raw_info if raw_info is not None else (f"""<info><language>en-US</language>{mandatory}
     <eventCode><valueName>SAME</valueName><value>CAE</value></eventCode>
     <expires>{expires}</expires><senderName>KBI</senderName><headline>AMBER Alert</headline>
     <description>{description}</description><instruction>Call 911.</instruction>
     <area><areaDesc>Saline</areaDesc><geocode><valueName>SAME</valueName><value>020169</value></geocode></area>
-  </info>""" if info else ""
+  </info>""" if info else "")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
   <identifier>{identifier}</identifier><sender>kbi@ks</sender>{sent_el}
-  <status>{status}</status><msgType>{msg_type}</msgType><scope>Public</scope>{refs}
+  <status>{status}</status><msgType>{msg_type}</msgType>{scope_el}{refs}
   {info_el}
 </alert>""".encode()
 
@@ -386,6 +397,242 @@ class CapAuthorityTests(unittest.TestCase):
     def test_a_non_actual_message_without_info_is_parsed_and_irrelevant(self):
         parsed = self.parse(cap_xml("T-1", status="Test", info=False))
         self.assertEqual(ipaws.current_alerts([parsed]), [])
+
+
+class CapStructureValidationTests(unittest.TestCase):
+    """Correction B: CAP 1.2 mandatory root and <info> elements (OASIS CAP-v1.2-os 3.2.1/3.2.2) are validated before
+    an Actual Alert/Update can be authoritative; optional elements are not required."""
+
+    def parse(self, xml):
+        with patch.object(ipaws, "_http_get", return_value=xml):
+            return ipaws.fetch_and_parse_cap("https://example.invalid/cap")
+
+    def assert_rejected(self, xml):
+        with self.assertRaises(ipaws.CapParseError):
+            self.parse(xml)
+
+    def test_an_actual_update_with_an_empty_info_block_is_rejected(self):
+        self.assert_rejected(cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"), raw_info="<info/>"))
+
+    def test_missing_scope_is_rejected(self):
+        self.assert_rejected(cap_xml("CAP-1", scope=None))
+
+    def test_each_missing_mandatory_info_element_is_rejected(self):
+        for name in ("category", "event", "urgency", "severity", "certainty"):
+            with self.subTest(missing=name):
+                self.assert_rejected(cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"),
+                                             info_fields={name: None}))
+
+    def test_empty_mandatory_elements_are_rejected(self):
+        for name in ("category", "event", "urgency", "severity", "certainty"):
+            with self.subTest(empty=name):
+                self.assert_rejected(cap_xml("CAP-1", info_fields={name: ""}))
+        for root in ("scope", "status", "msgType"):
+            with self.subTest(empty_root=root):
+                kwargs = {"scope": ""} if root == "scope" else {"status": ""} if root == "status" else {"msg_type": ""}
+                self.assert_rejected(cap_xml("CAP-1", **kwargs))
+
+    def test_invalid_enumeration_values_are_rejected(self):
+        cases = {"category": "Weather", "urgency": "Now", "severity": "Bad", "certainty": "Very Likely"}
+        for name, value in cases.items():
+            with self.subTest(field=name, value=value):
+                self.assert_rejected(cap_xml("CAP-1", info_fields={name: value}))
+        for kwargs in ({"scope": "Everyone"}, {"status": "actual"}, {"msg_type": "Notify"}):
+            with self.subTest(root=kwargs):
+                self.assert_rejected(cap_xml("CAP-1", **kwargs))
+
+    def test_malformed_sent_and_expires_datetimes_are_rejected(self):
+        self.assert_rejected(cap_xml("CAP-1").replace(b"2026-11-13T16:00:00-06:00</sent>", b"yesterday</sent>"))
+        self.assert_rejected(cap_xml("CAP-1", expires="2026-11-14 16:00"))
+
+    def test_correctly_structured_actual_alert_and_update_are_accepted(self):
+        self.assertEqual(self.parse(cap_xml("CAP-1"))["msg_type"], "Alert")
+        update = self.parse(cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1")))
+        self.assertEqual((update["msg_type"], update["references"]), ("Update", ["CAP-1"]))
+
+    def test_optional_elements_are_not_required(self):
+        minimal = cap_xml("CAP-1", raw_info="<info><category>Rescue</category><event>Child Abduction Emergency"
+                                            "</event><urgency>Immediate</urgency><severity>Severe</severity>"
+                                            "<certainty>Likely</certainty></info>")
+        parsed = self.parse(minimal)
+        self.assertEqual((parsed["headline"], parsed["expires"], parsed["areas"]), ("", "", []))
+
+    def test_a_valid_info_less_actual_cancel_is_accepted(self):
+        parsed = self.parse(cap_xml("CAN-1", msg_type="Cancel", references=ref("CAP-1"), info=False))
+        self.assertEqual(parsed["references"], ["CAP-1"])
+
+    def test_a_valid_non_actual_message_never_affects_actual_alerts(self):
+        alert = self.parse(cap_xml("CAP-1"))
+        for status in ("Test", "Exercise", "System", "Draft"):
+            with self.subTest(status=status):
+                update = self.parse(cap_xml("X-1", status=status, msg_type="Update", references=ref("CAP-1")))
+                self.assertEqual([c["identifier"] for c in ipaws.current_alerts([alert, update])], ["CAP-1"])
+
+    def test_a_non_actual_message_with_incomplete_info_is_irrelevant_not_malformed(self):
+        parsed = self.parse(cap_xml("T-1", status="Test", raw_info="<info/>"))
+        self.assertEqual(ipaws.current_alerts([parsed]), [])
+
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def atom_feed(*entries):
+    """entries: (entry_id, link, event or None, statefips or None)."""
+    parts = []
+    for entry_id, link, event, statefips in entries:
+        cats = ""
+        if event is not None:
+            cats += f'<category label="event" term="{event}"/>'
+        if statefips is not None:
+            cats += f'<category label="statefips" term="{statefips}"/>'
+        parts.append(f"<entry><id>{entry_id}</id><link href=\"{link}\"/>"
+                     f"<updated>2026-11-13T16:00:00Z</updated>{cats}</entry>")
+    return ('<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">'
+            + "".join(parts) + "</feed>").encode()
+
+
+class AtomToSnapshotTests(unittest.TestCase):
+    """Correction A, end to end through the REAL fetch_feed_entries -> prefilters -> fetch_and_parse_cap ->
+    current_alerts -> snapshot path (only the HTTP transport, the config bridge and the coordinator are doubles)."""
+
+    BASE = "https://ipaws.invalid"
+    CFG = {"enabled": True, "ipaws_base_url": BASE, "event_codes": ["CAE", "BLU", "MEP"],
+           "same_codes": ["020169"], "include_instruction_in_forecast": True}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="isadoraair-amber-e2e-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.active = self.tmp / "active_amber_alerts.json"
+        (self.tmp / "active_watches_warnings.json").write_text("[]")
+        self.feed = []
+        self.documents = {}
+        self.fetched = []
+        future = (NOW + timedelta(days=1)).astimezone(timezone(timedelta(hours=-6))).strftime("%Y-%m-%dT%H:%M:%S-06:00")
+        self.alert = cap_xml("CAP-1", expires=future)
+        patches = [
+            patch.object(amber_poll, "ACTIVE_FILE", self.active),
+            patch.object(amber_poll, "LOCKFILE", str(self.tmp / "poll.lock")),
+            patch.object(amber_poll, "load_amber_alert_config", side_effect=lambda: self.CFG),
+            patch.object(amber_poll, "_run_alert_coordinator"),
+            patch.object(ipaws, "_http_get", side_effect=self._http_get),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _http_get(self, url):
+        if url.endswith("/rest/feed"):
+            return atom_feed(*self.feed)
+        self.fetched.append(url)
+        document = self.documents[url]
+        if isinstance(document, Exception):
+            raise document
+        return document
+
+    def publish(self, entry_id, xml, event="CAE", statefips="20"):
+        link = f"{self.BASE}/rest/eas/{entry_id}"
+        self.documents[link] = xml
+        return (entry_id, link, event, statefips)
+
+    def poll(self):
+        self.fetched = []
+        amber_poll.main()
+        return json.loads(self.active.read_text())
+
+    def hold_alert(self):
+        self.feed = [self.publish("e-alert", self.alert)]
+        self.assertEqual([e["identifier"] for e in self.poll()], ["CAP-1"])     # 1: recognized
+
+    def unclassified_cancel(self, status="Actual"):
+        return self.publish("e-cancel", cap_xml("CAN-1", status=status, msg_type="Cancel",
+                                                references=ref("CAP-1"), info=False), event=None, statefips=None)
+
+    def test_an_unclassified_info_less_actual_cancel_retires_the_alert_and_the_announcement(self):
+        from isadoraair import wx_alert_state
+        self.hold_alert()
+        now = datetime.now(timezone.utc)
+        alerts, _sources, _ = wx_alert_state.effective_alerts(self.tmp, now)
+        audio = self.tmp / "wx_alert.flac"
+        audio.write_bytes(b"announcement containing CAP-1")
+        state = {"schema": 1, "generation": 1, "active": True, "fingerprint": wx_alert_state.content_fingerprint(alerts),
+                 "valid_until": wx_alert_state.format_ts(now + timedelta(hours=1)),
+                 "published_at": wx_alert_state.format_ts(now), "audio": wx_alert_state.audio_identity(audio),
+                 "sources": {"nws": "ok", "amber": "ok"}}
+        self.assertTrue(wx_alert_state.playback_decision(
+            state, wx_alert_state.audio_identity(audio), now, self.tmp).allowed)
+        self.feed.append(self.unclassified_cancel())                              # 2+3: no event/state, no <info>
+        self.assertEqual(self.poll(), [])                                         # 4+5: seen and applied
+        self.assertIn(f"{self.BASE}/rest/eas/e-cancel", self.fetched)
+        decision = wx_alert_state.playback_decision(state, wx_alert_state.audio_identity(audio), now, self.tmp)
+        self.assertFalse(decision.allowed)                                        # 6: no longer authorized
+        self.assertIn("sources changed", decision.reason)
+
+    def test_a_test_or_exercise_cancel_never_retires_an_actual_alert(self):
+        for status in ("Test", "Exercise"):
+            with self.subTest(status=status):
+                self.hold_alert()
+                self.feed.append(self.unclassified_cancel(status=status))
+                self.assertEqual([e["identifier"] for e in self.poll()], ["CAP-1"])   # 7
+
+    def test_feed_order_does_not_change_the_result(self):
+        self.hold_alert()
+        cancel = self.unclassified_cancel()
+        self.feed = [cancel] + self.feed                                          # 10
+        self.assertEqual(self.poll(), [])
+
+    def test_a_cancel_arriving_in_the_same_cycle_as_its_alert_is_applied(self):
+        self.feed = [self.unclassified_cancel(), self.publish("e-alert", self.alert)]
+        self.assertEqual(self.poll(), [])
+
+    def test_unrelated_classified_entries_are_never_fetched(self):
+        noise = [self.publish(f"n{i}", b"<never fetched/>", event=ev, statefips=st)
+                 for i, (ev, st) in enumerate([("TOR", "20"), ("CAE", "48"), ("SVR", "40"), ("BLU", "06")] * 50)]
+        self.feed = noise
+        self.assertEqual(self.poll(), [])
+        self.assertEqual(self.fetched, [])                                        # 8: 200 irrelevant, 0 fetches
+        self.feed = noise + [self.publish("e-alert", self.alert)]
+        self.poll()
+        self.assertEqual(self.fetched, [f"{self.BASE}/rest/eas/e-alert"])
+
+    def test_unclassified_entries_are_not_fetched_while_no_actual_alert_is_held(self):
+        self.feed = [self.publish(f"u{i}", b"<never fetched/>", event=None, statefips=None) for i in range(10)]
+        self.assertEqual(self.poll(), [])
+        self.assertEqual(self.fetched, [])
+
+    def test_a_failed_retrieval_of_a_cancellation_candidate_keeps_the_previous_snapshot(self):
+        self.hold_alert()
+        before = self.active.read_bytes()
+        link = f"{self.BASE}/rest/eas/e-flaky"
+        self.documents[link] = requests.ConnectionError("reset")
+        self.feed.append(("e-flaky", link, None, None))
+        with self.assertLogs(amber_poll.log, "WARNING") as logged:
+            self.poll()
+        self.assertEqual(self.active.read_bytes(), before)                        # 9: no partial commit
+        self.assertIn("previous snapshot kept", "\n".join(logged.output))
+
+    def test_more_unclassified_candidates_than_the_bound_fail_safe_without_a_fetch_storm(self):
+        self.hold_alert()
+        before = self.active.read_bytes()
+        many = [self.publish(f"u{i}", cap_xml(f"X-{i}", status="Test"), event=None, statefips=None)
+                for i in range(amber_poll.MAX_UNCLASSIFIED_CAP_FETCHES + 1)]
+        self.feed = [self.publish("e-alert", self.alert)] + many
+        with self.assertLogs(amber_poll.log, "WARNING"):
+            self.poll()
+        self.assertEqual(self.active.read_bytes(), before)
+        self.assertEqual(self.fetched, [f"{self.BASE}/rest/eas/e-alert"])         # bounded: nothing beyond it
+
+    def test_a_malformed_update_never_supersedes_the_alert_and_the_snapshot_stays_byte_identical(self):
+        self.hold_alert()
+        before = self.active.read_bytes()
+        self.feed.append(self.publish("e-update", cap_xml("CAP-2", msg_type="Update", references=ref("CAP-1"),
+                                                          raw_info="<info/>")))
+        with self.assertLogs(amber_poll.log, "WARNING") as logged:
+            self.poll()
+        self.assertEqual(self.active.read_bytes(), before)                        # not superseded, nothing committed
+        output = "\n".join(logged.output)                                       # observable in the journal
+        self.assertIn("CAP-2", output)
+        self.assertIn("previous snapshot kept", output)
+        self.assertEqual(amber_poll._run_alert_coordinator.call_count, 2)         # it sees an unchanged snapshot
 
 
 class CapParsingTests(unittest.TestCase):
