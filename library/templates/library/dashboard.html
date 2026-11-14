@@ -4510,8 +4510,9 @@ function fmtIntro(sec) {
 // engine reports that exact LogItem on a deck that is actually playing.
 const HISTORY_REFRESH_MS = 30000;
 const HISTORY_MIN_ATTEMPT_MS = 2000;
+const HISTORY_FETCH_TIMEOUT_MS = 6000;   // one history request may hold the slot this long
 const HISTORY_UNTRUSTED_TRANSPORT = ['OFFLINE', 'STALE', 'ERROR'];
-let logHistory = { logId: null, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false };
+let logHistory = { logId: null, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false, attempt: null };
 let lastQueueData = null;
 let lastCurrentItemId = null;
 let lastQueueUserScrollAt = 0;
@@ -4530,7 +4531,7 @@ function maybeRefreshLogHistory(data) {
   const logId = Number.isSafeInteger(data.log_id) ? data.log_id : null;
   if (logHistory.logId !== logId) {
     // A different active log (hour adopted): nothing of the old hour carries over.
-    logHistory = { logId, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false };
+    logHistory = { logId, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false, attempt: null };
   }
   if (logId === null || logHistory.inFlight) return;
   const now = Date.now();
@@ -4542,22 +4543,49 @@ function maybeRefreshLogHistory(data) {
 
 async function fetchLogHistory(logId, sig) {
   const mine = logHistory;
+  const attempt = {};                // identity of THIS request within its history context
   mine.inFlight = true;
+  mine.attempt = attempt;
   mine.attemptAt = Date.now();
+  // The request owns the in-flight slot only for a bounded time. The abort
+  // asks the browser to drop the request; the race below is what guarantees
+  // this function itself finishes (and frees the slot) even if the transport
+  // ignores the abort and never settles.
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (controller) controller.abort();
+      reject(new Error('log history timed out'));
+    }, HISTORY_FETCH_TIMEOUT_MS);
+  });
+  const request = (async () => {
+    const resp = await fetch(`/api/engine/status/log/${logId}/`,
+      { cache: 'no-store', signal: controller ? controller.signal : undefined });
+    return resp.ok ? await resp.json() : null;
+  })();
+  request.catch(() => {});           // a rejection after the deadline is consumed here
   try {
-    const resp = await fetch(`/api/engine/status/log/${logId}/`, { cache: 'no-store' });
-    if (resp.ok) {
-      const body = await resp.json();
-      if (body && body.log_id === logId && Array.isArray(body.items)) {
-        mine.items = body.items;
-        mine.sig = sig;
-        mine.fetchedAt = Date.now();
-      }
+    const body = await Promise.race([request, deadline]);
+    // Only this attempt, for the history context that is still current, may
+    // store anything: a response that lost the race (timed out) or belongs to
+    // a log that has since been replaced is ignored whole.
+    if (mine.attempt === attempt && logHistory === mine
+        && body && body.log_id === logId && Array.isArray(body.items)) {
+      mine.items = body.items;
+      mine.sig = sig;
+      mine.fetchedAt = Date.now();
     }
   } catch {
-    // Keep whatever was last fetched for this log; the next change retries.
+    // Failure or timeout: keep whatever was last fetched for this log; the
+    // next change (or the safety refresh) retries. The live queue is unaffected.
+  } finally {
+    clearTimeout(timer);
+    if (mine.attempt === attempt) {
+      mine.inFlight = false;
+      mine.attempt = null;
+    }
   }
-  mine.inFlight = false;
   // Repaint now rather than waiting up to a second for the next poll, but
   // only if this log is still the active one.
   if (logHistory === mine && lastQueueData) renderQueue(lastQueueData);

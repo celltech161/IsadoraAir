@@ -382,6 +382,178 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.assertIn("/api/engine/status/log/78/", self.history_requests)
         self.assertEqual(self.console_errors, [])
 
+    # ------------------------------------------------ history fetch: bounded, never stale
+    HOLD_HISTORY = """() => {
+      window.__hist = {mode: 'pass', held: []};
+      const realFetch = window.fetch.bind(window);
+      // A transport that, while 'hold'ing, never settles AND ignores abort.
+      window.fetch = (url, opts) => {
+        if (String(url).includes('/api/engine/status/log/') && window.__hist.mode === 'hold') {
+          return new Promise((resolve, reject) => window.__hist.held.push({url: String(url), resolve, reject}));
+        }
+        return realFetch(url, opts);
+      };
+      window.__histRespond = (i, logId, items) => window.__hist.held[i].resolve(new Response(
+        JSON.stringify({log_id: logId, items}), {status: 200, headers: {'Content-Type': 'application/json'}}));
+      window.__histReject = (i) => window.__hist.held[i].reject(new TypeError('simulated network loss'));
+    }"""
+    HIST_INFO = """() => ({inFlight: logHistory.inFlight, logId: logHistory.logId,
+      ids: logHistory.items.map(i => i.item_id), held: window.__hist ? window.__hist.held.length : 0})"""
+
+    def hold(self, page, on=True):
+        if page.evaluate("() => typeof window.__hist === 'undefined'"):
+            page.evaluate(self.HOLD_HISTORY)
+        page.evaluate("(m) => { window.__hist.mode = m; }", "hold" if on else "pass")
+
+    def info(self, page):
+        return page.evaluate(self.HIST_INFO)
+
+    def wait_info(self, page, predicate):
+        page.wait_for_function(f"() => {{ const i = ({self.HIST_INFO})(); return ({predicate})(i); }}", timeout=10_000)
+
+    def advance(self, page, ms):
+        page.clock.run_for(ms)
+        page.wait_for_function("() => statusInFlightSeq === 0")
+
+    GHOST = hist(999, 1, "Stale Ghost", played=AIRED - 5000)
+
+    def test_a_stalled_history_request_times_out_and_history_recovers(self):
+        for label, user, path in (("console", self.superuser, "/"), ("remote_dj", self.host, "/remote-dj/")):
+            with self.subTest(page=label):
+                self.history_requests.clear()
+                self.state = console_state(queue=standard_queue())
+                self.history = standard_history()
+                page = self.console(flag=True, user=user, path=path)
+                self.wait_states(page, GOLD)
+                self.hold(page)
+                # The queue moves on (904 airs): a refresh begins and never settles.
+                h2 = [dict(h) for h in standard_history()]
+                h2[3]["played_at"] = AIRED + 200
+                self.refresh(page, console_state(current=904, queue=[queued(905, "Upcoming Five", 60.0)]), history=h2)
+                self.wait_info(page, "i => i.held === 1 && i.inFlight")
+                # Still legitimately pending: more changes must not start a second request.
+                s3 = console_state(current=904, queue=[queued(905, "Upcoming Five", 60.0), queued(906, "Upcoming Six", 260.0)])
+                h3 = h2 + [hist(906, 6, "Upcoming Six")]
+                self.state, self.history = s3, h3
+                self.advance(page, 3_000)
+                info = self.info(page)
+                self.assertEqual((info["held"], info["inFlight"]), (1, True))
+                # Past the deadline the stalled request frees the slot and the next
+                # change is fetched for real, completing and updating the display.
+                self.hold(page, on=False)
+                self.advance(page, 4_000)
+                self.wait_states(page, [(901, "played"), (902, "played"), (903, "played"), (904, "current"),
+                                        (905, "upcoming"), (906, "upcoming")])
+                info = self.info(page)
+                self.assertEqual((info["held"], info["inFlight"]), (1, False))   # the stalled one never retried itself
+                self.assertEqual(len(self.history_requests), 2)                   # initial + the recovery
+                self.assertEqual(self.console_errors, [])
+
+    def test_a_late_response_from_a_timed_out_request_changes_nothing(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.hold(page)
+        self.refresh(page, console_state(current=904, queue=[queued(905, "Upcoming Five", 60.0)]),
+                     history=standard_history())
+        self.wait_info(page, "i => i.held === 1 && i.inFlight")
+        self.hold(page, on=False)
+        self.advance(page, 7_000)                                       # times out; recovery fetch completes
+        expected = [(901, "played"), (902, "played"), (903, "played"), (904, "current"), (905, "upcoming")]
+        self.wait_states(page, expected)
+        before = self.info(page)
+        # The original request finally answers -- with history that was never true.
+        # (log_id 77, the active log: only the attempt guard can reject it.)
+        page.evaluate("([ids]) => __histRespond(0, 77, ids)", [[self.GHOST]])
+        self.advance(page, 1_000)
+        self.assertEqual(self.states(page), [(str(i), st) for i, st in expected])
+        self.assertEqual(self.info(page)["ids"], before["ids"])
+        self.assertNotIn("999", [r["id"] for r in self.rows(page)])
+        self.assertEqual(self.info(page)["logId"], 77)
+        self.assertEqual(self.console_errors, [])
+
+    def _rollover(self, outcome):
+        self.state = console_state(queue=standard_queue())
+        self.history = standard_history()
+        self.history_requests.clear()
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.hold(page)
+        self.refresh(page, console_state(current=903, queue=[queued(905, "Upcoming Five", 60.0)]))
+        self.wait_info(page, "i => i.held === 1 && i.inFlight")          # a request for log 77 is outstanding
+        # The next hour (log 78) is adopted while it is still outstanding.
+        self.hold(page, on=False)
+        new_history = [hist(1000, 1, "Aired Early", played=AIRED + 400), hist(1001, 2, "Next Hour One"),
+                       hist(1002, 3, "Next Hour Two")]
+        state = console_state(current=903, log_id=78,
+                              queue=[queued(1001, "Next Hour One", 30.0), queued(1002, "Next Hour Two", 230.0)])
+        state["decks"]["A"]["playlist_log_id"] = 77
+        self.refresh(page, state, history=new_history)
+        want = [(1000, "played"), (1001, "upcoming"), (1002, "upcoming")]
+        self.wait_states(page, want)
+        self.wait_info(page, "i => i.logId === 78 && !i.inFlight")
+        self.assertIn("/api/engine/status/log/78/", self.history_requests)
+        if outcome == "completes":
+            page.evaluate("([ids]) => __histRespond(0, 77, ids)", [[self.GHOST]])
+        elif outcome == "fails":
+            page.evaluate("() => __histReject(0)")
+        else:                                                            # "times out"
+            self.advance(page, 7_000)
+        self.advance(page, 1_000)
+        self.assertEqual(self.states(page), [(str(i), st) for i, st in want])
+        info = self.info(page)
+        self.assertEqual((info["logId"], info["inFlight"], sorted(info["ids"])), (78, False, [1000, 1001, 1002]))
+        self.assertEqual(self.console_errors, [])
+
+    def test_an_outstanding_request_from_the_previous_hour_cannot_affect_the_new_hour(self):
+        for outcome in ("completes", "fails", "times out"):
+            with self.subTest(old_request=outcome):
+                self._rollover(outcome)
+
+    def test_controls_stay_correct_after_a_timeout_and_recovery(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.hold(page)
+        self.refresh(page, console_state(queue=[queued(905, "Upcoming Five", 60.0), queued(904, "Upcoming Four", 260.0)]))
+        self.wait_info(page, "i => i.held === 1 && i.inFlight")
+        self.hold(page, on=False)
+        self.advance(page, 7_000)
+        # Upcoming order comes from the LATEST engine queue (905 now ahead of 904).
+        self.wait_states(page, [(901, "played"), (902, "played"), (903, "current"), (905, "upcoming"), (904, "upcoming")])
+        for r in self.rows(page):
+            self.assertEqual((r["handle"], r["next"], r["queueRow"]), ((r["state"] == "upcoming"),) * 3, r["id"])
+        self.reveal_queue(page)
+        self.drag(page, 904, 905)
+        self.assertEqual(json.loads(self.wait_post(page, "/api/log/77/reorder/")[0]), {"order": [904, 905]})
+        page.locator('#queueList tr[data-item-id="904"] .qt-next-btn').click()
+        self.assertEqual(json.loads(self.wait_post(page, "/api/engine/queue/set-next/")[0]), {"item_id": 904})
+        self.assertEqual(page.locator("#queueList .qt-next-btn").count(), 2)
+
+    def test_request_spacing_safety_refresh_and_no_needless_retries(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.assertEqual(len(self.history_requests), 1)
+        # A change right away is held back by the 2 s minimum spacing ...
+        self.state = console_state(queue=[queued(905, "Upcoming Five", 60.0), queued(904, "Upcoming Four", 260.0)])
+        page.evaluate("async () => { await poll(); }")
+        self.assertEqual(len(self.history_requests), 1)
+        # ... and goes out once the spacing has passed, exactly once.
+        self.advance(page, 2_100)
+        page.wait_for_function("() => !logHistory.inFlight")
+        self.assertEqual(len(self.history_requests), 2)
+        self.advance(page, 20_000)                                       # nothing changes: no retries
+        self.assertEqual(len(self.history_requests), 2)
+        # The 30 s safety refresh fires on its own once the data is that old.
+        self.advance(page, 11_000)
+        page.wait_for_function("() => !logHistory.inFlight")
+        self.assertEqual(len(self.history_requests), 3)
+
+    def test_off_never_fetches_history_however_long_it_runs(self):
+        page = self.console(flag=False)
+        for _ in range(4):
+            self.advance(page, 10_000)
+        self.assertEqual(self.history_requests, [])
+        self.assertEqual(self.console_errors, [])
+
     # ------------------------------------------------------ queue-control safety
     def drag(self, page, source_id, target_id):
         src = self.box(page, f'#queueList tr[data-item-id="{source_id}"] .qt-drag-handle')
