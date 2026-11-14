@@ -668,6 +668,8 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
             # insert Tracks; the probe classifies a database default as manual.
             # 1.21 (P0): and library.0100 (the nullable PlaylistLog replay marker AddField and
             # a choices-only origin AlterField -- both additive, no manual operation).
+            # Console log display: and library.0101 (the UITheme.show_played_items
+            # BooleanField, a non-null AddField with a literal default -- additive).
             self.assertEqual([item["ref"] for item in payload["plan"]],
                              ["library.0089_voicetrack_media", "produced_content.0001_initial",
                               "active_messages.0002_playout_correlation", "active_messages.0003_message_content_type",
@@ -683,6 +685,7 @@ class VoiceTrackMigrationClassificationTests(TransactionTestCase):
                               "library.0098_hour_refill_automatic_failure_cause",
                               "library.0099_track_cue_marker_authority",
                               "library.0100_dst_fallback_replay_pass",
+                              "library.0101_uitheme_show_played_items",
                               "spoken.0001_initial",
                               "produced_content.0002_d3c_spoken_backend_and_test_take",
                               "produced_content.0003_recipe_key_leading_digit",
