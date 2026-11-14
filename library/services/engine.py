@@ -16740,6 +16740,9 @@ class PlaybackEngine:
                 "format": qt.format or "",
                 "fill_color": qt.category.kind.fill_color if qt.category else None,
                 "eta_seconds": round(eta, 1),
+                # Display only (Console "Intro" column): the Track's own
+                # marker, None when unset; 0 is a real, configured value.
+                "intro_until_seconds": qt.intro_until_seconds,
             })
             eta += q_airtime
         return queue

@@ -804,6 +804,11 @@ class UIThemeAdmin(admin.ModelAdmin):
                             "Deezer/iTunes, and default_album_art shows on a "
                             "deck when nothing in the lookup chain matches.",
         }),
+        ("Console / Remote DJ — Log Display", {
+            "fields": ["show_played_items"],
+            "description": "Station-wide; applies to both the Console and the "
+                            "Remote DJ page on their next reload.",
+        }),
         ("Deck Transport Buttons", {
             "fields": ["deck_transport_disabled_opacity"],
             "description": "Eject/play/pause buttons on each deck panel. Icon "

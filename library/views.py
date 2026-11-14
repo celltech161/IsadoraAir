@@ -4079,6 +4079,46 @@ def api_engine_status(request):
 
 
 @require_http_methods(["GET"])
+def api_engine_log_items(request, pk):
+    """Read-only: the ACTIVE log's items, for the Console / Remote DJ
+    "Show played items" display. The engine's live ``queue`` stays the
+    only authority for what is upcoming (and for what may be reordered);
+    this only supplies the already-aired / on-deck rows the queue no
+    longer carries, with ``played_at`` as the evidence an item aired.
+
+    Lives under /api/engine/status/ so every account that may read the
+    status feed may read this, with no access-map change; served only for
+    the log the (fresh) engine state names as active, so it cannot be used
+    to browse other hours.
+    """
+    state = _read_fresh_engine_state(REMOTE_DJ_GATE_STATE_MAX_AGE_SECONDS)
+    if state is None or state.get("log_id") != pk:
+        return JsonResponse({"error": "Not the active log"}, status=404)
+    items = (
+        LogItem.objects.filter(playlist_log_id=pk)
+        .select_related("track", "track__artist", "track__category__kind", "category__kind")
+        .order_by("position")
+    )
+    rows = []
+    for item in items:
+        track = item.track
+        category = (track.category if track is not None else None) or item.category
+        rows.append({
+            "item_id": item.id,
+            "position": item.position,
+            "track_id": item.track_id,
+            "title": track.title if track else item.track_title,
+            "artist": ((track.artist.name if track.artist else "") if track else item.track_artist),
+            "duration": (track.duration_seconds or 0) if track else 0,
+            "category": category.code if category else "",
+            "fill_color": category.kind.fill_color if category else None,
+            "intro_until_seconds": track.intro_until_seconds if track else None,
+            "played_at": item.played_at.timestamp() if item.played_at else None,
+        })
+    return JsonResponse({"log_id": pk, "items": rows})
+
+
+@require_http_methods(["GET"])
 def api_engine_levels(request):
     """Serves the pre-processor VU meter payload written by the engine's
     output_level bus handler (see engine.py::LEVELS_PATH). Polled from

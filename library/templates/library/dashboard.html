@@ -881,10 +881,10 @@
   }
 
   td.qt-pos { color: var(--text-muted); text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
-  td.qt-dur, td.qt-time { color: var(--text-muted); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.qt-dur, td.qt-intro, td.qt-time { color: var(--text-muted); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.qt-cat { color: var(--text-muted); font-size: 0.75rem; }
   th.qt-th-pos { text-align: center; }
-  th.qt-th-dur, th.qt-th-time { text-align: right; }
+  th.qt-th-dur, th.qt-th-intro, th.qt-th-time { text-align: right; }
   .qt-track-link { color: inherit; text-decoration: none; }
   .qt-track-link:hover { color: var(--accent); text-decoration: underline; }
 
@@ -911,6 +911,37 @@
   table.queue-table .qt-drag-handle:active { cursor: grabbing; }
   table.queue-table tr.drag-over td { border-top: 2px solid var(--accent); }
   table.queue-table tr.dragging td { opacity: 0.3; }
+
+  /* "Show played items" (UITheme.show_played_items): the table also lists
+     this hour's already-aired rows and the one on air. Past rows keep their
+     category hue under a dark overlay (a gradient layer on the cells, so the
+     row's own fill colour is untouched and the hue stays recognisable) with
+     explicitly light text, so contrast holds on any palette. The row on air
+     gets a thin white outline (inset shadows: reliable under
+     border-collapse). Upcoming rows are not styled here at all. */
+  .queue-table-wrap.qt-history {
+    max-height: min(70vh, 38rem);
+    overflow-y: auto;
+  }
+  table.queue-table.qt-history th { position: sticky; top: 0; z-index: 1; }
+  table.queue-table tr.qt-played td {
+    background-image: linear-gradient(rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.55));
+    color: #e5e7eb;
+  }
+  table.queue-table tr.qt-played td.qt-pos,
+  table.queue-table tr.qt-played td.qt-dur,
+  table.queue-table tr.qt-played td.qt-intro,
+  table.queue-table tr.qt-played td.qt-cat,
+  table.queue-table tr.qt-played td.qt-time { color: #b6bcc6; }
+  table.queue-table tr.qt-current td {
+    box-shadow: inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+  }
+  table.queue-table tr.qt-current td:first-child {
+    box-shadow: inset 1px 0 0 #fff, inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+  }
+  table.queue-table tr.qt-current td:last-child {
+    box-shadow: inset -1px 0 0 #fff, inset 0 1px 0 #fff, inset 0 -1px 0 #fff;
+  }
 
   .queue-empty {
     color: var(--text-muted);
@@ -1669,12 +1700,13 @@
             <th>Title</th>
             <th>Cat</th>
             <th class="qt-th-dur">Dur</th>
+            <th class="qt-th-intro">Intro</th>
             <th class="qt-th-time">Time On</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="queueList">
-          <tr><td colspan="8" class="queue-empty">No queue data</td></tr>
+          <tr><td colspan="9" class="queue-empty">No queue data</td></tr>
         </tbody>
       </table>
     </div>
@@ -4457,6 +4489,125 @@ let queueItemIds = [];
 let insertDebounce = null;
 let queueDragActive = false;
 
+// Coming Up table columns (drag, #, artist, title, cat, dur, intro, time on, next).
+const QUEUE_COLUMNS = 9;
+// "Show played items" (UITheme.show_played_items, station-wide, read at page
+// load). Off: the table is exactly the engine's upcoming queue, as before.
+const SHOW_PLAYED_ITEMS = {{ ui_theme.show_played_items|yesno:"true,false" }};
+
+// The Intro column: the Track's intro_until_seconds as M:SS. Unset (null)
+// is blank; a configured 0 is a real value and reads 0:00.
+function fmtIntro(sec) {
+  return (typeof sec === 'number' && isFinite(sec) && sec >= 0) ? fmtDur(sec) : '';
+}
+
+// --- Show played items: read-only history, merged in the browser. ---
+// The engine's `queue` stays the only authority for upcoming rows (their
+// order, ETAs and every control). The already-aired / on-deck rows come from
+// /api/engine/status/log/<id>/ -- fetched when the active log, the queue or
+// the decks change (plus a slow safety refresh), never on every 1 s poll.
+// A row is "played" only on played_at evidence, and "current" only when the
+// engine reports that exact LogItem on a deck that is actually playing.
+const HISTORY_REFRESH_MS = 30000;
+const HISTORY_MIN_ATTEMPT_MS = 2000;
+const HISTORY_UNTRUSTED_TRANSPORT = ['OFFLINE', 'STALE', 'ERROR'];
+let logHistory = { logId: null, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false };
+let lastQueueData = null;
+let lastCurrentItemId = null;
+let lastQueueUserScrollAt = 0;
+
+function historySignature(data) {
+  const decks = data.decks || {};
+  const deckSig = SLOTS.map(slot => {
+    const d = decks[slot];
+    return d ? `${d.log_item_id}:${d.air_started_at != null ? 1 : 0}:${d.actually_playing ? 1 : 0}` : '-';
+  }).join(',');
+  return `${data.log_id}|${(data.queue || []).map(q => q.item_id).join(',')}|${deckSig}`;
+}
+
+function maybeRefreshLogHistory(data) {
+  if (!SHOW_PLAYED_ITEMS) return;
+  const logId = Number.isSafeInteger(data.log_id) ? data.log_id : null;
+  if (logHistory.logId !== logId) {
+    // A different active log (hour adopted): nothing of the old hour carries over.
+    logHistory = { logId, items: [], sig: null, fetchedAt: 0, attemptAt: 0, inFlight: false };
+  }
+  if (logId === null || logHistory.inFlight) return;
+  const now = Date.now();
+  if (now - logHistory.attemptAt < HISTORY_MIN_ATTEMPT_MS) return;
+  const sig = historySignature(data);
+  if (logHistory.sig === sig && now - logHistory.fetchedAt < HISTORY_REFRESH_MS) return;
+  fetchLogHistory(logId, sig);
+}
+
+async function fetchLogHistory(logId, sig) {
+  const mine = logHistory;
+  mine.inFlight = true;
+  mine.attemptAt = Date.now();
+  try {
+    const resp = await fetch(`/api/engine/status/log/${logId}/`, { cache: 'no-store' });
+    if (resp.ok) {
+      const body = await resp.json();
+      if (body && body.log_id === logId && Array.isArray(body.items)) {
+        mine.items = body.items;
+        mine.sig = sig;
+        mine.fetchedAt = Date.now();
+      }
+    }
+  } catch {
+    // Keep whatever was last fetched for this log; the next change retries.
+  }
+  mine.inFlight = false;
+  // Repaint now rather than waiting up to a second for the next poll, but
+  // only if this log is still the active one.
+  if (logHistory === mine && lastQueueData) renderQueue(lastQueueData);
+}
+
+// The rows to show, in display order. Upcoming rows are the engine queue,
+// untouched and in its order; with Show played items on, the active log's
+// aired / on-deck rows (position order) precede them.
+function buildQueueRows(data) {
+  const queue = data.queue || [];
+  const rows = [];
+  if (SHOW_PLAYED_ITEMS && logHistory.logId !== null && logHistory.logId === data.log_id) {
+    const queued = new Set(queue.map(q => q.item_id));
+    const decks = data.decks || {};
+    const trusted = !HISTORY_UNTRUSTED_TRANSPORT.includes(data.transport);
+    const onDeck = {};
+    SLOTS.forEach(slot => {
+      const d = decks[slot];
+      if (d && Number.isSafeInteger(d.log_item_id) && d.playlist_log_id === data.log_id) onDeck[d.log_item_id] = d;
+    });
+    [...logHistory.items].sort((a, b) => a.position - b.position).forEach(h => {
+      if (queued.has(h.item_id)) return;  // the live queue wins: it is upcoming
+      const deck = onDeck[h.item_id];
+      let state = null;
+      if (deck) {
+        // On a deck: airing only when the engine says audio is actually
+        // playing. A claimed / preloaded / paused deck is "on deck": normal
+        // colours, no controls, and neither darkened nor outlined.
+        state = trusted && deck.actually_playing ? 'current' : 'ondeck';
+      } else if (h.played_at != null) {
+        state = 'played';
+      }
+      if (!state) return;  // never aired, not on a deck: not part of this display
+      const airedAt = h.played_at != null ? h.played_at : (deck && deck.air_started_at);
+      rows.push({
+        state, itemId: h.item_id, trackId: h.track_id, artist: h.artist, title: h.title,
+        category: h.category, fillColor: h.fill_color, duration: h.duration,
+        intro: h.intro_until_seconds,
+        timeText: airedAt != null && state !== 'ondeck' ? window.stationFormatTime(new Date(airedAt * 1000)) : '',
+      });
+    });
+  }
+  queue.forEach(q => rows.push({
+    state: 'upcoming', itemId: q.item_id, trackId: q.track_id, artist: q.artist, title: q.title,
+    category: q.category, fillColor: q.fill_color, duration: q.duration,
+    intro: q.intro_until_seconds, timeText: fmtEtaClock(data.timestamp, q.eta_seconds),
+  }));
+  return rows;
+}
+
 function renderQueue(data) {
   // The 1s poll would otherwise blow away the table's innerHTML (and
   // the drag listeners on it) mid-gesture -- looks like dragging works
@@ -4465,19 +4616,25 @@ function renderQueue(data) {
   // the current render until the drag finishes.
   if (queueDragActive) return;
 
+  lastQueueData = data;
+  maybeRefreshLogHistory(data);
+
   const list = document.getElementById('queueList');
-  const queue = data.queue || [];
+  const wrap = list.closest('.queue-table-wrap');
+  const rows = buildQueueRows(data);
   currentLogId = data.log_id;
 
-  if (!queue.length) {
-    list.innerHTML = '<tr><td colspan="8" class="queue-empty">No upcoming tracks</td></tr>';
+  if (!rows.length) {
+    list.innerHTML = `<tr><td colspan="${QUEUE_COLUMNS}" class="queue-empty">No upcoming tracks</td></tr>`;
     queueItemIds = [];
     return;
   }
 
-  queueItemIds = queue.map(q => q.item_id);
+  // Reorder / Next may only ever name rows that are in the engine's live queue.
+  queueItemIds = rows.filter(r => r.state === 'upcoming').map(r => r.itemId);
 
-  list.innerHTML = queue.map((q, i) => {
+  const scrollTop = wrap.scrollTop;
+  list.innerHTML = rows.map((r, i) => {
     // Drag-handle and next-button columns are present in both modes so
     // the remote DJ can also reorder the queue and force-next a track.
     // The one remaining split: artist/title are hyperlinks to the track
@@ -4485,27 +4642,58 @@ function renderQueue(data) {
     // navigation into the rest of the app, per remote_dj_page's mode
     // docstring.
     const artistCell = IS_REMOTE_DJ
-      ? esc(q.artist)
-      : `<a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.artist)}</a>`;
+      ? esc(r.artist)
+      : `<a class="qt-track-link" href="/track/${r.trackId}/">${esc(r.artist)}</a>`;
     const titleCell = IS_REMOTE_DJ
-      ? esc(q.title)
-      : `<a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.title)}</a>`;
+      ? esc(r.title)
+      : `<a class="qt-track-link" href="/track/${r.trackId}/">${esc(r.title)}</a>`;
+    // Only upcoming rows carry the drag handle, the Next button and the
+    // data-queue-row marker the reorder handler selects on.
+    const upcoming = r.state === 'upcoming';
+    const cls = r.state === 'played' ? ' class="qt-played"'
+      : r.state === 'current' ? ' class="qt-current" aria-current="true"'
+      : r.state === 'ondeck' ? ' class="qt-ondeck"' : '';
     return `
-    <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
-      <td class="qt-pos qt-drag-handle">&#9776;</td>
+    <tr${cls} data-item-id="${r.itemId}" data-row-state="${r.state}"${upcoming ? ' data-queue-row="1"' : ''} style="background-color: ${r.fillColor || 'transparent'};">
+      ${upcoming ? '<td class="qt-pos qt-drag-handle">&#9776;</td>' : '<td class="qt-pos"></td>'}
       <td class="qt-pos">${i + 1}</td>
       <td>${artistCell}</td>
       <td>${titleCell}</td>
-      <td class="qt-cat">${esc(q.category)}</td>
-      <td class="qt-dur">${fmtDur(q.duration)}</td>
-      <td class="qt-time">${fmtEtaClock(data.timestamp, q.eta_seconds)}</td>
-      <td><button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button></td>
+      <td class="qt-cat">${esc(r.category)}</td>
+      <td class="qt-dur">${fmtDur(r.duration)}</td>
+      <td class="qt-intro">${fmtIntro(r.intro)}</td>
+      <td class="qt-time">${r.timeText}</td>
+      <td>${upcoming ? `<button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${r.itemId})">next</button>` : ''}</td>
     </tr>
   `;
   }).join('');
 
+  if (SHOW_PLAYED_ITEMS) {
+    wrap.classList.add('qt-history');
+    list.closest('table').classList.add('qt-history');
+    // Keep the operator's scroll position through the 1 s repaint; only when a
+    // NEW item goes on air, and the operator hasn't just scrolled or touched
+    // the table, bring it into view (once -- never every poll).
+    wrap.scrollTop = scrollTop;
+    const current = list.querySelector('tr.qt-current');
+    const currentId = current ? current.dataset.itemId : null;
+    if (currentId !== lastCurrentItemId) {
+      lastCurrentItemId = currentId;
+      if (current && Date.now() - lastQueueUserScrollAt > 15000) {
+        wrap.scrollTop = Math.max(0, current.offsetTop - wrap.clientHeight / 3);
+      }
+    }
+  }
+
   initQueueDrag();
 }
+
+(function trackQueueUserScroll() {
+  const wrap = document.querySelector('.queue-table-wrap');
+  if (!wrap) return;
+  ['wheel', 'touchstart', 'pointerdown', 'keydown'].forEach(
+    type => wrap.addEventListener(type, () => { lastQueueUserScrollAt = Date.now(); }, { passive: true }));
+})();
 
 function initQueueDrag() {
   // Pointer Events instead of native HTML5 drag-and-drop -- the native
@@ -4525,7 +4713,9 @@ function initQueueDrag() {
   function rowAtPoint(x, y) {
     const el = document.elementFromPoint(x, y);
     const row = el && el.closest('tr');
-    return (row && list.contains(row)) ? row : null;
+    // Only live-queue rows are valid drop targets: played / on-air / on-deck
+    // rows (Show played items) are never part of a reorder.
+    return (row && list.contains(row) && row.dataset.queueRow === '1') ? row : null;
   }
 
   function clearDragOver() {
@@ -4568,7 +4758,8 @@ function initQueueDrag() {
       endDrag();
       if (!dropRow || dropRow === draggedEl) return;
       list.insertBefore(draggedEl, dropRow);
-      const order = [...list.querySelectorAll('tr')].map(
+      // Only upcoming (live-queue) rows -- never a played / on-air / on-deck one.
+      const order = [...list.querySelectorAll('tr[data-queue-row="1"]')].map(
         r => parseInt(r.dataset.itemId)
       );
       if (!currentLogId) return;

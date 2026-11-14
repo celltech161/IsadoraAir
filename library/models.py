@@ -1733,6 +1733,16 @@ class UITheme(models.Model):
                    "text_main (and accent on hover) above, not this field.",
     )
 
+    # --- Console / Remote DJ log display ---
+    show_played_items = models.BooleanField(
+        default=False,
+        help_text="Off: the Coming Up table drops items as they air. On: the "
+                   "Console and Remote DJ keep this hour's already-aired items "
+                   "(darker) and outline the item on air, above the upcoming "
+                   "items. Display only -- it never changes what plays or what "
+                   "can be reordered. Takes effect when the page is reloaded.",
+    )
+
     class Meta:
         verbose_name = "UI Theme"
         verbose_name_plural = "UI Theme"
