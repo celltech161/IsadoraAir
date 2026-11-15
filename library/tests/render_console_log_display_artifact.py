@@ -8,7 +8,7 @@ station data involved (Playwright suites cannot run inside the sandbox).
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 
-from library.models import UITheme
+from library.models import CategoryKind, FXCart, UITheme
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
@@ -36,3 +36,23 @@ class RenderArtifact(TestCase):
         page = self.client.get("/library/").content.decode()
         print(f"\n=====BEGIN-LIBRARY=====\n{page}\n=====END-LIBRARY=====")
         self.assertIn('id="navClock"', page)
+
+    def test_render_admin_colour_widgets(self):
+        """The admin forms that carry RGBAColorWidget, with stored colours set straight
+        in the database (bypassing validation, as an existing station's values would be)."""
+        self.client.force_login(get_user_model().objects.create_superuser("render_admin", "r@example.invalid", "pw"))
+        for label, value in (("HEX3", "#fff"), ("HEX4", "#fff8"), ("HEX6", "#FFFFFF"), ("HEX8", "#FFFFFF80"),
+                             ("RGBA", "rgba(10, 20, 30, 0.37)"), ("BAD5", "#12345")):
+            UITheme.load()
+            UITheme.objects.filter(pk=1).update(current_item_outline_color=value)
+            page = self.client.get("/admin/library/uitheme/1/change/").content.decode()
+            print(f"\n=====BEGIN-ADMIN-THEME-{label}=====\n{page}\n=====END-ADMIN-THEME-{label}=====")
+        CategoryKind.objects.create(code="rk1", name="Kind One", fill_color="#fff", sort_order=1)
+        CategoryKind.objects.create(code="rk2", name="Kind Two", fill_color="rgba(1, 2, 3, 0.4)", sort_order=2)
+        page = self.client.get("/admin/library/categorykind/").content.decode()
+        print(f"\n=====BEGIN-ADMIN-KINDS=====\n{page}\n=====END-ADMIN-KINDS=====")
+        cart = FXCart.objects.create(name="Render Cart", filepath="/tmp/render-cart.wav", enabled=True,
+                                     idle_color="#abc", playing_color="rgba(5, 6, 7, 0.5)")
+        page = self.client.get(f"/admin/library/fxcart/{cart.pk}/change/").content.decode()
+        print(f"\n=====BEGIN-ADMIN-FXCART=====\n{page}\n=====END-ADMIN-FXCART=====")
+        self.assertIn("_color", page)

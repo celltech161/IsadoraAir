@@ -273,15 +273,21 @@ class RGBAColorWidget(forms.TextInput):
 <span id="__ID___preview" style="display:inline-block; width:22px; height:22px; border:1px solid #999; vertical-align:middle; margin-left:4px;"></span>
 <script>
 (function () {
+    // Reads exactly what library.models.validate_css_color accepts: #rgb, #rgba,
+    // #rrggbb, #rrggbbaa, rgb()/rgba(). Anything else returns null and is left alone.
     function parseColor(v) {
         v = (v || '').trim();
         var m = v.match(/^rgba?\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*(?:,\\s*([\\d.]+))?\\s*\\)$/i);
         if (m) return {r: +m[1], g: +m[2], b: +m[3], a: m[4] !== undefined ? parseFloat(m[4]) : 1};
-        m = v.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
-        if (m) return {r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16), a: 1};
-        return {r: 55, g: 65, b: 81, a: 1};
+        m = v.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])([0-9a-f])?$/i);
+        if (m) return {r: parseInt(m[1] + m[1], 16), g: parseInt(m[2] + m[2], 16), b: parseInt(m[3] + m[3], 16),
+                       a: m[4] !== undefined ? parseInt(m[4] + m[4], 16) / 255 : 1};
+        m = v.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})?$/i);
+        if (m) return {r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16),
+                       a: m[4] !== undefined ? parseInt(m[4], 16) / 255 : 1};
+        return null;
     }
-    function toHex(n) { return n.toString(16).padStart(2, '0'); }
+    function toHex(n) { return Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0'); }
 
     var hidden = document.getElementById('__ID__');
     var colorInput = document.getElementById('__ID___color');
@@ -289,10 +295,16 @@ class RGBAColorWidget(forms.TextInput):
     var alphaLabel = document.getElementById('__ID___alpha_label');
     var preview = document.getElementById('__ID___preview');
 
-    var initial = parseColor(hidden.value);
+    // Initialise the CONTROLS from the stored value, but never rewrite the stored
+    // value itself: opening a form must not change a colour. An unreadable value
+    // shows the neutral fallback in the controls and stays exactly as stored.
+    var initial = parseColor(hidden.value) || {r: 55, g: 65, b: 81, a: 1};
     colorInput.value = '#' + toHex(initial.r) + toHex(initial.g) + toHex(initial.b);
     alphaInput.value = Math.round(initial.a * 100);
+    alphaLabel.textContent = alphaInput.value + '%';
+    preview.style.background = hidden.value || ('rgba(' + initial.r + ', ' + initial.g + ', ' + initial.b + ', ' + initial.a + ')');
 
+    // Only an actual change to the picker or the opacity slider recomputes it.
     function update() {
         var hex = colorInput.value;
         var r = parseInt(hex.substr(1, 2), 16);
@@ -306,7 +318,6 @@ class RGBAColorWidget(forms.TextInput):
     }
     colorInput.addEventListener('input', update);
     alphaInput.addEventListener('input', update);
-    update();
 })();
 </script>
 """

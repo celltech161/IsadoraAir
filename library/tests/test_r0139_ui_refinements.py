@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError
 from django.test import TestCase, override_settings
 
 from library.admin import OpacitySliderWidget, RGBAColorWidget
-from library.models import UITheme
+from library.models import UITheme, validate_css_color
 
 User = get_user_model()
 CHANGE = "/admin/library/uitheme/1/change/"
@@ -102,20 +102,59 @@ class ThemeAdminTests(ThemeFormMixin, TestCase):
                 self.assertTrue(response.context["adminform"].form.errors.get("played_item_darkening"))
                 self.assertEqual(UITheme.load().played_item_darkening, 0.55)
 
+    ACCEPTED = ("#fff", "#fff8", "#FFFFFF", "#FFFFFF80", "#abcdef12", "rgba(255, 255, 255, 1.00)", "rgba(0, 0, 0, 0.00)",
+                "rgb(10, 20, 30)", "rgb(255,255,255)", "rgba(12, 34, 56, .5)", "rgba(1, 2, 3, 1)", "rgba(1, 2, 3, 0)",
+                "rgba(255, 255, 255, 0.55)")
+    REJECTED = ("", "white", "red;}", "url(javascript:alert(1))", "rgba(1,2,3,0.5);x", "#12", "#1", "#12345", "#1234567",
+                "#123456789", "#ggg", "#fffffg", "fff", "rgb(999,999,999)", "rgb(256, 0, 0)", "rgba(0, 0, 0, 1.5)",
+                "rgba(0, 0, 0, 2)", "rgba(1, 2", "rgb(1, 2)", "rgba(1, 2, 3, )", "rgba(1, 2, 3, 0.5", "rgb(1 2 3)",
+                "rgba(1, 2, 3, -0.1)", "rgb(-1, 2, 3)", "hsl(0, 0%, 100%)")
+
     def test_invalid_outline_colours_are_rejected(self):
-        for value in ("white", "red;}", "url(javascript:alert(1))", "rgba(1,2,3,0.5);x", "#12", ""):
+        for value in self.REJECTED:
             with self.subTest(value=value):
                 response = self.save(current_item_outline_color=value)
                 self.assertEqual(response.status_code, 200)
                 self.assertTrue(response.context["adminform"].form.errors.get("current_item_outline_color"))
                 self.assertEqual(UITheme.load().current_item_outline_color, "rgba(255, 255, 255, 1.00)")
 
-    def test_valid_outline_colours_are_accepted(self):
-        for value in ("rgba(255, 255, 255, 1.00)", "rgba(0, 0, 0, 0.00)", "rgb(10, 20, 30)", "#fff", "#FFFFFF80",
-                      "rgba(12, 34, 56, .5)"):
+    def test_valid_outline_colours_are_accepted_and_stored_exactly(self):
+        for value in self.ACCEPTED:
             with self.subTest(value=value):
                 self.assertEqual(self.save(current_item_outline_color=value).status_code, 302)
                 self.assertEqual(UITheme.load().current_item_outline_color, value)
+
+    def test_the_validator_function_itself(self):
+        for value in self.ACCEPTED:
+            validate_css_color(value)
+        for value in self.REJECTED:
+            with self.assertRaises(ValidationError, msg=value):
+                validate_css_color(value)
+
+    def test_every_colour_the_widget_can_produce_is_accepted(self):
+        # The widget emits rgba(r, g, b, a.toFixed(2)) for any channel 0-255 and alpha 0-100%.
+        for r, g, b in ((0, 0, 0), (255, 255, 255), (55, 65, 81), (1, 254, 128)):
+            for pct in (0, 1, 25, 50, 55, 99, 100):
+                validate_css_color(f"rgba({r}, {g}, {b}, {pct / 100:.2f})")
+
+    def test_model_field_and_unreleased_migration_agree(self):
+        import importlib
+        migration = importlib.import_module("library.migrations.0102_uitheme_log_display_appearance")
+        fields = {op.name: op.field for op in migration.Migration.operations}
+        model_field = UITheme._meta.get_field("current_item_outline_color")
+        self.assertIn(validate_css_color, model_field.validators)
+        self.assertIn(validate_css_color, fields["current_item_outline_color"].validators)
+        self.assertNotIn("RegexValidator", [type(v).__name__ for v in model_field.validators])
+        self.assertEqual(fields["current_item_outline_color"].default, model_field.default)
+        self.assertEqual(fields["played_item_darkening"].default, UITheme._meta.get_field("played_item_darkening").default)
+        validate_css_color(model_field.default)
+
+    def test_widget_script_does_not_rewrite_the_stored_value_on_load(self):
+        html = RGBAColorWidget().render("c", "#fff", {"id": "id_c"})
+        script = html[html.index("<script>"):]
+        self.assertEqual(script.count("hidden.value ="), 1)          # only inside update()
+        self.assertNotIn("\n    update();", script)                    # no unconditional call at initialisation
+        self.assertIn('value="#fff"', html)
 
     def test_an_existing_station_value_survives_a_save_that_never_touches_the_slider(self):
         theme = UITheme.load()
@@ -203,3 +242,45 @@ class NavigationMarkupTests(ThemeFormMixin, TestCase):
         html = self.client.get("/library/").content.decode()
         self.assertIn('class="nav-logout-form"', html)
         self.assertIn('id="navLinks"', html)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class OtherColourWidgetConsumerTests(ThemeFormMixin, TestCase):
+    """The shared widget's other users render each stored colour untouched into the form
+    (the JavaScript preserving it on load is exercised in the browser tests)."""
+
+    def test_category_kind_changelist_carries_stored_colours_verbatim(self):
+        from library.models import CategoryKind
+        CategoryKind.objects.create(code="ck1", name="Kind One", fill_color="#fff", sort_order=1)
+        CategoryKind.objects.create(code="ck2", name="Kind Two", fill_color="rgba(1, 2, 3, 0.4)", sort_order=2)
+        html = self.client.get("/admin/library/categorykind/").content.decode()
+        hidden = re.findall(r'<input type="hidden" name="form-\d+-fill_color" id="[^"]*" value="([^"]*)">', html)
+        self.assertIn("#fff", hidden)
+        self.assertIn("rgba(1, 2, 3, 0.4)", hidden)
+        self.assertEqual(len(hidden), html.count("_alpha_label\" style"))         # one widget per kind row
+
+    def test_fx_cart_form_carries_both_widgets(self):
+        from library.models import FXCart
+        cart = FXCart.objects.create(name="Widget Cart", filepath="/tmp/widget-cart.wav", enabled=True,
+                                     idle_color="#abc", playing_color="rgba(5, 6, 7, 0.5)")
+        html = self.client.get(f"/admin/library/fxcart/{cart.pk}/change/").content.decode()
+        self.assertIn('name="idle_color" id="id_idle_color" value="#abc"', html)
+        self.assertIn('name="playing_color" id="id_playing_color" value="rgba(5, 6, 7, 0.5)"', html)
+
+    def test_ui_theme_palette_values_render_verbatim(self):
+        UITheme.objects.filter(pk=1).update(accent="#4ade80", panel_bg="rgba(15, 23, 42, 0.95)")
+        html = self.client.get(CHANGE).content.decode()
+        self.assertIn('name="accent" id="id_accent" value="#4ade80"', html)
+        self.assertIn('name="panel_bg" id="id_panel_bg" value="rgba(15, 23, 42, 0.95)"', html)
+
+
+class Migration0102ClassificationTests(TestCase):
+    def test_both_operations_classify_as_additive_with_the_shared_validator(self):
+        import importlib
+
+        from updatecenter.management.commands.updatecenter_probe import _classify_migration_operation
+        migration = importlib.import_module("library.migrations.0102_uitheme_log_display_appearance")
+        instance = migration.Migration("0102_uitheme_log_display_appearance", "library")
+        results = [_classify_migration_operation(instance, op) for op in instance.operations]
+        self.assertEqual([r["classification"] for r in results], ["additive", "additive"], results)
+        self.assertEqual([r["operation"] for r in results], ["AddField", "AddField"])

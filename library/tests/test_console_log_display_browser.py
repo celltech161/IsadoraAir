@@ -596,6 +596,19 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.assertFalse(any(p[0] >= 240 and p[1] <= 30
                              for p in self.edge_pixels(page, 'tr[data-item-id="905"] td:nth-child(3)')))
 
+    def test_outline_colour_formats_and_alpha_render(self):
+        blue = (40, 90, 200)           # the current row's own fill
+        for value, colour, alpha in (("rgb(0, 255, 0)", (0, 255, 0), 1.0), ("rgba(255, 0, 0, 0.50)", (255, 0, 0), 0.5),
+                                     ("#FFFFFF80", (255, 255, 255), 128 / 255), ("#fff", (255, 255, 255), 1.0),
+                                     ("#0f08", (0, 255, 0), 0x88 / 255)):
+            with self.subTest(outline=value):
+                page = self.console(flag=True, appearance={"current_item_outline_color": value})
+                self.wait_states(page, GOLD)
+                self.reveal_queue(page)
+                want = tuple(round(alpha * c + (1 - alpha) * b) for c, b in zip(colour, blue))
+                edges = self.edge_pixels(page, "tr.qt-current td:nth-child(3)")
+                self.assertTrue(any(all(abs(a - b) <= 28 for a, b in zip(px, want)) for px in edges), (value, want, edges))
+
     def playing_ids(self, page):
         return page.evaluate("() => Array.from(document.querySelectorAll('#queueList tr'))"
                              ".filter(tr => tr.querySelector('.qt-playing-icon')).map(tr => tr.dataset.itemId)")
@@ -700,6 +713,65 @@ class _LogDisplayBase(_ConsoleBrowserBase):
                 {"x": sx + (dx - sx) * k / 6, "y": sy + (dy - sy) * k / 6}]})
         cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
         self.assertEqual(json.loads(self.wait_post(page, "/api/log/77/reorder/")[0]), {"order": [905, 904]})
+
+    # ------------------------------------------------------------ admin colour widget
+    def open_admin(self, path):
+        client = Client()
+        client.force_login(self.superuser)
+        context = self.browser.new_context(viewport=DESKTOP)
+        self.addCleanup(context.close)
+        context.add_cookies([{"name": "sessionid", "value": client.cookies["sessionid"].value,
+                              "url": self.live_server_url}])
+        page = context.new_page()
+        self.console_errors = []
+        page.on("pageerror", lambda exc: self.console_errors.append(str(exc)))
+        page.goto(self.live_server_url + path)
+        return page
+
+    def save_admin(self, page):
+        page.click("input[name=_save]")
+        page.wait_for_selector(".messagelist .success", timeout=15_000)
+
+    def test_admin_round_trip_keeps_untouched_outline_colours(self):
+        """The real RGBAColorWidget JavaScript, in the real UI Theme admin form: opening it and
+        saving an unrelated setting must not change a stored colour."""
+        for stored in ("#fff", "#FFFFFF80", "#fff8", "rgba(10, 20, 30, 0.37)"):
+            with self.subTest(stored=stored):
+                UITheme.objects.filter(pk=1).update(current_item_outline_color=stored, show_played_items=False)
+                page = self.open_admin("/admin/library/uitheme/1/change/")
+                self.assertEqual(page.input_value("#id_current_item_outline_color"), stored)
+                page.check("#id_show_played_items")                    # the unrelated change
+                self.save_admin(page)
+                theme = UITheme.objects.get(pk=1)
+                self.assertEqual(theme.current_item_outline_color, stored)
+                self.assertTrue(theme.show_played_items)
+                self.assertEqual(self.console_errors, [])
+
+    def test_admin_intentional_colour_and_opacity_changes_are_saved(self):
+        UITheme.objects.filter(pk=1).update(current_item_outline_color="#FFFFFF80")
+        page = self.open_admin("/admin/library/uitheme/1/change/")
+        page.evaluate("""() => { const set = (id, v) => { const e = document.getElementById(id); e.value = v;
+          e.dispatchEvent(new Event('input', {bubbles: true})); };
+          set('id_current_item_outline_color_alpha', '25'); set('id_current_item_outline_color_color', '#ff0000'); }""")
+        self.save_admin(page)
+        self.assertEqual(UITheme.objects.get(pk=1).current_item_outline_color, "rgba(255, 0, 0, 0.25)")
+
+    def test_other_colour_widget_consumers_survive_opening_and_saving(self):
+        from library.models import CategoryKind
+        CategoryKind.objects.all().delete()
+        CategoryKind.objects.create(code="wk1", name="Widget Kind One", fill_color="#fff", sort_order=1)
+        CategoryKind.objects.create(code="wk2", name="Widget Kind Two", fill_color="rgba(1, 2, 3, 0.4)", sort_order=2)
+        page = self.open_admin("/admin/library/categorykind/")
+        self.save_admin(page)                                       # nothing touched
+        self.assertEqual(dict(CategoryKind.objects.values_list("code", "fill_color")),
+                         {"wk1": "#fff", "wk2": "rgba(1, 2, 3, 0.4)"})
+        self.assertEqual(self.console_errors, [])
+        # And the UI Theme palette (a dozen widgets on one form) is untouched by an ordinary save.
+        before = {f: getattr(UITheme.load(), f) for f in ("bg_dark", "panel_bg", "accent", "border_subtle",
+                                                          "deck_text_shadow_color", "nav_clock_color")}
+        page = self.open_admin("/admin/library/uitheme/1/change/")
+        self.save_admin(page)
+        self.assertEqual({f: getattr(UITheme.objects.get(pk=1), f) for f in before}, before)
 
     # ------------------------------------------------------------ shared navigation
     NAV = """() => ({open: document.getElementById('navLinks').classList.contains('open'),

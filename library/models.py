@@ -1,9 +1,10 @@
 import os
+import re
 import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator, URLValidator
+from django.core.validators import MaxValueValidator, MinValueValidator, URLValidator
 from django.db import models, router, transaction
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
@@ -1665,6 +1666,30 @@ class UploadConfig(models.Model):
         return obj
 
 
+_HEX_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+_FUNC_COLOR = re.compile(
+    r"^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*(\d*\.?\d+)\s*)?\)$")
+
+
+def validate_css_color(value):
+    """The colour syntax the admin colour widget (RGBAColorWidget) can read back
+    exactly: #rgb, #rgba, #rrggbb, #rrggbbaa, rgb(r, g, b) and rgba(r, g, b, a),
+    with channels 0-255 and alpha 0-1. Deliberately not every CSS colour
+    expression: whatever is accepted here must round-trip through the widget."""
+    value = (value or "").strip()
+    if _HEX_COLOR.match(value):
+        return
+    match = _FUNC_COLOR.match(value)
+    if match:
+        channels = [int(match.group(i)) for i in (1, 2, 3)]
+        alpha = float(match.group(4)) if match.group(4) is not None else 1.0
+        if all(0 <= c <= 255 for c in channels) and 0.0 <= alpha <= 1.0:
+            return
+    raise ValidationError(
+        "Enter #rgb, #rgba, #rrggbb, #rrggbbaa, rgb(r, g, b) or rgba(r, g, b, a) "
+        "(channels 0-255, alpha 0-1).")
+
+
 class UITheme(models.Model):
     """Singleton — site-wide color palette and nav bar sizing, editable in admin."""
     bg_dark = models.CharField(max_length=50, default="#0f172a", help_text="Any CSS color value (hex, rgb, rgba).")
@@ -1753,9 +1778,7 @@ class UITheme(models.Model):
     )
     current_item_outline_color = models.CharField(
         max_length=50, default="rgba(255, 255, 255, 1.00)",
-        validators=[RegexValidator(
-            r"^(#[0-9a-fA-F]{3,8}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*(,\s*(0|1|0?\.\d+|1\.0+)\s*)?\))$",
-            "Enter a hex colour or an rgb()/rgba() value.")],
+        validators=[validate_css_color],
         help_text="Outline drawn around the row(s) actually on air when Show played items "
                    "is on (default opaque white). Colour and opacity.",
     )
