@@ -578,6 +578,77 @@ def api_schedule_hour_detail(request):
     })
 
 
+PAST_OVERRIDES_DEFAULT_DATES = 30
+PAST_OVERRIDES_MAX_DATES = 100
+
+
+def _station_local_today():
+    """Today's date in the configured station timezone, independent of the
+    request's activated timezone (the middleware activates the same zone, but
+    this must not depend on it)."""
+    from library.middleware import get_station_timezone
+    return timezone.localtime(timezone.now(), get_station_timezone()).date()
+
+
+@require_http_methods(["GET"])
+def api_schedule_past_overrides(request):
+    """Stored, explicit date-specific schedule rows of one profile, dated
+    BEFORE today (station time) -- newest date first.
+
+    Answers "which old date still references this rotation/playlist?". It reads
+    ScheduleBlock rows directly (never the effective/inherited resolution), so
+    every explicit transition appears, including those at minutes other than
+    :00, and weekly rows never do. Today's and future overrides are excluded.
+
+    Read-only, same access as the other schedule reads. Paginated by whole
+    dates so one date is never split: ``?limit=N`` dates (default 30, max 100)
+    and ``?before=YYYY-MM-DD`` (exclusive) for the next page. ``?q=`` narrows
+    to rows whose rotation or playlist name contains the text.
+    """
+    profile = _selected_profile(request)
+    today = _station_local_today()
+    try:
+        before = _parse_iso_date(request.GET["before"]) if request.GET.get("before") else today
+        limit = int(request.GET.get("limit") or PAST_OVERRIDES_DEFAULT_DATES)
+    except (ValidationError, ValueError):
+        return JsonResponse({"error": "before must be YYYY-MM-DD and limit an integer"}, status=400)
+    limit = max(1, min(limit, PAST_OVERRIDES_MAX_DATES))
+    before = min(before, today)
+    query = (request.GET.get("q") or "").strip()[:100]
+
+    rows = ScheduleBlock.objects.filter(
+        profile=profile, specific_date__isnull=False, day_of_week__isnull=True, specific_date__lt=before,
+    )
+    if query:
+        rows = rows.filter(Q(rotation__name__icontains=query) | Q(playlist__name__icontains=query))
+    dates = list(
+        rows.order_by("-specific_date").values_list("specific_date", flat=True).distinct()[: limit + 1]
+    )
+    has_more = len(dates) > limit
+    dates = dates[:limit]
+    grouped = {day: [] for day in dates}
+    if dates:
+        for block in (
+            rows.filter(specific_date__in=dates)
+            .select_related("rotation", "playlist")
+            .order_by("-specific_date", "start_time", "pk")
+        ):
+            item = _block_to_dict(block)
+            item["start_time"] = block.start_time.strftime("%H:%M")
+            item["minute"] = block.start_time.minute
+            item["specific_date"] = block.specific_date.isoformat()
+            grouped[block.specific_date].append(item)
+    return JsonResponse({
+        "profile_uuid": str(profile.uuid),
+        "is_archived": profile.is_archived,
+        "today": today.isoformat(),
+        "query": query,
+        "dates": [{"date": day.isoformat(), "overrides": grouped[day]} for day in dates],
+        "has_more": has_more,
+        "next_before": dates[-1].isoformat() if has_more else None,
+    })
+
+
 # ---------------------------------------------------------------
 # Categories
 # ---------------------------------------------------------------

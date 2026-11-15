@@ -327,6 +327,33 @@
   .date-schedule-head h2 { margin: 0; font-size: 1rem; }
   .date-schedule-head .profile-notice { margin: 0; }
   .date-hour-list { display: flex; flex-direction: column; gap: 4px; }
+  .date-controls button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .past-overrides[hidden], .past-overrides-more[hidden], .date-schedule-head[hidden], .date-hour-list[hidden] { display: none; }
+  .past-overrides-head { display: flex; align-items: center; gap: .5rem 1rem; flex-wrap: wrap; margin-bottom: .45rem; }
+  .past-overrides-head h2 { margin: 0; font-size: 1rem; }
+  .past-overrides-head button, .past-overrides-more, .past-override-actions button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .32rem .55rem; cursor: pointer; }
+  .past-overrides-head button:hover, .past-overrides-more:hover, .past-override-actions button:hover:not(:disabled) { border-color: var(--accent); }
+  .past-override-actions button.danger { color: var(--danger); }
+  .past-override-actions button:disabled { opacity: .45; cursor: not-allowed; }
+  .past-overrides-filter { flex: 1 1 14rem; max-width: 22rem; background: var(--bg-darker); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .38rem .5rem; }
+  .past-overrides-list { display: flex; flex-direction: column; gap: .6rem; margin-top: .55rem; }
+  .past-override-date { background: var(--panel-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: .5rem .65rem; }
+  .past-override-date h3 { margin: 0 0 .35rem; font-size: .9rem; display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .past-override-date h3 button { font-size: .78rem; }
+  .past-override-row { display: grid; grid-template-columns: 4rem 5.5rem 1fr auto; align-items: center; gap: .5rem; padding: .3rem 0; border-top: 1px solid var(--border-subtle); }
+  .past-override-row:first-of-type { border-top: none; }
+  .past-override-time { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .past-override-kind { font-size: .7rem; font-weight: 800; letter-spacing: .04em; color: var(--text-muted); text-transform: uppercase; }
+  .past-override-name { overflow-wrap: anywhere; }
+  .past-override-name::before { content: ""; display: inline-block; width: .65rem; height: .65rem; border-radius: 2px; margin-right: .4rem; background: var(--content-color, transparent); vertical-align: -1px; }
+  .past-override-actions { display: flex; gap: .35rem; flex-wrap: wrap; justify-content: flex-end; }
+  .date-hour-row.focus-hour { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (max-width: 640px) {
+    .past-override-row { grid-template-columns: 3.6rem 1fr; }
+    .past-override-kind { grid-column: 2; }
+    .past-override-name { grid-column: 1 / -1; }
+    .past-override-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  }
   .date-load-state {
     padding: .9rem .75rem;
     border: 1px dashed var(--border-subtle);
@@ -474,6 +501,8 @@
       <label>Date: <input id="overrideDate" type="date" aria-label="Selected override date"></label>
       <button type="button" id="nextDateButton" title="Next day" aria-label="Next day" onclick="shiftOverrideDate(1)">&rarr;</button>
       <button type="button" id="todayButton" onclick="selectToday()">Today</button>
+      <button type="button" id="pastOverridesButton" aria-pressed="false" aria-controls="pastOverrides"
+              title="List this profile's explicit date overrides before today" onclick="togglePastOverrides()">Past Overrides</button>
     </div>
   </div>
   <div id="apiError" class="api-error" role="alert"></div>
@@ -564,6 +593,20 @@
     <p class="profile-notice">Each badge identifies the :00 assignment. Striped rows have minute transitions; Hour Detail shows the server-resolved timeline.</p>
   </div>
   <div id="dateHourList" class="date-hour-list" aria-label="24-hour Date Override schedule"></div>
+  <!-- Past Overrides: the selected profile's stored, explicit date rows dated
+       before today (station time), newest first. Read directly from the stored
+       rows, never from the inherited 24-hour view. -->
+  <section id="pastOverrides" class="past-overrides" aria-labelledby="pastOverridesTitle" hidden>
+    <div class="past-overrides-head">
+      <h2 id="pastOverridesTitle">Past Overrides</h2>
+      <input type="search" id="pastOverridesFilter" class="past-overrides-filter" aria-label="Filter past overrides by rotation or playlist name"
+             placeholder="Filter by rotation or playlist…">
+      <button type="button" id="pastOverridesClose" onclick="togglePastOverrides(false)">Back to date</button>
+    </div>
+    <p class="profile-notice">Explicit date overrides before today in this profile, newest first, including minute transitions. Removing one deletes only that dated assignment; the rotation or playlist, other dates and generated logs are not changed.</p>
+    <div id="pastOverridesList" class="past-overrides-list" aria-live="polite"></div>
+    <button type="button" id="pastOverridesMore" class="past-overrides-more" hidden onclick="loadPastOverrides(true)">Load older dates</button>
+  </section>
 </div>
 
 <!-- Hour Detail: the sixty minute positions of one hour. Only explicit
@@ -642,6 +685,14 @@ let hourDetailRequestGeneration = 0;
 let dateScheduleRequestGeneration = 0;
 let weeklyScheduleRequestGeneration = 0;
 let profileRequestGeneration = 0;
+// Past Overrides (Date Override mode): open state, request generation and the
+// list currently shown; pendingDateFocus is the hour to highlight once the
+// chosen date's 24-hour view has rendered.
+let pastOverridesOpen = false;
+let pastOverridesRequestGeneration = 0;
+let pastOverridesView = null;   // {profileUuid, q, nextBefore}
+let pastOverridesFilterTimer = null;
+let pendingDateFocus = null;    // {profileUuid, date, hour, minute}
 
 // Store content info per cell for mobile rendering
 const cellRotations = {};
@@ -739,7 +790,7 @@ async function loadProfiles(preferredUuid = null) {
     });
     select.setAttribute('aria-busy', 'false');
     updateProfileChrome();
-    if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+    await reloadScheduleView();
   } catch (error) {
     if (!isCurrent()) return;
     select.setAttribute('aria-busy', 'false');
@@ -832,10 +883,18 @@ async function deleteProfile() {
   } catch (error) { showError(error.message); }
 }
 
+// Whatever the page currently shows for the selected profile.
+async function reloadScheduleView() {
+  if (scheduleMode !== 'date') await loadSchedule();
+  else if (pastOverridesOpen) await loadPastOverrides();
+  else await loadDateSchedule();
+}
+
 async function setMode(mode) {
   closeHourDetail();
   dateScheduleRequestGeneration++;  // a late Date Override response must go inert
   weeklyScheduleRequestGeneration++;  // likewise for a late Weekly response
+  showPastOverrides(false);         // and a late Past Overrides response
   scheduleMode = mode;
   document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
   document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
@@ -895,6 +954,9 @@ function setOverrideDate(isoDate) {
   const input = document.getElementById('overrideDate');
   input.value = isoDate;
   closeHourDetail();
+  // Choosing a date returns to that date's 24-hour view.
+  pendingDateFocus = null;
+  showPastOverrides(false);
   if (scheduleMode === 'date') loadDateSchedule();
 }
 
@@ -1221,7 +1283,7 @@ function showDateScheduleLoading() {
 
 function dateScheduleContextIsLive(ctx) {
   return !!ctx && ctx.generation === dateScheduleRequestGeneration
-    && scheduleMode === 'date' && !!selectedProfile
+    && scheduleMode === 'date' && !pastOverridesOpen && !!selectedProfile
     && selectedProfile.uuid === ctx.profileUuid
     && document.getElementById('overrideDate').value === ctx.date;
 }
@@ -1308,6 +1370,7 @@ async function loadDateSchedule() {
     });
     list.style.minHeight = '';
     list.setAttribute('aria-busy', 'false');
+    applyPendingDateFocus(ctx);
   } catch (error) {
     if (!dateScheduleContextIsLive(ctx)) return;  // a stale failure never speaks for the new context
     list.style.minHeight = '';
@@ -1556,6 +1619,200 @@ async function afterMinuteWrite(ctx) {
   if (ctx.mode === 'date') await loadDateSchedule(); else await loadSchedule();
 }
 
+// --- Past Overrides ---------------------------------------------------------
+// Lists the selected profile's stored date-specific rows dated before today
+// (station time; decided by the server), newest first, so an obsolete rotation
+// or playlist reference can be found and removed. Removal reuses the existing
+// scoped DELETE /api/schedule/<id>/?profile=&date= (schedule.edit, archived
+// profiles refused) and deletes exactly one dated row.
+
+function showPastOverrides(open) {
+  const wasOpen = pastOverridesOpen;
+  pastOverridesOpen = !!open;
+  pastOverridesRequestGeneration++;   // any in-flight list response is now inert
+  dateScheduleRequestGeneration++;    // and so is any in-flight 24-hour response
+  clearTimeout(pastOverridesFilterTimer);
+  const button = document.getElementById('pastOverridesButton');
+  button.setAttribute('aria-pressed', pastOverridesOpen ? 'true' : 'false');
+  document.getElementById('pastOverrides').hidden = !pastOverridesOpen;
+  document.querySelector('#dateSchedule .date-schedule-head').hidden = pastOverridesOpen;
+  document.getElementById('dateHourList').hidden = pastOverridesOpen;
+  if (!pastOverridesOpen) {
+    pastOverridesView = null;
+    document.getElementById('pastOverridesList').replaceChildren();
+    document.getElementById('pastOverridesMore').hidden = true;
+  } else if (!wasOpen) {
+    closeHourDetail();
+  }
+}
+
+async function togglePastOverrides(open) {
+  const next = open === undefined ? !pastOverridesOpen : !!open;
+  if (scheduleMode !== 'date') return;
+  showPastOverrides(next);
+  if (next) {
+    await loadPastOverrides();
+  } else {
+    await loadDateSchedule();
+  }
+}
+
+function pastOverridesContextIsLive(ctx) {
+  return !!ctx && ctx.generation === pastOverridesRequestGeneration && pastOverridesOpen
+    && scheduleMode === 'date' && !!selectedProfile && selectedProfile.uuid === ctx.profileUuid
+    && document.getElementById('pastOverridesFilter').value.trim() === ctx.q;
+}
+
+// A rendered row acts only while the list it belongs to is still the one shown.
+function pastOverridesRowIsLive(ctx, element) {
+  return !!ctx && pastOverridesOpen && scheduleMode === 'date' && !!selectedProfile
+    && selectedProfile.uuid === ctx.profileUuid && !!element && element.isConnected;
+}
+
+function pastOverridesStateNode(text) {
+  const node = document.createElement('div');
+  node.className = 'date-load-state';
+  node.setAttribute('role', 'status');
+  node.textContent = text;
+  return node;
+}
+
+async function loadPastOverrides(append = false) {
+  const generation = ++pastOverridesRequestGeneration;
+  const list = document.getElementById('pastOverridesList');
+  const more = document.getElementById('pastOverridesMore');
+  if (!pastOverridesOpen || !selectedProfile) return;
+  const q = document.getElementById('pastOverridesFilter').value.trim();
+  const before = append && pastOverridesView && pastOverridesView.profileUuid === selectedProfile.uuid
+    && pastOverridesView.q === q ? pastOverridesView.nextBefore : null;
+  if (append && !before) return;
+  const ctx = Object.freeze({generation, profileUuid: selectedProfile.uuid, q, before});
+  more.hidden = true;
+  if (!append) {
+    pastOverridesView = null;
+    list.setAttribute('aria-busy', 'true');
+    list.replaceChildren(pastOverridesStateNode('Loading past overrides\u2026'));
+  }
+  let url = `/api/schedule/past-overrides/?profile=${encodeURIComponent(ctx.profileUuid)}`;
+  if (ctx.q) url += `&q=${encodeURIComponent(ctx.q)}`;
+  if (ctx.before) url += `&before=${encodeURIComponent(ctx.before)}`;
+  try {
+    const data = await apiRequest(url);
+    if (!pastOverridesContextIsLive(ctx) || data.profile_uuid !== ctx.profileUuid) return;
+    if (!append) list.replaceChildren();
+    data.dates.forEach(group => list.appendChild(renderPastOverrideDate(group, ctx)));
+    if (!list.children.length) {
+      list.appendChild(pastOverridesStateNode(ctx.q
+        ? 'No past overrides in this profile match that name.'
+        : 'This profile has no date overrides before today.'));
+    }
+    list.setAttribute('aria-busy', 'false');
+    pastOverridesView = {profileUuid: ctx.profileUuid, q: ctx.q, nextBefore: data.next_before};
+    more.hidden = !data.has_more;
+  } catch (error) {
+    if (!pastOverridesContextIsLive(ctx)) return;
+    list.setAttribute('aria-busy', 'false');
+    if (!append) list.replaceChildren(pastOverridesStateNode('Past overrides could not be loaded.'));
+    showError(error.message);
+  }
+}
+
+function renderPastOverrideDate(group, ctx) {
+  const section = document.createElement('section');
+  section.className = 'past-override-date';
+  section.dataset.date = group.date;
+  const heading = document.createElement('h3');
+  const title = document.createElement('span');
+  title.textContent = formatSelectedDate(group.date);
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.textContent = 'Show date';
+  open.setAttribute('aria-label', `Show the Date Override schedule for ${formatSelectedDate(group.date)}`);
+  open.addEventListener('click', () => showPastOverrideDate(group.date, group.overrides[0], ctx, open));
+  heading.append(title, open);
+  section.appendChild(heading);
+  group.overrides.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'past-override-row';
+    row.dataset.blockId = item.id;
+    const at = document.createElement('span');
+    at.className = 'past-override-time';
+    at.textContent = item.start_time;
+    const kind = document.createElement('span');
+    kind.className = 'past-override-kind';
+    kind.textContent = item.content_kind === 'playlist' ? 'Playlist' : 'Rotation';
+    const name = document.createElement('span');
+    name.className = 'past-override-name';
+    name.textContent = item.content_name || '\u2014';
+    if (item.content_id) name.style.setProperty('--content-color', contentColor(item.content_kind, item.content_id));
+    const actions = document.createElement('div');
+    actions.className = 'past-override-actions';
+    const inspect = document.createElement('button');
+    inspect.type = 'button';
+    inspect.textContent = item.minute ? 'Hour Detail' : 'Show hour';
+    inspect.setAttribute('aria-label', `Inspect ${formatSelectedDate(group.date)} at ${item.start_time}`);
+    inspect.addEventListener('click', () => showPastOverrideDate(group.date, item, ctx, inspect));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'danger';
+    remove.textContent = 'Remove';
+    remove.disabled = selectedProfile.is_archived;
+    remove.title = selectedProfile.is_archived ? 'Archived profiles are read-only' : 'Remove only this dated assignment';
+    remove.setAttribute('aria-label', `Remove the ${item.start_time} override on ${formatSelectedDate(group.date)} (${kind.textContent}: ${item.content_name})`);
+    remove.addEventListener('click', () => removePastOverride(group.date, item, ctx, remove));
+    actions.append(inspect, remove);
+    row.append(at, kind, name, actions);
+    section.appendChild(row);
+  });
+  return section;
+}
+
+function showPastOverrideDate(isoDate, item, ctx, element) {
+  if (!pastOverridesRowIsLive(ctx, element)) return;
+  const hour = item ? Number(item.start_time.slice(0, 2)) : null;
+  document.getElementById('overrideDate').value = isoDate;
+  showPastOverrides(false);
+  pendingDateFocus = hour === null ? null
+    : {profileUuid: ctx.profileUuid, date: isoDate, hour, minute: item.minute || 0};
+  loadDateSchedule();
+}
+
+function applyPendingDateFocus(ctx) {
+  const focus = pendingDateFocus;
+  pendingDateFocus = null;
+  if (!focus || focus.profileUuid !== ctx.profileUuid || focus.date !== ctx.date) return;
+  const row = document.getElementById('dateHourList').children[focus.hour];
+  if (row) {
+    row.classList.add('focus-hour');
+    row.scrollIntoView({block: 'center', behavior: 'smooth'});
+    const main = row.querySelector('.date-hour-main');
+    if (main) main.focus({preventScroll: true});
+  }
+  // A transition inside the hour is visible only in Hour Detail.
+  if (focus.minute) openHourDetail('date', null, focus.hour);
+}
+
+async function removePastOverride(isoDate, item, ctx, button) {
+  if (!pastOverridesRowIsLive(ctx, button) || selectedProfile.is_archived || button.disabled) return;
+  const kind = item.content_kind === 'playlist' ? 'Playlist' : 'Rotation';
+  const message = `Remove the ${item.start_time} override on ${formatSelectedDate(isoDate)} `
+    + `(${kind}: ${item.content_name}) from profile \u201c${selectedProfile.name}\u201d?\n\n`
+    + 'Only this dated assignment is deleted. The rotation or playlist, other dates, the weekly '
+    + 'schedule and generated logs are not changed.';
+  if (!window.confirm(message)) return;
+  button.disabled = true;
+  try {
+    await apiRequest(`/api/schedule/${item.id}/?profile=${encodeURIComponent(ctx.profileUuid)}&date=${encodeURIComponent(isoDate)}`, {
+      method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    showError('');
+  } catch (error) {
+    showError(error.message);
+  }
+  // Refresh profile counts and the list (a date whose last override was removed disappears).
+  if (selectedProfile && selectedProfile.uuid === ctx.profileUuid) await loadProfiles(ctx.profileUuid);
+}
+
 // Color the palette buttons
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.rotation-btn[data-rotation-id]').forEach(btn => {
@@ -1577,9 +1834,15 @@ document.addEventListener('DOMContentLoaded', () => {
     profileRequestGeneration++;  // an in-flight profile refresh cannot undo this explicit choice
     event.target.setAttribute('aria-busy', 'false');
     selectedProfile = profiles.find(profile => profile.uuid === event.target.value);
+    pendingDateFocus = null;
     closeHourDetail();
     updateProfileChrome();
-    if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+    if (scheduleMode === 'date' && pastOverridesOpen) await loadPastOverrides();
+    else if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+  });
+  document.getElementById('pastOverridesFilter').addEventListener('input', () => {
+    clearTimeout(pastOverridesFilterTimer);
+    pastOverridesFilterTimer = setTimeout(() => { if (pastOverridesOpen) loadPastOverrides(); }, 300);
   });
   loadProfiles();
   highlightNow();

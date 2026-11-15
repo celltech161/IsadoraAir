@@ -248,3 +248,33 @@ switches to the partial log without touching the currently playing deck; that
 deck finishes or crossfades naturally. A track crossing the takeover minute is
 therefore expected, not a hard-cut failure. Restart recovery continues to keep
 the interrupted occurrence identity separate from the saved active queue.
+
+## Past Overrides
+
+In Date Override mode, **Past Overrides** (right of the date controls) replaces
+the 24-hour day view with the selected profile's stored, explicit date rows
+dated **before today** in the station timezone, newest date first. It answers
+"which old date still references this rotation or playlist?" -- for example
+when a Rotation cannot be deleted because a forgotten dated `ScheduleBlock`
+still protects it.
+
+- It reads stored rows directly (`specific_date < today`, never weekly rows and
+  never the inherited/effective resolution), so every explicit transition is
+  listed, including those at minutes other than `:00`. Today's and future
+  overrides are not listed.
+- `GET /api/schedule/past-overrides/?profile=<uuid>` (same access as the other
+  schedule reads) returns whole dates, `?limit=` dates per page (default 30,
+  at most 100) with `?before=<date>` as the cursor for **Load older dates**,
+  and `?q=` to narrow by rotation or playlist name.
+- **Show date** / **Show hour** return to that date's 24-hour view and highlight
+  the hour; a transition inside the hour also opens Hour Detail.
+- **Remove** (after a confirmation naming the date, time, content and profile)
+  uses the existing scoped `DELETE /api/schedule/<id>/?profile=&date=` --
+  `schedule.edit`, archived profiles refused -- and deletes exactly that one
+  dated row. It never deletes the Rotation or Playlist, other dates, sibling
+  transitions, the weekly schedule or generated logs (no log references a
+  `ScheduleBlock`). A content item can be referenced by several dates and
+  several profiles; it becomes deletable only once every reference is gone.
+- Switching profile, switching to Weekly Schedule or choosing a date discards
+  any in-flight list request (request generation), so a late answer never
+  renders for the wrong profile, filter or mode.
