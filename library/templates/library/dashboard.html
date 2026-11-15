@@ -1667,6 +1667,12 @@
   </button>
 </div>
 <div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>
+{% if mode != 'remote_dj' %}{% if console_caps.rdj_emergency_mute or console_caps.rdj_force_disconnect %}
+{# r0119: the emergency controls are the Remote PTT and Connect buttons; this #}
+{# line reports an administrator action's progress and engine outcome.        #}
+<div class="rdj-admin-msg" id="rdjAdminMsg" role="status" aria-live="polite"></div>
+{% endif %}{% endif %}
+<audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 {# Roadmap 2.17 Package B: shown before a same-tab navigation would drop this #}
 {# page's live Remote DJ connection (rdjConfirmLeave).                        #}
 <dialog id="rdjLeaveDialog" class="rdj-leave-dialog" aria-labelledby="rdjLeaveTitle" aria-describedby="rdjLeaveText"
@@ -1679,12 +1685,6 @@
     <button type="button" id="rdjLeaveGo" onclick="rdjLeaveAndDisconnect()">Leave and disconnect</button>
   </div>
 </dialog>
-{% if mode != 'remote_dj' %}{% if console_caps.rdj_emergency_mute or console_caps.rdj_force_disconnect %}
-{# r0119: the emergency controls are the Remote PTT and Connect buttons; this #}
-{# line reports an administrator action's progress and engine outcome.        #}
-<div class="rdj-admin-msg" id="rdjAdminMsg" role="status" aria-live="polite"></div>
-{% endif %}{% endif %}
-<audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
 <div class="decks-row{% if console_caps.start_next %} has-start-next{% endif %}" id="decksRow">
   <div class="deck-panel" id="deck-A"></div>
@@ -3549,7 +3549,8 @@ function rdjLocalLink(data) {
 // installing this release requires, ends any Remote DJ session anyway.)
 function rdjMayGate(data) {
   // 2.17 Package B: never while an automatic reconnect sequence is pending.
-  return !rdjRetry && rdjLocalLink(data) === 'owner';
+  if (rdjRetry) return false;
+  return rdjLocalLink(data) === 'owner';
 }
 
 // Roadmap 2.17A -- the Remote Mic request's mandatory session binding: the

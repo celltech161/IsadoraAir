@@ -506,8 +506,11 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
                       self._function("rdjPageHasNoLink"))
         # r0119 review F1: after this page's own close, a strictly newer
         # trusted snapshot is required before any administrator action.
+        # 2.17 Package B: every local release (Disconnect included) goes
+        # through rdjReleaseLocal, which records the closing snapshot.
         self.assertIn("rdjLinkClosedRevision = acceptedRevision ? { ...acceptedRevision } : { instance: null, seq: 0 };",
-                      self._function("rdjDisconnect"))
+                      self._function("rdjReleaseLocal"))
+        self.assertIn("rdjReleaseLocal();", self._function("rdjDisconnect"))
         self.assertIn("(acceptedRevision.instance !== closed.instance || acceptedRevision.seq > closed.seq)",
                       self._function("rdjSeenSinceOwnClose"))
         self.assertIn("btn.dataset.adminAction === 'kick' && rdjAdminKickMode(live)", self._function("toggleRemoteDjConnect"))
@@ -520,7 +523,9 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
         connect = self._function("toggleRemoteDjConnect")
         self.assertLess(connect.index("if (rdjPc || rdjWs) { rdjDisconnect(); return; }"),
                         connect.index("rdjAdminKickMode(live)"))
-        self.assertLess(connect.index("if (live.remote_dj_connected) {"), connect.index("fetch('/api/remote-dj/token/'"))
+        # 2.17 Package B: the token request lives in rdjStartConnection, which
+        # the operator path starts only after these checks.
+        self.assertLess(connect.index("if (live.remote_dj_connected) {"), connect.index("rdjStartConnection(0);"))
         # Results come only from the engine's outcome for this request.
         track = self._function("rdjAdminTrack")
         self.assertIn("result.request_id === pending.requestId", track)
@@ -546,8 +551,11 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
                       binding)
 
     def test_control_key_lives_only_in_page_memory_for_one_attempt(self):
-        self.assertIn("rdjControlKey = null;", self._function("rdjDisconnect"))
-        connect = self._function("toggleRemoteDjConnect")
+        # 2.17 Package B: released by rdjReleaseLocal (Disconnect and every
+        # other local release); one attempt is started by rdjStartConnection.
+        self.assertIn("rdjControlKey = null;", self._function("rdjReleaseLocal"))
+        self.assertIn("rdjReleaseLocal();", self._function("rdjDisconnect"))
+        connect = self._function("rdjStartConnection")
         self.assertIn("/^[0-9a-f]{64}$/.test(tokenResponse.control_key)", connect)
         self.assertIn("if (!token || !rdjAttemptId || !rdjControlKey ||", connect)
         self.assertLess(connect.index("rdjControlKey = null;"), connect.index("fetch('/api/remote-dj/token/'"))
@@ -560,7 +568,8 @@ class RemoteDjIdentityTemplateContractTests(SimpleTestCase):
 
     def test_browser_key_is_derived_locally_and_dropped_on_disconnect(self):
         self.assertIn("window.crypto.subtle.digest('SHA-256'", self._function("rdjDeriveBrowserKey"))
-        self.assertIn("rdjBrowserKey = null;", self._function("rdjDisconnect"))
+        self.assertIn("rdjBrowserKey = null;", self._function("rdjReleaseLocal"))   # 2.17 Package B
+        self.assertIn("rdjReleaseLocal();", self._function("rdjDisconnect"))
 
     def test_status_polling_is_single_flight_and_bounded(self):
         # Fourth review: at most one outstanding status request, bounded by a
