@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0140",
+  "previous_release_id": "r0139",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Remote DJ: optional automatic fresh-session reconnect after an involuntary loss (station switch, Off by default; bounded, cancellable; Remote Mic Off in every new session), an always-on leave-page warning, and explicit microphone and Web Audio cleanup. Apply additive library.0103, then restart Gunicorn and the engine (interrupts program audio and ends live Remote DJ sessions); no package, static, unit, nginx or protected-runtime change.",
+  "migrations_required": [
+    "library.0103_remotedjconfig_auto_reconnect_enabled"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
