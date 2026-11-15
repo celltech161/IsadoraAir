@@ -909,17 +909,45 @@
     margin-top: 0.3rem;
   }
 
+  /* "NEXT" pill: dark translucent with green lettering and a green double-
+     chevron badge -- the same button element and handler as before, restyled
+     only (the status/stale-connection rules below still apply to it). */
   .qt-next-btn {
-    background: none;
-    border: 1px solid var(--border-subtle);
-    border-radius: 4px;
-    color: var(--text-muted);
-    font-size: 0.7rem;
-    padding: 0.15rem 0.4rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid rgba(34, 197, 94, 0.45);
+    border-radius: 999px;
+    color: var(--accent);
+    font: inherit;
+    font-size: 0.62rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    line-height: 1;
+    padding: 0.12rem 0.15rem 0.12rem 0.5rem;
     cursor: pointer;
-    transition: color 0.12s, border-color 0.12s;
+    white-space: nowrap;
+    transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
   }
-  .qt-next-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .qt-next-btn .qt-next-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.05rem;
+    height: 1.05rem;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, var(--accent-soft), var(--accent) 70%);
+    color: #fff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25) inset;
+  }
+  .qt-next-btn .qt-next-badge svg { width: 0.7rem; height: 0.7rem; display: block; }
+  .qt-next-btn:hover, .qt-next-btn:focus-visible {
+    background: rgba(34, 197, 94, 0.16);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.25);
+    outline: none;
+  }
 
   table.queue-table .qt-drag-handle { cursor: grab; touch-action: none; }
   table.queue-table .qt-drag-handle:active { cursor: grabbing; }
@@ -1952,6 +1980,8 @@ const ICON_PLAY = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="tru
 // gap, from the supplied reference. Stroked round joins on the inset triangles
 // give the rounded corners; currentColor inherits the cell's colour.
 const ICON_SORT = '<svg viewBox="240 120 720 960" fill="currentColor" stroke="currentColor" stroke-width="80" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M600 160L920 480H280Z"/><path d="M280 720H920L600 1040Z"/></svg>';
+// Double chevron for the NEXT button's badge.
+const ICON_NEXT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 5l7 7-7 7"/><path d="M12 5l7 7-7 7"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M20 7h5v22h-5zm-9 0h5v22h-5z"/></svg>';
 const ICON_EJECT = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M6 29v-5h24v5zM18 6L6 20h24z"/></svg>';
 
@@ -4712,7 +4742,7 @@ function renderQueue(data) {
       <td class="qt-dur">${fmtDur(r.duration)}</td>
       <td class="qt-intro">${fmtIntro(r.intro)}</td>
       <td class="qt-time">${r.timeText}</td>
-      <td>${upcoming ? `<button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${r.itemId})">next</button>` : ''}</td>
+      <td>${upcoming ? `<button class="qt-next-btn" title="Play this next" aria-label="Play this next" onclick="event.stopPropagation(); setNext(${r.itemId})">NEXT<span class="qt-next-badge" aria-hidden="true">${ICON_NEXT}</span></button>` : ''}</td>
     </tr>
   `;
   }).join('');

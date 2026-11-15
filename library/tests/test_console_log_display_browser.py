@@ -814,6 +814,24 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         page.wait_for_timeout(300)
         self.assertEqual([p for p, _ in self.posts if "reorder" in p], [])
 
+    def test_next_button_is_the_themed_pill_and_still_the_same_control(self):
+        page = self.console(flag=True)
+        self.wait_states(page, GOLD)
+        self.reveal_queue(page)
+        buttons = page.evaluate("""() => Array.from(document.querySelectorAll('#queueList .qt-next-btn')).map(b => {
+          const cs = getComputedStyle(b); const badge = b.querySelector('.qt-next-badge');
+          return {row: b.closest('tr').dataset.itemId, tag: b.tagName, text: b.textContent.trim(), label: b.getAttribute('aria-label'),
+                  badge: !!badge && badge.querySelectorAll('svg path').length, radius: cs.borderTopLeftRadius,
+                  color: cs.color, bg: cs.backgroundColor, h: b.getBoundingClientRect().height}; })""")
+        self.assertEqual([b["row"] for b in buttons], ["904", "905"])           # upcoming rows only
+        for b in buttons:
+            self.assertEqual((b["tag"], b["text"], b["label"], b["badge"]), ("BUTTON", "NEXT", "Play this next", 2))
+            self.assertEqual(b["color"], "rgb(34, 197, 94)")                     # green lettering
+            self.assertRegex(b["bg"], r"^rgba\(15, 23, 42, 0\.55\)$")           # dark translucent
+            self.assertGreaterEqual(float(b["radius"][:-2]), 10)                 # pill
+            self.assertLess(b["h"], 30)                                          # compact: row height is unchanged
+        self.shot(page, "next-button")
+
     def test_next_posts_the_upcoming_item_only(self):
         page = self.console(flag=True)
         self.wait_states(page, [(901, "played"), (902, "played"), (903, "current"),
