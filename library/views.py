@@ -4422,6 +4422,102 @@ def api_remote_dj_token(request):
     })
 
 
+# Roadmap 2.17 Package B -- automatic fresh-session reconnect policy.
+#
+# A browser whose ESTABLISHED Remote DJ session ended without the operator
+# asking for it may start a NEW session only after this endpoint says
+# "retry", and must ask again before every attempt (so an Admin switch-off,
+# a revocation, a Kick, another owner or a quarantined slot stops a sequence
+# already in progress). Decisions:
+#   "retry"  every condition holds now: start ONE new attempt;
+#   "wait"   not decidable yet (old session still finalizing, its native
+#            cleanup still running, or engine status momentarily unavailable):
+#            ask again later, without consuming an attempt;
+#   "stop"   never retry this sequence (manual Connect stays available,
+#            subject to the normal admission checks).
+# Anything the browser cannot read as "retry" -- an error, a timeout, a
+# malformed answer -- must be treated as not authorized (fail closed). This
+# endpoint authorizes nothing by itself: the new attempt still needs a fresh
+# token (api_remote_dj_token: capability + schedule) and normal admission.
+REMOTE_DJ_RECONNECT_MAX_ATTEMPT_IDS = 4      # the lost attempt + at most 3 replacements
+REMOTE_DJ_RECONNECT_STOP_END_REASONS = frozenset({"kicked", "authorization_revoked", "engine_shutdown"})
+REMOTE_DJ_RECONNECT_RETRYABLE_END_REASONS = frozenset({"signaling_closed", "peer_closed", "failed"})
+REMOTE_DJ_RECONNECT_STOP_FAILURES = frozenset({"authorization_token"})
+
+
+def _remote_dj_reconnect_decision(user, attempt_ids):
+    from library.models import RemoteDJConfig
+    from library.services.remote_dj_connection import ATTEMPT_ID_PATTERN
+
+    if not attempt_ids or len(attempt_ids) > REMOTE_DJ_RECONNECT_MAX_ATTEMPT_IDS or not all(
+            ATTEMPT_ID_PATTERN.fullmatch(a) for a in attempt_ids):
+        return "stop", "invalid_request"
+    if not authorize(user, "remote_dj.connect"):          # capability AND the real schedule policy
+        return "stop", "not_authorized"
+    config = RemoteDJConfig.load()
+    if not config.enabled:
+        return "stop", "remote_dj_disabled"
+    if not config.auto_reconnect_enabled:
+        return "stop", "auto_reconnect_disabled"
+    state = _read_fresh_engine_state(REMOTE_DJ_GATE_STATE_MAX_AGE_SECONDS)
+    if state is None:
+        return "wait", "engine_status_unavailable"
+    if not state.get("remote_dj_configured"):
+        return "stop", "remote_dj_not_running"
+    slot = state.get("remote_dj_slot")
+    if slot == "quarantined":
+        return "stop", "remote_dj_unavailable"
+    if "remote_dj_slot" not in state:
+        return "stop", "engine_unsupported"          # an engine that cannot report slot release
+    last = state.get("remote_dj_connection")
+    last = last if isinstance(last, dict) else {}
+    ours = last.get("attempt_id") in attempt_ids
+    if state.get("remote_dj_connected"):
+        # Only the lost session itself still finalizing is worth waiting for;
+        # anyone else's live session ends the sequence.
+        if ours and last.get("status") in ("connecting", "connected", "reconnecting"):
+            return "wait", "previous_session_finalizing"
+        return "stop", "remote_dj_in_use"
+    if not ours:
+        # Another attempt (another browser or operator) or an engine restart
+        # replaced the record of ours: the outcome is unknowable -> no retry.
+        return "stop", "session_not_recognized"
+    end_reason = last.get("end_reason")
+    if end_reason in REMOTE_DJ_RECONNECT_STOP_END_REASONS:
+        return "stop", end_reason
+    if last.get("emergency_mute_at_end"):
+        return "stop", "emergency_mute"
+    failure = last.get("failure") if isinstance(last.get("failure"), dict) else {}
+    if failure.get("class") in REMOTE_DJ_RECONNECT_STOP_FAILURES:
+        return "stop", "not_authorized"
+    if last.get("status") not in ("ended", "failed"):
+        return "wait", "previous_session_finalizing"
+    # end_reason None with status "failed": a replacement refused before any
+    # session existed (e.g. busy while the old slot was still cleaning).
+    if end_reason is not None and end_reason not in REMOTE_DJ_RECONNECT_RETRYABLE_END_REASONS:
+        return "stop", "session_end_unclassified"      # any other stop is ambiguous -> never retry
+    if slot == "cleaning":
+        return "wait", "previous_session_cleanup"
+    if slot != "available":
+        return "wait", "slot_not_available"
+    return "retry", "ok"
+
+
+@require_http_methods(["GET"])
+def api_remote_dj_reconnect_policy(request):
+    """Fresh automatic-reconnect decision for this browser's lost Remote DJ
+    attempt(s): ``?attempts=<lost>[,<replacement>...]`` (at most 4). Returns
+    ``{"decision": "retry"|"wait"|"stop", "reason": <code>}`` and never any
+    token, key, SDP, address or other user's identity. See the comment above
+    _remote_dj_reconnect_decision for the contract."""
+    raw = request.GET.get("attempts", "")
+    attempt_ids = [part for part in raw.split(",") if part][:REMOTE_DJ_RECONNECT_MAX_ATTEMPT_IDS + 1]
+    decision, reason = _remote_dj_reconnect_decision(request.user, attempt_ids)
+    response = JsonResponse({"decision": decision, "reason": reason})
+    response["Cache-Control"] = "no-store"
+    return response
+
+
 @require_http_methods(["GET"])
 def api_waveform(request, track_id):
     """The Track's waveform cache for display. Any readable cache is shown (a legacy one too), but

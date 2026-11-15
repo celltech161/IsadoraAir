@@ -51,6 +51,7 @@ import websockets
 
 from authz.evaluator import authorize
 from library.services.remote_dj_connection import (
+    END_SIGNALING_CLOSED,
     BROWSER_MILESTONES,
     FAILURE_AUTHORIZATION_TOKEN,
     FAILURE_SIGNALING_SESSION_BUSY,
@@ -219,7 +220,7 @@ class RemoteDJSignalingServer:
                 self._ws_attempt_id = None
                 print(f"  Remote DJ disconnected: attempt={attempt_id}")
                 GLib.idle_add(
-                    self.engine._remote_dj_session_stop, attempt_id
+                    self.engine._remote_dj_session_stop, attempt_id, END_SIGNALING_CLOSED
                 )
 
     @staticmethod

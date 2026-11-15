@@ -622,9 +622,9 @@ class AdminEngineTests(GateEngineHarness, TestCase):
         session = self.live()
         stop_seen = []
         real_stop = self.engine._remote_dj_session_stop
-        self.engine._remote_dj_session_stop = lambda attempt_id=None: (
+        self.engine._remote_dj_session_stop = lambda attempt_id=None, *end_reason: (   # 2.17B: + end reason
             stop_seen.append((attempt_id, self.gate.get_property("volume"), session.gate_desired)),
-            real_stop(attempt_id))[1]
+            real_stop(attempt_id, *end_reason))[1]
         self.assertEqual(self.run_admin("kick"), "executed")
         self.assertEqual(stop_seen, [(ATTEMPT_A, 0.0, False)])           # physical gate closed BEFORE teardown
         self.assertEqual(self.sent, [(ATTEMPT_A, {"type": "kicked", "reason": "station_administrator"}, 0.0)])

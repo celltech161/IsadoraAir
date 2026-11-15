@@ -2094,6 +2094,22 @@ class RemoteDJConfig(models.Model):
                    "restart or new session required. Bounded to 3-30 "
                    "seconds.",
     )
+    auto_reconnect_enabled = models.BooleanField(
+        "Enable automatic Remote DJ reconnect",
+        default=False,
+        help_text="Roadmap 2.17 Package B -- separate from the temporary "
+                   "same-session recovery above: when a connected Remote DJ "
+                   "session has definitively ENDED through a connection loss "
+                   "(not a Disconnect, Kick, revocation, engine shutdown or "
+                   "Emergency Mute), the DJ's browser may start a brand-new "
+                   "session on its own -- a new sign-in token, new connection "
+                   "and new microphone setup, with the Remote Mic Off -- up to "
+                   "3 attempts, with a Cancel button. Off: a lost session stays "
+                   "disconnected until the DJ presses Connect (unchanged "
+                   "behaviour). Checked again before every attempt, so turning "
+                   "it off stops a reconnect already in progress. Requires "
+                   "Remote DJ itself (Master switch) to be on.",
+    )
 
     class Meta:
         verbose_name = "Remote DJ Configuration"

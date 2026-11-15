@@ -500,6 +500,9 @@ class RemoteDJEngineStateCompatibilityTests(SimpleTestCase):
                 "failure",
                 "transport",
                 "media_stats",
+                # Roadmap 2.17 Package B (additive): why the session ended.
+                "end_reason",
+                "emergency_mute_at_end",
             },
         )
         self.assertEqual(

@@ -104,6 +104,8 @@ urlpatterns = [
     path('api/engine/remote-dj-admin/', views.api_engine_remote_dj_admin, name='api-engine-remote-dj-admin'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
     path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
+    path('api/remote-dj/reconnect-policy/', views.api_remote_dj_reconnect_policy,
+         name='api-remote-dj-reconnect-policy'),
     path('api/fx/fire/', views.api_fx_fire, name='api-fx-fire'),
     path('api/fx/cart-upload/', views.api_fx_cart_upload, name='api-fx-cart-upload'),
     path('voicetracks/', views.voicetracks_page, name='voicetracks'),

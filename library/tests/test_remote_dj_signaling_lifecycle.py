@@ -146,7 +146,7 @@ class RemoteDJSignalingLifecycleTests(TransactionTestCase):
                 a_stop_calls = [
                     call
                     for call in idle_add.call_args_list
-                    if call.args == (engine._remote_dj_session_stop, ATTEMPT_A)
+                    if call.args == (engine._remote_dj_session_stop, ATTEMPT_A, "signaling_closed")
                 ]
                 self.assertEqual(a_stop_calls, [])
 
@@ -213,7 +213,7 @@ class RemoteDJSignalingLifecycleTests(TransactionTestCase):
             self.assertIsNone(server._ws)
             self.assertEqual(
                 idle_add.call_args_list[-1].args,
-                (engine._remote_dj_session_stop, ATTEMPT_A),
+                (engine._remote_dj_session_stop, ATTEMPT_A, "signaling_closed"),  # 2.17B end reason
             )
 
         asyncio.run(scenario())

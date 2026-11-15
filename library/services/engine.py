@@ -48,6 +48,12 @@ from library.services.log_builder import (
 from library.services.schedule_resolution import resolve_schedule_segments
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from library.services.remote_dj_connection import (
+    END_AUTHORIZATION_REVOKED,
+    END_ENGINE_SHUTDOWN,
+    END_FAILED,
+    END_KICKED,
+    END_PEER_CLOSED,
+    END_SESSION_STOPPED,
     ATTEMPT_ID_PATTERN,
     FAILURE_DEPENDENCY_SESSION_BUILD,
     FAILURE_ICE_STATE,
@@ -2339,7 +2345,7 @@ class PlaybackEngine:
             # quarantined generation's set_state(NULL).
             coordinator.stop()
         if self.remote_dj_session:
-            self._remote_dj_session_stop()
+            self._remote_dj_session_stop(None, END_ENGINE_SHUTDOWN)
         # r0132 B: the session's elements are already out of main_pipeline;
         # never join a worker that may be wedged in their NULL.
         remote_dj_teardowns = getattr(self, "_remote_dj_teardowns", None)
@@ -11586,6 +11592,25 @@ class PlaybackEngine:
             attempt = getattr(self, "_remote_dj_last_attempt", None)
         return attempt.snapshot() if attempt is not None else None
 
+    def _remote_dj_slot_state(self):
+        """Roadmap 2.17 Package B -- whether a NEW Remote DJ session could be
+        admitted now, from the persistent slots' r0132 lifecycle (memory only):
+        "available" (a free slot), "cleaning" (the previous session's bounded
+        native cleanup is still running), "quarantined" (cleanup failed or
+        blocked; engine restart required), "occupied" (a session holds it), or
+        None when Remote DJ is not built into this engine run."""
+        if getattr(self, "remote_dj_tee", None) is None:
+            return None
+        slots = list(getattr(self, "dj_slots", None) or [])
+        states = {(getattr(slot, "teardown", None) or {}).get("state") for slot in slots}
+        if "quarantined" in states:
+            return "quarantined"
+        if any(getattr(slot, "session", None) is None for slot in slots):
+            return "available"
+        if "cleaning" in states:
+            return "cleaning"
+        return "occupied"
+
     def _remote_dj_quality_state(self):
         """P1 1.5 Pass B2 -- compact current link-quality summary for the
         ACTIVE session only (unlike _remote_dj_connection_state, this
@@ -12070,7 +12095,7 @@ class PlaybackEngine:
             return self._remote_dj_fail_bound_session(
                 session, attempt.attempt_id, failure_class, reason
             )
-        self._remote_dj_session_stop()
+        self._remote_dj_session_stop(None, END_FAILED)
         return False
 
     def _remote_dj_fail_bound_session(
@@ -12097,7 +12122,7 @@ class PlaybackEngine:
                 f"connection_failure class={attempt.failure['class']} "
                 f"reason={attempt.failure['reason']}",
             )
-        self._remote_dj_session_stop(attempt_id)
+        self._remote_dj_session_stop(attempt_id, END_FAILED)
         return False
 
     def _remote_dj_record_signaling_failure(
@@ -12213,7 +12238,7 @@ class PlaybackEngine:
             # closes the physical gate, restores the persistent slot to
             # silence, unlinks partial pads, removes ephemeral elements,
             # releases request pads, and disconnects signaling.
-            self._remote_dj_session_stop()
+            self._remote_dj_session_stop(None, END_FAILED)
         return False
 
     def _remote_dj_authorization_tick(self):
@@ -12316,7 +12341,7 @@ class PlaybackEngine:
                 )
             except Exception as exc:
                 print(f"  Remote DJ: failed to emit session-revoked audit event: {exc}")
-            self._remote_dj_session_stop()
+            self._remote_dj_session_stop(None, END_AUTHORIZATION_REVOKED)
             return True
 
         if not mic_allowed:
@@ -13577,7 +13602,7 @@ class PlaybackEngine:
                 FAILURE_ICE_STATE, "WebRTC peer connection entered failed state"
             )
         elif state == GstWebRTC.WebRTCPeerConnectionState.CLOSED:
-            self._remote_dj_session_stop(getattr(attempt, "attempt_id", None))
+            self._remote_dj_session_stop(getattr(attempt, "attempt_id", None), END_PEER_CLOSED)
 
     def _remote_dj_on_recovery_deadline(self, callback_context):
         """P1 1.5 Pass B1 -- fires once, RemoteDJConfig.reconnect_grace_
@@ -13793,7 +13818,7 @@ class PlaybackEngine:
             if self._remote_dj_server is not None:
                 self._remote_dj_server.send_json_threadsafe(
                     attempt_id, {"type": "kicked", "reason": "station_administrator"})
-            self._remote_dj_session_stop(attempt_id)
+            self._remote_dj_session_stop(attempt_id, END_KICKED)
         seen[command["request_id"]] = True
         while len(seen) > 256:
             seen.popitem(last=False)
@@ -13935,7 +13960,11 @@ class PlaybackEngine:
             dedupe_key=f"engine|remote_dj|automation_outcome|attempt={attempt_id}",
         )
 
-    def _remote_dj_session_stop(self, attempt_id=None):
+    def _remote_dj_session_stop(self, attempt_id=None, end_reason=END_SESSION_STOPPED):
+        """``end_reason`` (roadmap 2.17 Package B) records WHY the session ended
+        on its connection attempt (published with remote_dj_connection) so a
+        browser can tell an involuntary loss from a Kick, a revocation or an
+        engine shutdown. It never changes what the stop itself does."""
         if threading.current_thread() is not threading.main_thread():
             active = getattr(self, "remote_dj_session", None)
             active_attempt = getattr(active, "connection_attempt", None)
@@ -13943,7 +13972,7 @@ class PlaybackEngine:
             if attempt_id is not None and getattr(active_attempt, "attempt_id", None) != attempt_id:
                 active = None
             self._remote_dj_defer_off_glib_thread(
-                active, bound_id, self._remote_dj_session_stop, bound_id,
+                active, bound_id, self._remote_dj_session_stop, bound_id, end_reason,
             )
             return False
         if attempt_id is None:
@@ -14094,7 +14123,7 @@ class PlaybackEngine:
         # and the next session start truncates them.
         self._remote_dj_mark(session, "session_stopped")
         if attempt is not None:
-            attempt.end()
+            attempt.end(end_reason, emergency_mute=getattr(session, "emergency_latch", None) is not None)
 
         if not elements:
             # Nothing native to wait for: release the slot immediately.
@@ -17024,6 +17053,11 @@ class PlaybackEngine:
                 # evidence. Additive: the compatibility booleans above
                 # retain their exact meaning and shape.
                 "remote_dj_connection": self._remote_dj_connection_state(),
+                # Roadmap 2.17 Package B -- persistent-slot admission state
+                # (available / cleaning / quarantined / occupied); with the
+                # attempt's end_reason above, the evidence a browser needs
+                # before it may start a NEW session after a terminal loss.
+                "remote_dj_slot": self._remote_dj_slot_state(),
                 # P1 1.5 Pass B2 -- compact, direction-aware, hysteresis-
                 # smoothed link-quality summary (Good/Fair/Poor, forced to
                 # "reconnecting" whenever B1/B1.1 says so). Purely

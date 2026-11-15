@@ -81,7 +81,7 @@ _LOG_MODELS = {"emaillog", "playevent", "playeventsegment", "mediaplaybackincide
 
 _REMOTE_DJ_CONFIG_AUDIT_FIELDS = (
     "enabled", "stun_server", "ice_udp_min_port", "ice_udp_max_port",
-    "reconnect_grace_seconds",
+    "reconnect_grace_seconds", "auto_reconnect_enabled",
 )
 _REMOTE_DJ_APPLY_MODES = {
     "enabled": "engine_restart_required",
@@ -89,6 +89,9 @@ _REMOTE_DJ_APPLY_MODES = {
     "ice_udp_min_port": "next_remote_dj_session",
     "ice_udp_max_port": "next_remote_dj_session",
     "reconnect_grace_seconds": "next_remote_dj_recovery_decision",
+    # Roadmap 2.17 Package B: read fresh by /api/remote-dj/reconnect-policy/,
+    # which a browser must consult before EVERY automatic reconnect attempt.
+    "auto_reconnect_enabled": "next_remote_dj_reconnect_decision",
 }
 _FX_BUS_CONFIG_AUDIT_FIELDS = ("volume_db", "polyphony_cap")
 _FX_BUS_APPLY_MODES = {
@@ -1548,12 +1551,15 @@ class RemoteDJConfigAdmin(admin.ModelAdmin):
             "fields": ["stun_server", "ice_udp_min_port", "ice_udp_max_port"],
         }),
         ("Reconnect / recovery", {
-            "fields": ["reconnect_grace_seconds"],
+            "fields": ["reconnect_grace_seconds", "auto_reconnect_enabled"],
             "description": "How long a transient transport loss is given "
                             "to recover before the engine finalizes the "
                             "session and frees the slot. Applies "
                             "immediately to the next reconnect grace "
-                            "timer -- no restart required.",
+                            "timer -- no restart required. Automatic "
+                            "reconnect (off by default) lets the DJ's browser "
+                            "start a NEW session after a lost session has "
+                            "ended; it is re-checked before every attempt.",
         }),
     ]
 

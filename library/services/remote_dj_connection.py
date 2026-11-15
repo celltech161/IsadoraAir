@@ -27,6 +27,21 @@ FAILURE_SIGNALING_SESSION_BUSY = "signaling_session_busy"
 FAILURE_DEPENDENCY_SESSION_BUILD = "dependency_session_build"
 FAILURE_ICE_STATE = "ice_state"
 FAILURE_MEDIA_ROUTING = "media_routing"
+# Roadmap 2.17 Package B -- why a session ENDED (published with the attempt so
+# a browser can tell an involuntary loss from a deliberate termination; the
+# end reason is set once, by the engine, at logical session stop).
+END_SIGNALING_CLOSED = "signaling_closed"       # the signaling socket closed (browser or network)
+END_PEER_CLOSED = "peer_closed"                 # WebRTC peer connection CLOSED
+END_FAILED = "failed"                           # a recorded failure (see ``failure``)
+END_KICKED = "kicked"                           # station administrator Kick
+END_AUTHORIZATION_REVOKED = "authorization_revoked"
+END_ENGINE_SHUTDOWN = "engine_shutdown"
+END_SESSION_STOPPED = "session_stopped"         # any other engine stop
+END_REASONS = frozenset({
+    END_SIGNALING_CLOSED, END_PEER_CLOSED, END_FAILED, END_KICKED,
+    END_AUTHORIZATION_REVOKED, END_ENGINE_SHUTDOWN, END_SESSION_STOPPED,
+})
+
 FAILURE_CLASSES = frozenset({
     FAILURE_AUTHORIZATION_TOKEN,
     FAILURE_SIGNALING_SESSION_BUSY,
@@ -185,6 +200,8 @@ class RemoteDJConnectionAttempt:
             "browser": {},
         }
         self.failure = None
+        self.end_reason = None
+        self.emergency_mute_at_end = False
         # Fixed-key, JSON-safe observational state. Updates overwrite the
         # current snapshot; no unbounded history or database telemetry exists.
         self.transport = empty_transport_snapshot()
@@ -336,7 +353,15 @@ class RemoteDJConnectionAttempt:
         self.status = "failed"
         self._frozen_elapsed_ms = round(self._server_elapsed_ms(), 1)
 
-    def end(self):
+    def end(self, reason=END_SESSION_STOPPED, *, emergency_mute=False):
+        """Logical session stop. The first recorded end reason wins (a later,
+        duplicate stop never rewrites why the session ended)."""
+        if self.end_reason is None:
+            self.end_reason = reason if reason in END_REASONS else END_SESSION_STOPPED
+            self.emergency_mute_at_end = bool(emergency_mute)
+        self._end()
+
+    def _end(self):
         self.record("session_stopped")
         if self.status != "failed":
             self.status = "ended"
@@ -383,6 +408,9 @@ class RemoteDJConnectionAttempt:
             # from the local Connect click.
             "milestones_ms": milestone_summary,
             "failure": dict(self.failure) if self.failure is not None else None,
+            # Roadmap 2.17 Package B: set once at logical stop (None while live).
+            "end_reason": self.end_reason,
+            "emergency_mute_at_end": self.emergency_mute_at_end,
             "transport": transport_summary,
             "media_stats": {
                 section: dict(values)

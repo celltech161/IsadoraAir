@@ -134,6 +134,20 @@ class RemoteDJConfigAuditTests(SingletonAuditTestCase):
             {"reconnect_grace_seconds": "next_remote_dj_recovery_decision"},
         )
 
+    def test_auto_reconnect_switch_is_audited_old_and_new_with_next_decision_semantics(self):
+        """Roadmap 2.17 Package B: default Off; the switch is audited with both
+        values and applies to the next reconnect-policy decision (no restart)."""
+        self.assertFalse(RemoteDJConfig.load().auto_reconnect_enabled)
+        self.save({"auto_reconnect_enabled": True})
+        detail = _audit_events(self.object_type)[0].detail
+        self.assertEqual(detail["changed_fields"], ["auto_reconnect_enabled"])
+        self.assertEqual(detail["changes"]["auto_reconnect_enabled"], {"old": False, "new": True})
+        self.assertEqual(
+            detail["apply_modes"],
+            {"auto_reconnect_enabled": "next_remote_dj_reconnect_decision"},
+        )
+        self.assertFalse(detail["restart_required"])
+
     def test_multiple_fields_still_emit_once_with_per_field_semantics(self):
         self.save({"enabled": True, "ice_udp_min_port": 42000,
                    "reconnect_grace_seconds": 15})

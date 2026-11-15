@@ -209,7 +209,7 @@ class RemoteDJSignalingAttemptTests(TransactionTestCase):
         ))
         self.assertEqual(
             idle_add.call_args_list[-1].args,
-            (engine._remote_dj_session_stop, payload["attempt_id"]),
+            (engine._remote_dj_session_stop, payload["attempt_id"], "signaling_closed"),  # 2.17B end reason
         )
 
     def test_invalid_token_is_rejected_before_engine_crossing(self):
@@ -330,7 +330,7 @@ class RemoteDJSignalingAttemptTests(TransactionTestCase):
         )
         self.assertEqual(
             idle_add.call_args_list[-1].args,
-            (engine._remote_dj_session_stop, ATTEMPT_ID),
+            (engine._remote_dj_session_stop, ATTEMPT_ID, "signaling_closed"),  # 2.17B end reason
         )
 
     def test_browser_stats_are_sanitized_and_bound_to_signed_attempt(self):
