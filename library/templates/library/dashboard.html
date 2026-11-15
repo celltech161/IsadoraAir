@@ -973,6 +973,34 @@
     outline: none;
   }
 
+  /* Next / Swap action columns sit right after the drag handle. */
+  .qt-sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  table.queue-table td.qt-act { width: 1%; white-space: nowrap; text-align: center; padding-left: 0.25rem; padding-right: 0.25rem; }
+  table.queue-table th.qt-th-next, table.queue-table th.qt-th-swap { width: 1%; padding-left: 0.25rem; padding-right: 0.25rem; }
+  .qt-swap-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.55rem;
+    height: 1.35rem;
+    padding: 0;
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid rgba(226, 232, 240, 0.45);
+    border-radius: 999px;
+    color: #f1f5f9;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, box-shadow 0.12s, color 0.12s;
+  }
+  .qt-swap-btn svg { width: 0.85rem; height: 0.85rem; display: block; }
+  .qt-swap-btn:hover:not(:disabled), .qt-swap-btn:focus-visible {
+    background: rgba(34, 197, 94, 0.16);
+    border-color: var(--accent);
+    color: var(--accent);
+    box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.25);
+    outline: none;
+  }
+  .qt-swap-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
   table.queue-table .qt-drag-handle { cursor: grab; touch-action: none; }
   table.queue-table .qt-drag-handle:active { cursor: grabbing; }
   table.queue-table tr.drag-over td { border-top: 2px solid var(--accent); }
@@ -1557,6 +1585,7 @@
   #consoleRoot.connection-stale .deck-transport-btn,
   #consoleRoot.connection-stale .start-next-btn,
   #consoleRoot.connection-stale .qt-next-btn,
+  #consoleRoot.connection-stale .qt-swap-btn,
   #consoleRoot.connection-stale .qt-drag-handle,
   #consoleRoot.connection-stale .qir-btn,
   #consoleRoot.connection-stale .fx-cart,
@@ -1773,7 +1802,9 @@
       <table class="queue-table">
         <thead>
           <tr>
-            <th class="qt-th-handle"></th>
+            <th class="qt-th-handle"><span class="qt-sr">Reorder</span></th>
+            <th class="qt-th-next"><span class="qt-sr">Next</span></th>
+            <th class="qt-th-swap"><span class="qt-sr">Swap</span></th>
             <th class="qt-th-num">#</th>
             <th>Artist</th>
             <th>Title</th>
@@ -1781,11 +1812,10 @@
             <th class="qt-th-dur">Dur</th>
             <th class="qt-th-intro">Intro</th>
             <th class="qt-th-time">Time On</th>
-            <th></th>
           </tr>
         </thead>
         <tbody id="queueList">
-          <tr><td colspan="9" class="queue-empty">No queue data</td></tr>
+          <tr><td colspan="10" class="queue-empty">No queue data</td></tr>
         </tbody>
       </table>
     </div>
@@ -2018,6 +2048,9 @@ const ICON_PLAY = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="tru
 const ICON_SORT = '<svg viewBox="240 120 720 960" fill="currentColor" stroke="currentColor" stroke-width="80" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M600 160L920 480H280Z"/><path d="M280 720H920L600 1040Z"/></svg>';
 // Double chevron for the NEXT button's badge.
 const ICON_NEXT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 5l7 7-7 7"/><path d="M12 5l7 7-7 7"/></svg>';
+// Swap: two opposed arrows (the supplied swap motif), drawn in currentColor so it
+// reads on every category row colour.
+const ICON_SWAP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 8h14"/><path d="M14 4l4 4-4 4"/><path d="M20 16H6"/><path d="M10 12l-4 4 4 4"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M20 7h5v22h-5zm-9 0h5v22h-5z"/></svg>';
 const ICON_EJECT = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M6 29v-5h24v5zM18 6L6 20h24z"/></svg>';
 
@@ -5108,8 +5141,8 @@ let queueItemIds = [];
 let insertDebounce = null;
 let queueDragActive = false;
 
-// Coming Up table columns (drag, #, artist, title, cat, dur, intro, time on, next).
-const QUEUE_COLUMNS = 9;
+// Coming Up table columns (drag, next, swap, #, artist, title, cat, dur, intro, time on).
+const QUEUE_COLUMNS = 10;
 // "Show played items" (UITheme.show_played_items, station-wide, read at page
 // load). Off: the table is exactly the engine's upcoming queue, as before.
 const SHOW_PLAYED_ITEMS = {{ ui_theme.show_played_items|yesno:"true,false" }};
@@ -5255,6 +5288,12 @@ function buildQueueRows(data) {
   return rows;
 }
 
+// Swap (replace this upcoming occurrence with another track). Rendered on
+// upcoming rows only; inert until the guarded live replacement is available.
+function swapButtonHtml(r) {
+  return `<button type="button" class="qt-swap-btn" disabled aria-label="Swap this track" title="Swap this track (not available yet)">${ICON_SWAP}</button>`;
+}
+
 function renderQueue(data) {
   // The 1s poll would otherwise blow away the table's innerHTML (and
   // the drag listeners on it) mid-gesture -- looks like dragging works
@@ -5294,8 +5333,8 @@ function renderQueue(data) {
     const titleCell = IS_REMOTE_DJ
       ? esc(r.title)
       : `<a class="qt-track-link" href="/track/${r.trackId}/">${esc(r.title)}</a>`;
-    // Only upcoming rows carry the drag handle, the Next button and the
-    // data-queue-row marker the reorder handler selects on.
+    // Only upcoming rows carry the drag handle, the Next and Swap buttons and
+    // the data-queue-row marker the reorder handler selects on.
     const upcoming = r.state === 'upcoming';
     const cls = r.state === 'played' ? ' class="qt-played"'
       : r.state === 'current' ? ' class="qt-current" aria-current="true"'
@@ -5305,6 +5344,8 @@ function renderQueue(data) {
       ${upcoming ? `<td class="qt-pos qt-drag-handle" title="Drag to reorder"><span class="qt-sort-icon">${ICON_SORT}</span></td>`
         : r.state === 'current' ? `<td class="qt-pos"><span class="qt-playing-icon" role="img" aria-label="Currently playing" title="Currently playing">${ICON_PLAY}</span></td>`
         : '<td class="qt-pos"></td>'}
+      <td class="qt-act qt-next-cell">${upcoming ? `<button type="button" class="qt-next-btn" title="Play this next" aria-label="Play this next" onclick="event.stopPropagation(); setNext(${r.itemId})">NEXT<span class="qt-next-badge" aria-hidden="true">${ICON_NEXT}</span></button>` : ''}</td>
+      <td class="qt-act qt-swap-cell">${upcoming ? swapButtonHtml(r) : ''}</td>
       <td class="qt-num">${i + 1}</td>
       <td>${artistCell}</td>
       <td>${titleCell}</td>
@@ -5312,7 +5353,6 @@ function renderQueue(data) {
       <td class="qt-dur">${fmtDur(r.duration)}</td>
       <td class="qt-intro">${fmtIntro(r.intro)}</td>
       <td class="qt-time">${r.timeText}</td>
-      <td>${upcoming ? `<button class="qt-next-btn" title="Play this next" aria-label="Play this next" onclick="event.stopPropagation(); setNext(${r.itemId})">NEXT<span class="qt-next-badge" aria-hidden="true">${ICON_NEXT}</span></button>` : ''}</td>
     </tr>
   `;
   }).join('');

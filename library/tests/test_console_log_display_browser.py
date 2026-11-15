@@ -239,7 +239,7 @@ class _LogDisplayBase(_ConsoleBrowserBase):
             self.assertAlmostEqual(got, base * 0.45, delta=6)           # darker by the overlay ...
         self.assertGreater(played[0], 2 * played[1])                    # ... and still recognisably red
         self.assertLess(sum(played), 0.6 * sum(upcoming))
-        text = page.evaluate("() => getComputedStyle(document.querySelector('tr.qt-played td:nth-child(4)')).color")
+        text = page.evaluate("() => getComputedStyle(document.querySelector('tr.qt-played td:nth-child(6)')).color")
         self.assertEqual(text, "rgb(229, 231, 235)")                    # explicit light text on the dark overlay
         self.shot(page, "show-played-darkening")
 
@@ -250,8 +250,8 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.reveal_queue(page)
         self.assertEqual(page.evaluate(
             "() => getComputedStyle(document.querySelector('tr.qt-current')).backgroundColor"), "rgb(40, 90, 200)")
-        cell = self.box(page, 'tr.qt-current td:nth-child(3)')
-        other = self.box(page, 'tr[data-item-id="905"] td:nth-child(3)')
+        cell = self.box(page, 'tr.qt-current td:nth-child(5)')
+        other = self.box(page, 'tr[data-item-id="905"] td:nth-child(5)')
         x = cell["left"] + cell["width"] / 2
 
         def edge(box):
@@ -590,11 +590,11 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.wait_states(page, GOLD)
         self.reveal_queue(page)
         self.assertIn("rgb(255, 0, 0)", page.evaluate(
-            "() => getComputedStyle(document.querySelector('tr.qt-current td:nth-child(3)')).boxShadow"))
+            "() => getComputedStyle(document.querySelector('tr.qt-current td:nth-child(5)')).boxShadow"))
         self.assertTrue(any(p[0] >= 240 and p[1] <= 30 and p[2] <= 30
-                            for p in self.edge_pixels(page, "tr.qt-current td:nth-child(3)")))
+                            for p in self.edge_pixels(page, "tr.qt-current td:nth-child(5)")))
         self.assertFalse(any(p[0] >= 240 and p[1] <= 30
-                             for p in self.edge_pixels(page, 'tr[data-item-id="905"] td:nth-child(3)')))
+                             for p in self.edge_pixels(page, 'tr[data-item-id="905"] td:nth-child(5)')))
 
     def test_outline_colour_formats_and_alpha_render(self):
         blue = (40, 90, 200)           # the current row's own fill
@@ -606,7 +606,7 @@ class _LogDisplayBase(_ConsoleBrowserBase):
                 self.wait_states(page, GOLD)
                 self.reveal_queue(page)
                 want = tuple(round(alpha * c + (1 - alpha) * b) for c, b in zip(colour, blue))
-                edges = self.edge_pixels(page, "tr.qt-current td:nth-child(3)")
+                edges = self.edge_pixels(page, "tr.qt-current td:nth-child(5)")
                 self.assertTrue(any(all(abs(a - b) <= 28 for a, b in zip(px, want)) for px in edges), (value, want, edges))
 
     def playing_ids(self, page):
@@ -704,7 +704,7 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.reveal_queue(page)
         cdp = context.new_cdp_session(page)
         src = self.box(page, '#queueList tr[data-item-id="905"] .qt-drag-handle')
-        dst = self.box(page, '#queueList tr[data-item-id="904"] td:nth-child(3)')
+        dst = self.box(page, '#queueList tr[data-item-id="904"] td:nth-child(5)')
         sx, sy = src["left"] + src["width"] / 2, src["top"] + src["height"] / 2
         dx, dy = dst["left"] + 10, dst["top"] + dst["height"] / 2
         cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": sx, "y": sy}]})
@@ -842,7 +842,7 @@ class _LogDisplayBase(_ConsoleBrowserBase):
     # ------------------------------------------------------ queue-control safety
     def drag(self, page, source_id, target_id):
         src = self.box(page, f'#queueList tr[data-item-id="{source_id}"] .qt-drag-handle')
-        dst = self.box(page, f'#queueList tr[data-item-id="{target_id}"] td:nth-child(3)')
+        dst = self.box(page, f'#queueList tr[data-item-id="{target_id}"] td:nth-child(5)')
         page.mouse.move(src["left"] + src["width"] / 2, src["top"] + src["height"] / 2)
         page.mouse.down()
         page.mouse.move(dst["left"] + 10, dst["top"] + dst["height"] / 2, steps=6)
@@ -877,7 +877,7 @@ class _LogDisplayBase(_ConsoleBrowserBase):
         self.reveal_queue(page)
         for source in (901, 903):
             cell = self.box(page, f'#queueList tr[data-item-id="{source}"] td:nth-child(1)')
-            dst = self.box(page, '#queueList tr[data-item-id="905"] td:nth-child(3)')
+            dst = self.box(page, '#queueList tr[data-item-id="905"] td:nth-child(5)')
             page.mouse.move(cell["left"] + cell["width"] / 2, cell["top"] + cell["height"] / 2)
             page.mouse.down()
             page.mouse.move(dst["left"] + 10, dst["top"] + dst["height"] / 2, steps=6)

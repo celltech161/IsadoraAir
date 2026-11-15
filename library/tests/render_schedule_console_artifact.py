@@ -35,6 +35,16 @@ class RenderArtifact(TestCase):
             response = client.get(url, secure=True)
             self.assertEqual(response.status_code, 200, (name, response.status_code))
             pages[name] = response.content.decode()
+        # The Console again with "Show played items" on (played / on-air / on-deck rows).
+        from library.models import UITheme
+        theme = UITheme.load()
+        theme.show_played_items = True
+        theme.save()
+        client = Client()
+        client.force_login(staff)
+        response = client.get("/", secure=True)
+        self.assertEqual(response.status_code, 200)
+        pages["CONSOLE_HISTORY_PAGE"] = response.content.decode()
         for name, blob in pages.items():
             print(f"\n=====BEGIN-{name}=====\n{blob}\n=====END-{name}=====")
         self.assertIn('id="pastOverridesButton"', pages["SCHEDULE_PAGE"])
