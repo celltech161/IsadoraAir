@@ -18,8 +18,10 @@ considered only after the old one has definitively ended.
 `Remote DJ Configuration → Reconnect / recovery → Enable automatic Remote DJ reconnect`
 (`RemoteDJConfig.auto_reconnect_enabled`, migration `library.0103`, default False). Audited with
 the existing configuration audit (old/new values, apply mode `next_remote_dj_reconnect_decision`,
-no restart). It is read fresh by the policy endpoint before every attempt, so switching it off
-stops a sequence already in progress at its next decision. Remote DJ's own master switch
+no restart). It is read fresh by the policy endpoint before every attempt: switching it off
+prevents subsequent automatic attempts at their next policy decision. It does not cancel an
+attempt that already received a `retry` decision and is still negotiating (that attempt ends
+normally, by establishment, failure or its establishment bound). Remote DJ's own master switch
 (`enabled`) must also be on.
 
 ## Evidence that a session ended, and why (engine)
@@ -98,6 +100,23 @@ is bound to its attempt (`rdjAttemptSeq`) and its sequence (`rdjRetry.gen`): rel
 or ending a sequence makes all of its late callbacks inert, and a stream that arrives after its
 attempt was released is stopped immediately.
 
+**Setup failures.** Any rejection while an offer is applied (remote description, microphone,
+AudioContext / Web Audio graph, missing transceivers, `replaceTrack`, `createAnswer`,
+`setLocalDescription`, sending the answer) is handled, never left as an unhandled rejection. For
+the current attempt it fails through the normal path (`rdjAttemptFailed` → `rdjReleaseLocal`): an
+operator's Connect shows `Setup failed` and never starts a reconnect; an automatic replacement spends
+one attempt of the SAME sequence (no new sequence). A failure that arrives after its attempt was
+superseded closes or stops only what that attempt itself created (identity-checked against the
+current attempt's resources), never a successor's.
+
+**Deadline.** The 150 s whole-sequence deadline is authoritative everywhere: re-checked after every
+policy answer (a `retry` arriving past it mints no token), immediately before a token is requested,
+after the token response, after the microphone is acquired, before the answer is sent and before a
+replacement is adopted; an attempt's establishment bound is `min(30 s, remaining)`. It is measured on
+both `performance.now()` and the wall clock, whichever expires first, so a timer delayed by a
+background tab or system sleep never extends the sequence (a forward wall-clock correction can only
+end it early: fail-closed).
+
 When a sequence stops, the button briefly says why (`Reconnect failed`, `Reconnect cancelled`,
 `Disconnected by the station`, `Muted by the station`, `Reconnect not permitted`, `Remote DJ
 unavailable`, …); a manual Connect is always available afterwards, subject to normal admission.
@@ -108,7 +127,9 @@ Every local release now goes through one function (`rdjReleaseLocal`) that close
 `RTCPeerConnection`, the WebSocket and the AudioContext exactly once, **stops the microphone
 tracks** (before this package only the AudioContext was closed, which leaves a `getUserMedia`
 capture — and the browser's microphone indicator — alive), clears the monitor element, and
-invalidates the attempt. The separate calibration workflow is unchanged.
+invalidates the attempt. It also stops the Web Audio destination (output) track explicitly:
+Chromium's `AudioContext.close()` does not end a `MediaStreamDestination`'s tracks. The separate
+calibration workflow is unchanged.
 
 ## Leave-page protection
 

@@ -14,6 +14,14 @@ recording fakes so every resource the page creates or releases is counted, and a
 "engine" answers /api/engine/status/, /api/remote-dj/token/ and /api/remote-dj/reconnect-policy/.
 Playwright's fake clock drives the page's timers, so backoff, establishment timeouts and the
 sequence deadline are deterministic. Exit status 0 only if every check passes.
+
+Codex review regressions (2.17B remediation): offer/microphone setup failures (replaceTrack,
+createAnswer, setLocalDescription, setRemoteDescription, missing transceivers) for a manual Connect
+and an automatic replacement, LATE failures of a superseded attempt against its successor, the
+whole-sequence deadline (late policy answer, capped establishment, establishment after expiry,
+simulated system sleep, late token/microphone, stale timers vs. a successor), and native
+AudioContext semantics (closing it does NOT end its destination tracks). Unhandled promise
+rejections are recorded and asserted absent.
 """
 import hashlib
 import json
@@ -29,7 +37,20 @@ failures = []
 
 FAKES = r"""
 (() => {
-  const F = window.__fake = {ws: [], pcs: [], tracks: [], ctxs: [], gumCalls: 0, gumHold: false, gumPending: []};
+  const F = window.__fake = {ws: [], pcs: [], tracks: [], ctxs: [], gumCalls: 0, gumHold: false, gumPending: [],
+                             unhandled: [], nextPcInject: null, heldRejects: []};
+  // Every unhandled promise rejection the page leaves behind is recorded (a setup failure must not leave one).
+  window.addEventListener('unhandledrejection', e => F.unhandled.push(String(e.reason && e.reason.message || e.reason)));
+  // Failure injection for the NEXT RTCPeerConnection the page creates: {method: 'reject' | 'hold'}, methods
+  // setRemoteDescription, replaceTrack, createAnswer, setLocalDescription; {transceivers: 'missing'}.
+  // 'hold' leaves the call pending until F.rejectHeld() rejects it (a LATE failure).
+  function injected(pc, method) {
+    const mode = pc.inject[method];
+    if (mode === 'reject') return Promise.reject(new Error('injected ' + method + ' failure'));
+    if (mode === 'hold') return new Promise((_, reject) => F.heldRejects.push(() => reject(new Error('late ' + method + ' failure'))));
+    return null;
+  }
+  F.rejectHeld = () => { const held = F.heldRejects; F.heldRejects = []; held.forEach(reject => reject()); };
   function track(source) { const t = {kind: 'audio', source, stopped: false, stop() { this.stopped = true; }}; F.tracks.push(t); return t; }
   function stream(source = 'mic') { const t = track(source); return {getTracks: () => [t], getAudioTracks: () => [t]}; }
   class FakeWebSocket {
@@ -46,14 +67,19 @@ FAKES = r"""
   class FakePC {
     constructor(cfg) {
       this.cfg = cfg; this.iceConnectionState = 'new'; this.closed = false; this.localDescription = null;
-      const sender = () => ({replaceTrack: async () => {}, getParameters: () => ({encodings: [{}]}), setParameters: async () => {}});
+      this.inject = F.nextPcInject || {}; F.nextPcInject = null;
+      const pc = this;
+      const sender = () => ({replaceTrack: (t) => injected(pc, 'replaceTrack') || Promise.resolve(),
+                             getParameters: () => ({encodings: [{}]}), setParameters: async () => {}});
       this.transceivers = [{direction: '', sender: sender()}, {direction: '', sender: sender()}];
       F.pcs.push(this);
     }
-    getTransceivers() { return this.transceivers; }
-    async setRemoteDescription(d) { this.remote = d; }
-    async createAnswer() { return {type: 'answer', sdp: 'a=fmtp:111 minptime=10;useinbandfec=1'}; }
-    async setLocalDescription(d) { this.localDescription = d; }
+    getTransceivers() { return this.inject.transceivers === 'missing' ? this.transceivers.slice(0, 1) : this.transceivers; }
+    setRemoteDescription(d) { return injected(this, 'setRemoteDescription') || Promise.resolve(this.remote = d); }
+    createAnswer() {
+      return injected(this, 'createAnswer') || Promise.resolve({type: 'answer', sdp: 'a=fmtp:111 minptime=10;useinbandfec=1'});
+    }
+    setLocalDescription(d) { return injected(this, 'setLocalDescription') || Promise.resolve(this.localDescription = d); }
     async addIceCandidate() {}
     async getStats() { return new Map(); }
     close() { this.closed = true; this.iceConnectionState = 'closed'; }
@@ -66,13 +92,17 @@ FAKES = r"""
   };
   F.releaseGum = () => { const pending = F.gumPending; F.gumPending = []; pending.forEach(resolve => resolve(stream())); };
   class FakeAudioContext {
-    constructor() { this.closed = false; this.owned = []; F.ctxs.push(this); }
+    constructor() { this.closed = false; this.state = 'running'; F.ctxs.push(this); }
     createMediaStreamSource() { return {connect() {}}; }
     createGain() { return {gain: {value: 1}, connect() {}}; }
-    // A destination's track belongs to its context and ends when the context closes.
-    createMediaStreamDestination() { const s = stream('graph'); this.owned.push(...s.getTracks()); return {stream: s}; }
+    // Native Chromium (Codex F3): closing the context does NOT end its MediaStreamDestination's
+    // output tracks -- only an explicit track.stop() does. The fake behaves the same way.
+    createMediaStreamDestination() { return {stream: stream('graph')}; }
     createAnalyser() { return {fftSize: 2048, getFloatTimeDomainData() {}, connect() {}}; }
-    close() { this.closed = true; this.owned.forEach(t => t.stop()); return Promise.resolve(); }
+    close() {
+      if (this.closed) return Promise.reject(new Error('InvalidStateError: already closed'));
+      this.closed = true; this.state = 'closed'; return Promise.resolve();
+    }
   }
   window.AudioContext = FakeAudioContext; window.webkitAudioContext = FakeAudioContext;
   F.open = (i) => { const ws = F.ws[i]; ws.readyState = 1; ws.onopen && ws.onopen({}); };
@@ -87,6 +117,8 @@ FAKES = r"""
     pcs: F.pcs.map(pc => ({closed: pc.closed})),
     liveTracks: F.tracks.filter(t => !t.stopped).length,
     liveMic: F.tracks.filter(t => t.source === 'mic' && !t.stopped).length,
+    liveOutput: F.tracks.filter(t => t.source === 'graph' && !t.stopped).length,
+    unhandled: F.unhandled.slice(),
     tracks: F.tracks.length,
     openCtxs: F.ctxs.filter(c => !c.closed).length,
     gumCalls: F.gumCalls,
@@ -116,6 +148,7 @@ class Engine:
         self.policy = lambda attempts: {"decision": "retry", "reason": "ok"}
         self.viewer_is_owner = viewer_is_owner
         self.other_owner = None
+        self.instance = "eng-1"
 
     def mint(self):
         attempt = f"harnessAttempt{len(self.tokens) + 1:010d}"
@@ -143,7 +176,7 @@ class Engine:
                      "is_current_user": self.viewer_is_owner and not self.other_owner,
                      "browser_key": hashlib.sha256(attempt.encode()).hexdigest()[:32], "gate_generation": 1}
         return {"transport": "STOPPED", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": [],
-                "timestamp": 0, "state_revision": {"instance": "eng-1", "seq": self.seq},
+                "timestamp": 0, "state_revision": {"instance": self.instance, "seq": self.seq},
                 "remote_dj_configured": True, "remote_dj_connected": self.connected or bool(self.other_owner),
                 "remote_dj_live": False, "remote_dj_reconnecting": False,
                 "remote_dj_quality": {"overall": "good"} if self.connected else None,
@@ -159,6 +192,7 @@ class Page:
         self.page = self.context.new_page()
         self.errors = []
         self.held = []                # requests answered later (late responses) or aborted at close
+        self.held_policy = []         # policy requests held by the "hold" answer, released by release_policy()
         self.hold_tokens = False
         self.dialogs = []
         self.navigated = []
@@ -203,6 +237,9 @@ class Page:
                 return route.fulfill(status=500, body="boom")
             if answer == "hang":
                 self.held.append(route)    # never answered in time: the page's own timeout must handle it
+                return None
+            if answer == "hold":
+                self.held_policy.append(route)   # answered later, by release_policy()
                 return None
             return route.fulfill(status=200, content_type="application/json", body=json.dumps(answer))
         self.navigated.append(path) if request.is_navigation_request() else None
@@ -269,6 +306,21 @@ class Page:
           document.body.appendChild(box);
         }""")
 
+    def release_policy(self, answer):
+        held, self.held_policy = self.held_policy, []
+        for route in held:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(answer))
+        self.settle(6)
+        return len(held)
+
+    def now(self):
+        return self.js("Date.now()")
+
+    def wall_jump(self, ms):
+        """Wall clock jumps forward WITHOUT firing timers or advancing performance.now() (system sleep)."""
+        self.page.clock.set_system_time(self.now() + ms)
+        self.settle()
+
     def release_held(self):
         held, self.held = self.held, []
         for route in held:
@@ -283,6 +335,12 @@ class Page:
 
     def close(self):
         self.release_held()
+        for route in self.held_policy:
+            try:
+                route.abort()
+            except Exception:          # noqa: BLE001
+                pass
+        self.held_policy = []
         self.context.close()
 
 
@@ -370,6 +428,8 @@ def scenario_native_prompt_and_disconnect(browser, html):
     check(name, "Disconnect closes socket and peer", f["ws"][0]["closedByPage"] and f["pcs"][0]["closed"], f)
     check(name, "Disconnect stops the microphone and closes the AudioContext", f["liveTracks"] == 0
           and f["openCtxs"] == 0, f)
+    check(name, "explicit cleanup ends BOTH the microphone and the Web Audio destination tracks",
+          f["liveMic"] == 0 and f["liveOutput"] == 0 and f["tracks"] >= 2, f)
     check(name, "guard removed after Disconnect", not p.guard())
     check(name, "Disconnect never reconnects", engine.policy_calls == [] and len(engine.tokens) == 1)
     dialogs = len(p.dialogs)
@@ -423,6 +483,7 @@ def scenario_auto_reconnect_success(browser, html):
           and not f["pcs"][1]["closed"], f)
     check(name, "exactly one live microphone capture (the replacement's)", f["liveMic"] == 1
           and f["openCtxs"] == 1, f)
+    check(name, "exactly one live destination track (the replacement's)", f["liveOutput"] == 1, f)
     check(name, "normal presentation only after ownership", p.button()["action"] == "Disconnect", p.button())
     check(name, "retry sequence finished", p.js("rdjRetry") is None)
     check(name, "no page errors", not p.errors, p.errors)
@@ -755,6 +816,335 @@ def scenario_calibration(browser, html):
     p.close()
 
 
+# ---- 2.17B remediation (Codex review): setup failures, deadline, destination tracks ---------------
+SETUP_FAILURES = (("replaceTrack", "reject"), ("createAnswer", "reject"), ("setLocalDescription", "reject"),
+                  ("setRemoteDescription", "reject"), ("transceivers", "missing"))
+
+
+def guarded(label, fn, *args):
+    """Run one variant; an exception fails that variant only, never the remaining ones."""
+    try:
+        fn(*args)
+    except Exception as exc:      # noqa: BLE001
+        check(label, "raised", False, f"{type(exc).__name__}: {exc}")
+
+
+def released(f, ws_index, pc_index):
+    """The attempt's socket and peer are closed by the page; no microphone, destination track or context lives."""
+    return (f["ws"][ws_index]["closedByPage"] and f["pcs"][pc_index]["closed"] and f["liveMic"] == 0
+            and f["liveOutput"] == 0 and f["openCtxs"] == 0)
+
+
+def offer_with(p, index, inject):
+    p.js("i => window.__fake.open(i)", index)
+    p.js("inject => { window.__fake.nextPcInject = inject; }", inject)
+    p.js("i => window.__fake.offer(i)", index)
+    p.settle(6)
+
+
+def scenario_setup_failures(browser, html):
+    for method, mode in SETUP_FAILURES:
+        guarded(f"setup-failure:manual:{method}", scenario_setup_failures_manual, browser, html, method, mode)
+        guarded(f"setup-failure:replacement:{method}", scenario_setup_failures_replacement, browser, html, method, mode)
+
+
+def scenario_setup_failures_manual(browser, html, method, mode):
+    name = f"setup-failure:manual:{method}"
+    engine = Engine()
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    offer_with(p, 0, {method: mode})
+    f = p.fake()
+    check(name, "mic + destination tracks stopped; AudioContext, peer and socket closed", released(f, 0, 0), f)
+    check(name, "UI leaves Connecting/Negotiating", p.button()["action"] == "Connect"
+          and p.button()["status"] == "Setup failed", p.button())
+    check(name, "navigation protection not armed", not p.guard() and not p.owns())
+    check(name, "no unhandled rejection or page error", not f["unhandled"] and not p.errors,
+          (f["unhandled"], p.errors))
+    check(name, "a manual Connect that never established never reconnects", engine.policy_calls == []
+          and len(engine.tokens) == 1)
+    engine.finalize("signaling_closed", slot="available")      # the server cleaned up the abandoned attempt
+    p.advance(3500)
+    p.click_connect()
+    check(name, "a later Connect proceeds", len(engine.tokens) == 2, engine.tokens)
+    p.establish(1)
+    f = p.fake()
+    check(name, "the later session is live", p.button()["action"] == "Disconnect" and f["liveMic"] == 1
+          and f["liveOutput"] == 1 and f["openCtxs"] == 1 and not f["pcs"][1]["closed"], (p.button(), f))
+    p.close()
+
+
+def scenario_setup_failures_replacement(browser, html, method, mode):
+    name = f"setup-failure:replacement:{method}"
+    engine = Engine()
+    engine.policy = lambda attempts: {"decision": "retry", "reason": "ok"}
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    p.establish(0)
+    p.lose_established(0)
+    p.advance(1100)
+    check(name, "replacement attempt 1 started", len(engine.tokens) == 2, engine.tokens)
+    offer_with(p, 1, {method: mode})
+    f = p.fake()
+    check(name, "the replacement's resources are released", released(f, 1, 1), f)
+    check(name, "the failure spends one attempt of the SAME sequence", p.js(
+        "rdjRetry && [rdjRetry.gen, rdjRetry.used, rdjRetry.phase]") == [1, 1, "backoff"]
+        and p.js("rdjRetryGen") == 1, p.js("rdjRetry && [rdjRetry.gen, rdjRetry.used, rdjRetry.phase]"))
+    check(name, "still protected while the reconnect is pending", p.guard())
+    check(name, "no unhandled rejection or page error", not f["unhandled"] and not p.errors,
+          (f["unhandled"], p.errors))
+    p.advance(2100)
+    check(name, "next attempt after its backoff", len(engine.tokens) == 3, engine.tokens)
+    p.establish(2)
+    f = p.fake()
+    check(name, "the next replacement is adopted", p.button()["action"] == "Disconnect"
+          and p.js("rdjRetry") is None and p.js("rdjRetryGen") == 1 and f["liveMic"] == 1
+          and f["liveOutput"] == 1 and f["openCtxs"] == 1, (p.button(), f))
+    p.close()
+
+
+
+def scenario_stale_setup_failure(browser, html):
+    for method in ("replaceTrack", "createAnswer", "setLocalDescription"):
+        guarded(f"stale-failure:manual:{method}", scenario_stale_setup_failure_manual, browser, html, method)
+        guarded(f"stale-failure:replacement:{method}", scenario_stale_setup_failure_replacement, browser, html, method)
+
+
+def scenario_stale_setup_failure_manual(browser, html, method):
+    name = f"stale-failure:manual:{method}"
+    engine = Engine()
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    offer_with(p, 0, {method: "hold"})              # the step is still pending ...
+    p.click_connect()                               # ... when the operator cancels
+    f = p.fake()
+    check(name, "cancel releases the pending attempt (incl. its destination track)", released(f, 0, 0), f)
+    p.advance(500)
+    p.click_connect()                               # a new Connect
+    p.establish(1)
+    p.js("window.__fake.rejectHeld()")              # the abandoned step now fails, late
+    p.settle(6)
+    p.advance(1200)
+    f = p.fake()
+    check(name, "a late failure of the cancelled attempt leaves the successor intact",
+          f["ws"][1]["readyState"] == 1 and not f["ws"][1]["closedByPage"] and not f["pcs"][1]["closed"]
+          and f["liveMic"] == 1 and f["liveOutput"] == 1 and f["openCtxs"] == 1
+          and p.button()["action"] == "Disconnect" and p.js("rdjAttemptId") == engine.tokens[1], (p.button(), f))
+    check(name, "no unhandled rejection or page error", not f["unhandled"] and not p.errors,
+          (f["unhandled"], p.errors))
+    p.close()
+
+
+def scenario_stale_setup_failure_replacement(browser, html, method):
+    name = f"stale-failure:replacement:{method}"
+    engine = Engine()
+    engine.policy = lambda attempts: {"decision": "retry", "reason": "ok"}
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    p.establish(0)
+    p.lose_established(0)
+    p.advance(1100)
+    offer_with(p, 1, {method: "hold"})
+    p.js("([i, c]) => window.__fake.serverClose(i, c)", [1, 1006])     # attempt 1 refused while pending
+    p.settle()
+    p.advance(2100)
+    check(name, "attempt 2 started", len(engine.tokens) == 3, engine.tokens)
+    p.establish(2)
+    p.js("window.__fake.rejectHeld()")
+    p.settle(6)
+    p.advance(1200)
+    f = p.fake()
+    check(name, "a late failure of attempt 1 leaves the adopted replacement intact",
+          f["ws"][2]["readyState"] == 1 and not f["pcs"][2]["closed"] and f["liveMic"] == 1
+          and f["liveOutput"] == 1 and f["openCtxs"] == 1 and p.button()["action"] == "Disconnect"
+          and p.js("rdjAttemptId") == engine.tokens[2] and p.js("rdjRetry") is None, (p.button(), f))
+    check(name, "no unhandled rejection or page error", not f["unhandled"] and not p.errors,
+          (f["unhandled"], p.errors))
+    p.close()
+
+
+
+WAIT = {"decision": "wait", "reason": "previous_session_cleanup"}
+RETRY = {"decision": "retry", "reason": "ok"}
+
+
+def lost_and_waiting(browser, html, name, until_ms):
+    """An established session lost at T; the policy answers "wait" (1 s re-asks) until T + until_ms."""
+    engine = Engine()
+    mode = {"answer": WAIT}
+    engine.policy = lambda attempts: mode["answer"]
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    p.establish(0)
+    p.lose_established(0)
+    p.advance(until_ms, step=1000)
+    return engine, mode, p
+
+
+def scenario_deadline(browser, html):
+    guarded("deadline:late-retry-answer", deadline_late_retry_answer, browser, html)
+    guarded("deadline:establishment-capped", deadline_establishment_capped, browser, html)
+    guarded("deadline:established-after-expiry", deadline_established_after_expiry, browser, html)
+    guarded("deadline:sleep-while-waiting", deadline_sleep_while_waiting, browser, html)
+    guarded("deadline:late-token", deadline_late_token, browser, html)
+    guarded("deadline:late-microphone", deadline_late_microphone, browser, html)
+    guarded("deadline:successor-after-cancel", deadline_successor_after_cancel, browser, html)
+    guarded("deadline:engine-turnover", deadline_engine_turnover, browser, html)
+
+
+def deadline_late_retry_answer(browser, html):
+    name = "deadline:late-retry-answer"
+    engine, mode, p = lost_and_waiting(browser, html, name, 148500)
+    mode["answer"] = "hold"
+    p.advance(1000)                                     # the T+149 s request is held
+    check(name, "one policy request held across the deadline", len(p.held_policy) == 1)
+    p.advance(1500)                                     # T+151 s: deadline passed, request timeout (4 s) not yet
+    remaining = p.js("rdjRetry ? rdjRetry.deadline - performance.now() : null")
+    check(name, "deadline passed while the answer was in flight", remaining is not None and remaining < 0, remaining)
+    p.release_policy(RETRY)
+    p.advance(1000)
+    check(name, "a valid retry answer after the deadline mints no token", len(engine.tokens) == 1, engine.tokens)
+    check(name, "sequence ended, guard removed", p.js("rdjRetry") is None
+          and p.button()["status"] == "Reconnect failed" and not p.guard(), p.button())
+    check(name, "no unhandled rejection", not p.fake()["unhandled"] and not p.errors)
+    p.close()
+
+
+def deadline_establishment_capped(browser, html):
+    name = "deadline:establishment-capped"
+    engine, mode, p = lost_and_waiting(browser, html, name, 144500)
+    mode["answer"] = RETRY
+    p.advance(600)                                      # T+145 s: retry with 5 s of the sequence left
+    check(name, "attempt started 5 s before the deadline", len(engine.tokens) == 2, engine.tokens)
+    p.js("i => window.__fake.open(i)", 1)
+    p.js("i => window.__fake.offer(i)", 1)
+    p.settle(6)
+    p.advance(4700)
+    check(name, "still establishing inside the remaining time", not p.fake()["ws"][1]["closedByPage"]
+          and p.js("rdjRetry && rdjRetry.phase") == "connecting")
+    p.advance(400)
+    f = p.fake()
+    check(name, "the attempt ends at the sequence deadline, not 30 s later", released(f, 1, 1)
+          and p.js("rdjRetry") is None, f)
+    check(name, "terminal presentation, guard removed", p.button()["status"] == "Reconnect failed"
+          and not p.guard(), p.button())
+    calls = len(engine.policy_calls)
+    p.advance(40000, step=1000)
+    check(name, "nothing further", len(engine.tokens) == 2 and len(engine.policy_calls) == calls)
+    p.close()
+
+
+def deadline_established_after_expiry(browser, html):
+    name = "deadline:established-after-expiry"
+    engine = Engine()
+    engine.policy = lambda attempts: RETRY
+    p = Page(browser, html, engine, name)
+    p.click_connect()
+    p.establish(0)
+    p.lose_established(0)
+    p.advance(1100)
+    p.js("i => window.__fake.open(i)", 1)
+    p.js("i => window.__fake.offer(i)", 1)
+    p.settle(6)
+    perf = p.js("performance.now()")
+    p.wall_jump(200000)                                 # system sleep: wall clock past the deadline, no timer fired
+    check(name, "simulated sleep left performance.now() and the attempt untouched",
+          abs(p.js("performance.now()") - perf) < 50 and p.js("rdjRetry && rdjRetry.phase") == "connecting")
+    p.js("i => window.__fake.ice(i, 'connected')", 1)
+    engine.admit(engine.tokens[-1])
+    p.advance(2200)
+    f = p.fake()
+    check(name, "an establishment after the deadline is never adopted", p.js("rdjRetry") is None
+          and p.js("rdjLastSequence") is None and p.button()["action"] != "Disconnect", p.button())
+    check(name, "the late replacement is released", released(f, 1, 1), f)
+    check(name, "no unhandled rejection", not f["unhandled"] and not p.errors, (f["unhandled"], p.errors))
+    p.close()
+
+
+def deadline_sleep_while_waiting(browser, html):
+    name = "deadline:sleep-while-waiting"
+    engine, mode, p = lost_and_waiting(browser, html, name, 1100)
+    mode["answer"] = RETRY
+    p.wall_jump(200000)
+    p.advance(1100)
+    check(name, "a delayed re-ask after sleep never mints a token", len(engine.tokens) == 1
+          and p.js("rdjRetry") is None and p.button()["status"] == "Reconnect failed", p.button())
+    p.close()
+
+
+def deadline_late_token(browser, html):
+    name = "deadline:late-token"
+    engine, mode, p = lost_and_waiting(browser, html, name, 144500)
+    mode["answer"] = RETRY
+    p.hold_tokens = True
+    p.advance(600)
+    check(name, "replacement token request in flight", len(p.held) == 1)
+    p.advance(5200)
+    check(name, "deadline ends the sequence while the token is pending", p.js("rdjRetry") is None)
+    p.hold_tokens = False
+    p.release_held()                                    # the token arrives late
+    p.advance(2000)
+    check(name, "a late token response opens nothing", len(p.fake()["ws"]) == 1 and not p.owns(), p.fake())
+    p.close()
+
+
+def deadline_late_microphone(browser, html):
+    name = "deadline:late-microphone"
+    engine, mode, p = lost_and_waiting(browser, html, name, 144500)
+    mode["answer"] = RETRY
+    p.advance(600)
+    p.js("window.__fake.gumHold = true")
+    p.js("i => window.__fake.open(i)", 1)
+    p.js("i => window.__fake.offer(i)", 1)
+    p.settle(6)
+    p.advance(5200)
+    check(name, "deadline ends the sequence while the microphone prompt is pending", p.js("rdjRetry") is None)
+    p.js("window.__fake.releaseGum()")
+    p.settle(6)
+    f = p.fake()
+    check(name, "the late microphone stream is stopped, no answer, nothing revived", f["liveMic"] == 0
+          and f["liveOutput"] == 0 and f["openCtxs"] == 0 and not f["ws"][1]["answer"] and not p.owns(), f)
+    p.close()
+
+
+def deadline_successor_after_cancel(browser, html):
+    name = "deadline:successor-after-cancel"
+    engine, mode, p = lost_and_waiting(browser, html, name, 144500)
+    mode["answer"] = RETRY
+    p.advance(600)                                      # attempt timer capped at T+150 s
+    p.js("i => window.__fake.open(i)", 1)
+    p.js("i => window.__fake.offer(i)", 1)
+    p.settle(6)
+    p.advance(1000)
+    p.click_connect()                                   # Cancel reconnect
+    p.advance(500)
+    p.click_connect()                                   # an operator Connect
+    p.establish(2)
+    p.advance(12000, step=1000)                         # past the old attempt timer and the old deadline
+    f = p.fake()
+    check(name, "stale sequence timers never touch the successor", p.button()["action"] == "Disconnect"
+          and f["ws"][2]["readyState"] == 1 and not f["pcs"][2]["closed"] and f["liveMic"] == 1
+          and f["liveOutput"] == 1 and p.js("rdjAttemptId") == engine.tokens[-1], (p.button(), f))
+    p.close()
+
+
+def deadline_engine_turnover(browser, html):
+    name = "deadline:engine-turnover"
+    engine, mode, p = lost_and_waiting(browser, html, name, 1100)
+    engine.instance = "eng-2"                           # the engine restarted meanwhile
+    mode["answer"] = {"decision": "stop", "reason": "session_not_recognized"}
+    p.advance(1100)
+    check(name, "an engine turnover stops the sequence", p.js("rdjRetry") is None and len(engine.tokens) == 1)
+    p.advance(3500)
+    p.click_connect()
+    p.establish(1)
+    p.advance(160000, step=2000)                        # well past every timer of the old sequence
+    f = p.fake()
+    check(name, "the successor survives every stale timer", p.button()["action"] == "Disconnect"
+          and f["ws"][1]["readyState"] == 1 and not f["pcs"][1]["closed"] and f["liveMic"] == 1, (p.button(), f))
+    p.close()
+
+
 def main():
     """argv: <render dir> [scenario-name filter] [page filter: remote_dj|console]"""
     import time as _time
@@ -767,7 +1157,8 @@ def main():
                  scenario_auto_reconnect_success, scenario_policy_stops, scenario_cancel,
                  scenario_bounded_failures, scenario_establish_timeout, scenario_fail_closed_policy,
                  scenario_terminal_events, scenario_late_media_and_tokens, scenario_unstable_replacement,
-                 scenario_observer_and_tabs, scenario_lifecycle, scenario_calibration]
+                 scenario_observer_and_tabs, scenario_lifecycle, scenario_calibration,
+                 scenario_setup_failures, scenario_stale_setup_failure, scenario_deadline]
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         for page_name, html in pages.items():

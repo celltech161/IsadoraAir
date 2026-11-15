@@ -2598,6 +2598,10 @@ let rdjReconnecting = false;
 // superseded attempt can never touch a newer one.
 let rdjAttemptSeq = 0;
 let rdjMicStream = null;     // the attempt's own getUserMedia stream (tracks stopped on release)
+// 2.17B remediation (Codex F3): the attempt's Web Audio destination (output)
+// tracks. AudioContext.close() does not end them in Chromium, so release
+// stops them explicitly, independently of the microphone tracks.
+let rdjOutputTracks = [];
 let rdjEstablished = false;  // this attempt's ICE reached connected/completed
 // One automatic reconnect SEQUENCE after an established session ended
 // involuntarily, or null. Its gen is the sequence identity: every timer,
@@ -2798,6 +2802,10 @@ async function toggleRemoteDjConnect() {
 // automatic reconnect sequence that launched it (0: the operator's Connect).
 async function rdjStartConnection(retryGen) {
   const seq = ++rdjAttemptSeq;
+  // 2.17B remediation (Codex F1): what THIS attempt created, so a late
+  // failure of a superseded attempt can release its own resources -- and
+  // never a successor's (see rdjSetupFailed).
+  const owned = {ws: null, pc: null, stream: null, ctx: null, outputTracks: []};
   if (retryGen && rdjRetryAlive(retryGen)) rdjRetry.seq = seq;
   const btn = document.getElementById('remoteDjConnectBtn');
   rdjConnecting = true;
@@ -2854,7 +2862,7 @@ async function rdjStartConnection(retryGen) {
       throw error;
     }
     const tokenResponse = await r.json();
-    if (seq !== rdjAttemptSeq) return;
+    if (seq !== rdjAttemptSeq || rdjRetryAttemptExpired(retryGen)) return;
     ({token} = tokenResponse);
     rdjAttemptId = tokenResponse.attempt_id;
     rdjBrowserKey = null;
@@ -2878,15 +2886,17 @@ async function rdjStartConnection(retryGen) {
   }
 
   rdjWs = new WebSocket('wss://' + location.host + '/ws/remote-dj/?token=' + token);
+  owned.ws = rdjWs;
   rdjWs.onopen = () => {
     if (seq !== rdjAttemptSeq) return;
     rdjSendMilestone('browser_connect_start', 0);
     rdjSendMilestone('browser_token_received', tokenElapsedMs);
     rdjSendMilestone('browser_websocket_open');
   };
-  rdjWs.onmessage = async (event) => {
+  const onSignal = async (event) => {
     if (seq !== rdjAttemptSeq) return;
-    const msg = JSON.parse(event.data);
+    let msg;
+    try { msg = JSON.parse(event.data); } catch (e) { return; }   // never a rejection
     if (msg.type === 'kicked') { rdjKickedNotice = true; return; }
     if (msg.type === 'offer') {
       // Client-side STUN so the browser gathers its own srflx candidate
@@ -2896,6 +2906,7 @@ async function rdjStartConnection(retryGen) {
       // for the earlier static-on-playing-deck race -- see
       // engine.py::_remote_dj_build_session's history).
       rdjPc = new RTCPeerConnection({iceServers: rdjIceServers});
+      owned.pc = rdjPc;
       const statsPc = rdjPc;
       const statsWs = rdjWs;
       const statsAttemptId = rdjAttemptId;
@@ -2977,21 +2988,27 @@ async function rdjStartConnection(retryGen) {
         return;
       }
       rdjMicStream = stream;
+      owned.stream = stream;
+      if (rdjRetryAttemptExpired(retryGen)) return;
 
       // Route mic through a Web Audio graph so the persisted calibration
       // gain applies (set via this dashboard's own Remote Mic calibrate
       // action -- see the toggleRemoteDjGate() dual-purpose flow).
       rdjAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      owned.ctx = rdjAudioCtx;
       const micSource = rdjAudioCtx.createMediaStreamSource(stream);
       rdjGainNode = rdjAudioCtx.createGain();
       const savedDb = rdjGetSavedGainDb();
       rdjGainNode.gain.value = rdjDbToLin(savedDb !== null ? savedDb : 0);
       const rdjDestination = rdjAudioCtx.createMediaStreamDestination();
+      rdjOutputTracks = rdjDestination.stream.getTracks();
+      owned.outputTracks = rdjOutputTracks;
       micSource.connect(rdjGainNode);
       rdjGainNode.connect(rdjDestination);
 
       const transceivers = rdjPc.getTransceivers();
       const monitorT = transceivers[0], micT = transceivers[1];
+      if (!monitorT || !micT || !micT.sender) throw new Error('missing transceiver');
       await micT.sender.replaceTrack(rdjDestination.stream.getAudioTracks()[0]);
       micT.direction = 'sendonly';
       monitorT.direction = 'recvonly';
@@ -3029,11 +3046,20 @@ async function rdjStartConnection(retryGen) {
         senderParams.encodings[0].maxBitrate = 128000;
         await micT.sender.setParameters(senderParams);
       } catch (e) {}
-      if (seq !== rdjAttemptSeq) return;
+      if (seq !== rdjAttemptSeq || rdjRetryAttemptExpired(retryGen)) return;
       rdjWs.send(JSON.stringify({type: 'answer', sdp: rdjPc.localDescription.sdp}));
     } else if (msg.type === 'ice' && rdjPc) {
       try { await rdjPc.addIceCandidate({sdpMLineIndex: msg.sdpMLineIndex, candidate: msg.candidate}); } catch(e){}
     }
+  };
+  // 2.17B remediation (Codex F1): every awaited setup step above can reject
+  // (remote description, microphone, AudioContext/graph, transceivers,
+  // replaceTrack, createAnswer, setLocalDescription, the answer send). A
+  // rejection is never left unhandled: it fails this attempt through the
+  // normal path, or -- if the attempt was already superseded -- releases
+  // only what this attempt itself created.
+  rdjWs.onmessage = (event) => {
+    onSignal(event).catch(() => rdjSetupFailed(seq, owned));
   };
   rdjWs.onerror = () => {
     if (seq !== rdjAttemptSeq) return;
@@ -3099,10 +3125,30 @@ function rdjReleaseLocal() {
     rdjMicStream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
     rdjMicStream = null;
   }
+  rdjOutputTracks.forEach(track => { try { track.stop(); } catch (e) {} });
+  rdjOutputTracks = [];
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
   rdjGainNode = null;
   const audio = document.getElementById('remoteMonitorAudio');
   if (audio) audio.srcObject = null;
+}
+
+// 2.17B remediation (Codex F1): an offer-processing / microphone-setup step
+// of attempt `seq` rejected. The current attempt fails through the
+// established path (a manual Connect: error presentation, no reconnect; an
+// automatic replacement: one attempt of the SAME bounded sequence). A
+// superseded attempt's resources were released with it; anything it still
+// holds (it is never a successor's: identity-checked) is stopped/closed here.
+function rdjSetupFailed(seq, owned) {
+  if (seq === rdjAttemptSeq) { rdjAttemptFailed(seq, 'Setup failed'); return; }
+  const stop = track => { try { track.stop(); } catch (e) {} };
+  if (owned.stream && owned.stream !== rdjMicStream) owned.stream.getTracks().forEach(stop);
+  owned.outputTracks.forEach(track => { if (!rdjOutputTracks.includes(track)) stop(track); });
+  if (owned.ctx && owned.ctx !== rdjAudioCtx && owned.ctx.state !== 'closed') {
+    try { owned.ctx.close().catch(() => {}); } catch (e) {}
+  }
+  if (owned.pc && owned.pc !== rdjPc) { try { owned.pc.close(); } catch (e) {} }
+  if (owned.ws && owned.ws !== rdjWs) { try { owned.ws.close(); } catch (e) {} }
 }
 
 function rdjPresentOffline() {
@@ -3157,6 +3203,25 @@ function rdjRetryAlive(gen) {
   return !!rdjRetry && rdjRetry.gen === gen;
 }
 
+// 2.17B remediation (Codex F2): the whole-sequence deadline is authoritative.
+// Measured on BOTH the monotonic clock and the wall clock, whichever runs out
+// first: performance.now() may not advance during system sleep, and a delayed
+// (background/sleep) timer must never extend the sequence.
+function rdjRetryRemainingMs(retry) {
+  return Math.min(retry.deadline - performance.now(), retry.wallDeadline - Date.now());
+}
+function rdjRetryExpired(retry) {
+  return rdjRetryRemainingMs(retry) <= 0;
+}
+// For an attempt launched by sequence retryGen (0: an operator Connect, never
+// expires): once the sequence deadline passed, end the sequence -- which
+// releases this attempt -- and report true so the caller stops.
+function rdjRetryAttemptExpired(retryGen) {
+  if (!retryGen || !rdjRetryAlive(retryGen) || !rdjRetryExpired(rdjRetry)) return false;
+  rdjRetryStop(retryGen, 'deadline');
+  return true;
+}
+
 // The current attempt failed before it was established.
 function rdjAttemptFailed(seq, msg, opts = {}) {
   if (seq !== rdjAttemptSeq) return;
@@ -3201,7 +3266,8 @@ function rdjMaybeStartRetry(lostAttemptId) {
   const gen = ++rdjRetryGen;
   rdjRetry = {
     gen, attemptIds: [lostAttemptId], used, seq: 0, phase: 'evaluating',
-    deadline: now + RDJ_RETRY_DEADLINE_MS, timer: null, attemptTimer: null, abort: null,
+    deadline: now + RDJ_RETRY_DEADLINE_MS, wallDeadline: Date.now() + RDJ_RETRY_DEADLINE_MS,
+    timer: null, attemptTimer: null, abort: null,
   };
   rdjRetryNotice = null;
   rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen), RDJ_RETRY_BACKOFF_MS[Math.min(used, RDJ_RETRY_BACKOFF_MS.length - 1)]);
@@ -3212,7 +3278,7 @@ function rdjMaybeStartRetry(lostAttemptId) {
 async function rdjRetryCheckPolicy(gen) {
   if (!rdjRetryAlive(gen)) return;
   rdjRetry.timer = null;
-  if (performance.now() >= rdjRetry.deadline) { rdjRetryStop(gen, 'deadline'); return; }
+  if (rdjRetryExpired(rdjRetry)) { rdjRetryStop(gen, 'deadline'); return; }
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   rdjRetry.abort = controller;
   const timeout = setTimeout(() => { if (controller) controller.abort(); }, RDJ_RETRY_POLICY_TIMEOUT_MS);
@@ -3232,27 +3298,35 @@ async function rdjRetryCheckPolicy(gen) {
   clearTimeout(timeout);
   if (!rdjRetryAlive(gen)) return;   // cancelled meanwhile: this answer is inert
   rdjRetry.abort = null;
+  if (decision === 'stop') { rdjRetryStop(gen, typeof reason === 'string' ? reason : 'stopped'); return; }
+  // Re-checked after the await: an answer that arrives past the deadline
+  // never mints a token or schedules another request.
+  if (rdjRetryExpired(rdjRetry)) { rdjRetryStop(gen, 'deadline'); return; }
   if (decision === 'retry') {
     if (rdjRetry.used >= RDJ_RETRY_MAX_ATTEMPTS) { rdjRetryStop(gen, 'exhausted'); return; }
     rdjRetryLaunch(gen);
     return;
   }
-  if (decision === 'stop') { rdjRetryStop(gen, typeof reason === 'string' ? reason : 'stopped'); return; }
   // "wait" -- or anything else, which fails closed: ask again, bounded by
   // the sequence deadline, without spending an attempt.
   rdjRetry.phase = 'waiting';
   rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen),
-    Math.max(0, Math.min(RDJ_RETRY_POLICY_WAIT_MS, rdjRetry.deadline - performance.now())));
+    Math.max(0, Math.min(RDJ_RETRY_POLICY_WAIT_MS, rdjRetryRemainingMs(rdjRetry))));
   renderRemoteDjConnect(window.__rdjLastEngineState || {});
 }
 
 function rdjRetryLaunch(gen) {
+  // Immediately before minting a token: never past the sequence deadline, and
+  // establishment is bounded by whatever remains of it.
+  const remaining = rdjRetryRemainingMs(rdjRetry);
+  if (remaining <= 0) { rdjRetryStop(gen, 'deadline'); return; }
   rdjRetry.used += 1;
   rdjRetry.phase = 'connecting';
   rdjRetry.attemptTimer = setTimeout(() => {
     if (!rdjRetryAlive(gen) || rdjRetry.phase !== 'connecting') return;
+    if (rdjRetryExpired(rdjRetry)) { rdjRetryStop(gen, 'deadline'); return; }
     rdjAttemptFailed(rdjRetry.seq, null);   // establishment took too long
-  }, RDJ_RETRY_ESTABLISH_TIMEOUT_MS);
+  }, Math.min(RDJ_RETRY_ESTABLISH_TIMEOUT_MS, remaining));
   rdjStartConnection(gen);
 }
 
@@ -3263,7 +3337,7 @@ function rdjRetryAttemptFailed(gen) {
   rdjRetry.seq = 0;
   if (rdjRetry.used >= RDJ_RETRY_MAX_ATTEMPTS) { rdjRetryStop(gen, 'exhausted'); return; }
   const delay = RDJ_RETRY_BACKOFF_MS[Math.min(rdjRetry.used, RDJ_RETRY_BACKOFF_MS.length - 1)];
-  if (performance.now() + delay >= rdjRetry.deadline) { rdjRetryStop(gen, 'deadline'); return; }
+  if (delay >= rdjRetryRemainingMs(rdjRetry)) { rdjRetryStop(gen, 'deadline'); return; }
   rdjRetry.phase = 'backoff';
   rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen), delay);
   renderRemoteDjConnect(window.__rdjLastEngineState || {});
@@ -3274,6 +3348,13 @@ function rdjRetryAttemptFailed(gen) {
 // as the owner (rdjLocalLink 'owner').
 function rdjRetryOnStatus(data) {
   if (!rdjRetry || rdjRetry.phase !== 'connecting' || !rdjEstablished) return false;
+  if (rdjRetryExpired(rdjRetry)) {
+    // Established only after the sequence deadline: never adopted. Ended just
+    // after this render (it is mid-presentation of the sequence).
+    const gen = rdjRetry.gen;
+    queueMicrotask(() => rdjRetryStop(gen, 'deadline'));
+    return false;
+  }
   if (rdjLocalLink(data) !== 'owner') return false;
   const retry = rdjRetry;
   rdjRetry = null;
