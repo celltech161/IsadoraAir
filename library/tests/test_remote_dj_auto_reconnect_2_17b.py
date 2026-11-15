@@ -367,6 +367,23 @@ class AutoReconnectAdminTests(TestCase):
         self.assertFalse(field.default)
         self.assertIn("same-session recovery", field.help_text)
 
+    def test_help_text_states_the_switch_semantics_truthfully_in_model_and_migration(self):
+        # Codex review F4: switching it off prevents SUBSEQUENT attempts at their next policy decision; it
+        # does not necessarily cancel an attempt already negotiating. The migration states the same text.
+        import importlib
+        field = RemoteDJConfig._meta.get_field("auto_reconnect_enabled")
+        self.assertIn("When disabled, prevents subsequent automatic reconnect attempts at their next policy "
+                      "decision. It does not necessarily cancel a connection attempt already negotiating.",
+                      field.help_text)
+        self.assertNotIn("stops a reconnect already in progress", field.help_text)
+        migration = importlib.import_module("library.migrations.0103_remotedjconfig_auto_reconnect_enabled")
+        (operation,) = migration.Migration.operations
+        self.assertEqual(operation.name, "auto_reconnect_enabled")
+        self.assertEqual(operation.field.help_text, field.help_text)
+        self.assertIs(operation.field.default, False)
+        self.assertEqual(operation.field.verbose_name, field.verbose_name)
+        self.assertEqual(migration.Migration.dependencies, [("library", "0102_uitheme_log_display_appearance")])
+
     def test_admin_change_page_toggles_and_audits(self):
         admin_user = User.objects.create_superuser("ar217b_super", password="x")
         client = Client()

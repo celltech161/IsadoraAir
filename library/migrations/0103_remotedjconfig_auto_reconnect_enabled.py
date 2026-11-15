@@ -24,9 +24,10 @@ class Migration(migrations.Migration):
                     "Disconnect, Kick, revocation, engine shutdown or Emergency Mute), the DJ's browser may "
                     "start a brand-new session on its own -- a new sign-in token, new connection and new "
                     "microphone setup, with the Remote Mic Off -- up to 3 attempts, with a Cancel button. Off: a "
-                    "lost session stays disconnected until the DJ presses Connect (unchanged behaviour). Checked "
-                    "again before every attempt, so turning it off stops a reconnect already in progress. "
-                    "Requires Remote DJ itself (Master switch) to be on."
+                    "lost session stays disconnected until the DJ presses Connect (unchanged behaviour). When "
+                    "disabled, prevents subsequent automatic reconnect attempts at their next policy decision. "
+                    "It does not necessarily cancel a connection attempt already negotiating. Requires Remote "
+                    "DJ itself (Master switch) to be on."
                 ),
                 verbose_name="Enable automatic Remote DJ reconnect",
             ),

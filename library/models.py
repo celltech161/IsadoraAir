@@ -2106,9 +2106,11 @@ class RemoteDJConfig(models.Model):
                    "and new microphone setup, with the Remote Mic Off -- up to "
                    "3 attempts, with a Cancel button. Off: a lost session stays "
                    "disconnected until the DJ presses Connect (unchanged "
-                   "behaviour). Checked again before every attempt, so turning "
-                   "it off stops a reconnect already in progress. Requires "
-                   "Remote DJ itself (Master switch) to be on.",
+                   "behaviour). When disabled, prevents subsequent automatic "
+                   "reconnect attempts at their next policy decision. It does "
+                   "not necessarily cancel a connection attempt already "
+                   "negotiating. Requires Remote DJ itself (Master switch) to "
+                   "be on.",
     )
 
     class Meta:
