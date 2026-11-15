@@ -7155,7 +7155,15 @@ class PlaybackEngine:
         # iPortal D2B: from here a native item is the deck path's (claimed at
         # deck open) -- no longer an unaired queue entry.
         native_held = self.__dict__.get("_active_message_held", {}).pop(log_item.id, None) is not None
+        self.__dict__.pop("_claim_track_changed_item_id", None)
         deck = self._create_deck(slot, log_item)
+        if deck is None and self.__dict__.pop("_claim_track_changed_item_id", None) == log_item.id:
+            # Queue Swap: the committed track differs from this in-memory copy. Open the
+            # committed occurrence (same LogItem, same slot) instead of skipping it.
+            fresh = self._reread_changed_occurrence(log_item)
+            if fresh is not None:
+                log_item = fresh
+                deck = self._create_deck(slot, log_item)
         if deck is None:
             # Roadmap 2.23: lets Start Next tell "nothing could be opened"
             # apart from an ordinarily empty queue.
@@ -7182,6 +7190,34 @@ class PlaybackEngine:
         running_time = clock.get_time() - self.main_pipeline.get_base_time()
         deck_bin.get_static_pad("src").set_offset(running_time - internal_position_ns)
 
+    def _reread_changed_occurrence(self, log_item):
+        """The committed row of an occurrence whose track changed after the last queue reload, or None if
+        it is no longer something to open (aired, claimed, poison-guarded, unplayable). Keeps the in-memory
+        queue on the same object. One indexed read, only on that rare mismatch."""
+        try:
+            _close_old_connections()
+            fresh = (
+                LogItem.objects.select_related(
+                    "track", "track__artist", "track__album", "track__category", "track__category__kind",
+                    "category", "category__kind",
+                )
+                .filter(pk=log_item.id, playlist_log_id=log_item.playlist_log_id)
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Re-reading changed occurrence log_item={log_item.id} failed: {exc}")
+            return None
+        if fresh is None or fresh.played_at is not None or fresh.playback_claimed_at is not None:
+            return None
+        if self._is_poison_guarded(fresh):
+            return None
+        playable, reason = _log_item_playable(fresh)
+        if not playable:
+            print(f"  Changed occurrence log_item={fresh.id} is not playable: {reason}")
+            return None
+        self.log_items = [fresh if item.id == fresh.id else item for item in self.log_items]
+        return fresh
+
     def _claim_playback_occurrence(self, log_item):
         """Persist the one-way engine commitment for one concrete LogItem.
 
@@ -7201,9 +7237,20 @@ class PlaybackEngine:
                     cur.execute("SET LOCAL lock_timeout = '250ms'")
                 locked = (
                     LogItem.objects.select_for_update(of=("self",))
-                    .only("id", "playback_claimed_at", "played_at")
+                    .only("id", "playback_claimed_at", "played_at", "track_id")
                     .get(pk=log_item.id)
                 )
+                expected_track_id = getattr(log_item, "track_id", locked.track_id)
+                if locked.playback_claimed_at is None and locked.track_id != expected_track_id:
+                    # A track replacement (operator Swap, a request swap) committed after this
+                    # in-memory copy was read. Never claim -- and so never open -- the stale track:
+                    # _start_next_track re-reads the occurrence and opens what is committed.
+                    self._claim_track_changed_item_id = log_item.id
+                    print(
+                        f"  Occurrence log_item={log_item.id} changed track "
+                        f"({expected_track_id} -> {locked.track_id}) before its claim; re-reading it"
+                    )
+                    return False
                 if locked.playback_claimed_at is None:
                     locked.playback_claimed_at = timezone.now()
                     locked.save(update_fields=["playback_claimed_at"])

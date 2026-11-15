@@ -1000,6 +1000,32 @@
     outline: none;
   }
   .qt-swap-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .swap-dialog {
+    width: min(36rem, calc(100vw - 2rem));
+    max-height: calc(100vh - 2rem);
+    background: var(--panel-bg);
+    color: var(--text-main);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1rem 1.1rem;
+  }
+  .swap-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+  .swap-dialog h2 { font-size: 1rem; margin-bottom: 0.6rem; }
+  .swap-label { display: block; color: var(--text-muted); font-size: 0.75rem; font-weight: 700; margin: 0.55rem 0 0.25rem; }
+  .swap-track { border: 1px solid var(--border-subtle); border-radius: 8px; padding: 0.45rem 0.6rem; background: var(--bg-darker); display: flex; flex-wrap: wrap; gap: 0.15rem 0.6rem; align-items: baseline; }
+  .swap-track .swap-title { font-weight: 700; }
+  .swap-track .swap-meta { color: var(--text-muted); font-size: 0.75rem; }
+  .swap-choice { border-color: var(--accent); }
+  .swap-results { max-height: min(45vh, 18rem); overflow-y: auto; margin-top: 0.4rem; display: flex; flex-direction: column; gap: 2px; }
+  .swap-results .qir-item { cursor: default; }
+  .swap-length { color: var(--text-muted); font-size: 0.78rem; margin-top: 0.45rem; }
+  .swap-status { min-height: 1.2em; font-size: 0.8rem; margin-top: 0.55rem; color: var(--text-muted); }
+  .swap-status.error { color: var(--danger); }
+  .swap-actions { display: flex; justify-content: flex-end; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.7rem; }
+  .swap-actions button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 0.42rem 0.8rem; font: inherit; font-size: 0.82rem; cursor: pointer; }
+  .swap-actions button:hover:not(:disabled), .swap-actions button:focus-visible { border-color: var(--accent); }
+  .swap-actions .swap-confirm { border-color: var(--accent); color: var(--accent); font-weight: 700; }
+  .swap-actions button:disabled { opacity: 0.45; cursor: not-allowed; }
 
   table.queue-table .qt-drag-handle { cursor: grab; touch-action: none; }
   table.queue-table .qt-drag-handle:active { cursor: grabbing; }
@@ -1821,6 +1847,30 @@
     </div>
   </div>
 </div>
+{# Queue Swap: replace one upcoming occurrence in place. Outside the table, #}
+{# which the 1 s status poll re-renders; bound to the row it was opened for. #}
+<dialog id="swapDialog" class="swap-dialog" aria-labelledby="swapDialogTitle" oncancel="closeSwapDialog()">
+  <h2 id="swapDialogTitle">Swap track</h2>
+  <p class="swap-label">Replace this upcoming track:</p>
+  <div id="swapTarget" class="swap-track swap-target"></div>
+  <div id="swapPick">
+    <label class="swap-label" for="swapSearch">Replacement</label>
+    <input type="search" id="swapSearch" class="queue-insert-input" autocomplete="off"
+           placeholder="Search to choose a replacement track...">
+    <div id="swapResults" class="swap-results" role="list" aria-label="Replacement tracks"></div>
+  </div>
+  <div id="swapReview" hidden>
+    <p class="swap-label">With:</p>
+    <div id="swapChoice" class="swap-track swap-choice"></div>
+    <p id="swapLength" class="swap-length"></p>
+  </div>
+  <p id="swapStatus" class="swap-status" role="status" aria-live="polite"></p>
+  <div class="swap-actions">
+    <button type="button" id="swapBack" hidden onclick="swapBackToSearch()">Choose another</button>
+    <button type="button" id="swapCancel" onclick="closeSwapDialog()">Cancel</button>
+    <button type="button" id="swapConfirm" class="swap-confirm" hidden onclick="confirmSwap()">Swap track</button>
+  </div>
+</dialog>
 </div>
 {% endblock %}
 
@@ -4252,6 +4302,7 @@ function renderConnectionStale(stale) {
   const root = document.getElementById('consoleRoot');
   if (root) root.classList.toggle('connection-stale', stale);
   renderStartNext(null);
+  if (swapCtx) swapRender();   // [P1] 1.7 -- a stale console never commits a Swap
 }
 
 // Evaluated at the START of every poll() tick, BEFORE awaiting
@@ -5288,10 +5339,15 @@ function buildQueueRows(data) {
   return rows;
 }
 
-// Swap (replace this upcoming occurrence with another track). Rendered on
-// upcoming rows only; inert until the guarded live replacement is available.
+// Swap (replace this upcoming occurrence with another track, in place). Upcoming
+// rows only. Presentation follows CONSOLE_CAPS.queue_swap (playout.queue_manage
+// and the account's access to the endpoint); the server re-checks everything.
+const CAN_QUEUE_SWAP = CONSOLE_CAPS.queue_swap === true;
 function swapButtonHtml(r) {
-  return `<button type="button" class="qt-swap-btn" disabled aria-label="Swap this track" title="Swap this track (not available yet)">${ICON_SWAP}</button>`;
+  if (!CAN_QUEUE_SWAP) {
+    return `<button type="button" class="qt-swap-btn" disabled aria-label="Swap this track" title="Swap is not available for this account">${ICON_SWAP}</button>`;
+  }
+  return `<button type="button" class="qt-swap-btn" aria-label="Swap this track" title="Swap this track" onclick="event.stopPropagation(); openSwapDialog(${r.itemId})">${ICON_SWAP}</button>`;
 }
 
 function renderQueue(data) {
@@ -5304,6 +5360,7 @@ function renderQueue(data) {
 
   lastQueueData = data;
   maybeRefreshLogHistory(data);
+  swapSyncWithQueue(data);
 
   const list = document.getElementById('queueList');
   const wrap = list.closest('.queue-table-wrap');
@@ -5320,6 +5377,11 @@ function renderQueue(data) {
   queueItemIds = rows.filter(r => r.state === 'upcoming').map(r => r.itemId);
 
   const scrollTop = wrap.scrollTop;
+  // The table is rebuilt every second: keep keyboard focus on the same row's
+  // control (NEXT / Swap) instead of dropping it to the page.
+  const active = document.activeElement;
+  const refocus = active && list.contains(active) && active.closest('tr')
+    ? { itemId: active.closest('tr').dataset.itemId, cls: active.classList[0] } : null;
   list.innerHTML = rows.map((r, i) => {
     // Drag-handle and next-button columns are present in both modes so
     // the remote DJ can also reorder the queue and force-next a track.
@@ -5356,6 +5418,11 @@ function renderQueue(data) {
     </tr>
   `;
   }).join('');
+
+  if (refocus && refocus.itemId && refocus.cls) {
+    const again = list.querySelector(`tr[data-item-id="${refocus.itemId}"] .${refocus.cls}`);
+    if (again) again.focus({ preventScroll: true });
+  }
 
   if (SHOW_PLAYED_ITEMS) {
     wrap.classList.add('qt-history');
@@ -5493,26 +5560,38 @@ document.getElementById('queueInsertSearch').addEventListener('blur', function()
   setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
 });
 
-async function searchForInsert(q) {
+// One track search for "Search to add track" and Swap: the same request, the same
+// Ready-to-Air filter and the same result summary. null on failure.
+async function fetchQueueSearchResults(q) {
   // 200 is the backend's own hard ceiling (Paginator per_page cap in
   // api_track_list) -- effectively "all matches" for any realistic
   // search term. Results list already scrolls (max-height + overflow-y
   // on .queue-insert-results), so there's no separate paging UI needed.
   const resp = await fetch(`/api/tracks/?q=${encodeURIComponent(q)}&per_page=200&ready2air=true`);
-  if (!resp.ok) return;
+  if (!resp.ok) return null;
   const data = await resp.json();
+  return Array.isArray(data.items) ? data.items : null;
+}
+
+function queueSearchSummaryHtml(t) {
+  return `<span>${esc(t.title)}</span>
+      <span class="qir-artist">${esc(t.artist)}</span>
+      <span class="qir-dur">${fmtDur(t.duration_seconds)}</span>`;
+}
+
+async function searchForInsert(q) {
+  const items = await fetchQueueSearchResults(q);
+  if (!items) return;
   const container = document.getElementById('queueInsertResults');
 
-  if (!data.items.length) {
+  if (!items.length) {
     container.classList.remove('visible');
     return;
   }
 
-  container.innerHTML = data.items.map(t => `
+  container.innerHTML = items.map(t => `
     <div class="qir-item">
-      <span>${esc(t.title)}</span>
-      <span class="qir-artist">${esc(t.artist)}</span>
-      <span class="qir-dur">${fmtDur(t.duration_seconds)}</span>
+      ${queueSearchSummaryHtml(t)}
       <button class="qir-btn" onmousedown="event.preventDefault(); insertTrack(${t.id}, 'next')">Play Next</button>
       <button class="qir-btn" onmousedown="event.preventDefault(); insertTrack(${t.id}, 'end')">Add to End</button>
     </div>
@@ -5531,6 +5610,187 @@ async function insertTrack(trackId, position) {
   document.getElementById('queueInsertResults').classList.remove('visible');
   poll();
 }
+
+// --- Queue Swap -------------------------------------------------------------
+// Replace one upcoming occurrence in place (POST /api/engine/queue/replace/).
+// The dialog is bound to the row, track and engine instance it was opened for;
+// the server re-checks all of them (docs/QUEUE_SWAP.md).
+let swapCtx = null;           // {itemId, trackId, title, artist, duration, category, engineInstance}
+let swapChoice = null;        // the chosen replacement (search result)
+let swapSearchGen = 0;        // newest search; older answers never render
+let swapSearchTimer = null;
+let swapSubmitting = false;
+let swapStale = null;         // why the queue says the target can no longer be swapped (or null)
+let swapRefused = null;       // a final refusal from the server for this dialog (or null)
+
+function swapTrackHtml(title, artist, duration, category) {
+  return `<span class="swap-title">${esc(title)}</span><span class="swap-meta">${esc(artist)}</span>`
+    + `<span class="swap-meta">${fmtDur(duration)}${category ? ' &middot; ' + esc(category) : ''}</span>`;
+}
+
+function swapSetStatus(text, isError) {
+  const node = document.getElementById('swapStatus');
+  node.textContent = text || '';
+  node.classList.toggle('error', !!isError);
+}
+
+function swapRender() {
+  const reviewing = !!swapChoice;
+  document.getElementById('swapPick').hidden = reviewing;
+  document.getElementById('swapReview').hidden = !reviewing;
+  document.getElementById('swapBack').hidden = !reviewing;
+  const confirm = document.getElementById('swapConfirm');
+  confirm.hidden = !reviewing;
+  confirm.disabled = swapSubmitting || !!swapStale || !!swapRefused || connectionStale;
+  if (reviewing) {
+    document.getElementById('swapChoice').innerHTML = swapTrackHtml(
+      swapChoice.title, swapChoice.artist, swapChoice.duration_seconds, swapChoice.category_name);
+    const before = Number(swapCtx.duration) || 0, after = Number(swapChoice.duration_seconds) || 0;
+    const diff = Math.round(after - before);
+    document.getElementById('swapLength').textContent = `Track length ${fmtDur(before)} \u2192 ${fmtDur(after)}`
+      + (diff ? ` (${fmtDur(Math.abs(diff))} ${diff < 0 ? 'shorter' : 'longer'}).` : '.')
+      + (diff < 0 ? ' The hour\u2019s normal live fill covers any resulting shortfall.' : '');
+  }
+}
+
+function openSwapDialog(itemId) {
+  if (!CAN_QUEUE_SWAP || connectionStale || !lastQueueData) return;
+  const row = (lastQueueData.queue || []).find(q => q.item_id === itemId);
+  const engineInstance = startNextInstance(lastQueueData);
+  if (!row || !engineInstance) return;
+  swapCtx = Object.freeze({
+    itemId, trackId: row.track_id, title: row.title, artist: row.artist, duration: row.duration,
+    category: row.category, engineInstance,
+  });
+  swapChoice = null;
+  swapSubmitting = false;
+  swapStale = null;
+  swapRefused = null;
+  swapSearchGen++;
+  document.getElementById('swapTarget').innerHTML = swapTrackHtml(row.title, row.artist, row.duration, row.category);
+  document.getElementById('swapSearch').value = '';
+  document.getElementById('swapResults').replaceChildren();
+  swapSetStatus('');
+  swapRender();
+  const dialog = document.getElementById('swapDialog');
+  if (!dialog.open) dialog.showModal();
+  document.getElementById('swapSearch').focus();
+}
+
+function closeSwapDialog() {
+  const dialog = document.getElementById('swapDialog');
+  const ctx = swapCtx;
+  swapCtx = null;
+  swapChoice = null;
+  swapSearchGen++;           // a late search answer never renders
+  clearTimeout(swapSearchTimer);
+  if (dialog.open) dialog.close();
+  if (ctx) {
+    const button = document.querySelector(`#queueList tr[data-item-id="${ctx.itemId}"] .qt-swap-btn`);
+    if (button) button.focus();
+  }
+}
+
+function swapBackToSearch() {
+  if (swapSubmitting) return;
+  swapChoice = null;
+  swapSetStatus('');
+  swapRender();
+  document.getElementById('swapSearch').focus();
+}
+
+// Every queue render: the row must still be upcoming, with the same track,
+// from the same engine. Otherwise nothing can be committed from this dialog.
+function swapSyncWithQueue(data) {
+  if (!swapCtx || swapSubmitting) return;
+  const row = (data.queue || []).find(q => q.item_id === swapCtx.itemId);
+  let why = null;
+  if (startNextInstance(data) !== swapCtx.engineInstance) why = 'The engine restarted; this row can no longer be swapped.';
+  else if (!row) why = 'This track is no longer upcoming (it may have started or been removed).';
+  else if (row.track_id !== swapCtx.trackId) why = 'This row changed since the dialog opened.';
+  if (why !== swapStale) {
+    swapStale = why;
+    if (why) swapSetStatus(why, true);
+    else if (!swapRefused) swapSetStatus('');
+    swapRender();
+  }
+}
+
+async function swapSearch(q) {
+  const generation = ++swapSearchGen;
+  const container = document.getElementById('swapResults');
+  const items = await fetchQueueSearchResults(q);
+  if (generation !== swapSearchGen || !swapCtx || swapChoice) return;   // superseded / closed / chosen
+  container.replaceChildren();
+  if (!items) { swapSetStatus('Search failed. Try again.', true); return; }
+  if (!items.length) { swapSetStatus('No ready-to-air tracks match.'); return; }
+  swapSetStatus('');
+  items.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'qir-item';
+    row.setAttribute('role', 'listitem');
+    row.innerHTML = queueSearchSummaryHtml(t);
+    const choose = document.createElement('button');
+    choose.type = 'button';
+    choose.className = 'qir-btn';
+    choose.textContent = 'Choose';
+    choose.setAttribute('aria-label', `Choose ${t.title} by ${t.artist}`);
+    choose.addEventListener('click', () => {
+      if (!swapCtx || swapSubmitting) return;
+      swapChoice = Object.freeze({...t});
+      swapSetStatus(swapRefused || swapStale || '', !!(swapRefused || swapStale));
+      swapRender();
+      document.getElementById('swapConfirm').focus();
+    });
+    row.appendChild(choose);
+    container.appendChild(row);
+  });
+}
+
+async function confirmSwap() {
+  const ctx = swapCtx, choice = swapChoice;
+  if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || connectionStale) return;
+  swapSubmitting = true;
+  swapSetStatus('Swapping\u2026');
+  swapRender();
+  let data = {}, status = 0;
+  try {
+    const resp = await fetch('/api/engine/queue/replace/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ item_id: ctx.itemId, expected_track_id: ctx.trackId, track_id: choice.id,
+                             engine_instance: ctx.engineInstance }),
+    });
+    status = resp.status;
+    try { data = await resp.json(); } catch (e) { data = {}; }
+  } catch (e) {
+    data = { error: 'The station could not be reached. Nothing was changed.' };
+  }
+  if (swapCtx !== ctx) return;           // closed meanwhile: the queue refresh shows the outcome
+  swapSubmitting = false;
+  if (status === 200 && data.ok) {
+    closeSwapDialog();
+    poll();
+    return;
+  }
+  const finalReasons = ['not_upcoming', 'on_deck', 'claimed', 'played', 'item_changed', 'engine_changed',
+                        'not_replaceable', 'request_reserved', 'log_not_live'];
+  if (finalReasons.includes(data.reason)) swapRefused = data.error || 'This row can no longer be swapped.';
+  swapSetStatus(data.error || `Swap failed (${status || 'network'}). Nothing was changed.`, true);
+  swapRender();
+  poll();
+}
+
+document.getElementById('swapSearch').addEventListener('input', function () {
+  clearTimeout(swapSearchTimer);
+  const q = this.value.trim();
+  if (q.length < 2) {
+    swapSearchGen++;
+    document.getElementById('swapResults').replaceChildren();
+    return;
+  }
+  swapSearchTimer = setTimeout(() => swapSearch(q), 300);
+});
 
 // --- Main poll loop ---
 // Single-flight, bounded status polling (fourth-review P2/P3). The 1 s tick

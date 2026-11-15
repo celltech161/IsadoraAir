@@ -115,7 +115,35 @@ def _console_capabilities(user):
             # Unknown slug (capability row absent): render nothing extra
             # rather than failing the whole on-air Console page.
             caps[key] = False
+    # Queue Swap: the capability AND the account's GroupAccess path reach (the middleware refuses an
+    # unlisted path before the view's own authorize() runs). Presentation only, like the rest.
+    try:
+        holds = bool(authorize(user, "playout.queue_manage", schedule_policy=SCHEDULE_POLICY_IGNORE))
+    except ValueError:
+        holds = False
+    caps["queue_swap"] = holds and _path_reachable_for(user, QUEUE_REPLACE_PATH)
     return caps
+
+
+QUEUE_REPLACE_PATH = "/api/engine/queue/replace/"
+
+
+def _path_reachable_for(user, path):
+    """Whether GroupBasedAccessMiddleware would let ``user`` reach ``path`` (same rules, read-only).
+    Presentation only: the middleware itself remains the enforcement."""
+    from library.middleware import get_group_access_map
+
+    if not getattr(user, "is_authenticated", False):
+        return False
+    if user.is_staff or user.is_superuser:
+        return True
+    access_map = get_group_access_map()
+    for name in set(user.groups.values_list("name", flat=True)) & set(access_map):
+        access = access_map[name]
+        if path in access["exact"] or any(path.startswith(prefix) for prefix in access["prefixes"]) \
+                or any(rx.match(path) for rx in access["regex"]):
+            return True
+    return False
 
 
 @ensure_csrf_cookie
@@ -3615,6 +3643,65 @@ def api_engine_insert_track(request):
     _reposition_items(all_items)
 
     return JsonResponse({"ok": True, "item_id": new_item.id})
+
+
+@require_http_methods(["POST"])
+def api_engine_queue_replace(request):
+    """Operator Swap: replace ONE upcoming occurrence of the live queue with another track, in place
+    (same LogItem id, position, category and origin; nothing inserted). playout.queue_manage with the
+    real schedule policy, CSRF-protected. The browser's view is never the authority: the engine state
+    and the locked rows are re-checked (library.services.queue_replace; docs/QUEUE_SWAP.md).
+
+    Body: {item_id, expected_track_id, track_id, engine_instance}. 200 {ok, changed, ...}; refusals answer
+    {ok: false, reason, error} with 409 (stale/ineligible), 404 (track gone) or 422 (track not airable)."""
+    result = authorize(request.user, "playout.queue_manage")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.queue_manage")
+    from library.services import queue_replace
+    from library.services.log_builder import effective_airtime_seconds
+
+    try:
+        body = _json_body(request)
+        item_id = body.get("item_id")
+        expected_track_id = body.get("expected_track_id")
+        track_id = body.get("track_id")
+        engine_instance = body.get("engine_instance")
+        for value in (item_id, expected_track_id, track_id):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError("item_id, expected_track_id and track_id must be positive integers")
+        if not isinstance(engine_instance, str) or not engine_instance or len(engine_instance) > 128:
+            raise ValidationError("engine_instance is required")
+    except ValidationError as exc:
+        return JsonResponse({"ok": False, "reason": "invalid", "error": exc.message}, status=400)
+
+    outcome = queue_replace.replace_upcoming_item(
+        item_id=item_id, expected_track_id=expected_track_id, track_id=track_id,
+        engine_instance=engine_instance, state=queue_replace.read_engine_state(),
+    )
+    if not outcome.ok:
+        return JsonResponse({"ok": False, "reason": outcome.reason, "error": outcome.message},
+                            status=outcome.status)
+    item = outcome.item
+    payload = {"ok": True, "changed": outcome.changed, "item_id": item.id, "track_id": item.track_id,
+               "title": item.track_title, "artist": item.track_artist}
+    if outcome.changed:
+        tracks = {t.id: t for t in Track.objects.filter(pk__in=[outcome.previous_track_id, item.track_id])}
+        before, after = tracks.get(outcome.previous_track_id), tracks.get(item.track_id)
+        payload["previous_track_id"] = outcome.previous_track_id
+        payload["airtime_change_seconds"] = (
+            round(effective_airtime_seconds(after) - effective_airtime_seconds(before), 1)
+            if before is not None and after is not None else None
+        )
+        from monitoring.models import emit_event
+        emit_event(
+            category="engine", level="info", title="Queue item swapped by operator",
+            detail={"log_item_id": item.id, "playlist_log_id": outcome.detail.get("log_id"),
+                    "position": outcome.detail.get("position"), "previous_track_id": outcome.previous_track_id,
+                    "track_id": item.track_id, "user_id": request.user.pk, "username": request.user.get_username(),
+                    "airtime_change_seconds": payload["airtime_change_seconds"]},
+            dedupe_key=f"engine|queue-swap|{item.id}|{item.track_id}",
+        )
+    return JsonResponse(payload)
 
 
 @csrf_exempt

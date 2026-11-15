@@ -45,6 +45,13 @@ class Engine:
                       item(906, "Upcoming Three", 540)]
         self.history = []          # played-history rows (Show played items)
         self.posts = []            # (path, json body)
+        self.searches = []         # query strings of /api/tracks/ requests
+        self.status_ok = True
+        self.replace_answer = lambda body: (200, {"ok": True, "changed": True, "item_id": body["item_id"],
+                                                  "track_id": body["track_id"]})
+        self.hold_replace = False
+        self.hold_search = False
+        self.held = []
 
     def status(self):
         self.seq += 1
@@ -75,7 +82,27 @@ class Page:
         if path == page_path and request.method == "GET" and request.resource_type == "document":
             return route.fulfill(status=200, content_type="text/html", body=html)
         if path == "/api/engine/status/":
+            if not self.engine.status_ok:
+                return route.fulfill(status=503, body="")
             return self._json(route, self.engine.status())
+        if path == "/api/tracks/":
+            self.engine.searches.append(parsed.query)
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            items = [{"id": 7000 + n, "title": f"{query} Result {n}", "artist": "Swap Artist", "album": "",
+                      "category_code": "ROCK", "category_name": "Rock", "duration_seconds": 125.0 + n,
+                      "next_start_seconds": 120.0, "format": "mp3"} for n in range(3)]
+            if self.engine.hold_search:
+                self.engine.held.append((route, {"items": items}))
+                return None
+            return self._json(route, {"items": items, "total": 3, "page": 1, "pages": 1, "per_page": 200})
+        if path == "/api/engine/queue/replace/":
+            body = json.loads(request.post_data or "{}")
+            self.engine.posts.append((path, body))
+            if self.engine.hold_replace:
+                self.engine.held.append((route, None))
+                return None
+            status, answer = self.engine.replace_answer(body)
+            return self._json(route, answer, status)
         if path.startswith("/api/engine/status/log/"):
             return self._json(route, {"log_id": self.engine.log_id, "items": self.engine.history})
         if request.method == "POST":
@@ -86,6 +113,10 @@ class Page:
             self.engine.posts.append((path, body))
             return self._json(route, {"ok": True})
         return self._json(route, {})
+
+    def release(self, index=0, body=None):
+        route, payload = self.engine.held.pop(index)
+        self._json(route, payload if body is None else body)
 
     def wait_rows(self):
         self.page.wait_for_function("document.querySelectorAll('#queueList tr[data-item-id]').length > 0",
@@ -206,6 +237,165 @@ def scenario_row_states(browser, html_history):
     p.close()
 
 
+def open_swap(p, item_id=905):
+    p.page.locator(f'#queueList tr[data-item-id="{item_id}"] .qt-swap-btn').click()
+    p.page.wait_for_function("document.getElementById('swapDialog').open", timeout=3000)
+
+
+def search_and_choose(p, text="Rock", index=0):
+    p.page.fill("#swapSearch", text)
+    p.page.wait_for_function("document.querySelectorAll('#swapResults .qir-item').length === 3", timeout=3000)
+    p.page.locator("#swapResults .qir-btn").nth(index).click()
+
+
+def scenario_swap_dialog(browser, html):
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    check("swap: the dialog shows the target row",
+          "Upcoming Two" in p.js("document.getElementById('swapTarget').textContent"))
+    check("swap: focus moves to the search field", p.js("document.activeElement.id") == "swapSearch")
+    search_and_choose(p, "Rock", 1)
+    check("swap: uses the same search request as Search to add track",
+          engine.searches and engine.searches[-1] == "q=Rock&per_page=200&ready2air=true", engine.searches)
+    review = p.js("({choice: document.getElementById('swapChoice').textContent,"
+                  " length: document.getElementById('swapLength').textContent,"
+                  " confirm: !document.getElementById('swapConfirm').hidden && !document.getElementById('swapConfirm').disabled})")
+    check("swap: review shows the chosen replacement and the length change before committing",
+          "Rock Result 1" in review["choice"] and "4:00" in review["length"] and "shorter" in review["length"]
+          and review["confirm"], review)
+    check("swap: nothing is sent before Confirm", not [b for path, b in engine.posts if path.endswith("/replace/")])
+    p.page.click("#swapConfirm")
+    p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
+    sent = [b for path, b in engine.posts if path.endswith("/replace/")]
+    check("swap: Confirm sends exactly the row, its track, the choice and the engine instance",
+          sent == [{"item_id": 905, "expected_track_id": 1905, "track_id": 7001, "engine_instance": "eng-1"}], sent)
+    check("swap: no insert request was made", not [b for path, b in engine.posts if path.endswith("/insert/")])
+    check("swap: focus returns to the row's Swap button",
+          p.js("document.activeElement && document.activeElement.classList.contains('qt-swap-btn')"))
+    check("swap: no page errors", not p.errors, p.errors)
+    p.close()
+
+    # Cancel (Escape) changes nothing.
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    search_and_choose(p)
+    p.page.keyboard.press("Escape")
+    p.page.wait_for_timeout(300)
+    check("swap: Escape cancels without a request", not p.js("document.getElementById('swapDialog').open")
+          and not [b for path, b in engine.posts if path.endswith("/replace/")])
+    # Keyboard: Enter on the focused Swap button opens it.
+    p.page.locator('#queueList tr[data-item-id="906"] .qt-swap-btn').focus()
+    p.page.keyboard.press("Enter")
+    p.page.wait_for_function("document.getElementById('swapDialog').open", timeout=3000)
+    check("swap: keyboard-operable", "Upcoming Three" in p.js("document.getElementById('swapTarget').textContent"))
+    check("swap: no page errors (cancel/keyboard)", not p.errors, p.errors)
+    p.close()
+
+
+def scenario_swap_guards(browser, html):
+    # Double submission: one request while the first is in flight.
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    search_and_choose(p)
+    engine.hold_replace = True
+    p.page.click("#swapConfirm")
+    p.page.evaluate("document.getElementById('swapConfirm').click(); confirmSwap(); confirmSwap();")
+    p.page.wait_for_timeout(300)
+    check("swap: double clicks send one request", len([b for path, b in engine.posts if path.endswith("/replace/")]) == 1)
+    check("swap: Confirm is disabled while in flight", p.js("document.getElementById('swapConfirm').disabled"))
+    p.release(0, {"ok": True, "changed": True})
+    p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
+    check("swap: the dialog closes after the server confirms", True)
+    p.close()
+
+    # A row that stops being upcoming (claimed by the engine) while the dialog is open.
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    search_and_choose(p)
+    engine.queue = [q for q in engine.queue if q["item_id"] != 905]
+    p.page.wait_for_function("document.getElementById('swapConfirm').disabled", timeout=4000)
+    check("swap: a row that left the queue cannot be committed",
+          "no longer upcoming" in p.js("document.getElementById('swapStatus').textContent"))
+    p.page.evaluate("confirmSwap()")
+    p.page.wait_for_timeout(200)
+    check("swap: nothing is sent for it", not [b for path, b in engine.posts if path.endswith("/replace/")])
+    p.close()
+
+    # The row's track changed (someone else swapped it) or the engine restarted.
+    for change, expect in (("track", "changed since"), ("engine", "engine restarted")):
+        engine = Engine()
+        p = Page(browser, html, engine)
+        open_swap(p)
+        if change == "track":
+            engine.queue[1] = {**engine.queue[1], "track_id": 4242}
+        else:
+            status = engine.status
+            engine.status = lambda: {**status(), "state_revision": {"instance": "eng-2", "seq": 1},
+                                     "engine_session_id": "eng-2"}
+        p.page.wait_for_function("document.getElementById('swapStatus').textContent.length > 0", timeout=4000)
+        check(f"swap: {change} change is detected", expect in p.js("document.getElementById('swapStatus').textContent"),
+              p.js("document.getElementById('swapStatus').textContent"))
+        p.close()
+
+    # A refusal from the server is shown and leaves the dialog open, disabled.
+    engine = Engine()
+    engine.replace_answer = lambda body: (409, {"ok": False, "reason": "item_changed",
+                                                "error": "That queue row changed since it was shown."})
+    p = Page(browser, html, engine)
+    open_swap(p)
+    search_and_choose(p)
+    p.page.click("#swapConfirm")
+    p.page.wait_for_function("document.getElementById('swapStatus').classList.contains('error')", timeout=3000)
+    check("swap: a refusal is explained and the dialog stays open",
+          p.js("document.getElementById('swapDialog').open")
+          and "changed since it was shown" in p.js("document.getElementById('swapStatus').textContent")
+          and p.js("document.getElementById('swapConfirm').disabled"))
+    p.close()
+
+    # Late search answers never replace newer results.
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    engine.hold_search = True
+    p.page.fill("#swapSearch", "Old"); p.page.wait_for_timeout(450)
+    p.page.fill("#swapSearch", "New"); p.page.wait_for_timeout(450)
+    engine.hold_search = False
+    p.release(1)
+    p.page.wait_for_timeout(200)
+    p.release(0)
+    p.page.wait_for_timeout(300)
+    titles = p.js("[...document.querySelectorAll('#swapResults .qir-item span:first-child')].map(s => s.textContent)")
+    check("swap: a late search answer never replaces the newer results", titles and all(t.startswith("New") for t in titles), titles)
+    p.close()
+
+    # A stale console (no status for > 3 s) cannot commit.
+    engine = Engine()
+    p = Page(browser, html, engine)
+    open_swap(p)
+    search_and_choose(p)
+    engine.status_ok = False
+    p.page.wait_for_function("document.getElementById('consoleRoot').classList.contains('connection-stale')", timeout=8000)
+    check("swap: a stale console disables Confirm", p.js("document.getElementById('swapConfirm').disabled"))
+    p.page.evaluate("confirmSwap()")
+    p.page.wait_for_timeout(200)
+    check("swap: and sends nothing", not [b for path, b in engine.posts if path.endswith("/replace/")])
+    check("swap: no page errors (guards)", not p.errors, p.errors)
+    p.close()
+
+
+def scenario_swap_unavailable_on_remote_dj(browser, html_rdj):
+    p = Page(browser, html_rdj, Engine(), path="/remote-dj/")
+    state = p.js("(() => { const b = document.querySelector('#queueList tr[data-item-id=\"905\"] .qt-swap-btn');"
+                 " return {disabled: b.disabled, title: b.title}; })()")
+    check("remote-dj: Swap is shown but unavailable for an account that cannot reach it",
+          state == {"disabled": True, "title": "Swap is not available for this account"}, state)
+    p.close()
+
+
 def scenario_empty_queue(browser, html):
     engine = Engine()
     engine.queue = [item(904, "Only", 60)]
@@ -227,7 +417,9 @@ def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         for scenario, html in ((scenario_layout, console), (scenario_layout_remote_dj, rdj),
-                               (scenario_row_states, history), (scenario_empty_queue, console)):
+                               (scenario_row_states, history), (scenario_empty_queue, console),
+                               (scenario_swap_dialog, console), (scenario_swap_guards, console),
+                               (scenario_swap_unavailable_on_remote_dj, rdj)):
             if only and only not in scenario.__name__:
                 continue
             try:

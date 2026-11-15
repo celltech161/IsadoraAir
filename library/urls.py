@@ -97,6 +97,7 @@ urlpatterns = [
     path('api/engine/levels/', views.api_engine_levels, name='api-engine-levels'),
     path('api/engine/queue/set-next/', views.api_engine_set_next, name='api-engine-set-next'),
     path('api/engine/queue/insert/', views.api_engine_insert_track, name='api-engine-insert-track'),
+    path('api/engine/queue/replace/', views.api_engine_queue_replace, name='api-engine-queue-replace'),
     path('api/engine/seek/', views.api_engine_seek, name='api-engine-seek'),
     path('api/engine/deck/<str:slot>/', views.api_engine_deck_command, name='api-engine-deck-command'),
     path('api/engine/start-next/', views.api_engine_start_next, name='api-engine-start-next'),
