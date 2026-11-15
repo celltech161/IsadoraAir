@@ -445,5 +445,14 @@ class RemoteDJReconnectDashboardTemplateContractTests(TestCase):
         self.assertIn("weAreConnected ? 'Disconnect' : 'Remote in use'", self.template)
 
     def test_ws_onclose_finalizes_when_peer_still_open(self):
-        self.assertIn("if (!rdjPc) { rdjConnectFail('Closed (' + e.code + ')'); return; }", self.template)
-        self.assertIn("rdjReconnecting = false;\n    rdjDisconnect();\n  };", self.template)
+        # Roadmap 2.17 Package B: an attempt that never got a peer still fails
+        # (now through rdjAttemptFailed, which routes a reconnect attempt's
+        # failure to its sequence); an ESTABLISHED session whose socket the
+        # server closed is finalized locally by rdjOnTerminalLoss, which
+        # releases every local resource (rdjReleaseLocal) before it may
+        # consider an automatic reconnect.
+        self.assertIn("rdjAttemptFailed(seq, 'Closed (' + e.code + ')'", self.template)
+        self.assertIn("rdjReconnecting = false;\n    rdjOnTerminalLoss(seq);\n  };", self.template)
+        loss = self.template[self.template.index("function rdjOnTerminalLoss(seq) {"):]
+        loss = loss[:loss.index("\n}\n")]
+        self.assertIn("rdjReleaseLocal();", loss)

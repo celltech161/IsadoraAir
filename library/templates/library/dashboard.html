@@ -181,6 +181,30 @@
   }
   .ops-msg:empty { display: none; }
 
+  /* Roadmap 2.17 Package B -- leave-page confirmation for a live Remote DJ link. */
+  .rdj-leave-dialog {
+    max-width: 28rem;
+    background: var(--bg-dark);
+    color: var(--text-main);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 1.25rem;
+  }
+  .rdj-leave-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+  .rdj-leave-dialog h2 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+  .rdj-leave-dialog p { margin: 0 0 1rem; line-height: 1.4; }
+  .rdj-leave-actions { display: flex; gap: 0.5rem; justify-content: flex-end; flex-wrap: wrap; }
+  .rdj-leave-actions button {
+    padding: 0.5rem 0.9rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-darker);
+    color: var(--text-main);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .rdj-leave-actions #rdjLeaveGo { border-color: var(--danger); color: var(--danger); }
+
   /* r0119 -- the Remote DJ emergency controls live IN the Remote PTT and
      Connect buttons (no separate row). Only their compact status line
      remains: progress and the engine-confirmed outcome of an administrator
@@ -1643,6 +1667,18 @@
   </button>
 </div>
 <div class="ops-msg" id="opsMsg" role="status" aria-live="polite"></div>
+{# Roadmap 2.17 Package B: shown before a same-tab navigation would drop this #}
+{# page's live Remote DJ connection (rdjConfirmLeave).                        #}
+<dialog id="rdjLeaveDialog" class="rdj-leave-dialog" aria-labelledby="rdjLeaveTitle" aria-describedby="rdjLeaveText"
+        oncancel="rdjLeaveStay()">
+  <h2 id="rdjLeaveTitle">Leave this page?</h2>
+  <p id="rdjLeaveText">You have a live Remote DJ audio session in progress. Are you sure you want to leave this page?
+    Leaving will disconnect your microphone and station monitor audio.</p>
+  <div class="rdj-leave-actions">
+    <button type="button" id="rdjLeaveStay" onclick="rdjLeaveStay()">Stay on this page</button>
+    <button type="button" id="rdjLeaveGo" onclick="rdjLeaveAndDisconnect()">Leave and disconnect</button>
+  </div>
+</dialog>
 {% if mode != 'remote_dj' %}{% if console_caps.rdj_emergency_mute or console_caps.rdj_force_disconnect %}
 {# r0119: the emergency controls are the Remote PTT and Connect buttons; this #}
 {# line reports an administrator action's progress and engine outcome.        #}
@@ -2553,6 +2589,37 @@ let rdjConnecting = false;
 // deliberately NOT closed -- see oniceconnectionstatechange below.
 let rdjReconnecting = false;
 
+// Roadmap 2.17 Package B -- automatic fresh-session reconnect and attempt-
+// scoped resource ownership.
+// rdjAttemptSeq identifies THIS page's current connection attempt. Every
+// asynchronous continuation of an attempt (token response, socket events,
+// offer handling, getUserMedia, timers) captures it and does nothing once it
+// changed: rdjReleaseLocal() advances it, so a released, cancelled or
+// superseded attempt can never touch a newer one.
+let rdjAttemptSeq = 0;
+let rdjMicStream = null;     // the attempt's own getUserMedia stream (tracks stopped on release)
+let rdjEstablished = false;  // this attempt's ICE reached connected/completed
+// One automatic reconnect SEQUENCE after an established session ended
+// involuntarily, or null. Its gen is the sequence identity: every timer,
+// fetch and attempt of the sequence checks rdjRetryAlive(gen).
+let rdjRetry = null;
+let rdjRetryGen = 0;
+let rdjRetryNotice = null;    // {text, cls, until}: why the last sequence stopped
+let rdjLastSequence = null;   // {used, establishedAt} of the last successful replacement
+let rdjSequenceStarts = [];   // performance.now() of recent sequence starts (rate bound)
+let rdjLeaveConfirmed = false; // the operator chose to leave this page
+// Reviewed bounds (see docs/REMOTE_DJ_AUTO_RECONNECT.md):
+const RDJ_RETRY_MAX_ATTEMPTS = 3;                 // fresh-session attempts per qualifying loss
+const RDJ_RETRY_BACKOFF_MS = [1000, 2000, 4000];  // before attempt 1, 2, 3
+const RDJ_RETRY_ESTABLISH_TIMEOUT_MS = 30000;     // token -> socket -> offer -> ICE -> engine ownership
+const RDJ_RETRY_POLICY_TIMEOUT_MS = 4000;         // one policy request
+const RDJ_RETRY_POLICY_WAIT_MS = 1000;            // re-ask while the old session finalizes/cleans up
+// Whole sequence: the old session's recovery grace (<= 30 s) + r0132 native
+// cleanup (<= 10 s) + 3 x (backoff + establishment) = 40 + 7 + 90 < 150.
+const RDJ_RETRY_DEADLINE_MS = 150000;
+const RDJ_RETRY_STABLE_MS = 60000;   // a replacement healthier than this earns a fresh budget
+const RDJ_RETRY_MAX_SEQUENCES_PER_HOUR = 6;
+
 const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
 
 function rdjDbToLin(db) { return Math.pow(10, db / 20); }
@@ -2699,8 +2766,14 @@ function rdjSetConnectPresentation(action, status, statusClass, ariaLabel) {
 }
 
 async function toggleRemoteDjConnect() {
+  // Roadmap 2.17 Package B: while an automatic reconnect sequence is pending,
+  // this button is its Cancel action.
+  if (rdjRetry) { rdjCancelRetry('cancelled'); return; }
   // Own link first: Disconnect / Close stale link are purely local cleanup.
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
+  // 2.17 Package B: a press while the token request is still in flight
+  // cancels that attempt instead of starting a second, overlapping one.
+  if (rdjConnecting) { rdjDisconnect(); return; }
   const live = window.__rdjLastEngineState || {};
   if (live.remote_dj_connected) {
     // Another browser holds the session: never start a connection here.
@@ -2715,14 +2788,31 @@ async function toggleRemoteDjConnect() {
   // local WebRTC/WebSocket cleanup with no engine round-trip, and
   // must stay available even while the status poll is stale.
   if (connectionStale) return;
+  rdjRetryNotice = null;
+  rdjLastSequence = null;   // an operator Connect starts a fresh reconnect budget
+  rdjStartConnection(0);
+}
+
+// One connection attempt: a fresh token, attempt identity, WebSocket,
+// RTCPeerConnection, microphone stream and AudioContext. retryGen is the
+// automatic reconnect sequence that launched it (0: the operator's Connect).
+async function rdjStartConnection(retryGen) {
+  const seq = ++rdjAttemptSeq;
+  if (retryGen && rdjRetryAlive(retryGen)) rdjRetry.seq = seq;
   const btn = document.getElementById('remoteDjConnectBtn');
   rdjConnecting = true;
+  rdjEstablished = false;
   btn.classList.add('pending');
   btn.classList.remove('error');
-  rdjSetConnectPresentation(
-    'Connecting…', 'Negotiating', 'negotiating',
-    'Remote DJ connecting — Negotiating',
-  );
+  if (retryGen) {
+    renderRemoteDjConnect(window.__rdjLastEngineState || {});
+  } else {
+    rdjSetConnectPresentation(
+      'Connecting…', 'Negotiating', 'negotiating',
+      'Remote DJ connecting — Negotiating',
+    );
+  }
+  rdjSyncNavigationGuard();
   rdjConnectStartedAt = performance.now();
   rdjAttemptId = null;
   rdjBrowserKey = null;
@@ -2743,6 +2833,7 @@ async function toggleRemoteDjConnect() {
       method: 'POST',
       headers: {'X-CSRFToken': getCookie('csrftoken')},
     });
+    if (seq !== rdjAttemptSeq) return;   // released/cancelled while the token was in flight
     if (!r.ok) {
       // Roadmap 2.5C -- authorize()'s own denial reason (e.g. "No talent
       // assignment is currently in its effective window...") is already
@@ -2758,9 +2849,12 @@ async function toggleRemoteDjConnect() {
       } catch (parseErr) {
         // Non-JSON/empty error body -- keep the generic fallback.
       }
-      throw new Error(reason);
+      const error = new Error(reason);
+      error.status = r.status;
+      throw error;
     }
     const tokenResponse = await r.json();
+    if (seq !== rdjAttemptSeq) return;
     ({token} = tokenResponse);
     rdjAttemptId = tokenResponse.attempt_id;
     rdjBrowserKey = null;
@@ -2776,18 +2870,22 @@ async function toggleRemoteDjConnect() {
       throw new Error('incomplete token response');
     }
     btn.title = 'Connection attempt ' + rdjAttemptId;
+    if (retryGen && rdjRetryAlive(retryGen)) rdjRetry.attemptIds.push(rdjAttemptId);
   } catch (e) {
-    rdjConnectFail(e.message || 'Token failed');
+    const denied = typeof e.status === 'number' && e.status === 403;
+    rdjAttemptFailed(seq, e.message || 'Token failed', denied ? {final: 'not_authorized'} : {});
     return;
   }
 
   rdjWs = new WebSocket('wss://' + location.host + '/ws/remote-dj/?token=' + token);
   rdjWs.onopen = () => {
+    if (seq !== rdjAttemptSeq) return;
     rdjSendMilestone('browser_connect_start', 0);
     rdjSendMilestone('browser_token_received', tokenElapsedMs);
     rdjSendMilestone('browser_websocket_open');
   };
   rdjWs.onmessage = async (event) => {
+    if (seq !== rdjAttemptSeq) return;
     const msg = JSON.parse(event.data);
     if (msg.type === 'kicked') { rdjKickedNotice = true; return; }
     if (msg.type === 'offer') {
@@ -2817,6 +2915,7 @@ async function toggleRemoteDjConnect() {
         if (['connected', 'completed'].includes(statsPc.iceConnectionState)) {
           rdjReconnecting = false;
           rdjConnecting = false;
+          rdjEstablished = true;
           document.getElementById('remoteDjConnectBtn')?.classList.remove('pending');
           rdjSendMilestone('ice_connected');
           rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
@@ -2841,7 +2940,12 @@ async function toggleRemoteDjConnect() {
         }
         if (['failed', 'closed'].includes(statsPc.iceConnectionState)) {
           rdjReconnecting = false;
-          rdjDisconnect();
+          // 2.17 Package B: an ESTABLISHED session lost involuntarily may
+          // start a new one (rdjOnTerminalLoss); a not-yet-established
+          // attempt simply failed (silently, as before, for an operator's
+          // own Connect).
+          if (rdjEstablished) rdjOnTerminalLoss(seq);
+          else rdjAttemptFailed(seq, null);
         }
       };
       rdjPc.ontrack = (e) => {
@@ -2852,6 +2956,7 @@ async function toggleRemoteDjConnect() {
       };
 
       await rdjPc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
+      if (seq !== rdjAttemptSeq) return;
 
       let stream;
       try {
@@ -2864,7 +2969,14 @@ async function toggleRemoteDjConnect() {
             sampleRate: {ideal: 48000},
           },
         });
-      } catch (e) { rdjConnectFail('Mic denied'); return; }
+      } catch (e) { rdjAttemptFailed(seq, 'Mic denied', {final: 'mic_denied'}); return; }
+      if (seq !== rdjAttemptSeq) {
+        // The attempt was released while the permission prompt was open:
+        // never let a late stream keep the microphone captured.
+        stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
+        return;
+      }
+      rdjMicStream = stream;
 
       // Route mic through a Web Audio graph so the persisted calibration
       // gain applies (set via this dashboard's own Remote Mic calibrate
@@ -2884,7 +2996,9 @@ async function toggleRemoteDjConnect() {
       micT.direction = 'sendonly';
       monitorT.direction = 'recvonly';
 
+      if (seq !== rdjAttemptSeq) return;
       const answer = await rdjPc.createAnswer();
+      if (seq !== rdjAttemptSeq) return;
       // Same SDP munging as /remote-dj/ -- force stereo fullband
       // 128 kbps Opus over the browser's voice-mode defaults.
       answer.sdp = answer.sdp.replace(
@@ -2908,26 +3022,42 @@ async function toggleRemoteDjConnect() {
         }
       );
       await rdjPc.setLocalDescription(answer);
+      if (seq !== rdjAttemptSeq) return;
       try {
         const senderParams = micT.sender.getParameters();
         senderParams.encodings = senderParams.encodings || [{}];
         senderParams.encodings[0].maxBitrate = 128000;
         await micT.sender.setParameters(senderParams);
       } catch (e) {}
+      if (seq !== rdjAttemptSeq) return;
       rdjWs.send(JSON.stringify({type: 'answer', sdp: rdjPc.localDescription.sdp}));
     } else if (msg.type === 'ice' && rdjPc) {
       try { await rdjPc.addIceCandidate({sdpMLineIndex: msg.sdpMLineIndex, candidate: msg.candidate}); } catch(e){}
     }
   };
-  rdjWs.onerror = () => rdjConnectFail('WS error');
+  rdjWs.onerror = () => {
+    if (seq !== rdjAttemptSeq) return;
+    // An established session's socket error is followed by its close, which
+    // decides (rdjWs.onclose below); before establishment it is a failure.
+    if (rdjEstablished) return;
+    rdjAttemptFailed(seq, 'WS error');
+  };
   rdjWs.onclose = (e) => {
+    if (seq !== rdjAttemptSeq) return;
     if (rdjKickedNotice) {
-      // Roadmap 2.17A: the station forcibly ended this session.
+      // Roadmap 2.17A: the station forcibly ended this session -- final,
+      // never an automatic reconnect.
       rdjKickedNotice = false;
+      rdjCancelRetry(null);
       rdjConnectFail('Disconnected by the station');
       return;
     }
-    if (!rdjPc) { rdjConnectFail('Closed (' + e.code + ')'); return; }
+    if (!rdjPc) {
+      // 4003: the signaling server refused this account -- final for a sequence.
+      rdjAttemptFailed(seq, 'Closed (' + e.code + ')', e.code === 4003 ? {final: 'not_authorized'} : {});
+      return;
+    }
+    if (!rdjEstablished) { rdjAttemptFailed(seq, null); return; }
     // P1 1.5 Pass B1 -- the peer connection is still open (we're either
     // fully connected or riding out a 'disconnected' reconnect grace),
     // yet the SERVER closed the signaling socket. That only happens on
@@ -2936,28 +3066,46 @@ async function toggleRemoteDjConnect() {
     // keep showing a live console after the engine already released the
     // slot. No error flash: this is an expected outcome of an
     // unrecovered disconnect, not a failed connection attempt.
+    // 2.17 Package B: the page did not ask for this, so it may start a new
+    // session (rdjOnTerminalLoss) -- only once the policy endpoint confirms
+    // the engine finalized it and its cleanup released the slot.
     rdjReconnecting = false;
-    rdjDisconnect();
+    rdjOnTerminalLoss(seq);
   };
 }
 
-function rdjDisconnect() {
+// Release every local resource the CURRENT attempt owns, exactly once, and
+// make all of that attempt's late callbacks inert (rdjAttemptSeq advances).
+// Presentation and retry policy are the callers' business.
+function rdjReleaseLocal() {
+  rdjAttemptSeq += 1;
   // r0119 review F1: remember the snapshot this page's own link closed at.
   rdjLinkClosedRevision = acceptedRevision ? { ...acceptedRevision } : { instance: null, seq: 0 };
   rdjReconnecting = false;
   rdjConnecting = false;
+  rdjEstablished = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
   rdjStatsTimers = [];
   rdjStatsBurstPc = null;
   if (rdjQualityIntervalId !== null) { clearInterval(rdjQualityIntervalId); rdjQualityIntervalId = null; }
-  if (rdjPc) { rdjPc.close(); rdjPc = null; }
-  if (rdjWs) { rdjWs.close(); rdjWs = null; }
+  if (rdjPc) { try { rdjPc.close(); } catch (e) {} rdjPc = null; }
+  if (rdjWs) { try { rdjWs.close(); } catch (e) {} rdjWs = null; }
   rdjBrowserKey = null;  // Phase 1B: this browser no longer owns a connection
   rdjControlKey = null;  // 2.17A: nor its Remote Mic credential
+  // 2.17 Package B: stop the capture itself, not just the graph -- closing
+  // the AudioContext leaves a getUserMedia track (and the browser's mic
+  // indicator) alive.
+  if (rdjMicStream) {
+    rdjMicStream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
+    rdjMicStream = null;
+  }
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
   rdjGainNode = null;
   const audio = document.getElementById('remoteMonitorAudio');
   if (audio) audio.srcObject = null;
+}
+
+function rdjPresentOffline() {
   const connectBtn = document.getElementById('remoteDjConnectBtn');
   if (connectBtn) connectBtn.classList.remove('pending', 'active');
   rdjSetConnectPresentation(
@@ -2969,6 +3117,15 @@ function rdjDisconnect() {
     renderRemoteDjConnect(window.__rdjLastEngineState);
     renderRemoteDjGate(window.__rdjLastEngineState);
   }
+  rdjSyncNavigationGuard();
+}
+
+// An operator's Disconnect (or a failed operator Connect): ends any automatic
+// reconnect sequence too, and never starts one.
+function rdjDisconnect() {
+  rdjCancelRetry(null);
+  rdjReleaseLocal();
+  rdjPresentOffline();
 }
 
 function rdjConnectFail(msg) {
@@ -2981,6 +3138,312 @@ function rdjConnectFail(msg) {
   );
   setTimeout(() => btn.classList.remove('error'), 3000);
 }
+
+// ---- Roadmap 2.17 Package B: automatic fresh-session reconnect ----------
+//
+// Starts only when THIS page's ESTABLISHED session ends without the page
+// asking for it (rdjOnTerminalLoss). Never after Disconnect, Cancel, a Kick,
+// leaving the page, or a failed first Connect. Each new attempt is a complete
+// new session (token, attempt identity, WebSocket, RTCPeerConnection,
+// microphone, AudioContext) admitted normally by the server; the Remote Mic is
+// Off in it (the engine opens every session muted; nothing here touches the
+// gate). Before EVERY attempt the page asks /api/remote-dj/reconnect-policy/,
+// which re-reads the station switch, this account's permission and schedule,
+// the engine's record of the lost session (finalized? why?) and the r0132
+// slot state; anything but "retry" -- including an error or timeout -- never
+// starts an attempt.
+
+function rdjRetryAlive(gen) {
+  return !!rdjRetry && rdjRetry.gen === gen;
+}
+
+// The current attempt failed before it was established.
+function rdjAttemptFailed(seq, msg, opts = {}) {
+  if (seq !== rdjAttemptSeq) return;
+  if (rdjRetry && rdjRetry.seq === seq) {
+    const gen = rdjRetry.gen;
+    rdjReleaseLocal();
+    if (opts.final) rdjRetryStop(gen, opts.final);
+    else rdjRetryAttemptFailed(gen);
+    return;
+  }
+  if (msg) rdjConnectFail(msg); else rdjDisconnect();
+}
+
+// The current attempt's ESTABLISHED session ended without this page asking.
+function rdjOnTerminalLoss(seq) {
+  if (seq !== rdjAttemptSeq) return;
+  if (rdjRetry && rdjRetry.seq === seq) {
+    // A replacement that dropped before it was authoritatively established.
+    rdjAttemptFailed(seq, null);
+    return;
+  }
+  const lostAttemptId = rdjAttemptId;
+  rdjReleaseLocal();
+  rdjPresentOffline();
+  rdjMaybeStartRetry(lostAttemptId);
+}
+
+function rdjMaybeStartRetry(lostAttemptId) {
+  if (!lostAttemptId || rdjLeaveConfirmed || rdjRetry) return;
+  const now = performance.now();
+  // A replacement that dropped again before it proved stable continues the
+  // SAME budget: unstable links cannot loop.
+  let used = 0;
+  if (rdjLastSequence && now - rdjLastSequence.establishedAt < RDJ_RETRY_STABLE_MS) used = rdjLastSequence.used;
+  rdjSequenceStarts = rdjSequenceStarts.filter(t => now - t < 3600000);
+  if (used >= RDJ_RETRY_MAX_ATTEMPTS || rdjSequenceStarts.length >= RDJ_RETRY_MAX_SEQUENCES_PER_HOUR) {
+    rdjRetryNotice = {text: 'Reconnect failed', cls: 'poor', until: now + 15000};
+    renderRemoteDjConnect(window.__rdjLastEngineState || {});
+    return;
+  }
+  rdjSequenceStarts.push(now);
+  const gen = ++rdjRetryGen;
+  rdjRetry = {
+    gen, attemptIds: [lostAttemptId], used, seq: 0, phase: 'evaluating',
+    deadline: now + RDJ_RETRY_DEADLINE_MS, timer: null, attemptTimer: null, abort: null,
+  };
+  rdjRetryNotice = null;
+  rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen), RDJ_RETRY_BACKOFF_MS[Math.min(used, RDJ_RETRY_BACKOFF_MS.length - 1)]);
+  renderRemoteDjConnect(window.__rdjLastEngineState || {});
+  rdjSyncNavigationGuard();
+}
+
+async function rdjRetryCheckPolicy(gen) {
+  if (!rdjRetryAlive(gen)) return;
+  rdjRetry.timer = null;
+  if (performance.now() >= rdjRetry.deadline) { rdjRetryStop(gen, 'deadline'); return; }
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  rdjRetry.abort = controller;
+  const timeout = setTimeout(() => { if (controller) controller.abort(); }, RDJ_RETRY_POLICY_TIMEOUT_MS);
+  let decision = null;
+  let reason = null;
+  try {
+    const r = await fetch('/api/remote-dj/reconnect-policy/?attempts=' + encodeURIComponent(rdjRetry.attemptIds.join(',')), {
+      cache: 'no-store', credentials: 'same-origin', signal: controller ? controller.signal : undefined,
+    });
+    if (r.ok) {
+      const body = await r.json();
+      if (body && typeof body.decision === 'string') { decision = body.decision; reason = body.reason; }
+    }
+  } catch (e) {
+    // Network error, abort or unreadable body: not a "retry".
+  }
+  clearTimeout(timeout);
+  if (!rdjRetryAlive(gen)) return;   // cancelled meanwhile: this answer is inert
+  rdjRetry.abort = null;
+  if (decision === 'retry') {
+    if (rdjRetry.used >= RDJ_RETRY_MAX_ATTEMPTS) { rdjRetryStop(gen, 'exhausted'); return; }
+    rdjRetryLaunch(gen);
+    return;
+  }
+  if (decision === 'stop') { rdjRetryStop(gen, typeof reason === 'string' ? reason : 'stopped'); return; }
+  // "wait" -- or anything else, which fails closed: ask again, bounded by
+  // the sequence deadline, without spending an attempt.
+  rdjRetry.phase = 'waiting';
+  rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen),
+    Math.max(0, Math.min(RDJ_RETRY_POLICY_WAIT_MS, rdjRetry.deadline - performance.now())));
+  renderRemoteDjConnect(window.__rdjLastEngineState || {});
+}
+
+function rdjRetryLaunch(gen) {
+  rdjRetry.used += 1;
+  rdjRetry.phase = 'connecting';
+  rdjRetry.attemptTimer = setTimeout(() => {
+    if (!rdjRetryAlive(gen) || rdjRetry.phase !== 'connecting') return;
+    rdjAttemptFailed(rdjRetry.seq, null);   // establishment took too long
+  }, RDJ_RETRY_ESTABLISH_TIMEOUT_MS);
+  rdjStartConnection(gen);
+}
+
+function rdjRetryAttemptFailed(gen) {
+  if (!rdjRetryAlive(gen)) return;
+  clearTimeout(rdjRetry.attemptTimer);
+  rdjRetry.attemptTimer = null;
+  rdjRetry.seq = 0;
+  if (rdjRetry.used >= RDJ_RETRY_MAX_ATTEMPTS) { rdjRetryStop(gen, 'exhausted'); return; }
+  const delay = RDJ_RETRY_BACKOFF_MS[Math.min(rdjRetry.used, RDJ_RETRY_BACKOFF_MS.length - 1)];
+  if (performance.now() + delay >= rdjRetry.deadline) { rdjRetryStop(gen, 'deadline'); return; }
+  rdjRetry.phase = 'backoff';
+  rdjRetry.timer = setTimeout(() => rdjRetryCheckPolicy(gen), delay);
+  renderRemoteDjConnect(window.__rdjLastEngineState || {});
+}
+
+// A replacement attempt is authoritatively established only when its own ICE
+// reached connected AND a trusted engine snapshot names this page's attempt
+// as the owner (rdjLocalLink 'owner').
+function rdjRetryOnStatus(data) {
+  if (!rdjRetry || rdjRetry.phase !== 'connecting' || !rdjEstablished) return false;
+  if (rdjLocalLink(data) !== 'owner') return false;
+  const retry = rdjRetry;
+  rdjRetry = null;
+  clearTimeout(retry.attemptTimer);
+  clearTimeout(retry.timer);
+  rdjLastSequence = {used: retry.used, establishedAt: performance.now()};
+  rdjRetryNotice = null;
+  return true;
+}
+
+function rdjRetryStop(gen, reason) {
+  if (!rdjRetryAlive(gen)) return;
+  rdjCancelRetry(reason);
+}
+
+const RDJ_RETRY_NOTICES = {
+  auto_reconnect_disabled: ['Disconnected', 'offline'],
+  remote_dj_disabled: ['Disconnected', 'offline'],
+  remote_dj_not_running: ['Disconnected', 'offline'],
+  cancelled: ['Reconnect cancelled', 'offline'],
+  kicked: ['Disconnected by the station', 'poor'],
+  authorization_revoked: ['Access ended', 'poor'],
+  not_authorized: ['Reconnect not permitted', 'poor'],
+  emergency_mute: ['Muted by the station', 'poor'],
+  remote_dj_unavailable: ['Remote DJ unavailable', 'poor'],
+  engine_shutdown: ['Station engine restarted', 'poor'],
+  mic_denied: ['Mic denied', 'poor'],
+};
+
+// End the sequence now: invalidates its gen (every pending timer, fetch and
+// attempt callback becomes inert), aborts an in-flight policy request and
+// releases a replacement attempt still in progress. reason null: silent (an
+// operator Disconnect or a Kick, which present themselves).
+function rdjCancelRetry(reason) {
+  const retry = rdjRetry;
+  if (!retry) return;
+  rdjRetry = null;
+  clearTimeout(retry.timer);
+  clearTimeout(retry.attemptTimer);
+  if (retry.abort) { try { retry.abort.abort(); } catch (e) {} }
+  if (retry.seq && retry.seq === rdjAttemptSeq) rdjReleaseLocal();
+  if (reason) {
+    const [text, cls] = RDJ_RETRY_NOTICES[reason] || ['Reconnect failed', 'poor'];
+    rdjRetryNotice = {text, cls, until: performance.now() + 15000};
+  } else {
+    rdjRetryNotice = null;
+  }
+  rdjPresentOffline();
+}
+
+function rdjRetryPresentation() {
+  const n = rdjRetry.used;
+  const total = RDJ_RETRY_MAX_ATTEMPTS;
+  switch (rdjRetry.phase) {
+    case 'connecting': return 'Retrying ' + n + ' of ' + total;
+    case 'waiting': return 'Waiting for connection…';
+    case 'backoff': return 'Retrying ' + (n + 1) + ' of ' + total + ' shortly';
+    default: return 'Reconnecting…';
+  }
+}
+
+// ---- Roadmap 2.17 Package B: navigation-loss protection ------------------
+//
+// While THIS page owns an active or establishing Remote DJ connection (or an
+// automatic reconnect sequence), leaving it would drop the DJ's microphone and
+// station monitor. Same-tab navigations the page can see (link clicks and form
+// submissions nothing else handled) get an explicit Stay / Leave dialog; every
+// other exit (Back, Reload, closing the tab, typed URLs, script navigation)
+// gets the browser's own generic leave-page prompt via a beforeunload handler
+// installed ONLY while the page owns a connection. Browsers show their own
+// wording there, and some mobile exits show nothing at all.
+function rdjOwnsLiveSession() {
+  return !!(rdjPc || rdjWs || rdjConnecting || rdjRetry);
+}
+
+function rdjBeforeUnload(event) {
+  if (rdjLeaveConfirmed || !rdjOwnsLiveSession()) return undefined;
+  event.preventDefault();
+  event.returnValue = '';
+  return '';
+}
+
+let rdjUnloadGuardInstalled = false;
+function rdjSyncNavigationGuard() {
+  const wanted = rdjOwnsLiveSession() && !rdjLeaveConfirmed;
+  if (wanted && !rdjUnloadGuardInstalled) {
+    window.addEventListener('beforeunload', rdjBeforeUnload);
+    rdjUnloadGuardInstalled = true;
+  } else if (!wanted && rdjUnloadGuardInstalled) {
+    window.removeEventListener('beforeunload', rdjBeforeUnload);
+    rdjUnloadGuardInstalled = false;
+  }
+}
+
+let rdjLeaveProceed = null;
+function rdjConfirmLeave(proceed) {
+  const dialog = document.getElementById('rdjLeaveDialog');
+  if (!dialog || typeof dialog.showModal !== 'function') {
+    // No dialog support: the native beforeunload prompt still protects.
+    proceed();
+    return;
+  }
+  rdjLeaveProceed = proceed;
+  if (!dialog.open) dialog.showModal();
+  const stay = document.getElementById('rdjLeaveStay');
+  if (stay) stay.focus();
+}
+
+function rdjLeaveStay() {
+  rdjLeaveProceed = null;
+  const dialog = document.getElementById('rdjLeaveDialog');
+  if (dialog && dialog.open) dialog.close();
+}
+
+function rdjLeaveAndDisconnect() {
+  const proceed = rdjLeaveProceed;
+  rdjLeaveProceed = null;
+  const dialog = document.getElementById('rdjLeaveDialog');
+  if (dialog && dialog.open) dialog.close();
+  rdjLeaveConfirmed = true;     // no retry may follow, and no second (native) prompt
+  rdjDisconnect();
+  rdjSyncNavigationGuard();
+  if (proceed) proceed();
+}
+
+function rdjNavigationTargetIsSameTab(target) {
+  return !target || target === '_self';
+}
+
+document.addEventListener('click', (event) => {
+  // Bubble phase: a click a page handler already took (preventDefault) is not
+  // a navigation.
+  if (event.defaultPrevented || event.button !== 0
+      || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (!rdjOwnsLiveSession() || rdjLeaveConfirmed) return;
+  const anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+  if (!anchor || anchor.hasAttribute('download') || !rdjNavigationTargetIsSameTab(anchor.target)) return;
+  let url;
+  try { url = new URL(anchor.href, location.href); } catch (e) { return; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+  if (url.origin === location.origin && url.pathname === location.pathname
+      && url.search === location.search && url.hash) return;   // in-page anchor
+  event.preventDefault();
+  rdjConfirmLeave(() => { location.assign(url.href); });
+});
+
+document.addEventListener('submit', (event) => {
+  if (event.defaultPrevented || !rdjOwnsLiveSession() || rdjLeaveConfirmed) return;
+  const form = event.target;
+  const submitter = event.submitter || null;
+  const target = (submitter && submitter.getAttribute('formtarget')) || form.getAttribute('target');
+  if (!rdjNavigationTargetIsSameTab(target)) return;
+  event.preventDefault();
+  rdjConfirmLeave(() => {
+    if (typeof form.requestSubmit === 'function') form.requestSubmit(submitter || undefined);
+    else form.submit();
+  });
+});
+
+// Leaving for real (also bfcache): best-effort release so the station frees
+// the slot promptly; never a guaranteed cleanup (mobile may not deliver it).
+// The page leaving is deliberate: no automatic reconnect may follow.
+window.addEventListener('pagehide', () => {
+  if (!rdjOwnsLiveSession()) return;
+  rdjLeaveConfirmed = true;
+  rdjDisconnect();
+});
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) { rdjLeaveConfirmed = false; rdjSyncNavigationGuard(); }
+});
 
 // Roadmap 2.23 Phase 1B (second-review P2) -- how THIS page relates to the
 // engine's ACTIVE Remote DJ session. A local RTCPeerConnection alone is not
@@ -3085,7 +3548,8 @@ function rdjLocalLink(data) {
 // enables it -- its ownership can't be verified, and an engine restart, which
 // installing this release requires, ends any Remote DJ session anyway.)
 function rdjMayGate(data) {
-  return rdjLocalLink(data) === 'owner';
+  // 2.17 Package B: never while an automatic reconnect sequence is pending.
+  return !rdjRetry && rdjLocalLink(data) === 'owner';
 }
 
 // Roadmap 2.17A -- the Remote Mic request's mandatory session binding: the
@@ -3227,6 +3691,23 @@ function renderRemoteDjConnect(data) {
   btn.classList.toggle('rdj-kick-mode', !!kick);
   btn.classList.toggle('rdj-stale-link', link === 'stale');
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
+  // Roadmap 2.17 Package B: an automatic reconnect sequence owns this button
+  // (as its Cancel action) until a replacement is authoritatively
+  // established -- never an optimistic Connected/quality state before that.
+  if (rdjRetry && !rdjRetryOnStatus(data)) {
+    const status = rdjRetryPresentation();
+    btn.disabled = false;
+    btn.classList.toggle('pending', rdjRetry.phase === 'connecting');
+    btn.classList.remove('active', 'rdj-observing', 'rdj-kick-mode', 'rdj-stale-link');
+    btn.dataset.adminAction = '';
+    btn.title = 'This browser\'s Remote DJ session ended unexpectedly; it is starting a new session '
+      + '(up to ' + RDJ_RETRY_MAX_ATTEMPTS + ' attempts, Remote Mic Off). Press to cancel.';
+    rdjSetConnectPresentation(
+      'Cancel reconnect', status, 'reconnecting', 'Cancel automatic Remote DJ reconnect — ' + status,
+    );
+    rdjSyncNavigationGuard();
+    return;
+  }
   if (!data.remote_dj_configured) {
     btn.classList.remove('pending');
     btn.title = '';
@@ -3319,9 +3800,16 @@ function renderRemoteDjConnect(data) {
   }
   btn.classList.remove('pending');
   btn.title = '';
-  rdjSetConnectPresentation(
-    'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
-  );
+  // 2.17 Package B: briefly say why an automatic reconnect stopped.
+  const notice = rdjRetryNotice && performance.now() < rdjRetryNotice.until ? rdjRetryNotice : null;
+  if (notice) {
+    rdjSetConnectPresentation('Connect', notice.text, notice.cls, 'Connect Remote DJ — ' + notice.text);
+  } else {
+    rdjSetConnectPresentation(
+      'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
+    );
+  }
+  rdjSyncNavigationGuard();
 }
 
 const RDJ_GATE_TITLE = 'Opens/closes the currently-connected remote DJ\'s mic into the on-air mix. Disabled when no remote DJ is connected.';
