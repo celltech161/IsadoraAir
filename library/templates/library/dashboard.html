@@ -6028,6 +6028,12 @@ const VU_MIN_DB = {{ vu_min_db|default:-40 }};
 // admin-configurable because it's a labelling convention, not a signal
 // parameter -- an operator trained on VU expects 0 VU where it is.
 const VU_ZERO_DBFS = -20;
+// A level sample older than this (viewer clock minus the engine's
+// timestamp) renders as silence. The age includes any difference between
+// the viewing device's clock and the station's, so the window allows a
+// device clock up to about a second ahead (Windows time sync commonly
+// leaves ~0.8 s). Shared by Program Level and the Remote Mic PTT meter.
+const VU_STALE_SECONDS = 1.0;
 
 function vuDbToPct(db) {
   // VU_MIN_DB -> 0%, 0 dBFS -> 100%. Clamped both ends.
@@ -6151,7 +6157,7 @@ function renderRemoteDjVu(remoteDj) {
     return;
   }
   const now = Date.now() / 1000;
-  if (!remoteDj.ts || (now - remoteDj.ts) > 0.75) {
+  if (!remoteDj.ts || (now - remoteDj.ts) > VU_STALE_SECONDS) {
     btn.style.setProperty('--remote-dj-vu-pct', '0%');
     return;
   }
@@ -6169,7 +6175,7 @@ async function pollLevels() {
     if (!resp.ok) { vuRenderSilence(); renderRemoteDjVu(null); return; }
     const data = await resp.json();
     const now = Date.now() / 1000;
-    const stale = !data.ts || (now - data.ts) > 0.75;
+    const stale = !data.ts || (now - data.ts) > VU_STALE_SECONDS;
     if (stale) { vuRenderSilence(); renderRemoteDjVu(null); return; }
     const rms = data.rms || [];
     const decay = data.decay || [];
