@@ -1,3 +1,4 @@
+import copy
 import functools
 import itertools
 import json
@@ -27,7 +28,7 @@ django.setup()
 
 from contextlib import ExitStack, contextmanager
 
-from django.db import close_old_connections, connection, transaction
+from django.db import OperationalError, close_old_connections, connection, transaction
 from django.db.models import F, Min, Sum
 from django.db.utils import OperationalError
 from django.utils import timezone
@@ -877,6 +878,15 @@ LIVE_FILL_CLOSING_TOLERANCE_SECONDS = 1.0
 # _project_upcoming_hour_target_duration.
 MAX_CLOCK_RECOVERY_SECONDS = 600
 CACHE_WARM_LEAD_SECONDS = 3.0
+
+# Queue Swap remediation (Codex F1). A playback claim that cannot take its row lock within its bounded wait
+# (another transaction -- an operator Swap, a Web Request swap -- is writing the row) is CONTENDED, not a
+# failed occurrence: the occurrence is put back as the next item and retried. Bounded: after this many
+# consecutive contended attempts for the same occurrence it is skipped with an error event.
+CLAIM_CONTENDED = object()
+CLAIM_CONTENTION_MAX_ATTEMPTS = 8
+CLAIM_CONTENTION_RETRY_MS = 300
+_TRANSIENT_LOCK_SQLSTATES = frozenset({"55P03", "40P01"})   # lock_not_available, deadlock_detected
 SILENCE_PRIME_SECONDS = 0.3
 # Roadmap 2.23 Start Next (START-NEXT-CONTRACT in the 2.23 evidence). The fade
 # bounds duplicate library.models.START_NEXT_FADE_MS_MIN/MAX: the engine
@@ -6565,6 +6575,10 @@ class PlaybackEngine:
         accumulated = 0.0
         target_duration_seconds = deficit
         start_position = self.log_items[-1].position + 1
+        # Queue Swap remediation (Codex F2): the shortage is a function of WHICH tracks are queued, not just
+        # how many. The proposal is bound to this ordered identity; the installer re-checks it against the
+        # database under the PlaylistLog lock, so an in-place replacement (or a reorder) in between voids it.
+        self._live_fill_queue_identity = (generation, log_id, self._queue_identity(self.log_items))
 
         threading.Thread(
             target=self._live_fill_worker,
@@ -6573,6 +6587,11 @@ class PlaybackEngine:
             daemon=True,
         ).start()
         return False
+
+    @staticmethod
+    def _queue_identity(items):
+        """Ordered (LogItem id, Track id) of a queue: what a live-fill shortage was computed from."""
+        return tuple((item.id, item.track_id) for item in items)
 
     def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds=NOMINAL_HOUR_SECONDS, closing_until=None):
         """Runs on a background thread -- READ-ONLY with respect to the
@@ -6736,6 +6755,14 @@ class PlaybackEngine:
         if len(self.log_items) != expected_prior_count:
             print(f"  Discarding stale live-fill proposal for log id={log_id} -- queue already changed since dispatch")
             return False
+        # The ordered (LogItem, Track) identity the dispatcher computed the shortage from. Recorded by the
+        # only production dispatcher (_try_extend_live_log_async) for exactly this generation and log; absent
+        # only when a caller invokes the installer directly.
+        recorded = getattr(self, "_live_fill_queue_identity", None)
+        expected_identity = recorded[2] if recorded and recorded[0] == generation and recorded[1] == log_id else None
+        if expected_identity is not None and self._queue_identity(self.log_items) != expected_identity:
+            print(f"  Discarding stale live-fill proposal for log id={log_id} -- queued tracks changed since dispatch")
+            return False
 
         wall_now = timezone.localtime()
         seconds_left_now = 3600 - (wall_now.minute * 60 + wall_now.second)
@@ -6757,10 +6784,39 @@ class PlaybackEngine:
         _close_old_connections()
         try:
             with transaction.atomic():
-                log = PlaylistLog.objects.get(id=log_id)
+                # Same lock order as Queue Swap, Web Requests and Hour Refill (PlaylistLog first), with the
+                # bounded wait the GLib thread uses for its claim. The committed queue is compared with the
+                # proposal's identity and the append happens in this one transaction: a writer that takes
+                # this lock either committed before (and is seen here) or waits until after the append.
+                with connection.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '250ms'")
+                log = PlaylistLog.objects.select_for_update().get(id=log_id)
+                if expected_identity is not None:
+                    # The engine's queue is the persisted rows minus poison-guarded occurrences
+                    # (_apply_poison_skip): compare like with like.
+                    skip = getattr(self, "_poison_skip_identities", None) or ()
+                    committed = tuple(
+                        row for row in LogItem.objects.filter(playlist_log_id=log_id).order_by("position")
+                        .values_list("id", "track_id")
+                        if (log_id, row[0]) not in skip
+                    )
+                    if committed != expected_identity:
+                        print(f"  Discarding stale live-fill proposal for log id={log_id} -- the committed queue "
+                              "changed since dispatch")
+                        return False
                 new_items = append_fill_items(log, new_picks, start_position)
         except PlaylistLog.DoesNotExist:
             print(f"  Discarding live-fill proposal for log id={log_id} -- PlaylistLog no longer exists")
+            return False
+        except OperationalError as exc:
+            if getattr(getattr(exc, "__cause__", None), "pgcode", None) in _TRANSIENT_LOCK_SQLSTATES:
+                print(f"  Discarding live-fill proposal for log id={log_id} -- its log is locked by another writer")
+                return False
+            print(f"  Live-fill DB append failed (non-fatal): {exc}")
+            emit_event(
+                category="engine", level="error", title="Live-fill DB append failed",
+                detail={"log_id": log_id, "exception": repr(exc), "traceback": traceback.format_exc()},
+            )
             return False
         except Exception as exc:
             print(f"  Live-fill DB append failed (non-fatal): {exc}")
@@ -7154,16 +7210,17 @@ class PlaybackEngine:
         self._next_triggered = False
         # iPortal D2B: from here a native item is the deck path's (claimed at
         # deck open) -- no longer an unaired queue entry.
-        native_held = self.__dict__.get("_active_message_held", {}).pop(log_item.id, None) is not None
-        self.__dict__.pop("_claim_track_changed_item_id", None)
+        held_value = self.__dict__.get("_active_message_held", {}).pop(log_item.id, None)
+        native_held = held_value is not None
+        self.__dict__.pop("_claim_contended_item_id", None)
         deck = self._create_deck(slot, log_item)
-        if deck is None and self.__dict__.pop("_claim_track_changed_item_id", None) == log_item.id:
-            # Queue Swap: the committed track differs from this in-memory copy. Open the
-            # committed occurrence (same LogItem, same slot) instead of skipping it.
-            fresh = self._reread_changed_occurrence(log_item)
-            if fresh is not None:
-                log_item = fresh
-                deck = self._create_deck(slot, log_item)
+        if deck is None and self.__dict__.pop("_claim_contended_item_id", None) == log_item.id:
+            # The claim could not take the row lock in time: a transient conflict, never a
+            # reason to skip. Put the same occurrence back as next and retry (bounded).
+            if self._defer_contended_occurrence(log_item, is_forced, held_value):
+                return
+        if deck is not None:
+            self._claim_contention = None
         if deck is None:
             # Roadmap 2.23: lets Start Next tell "nothing could be opened"
             # apart from an ordinarily empty queue.
@@ -7190,33 +7247,87 @@ class PlaybackEngine:
         running_time = clock.get_time() - self.main_pipeline.get_base_time()
         deck_bin.get_static_pad("src").set_offset(running_time - internal_position_ns)
 
-    def _reread_changed_occurrence(self, log_item):
-        """The committed row of an occurrence whose track changed after the last queue reload, or None if
-        it is no longer something to open (aired, claimed, poison-guarded, unplayable). Keeps the in-memory
-        queue on the same object. One indexed read, only on that rare mismatch."""
-        try:
-            _close_old_connections()
-            fresh = (
-                LogItem.objects.select_related(
-                    "track", "track__artist", "track__album", "track__category", "track__category__kind",
-                    "category", "category__kind",
-                )
-                .filter(pk=log_item.id, playlist_log_id=log_item.playlist_log_id)
-                .first()
+    def _defer_contended_occurrence(self, log_item, is_forced, held_value):
+        """Put an occurrence whose claim was CONTENDED back as the next item, exactly where it came from, and
+        arm one bounded retry. False (the caller's existing failure path) when it cannot be put back -- an
+        already-claimed occurrence (resume / deck re-creation keep their existing handling) or one no longer in
+        the queue -- or when CLAIM_CONTENTION_MAX_ATTEMPTS consecutive attempts stayed contended (an error
+        event makes that skip visible). Restoring the cursor (not a side list) keeps every existing rule in
+        charge of it: Manual mode holds it, a rollover discards it, the preview and runway count it."""
+        if getattr(log_item, "playback_claimed_at", None) is not None:
+            return False
+        pending = getattr(self, "_claim_contention", None)
+        attempts = pending["attempts"] + 1 if pending and pending["item_id"] == log_item.id else 1
+        if attempts > CLAIM_CONTENTION_MAX_ATTEMPTS:
+            self._claim_contention = None
+            print(f"  Claim for log_item={log_item.id} stayed contended for {attempts - 1} attempts; skipping it")
+            emit_event(
+                category="engine", level="error", title="Occurrence skipped after persistent claim contention",
+                detail={"log_item_id": log_item.id, "attempts": attempts - 1},
+                dedupe_key=f"engine|claim-contention-skip|{log_item.id}",
             )
-        except Exception as exc:
-            print(f"  Re-reading changed occurrence log_item={log_item.id} failed: {exc}")
+            return False
+        if is_forced:
+            self._forced_next_items.insert(0, log_item)
+        else:
+            index = next((i for i, item in enumerate(self.log_items) if item.id == log_item.id), None)
+            if index is None or index >= self._queue_cursor:
+                return False
+            self._queue_cursor = index
+        if held_value is not None:
+            self.__dict__.setdefault("_active_message_held", {})[log_item.id] = held_value
+        self._claim_contention = {"item_id": log_item.id, "attempts": attempts}
+        self._next_triggered = False      # the crossfade trigger may also retry on its next tick
+        print(f"  Claim for log_item={log_item.id} contended (attempt {attempts}); it stays next and will be retried")
+        try:
+            GLib.timeout_add(CLAIM_CONTENTION_RETRY_MS, self._retry_contended_occurrence, (log_item.id, attempts))
+        except Exception:
+            pass
+        return True
+
+    def _next_queue_item_id(self):
+        """The id _next_queue_item would hand out next, without consuming anything (forced first)."""
+        if self._forced_next_items:
+            return self._forced_next_items[0].id
+        if 0 <= self._queue_cursor < len(self.log_items):
+            return self.log_items[self._queue_cursor].id
+        return None
+
+    @_glib_safe(default_return=False)
+    def _retry_contended_occurrence(self, token):
+        """One-shot retry of a contended claim. Inert unless that exact attempt is still pending, the engine is
+        running in Auto, the occurrence is still the next item (a rollover, a newer start or a queue change
+        makes it stale) and no deck holds it; whichever of this and the crossfade trigger runs first starts it."""
+        pending = getattr(self, "_claim_contention", None)
+        if not self.running or pending is None or (pending["item_id"], pending["attempts"]) != token:
+            return False
+        if self.manual_mode or self._next_queue_item_id() != pending["item_id"]:
+            return False
+        if any(deck is not None and getattr(deck.log_item, "id", None) == pending["item_id"]
+               for deck in self.decks.values()):
+            return False
+        slot = self._free_slot()
+        if slot is not None:
+            self._start_next_track(slot=slot)
+        return False
+
+    def _committed_track_for_claim(self, log_item, track_id):
+        """The playable Track a not-yet-claimed occurrence now commits to (a replacement that committed after
+        the in-memory copy was read), or None if it is not playable -- then the occurrence keeps the existing
+        unplayable-occurrence handling. Read inside the claim transaction, under its row lock."""
+        track = (
+            Track.objects.select_related("artist", "album", "category", "category__kind")
+            .filter(pk=track_id).first() if track_id else None
+        )
+        if track is None:
             return None
-        if fresh is None or fresh.played_at is not None or fresh.playback_claimed_at is not None:
-            return None
-        if self._is_poison_guarded(fresh):
-            return None
-        playable, reason = _log_item_playable(fresh)
+        probe = copy.copy(log_item)
+        probe.track = track
+        playable, reason = _log_item_playable(probe)
         if not playable:
-            print(f"  Changed occurrence log_item={fresh.id} is not playable: {reason}")
+            print(f"  Committed replacement for log_item={log_item.id} is not playable: {reason}")
             return None
-        self.log_items = [fresh if item.id == fresh.id else item for item in self.log_items]
-        return fresh
+        return probe.track
 
     def _claim_playback_occurrence(self, log_item):
         """Persist the one-way engine commitment for one concrete LogItem.
@@ -7237,26 +7348,50 @@ class PlaybackEngine:
                     cur.execute("SET LOCAL lock_timeout = '250ms'")
                 locked = (
                     LogItem.objects.select_for_update(of=("self",))
-                    .only("id", "playback_claimed_at", "played_at", "track_id")
+                    .only("id", "playback_claimed_at", "played_at", "track_id", "track_title", "track_artist")
                     .get(pk=log_item.id)
                 )
                 expected_track_id = getattr(log_item, "track_id", locked.track_id)
                 if locked.playback_claimed_at is None and locked.track_id != expected_track_id:
-                    # A track replacement (operator Swap, a request swap) committed after this
-                    # in-memory copy was read. Never claim -- and so never open -- the stale track:
-                    # _start_next_track re-reads the occurrence and opens what is committed.
-                    self._claim_track_changed_item_id = log_item.id
+                    # A replacement (operator Swap, Web Request swap) committed after this in-memory
+                    # copy was read. Adopt the committed track atomically with the claim -- under this
+                    # row lock nothing else can change it, and once claimed no Swap is accepted -- so
+                    # the occurrence opens what is committed, however many swaps preceded it.
+                    adopted = self._committed_track_for_claim(log_item, locked.track_id)
+                    if adopted is None:
+                        return False
                     print(
-                        f"  Occurrence log_item={log_item.id} changed track "
-                        f"({expected_track_id} -> {locked.track_id}) before its claim; re-reading it"
+                        f"  Occurrence log_item={log_item.id} adopts its committed track "
+                        f"({expected_track_id} -> {locked.track_id}) at claim"
                     )
-                    return False
+                    log_item.track = adopted
+                    log_item.track_title = locked.track_title
+                    log_item.track_artist = locked.track_artist
                 if locked.playback_claimed_at is None:
                     locked.playback_claimed_at = timezone.now()
                     locked.save(update_fields=["playback_claimed_at"])
                 log_item.playback_claimed_at = locked.playback_claimed_at
                 log_item.played_at = locked.played_at
             return True
+        except OperationalError as exc:
+            if getattr(getattr(exc, "__cause__", None), "pgcode", None) in _TRANSIENT_LOCK_SQLSTATES:
+                print(f"  Playback claim for log_item={getattr(log_item, 'id', None)} contended: {exc}")
+                return CLAIM_CONTENDED
+            print(
+                f"  Playback claim failed for log_item={getattr(log_item, 'id', None)}; "
+                f"deck not created: {exc}"
+            )
+            try:
+                emit_event(
+                    category="engine",
+                    level="error",
+                    title="Playback occurrence claim failed",
+                    detail={"log_item_id": getattr(log_item, "id", None), "error": str(exc)},
+                    dedupe_key=f"engine|playback-claim-failed|{getattr(log_item, 'id', None)}",
+                )
+            except Exception:
+                pass
+            return False
         except Exception as exc:
             print(
                 f"  Playback claim failed for log_item={getattr(log_item, 'id', None)}; "
@@ -7649,8 +7784,15 @@ class PlaybackEngine:
         # Claim only after all caller-side request substitution/dedication
         # selection and the centralized playability gate have resolved the
         # concrete occurrence, but before presentation or live-pipeline work.
-        if not self._claim_playback_occurrence(log_item):
+        claim = self._claim_playback_occurrence(log_item)
+        if claim is not True:
+            if claim is CLAIM_CONTENDED:
+                self._claim_contended_item_id = log_item.id
             return None
+        # The claim may have adopted a replacement committed after the queue reload (Queue Swap):
+        # everything from here opens what the claimed row commits to.
+        track = log_item.track
+        filepath = track.filepath
 
         air_start_eligible = continuation_reason is None and log_item.played_at is None
         if continuation_reason == "auto_resume" and log_item.played_at is None:

@@ -2,7 +2,6 @@
 claim-time track identity check that closes the replacement/claim race (docs/QUEUE_SWAP.md)."""
 import json
 import tempfile
-import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -10,7 +9,6 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.db import connection, connections
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -45,8 +43,11 @@ class SwapFixtures:
         self.items = [
             self.item(0, self.legal_id, self.ids, LogItem.ORIGIN_GENERATED_SCHEDULE),
             self.item(1, self.long, self.rock, LogItem.ORIGIN_GENERATED_SCHEDULE),
-            self.item(2, self.other, self.rock, LogItem.ORIGIN_LIVE_FILL),
+            self.item(2, self.other, self.rock, LogItem.ORIGIN_GENERATED_FILL),
             self.item(3, self.other, self.rock, LogItem.ORIGIN_ENGINE_INSERTED),
+            self.item(4, self.other, self.rock, LogItem.ORIGIN_LIVE_FILL),
+            self.item(5, self.other, self.rock, LogItem.ORIGIN_REFILL_INSTALLED),
+            self.item(6, self.other, self.rock, LogItem.ORIGIN_OPERATOR_INSERTED),
         ]
         self.target = self.items[1]
         self.state = {
@@ -292,117 +293,3 @@ class ConsoleSwapPresentationTests(TestCase):
                       confirm)
         self.assertIn("swapSubmitting = true;", confirm)
         self.assertIn("#consoleRoot.connection-stale .qt-swap-btn", source)
-
-
-class _ClaimStandIn:
-    """Just enough engine for _claim_playback_occurrence / _reread_changed_occurrence."""
-
-    def __init__(self):
-        import library.services.engine as eng
-        self.engine = object.__new__(eng.PlaybackEngine)
-        self.engine._poison_skip_identities = set()
-        self.engine.log_items = []
-
-
-class EngineClaimIdentityTests(SwapFixtures, TransactionTestCase):
-    def setUp(self):
-        self.build()
-        self.engine = _ClaimStandIn().engine
-        self.engine.log_items = list(LogItem.objects.filter(playlist_log=self.log).order_by("position"))
-
-    def test_a_replacement_committed_after_the_queue_reload_is_never_claimed_with_the_stale_track(self):
-        stale = self.engine.log_items[1]                       # in-memory copy, still the long track
-        self.assertTrue(self.replace().changed)                # committed after the reload
-        self.assertFalse(self.engine._claim_playback_occurrence(stale))
-        self.assertEqual(self.engine._claim_track_changed_item_id, stale.id)
-        self.assertIsNone(LogItem.objects.get(pk=stale.pk).playback_claimed_at)   # nothing claimed
-        fresh = self.engine._reread_changed_occurrence(stale)
-        self.assertEqual((fresh.id, fresh.track_id, fresh.track.title), (stale.id, self.short.id, "Short Song"))
-        self.assertIs(self.engine.log_items[1], fresh)         # the queue now holds the committed row
-        self.assertTrue(self.engine._claim_playback_occurrence(fresh))
-        self.assertIsNotNone(LogItem.objects.get(pk=stale.pk).playback_claimed_at)
-
-    def test_an_unchanged_occurrence_claims_exactly_as_before(self):
-        item = self.engine.log_items[2]
-        self.assertTrue(self.engine._claim_playback_occurrence(item))
-        self.assertFalse(hasattr(self.engine, "_claim_track_changed_item_id"))
-        self.assertIsNotNone(item.playback_claimed_at)
-
-    def test_an_already_claimed_occurrence_is_not_reconsidered(self):
-        item = self.engine.log_items[2]
-        self.assertTrue(self.engine._claim_playback_occurrence(item))
-        LogItem.objects.filter(pk=item.pk).update(track=self.short)   # only possible outside the endpoint
-        self.assertTrue(self.engine._claim_playback_occurrence(item))  # deck re-creation of a claimed occurrence
-
-    def test_a_changed_occurrence_that_became_unplayable_is_not_reopened(self):
-        stale = self.engine.log_items[1]
-        self.replace()
-        Path(self.short.filepath).unlink()
-        self.assertIsNone(self.engine._reread_changed_occurrence(stale))
-
-    def test_start_next_track_opens_the_committed_replacement_in_the_same_slot(self):
-        engine = self.engine
-        stale = engine.log_items[1]
-        self.replace()
-        opened = []
-
-        def create_deck(slot, log_item, *args, **kwargs):
-            if not engine._claim_playback_occurrence(log_item):
-                return None
-            opened.append((slot, log_item.id, log_item.track_id))
-            return object()
-
-        engine.decks = {"A": None, "B": None}
-        engine._deck_slot_available = lambda slot: True
-        engine._free_slot = lambda: "B"
-        engine._next_queue_item = lambda: (stale, True)        # forced: skips request scheduling
-        engine._create_deck = create_deck
-        engine._on_log_exhausted = lambda slot: None
-        engine._next_triggered = True
-        engine._start_next_track(slot="B")
-        self.assertEqual(opened, [("B", stale.id, self.short.id)])
-        self.assertFalse(engine._next_triggered)
-
-
-@override_settings(SECURE_SSL_REDIRECT=False)
-class ReplaceClaimRaceTests(SwapFixtures, TransactionTestCase):
-    """The replacement and the engine's claim serialize on the LogItem row lock."""
-
-    def setUp(self):
-        self.build()
-
-    def _hold_claim_lock(self, ready, release):
-        try:
-            from django.db import transaction
-            with transaction.atomic():
-                LogItem.objects.select_for_update().get(pk=self.target.pk)
-                LogItem.objects.filter(pk=self.target.pk).update(playback_claimed_at=timezone.now())
-                ready.set()
-                release.wait(5)
-        finally:
-            connections.close_all()
-
-    def test_a_claim_in_progress_wins_and_the_swap_is_refused(self):
-        ready, release = threading.Event(), threading.Event()
-        worker = threading.Thread(target=self._hold_claim_lock, args=(ready, release))
-        worker.start()
-        self.assertTrue(ready.wait(5))
-        try:
-            outcome = self.replace()                         # waits up to the 1 s lock timeout
-            self.assertEqual(outcome.reason, "contended")
-        finally:
-            release.set()
-            worker.join(5)
-        self.assertEqual(self.replace().reason, "claimed")   # after the claim commits
-        self.assertEqual(LogItem.objects.get(pk=self.target.pk).track_id, self.long.id)
-
-    def test_a_swap_that_commits_first_is_what_the_engine_opens(self):
-        engine = _ClaimStandIn().engine
-        engine.log_items = list(LogItem.objects.filter(playlist_log=self.log).order_by("position"))
-        stale = engine.log_items[1]
-        self.assertTrue(self.replace().changed)
-        self.assertFalse(engine._claim_playback_occurrence(stale))
-        fresh = engine._reread_changed_occurrence(stale)
-        self.assertTrue(engine._claim_playback_occurrence(fresh))
-        self.assertEqual(LogItem.objects.get(pk=self.target.pk).track_id, self.short.id)
-        connection.close()

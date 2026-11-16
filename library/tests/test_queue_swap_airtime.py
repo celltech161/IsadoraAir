@@ -75,6 +75,7 @@ class SwapAirtimeTests(TransactionTestCase):
         return engine
 
     def swap(self, item, track):
+        item = LogItem.objects.get(pk=item.pk)              # the committed track is the expected one
         state = {"timestamp": time.time(), "state_revision": {"instance": INSTANCE, "seq": 1},
                  "decks": {"A": {"log_item_id": self.items[0].id}}, "queue": [{"item_id": i.id} for i in self.items[1:]]}
         outcome = queue_replace.replace_upcoming_item(item_id=item.id, expected_track_id=item.track_id,
