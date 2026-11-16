@@ -579,6 +579,9 @@ class ClosingFillOwnershipTests(_UnitFixture, TransactionTestCase):
         LogItem.objects.filter(origin=LogItem.ORIGIN_LIVE_FILL).delete()
         engine3, _now3, _ = self.engine_with_final_song()
         engine3._live_fill_generation = args[1]
+        # What a real dispatch of this generation records (Queue Swap remediation F2): both installs then
+        # make the same committed-queue identity check.
+        engine3._live_fill_queue_identity = (args[1], args[0], engine3._queue_identity(engine3.log_items))
         with CaptureQueriesContext(connection) as ordinary_queries:
             self.deliver((engine3._install_live_fill, ordinary_args), now2 + timedelta(seconds=1))
         self.assertEqual(len(ordinary_queries), len(closing_queries))
