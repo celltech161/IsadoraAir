@@ -7,6 +7,7 @@ import time as time_mod
 from datetime import date as date_type, time
 from itertools import islice
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
 from django.http import FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound
@@ -613,9 +614,18 @@ PAST_OVERRIDES_MAX_DATES = 100
 def _station_local_today():
     """Today's date in the configured station timezone, independent of the
     request's activated timezone (the middleware activates the same zone, but
-    this must not depend on it)."""
+    this must not depend on it).
+
+    get_station_timezone() returns the zone NAME (a str), so it is resolved to
+    a tzinfo here. An unusable name follows StationTimeActivateMiddleware's
+    policy: never fail the request, use the default timezone (settings.TIME_ZONE).
+    """
     from library.middleware import get_station_timezone
-    return timezone.localtime(timezone.now(), get_station_timezone()).date()
+    try:
+        zone = ZoneInfo(get_station_timezone())
+    except Exception:
+        zone = timezone.get_default_timezone()
+    return timezone.localtime(timezone.now(), zone).date()
 
 
 @require_http_methods(["GET"])

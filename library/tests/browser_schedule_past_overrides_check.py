@@ -49,6 +49,7 @@ class Api:
             P2: [{"id": 9, "date": "2026-12-25", "time": "10:00", "kind": "rotation", "name": "Xmas", "cid": 5}],
         }
         self.calls, self.deletes, self.held, self.hold_past = [], [], [], False
+        self.fail_past = 0   # answer the next N list requests like production Django's HTML 500 page
 
     def past(self, query):
         profile = query.get("profile", [P1])[0]
@@ -106,6 +107,9 @@ class Page:
             if self.api.hold_past:
                 self.api.held.append((route, query))
                 return None
+            if self.api.fail_past:
+                self.api.fail_past -= 1
+                return self._server_error(route)
             return self._json(route, self.api.past(query))
         if path == "/api/schedule/hour-detail/":
             hour = int(query["hour"][0])
@@ -124,10 +128,23 @@ class Page:
             return self._json(route, {"blocks": []})
         return route.fulfill(status=404, body="")
 
-    def release(self, index=0):
+    @staticmethod
+    def _server_error(route):
+        # What DEBUG=False Django sends for an unhandled exception: HTML, no JSON, no traceback.
+        route.fulfill(status=500, content_type="text/html", body="\n<!doctype html>\n<html lang=\"en\">\n<head>\n"
+                      "  <title>Server Error (500)</title>\n</head>\n<body>\n  <h1>Server Error (500)</h1><p></p>\n"
+                      "</body>\n</html>\n")
+
+    def release(self, index=0, *, fail=False):
         route, query = self.api.held.pop(index)
-        self._json(route, self.api.past(query))
+        self._server_error(route) if fail else self._json(route, self.api.past(query))
         self.settle()
+
+    def list_text(self):
+        return self.js("document.getElementById('pastOverridesList').textContent")
+
+    def api_error(self):
+        return self.js("document.getElementById('apiError').textContent")
 
     def settle(self, ms=250):
         self.page.wait_for_timeout(ms)
@@ -277,6 +294,81 @@ def scenario_paging(browser, html):
     p.close()
 
 
+def scenario_failure_and_empty(browser, html):
+    """r0141 production defect: every list request answered HTTP 500. The page must say so truthfully,
+    never keep or render a stale list, recover on a later success and tell "nothing found" apart from
+    "could not load"."""
+    api = Api()
+    p = Page(browser, html, api)
+    p.page.click("#dateModeButton"); p.settle()
+    api.fail_past = 1
+    p.page.click("#pastOverridesButton"); p.settle()
+    check("a 500 on first load says the list could not be loaded",
+          p.list_text() == "Past overrides could not be loaded." and p.dates_shown() == [], p.list_text())
+    check("the error banner shows the status only, no server page or details",
+          p.api_error() == "Request failed (500)", p.api_error())
+    check("a failed load offers no Load older dates", not p.visible("#pastOverridesMore"))
+    check("a failed load is not left busy", p.js("pastOverridesList.getAttribute('aria-busy')") == "false")
+
+    p.page.click("#pastOverridesClose"); p.settle()
+    p.page.click("#pastOverridesButton"); p.settle()
+    check("reopening after the failure renders the list",
+          p.dates_shown() == ["2027-03-09", "2027-02-01", "2027-01-15"] and "could not be loaded" not in p.list_text(),
+          p.dates_shown())
+
+    api.fail_past = 1
+    p.page.fill("#pastOverridesFilter", "jeff"); p.settle(500)
+    check("a failed filter request leaves no stale rows from the previous list",
+          p.dates_shown() == [] and p.list_text() == "Past overrides could not be loaded.", p.dates_shown())
+    check("no Remove control survives the failure", p.js("document.querySelectorAll('#pastOverridesList button').length") == 0)
+    p.page.fill("#pastOverridesFilter", "special"); p.settle(500)
+    check("the next successful filter request renders its rows", p.dates_shown() == ["2027-02-01"], p.dates_shown())
+    p.page.fill("#pastOverridesFilter", "no-such-name"); p.settle(500)
+    check("an empty filter result is a stated empty result, not a failure",
+          p.list_text() == "No past overrides in this profile match that name.", p.list_text())
+
+    api.hold_past = True
+    p.page.fill("#pastOverridesFilter", ""); p.settle(500)            # held: will fail late
+    p.page.select_option("#profileSelect", P2); p.settle()            # held: will succeed
+    api.hold_past = False
+    p.release(1)
+    p.release(0, fail=True)
+    check("a late 500 for an abandoned request neither clears nor replaces the current list",
+          p.dates_shown() == ["2026-12-25"] and "could not be loaded" not in p.list_text(), p.dates_shown())
+    check("no page errors", not p.errors, p.errors)
+    p.close()
+
+    empty = Api()
+    empty.rows[P1] = []
+    p = Page(browser, html, empty)
+    p.page.click("#dateModeButton"); p.settle()
+    p.page.click("#pastOverridesButton"); p.settle()
+    check("a profile with no past overrides says so, with no error",
+          p.list_text() == "This profile has no date overrides before today." and p.api_error() == "", p.list_text())
+    check("no page errors", not p.errors, p.errors)
+    p.close()
+
+    api = Api()
+    api.rows[P1] = [{"id": 100 + n, "date": f"2026-{1 + n // 28:02d}-{1 + n % 28:02d}", "time": "08:00",
+                     "kind": "rotation", "name": "Jeff Memorial", "cid": 7} for n in range(35)]
+    p = Page(browser, html, api)
+    p.page.click("#dateModeButton"); p.settle()
+    p.page.click("#pastOverridesButton"); p.settle()
+    api.fail_past = 1
+    p.page.click("#pastOverridesMore"); p.settle()
+    check("a failed Load older dates keeps the page already shown and reports the error",
+          len(p.dates_shown()) == 30 and p.api_error() == "Request failed (500)", (len(p.dates_shown()), p.api_error()))
+    p.page.click("#pastOverridesClose"); p.settle()
+    p.page.click("#pastOverridesButton"); p.settle()
+    p.page.click("#pastOverridesMore"); p.settle()
+    check("after reopening, Load older dates works", len(p.dates_shown()) == 35, len(p.dates_shown()))
+    p.page.click(".past-override-date[data-date='2026-01-01'] h3 button"); p.settle(500)
+    check("Show date from an older page returns to that date",
+          p.js("overrideDate.value") == "2026-01-01" and p.visible("#dateHourList"), p.js("overrideDate.value"))
+    check("no page errors", not p.errors, p.errors)
+    p.close()
+
+
 def main():
     render = Path(sys.argv[1])
     html = (render / "schedule_page.html").read_text()
@@ -285,7 +377,7 @@ def main():
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         for scenario in (scenario_mode_and_layout, scenario_stale_responses, scenario_show_date_and_remove,
-                         scenario_paging):
+                         scenario_paging, scenario_failure_and_empty):
             if only and only not in scenario.__name__:
                 continue
             try:

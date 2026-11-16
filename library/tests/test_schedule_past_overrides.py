@@ -5,7 +5,6 @@ from datetime import date, datetime, time, timezone as dt_timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
 
 from django.db.models.deletion import ProtectedError
 from django.test import TestCase, override_settings
@@ -185,7 +184,7 @@ class PastOverridesApiTests(ApiMixin, TestCase):
 
 class StationTodayTests(TestCase):
     def test_today_is_the_station_date_not_the_utc_date(self):
-        chicago = ZoneInfo("America/Chicago")
+        chicago = "America/Chicago"   # get_station_timezone() returns the zone NAME, never a tzinfo
         # 03:30 UTC on 2 March is still 1 March (21:30 CST) at the station.
         instant = datetime(2027, 3, 2, 3, 30, tzinfo=dt_timezone.utc)
         with patch("library.middleware.get_station_timezone", lambda: chicago), \
@@ -196,7 +195,7 @@ class StationTodayTests(TestCase):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class StationTodayBoundaryApiTests(ApiMixin, TestCase):
     def test_the_station_date_decides_what_is_past(self):
-        chicago = ZoneInfo("America/Chicago")
+        chicago = "America/Chicago"   # the getter's real return type (a str)
         instant = datetime(2027, 3, 2, 3, 30, tzinfo=dt_timezone.utc)   # 1 March at the station
         at(self.default, date(2027, 3, 1), 20, rotation=self.rotation_a)   # station "today": excluded
         at(self.default, date(2027, 2, 28), 20, rotation=self.rotation_b)  # yesterday: listed
