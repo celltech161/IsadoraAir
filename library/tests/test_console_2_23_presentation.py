@@ -87,7 +87,8 @@ class ConsoleCapabilityFlagTests(TestCase):
     def test_superuser_full_console_gets_deck_transport(self):
         self.client.force_login(self.superuser)
         self.assertEqual(_console_caps(self.client.get("/")), {"playout_control": True, "start_next": True,
-                                                                "rdj_emergency_mute": True, "rdj_force_disconnect": True})
+                                                                "rdj_emergency_mute": True, "rdj_force_disconnect": True,
+                                                                "queue_swap": True})
 
     def test_staff_gets_deck_transport_on_both_pages(self):
         self.client.force_login(self.staff)
@@ -106,13 +107,17 @@ class ConsoleCapabilityFlagTests(TestCase):
         self.assertEqual(response.status_code, 200)
         # Phase 3: Start Next (playout.start_next) without deck transport.
         # 2.17A: and never the administrator emergency controls.
+        # Queue Swap: holds playout.queue_manage, but the seeded remote_dj GroupAccess does not list the
+        # replace endpoint, so it is not offered.
         self.assertEqual(_console_caps(response), {"playout_control": False, "start_next": True,
-                                                   "rdj_emergency_mute": False, "rdj_force_disconnect": False})
+                                                   "rdj_emergency_mute": False, "rdj_force_disconnect": False,
+                                                   "queue_swap": False})
 
     def test_flag_object_carries_only_the_known_presentation_keys(self):
         self.client.force_login(self.superuser)
         self.assertEqual(set(_console_caps(self.client.get("/"))),
-                         {"playout_control", "start_next", "rdj_emergency_mute", "rdj_force_disconnect"})
+                         {"playout_control", "start_next", "rdj_emergency_mute", "rdj_force_disconnect",
+                          "queue_swap"})
 
     @patch("library.views.enqueue_engine_command")
     def test_hidden_controls_are_still_refused_by_the_server(self, mock_enqueue):

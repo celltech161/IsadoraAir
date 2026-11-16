@@ -288,7 +288,8 @@ class ConsoleSwapPresentationTests(TestCase):
                       "                             engine_instance: ctx.engineInstance }),", source)
         confirm = source[source.index("async function confirmSwap()"):]
         confirm = confirm[: confirm.index("\n}\n")]
-        self.assertIn("if (!ctx || !choice || swapSubmitting || swapStale || connectionStale) return;", confirm)
+        self.assertIn("if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || connectionStale) return;",
+                      confirm)
         self.assertIn("swapSubmitting = true;", confirm)
         self.assertIn("#consoleRoot.connection-stale .qt-swap-btn", source)
 
