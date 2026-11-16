@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0141",
+  "previous_release_id": "r0140",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Schedule: Past Overrides list in Date Override mode. Console: NEXT beside the drag handle and guarded live Swap of an eligible upcoming music slot, with effective-airtime preview and unknown-outcome reconciliation. Engine: the playback claim adopts a committed Swap atomically; live-fill proposals are revalidated under the log lock. Restart Gunicorn, then the engine (interrupts program audio, ends live Remote DJ sessions); no migration, package, static, unit, nginx or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
