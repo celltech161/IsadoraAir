@@ -47,11 +47,35 @@ class Engine:
         self.posts = []            # (path, json body)
         self.searches = []         # query strings of /api/tracks/ requests
         self.status_ok = True
-        self.replace_answer = lambda body: (200, {"ok": True, "changed": True, "item_id": body["item_id"],
-                                                  "track_id": body["track_id"]})
+        # The committed rows (what GET /api/engine/queue/replace/ reads) and effective airtime per track.
+        self.committed = {q["item_id"]: q["track_id"] for q in self.queue}
+        self.claimed = set()
+        self.airtime = {}                                  # track_id -> (seconds or None, basis)
+        self.get_ok = True
+        self.gets = []
+        self.replace_answer = self.commit_ok
         self.hold_replace = False
         self.hold_search = False
         self.held = []
+
+    def commit_ok(self, body):
+        self.committed[body["item_id"]] = body["track_id"]
+        return 200, {"ok": True, "changed": True, "item_id": body["item_id"], "track_id": body["track_id"]}
+
+    def track_details(self, track_id):
+        default = (230.0, "markers") if track_id < 7000 else (120.0, "markers")
+        seconds, basis = self.airtime.get(track_id, default)
+        return {"id": track_id, "title": f"Track {track_id}", "artist": "A", "duration_seconds": 240.0,
+                "airtime_seconds": seconds, "airtime_basis": basis}
+
+    def describe(self, item_id, track_id):
+        if item_id not in self.committed:
+            return 404, {"ok": False, "reason": "not_found", "error": "That queue row no longer exists."}
+        current = self.committed[item_id]
+        return 200, {"ok": True, "item_id": item_id, "track_id": current, "title": "", "artist": "",
+                     "played": False, "claimed": item_id in self.claimed, "log_status": "approved",
+                     "current": self.track_details(current),
+                     "candidate": self.track_details(track_id) if track_id else None}
 
     def status(self):
         self.seq += 1
@@ -95,14 +119,27 @@ class Page:
                 self.engine.held.append((route, {"items": items}))
                 return None
             return self._json(route, {"items": items, "total": 3, "page": 1, "pages": 1, "per_page": 200})
+        if path == "/api/engine/queue/replace/" and request.method == "GET":
+            query = parse_qs(parsed.query)
+            self.engine.gets.append(parsed.query)
+            if not self.engine.get_ok:
+                return route.fulfill(status=503, body="<html>Service Unavailable</html>")
+            status, answer = self.engine.describe(int(query["item_id"][0]),
+                                                  int(query["track_id"][0]) if "track_id" in query else None)
+            return self._json(route, answer, status)
         if path == "/api/engine/queue/replace/":
             body = json.loads(request.post_data or "{}")
             self.engine.posts.append((path, body))
             if self.engine.hold_replace:
                 self.engine.held.append((route, None))
                 return None
-            status, answer = self.engine.replace_answer(body)
-            return self._json(route, answer, status)
+            answer = self.engine.replace_answer(body)
+            if answer == "abort":
+                return route.abort("connectionreset")
+            if answer[0] == "raw":
+                return route.fulfill(status=answer[1], body=answer[2], content_type="text/html")
+            status, payload = answer
+            return self._json(route, payload, status)
         if path.startswith("/api/engine/status/log/"):
             return self._json(route, {"log_id": self.engine.log_id, "items": self.engine.history})
         if request.method == "POST":
@@ -256,14 +293,18 @@ def scenario_swap_dialog(browser, html):
           "Upcoming Two" in p.js("document.getElementById('swapTarget').textContent"))
     check("swap: focus moves to the search field", p.js("document.activeElement.id") == "swapSearch")
     search_and_choose(p, "Rock", 1)
+    airtime_text(p)
     check("swap: uses the same search request as Search to add track",
           engine.searches and engine.searches[-1] == "q=Rock&per_page=200&ready2air=true", engine.searches)
     review = p.js("({choice: document.getElementById('swapChoice').textContent,"
                   " length: document.getElementById('swapLength').textContent,"
                   " confirm: !document.getElementById('swapConfirm').hidden && !document.getElementById('swapConfirm').disabled})")
-    check("swap: review shows the chosen replacement and the length change before committing",
-          "Rock Result 1" in review["choice"] and "4:00" in review["length"] and "shorter" in review["length"]
-          and review["confirm"], review)
+    check("swap: review shows the replacement and the server's planned effective airtime change before committing",
+          "Rock Result 1" in review["choice"] and "3:50 \u2192 2:00" in review["length"]
+          and "reduces the planned effective airtime by about 1:50" in review["length"]
+          and "Additional material is not guaranteed." in review["length"] and review["confirm"], review)
+    check("swap: the preview read the committed row with the candidate",
+          engine.gets and engine.gets[-1] == "item_id=905&track_id=7001", engine.gets)
     check("swap: nothing is sent before Confirm", not [b for path, b in engine.posts if path.endswith("/replace/")])
     p.page.click("#swapConfirm")
     p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
@@ -392,8 +433,138 @@ def scenario_swap_unavailable_on_remote_dj(browser, html_rdj):
     state = p.js("(() => { const b = document.querySelector('#queueList tr[data-item-id=\"905\"] .qt-swap-btn');"
                  " return {disabled: b.disabled, title: b.title}; })()")
     check("remote-dj: Swap is shown but unavailable for an account that cannot reach it",
-          state == {"disabled": True, "title": "Swap is not available for this account"}, state)
+          state == {"disabled": True, "title": "Swap is unavailable: this account's current access policy does not include it"},
+          state)
     p.close()
+
+
+def airtime_text(p):
+    p.page.wait_for_function("!document.getElementById('swapLength').textContent.startsWith('Calculating')", timeout=3000)
+    return p.js("document.getElementById('swapLength').textContent")
+
+
+def scenario_swap_airtime(browser, html):
+    cases = (
+        # (candidate airtime, basis, expectation, label)
+        ((300.0, "markers"), "adds about 1:10", "raw length shorter (2:05) but effective airtime longer"),
+        ((None, "unknown"), "can\u2019t be estimated", "missing timing data"),
+        ((230.0, "markers"), "No change in planned airtime.", "zero difference"),
+        ((200.0, "duration"), "estimated from file length", "no next-start marker"),
+        ((50.0, "markers"), "reduces the planned effective airtime by about 3:00", "shortening"),
+    )
+    for (seconds, basis), expect, label in cases:
+        engine = Engine()
+        engine.airtime[7000] = (seconds, basis)
+        p = Page(browser, html, engine)
+        open_swap(p)
+        search_and_choose(p, "Rock", 0)
+        text = airtime_text(p)
+        check(f"airtime: {label}", expect in text, text)
+        check(f"airtime: {label} -- never promises fill",
+              not any(word in text.lower() for word in ("will be filled", "covers", "guaranteed to"))
+              and ("not guaranteed" in text) == ("reduces" in text), text)
+        check(f"airtime: {label} -- the original track stays shown",
+              "Upcoming Two" in p.js("document.getElementById('swapTarget').textContent"))
+        p.close()
+
+
+def confirm_and_wait(p, settle_ms=3400):
+    p.page.click("#swapConfirm")
+    p.page.wait_for_timeout(settle_ms)
+    return p.js("({status: document.getElementById('swapStatus').textContent,"
+                " open: document.getElementById('swapDialog').open,"
+                " confirmHidden: document.getElementById('swapConfirm').hidden,"
+                " confirmDisabled: document.getElementById('swapConfirm').disabled,"
+                " recheck: !document.getElementById('swapRecheck').hidden})")
+
+
+def posts(engine):
+    return [b for path, b in engine.posts if path.endswith("/replace/")]
+
+
+def scenario_swap_unknown_outcome(browser, html):
+    # Definite refusals: a structured 4xx and a plain-text 403 (no reconciliation read).
+    for answer, expect in (((422, {"ok": False, "reason": "track_ineligible", "error": "The chosen replacement is not ready to air."}),
+                            "not ready to air"),
+                           (("raw", 403, "Not available for this account."), "refused the swap (HTTP 403)")):
+        engine = Engine()
+        engine.replace_answer = lambda body, answer=answer: answer
+        p = Page(browser, html, engine)
+        open_swap(p); search_and_choose(p)
+        gets = len(engine.gets)
+        state = confirm_and_wait(p, 600)
+        check(f"outcome: definite refusal ({expect})", expect in state["status"] and not state["recheck"]
+              and len(engine.gets) == gets, state)
+        p.close()
+
+    # Committed, then the reply was lost: unknown -> reconciled as confirmed from the committed row.
+    engine = Engine()
+    engine.replace_answer = lambda body: (engine.commit_ok(body), "abort")[1]
+    p = Page(browser, html, engine)
+    open_swap(p); search_and_choose(p)
+    p.page.click("#swapConfirm")
+    p.page.wait_for_timeout(400)
+    early = p.js("document.getElementById('swapStatus').textContent")
+    check("outcome: a lost reply is reported as unknown, not as unchanged",
+          "unknown" in early and "Nothing was changed" not in early, early)
+    p.page.evaluate("confirmSwap(); confirmSwap();")
+    p.page.wait_for_timeout(3000)
+    state = p.js("document.getElementById('swapStatus').textContent")
+    check("outcome: reconciliation confirms the committed swap", "Swap confirmed" in state, state)
+    check("outcome: no automatic or duplicate POST", len(posts(engine)) == 1, posts(engine))
+    check("outcome: reconciliation read the row without a candidate",
+          engine.gets[-1] == "item_id=905", engine.gets)
+    p.close()
+
+    # A 500 after commit (timeout-like) -> confirmed; a 500 before commit -> original remains, explicit retry.
+    for committed, expect in ((True, "Swap confirmed"), (False, "still has the original track")):
+        engine = Engine()
+        engine.replace_answer = lambda body, committed=committed: (
+            (engine.commit_ok(body) if committed else None), ("raw", 500, "<html>Server Error</html>"))[1]
+        p = Page(browser, html, engine)
+        open_swap(p); search_and_choose(p)
+        state = confirm_and_wait(p)
+        check(f"outcome: 5xx then committed={committed}", expect in state["status"], state)
+        if not committed:
+            check("outcome: the original track remaining allows an explicit retry",
+                  not state["confirmHidden"] and not state["confirmDisabled"] and not state["recheck"], state)
+            engine.replace_answer = engine.commit_ok
+            p.page.click("#swapConfirm")
+            p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
+            check("outcome: the explicit retry is a second, operator-initiated POST", len(posts(engine)) == 2)
+        p.close()
+
+    # The station unreachable while reconciling: stays unknown; Check again resolves it later.
+    engine = Engine()
+    engine.replace_answer = lambda body: (engine.commit_ok(body), "abort")[1]
+    engine.get_ok = False
+    p = Page(browser, html, engine)
+    open_swap(p); search_and_choose(p)
+    state = confirm_and_wait(p)
+    check("outcome: unreachable during reconciliation stays unknown",
+          "Still unknown" in state["status"] and state["recheck"] and state["confirmHidden"], state)
+    engine.get_ok = True
+    p.page.click("#swapRecheck")
+    p.page.wait_for_timeout(500)
+    check("outcome: Check again settles it from evidence",
+          "Swap confirmed" in p.js("document.getElementById('swapStatus').textContent"))
+    p.close()
+
+    # Third-party change, row gone, and the original already claimed.
+    for label, mutate, expect in (
+        ("a different track", lambda e: e.committed.__setitem__(905, 4242), "changed elsewhere"),
+        ("the row gone", lambda e: e.committed.pop(905), "no longer exists"),
+        ("original claimed", lambda e: e.claimed.add(905), "already started loading or played"),
+    ):
+        engine = Engine()
+        engine.replace_answer = lambda body, mutate=mutate, engine=engine: (mutate(engine), "abort")[1]
+        p = Page(browser, html, engine)
+        open_swap(p); search_and_choose(p)
+        state = confirm_and_wait(p)
+        check(f"outcome: {label}", expect in state["status"] and state["confirmHidden"] or
+              (label == "original claimed" and expect in state["status"] and state["confirmDisabled"]), state)
+        check(f"outcome: {label} -- one POST only", len(posts(engine)) == 1)
+        p.close()
 
 
 def scenario_empty_queue(browser, html):
@@ -419,6 +590,7 @@ def main():
         for scenario, html in ((scenario_layout, console), (scenario_layout_remote_dj, rdj),
                                (scenario_row_states, history), (scenario_empty_queue, console),
                                (scenario_swap_dialog, console), (scenario_swap_guards, console),
+                               (scenario_swap_airtime, console), (scenario_swap_unknown_outcome, console),
                                (scenario_swap_unavailable_on_remote_dj, rdj)):
             if only and only not in scenario.__name__:
                 continue

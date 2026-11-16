@@ -3645,20 +3645,43 @@ def api_engine_insert_track(request):
     return JsonResponse({"ok": True, "item_id": new_item.id})
 
 
-@require_http_methods(["POST"])
+@require_http_methods(["GET", "POST"])
 def api_engine_queue_replace(request):
     """Operator Swap: replace ONE upcoming occurrence of the live queue with another track, in place
     (same LogItem id, position, category and origin; nothing inserted). playout.queue_manage with the
     real schedule policy, CSRF-protected. The browser's view is never the authority: the engine state
     and the locked rows are re-checked (library.services.queue_replace; docs/QUEUE_SWAP.md).
 
-    Body: {item_id, expected_track_id, track_id, engine_instance}. 200 {ok, changed, ...}; refusals answer
-    {ok: false, reason, error} with 409 (stale/ineligible), 404 (track gone) or 422 (track not airable)."""
+    POST body: {item_id, expected_track_id, track_id, engine_instance}. 200 {ok, changed, ...}; refusals answer
+    {ok: false, reason, error} with 409 (stale/ineligible), 404 (track gone) or 422 (track not airable).
+    GET ?item_id=[&track_id=] is read-only: the row's committed state and effective airtime (with how it was
+    derived) for the dialog's preview and for settling a POST whose reply was lost."""
     result = authorize(request.user, "playout.queue_manage")
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="playout.queue_manage")
     from library.services import queue_replace
     from library.services.log_builder import effective_airtime_seconds
+
+    if request.method == "GET":
+        # Read-only: the occurrence's COMMITTED state (database, not the engine's ~3 s snapshot) and an
+        # optional candidate's effective airtime -- the dialog's airtime preview and its reconciliation of
+        # an unknown POST outcome. Never mutates.
+        try:
+            item_id = int(request.GET.get("item_id", ""))
+            track_id = int(request.GET["track_id"]) if request.GET.get("track_id") else None
+            if item_id <= 0 or (track_id is not None and track_id <= 0):
+                raise ValueError
+        except ValueError:
+            return JsonResponse({"ok": False, "reason": "invalid", "error": "item_id (and optional track_id) "
+                                 "must be positive integers"}, status=400)
+        described = queue_replace.describe_occurrence(item_id, track_id)
+        if described is None:
+            response = JsonResponse({"ok": False, "reason": "not_found", "error": "That queue row no longer exists."},
+                                    status=404)
+        else:
+            response = JsonResponse({"ok": True, **described})
+        response["Cache-Control"] = "no-store"
+        return response
 
     try:
         body = _json_body(request)

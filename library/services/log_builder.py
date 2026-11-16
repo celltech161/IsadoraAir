@@ -493,6 +493,20 @@ def _effective_airtime(next_start, duration, cue_in):
     return max(0.0, end_point - cue_in)
 
 
+def effective_airtime_details(track):
+    """``(seconds, basis)`` for presentation: the same figure as effective_airtime_seconds and how it was
+    derived -- ``"markers"`` (next_start minus cue_in), ``"duration"`` (no next_start marker: the file length
+    minus cue_in, the fallback scheduling also uses) or ``"unknown"`` (neither is set; seconds is None, never a
+    silent zero)."""
+    if track.next_start_seconds is not None:
+        basis = "markers"
+    elif track.duration_seconds is not None:
+        basis = "duration"
+    else:
+        return None, "unknown"
+    return round(effective_airtime_seconds(track), 1), basis
+
+
 def effective_airtime_seconds(track):
     """THE authoritative definition of a track's listener-facing
     broadcast-clock contribution -- how much wall-clock time separates

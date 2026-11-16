@@ -152,6 +152,23 @@ class ReplaceServiceTests(SwapFixtures, TestCase):
         LogItem.objects.filter(pk=self.items[2].pk).update(origin=None)
         self.assertEqual(self.replace(item=self.items[2]).reason, "not_replaceable")       # unknown origin
 
+    def test_live_fill_and_hour_refill_rows_are_refused_and_left_unchanged(self):
+        from library.models import HourRefillInstall
+        for row in (self.items[4], self.items[5]):
+            before = LogItem.objects.filter(pk=row.pk).values().get()
+            outcome = self.replace(item=row)
+            self.assertEqual(outcome.reason, "not_replaceable", row.origin)
+            self.assertIn("Hour Refill", outcome.message)
+            self.assertEqual(LogItem.objects.filter(pk=row.pk).values().get(), before)
+        self.assertEqual(HourRefillInstall.objects.count(), 0)
+
+    def test_ordinary_origins_remain_replaceable(self):
+        self.assertEqual(queue_replace.REPLACEABLE_ORIGINS, frozenset({
+            LogItem.ORIGIN_GENERATED_SCHEDULE, LogItem.ORIGIN_GENERATED_FILL, LogItem.ORIGIN_OPERATOR_INSERTED}))
+        for row in (self.items[1], self.items[2], self.items[6]):
+            self.assertTrue(self.replace(item=row).changed, row.origin)
+            self.assertEqual(LogItem.objects.get(pk=row.pk).origin, row.origin)
+
     def test_listener_request_reservations_are_protected(self):
         request = SongRequest.objects.create(
             external_request_id="swap-req-1", track=self.long, requester_name="Listener", status="scheduled",
@@ -227,8 +244,52 @@ class ReplaceEndpointTests(SwapFixtures, TestCase):
         bad = self.client.post(reverse("library:api-engine-queue-replace"), "[]", content_type="application/json")
         self.assertEqual(bad.status_code, 400)
 
-    def test_get_is_not_allowed(self):
-        self.assertEqual(self.client.get(reverse("library:api-engine-queue-replace")).status_code, 405)
+    def get(self, **params):
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        return self.client.get(reverse("library:api-engine-queue-replace") + "?" + query)
+
+    def test_get_reads_the_committed_row_and_effective_airtime_without_changing_anything(self):
+        before = list(LogItem.objects.order_by("pk").values())
+        response = self.get(item_id=self.target.id, track_id=self.short.id)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        data = response.json()
+        self.assertEqual((data["ok"], data["item_id"], data["track_id"], data["played"], data["claimed"],
+                          data["log_status"]), (True, self.target.id, self.long.id, False, False, "approved"))
+        self.assertEqual((data["current"]["airtime_seconds"], data["current"]["airtime_basis"]), (295.0, "markers"))
+        self.assertEqual((data["candidate"]["airtime_seconds"], data["candidate"]["airtime_basis"]), (115.0, "markers"))
+        self.assertEqual(list(LogItem.objects.order_by("pk").values()), before)
+        # Committed state, not the engine snapshot: a committed swap shows at once.
+        self.post(self.body())
+        self.assertEqual(self.get(item_id=self.target.id).json()["track_id"], self.short.id)
+
+    def test_get_reports_how_airtime_was_derived_and_never_invents_it(self):
+        no_marker = self.track("No Marker", self.rock, duration=200.0, next_start=None)
+        no_timing = Track.objects.create(filepath="", filename="x.mp3", title="No Timing", artist=self.artist,
+                                         category=self.rock, ready2air=True, duration_seconds=None)
+        data = self.get(item_id=self.target.id, track_id=no_marker.id).json()
+        self.assertEqual((data["candidate"]["airtime_seconds"], data["candidate"]["airtime_basis"]), (200.0, "duration"))
+        data = self.get(item_id=self.target.id, track_id=no_timing.id).json()
+        self.assertEqual((data["candidate"]["airtime_seconds"], data["candidate"]["airtime_basis"]), (None, "unknown"))
+
+    def test_get_validation_missing_rows_and_authorization(self):
+        self.assertEqual(self.get(item_id="x").status_code, 400)
+        self.assertEqual(self.get(item_id=self.target.id, track_id=-1).status_code, 400)
+        missing = self.get(item_id=987654)
+        self.assertEqual((missing.status_code, missing.json()["reason"]), (404, "not_found"))
+        plain = User.objects.create_user("swap_get_plain", password="pw")
+        group = Group.objects.create(name="swap get readers")
+        GroupAccess.objects.create(group=group, allowed_prefixes="/api/")
+        plain.groups.add(group)
+        self.client.force_login(plain)
+        self.assertEqual(self.get(item_id=self.target.id).status_code, 403)
+
+    def test_refused_origins_leave_no_monitoring_record(self):
+        events = SystemEvent.objects.count()                 # both rows are in the engine's queue fixture
+        for row in (self.items[4], self.items[5]):
+            response = self.post(self.body(item_id=row.id, expected_track_id=row.track_id))
+            self.assertEqual((response.status_code, response.json()["reason"]), (409, "not_replaceable"))
+        self.assertEqual(SystemEvent.objects.count(), events)
 
     def test_csrf_is_enforced(self):
         from django.test import Client
@@ -289,7 +350,7 @@ class ConsoleSwapPresentationTests(TestCase):
                       "                             engine_instance: ctx.engineInstance }),", source)
         confirm = source[source.index("async function confirmSwap()"):]
         confirm = confirm[: confirm.index("\n}\n")]
-        self.assertIn("if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || connectionStale) return;",
-                      confirm)
+        self.assertIn("if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || swapUnknown || connectionStale) "
+                      "return;", confirm)
         self.assertIn("swapSubmitting = true;", confirm)
         self.assertIn("#consoleRoot.connection-stale .qt-swap-btn", source)

@@ -43,14 +43,14 @@ STATE_MAX_AGE_SECONDS = 5.0
 LOCK_TIMEOUT = "1s"
 _LOCK_NOT_AVAILABLE = "55P03"
 
-#: Origins an operator may replace. Engine insertions (urgent alerts, native Active Messages, dedication
-#: intros) and DST fall-back replays are never replaceable; a row without an origin fails closed.
+#: Origins an operator may replace. Never replaceable: engine insertions (urgent alerts, native Active
+#: Messages, dedication intros), DST fall-back replays, live fill (it may be a deadline-qualified closing fill
+#: whose timing contract its origin alone does not reveal) and Hour Refill installs (bound to an immutable
+#: HourRefillInstall ledger). A row without an origin fails closed.
 REPLACEABLE_ORIGINS = frozenset({
     LogItem.ORIGIN_GENERATED_SCHEDULE,
     LogItem.ORIGIN_GENERATED_FILL,
-    LogItem.ORIGIN_LIVE_FILL,
     LogItem.ORIGIN_OPERATOR_INSERTED,
-    LogItem.ORIGIN_REFILL_INSTALLED,
 })
 
 #: reason -> (HTTP status, operator-facing message)
@@ -63,8 +63,9 @@ REASONS = {
     "played": (409, "That track has already played."),
     "log_not_live": (409, "That track is not part of an approved live log."),
     "item_changed": (409, "That queue row changed since it was shown. The queue has been refreshed."),
-    "not_replaceable": (409, "Only music slots can be swapped; this row is an announcement, alert, "
-                             "intro or other protected item."),
+    "not_replaceable": (409, "This row cannot be swapped: only scheduled, build-fill or operator-inserted "
+                             "music slots can. Announcements, alerts, intros, live fill and Hour Refill "
+                             "items are protected."),
     "request_reserved": (409, "That slot is reserved for a listener's song request and cannot be swapped."),
     "contended": (409, "The queue is being updated by the engine right now. Try again."),
     "track_not_found": (404, "The chosen replacement track no longer exists."),
@@ -123,6 +124,45 @@ def assign_track_snapshot(item, track):
 def _music_slot(item):
     category = item.category
     return bool(category and category.kind_id and category.kind.code == "music")
+
+
+def describe_occurrence(item_id, candidate_track_id=None):
+    """Read-only: the COMMITTED state of one occurrence (straight from the database, not the engine's
+    ~3 s queue snapshot) and, optionally, a candidate replacement, each with its effective airtime as the
+    engine and builder count it (log_builder.effective_airtime_seconds) and how that figure was derived.
+    None if the occurrence does not exist."""
+    from library.services.log_builder import effective_airtime_details
+
+    item = (
+        LogItem.objects.select_related("playlist_log", "track", "track__artist")
+        .filter(pk=item_id).first()
+    )
+    if item is None:
+        return None
+
+    def track_details(track):
+        if track is None:
+            return None
+        seconds, basis = effective_airtime_details(track)
+        return {"id": track.id, "title": track.title, "artist": track.artist.name if track.artist_id else "",
+                "duration_seconds": track.duration_seconds, "airtime_seconds": seconds, "airtime_basis": basis}
+
+    candidate = None
+    if candidate_track_id:
+        candidate = track_details(
+            Track.objects.select_related("artist").filter(pk=candidate_track_id).first()
+        )
+    return {
+        "item_id": item.id,
+        "track_id": item.track_id,
+        "title": item.track_title,
+        "artist": item.track_artist,
+        "played": item.played_at is not None,
+        "claimed": item.playback_claimed_at is not None,
+        "log_status": item.playlist_log.status,
+        "current": track_details(item.track),
+        "candidate": candidate,
+    }
 
 
 def replace_upcoming_item(*, item_id, expected_track_id, track_id, engine_instance, state):

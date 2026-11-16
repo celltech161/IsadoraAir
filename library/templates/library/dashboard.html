@@ -1867,6 +1867,7 @@
   <p id="swapStatus" class="swap-status" role="status" aria-live="polite"></p>
   <div class="swap-actions">
     <button type="button" id="swapBack" hidden onclick="swapBackToSearch()">Choose another</button>
+    <button type="button" id="swapRecheck" hidden onclick="recheckSwap()">Check again</button>
     <button type="button" id="swapCancel" onclick="closeSwapDialog()">Cancel</button>
     <button type="button" id="swapConfirm" class="swap-confirm" hidden onclick="confirmSwap()">Swap track</button>
   </div>
@@ -5345,7 +5346,7 @@ function buildQueueRows(data) {
 const CAN_QUEUE_SWAP = CONSOLE_CAPS.queue_swap === true;
 function swapButtonHtml(r) {
   if (!CAN_QUEUE_SWAP) {
-    return `<button type="button" class="qt-swap-btn" disabled aria-label="Swap this track" title="Swap is not available for this account">${ICON_SWAP}</button>`;
+    return `<button type="button" class="qt-swap-btn" disabled aria-label="Swap this track" title="Swap is unavailable: this account's current access policy does not include it">${ICON_SWAP}</button>`;
   }
   return `<button type="button" class="qt-swap-btn" aria-label="Swap this track" title="Swap this track" onclick="event.stopPropagation(); openSwapDialog(${r.itemId})">${ICON_SWAP}</button>`;
 }
@@ -5614,14 +5615,24 @@ async function insertTrack(trackId, position) {
 // --- Queue Swap -------------------------------------------------------------
 // Replace one upcoming occurrence in place (POST /api/engine/queue/replace/).
 // The dialog is bound to the row, track and engine instance it was opened for;
-// the server re-checks all of them (docs/QUEUE_SWAP.md).
+// the server re-checks all of them (docs/QUEUE_SWAP.md). GET on the same URL
+// reads the row's COMMITTED state (not the engine's ~3 s snapshot): the planned
+// airtime preview and the reconciliation of an unknown outcome.
+const SWAP_URL = '/api/engine/queue/replace/';
+const SWAP_RECONCILE_DELAY_MS = 2500;   // longer than the server's 1 s lock wait
+const SWAP_FINAL_REASONS = ['not_upcoming', 'on_deck', 'claimed', 'played', 'item_changed', 'engine_changed',
+                            'not_replaceable', 'request_reserved', 'log_not_live'];
 let swapCtx = null;           // {itemId, trackId, title, artist, duration, category, engineInstance}
 let swapChoice = null;        // the chosen replacement (search result)
 let swapSearchGen = 0;        // newest search; older answers never render
 let swapSearchTimer = null;
 let swapSubmitting = false;
 let swapStale = null;         // why the queue says the target can no longer be swapped (or null)
-let swapRefused = null;       // a final refusal from the server for this dialog (or null)
+let swapRefused = null;       // a final refusal / settled outcome for this dialog (or null)
+let swapPreview = null;       // {state: 'loading'|'ready'|'failed', data}
+let swapPreviewGen = 0;
+let swapUnknown = null;       // {checking}: the last POST's outcome is not known yet
+let swapReconcileGen = 0;
 
 function swapTrackHtml(title, artist, duration, category) {
   return `<span class="swap-title">${esc(title)}</span><span class="swap-meta">${esc(artist)}</span>`
@@ -5634,22 +5645,42 @@ function swapSetStatus(text, isError) {
   node.classList.toggle('error', !!isError);
 }
 
+// Planned effective airtime as the engine and builder count it (server-computed:
+// next start minus cue-in, or the file length where no next-start marker is set).
+// Never a promise that fill will follow.
+function swapAirtimeText() {
+  if (!swapPreview || swapPreview.state === 'loading') return 'Calculating the planned airtime change…';
+  if (swapPreview.state === 'failed') return 'The planned airtime change could not be calculated.';
+  const cur = swapPreview.data.current, cand = swapPreview.data.candidate;
+  if (!cur || !cand || cur.airtime_seconds == null || cand.airtime_seconds == null) {
+    return 'The planned airtime change can’t be estimated: timing data is missing for one of these tracks.';
+  }
+  const diff = Math.round(cand.airtime_seconds - cur.airtime_seconds);
+  const estimated = cur.airtime_basis === 'duration' || cand.airtime_basis === 'duration'
+    ? ' (estimated from file length where a track has no next-start marker)' : '';
+  const head = `Planned effective airtime ${fmtDur(cur.airtime_seconds)} → ${fmtDur(cand.airtime_seconds)}${estimated}. `;
+  if (diff === 0) return head + 'No change in planned airtime.';
+  if (diff > 0) return head + `This replacement adds about ${fmtDur(diff)} of planned effective airtime.`;
+  return head + `This replacement reduces the planned effective airtime by about ${fmtDur(-diff)}. `
+    + 'IsadoraAir will evaluate the remaining hour using its existing scheduling and fill rules. '
+    + 'Additional material is not guaranteed.';
+}
+
 function swapRender() {
   const reviewing = !!swapChoice;
   document.getElementById('swapPick').hidden = reviewing;
   document.getElementById('swapReview').hidden = !reviewing;
-  document.getElementById('swapBack').hidden = !reviewing;
+  document.getElementById('swapBack').hidden = !reviewing || !!swapUnknown || swapSubmitting;
   const confirm = document.getElementById('swapConfirm');
-  confirm.hidden = !reviewing;
-  confirm.disabled = swapSubmitting || !!swapStale || !!swapRefused || connectionStale;
+  confirm.hidden = !reviewing || !!swapUnknown;
+  confirm.disabled = swapSubmitting || !!swapStale || !!swapRefused || !!swapUnknown || connectionStale;
+  const recheck = document.getElementById('swapRecheck');
+  recheck.hidden = !swapUnknown;
+  recheck.disabled = !!(swapUnknown && swapUnknown.checking);
   if (reviewing) {
     document.getElementById('swapChoice').innerHTML = swapTrackHtml(
       swapChoice.title, swapChoice.artist, swapChoice.duration_seconds, swapChoice.category_name);
-    const before = Number(swapCtx.duration) || 0, after = Number(swapChoice.duration_seconds) || 0;
-    const diff = Math.round(after - before);
-    document.getElementById('swapLength').textContent = `Track length ${fmtDur(before)} \u2192 ${fmtDur(after)}`
-      + (diff ? ` (${fmtDur(Math.abs(diff))} ${diff < 0 ? 'shorter' : 'longer'}).` : '.')
-      + (diff < 0 ? ' The hour\u2019s normal live fill covers any resulting shortfall.' : '');
+    document.getElementById('swapLength').textContent = swapAirtimeText();
   }
 }
 
@@ -5666,7 +5697,11 @@ function openSwapDialog(itemId) {
   swapSubmitting = false;
   swapStale = null;
   swapRefused = null;
+  swapPreview = null;
+  swapUnknown = null;
   swapSearchGen++;
+  swapPreviewGen++;
+  swapReconcileGen++;
   document.getElementById('swapTarget').innerHTML = swapTrackHtml(row.title, row.artist, row.duration, row.category);
   document.getElementById('swapSearch').value = '';
   document.getElementById('swapResults').replaceChildren();
@@ -5682,7 +5717,10 @@ function closeSwapDialog() {
   const ctx = swapCtx;
   swapCtx = null;
   swapChoice = null;
-  swapSearchGen++;           // a late search answer never renders
+  swapUnknown = null;
+  swapSearchGen++;           // a late search, preview or reconciliation answer never renders
+  swapPreviewGen++;
+  swapReconcileGen++;
   clearTimeout(swapSearchTimer);
   if (dialog.open) dialog.close();
   if (ctx) {
@@ -5692,9 +5730,11 @@ function closeSwapDialog() {
 }
 
 function swapBackToSearch() {
-  if (swapSubmitting) return;
+  if (swapSubmitting || swapUnknown) return;
   swapChoice = null;
-  swapSetStatus('');
+  swapPreview = null;
+  swapPreviewGen++;
+  swapSetStatus(swapRefused || swapStale || '', !!(swapRefused || swapStale));
   swapRender();
   document.getElementById('swapSearch').focus();
 }
@@ -5710,10 +5750,36 @@ function swapSyncWithQueue(data) {
   else if (row.track_id !== swapCtx.trackId) why = 'This row changed since the dialog opened.';
   if (why !== swapStale) {
     swapStale = why;
-    if (why) swapSetStatus(why, true);
-    else if (!swapRefused) swapSetStatus('');
+    if (!swapUnknown && !swapRefused) swapSetStatus(why || '', !!why);   // an unknown outcome keeps its own message
     swapRender();
   }
+}
+
+async function swapReadRow(itemId, trackId) {
+  const query = `item_id=${encodeURIComponent(itemId)}` + (trackId ? `&track_id=${encodeURIComponent(trackId)}` : '');
+  const resp = await fetch(`${SWAP_URL}?${query}`, { cache: 'no-store' });
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  return { status: resp.status, data };
+}
+
+async function loadSwapPreview(ctx, choice) {
+  const generation = ++swapPreviewGen;
+  swapPreview = { state: 'loading' };
+  swapRender();
+  let result = null;
+  try { result = await swapReadRow(ctx.itemId, choice.id); } catch (e) { result = null; }
+  if (generation !== swapPreviewGen || swapCtx !== ctx || swapChoice !== choice) return;   // superseded
+  if (result && result.status === 200 && result.data && result.data.ok) {
+    swapPreview = { state: 'ready', data: result.data };
+    if (result.data.track_id !== ctx.trackId && !swapStale) {
+      swapStale = 'This row changed since the dialog opened.';
+      if (!swapRefused) swapSetStatus(swapStale, true);
+    }
+  } else {
+    swapPreview = { state: 'failed' };
+  }
+  swapRender();
 }
 
 async function swapSearch(q) {
@@ -5724,7 +5790,7 @@ async function swapSearch(q) {
   container.replaceChildren();
   if (!items) { swapSetStatus('Search failed. Try again.', true); return; }
   if (!items.length) { swapSetStatus('No ready-to-air tracks match.'); return; }
-  swapSetStatus('');
+  swapSetStatus(swapRefused || swapStale || '', !!(swapRefused || swapStale));
   items.forEach(t => {
     const row = document.createElement('div');
     row.className = 'qir-item';
@@ -5736,10 +5802,11 @@ async function swapSearch(q) {
     choose.textContent = 'Choose';
     choose.setAttribute('aria-label', `Choose ${t.title} by ${t.artist}`);
     choose.addEventListener('click', () => {
-      if (!swapCtx || swapSubmitting) return;
+      if (!swapCtx || swapSubmitting || swapUnknown) return;
+      const ctx = swapCtx;
       swapChoice = Object.freeze({...t});
       swapSetStatus(swapRefused || swapStale || '', !!(swapRefused || swapStale));
-      swapRender();
+      loadSwapPreview(ctx, swapChoice);
       document.getElementById('swapConfirm').focus();
     });
     row.appendChild(choose);
@@ -5747,38 +5814,103 @@ async function swapSearch(q) {
   });
 }
 
+// One POST per press. A 200 {ok} is success; any 4xx is a definite refusal
+// (the server refuses before changing anything); anything else -- a network
+// error, 5xx, an unreadable reply -- leaves the outcome UNKNOWN: nothing is
+// assumed and the request is never repeated automatically.
 async function confirmSwap() {
   const ctx = swapCtx, choice = swapChoice;
-  if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || connectionStale) return;
+  if (!ctx || !choice || swapSubmitting || swapStale || swapRefused || swapUnknown || connectionStale) return;
   swapSubmitting = true;
-  swapSetStatus('Swapping\u2026');
+  swapSetStatus('Swapping…');
   swapRender();
-  let data = {}, status = 0;
+  let status = 0, data = null, reached = true;
   try {
-    const resp = await fetch('/api/engine/queue/replace/', {
+    const resp = await fetch(SWAP_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
       body: JSON.stringify({ item_id: ctx.itemId, expected_track_id: ctx.trackId, track_id: choice.id,
                              engine_instance: ctx.engineInstance }),
     });
     status = resp.status;
-    try { data = await resp.json(); } catch (e) { data = {}; }
+    try { data = await resp.json(); } catch (e) { data = null; }
   } catch (e) {
-    data = { error: 'The station could not be reached. Nothing was changed.' };
+    reached = false;
   }
   if (swapCtx !== ctx) return;           // closed meanwhile: the queue refresh shows the outcome
   swapSubmitting = false;
-  if (status === 200 && data.ok) {
+  if (reached && status === 200 && data && data.ok === true) {
     closeSwapDialog();
     poll();
     return;
   }
-  const finalReasons = ['not_upcoming', 'on_deck', 'claimed', 'played', 'item_changed', 'engine_changed',
-                        'not_replaceable', 'request_reserved', 'log_not_live'];
-  if (finalReasons.includes(data.reason)) swapRefused = data.error || 'This row can no longer be swapped.';
-  swapSetStatus(data.error || `Swap failed (${status || 'network'}). Nothing was changed.`, true);
+  if (reached && status >= 400 && status < 500) {
+    const message = (data && data.error) || `The station refused the swap (HTTP ${status}). Nothing was changed.`;
+    if (!data || !data.reason || SWAP_FINAL_REASONS.includes(data.reason)) swapRefused = message;
+    swapSetStatus(message, true);
+    swapRender();
+    poll();
+    return;
+  }
+  swapUnknown = { checking: true };
+  swapSetStatus('The swap’s outcome is unknown: the station’s reply was lost or unreadable. '
+    + 'Checking the committed queue row…', true);
   swapRender();
-  poll();
+  setTimeout(() => reconcileSwap(ctx, choice), SWAP_RECONCILE_DELAY_MS);
+}
+
+// Settle an unknown outcome from authoritative evidence only: the row's
+// committed track. Matching the choice confirms it; the original track still
+// in place means it was not applied; anything else stays unknown.
+async function reconcileSwap(ctx, choice) {
+  if (swapCtx !== ctx || !swapUnknown) return;
+  const generation = ++swapReconcileGen;
+  swapUnknown = { checking: true };
+  swapRender();
+  let result = null;
+  try { result = await swapReadRow(ctx.itemId, null); } catch (e) { result = null; }
+  if (generation !== swapReconcileGen || swapCtx !== ctx || !swapUnknown) return;
+  swapUnknown = { checking: false };
+  if (!result || (result.status !== 200 && result.status !== 404) || (result.status === 200 && !(result.data && result.data.ok))) {
+    swapSetStatus('Still unknown: the station could not be reached to confirm the swap. '
+      + 'Check again, or close and look at the queue.', true);
+    swapRender();
+    return;
+  }
+  if (result.status === 404) {
+    swapSetStatus('Still unknown: this queue row no longer exists, so the swap cannot be confirmed.', true);
+    swapRender();
+    return;
+  }
+  const row = result.data;
+  if (row.track_id === choice.id) {
+    swapUnknown = null;
+    swapRefused = 'Swap confirmed: the row now holds the chosen track.';
+    swapSetStatus(swapRefused);
+    swapRender();
+    poll();
+    return;
+  }
+  if (row.track_id === ctx.trackId) {
+    swapUnknown = null;
+    if (row.claimed || row.played) {
+      swapRefused = 'Not swapped: the original track is still in this row and has already started loading or played.';
+    } else {
+      swapSetStatus('Not swapped: the station still has the original track in this row. You can try again.', true);
+    }
+    if (swapRefused) swapSetStatus(swapRefused, true);
+    swapRender();
+    poll();
+    return;
+  }
+  swapSetStatus('Still unknown: this row now holds a different track (changed elsewhere), '
+    + 'so this swap cannot be confirmed.', true);
+  swapRender();
+}
+
+function recheckSwap() {
+  const ctx = swapCtx, choice = swapChoice;
+  if (ctx && choice && swapUnknown && !swapUnknown.checking) reconcileSwap(ctx, choice);
 }
 
 document.getElementById('swapSearch').addEventListener('input', function () {
