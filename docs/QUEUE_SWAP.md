@@ -30,10 +30,13 @@ another track:
    (the server refuses before changing anything). Anything else -- a network error, a 5xx, an unreadable
    reply -- leaves the outcome **unknown**: the request is never repeated automatically. After a short delay
    the dialog reads the row's committed state (GET above, from the database, not the engine's ~3 s
-   snapshot): the chosen track confirms the swap; the original track (still unclaimed) means it was not
-   applied and may be tried again explicitly (a repeat of a swap that did commit is an idempotent no-op);
-   anything else -- a different track, the row gone, the station unreachable -- stays unknown with
-   **Check again**.
+   snapshot): the chosen track confirms the swap; the original track on a row the engine has **claimed or
+   played** means it was not applied (a claim blocks any later Swap commit). Everything else stays unknown
+   with **Check again** and Swap track hidden -- including the original track on a row that is still
+   **unclaimed**, because the lost request may still be running and commit after that read; a different
+   track, the row gone, or the station unreachable. A new attempt is an explicit operator action (close,
+   reopen, choose, confirm); it carries the original `expected_track_id`, so if the earlier request did
+   commit meanwhile it is refused (`item_changed`) or, for the same choice, is an idempotent no-op.
 
 The dialog is bound to the row it was opened for. If that row leaves the queue (the engine started loading
 it), changes track, or the engine instance changes, Swap track is disabled and the reason is shown; a final

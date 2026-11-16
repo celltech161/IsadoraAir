@@ -50,6 +50,7 @@ class Engine:
         # The committed rows (what GET /api/engine/queue/replace/ reads) and effective airtime per track.
         self.committed = {q["item_id"]: q["track_id"] for q in self.queue}
         self.claimed = set()
+        self.played = set()
         self.airtime = {}                                  # track_id -> (seconds or None, basis)
         self.get_ok = True
         self.gets = []
@@ -73,7 +74,7 @@ class Engine:
             return 404, {"ok": False, "reason": "not_found", "error": "That queue row no longer exists."}
         current = self.committed[item_id]
         return 200, {"ok": True, "item_id": item_id, "track_id": current, "title": "", "artist": "",
-                     "played": False, "claimed": item_id in self.claimed, "log_status": "approved",
+                     "played": item_id in self.played, "claimed": item_id in self.claimed, "log_status": "approved",
                      "current": self.track_details(current),
                      "candidate": self.track_details(track_id) if track_id else None}
 
@@ -516,8 +517,9 @@ def scenario_swap_unknown_outcome(browser, html):
           engine.gets[-1] == "item_id=905", engine.gets)
     p.close()
 
-    # A 500 after commit (timeout-like) -> confirmed; a 500 before commit -> original remains, explicit retry.
-    for committed, expect in ((True, "Swap confirmed"), (False, "still has the original track")):
+    # A 500 after commit (timeout-like) -> confirmed. A 500 with the original still on an UNCLAIMED row is not
+    # final (the request may still commit): it stays unknown, Confirm stays hidden, nothing is resent.
+    for committed, expect in ((True, "Swap confirmed"), (False, "may still be in progress")):
         engine = Engine()
         engine.replace_answer = lambda body, committed=committed: (
             (engine.commit_ok(body) if committed else None), ("raw", 500, "<html>Server Error</html>"))[1]
@@ -526,13 +528,46 @@ def scenario_swap_unknown_outcome(browser, html):
         state = confirm_and_wait(p)
         check(f"outcome: 5xx then committed={committed}", expect in state["status"], state)
         if not committed:
-            check("outcome: the original track remaining allows an explicit retry",
-                  not state["confirmHidden"] and not state["confirmDisabled"] and not state["recheck"], state)
+            check("outcome: the original on an unclaimed row stays unknown (no Confirm, Check again offered)",
+                  "Still unknown" in state["status"] and "Not swapped" not in state["status"]
+                  and state["confirmHidden"] and state["recheck"], state)
+            p.page.evaluate("confirmSwap(); confirmSwap();")
+            p.page.wait_for_timeout(300)
+            check("outcome: no second POST while unknown", len(posts(engine)) == 1, posts(engine))
+            # A new attempt is an explicit operator action: close, reopen, choose, confirm.
+            p.page.keyboard.press("Escape")
+            p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
             engine.replace_answer = engine.commit_ok
+            open_swap(p); search_and_choose(p)
             p.page.click("#swapConfirm")
             p.page.wait_for_function("!document.getElementById('swapDialog').open", timeout=3000)
-            check("outcome: the explicit retry is a second, operator-initiated POST", len(posts(engine)) == 2)
+            check("outcome: a retry is a second, operator-initiated POST", len(posts(engine)) == 2)
         p.close()
+
+    # Codex F5 trace: the reply is lost, the request is still running past the reconciliation read, and commits
+    # LATER. The early read of the original track must not be reported as "not swapped".
+    engine = Engine()
+    engine.replace_answer = lambda body: "abort"       # reply lost; the server has not committed yet
+    p = Page(browser, html, engine)
+    open_swap(p); search_and_choose(p)
+    state = confirm_and_wait(p)                          # first reconciliation read at ~2.5 s sees 1905
+    body = posts(engine)[0]
+    check("delayed commit: the first read (original, unclaimed) stays unknown",
+          "Still unknown" in state["status"] and "Not swapped" not in state["status"]
+          and state["confirmHidden"] and state["recheck"]
+          and p.js("swapUnknown !== null") and engine.committed[905] == body["expected_track_id"], state)
+    engine.commit_ok(body)                               # the original request commits after that read
+    p.page.wait_for_timeout(700)
+    later = p.js("document.getElementById('swapStatus').textContent")
+    check("delayed commit: no false terminal message after the late commit",
+          "Not swapped" not in later and "Still unknown" in later, later)
+    p.page.click("#swapRecheck")
+    p.page.wait_for_timeout(500)
+    final = p.js("document.getElementById('swapStatus').textContent")
+    check("delayed commit: Check again confirms the late commit", "Swap confirmed" in final, final)
+    check("delayed commit: exactly one POST, never repeated", len(posts(engine)) == 1, posts(engine))
+    check("delayed commit: no page errors", not p.errors, p.errors)
+    p.close()
 
     # The station unreachable while reconciling: stays unknown; Check again resolves it later.
     engine = Engine()
@@ -555,6 +590,7 @@ def scenario_swap_unknown_outcome(browser, html):
         ("a different track", lambda e: e.committed.__setitem__(905, 4242), "changed elsewhere"),
         ("the row gone", lambda e: e.committed.pop(905), "no longer exists"),
         ("original claimed", lambda e: e.claimed.add(905), "already started loading or played"),
+        ("original played", lambda e: (e.claimed.add(905), e.played.add(905)), "already started loading or played"),
     ):
         engine = Engine()
         engine.replace_answer = lambda body, mutate=mutate, engine=engine: (mutate(engine), "abort")[1]
@@ -562,7 +598,7 @@ def scenario_swap_unknown_outcome(browser, html):
         open_swap(p); search_and_choose(p)
         state = confirm_and_wait(p)
         check(f"outcome: {label}", expect in state["status"] and state["confirmHidden"] or
-              (label == "original claimed" and expect in state["status"] and state["confirmDisabled"]), state)
+              (label.startswith("original ") and expect in state["status"] and state["confirmDisabled"]), state)
         check(f"outcome: {label} -- one POST only", len(posts(engine)) == 1)
         p.close()
 

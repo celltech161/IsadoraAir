@@ -5860,8 +5860,10 @@ async function confirmSwap() {
 }
 
 // Settle an unknown outcome from authoritative evidence only: the row's
-// committed track. Matching the choice confirms it; the original track still
-// in place means it was not applied; anything else stays unknown.
+// committed track. Matching the choice confirms it; the original track on a
+// claimed or played row means it was not applied (a claim blocks any later
+// Swap commit); anything else -- including the original track on an
+// unclaimed row, where the lost POST may still commit -- stays unknown.
 async function reconcileSwap(ctx, choice) {
   if (swapCtx !== ctx || !swapUnknown) return;
   const generation = ++swapReconcileGen;
@@ -5891,16 +5893,20 @@ async function reconcileSwap(ctx, choice) {
     poll();
     return;
   }
-  if (row.track_id === ctx.trackId) {
+  if (row.track_id === ctx.trackId && (row.claimed || row.played)) {
+    // Final: once the engine claims the row no Swap can commit to it.
     swapUnknown = null;
-    if (row.claimed || row.played) {
-      swapRefused = 'Not swapped: the original track is still in this row and has already started loading or played.';
-    } else {
-      swapSetStatus('Not swapped: the station still has the original track in this row. You can try again.', true);
-    }
-    if (swapRefused) swapSetStatus(swapRefused, true);
+    swapRefused = 'Not swapped: the original track is still in this row and has already started loading or played.';
+    swapSetStatus(swapRefused, true);
     swapRender();
     poll();
+    return;
+  }
+  if (row.track_id === ctx.trackId) {
+    // NOT final: the lost request may still be running and commit after this read.
+    swapSetStatus('Still unknown: the row still holds the original track, but the swap request may still be '
+      + 'in progress. Check again, or close and look at the queue.', true);
+    swapRender();
     return;
   }
   swapSetStatus('Still unknown: this row now holds a different track (changed elsewhere), '
