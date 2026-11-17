@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0144",
+  "previous_release_id": "r0143",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Engine restart safeguard: Update Center installs that restart the engine, Monitoring's engine Restart and Audio Pipeline saves that restart it are refused while a microphone or Remote DJ is live or engine status is unknown, unless a superuser overrides with a reason (audited). Library: unique Artist count beside the Track count; Bulk Edit Related Artists. Restart Gunicorn only; no migration, dependency, engine restart, static collection, nginx, unit or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
