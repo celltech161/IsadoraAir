@@ -1085,10 +1085,28 @@ function libraryCountsLabel(total, artistTotal) {
   return label;
 }
 
+// Only the NEWEST list request may update the page. Each call supersedes (and
+// aborts) the one before it, so a slow answer for an earlier filter, search,
+// sort or page can never overwrite the totals or rows of the current one.
+let tracksRequestGeneration = 0;
+let tracksAbort = null;
+
 async function loadTracks() {
-  const resp = await fetch('/api/tracks/?' + buildQuery());
-  if (!resp.ok) return;
-  const data = await resp.json();
+  const generation = ++tracksRequestGeneration;
+  if (tracksAbort) tracksAbort.abort();
+  const controller = new AbortController();
+  tracksAbort = controller;
+  let data;
+  try {
+    const resp = await fetch('/api/tracks/?' + buildQuery(), { signal: controller.signal });
+    if (generation !== tracksRequestGeneration || !resp.ok) return;
+    data = await resp.json();
+  } catch (e) {
+    if (controller.signal.aborted || generation !== tracksRequestGeneration) return;
+    throw e;
+  }
+  if (generation !== tracksRequestGeneration) return;
+  tracksAbort = null;
 
   totalPages = data.pages;
   currentPage = data.page;
