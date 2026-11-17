@@ -95,16 +95,26 @@ even an empty one, is never read as "no active alert"). r0145 makes the cause vi
 logic and no state:
 
 * `update_local_wx_data.py` logs `NWS alerts API returned HTTP <code>; keeping the previous watch/warning snapshot.`
-  and records every fetch outcome in `WEATHER_DATA_DIR/nws_alert_fetch_status.json`:
-  `{"ok", "checked_at", "status_code", "error", "failing_since"}` (`failing_since` = first failure of the current
-  unbroken run; null after a success). The file is evidence only and is written with the rest of the cycle's
-  files; failing to write it never affects the cycle.
+  and records every cycle's outcome in `WEATHER_DATA_DIR/nws_alert_fetch_status.json`:
+  `{"ok", "kind", "checked_at", "status_code", "error", "failing_since"}`. `ok: true` is recorded only after the
+  authoritative snapshot was written AND renamed into place (`write_json_atomic`, which raises; the destination
+  merely existing proves nothing, it may be the previous snapshot). A failure has a `kind`: `upstream` (an HTTP
+  status other than 200, a network error, or an unreadable answer) or `local` (NWS answered but this station could
+  not process or publish the answer -- e.g. a full disk). A failed publication leaves the previous snapshot in place
+  and records `local`; the rest of the cycle (warn.txt, alert status, fingerprint, headline trigger, coordinator) is
+  unchanged. `failing_since` is the first failed attempt of the current unbroken run of the same kind; it is carried
+  forward only from a coherent previous record (timezone-aware `failing_since` <= `checked_at` <= now, same kind,
+  checked within 15 minutes), otherwise a new run starts. The file is evidence only; failing to write it never
+  affects the cycle.
 * `weather/diagnostics.py` appends the cause to the `watch_warnings` summary only when that fact is already degraded
-  (snapshot missing or stale) AND the status record says the fetch is failing AND the record is itself fresh (written
-  within 15 minutes -- an older record means the updater stopped, which stays plain staleness): e.g. `... Stale: 19 min
-  old (freshness threshold 15 min). The NWS alerts fetch has been failing for 14 min (HTTP 503); the last snapshot is
-  kept until it succeeds.` The fact's evidence carries `nws_alert_fetch`. A fresh snapshot is never degraded by this
-  file.
+  (snapshot missing or stale) AND the status record is a coherent, fresh failure: `ok` exactly false, a known `kind`,
+  timezone-aware `checked_at` and `failing_since`, neither in the future, `failing_since` not after `checked_at`, and
+  `checked_at` within 15 minutes (an older record means the updater stopped, which stays plain staleness). Any invalid
+  record is ignored and the original plain staleness text stands -- no cause is inferred. `upstream`: `... The NWS
+  alerts fetch has been failing for 14 min (HTTP 503); the last snapshot is kept until it succeeds.` `local`: `...
+  The NWS alerts answer could not be processed or published on this station for 14 min (<error>); the last snapshot
+  is kept until it succeeds.` The fact's evidence carries `nws_alert_fetch`. A fresh snapshot is never degraded by
+  this file.
 * The Weather Health probe (`monitoring.services.probes.probe_weather`) adds `degraded_details` (and, when critical,
   `needs_attention_details`): each fact's own summary keyed by fact key. `reason` and `degraded_keys` /
   `needs_attention_keys` are unchanged. Recent Events and notifications therefore show the cause when the row is

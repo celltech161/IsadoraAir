@@ -200,11 +200,12 @@ session.headers.update({"User-Agent": "OakGroveRadio-WX/1.0"})
 
 # ---------------- FILE UTILS ----------------
 
-def safe_write_json(path, obj):
-    # Atomic write: stage to a unique tmp filename, fsync, then os.replace
-    # onto the destination -- the announcer scripts read
-    # processed_weather.json / warn.txt while building broadcast text, and
-    # this eliminates the window where they could see a half-written file.
+def write_json_atomic(path, obj):
+    """Atomic write: stage to a unique tmp filename, fsync, then os.replace onto the destination -- the announcer
+    scripts read processed_weather.json / warn.txt while building broadcast text, and this eliminates the window
+    where they could see a half-written file. RAISES on any failure (after removing the staged file); the
+    destination is then untouched, i.e. the previous content is preserved. Returning normally means the new
+    content has been written AND renamed into place."""
     tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp_path, "w") as f:
@@ -212,13 +213,26 @@ def safe_write_json(path, obj):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
-    except Exception as e:
-        log.error("Error writing %s: %s", path, e)
+    except Exception:
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except Exception:
             pass
+        raise
+
+
+def safe_write_json(path, obj):
+    """write_json_atomic() that logs and swallows a failure (every pre-r0145 caller's contract, unchanged).
+    Returns True when the content was written and renamed into place, False when it was not -- callers that must
+    know (the authoritative NWS snapshot) use the result or call write_json_atomic() directly; the destination's
+    mere existence says nothing, it may be the previous content."""
+    try:
+        write_json_atomic(path, obj)
+        return True
+    except Exception as e:
+        log.error("Error writing %s: %s", path, e)
+        return False
 
 def safe_write_text(path, text):
     tmp_path = f"{path}.{os.getpid()}.tmp"
@@ -1034,27 +1048,70 @@ def update_wx_alerts():
         _trigger_current_temp()
 
 
-def _record_alert_fetch(ok, status_code=None, error=None):
+#: Mirrors weather.freshness.CURRENT_DERIVED_FRESHNESS_SECONDS (this updater runs in its own venv, without
+#: Django); a test pins the two together. A previous failure record older than this is not "the same run".
+FETCH_STATUS_FRESH_SECONDS = 15 * 60
+
+#: Failure kinds recorded in NWS_ALERT_FETCH_STATUS_FILE: the NWS side (HTTP status, network error, an
+#: unreadable answer) versus this station's own processing/publication of an answer NWS did give.
+FETCH_FAILURE_UPSTREAM = "upstream"
+FETCH_FAILURE_LOCAL = "local"
+
+
+def _parse_aware_timestamp(value):
+    """A timezone-aware datetime from an ISO-8601 string, or None (never raises)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _previous_failure_start(kind, now):
+    """The `failing_since` to carry forward into a new failure record of `kind`, or None.
+
+    Carried only from a previous record that is a coherent, current run of the SAME kind of failure: ok False,
+    that kind, timezone-aware `failing_since` <= `checked_at` <= now, and `checked_at` within
+    FETCH_STATUS_FRESH_SECONDS. Anything else (unreadable, wrong types, naive or future timestamps, a start after
+    the last check, a different kind, a record too old to be continuous) is not history: the caller starts a new
+    run from the current attempt."""
+    try:
+        with open(NWS_ALERT_FETCH_STATUS_FILE, "r") as f:
+            previous = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(previous, dict) or previous.get("ok") is not False or previous.get("kind") != kind:
+        return None
+    checked_at = _parse_aware_timestamp(previous.get("checked_at"))
+    failing_since = _parse_aware_timestamp(previous.get("failing_since"))
+    if checked_at is None or failing_since is None:
+        return None
+    if not (failing_since <= checked_at <= now) or (now - checked_at).total_seconds() > FETCH_STATUS_FRESH_SECONDS:
+        return None
+    return failing_since.astimezone(timezone.utc).isoformat()
+
+
+def _record_alert_fetch(ok, kind=None, status_code=None, error=None):
     """Record the outcome of this cycle's NWS alerts fetch in NWS_ALERT_FETCH_STATUS_FILE.
 
+    `ok` True means the authoritative snapshot (active_watches_warnings.json) was written AND renamed into place
+    this cycle -- the caller records it only after write_json_atomic() returned. A failure carries its `kind`
+    (FETCH_FAILURE_UPSTREAM / FETCH_FAILURE_LOCAL) so Weather Health never calls a local write failure an NWS
+    outage. `failing_since` is the first failed attempt of the current unbroken run of the same kind (see
+    _previous_failure_start), None after a success.
+
     Evidence for diagnostics only; it must never break or delay the alert cycle, so every failure here is
-    swallowed after a log line. `failing_since` is the first failed attempt of the current unbroken run of
-    failures (carried over from the previous record while it was also a failure), None once a fetch succeeds."""
+    swallowed after a log line (safe_write_json logs its own)."""
     try:
         now = datetime.now(timezone.utc)
         failing_since = None
         if not ok:
-            failing_since = now.isoformat()
-            try:
-                with open(NWS_ALERT_FETCH_STATUS_FILE, "r") as f:
-                    previous = json.load(f)
-                if isinstance(previous, dict) and previous.get("ok") is False \
-                        and isinstance(previous.get("failing_since"), str):
-                    failing_since = previous["failing_since"]
-            except (OSError, ValueError):
-                pass
+            failing_since = _previous_failure_start(kind, now) or now.isoformat()
         safe_write_json(NWS_ALERT_FETCH_STATUS_FILE, {
             "ok": bool(ok),
+            "kind": None if ok else kind,
             "checked_at": now.isoformat(),
             "status_code": status_code,
             "error": (str(error)[:200] if error else None),
@@ -1067,8 +1124,9 @@ def _record_alert_fetch(ok, status_code=None, error=None):
 def _refresh_wx_alerts():
     """Returns True when the cleaned-headline fingerprint changed (after the
     first run), which only drives the current_temp.py trigger."""
-    snapshot_written = False
+    outcome_recorded = False
     status_code = None
+    from_nws = True        # True until NWS's answer has been fully read; after that a failure is this station's own
     try:
         r = session.get(ALERT_URL, timeout=10)
         status_code = r.status_code
@@ -1077,9 +1135,11 @@ def _refresh_wx_alerts():
             # so Weather Health can explain the resulting stale snapshot.
             log.warning("NWS alerts API returned HTTP %s; keeping the previous watch/warning snapshot.",
                         r.status_code)
-            _record_alert_fetch(False, status_code=r.status_code, error=f"HTTP {r.status_code}")
+            _record_alert_fetch(False, FETCH_FAILURE_UPSTREAM, status_code=r.status_code,
+                                error=f"HTTP {r.status_code}")
             return False
         alerts = r.json().get("features", [])
+        from_nws = False
 
         latest_by_event = {}
         severe_active = False  # Weather Alert Beep activation state ONLY -- see event_triggers_alert_beep()
@@ -1144,9 +1204,19 @@ def _refresh_wx_alerts():
         # the feed's own ordering, so a reordered feed never reads as a
         # content change.
         watchwarn_entries.sort(key=lambda e: (-_alert_severity(e), e.get("event") or "", e.get("key") or ""))
-        safe_write_json(WX_WATCHWARN_FILE, watchwarn_entries)
-        snapshot_written = True
-        _record_alert_fetch(True, status_code=200)
+        try:
+            write_json_atomic(WX_WATCHWARN_FILE, watchwarn_entries)
+        except Exception as e:
+            # Same log line and same continuation as before (the rest of the cycle -- warn.txt, alert status,
+            # fingerprint, headline trigger, coordinator -- is unchanged); the previous snapshot is intact.
+            # What changes: this is recorded as a LOCAL publication failure, never as a success.
+            log.error("Error writing %s: %s", WX_WATCHWARN_FILE, e)
+            _record_alert_fetch(False, FETCH_FAILURE_LOCAL, status_code=200,
+                                error=f"snapshot publication failed: {type(e).__name__}: {e}")
+            outcome_recorded = True        # the failure above is recorded; the handler below must not add one
+        else:
+            outcome_recorded = True
+            _record_alert_fetch(True, status_code=200)
 
         warn_text = ", ".join(all_alerts) + "\n" if all_alerts else ""
         safe_write_text(ALERT_DESCRIPTION, warn_text)
@@ -1174,8 +1244,10 @@ def _refresh_wx_alerts():
         return changed
     except Exception as e:
         log.error("Alert update error: %s", e)
-        if not snapshot_written:
-            _record_alert_fetch(False, status_code=status_code, error=f"{type(e).__name__}: {e}")
+        if not outcome_recorded:
+            _record_alert_fetch(
+                False, FETCH_FAILURE_UPSTREAM if from_nws else FETCH_FAILURE_LOCAL, status_code=status_code,
+                error=f"{type(e).__name__}: {e}")
     return False
 
 # ---------------- RDS & PROCESSED WEATHER ----------------

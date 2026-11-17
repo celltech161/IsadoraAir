@@ -719,29 +719,54 @@ def _check_forecast_cache(path: Path, now) -> DiagnosticFact:
 NWS_ALERT_FETCH_STATUS_FILENAME = "nws_alert_fetch_status.json"
 
 
-def _read_nws_alert_fetch_failure(path: Path, now) -> dict[str, Any] | None:
-    """The updater's record of a CURRENTLY failing NWS alerts fetch, or None.
+def _parse_aware_timestamp(value) -> datetime | None:
+    """A timezone-AWARE datetime from an ISO-8601 string, else None (never raises). Stricter than
+    _parse_semantic_timestamp() on purpose: the fetch-status contract requires an explicit offset, and a naive
+    value is not guessed to be UTC. Used only for that contract."""
+    parsed = _parse_semantic_timestamp(value)
+    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
-    Explanatory evidence only -- never a state input. It is returned only when the record parses, says the last
-    fetch failed (`ok` is False) and is itself fresh (written within CURRENT_DERIVED_FRESHNESS_SECONDS): a record
-    older than that means the updater has stopped reporting, which is plain staleness, not an NWS outage.
-    Anything missing, malformed or of the wrong type is ignored (never raises)."""
+
+#: The two failure kinds update_local_wx_data.py records (FETCH_FAILURE_UPSTREAM / FETCH_FAILURE_LOCAL).
+_FETCH_FAILURE_KINDS = ("upstream", "local")
+
+
+def _read_nws_alert_fetch_failure(path: Path, now) -> dict[str, Any] | None:
+    """The updater's record of a CURRENTLY failing NWS alerts fetch/publication, or None.
+
+    Explanatory evidence only -- never a state input. Returned only for a coherent record: it parses as an object;
+    `ok` is exactly False; `kind` is a known failure kind; `checked_at` and `failing_since` are timezone-aware;
+    `failing_since` <= `checked_at` <= now (nothing from the future, no start after the last check); and
+    `checked_at` is within CURRENT_DERIVED_FRESHNESS_SECONDS of now (an older record means the updater stopped
+    reporting, which is plain staleness, not an outage). Anything else -- missing, malformed, wrongly typed,
+    naive, future or contradictory -- yields None, so the caller keeps the original plain staleness explanation
+    instead of inferring a cause. Never raises."""
     try:
         record = json.loads(path.read_text())
         if not isinstance(record, dict) or record.get("ok") is not False:
             return None
-        checked_at = _parse_semantic_timestamp(record.get("checked_at"))
-        if checked_at is None or is_stale(_age_seconds(now, checked_at), CURRENT_DERIVED_FRESHNESS_SECONDS):
+        kind = record.get("kind")
+        if kind not in _FETCH_FAILURE_KINDS:
             return None
-        failing_since = _parse_semantic_timestamp(record.get("failing_since")) or checked_at
+        checked_at = _parse_aware_timestamp(record.get("checked_at"))
+        failing_since = _parse_aware_timestamp(record.get("failing_since"))
+        if checked_at is None or failing_since is None:
+            return None
+        if not (failing_since <= checked_at <= now):
+            return None
+        if is_stale(_age_seconds(now, checked_at), CURRENT_DERIVED_FRESHNESS_SECONDS):
+            return None
         status_code = record.get("status_code")
         error = record.get("error")
         return {
+            "kind": kind,
             "status_code": status_code if isinstance(status_code, int) and not isinstance(status_code, bool) else None,
             "error": error[:200] if isinstance(error, str) and error else None,
             "checked_at": _iso(checked_at),
             "failing_since": _iso(failing_since),
-            "failing_seconds": max(0.0, _age_seconds(now, failing_since)),
+            "failing_seconds": _age_seconds(now, failing_since),        # >= 0: failing_since <= checked_at <= now
         }
     except Exception:
         return None
@@ -749,6 +774,10 @@ def _read_nws_alert_fetch_failure(path: Path, now) -> dict[str, Any] | None:
 
 def _describe_nws_alert_fetch_failure(failure: dict[str, Any]) -> str:
     minutes = failure["failing_seconds"] / 60.0
+    if failure["kind"] == "local":
+        # NWS answered; this station could not process or publish the answer. Never an NWS outage.
+        return (f"The NWS alerts answer could not be processed or published on this station for {minutes:.0f} min "
+                f"({failure['error'] or 'error'}); the last snapshot is kept until it succeeds.")
     if failure["status_code"] not in (None, 200):
         how = f"HTTP {failure['status_code']}"
     else:

@@ -42,8 +42,8 @@ class FetchVisibilityBase(TestCase):
         os.utime(path, (stamp, stamp))
 
     def write_status(self, **fields):
-        record = {"ok": False, "checked_at": iso(NOW - timedelta(seconds=30)), "status_code": 503,
-                  "error": "HTTP 503", "failing_since": iso(NOW - timedelta(minutes=14))}
+        record = {"ok": False, "kind": "upstream", "checked_at": iso(NOW - timedelta(seconds=30)),
+                  "status_code": 503, "error": "HTTP 503", "failing_since": iso(NOW - timedelta(minutes=14))}
         record.update(fields)
         (self.data_dir / NWS_ALERT_FETCH_STATUS_FILENAME).write_text(json.dumps(record))
 
@@ -117,7 +117,8 @@ class WatchWarningCauseTests(FetchVisibilityBase):
 
     def test_a_record_at_the_freshness_boundary_still_counts(self):
         self.write_snapshot([], STALE_SECONDS)
-        self.write_status(checked_at=iso(NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS)))
+        boundary = NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS)
+        self.write_status(checked_at=iso(boundary), failing_since=iso(boundary - timedelta(minutes=1)))
         self.assertIn("NWS alerts fetch", self.watch_fact().summary)
 
     def test_absent_malformed_or_wrongly_typed_records_are_ignored_without_error(self):
@@ -135,11 +136,13 @@ class WatchWarningCauseTests(FetchVisibilityBase):
 
     def test_odd_field_types_do_not_leak_or_crash(self):
         self.write_snapshot([], STALE_SECONDS)
-        self.write_status(status_code="503", error={"a": 1}, failing_since="garbage")
+        self.write_status(status_code="503", error={"a": 1})
         fact = self.watch_fact()
         self.assertIn("NWS alerts fetch has been failing", fact.summary)
         self.assertIsNone(fact.evidence["nws_alert_fetch"]["status_code"])
         self.assertIsNone(fact.evidence["nws_alert_fetch"]["error"])
+        self.write_status(status_code=True)                          # a bool is not a status code
+        self.assertIsNone(self.watch_fact().evidence["nws_alert_fetch"]["status_code"])
         self.write_status(error="x" * 5000)
         self.assertLessEqual(len(self.watch_fact().evidence["nws_alert_fetch"]["error"]), 200)
 
@@ -152,8 +155,144 @@ class WatchWarningCauseTests(FetchVisibilityBase):
 
     def test_a_failure_started_just_now_reads_zero_minutes(self):
         self.write_snapshot([], STALE_SECONDS)
-        self.write_status(failing_since=iso(NOW - timedelta(seconds=10)))
+        self.write_status(checked_at=iso(NOW - timedelta(seconds=5)), failing_since=iso(NOW - timedelta(seconds=10)))
         self.assertIn("failing for 0 min", self.watch_fact().summary)
+
+
+class StatusTimestampValidationTests(FetchVisibilityBase):
+    """The stricter contract for the new status record only (P2): aware, not future, ordered, fresh, known kind.
+    Any violation leaves the ORIGINAL plain staleness explanation -- never an inferred outage."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_snapshot([], STALE_SECONDS)
+        self.plain = self.watch_fact().summary
+
+    def assert_plain(self, label, **fields):
+        self.write_status(**fields)
+        fact = self.watch_fact()
+        self.assertEqual(fact.state, "degraded", label)
+        self.assertEqual(fact.summary, self.plain, label)
+        self.assertNotIn("nws_alert_fetch", fact.evidence, label)
+
+    def assert_annotated(self, label, **fields):
+        self.write_status(**fields)
+        fact = self.watch_fact()
+        self.assertIn("NWS alerts", fact.summary, label)
+        self.assertIn("nws_alert_fetch", fact.evidence, label)
+        return fact
+
+    def test_a_future_checked_at_is_ignored(self):
+        self.assert_plain("future", checked_at=iso(NOW + timedelta(seconds=1)))
+        self.assert_plain("far future", checked_at=iso(NOW + timedelta(days=1)),
+                          failing_since=iso(NOW - timedelta(minutes=5)))
+
+    def test_a_future_failing_since_is_ignored(self):
+        self.assert_plain("future start", failing_since=iso(NOW + timedelta(minutes=5)))
+        self.assert_plain("future start and check", failing_since=iso(NOW + timedelta(minutes=5)),
+                          checked_at=iso(NOW + timedelta(minutes=6)))
+
+    def test_failing_since_later_than_checked_at_is_ignored(self):
+        self.assert_plain("start after last check", checked_at=iso(NOW - timedelta(minutes=5)),
+                          failing_since=iso(NOW - timedelta(minutes=1)))
+        self.assert_plain("start one second after last check", checked_at=iso(NOW - timedelta(minutes=5)),
+                          failing_since=iso(NOW - timedelta(minutes=5) + timedelta(seconds=1)))
+
+    def test_naive_timestamps_are_ignored_not_guessed_to_be_utc(self):
+        naive = lambda dt: dt.replace(tzinfo=None).isoformat()
+        self.assert_plain("naive checked_at", checked_at=naive(NOW - timedelta(seconds=30)))
+        self.assert_plain("naive failing_since", failing_since=naive(NOW - timedelta(minutes=14)))
+        self.assert_plain("both naive", checked_at=naive(NOW - timedelta(seconds=30)),
+                          failing_since=naive(NOW - timedelta(minutes=14)))
+
+    def test_malformed_missing_or_non_string_timestamps_are_ignored(self):
+        for label, fields in {
+            "checked_at text": dict(checked_at="yesterday"), "failing_since text": dict(failing_since="garbage"),
+            "empty": dict(checked_at="", failing_since=""), "numbers": dict(checked_at=1, failing_since=2),
+            "null": dict(checked_at=None, failing_since=None), "date only": dict(checked_at="2026-11-17"),
+            "list": dict(failing_since=[iso(NOW)]),
+        }.items():
+            self.assert_plain(label, **fields)
+
+    def test_missing_failing_since_is_ignored(self):
+        path = self.data_dir / NWS_ALERT_FETCH_STATUS_FILENAME
+        path.write_text(json.dumps({"ok": False, "kind": "upstream", "checked_at": iso(NOW - timedelta(seconds=30)),
+                                    "status_code": 503, "error": "HTTP 503"}))
+        self.assertEqual(self.watch_fact().summary, self.plain)
+
+    def test_unknown_or_missing_kind_is_ignored(self):
+        self.assert_plain("none", kind=None)
+        self.assert_plain("unknown", kind="mystery")
+        self.assert_plain("wrong type", kind=["upstream"])
+        path = self.data_dir / NWS_ALERT_FETCH_STATUS_FILENAME
+        path.write_text(json.dumps({"ok": False, "checked_at": iso(NOW - timedelta(seconds=30)),
+                                    "failing_since": iso(NOW - timedelta(minutes=14)), "status_code": 503}))
+        self.assertEqual(self.watch_fact().summary, self.plain)        # a pre-kind record
+
+    def test_valid_aware_timestamps_in_any_offset_are_accepted(self):
+        for tz in (dt_timezone.utc, dt_timezone(timedelta(hours=-6)), dt_timezone(timedelta(hours=5, minutes=30))):
+            fact = self.assert_annotated(
+                f"offset {tz}", checked_at=iso((NOW - timedelta(seconds=30)).astimezone(tz)),
+                failing_since=iso((NOW - timedelta(minutes=14)).astimezone(tz)))
+            self.assertEqual(fact.evidence["nws_alert_fetch"]["failing_seconds"], 14 * 60)
+        fact = self.assert_annotated("Z suffix", checked_at="2026-11-17T16:19:30Z", failing_since="2026-11-17T16:06:00Z")
+        self.assertEqual(fact.evidence["nws_alert_fetch"]["failing_seconds"], 14 * 60)
+
+    def test_failing_since_equal_to_checked_at_and_to_now_is_valid(self):
+        fact = self.assert_annotated("equal", checked_at=iso(NOW), failing_since=iso(NOW))
+        self.assertEqual(fact.evidence["nws_alert_fetch"]["failing_seconds"], 0)
+        self.assertIn("failing for 0 min", fact.summary)
+
+    def test_a_long_valid_continuous_failure_reports_its_true_duration(self):
+        fact = self.assert_annotated("three hours", failing_since=iso(NOW - timedelta(hours=3)))
+        self.assertEqual(fact.evidence["nws_alert_fetch"]["failing_seconds"], 3 * 3600)
+        self.assertIn("failing for 180 min", fact.summary)
+
+    def test_the_freshness_boundary_is_unchanged(self):
+        t = CURRENT_DERIVED_FRESHNESS_SECONDS
+        self.assert_annotated("exactly at the threshold", checked_at=iso(NOW - timedelta(seconds=t)),
+                              failing_since=iso(NOW - timedelta(seconds=t + 60)))
+        self.assert_plain("one second past", checked_at=iso(NOW - timedelta(seconds=t + 1)),
+                          failing_since=iso(NOW - timedelta(seconds=t + 60)))
+
+    def test_a_non_failure_record_is_ignored_whatever_its_timestamps(self):
+        self.assert_plain("ok true", ok=True, kind=None, failing_since=None)
+        self.assert_plain("ok string", ok="false")
+        self.assert_plain("ok null", ok=None)
+
+    def test_an_invalid_record_never_changes_state_or_wx_alert_applicability(self):
+        baseline = [(f.key, f.state) for f in self.snapshot().facts]
+        self.write_status(checked_at=iso(NOW + timedelta(hours=1)))
+        self.assertEqual([(f.key, f.state) for f in self.snapshot().facts], baseline)
+
+
+class LocalPublicationFailureWordingTests(FetchVisibilityBase):
+    """A local processing/publication failure is never described as an NWS outage."""
+
+    def test_local_failure_is_described_as_local(self):
+        self.write_snapshot([], STALE_SECONDS)
+        self.write_status(kind="local", status_code=200,
+                          error="snapshot publication failed: OSError: [Errno 28] No space left on device")
+        fact = self.watch_fact()
+        self.assertEqual(fact.state, "degraded")
+        self.assertIn("could not be processed or published on this station for 14 min", fact.summary)
+        self.assertIn("No space left on device", fact.summary)
+        self.assertNotIn("NWS alerts fetch has been failing", fact.summary)
+        self.assertNotIn("HTTP", fact.summary)
+        self.assertEqual(fact.evidence["nws_alert_fetch"]["kind"], "local")
+
+    def test_upstream_failure_is_still_described_as_the_nws_fetch(self):
+        self.write_snapshot([], STALE_SECONDS)
+        self.write_status()
+        fact = self.watch_fact()
+        self.assertIn("The NWS alerts fetch has been failing for 14 min (HTTP 503)", fact.summary)
+        self.assertEqual(fact.evidence["nws_alert_fetch"]["kind"], "upstream")
+
+    def test_a_local_record_obeys_the_same_validation(self):
+        self.write_snapshot([], STALE_SECONDS)
+        plain = self.watch_fact().summary
+        self.write_status(kind="local", checked_at=iso(NOW + timedelta(minutes=1)))
+        self.assertEqual(self.watch_fact().summary, plain)
 
 
 def make_check():
