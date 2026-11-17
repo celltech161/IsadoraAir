@@ -1,13 +1,15 @@
-# Roadmap 2.25 Phase A: Evergreen Voice Track transition contract and engineering audit
+# Roadmap 2.25: Evergreen Voice Track transition contract (approved) and Phase A engineering audit
 
-Status: **Phase A audit and contract-review gate.** No engine behaviour was changed. This branch
-(`feature/2.25-phase-a-vt-transition-audit`) adds this document and the characterization module
-`library/tests/test_vt_transition_2_25_phase_a.py` only.
+Status: **Phase A accepted (6ad5222). All fifteen operator decisions approved (Phase B0 workorder).
+Phase B0 timing feasibility complete; see `2_25_PHASE_B0_TIMING_FEASIBILITY.md`.** No production engine
+behaviour has changed. Production implementation (B1 onward) needs a separate engineering gate.
 
 - Audited baseline: r0144, canonical `e4003aa7f075b940ec5680bf6864f08530ceed05`, tree
   `ca941ed15e937cbf0508f2b03aa6545fb39f8c01`. It is identical to `/opt/isadoraair` and canonical main at
   the time of the audit.
 - Line references are to `library/services/engine.py` at that commit unless another file is named.
+- Sections 1-3 are the accepted Phase A audit (unchanged). Sections 4-11 are the approved contract,
+  reconciled with the decisions in section 11 and the B0 measurements.
 
 ## 1. Confirmed production incident (KOGR, 2026-11-16 20:45:04)
 
@@ -104,135 +106,230 @@ r0144 and asserts the defective behaviour. F10 is the existing 2.23 E8 character
 - **The r0144 intro fit never overruns the vocal post.** It ends the VT exactly one silence prime
   (0.3 s) early (R10b: music audible 0.560 s after the VT, against 0.3 + 0.25 cue-in expected).
 
-## 4. Timing model (all in pipeline running time)
+## 4. Timing model (approved; pipeline running time)
 
-| Symbol | Meaning |
+Every instant below is a **pipeline running time at which the sample is rendered by the program
+mixers**. It is not the time a command is issued. B0 measured these instants in rendered PCM.
+
+| Symbol | Meaning (approved) |
 |---|---|
-| `P` | Silence prime of a fresh deck, 0.300 s. A deck is audible `P + cue_in` after it is created. |
-| `t_seg` | The instant the ordinary path starts the incoming: the trigger (outgoing at `next_start − cue_in_I`, or `next_start` when under 10 s), or the outgoing's natural completion when nothing triggered. |
-| `c_I`, `u_I` | Incoming Cue In and Intro Until (media positions). |
-| `W` | Usable intro, `u_I − c_I`. |
-| `d_O`, `d_I` | Validated VT durations. |
-| `O_s`, `O_end` | Outro VT start (the outgoing crossing `outro_starts`) and its confirmed end. |
-| `gap` | `VoiceTrackConfig.min_gap_ms` (speech separation, unchanged meaning). |
-| `g` | Post guard before the vocal entry. Proposed engine constant 0.15 s; **decision D11**. |
+| `V` | Validated playable VT duration (`playable_audio().duration_seconds`). |
+| `C` | Effective incoming music start: its Cue In (media position). |
+| `I` | Intro Until marker (media position). |
+| `W` | `max(0, I − C)`, the usable instrumental introduction. |
+| `M` | 0.150 s vocal safety margin (D11, fixed engine constant, no admin field). |
+| `U` | `max(0, V − W + M)` when `W > 0`; `V + M` when there is no usable window (D10). The music underlap. |
+| `A_seg` | Running time at which the outgoing's Next Start is rendered (the planned segue point). |
+| `O_s`, `O_end` | Outro VT start (the outgoing's Outro Starts rendered) and `O_s + V_O`. |
+| `gap` | `VoiceTrackConfig.min_gap_ms` between two recorded voices (unchanged meaning). |
 
-Unified plan. Every term exists only if that side is eligible:
-
-```
-S_I0 = max(t_seg, O_end − P − c_I)               incoming deck created + claimed (segue hold while the outro VT talks: D3)
-S_v  = max(S_I0 + P + c_I, O_end + gap)           intro VT start: front-timed to audible music (D1), after speech separation
-S_I  = max(S_I0, S_v + d_I + g − P − u_I)         incoming audio start; U = S_I − S_I0 is the underlap delay (D2)
-```
-
-The incoming deck is always created and claimed at `S_I0 ≤ S_v`. The intro VT therefore always fires for
-an **already-claimed, live** occurrence; this is the F2 fix. If `U > 0`, the deck's audio is delayed by
-`U` at its mixer pad. With an invalid or missing Intro Until, `u_I := c_I`: the whole VT airs before the
-music (D10).
-
-Precision available on this pipeline (measured):
-
-| Item | Precision |
-|---|---|
-| VT fire | ±7 ms (R10) |
-| Deck audible onset | `P + cue_in` ± one 10 ms aggregator buffer (R10b) |
-| Ordinary trigger | 250 ms poll, plus a wall-clock position estimate (`_get_deck_position` 10743-10757) that lags creation |
-
-The r0144 ordinary segue lands **+0.78-0.79 s** after Next Start (R0, A02/A03). That baseline stays **unchanged**.
-
-VT transitions are planned on the decks' running-time pad offsets, so they can be held to about ±10 ms.
-The r0144 timers chain from callback times (EOS idle callback → retirement → `min_gap_ms` timer → intro
-timer), so their errors add up. EOS is also observed before the last audio sample: R8 measured an
-effective gap of 0.11 s against a configured 0.20 s.
-
-### Worked examples (incident incoming, `g = 0.15`)
+Plan. A term exists only if that side is eligible.
 
 ```
-t_seg = outgoing 255.818594
-
-A. Incident, intro VT only (d_I = 6.456229, W = 14.883283; d_I + g ≤ W, so U = 0)
-   outgoing ─────────────────────────────╮ (its own tail continues to 261.53, unducked except under speech)
-   incoming          ▒▒(P .300)(c .125)♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪ VOCAL @ t_seg+15.308
-   intro VT                         [====== 6.456 ======]          ends t_seg+6.881, clear of the post by 8.427 s
-   r0144: the intro VT never aired.  r0144 with outgoing Outro Starts 250.0: outgoing ducked 250.0→261.53 with
-   no speech, incoming audible at 262.16 (5.9 s after the ordinary segue).
-
-B. Long intro VT (d_I = 18.0): U = 18.0 + 0.15 − 14.883 = 3.267 s
-   intro VT starts t_seg+0.425 over the outgoing's tail (5.712 s remain, so no dry air);
-   incoming audible t_seg+3.691; VT ends t_seg+18.425; vocal post t_seg+18.575 (g = 0.15).
-
-C. Both, outro VT 4.0 s at 250.0: outro VT ends 254.0 < t_seg → the ordinary segue is unchanged;
-   intro VT at t_seg+0.425 ≥ 254.0 + gap.
-
-D. Both, outro VT 9.0 s at 250.0 (ends 259.0 > t_seg): S_I0 = 258.575 → incoming audible at 259.0, when the outro VT ends;
-   intro VT at 259.2 (gap 0.2); ends 265.656; post at 273.883.
-
-E. Outro VT outlasting the outgoing (15.0 s at 250.0, ends 265.0; outgoing ends 261.53):
-   dry outro VT for 3.47 s, then incoming audible at 265.0 (D3).
-
-F. Short outgoing (a 4 s ID; no poll ever evaluates it): t_seg = its completion; same formulas. The intro VT airs (F8 fix).
-
-G. Missing Intro Until: u_I := c_I → U = d_I + g. The VT airs over the outgoing's tail or silence,
-   and the music is audible g after the VT ends.
+A_0  = max(A_seg, O_end)          segue point, held while an eligible outro VT talks (D3)
+S_v  = max(A_0, O_end + gap)      intro VT speech starts (D1 front-timed to the music, after separation)
+A_I  = S_v + U                    incoming music (media position C) rendered (D2 / D10)
+A_I + W                           the vocal entry (Intro Until) is rendered
+S_v + V  ≤  A_I + W − M           speech always ends at least M before the vocal (equality when U > 0)
 ```
 
-## 5. Transition contract
+- With no intro VT, `A_I = A_0`.
+- With neither side eligible, nothing here applies. The **r0144 ordinary path runs unchanged**, and its
+  segue lands +0.78 to 0.79 s after Next Start (R0; B0 E01).
+- A VT transition is **exact**. Its music lands at `A_seg` itself, not at r0144's late ordinary point.
+  See note N1 in the B0 report.
+
+**Admission (B0 result).** Each branch is admitted at its planned instant by a pad offset set before the
+branch starts:
+- the intro and outro VT branches use offset `S_v` (or `O_s`);
+- the incoming deck uses offset `A_I − C` (direct scheduled admission, see §6).
+
+The first buffer of each branch arrives early and waits in the aggregator pad. The mixer renders it at
+exactly the offset, with nothing lost from the start of the recording.
+
+### Worked examples (incident fixture: `C = 0.124717`, `I = 15.008`, so `W = 14.883283`)
+
+```
+A. Incident VT, V = 6.456229:     U = max(0, 6.456229 − 14.883283 + 0.15) = 0
+   speech S_v .. S_v+6.456229; music rendered at S_v; vocal at S_v+14.883283; clearance 8.427054 s.
+   (r0144: the intro VT never aired.)
+
+B. Synthetic long VT, V = 18.0:   U = 18.0 − 14.883283 + 0.15 = 3.266717 s
+   speech starts at S_v = A_seg (over the outgoing's tail); music rendered at S_v+3.266717;
+   speech ends S_v+18.0; vocal at S_v+18.150000 (clearance exactly M).
+
+C. Exact fit, V = W − M:          U = 0, clearance exactly M.
+
+D. Missing / unusable Intro Until (I ≤ C or NULL): W = 0, U = V + M:
+   the whole VT, then music M after it.
+
+E. Outro VT 9.0 s from Outro Starts 250.0 (outgoing Next Start 255.943311, so O_end > A_seg):
+   A_0 = O_end; with an intro VT, S_v = O_end + gap and the music follows by U.
+
+F. Outro VT outlasting the outgoing: dry speech after the outgoing ends, music at O_end (D3),
+   subject to the urgent rule (§5) and bounded recovery (§7).
+```
+
+Measured precision (B0, rendered PCM, 44.1 and 48 kHz, WAV and FLAC): see the B0 report. The approved
+target of ±10-15 ms is **demonstrated**. Every scheduled onset and speech boundary measured within ±0.1 ms
+of plan.
+
+## 5. Transition contract (approved)
 
 ### Eligibility (attached ≠ eligible)
 
-A side is **eligible** only if all of the following hold. Otherwise it is skipped, with one deduplicated
-event giving the reason.
-- `VoiceTrack(track, position)` exists, and `playable_audio()` returns a present file with a validated
-  duration > 0. A legacy fallback is allowed exactly as `playable_audio()` defines it.
-- The markers are valid:
-  - finite;
-  - `0 ≤ cue_in < intro_until ≤ duration` for an intro;
-  - `cue_in < outro_starts < next_start ≤ duration` for an outro (D7);
-  - checked with the existing `library.services.cue_markers` ordering rules.
-- The engine is in Auto. No studio mic and no Remote DJ gate is live.
-- For an **outro**: this deck generation's own playback crossed `outro_starts` (its start position was
-  before the marker), and this occurrence's outro VT has not aired in this process.
-- For an **intro**: the occurrence is a fresh, automatic start (D5); not a resume occurrence, not a
-  dedication intro and not its follow-up song.
+A side is **eligible** only if every condition below holds. Otherwise it is suppressed, with one
+deduplicated event giving the reason (D4, D7).
 
-The two sides are evaluated **independently**. The outgoing's Outro Starts has no bearing on the
-incoming intro VT, and the incoming's Intro Until has no bearing on the outgoing outro VT.
+**Media.** `VoiceTrack(track, position)` exists, and `playable_audio()` returns a present file with a
+validated duration greater than 0. The legacy fallback is allowed exactly as `playable_audio()` defines
+it. Eligibility is decided from playable media, never from the record alone (F6).
+
+**Markers.** Each marker must be finite and follow the existing `library.services.cue_markers` ordering
+rules.
+- **Outro:** `cue_in < outro_starts < next_start ≤ duration`.
+  - A missing or invalid Outro Starts suppresses the outro VT (D4).
+  - Outro Starts at or beyond the ordinary segue boundary also suppresses it, and does not delay the
+    ordinary transition (D7).
+- **Intro:** `0 ≤ cue_in < intro_until ≤ duration` gives a usable window.
+  - A missing or unusable Intro Until does not suppress the intro VT. The whole VT plays before the
+    music (D10).
+  - iPortal's existing requirement is unchanged: it still needs the marker before an intro VT can be
+    recorded (`voicetrack_media.py:104-111`).
+
+**Live talent.**
+- The engine is in Auto.
+- No studio mic and no Remote DJ gate is live (D6).
+
+**Outro side.**
+- This deck generation's own playback crossed `outro_starts`, rising from a start position before it.
+- A continuation (resume) generation qualifies only if its start position, plus the resume evidence's
+  staleness bound, is still before `outro_starts`. Otherwise prior delivery is uncertain, and the outro VT
+  is suppressed (D13).
+- The outro VT has not already aired for this occurrence in this process.
+
+**Intro side.**
+- The incoming occurrence is a fresh **automatic** start: the trigger, natural, error or watchdog
+  completion, or the end of a VT hold.
+- No intro VT for (D5):
+  - an explicit **Start Next**;
+  - a **manual deck start**, including the replacement started by **Eject**;
+  - the start released by a **deferred Manual-to-Auto handoff**.
+
+  The next ordinary automatic transition after any of these is eligible again.
+- No intro VT for (D13):
+  - an occurrence that already has `playback_claimed_at` (interrupted-occurrence resume, deck
+    re-creation);
+  - a continuation generation.
+- Protected speech paths are untouched (D14). There is no intro VT for:
+  - a dedication intro or its follow-up song;
+  - an urgent Weather/AMBER item (`wx_alert_playout`);
+  - an Active Message item.
+
+  Promos and IDs with an explicitly attached evergreen VT are otherwise eligible.
+
+The two sides are evaluated **independently**. The outgoing's Outro Starts has no bearing on the incoming
+intro VT, and the incoming's Intro Until has no bearing on the outgoing outro VT.
+
+### Urgent priority (D3, D14; r0137 preserved)
+
+Recorded speech never gains open-ended authority over an urgent announcement. Urgent insertion,
+deduplication and the canonical-Track synchronization of r0137 are unchanged; this contract only limits
+the VT.
+- **Urgent item already next when the transition is planned:**
+  - no segue hold, and no intro VT on the urgent item;
+  - an outro VT is eligible only if it ends by `A_seg`; otherwise it is suppressed with a reason.
+- **Urgent item committed while a transition is pending:**
+  - every not-yet-admitted VT is cancelled before it is audible;
+  - a segue hold is released at once, and the urgent item starts by the ordinary path.
+- **Urgent item committed while outro speech is audible:**
+  - the outro VT continues only up to `A_seg`, then fades out over about 50 ms;
+  - the urgent item is never held past the ordinary segue point.
+- **An intro VT that is already audible** belongs to the claimed incoming song. The urgent item airs after
+  that song, which is the existing r0137 cursor contract. The VT does not delay it.
 
 ### Behaviour matrix
 
 | Case | Behaviour |
 |---|---|
-| Neither side | Ordinary path **byte-for-byte unchanged**: trigger, clamp, crossfade, EOS advance, timing (R0 baseline). |
-| Intro VT only | The outgoing is untouched (no early duck, no EOS wait). The incoming is created at `t_seg`. The intro VT is front-timed and ends ≥ `g` before the vocal post, delaying the incoming's audio by `U` when needed. |
-| Outro VT only | The outro VT fires as this generation crosses `outro_starts`. The duck covers the speech only. The segue is unchanged if the outro VT ends before `t_seg`; otherwise it is held until the outro VT ends (D3). The incoming is never made to wait for the outgoing's EOS. |
-| Both | As above, with the intro VT ≥ `gap` after the outro VT ends. Two recorded voices never overlap. |
-| Unusable audio on a side | That side is ineligible. The other side proceeds alone; if neither remains, the ordinary path applies. |
-| A fire fails or runs late at runtime | Terminal "failed", after which the transition proceeds as if that side had ended (see §7). |
-| Missing, zero or invalid markers | Missing/invalid Intro Until: dry VT before the music (D10). Missing/invalid or late Outro Starts: the outro VT is ineligible (D4, D7). |
+| Neither side | **r0144 ordinary path unchanged**: trigger, clamp, crossfade, EOS advance, timing (R0 and E01 baseline). |
+| Intro VT only | The outgoing is untouched: no early duck and no EOS wait. The VT starts at `A_seg` (D1). If `U > 0`, speech starts first and the music is admitted `U` later (D2). Speech ends at least `M` before the vocal. |
+| Outro VT only | The outro VT starts as this generation crosses `outro_starts`. If it ends by `A_seg`, the segue is unchanged. Otherwise the music is held until speech ends (D3), within the urgent rule and the §7 bounds. |
+| Both | As above. The intro VT starts at least `gap` after the outro VT ends, so two recorded voices never overlap. |
+| Unusable audio on a side | That side is ineligible, and the other side proceeds alone. If neither side remains, the ordinary path applies. |
+| A fire fails, stalls or overruns | Terminal "failed" (§7). Held music is admitted at once, and the transition proceeds as if that side had ended. |
+| Missing or unusable markers | See Eligibility (D4, D7, D10). |
 
-**Ducking.** `vt_duck_gain` is owned by **audible VT speech**:
-- attack begins `duck_ramp_ms` before a planned VT start;
-- release begins at the confirmed end of the last speech interval;
-- intervals closer than 2 × `duck_ramp_ms` merge.
+**Ducking (D12).** `vt_duck_gain` is owned by **actual VT speech**:
+- the attack starts one `duck_ramp_ms` before the planned speech start;
+- the release starts at speech end, or immediately on cancel or failure;
+- speech intervals closer than 2 × `duck_ramp_ms` merge into one duck.
+
+The duck is a running-time control curve on `vt_duck_gain` (B0), not a GLib stepper. The mic duck
+(`duck_gain`) stays independent.
 
 `program_duck_db`, `duck_ramp_ms` and `min_gap_ms` keep their names, admin forms and meaning. There is no
 schema change.
 
-## 6. Authoritative incoming occurrence (F2)
+## 6. Authoritative incoming occurrence and admission (F2)
 
-- **Plan, read-only.** The lookahead (`_peek_playable_at_cursor` / `_peek_next_hour`) is used only to
-  estimate timing (`d_I`, `W`) and to decide whether a segue hold is needed. It never decides what airs.
-- **Commit.** The intro VT is resolved inside the deck-open path, **after** the occurrence is final:
-  request scheduling, dedication splice, forced/urgent/Active Message items, rollover or live-fill
-  adoption, unplayable skip, claim contention retry and Swap adoption under the claim's row lock. It is
-  resolved before the deck's mixer-pad offset is applied, so the underlap delay `U` can be applied
-  there.
-- **Fire.** The intro VT is owned by the incoming deck generation, by `(slot, log_item_id, generation)`.
-  It fires only if that generation is still live, Auto is on, no mic is live, and the transition sequence
-  is current.
-- **Change of plan.** If the committed track differs from the planned track, the plan is recomputed for
-  the committed track. If that needs an underlap that was not planned for, the intro VT is skipped
-  rather than started late.
+**Plan (read-only).** The lookahead (`_peek_playable_at_cursor` / `_peek_next_hour`) only estimates:
+- timing (`V`, `W`, `U`);
+- whether a segue hold is needed;
+- the instant `A_seg − C − lead` at which the incoming deck must be opened.
+
+It never decides what airs. Its database reads move out of `_poll_position` (F13). They are taken once,
+when the outgoing occurrence is admitted, or in the existing look-ahead/refresh path. They are cached by
+`(log_item_id, track_id)`.
+
+**Commit (the deck-open path).** Everything that can change the occurrence happens first, in the existing
+`_start_next_track` → `_create_deck` path:
+- request scheduling;
+- dedication splice;
+- forced, urgent and Active Message items;
+- rollover or live-fill adoption;
+- unplayable skip;
+- claim-contention retry;
+- Swap adoption under the claim's row lock.
+
+The claim runs before any VT is considered. Only after it does the engine resolve the intro VT for the
+**claimed** `log_item.track`. That is one indexed `VoiceTrack` read, in the same deck-open path that
+already performs the claim. Eligibility is decided there, and the plan is computed for this occurrence.
+
+**Admission.** In a VT transition the incoming deck is opened in **scheduled admission** mode:
+- the existing deck bin, **without** the 0.3 s silence prime;
+- its pad offset set to `A_I − C` before the bin starts, instead of "now".
+
+A VT transition is the only thing that opens a deck this way. An ordinary start still opens a primed deck
+whose offset is "now" (r0144 unchanged).
+
+**Viability before speech.** The VT branch is prepared only after the claimed deck has produced
+**readiness evidence**: its first decoded buffer at the real stage (`seek_gate_pad`).
+- B0 measured that this evidence arrives about 3 ms after a scheduled deck opens, for every format and
+  rate tested.
+- A primed deck cannot give this evidence for FLAC or resampled media until its prime starts. That is
+  only `P + C` before the music, which is after speech has started when `U > P + C` (B0 DeckReadiness).
+- A scheduled deck's mixer pad is empty until its first buffer arrives, and the non-live deck mixer
+  waits on an empty pad. So a stalled decode would freeze the outgoing too (F15, pre-existing in r0144
+  at the prime-to-music switch; B0 E12).
+- **Readiness deadline: open + 100 ms.** If no evidence by then, the deck is detached at once. Detaching
+  releases the pad, and the mixer stops waiting. The intro VT is skipped, and the occurrence is re-opened
+  as an ordinary primed start. B0 E12c bounds the outgoing interruption to the deadline.
+- If the evidence has not arrived by `S_v − 50 ms` for any other reason, the intro VT is skipped before it
+  is audible.
+
+**Fire ownership.** The intro VT is owned by `(slot, log_item_id, generation, transition_seq, fire_id)`.
+It is admitted only if, at preparation:
+- that generation is the live incoming;
+- Auto is on and no mic is live;
+- the sequence is current.
+
+Track id alone never identifies an owner.
+
+**Change of plan.** If the claimed track differs from the planned track, the plan is recomputed for the
+claimed occurrence. If the recomputed plan cannot be met, for example because a new underlap would need
+an admission instant that has already passed, the intro VT is skipped rather than started late or
+clipped.
 
 The queue is never frozen. The only lock is the existing one-row claim lock (`lock_timeout 250ms`). Queue
 mutation guards, Hour Refill, live fill and the native Active Message restrictions are untouched.
@@ -242,144 +339,258 @@ mutation guards, Hour Refill, live fill and the native Active Message restrictio
 One owner record replaces the phase dictionary:
 
 ```
-transition = {seq, outgoing:(slot, log_item_id, generation), segue_hold,
-              outro:{fire_id, planned_end, state}, intro:{fire_id, owner:(slot, log_item_id, generation), state}}
-state: planned → firing → audible (first buffer) → ended | failed | aborted
+transition = {seq, outgoing:(slot, log_item_id, generation), incoming:(slot, log_item_id, generation),
+              plan:{A_seg, O_s, O_end, S_v, U, A_I}, hold:{until, reason},
+              outro:{fire_id, state}, intro:{fire_id, state}}
+fire state: planned → preparing → ready (first buffer waiting in the mixer pad) → admitted
+            → ended | failed | cancelled
 ```
 
-- **Fires.** Each fire carries `(seq, side)`. Branch errors are routed to their fire, so
-  `_on_main_bus_error` resolves FX/VT elements as well.
-- **Deadlines.**
-  - No first buffer within 1.0 s: failed.
-  - No EOS by validated duration + 2.0 s: failed.
-  - Every failure is terminal and advances exactly like EOS.
-  - Late EOS and stale timers are ignored by `(seq, fire_id)`, which is the existing 2.23 mechanism.
-- **Every terminal releases ownership and the VT duck.** No terminal path:
-  - starts an extra deck (the existing `_live_decks()` and claim rules);
-  - skips an otherwise valid song;
-  - leaves `segue_hold` set. A transition deadline (planned end + 3 s) clears it and, in Auto, runs the
-    ordinary start.
-- **The mic duck is independent.** A VT abort releases only the VT duck.
+**Fires.**
+- Each fire is a scheduled branch, admitted by its pad offset.
+- Its probes record readiness (the first buffer) and completion (EOS, dropped at the branch).
+- Branch errors are routed to the owning fire. `_on_main_bus_error` resolves VT elements, as it already
+  does for decks, the mic and output slots.
 
-## 8. Operator-controlled transitions (recommended)
+**Deadlines (B0-verified).** All deadlines are in running time and owner-checked by `(seq, fire_id)`.
 
-| Event | Recommendation |
-|---|---|
-| Studio mic or Remote DJ gate goes live | Suppress any VT not yet audible. Abort an audible VT with a fast fade (≈50 ms) (D6). Then the existing Manual hold applies: the incoming waits (`_manual_hold_pending`). |
-| Manual mode (operator) | No VT is started in Manual. An audible VT completes (it is not competing with a mic). A VT-held incoming waits for Auto like the ordinary trigger. |
-| Return to Auto | The held start fires through the ordinary path (no intro VT; D5). |
-| Start Next | Abort in-progress VT speech, then the 2.23 Start Next proceeds. This replaces the `busy_voice_track` refusal (D8). No intro VT on its incoming. |
-| Eject outgoing during its outro VT | Keep 2.23 D9 (the outro VT completes, then the incoming), now occurrence-bound (D9). |
-| Eject incoming during its intro VT | Abort the intro VT (it belongs to the ejected song; F10); no intro VT on the replacement (D5). |
-| Pause, seek or resume of a deck with its VT active | Abort that side. No replay on resume or re-cross: the per-occurrence aired set plus the crossing rule. |
-| Play Now / log reload | Abort everything (existing). |
-| Engine restart | VT state is not persisted. A resumed generation starts past the marker, so no outro VT (F9 fix), and a resume occurrence gets no intro VT. An intro VT interrupted before its song was claimed may air again with that song (D13). |
-
-## 9. Validation design
-
-**L1 Pure** (planner + eligibility, no GStreamer):
-- every §4 example to the millisecond;
-- `d_I` = `W − g` exactly; long, short and zero durations;
-- cue-in variations; missing, zero, inverted or out-of-range markers; Outro Starts before, at and after
-  Next Start;
-- attached-but-unplayable records; config edge cases (`program_duck_db` = 0, `min_gap_ms` = 0).
-
-**L2 Engine state machine** (transport harness, fakesink): R1–R11 inverted, plus:
-- neither side (R0-identical claims);
-- intro-only, outro-only and both;
-- urgent, request, dedication, Swap adoption, Active Message, rollover, live fill, skip and claim
-  contention (**intro VT always that of the claimed deck's track, or none**);
-- mic before and during a VT; Remote DJ gate; Manual and return to Auto;
-- Start Next, Eject of either side, pause/seek/resume, restart resume;
-- fire failure at open, decode and preroll, and a missing EOS;
-- exactly-once claims, no extra deck, the duck at unity at every terminal.
-
-**L3 PostgreSQL integration:**
-- real `VoiceTrack` + `ProductionMedia`: valid, invalid, missing bytes, legacy and no-air refusal;
-- real SongRequest scheduling and dedication splice at claim;
-- a Swap committed between plan and claim;
-- an urgent or Active Message splice during a VT;
-- next-hour adoption and live-fill install;
-- the claim-contention retry.
-
-**L4 Real audio** (appsink, tone-identified signals as in this module):
-- the incoming media carries an 800 Hz "vocal" from `intro_until`;
-- the intro VT is audible front-timed and **absent from the vocal post on**, with clearance ≥ `g` −
-  10 ms;
-- underlap delay = `U` ± 15 ms;
-- duck depth `program_duck_db` ± 0.5 dB and ramp `duck_ramp_ms` ± 20 ms;
-- speech separation `min_gap_ms` ± 20 ms;
-- no speechless duck longer than one ramp;
-- no VT audio while a mic is live;
-- an undecodable VT leaves program running at unity;
-- **ordinary segue distribution equal to the r0144 R0 baseline** (N ≥ 10 runs).
-
-**Negative controls.**
-- R1–R11 run against the r0144 engine must fail the Phase B assertions. The L2 incident case must fail on
-  r0144 (the outgoing-marker dependency) and the R2/R3/R3b cases must fail on r0144 (the wrong
-  occurrence).
-- Mutation controls must each be detected:
-  - re-gating intro on `outro_starts`;
-  - binding the intro to the lookahead;
-  - removing fire deadlines or error routing;
-  - removing the mic check;
-  - removing the aired set;
-  - releasing the duck at entry instead of speech end.
-
-## 10. Phase B plan, change surface and restarts
-
-| Step | Content | Fixes |
+| Deadline | Instant | Result |
 |---|---|---|
-| B0 spike (isolated) | Future-dated mixer-pad offsets for a VT branch and for a deck's audio delay (accuracy, deck position estimate, EOS and watchdog interaction); VT-branch error and first-buffer detection | Chooses between running-time pad offsets and anchored GLib timers |
-| B1 | New pure `library/services/vt_transition.py` (eligibility + plan) + L1 | — |
-| B2 | Fire lifecycle: owner token, bus routing, first and last buffer probes, deadlines; speech-owned duck | F3, F5 (duck), F6 |
-| B3 | Outro side: generation crossing + aired set, independent of the incoming; segue hold | F7, F9, F12 |
-| B4 | Intro side: in the deck-open path after claim, before the pad offset; audio delay `U`; automatic starts only | **F1**, **F2**, F5, F8, F10 |
-| B5 | Live talent and operator commands (§8) | **F4**, F10, F11 |
-| B6 | Remove the r0144 phase machine and `_vt_maybe_enter`; update the 2.23 characterizations (intro-only, E8); publish VT state | F13 |
-| B7 | L2–L4 suites, negative and mutation controls, full qualification | — |
+| Ready | `admission − 50 ms` | Not ready: **failed before audible**. Nothing is clipped, and nothing aired. |
+| First audio | admission + 1.0 s | No buffer by then: failed. With ready-before-admission, this is a backstop that should not fire. |
+| Completion | admission + `V` + 2.0 s | Failed (overrun). Speech is cut, and the next step proceeds. |
 
-**Files.**
+**Every terminal releases.** Whether a fire ended, failed or was cancelled, it releases its ownership and
+its part of the VT duck curve. If it held the music, the held deck is **re-admitted at once by
+regeneration**, so there is no dead air for `U`:
+- the held generation has never been audible, and is detached;
+- a replacement generation of the **same claimed occurrence** opens with admission at now + 0.10 s (plus
+  `C`);
+- B0 E09d measured the replacement ready in about 4 ms and the music at its new target (0.0000 s), with
+  the outgoing continuous.
+- Moving the pad offset of a held deck forward does **not** work. Its queued first buffer anchors the
+  old time, and the music is lost (B0 E09b).
+- A blocking-probe gate, which would allow that, starves the deck mixer (B0 E04d). It is rejected.
+
+No terminal path:
+- starts an extra deck (the existing `_live_decks()` and claim rules apply);
+- skips an otherwise valid song;
+- leaves a hold set. A transition deadline (planned end + 3 s) releases any hold, and in Auto runs the
+  ordinary start.
+
+**Retirement.**
+- **Detach first, on the main loop.** Unlink the branch, then release its aggregator pad. This wakes a
+  streaming thread waiting there with a held buffer.
+- **NULL transitions and removal run off the GLib main loop.** For decks this is the existing
+  `BoundedTeardownCoordinator`; for VT branches it is the same kind of bounded worker.
+- B0 E09c measured the hazard of the other order: NULL-first on a held branch blocks for the rest of
+  its hold.
+
+**Stale callbacks.** Every timer, probe callback and bus-error route carries the owner token. A token
+that is no longer current is ignored and counted. B0 records these as `ignored`.
+
+**The mic duck is independent.** A VT cancel releases only the VT duck.
+
+## 8. Operator-controlled transitions (approved)
+
+| Event | Behaviour |
+|---|---|
+| Studio mic or Remote DJ gate goes live | Not-yet-audible VTs are cancelled. Audible speech fades out over about 50 ms (D6). The VT duck is released; the mic duck holds independently. The existing Manual hold then applies: the incoming waits (`_manual_hold_pending`). |
+| Manual mode (operator) | No VT is planned or admitted in Manual. Audible speech completes. A hold waits for Auto, like the ordinary trigger. |
+| Deferred Manual-to-Auto handoff | The released start is ordinary, with no intro VT (D5). The next automatic transition is eligible. |
+| Start Next during a VT | Speech is cancelled with a 50 ms fade (D8). If the next occurrence is already claimed and held, it is **re-admitted by regeneration** (same occurrence, no second claim). Otherwise the 2.23 Start Next runs. Either way there is exactly one advance, with no double advance and no skipped occurrence. This replaces the `busy_voice_track` refusal. |
+| Eject the outgoing during its outro VT | Keep 2.23 D9: the outro VT completes, then the incoming (D9). |
+| Eject the incoming during its intro VT | The intro VT is cancelled (D9, F10). Held music never airs. The replacement is a manual start with no intro VT (D5). |
+| Pause, seek or resume of a deck with a VT side active | That side is cancelled. There is no replay on resume or re-crossing (D13 rules, §5). |
+| Play Now or log reload | Everything is cancelled (existing). |
+| Urgent insertion | §5 urgent rule. |
+| Engine restart | VT state is not persisted. Claim evidence (`playback_claimed_at`) and the resume hint (`saved_position`, `state_age_seconds`) enforce D13 without a migration (§5). |
+
+## 9. Validation design and regression matrix (revised after B0)
+
+### Layers
+
+| Layer | What it runs | What it proves |
+|---|---|---|
+| **L1 Pure** (`vt_transition` planner, no GStreamer) | §4 examples to 1 µs; `V = W − M` exactly; long, short and zero `V`; Cue In variations; missing, zero, inverted and out-of-range markers; Outro Starts before, at and after the segue boundary; attached-but-unplayable records; `program_duck_db = 0`, `min_gap_ms = 0`; urgent-next and the D5/D13/D14 eligibility tables. | The plan and eligibility are right before any audio exists. |
+| **L2 Engine state machine** (transport harness) | R1–R11 inverted; owner tokens; deadlines; cancellation; re-admission; exactly-once claims; no extra deck; the duck at unity at every terminal; stale callbacks ignored. | The state machine routes every case correctly. |
+| **L3 PostgreSQL** | Real `VoiceTrack` + `ProductionMedia` (valid, invalid, missing bytes, legacy, no-air refusal); SongRequest scheduling and dedication splice at claim; a Swap committed between plan and claim; urgent and Active Message splice; next-hour adoption and live-fill install; claim-contention retry. | The intro VT is that of the claimed occurrence, or none. |
+| **L4 Rendered audio** (the B0 lab promoted to engine tests) | B0's tone signals, sample-accurate onset and end measurement, 44.1 and 48 kHz, WAV and FLAC. | Every timing claim, measured in rendered PCM (table below). |
+
+### Regression matrix: every finding mapped to its Phase B proof
+
+| Finding | r0144 characterization (must fail after the fix) | Phase B assertion (L-layer) |
+|---|---|---|
+| F1 outgoing-marker dependency (incident) | R1a, R1b | L2 + L4: the incident fixture airs its intro VT at `A_seg` ±15 ms with no outgoing marker. The control (outgoing marker added) gives the same intro result. |
+| F2 wrong occurrence | R2, R3, R3b, plus the 2.23 E8 characterization | L2 + L3: an urgent, request, dedication, Swap, Active Message, rollover, live-fill, skip or contention case either carries the **claimed** track's VT or no VT. L4: 0.00 s of a foreign VT over an alert, request or dedication. |
+| F3 failed fire strands | R4a, R4b | L2: corrupt, stalled and overrun fires reach "failed" by deadline (B0 E11). L4: no dead air, held music re-admitted, duck back to unity, Start Next accepted. |
+| F4 mic / Manual ignored | R5 | L2 + L4: mic live cancels pending speech, fades audible speech within 50 ms + 20 ms (B0 E13), releases the VT duck while the mic duck holds, and leaves the incoming waiting. |
+| F5 speechless duck, dropped segue | R8 | L4: the duck starts no earlier than one ramp before speech and releases at speech end. An intro-only VT with an outgoing marker keeps the segue at `A_seg`. |
+| F6 attached-but-unplayable | R11 | L1 + L2: ineligible with a reason; the ordinary path is unchanged. |
+| F7 outro marker past the trigger | R6 | L1 + L2: suppressed with a reason (D7); no segue delay. |
+| F8 short outgoing | R7 | L2 + L4: a 4 s ID followed by a song with an intro VT airs the VT. |
+| F9 outro re-fire on resume | R9 | L2: a continuation generation at or near the marker gets no outro VT (D13). |
+| F10 ejected incoming's VT continues | 2.23 E8 | L2 + L4: Eject of the incoming cancels its VT (B0 E09: 0.00 s of held music). |
+| F11 pause/seek | (source) | L2: the side is cancelled, with no replay. |
+| F12 identity by track id | (source) | L2: a back-to-back repeat of one track is owned by occurrence and generation. |
+| F13 unpublished state, DB on GLib | (source) | L2: VT state in `engine_state.json`. The poll path makes no VT DB call (query-count assertion). |
+| **F15 (new, B0; pre-existing) a stalled deck freezes the deck bus** | B0 E12 (primed deck stalled 1.0 s: outgoing rendered 0.83 s of 2.2 s) | L4: a scheduled deck that misses its readiness deadline is detached within 100 ms; the outgoing loses at most that (B0 E12c). The ordinary primed path is not changed in 2.25; record it as a transport follow-up. |
+| **F14b (new, B0; pre-existing) r0144 deck tails cut** | B0 `R0144DeckTailTests` (71-177 ms) | Not changed by 2.25 unless separately approved: it changes every ordinary song end. B2 plans retirement for VT branches only. |
+| **F14 (new, B0) r0144 VT/FX tails cut** | B0 `R0144TailTruncationTests` | L4: every VT renders its whole recording (`vt_len` within ±15 ms of `V`). Retirement happens after the last sample is rendered. Also check whether the FX cart path should get the same fix, separately scoped. |
+| Ordinary path preserved | Phase A R0, B0 E01 | L4: segue distribution equal to r0144 (B0 E01: +0.770 to +0.780 s), N ≥ 10 runs. |
+
+### Rendered-audio acceptance (L4; B0 demonstrated every row)
+
+| Quantity | Bound |
+|---|---|
+| VT and music onset vs plan | ±15 ms (B0 measured ±0.1 ms) |
+| Underlap `U` | ±15 ms |
+| Clearance before the vocal | `≥ M − 15 ms`; equals `M` ±15 ms when `U > 0` or `V = W − M` |
+| Speech length | `V` ±15 ms (whole recording, nothing cut from start or end) |
+| Duck depth | `program_duck_db` ±0.5 dB |
+| Duck attack and release | Starts one `duck_ramp_ms` before speech; releases at speech end ±20 ms |
+| Speech separation | `min_gap_ms` ±15 ms |
+| Cancel and mic fade | Audible speech ends ≤ 70 ms after the command (B0: ≤ 20 ms) |
+| Speech while a mic is live | None |
+| Failed VT | Leaves the program running at unity with no gap |
+| Ordinary segue | Equal to r0144 |
+| Repeated cycles | No drift, and no pad, element, thread or fd growth (B0 E14) |
+
+**Negative and mutation controls.** Each mutation below must make at least one L2/L4 test fail:
+- re-gating the intro on `outro_starts`;
+- binding the intro VT to the lookahead;
+- dropping the readiness gate;
+- removing deadlines or error routing;
+- removing the mic check;
+- removing the aired set;
+- releasing the duck at entry;
+- retiring a branch on EOS before its last sample;
+- NULL-before-detach.
+
+## 10. Phase B plan, change surface and restarts (refined after B0)
+
+| Step | Content | Fixes | Gate |
+|---|---|---|---|
+| **B0** (done) | Isolated real-GStreamer feasibility: scheduled admission, readiness, cancellation, retirement, duck curve, mic, repeated cycles | — | This review |
+| **B1** | Pure planner and eligibility | F6, F7 (rules) | L1 |
+| **B2** | Admission and fire-lifecycle primitives, dormant (nothing calls them in production yet) | F3, F14 (primitives) | L2 + L4 |
+| B3 | Outro side: crossing within the generation, aired set, D13 resume rule, D3 hold within the urgent rule | F7, F9, F12 | L2 + L4 |
+| B4 | Intro side: claim → resolve → readiness → admit; re-admission on cancel or failure | **F1**, **F2**, F5, F8, F10 | L2 + L3 + L4 |
+| B5 | Live talent and operator commands (§8) | **F4**, F10, F11 | L2 + L4 |
+| B6 | Remove the r0144 phase machine and `_vt_maybe_enter`; update the 2.23 characterizations (intro-only, E8); publish VT state; move VT reads off the poll | F13 | L2 |
+| B7 | Phase A characterizations inverted, mutation controls, full qualification, r0145 candidate | — | Release review |
+
+### B1: pure planner and eligibility (no engine change)
+
+New module `library/services/vt_transition.py`. It is pure: no Django ORM, no GStreamer, no clock.
+- **Types.**
+  - `SideEligibility(eligible, reason)`;
+  - `TransitionInput`: markers, `V_O`/`V_I` from `playable_audio()`, the `A_seg` and `O_s` running times, `gap`, `ramp`, the urgent-next flag and the start kind;
+  - `TransitionPlan(A_0, S_v, U, A_I, O_s, O_end, hold_until, duck_points, reasons)`.
+- **Rules.** It implements exactly §4 and §5:
+  - D4, D7 and D10 marker rules (using `cue_markers` ordering);
+  - D5 start kinds (`automatic`, `start_next`, `manual`, `eject_replacement`, `manual_to_auto_handoff`, `resume`);
+  - D13 continuation and staleness rule (`saved_position`, `state_age_seconds`);
+  - D14 protected paths (dedication intro and follow-up, wx_alert, Active Message);
+  - the urgent rule;
+  - duck-point merging (D12).
+- **Tests.** L1 only, as `library/tests/test_vt_transition_planner.py`. It covers every §4 example (incident `U = 0`, 18 s `U = 3.266717`, exact fit, missing marker), every eligibility reason, and property checks: `S_v + V ≤ A_I + W − M` always, and `A_I ≥ A_0`.
+- **Exit.** No engine import of the module yet. No restart is needed to ship B1 alone.
+
+### B2: admission and fire-lifecycle primitives (dormant)
+
+All in `engine.py`, behind methods that no production path calls until B3/B4:
+
+- **`_vt_prepare_fire(path, gain_db, *, owner, admission_ns, validated_duration)`.** This is the
+  ScheduledBranch from B0:
+  - its pad offset is set before the elements start, and a target less than 50 ms in the future is
+    refused;
+  - readiness, last-buffer-end and EOS probes;
+  - owner-checked deadlines: ready (`admission − 50 ms`), first audio (+1.0 s), completion (`+V + 2.0 s`);
+  - retirement drains first: only after the last sample's running time, which fixes F14 for VTs;
+  - detach-first teardown on the main loop, NULL off the main loop.
+- **`_on_main_bus_error`.** Routes VT branch elements to the owning fire (F3).
+- **`_create_deck(..., scheduled_admission_ns=None)`.** When set:
+  - no silence prime;
+  - pad offset `scheduled_admission_ns`;
+  - readiness from the first real-stage buffer;
+  - `started_at` and the air-start evidence anchored to the scheduled render time, not the
+    (early) first buffer. Without that, `played_at` would be early by the hold.
+
+  When unset, the deck is r0144 byte-for-byte; a test asserts the primed path's elements and offsets are
+  unchanged.
+- **`_readmit_held_deck(deck, now_ns)`.** Regeneration (B0 E09d), for cancel, failure and Start Next:
+  - detach the never-audible held generation;
+  - open a replacement generation of the same claimed occurrence, with admission at now + 0.10 s.
+
+  Accounting must treat the held generation as never aired, with no segment and no air start. Only the
+  replacement's scheduled render time is the air start. B4 decides how the claim path recognises its own
+  claimed-but-unaired occurrence.
+- **Readiness deadline for scheduled decks.** Open + 100 ms; on a miss, detach and fall back to an
+  ordinary start (F15 bound, B0 E12c).
+- **`_vt_duck_curve`.** A single `InterpolationControlSource` bound once to `vt_duck_gain.volume`. It is
+  never removed (cf. the GstController binding-removal crash note) and only its points are replaced. It
+  replaces the GLib stepper `_vt_ramp_duck_to_db` when B4 lands.
+- **Tests.**
+  - L2 lifecycle (tokens, deadlines, stale callbacks, re-admission, pad and element counts);
+  - L4 rendered audio (the B0 experiments promoted to engine-level tests against these methods);
+  - an F14 test for the new VT path.
+- **Exit.** The ordinary path is unchanged (E01 distribution), and nothing calls the primitives.
+  Shipping B2 alone would need an engine restart. Recommend landing B1+B2 together with B3/B4 in r0145
+  rather than shipping dormant code separately.
+
+### Files
+
 - `library/services/engine.py`:
-  - the VT section 9704-10061;
-  - `_poll_position`; `_handle_deck_finished`; the watchdog hand-over;
+  - the VT section 9704-10061 (replaced in B4/B6) and `_vt_fire_file`;
+  - `_fx_install_completion_probe` and `_fx_fire_completed` (VT branch drain; FX carts are out of scope
+    unless approved, see F14);
+  - `_on_main_bus_error`;
+  - `_create_deck` (scheduled admission);
+  - `_poll_position`, `_handle_deck_finished`, the watchdog hand-over;
   - `_eject_deck`; pause, resume and seek;
   - `_set_mic_ptt`, `_apply_mic_mode_hold`, the Remote DJ gate path;
-  - `_on_main_bus_error`; `_start_next_track` / `_create_deck`;
-  - the Start Next guard; `_write_state`.
+  - `_start_next_track`, the Start Next guard;
+  - `_insert_urgent_next_inner` (the urgent rule hook only; r0137 semantics unchanged);
+  - `_write_state`.
 - New: `library/services/vt_transition.py`.
 - Tests:
-  - `library/tests/_transport_harness.py` (Intro Until in queue specs);
-  - `test_transport_safety_2_23.py`;
+  - `_transport_harness.py`;
+  - `_vt_b0_lab.py` (promoted);
+  - `test_transport_safety_2_23.py` (intro-only and E8 updated in B6);
+  - `test_vt_transition_2_25_phase_a.py` (inverted in B7);
   - new L1–L4 modules.
-- `library/templates/library/dashboard.html`, only if D8 removes the `busy_voice_track` text.
+- `library/templates/library/dashboard.html`: only if the `busy_voice_track` text is removed (D8).
 - Docs.
-- `library/models.py`: no field or help_text change (a help_text edit would itself generate a
-  migration).
+- `library/models.py`: **no change**. A help_text edit alone would generate a migration.
 
-**Expected migrations and restarts.**
-- **No migration** and no protected-runtime change.
-- **`isadoraair-engine` restart** (engine code). This interrupts program audio, and the r0144 restart
+### Expected migrations and restarts
+
+- **No migration.** D13 is enforced from existing evidence: `LogItem.playback_claimed_at`, `played_at`,
+  and the resume hint's `saved_position` and `state_age_seconds`. Nothing new is persisted.
+- No protected-runtime change, no iPortal or ProductionMedia change, and no updater change.
+- An **`isadoraair-engine` restart** (engine code) interrupts program audio, so the r0144 restart
   safeguard applies.
-- **`isadoraair-gunicorn`** only if a template or web module changes.
-- The exact inventory is to be proved in Phase B with the release import-graph check.
+- **`isadoraair-gunicorn`** restarts only if `dashboard.html` changes (D8 text).
 
-## 11. Decisions requiring operator approval
+The exact inventory is proved at release with the import-graph check.
 
-| # | Decision | Recommendation |
+## 11. Operator decisions (approved, B0 workorder)
+
+| # | Approved contract | Where |
 |---|---|---|
-| D1 | Intro VT alignment | Front-timed to the incoming's audible start (r0144 started it 0.3 s + cue-in earlier); not back-timed to the post |
-| D2 | Long intro VT | Delay the incoming's audio by `U`. The VT starts at the segue point and never talks over the outgoing before its Next Start |
-| D3 | Outro VT running past the segue or the outgoing's end | Hold the incoming until the outro VT ends (dry outro tail if the outgoing ended); not music under the outro VT |
-| D4 | Outro VT with no Outro Starts | Ineligible, with an event; no fallback position |
-| D5 | Which starts carry an intro VT | Automatic only: trigger, natural/error/watchdog completion, VT hold release. Not Start Next, Eject, Play Now, Return to Auto or a restart resume |
-| D6 | Mic live during an audible VT | Abort with an ≈50 ms fade |
-| D7 | Outro Starts at or after Next Start | Outro VT ineligible (marker inconsistent), with an event |
-| D8 | Start Next during a VT | Abort the VT and proceed (replaces `busy_voice_track`) |
-| D9 | Eject of the outgoing during its outro VT | Keep 2.23 D9; Eject of the incoming aborts its intro VT |
-| D10 | Missing or invalid Intro Until | Dry VT entirely before the music |
-| D11 | Post guard `g` | Engine constant 0.15 s (no new admin field, no migration) |
-| D12 | Duck attack | Pre-attack one `duck_ramp_ms` before the speech; release at the speech's confirmed end |
-| D13 | Intro VT interrupted by a restart before its song was claimed | May re-air with that song (accepted) |
-| D14 | Intro VT on non-music incoming (promos, IDs) | Allowed: the binding is to the Track, as recorded |
-| D15 | Precision | VT transitions use running-time planning (±10 ms); ordinary segues keep the r0144 timing exactly |
+| D1 | A short intro VT starts with the audible incoming music, not back-timed from the vocal entry. | §4 |
+| D2 | A long intro VT starts first; the incoming music is delayed by `U` so the whole VT fits before Intro Until. | §4 |
+| D3 | An eligible outro VT running past the segue point may hold the incoming until speech ends, subject to bounded failure recovery, operator control and urgent priority. | §5, §7 |
+| D4 | An outro VT without a valid Outro Starts is suppressed, with a diagnostic reason. | §5 |
+| D5 | Start Next and manual deck starts bypass evergreen intro VTs. A deferred Manual-to-Auto handoff bypasses the immediate intro VT. Later automatic transitions are eligible. **Interpretation for review:** the replacement started by Eject counts as a manual start. | §5, §8 |
+| D6 | A live mic suppresses pending VTs and fades active speech out in about 50 ms. | §8 |
+| D7 | Outro Starts at or beyond the ordinary segue boundary does not delay the transition. The outro VT is suppressed, with a reason. | §5 |
+| D8 | Start Next during a VT cancels the VT and honours operator intent, with no double advance and no skipped occurrence. | §8 |
+| D9 | Outgoing-deck Eject behaviour is preserved. Ejecting the incoming cancels its intro VT. | §8 |
+| D10 | With no valid Intro Until, the whole VT plays before the song. **Interpretation:** music follows `M` after the VT, i.e. `U = V + M`, the approved formula with `W = 0`. With an insufficient window, the underlap applies. iPortal's marker requirement is preserved. | §4, §5 |
+| D11 | Fixed 150 ms vocal safety margin; no admin setting. | §4 |
+| D12 | The duck anticipates actual speech by the configured ramp, and releases at speech end or cancel. | §5 |
+| D13 | No intro VT replay on interrupted-occurrence resume. No outro VT replay for an occurrence. Suppress where delivery is uncertain. Achieved without a migration. | §5, §10 |
+| D14 | Evergreen VTs may be used on promos and IDs, but never on protected urgent or dedication speech paths. | §5 |
+| D15 | Target ±10-15 ms in the qualified harness; ordinary segue preserved. **Demonstrated in B0:** ±0.1 ms measured (B09). | §4, §9 |
