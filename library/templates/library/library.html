@@ -289,6 +289,9 @@
   <a href="{% url 'library:library-import' %}" class="lib-import-btn">+ Import Tracks</a>
   {% endif %}
 
+  <button type="button" class="lib-import-btn" id="exportCsvBtn" onclick="exportCsv()"
+          title="Download every track matching the current search, category and status filters (all pages) as a .csv file">Export to .csv</button>
+
   {% if not is_library_read_only %}
   <button type="button" class="lib-import-btn" id="autofillRelatedArtistsBtn" onclick="autofillRelatedArtists()">Auto-fill Related Artists</button>
   {% endif %}
@@ -516,6 +519,32 @@ function buildQuery() {
   params.set('page', currentPage);
   params.set('per_page', 50);
   return params.toString();
+}
+
+// Export to .csv: a normal browser download of EVERY track matching the filter controls and sort as they
+// are at this moment (not the current page, not the checkbox selection). A hidden anchor navigates to the
+// streaming endpoint; the server's Content-Disposition names the file and keeps the user on this page.
+function buildExportQuery() {
+  const params = new URLSearchParams();
+  const q = document.getElementById('searchInput').value.trim();
+  if (q) params.set('q', q);
+  const cat = document.getElementById('categoryFilter').value;
+  if (cat) params.set('category', cat);
+  const ready = document.getElementById('readyFilter').value;
+  if (ready) params.set('ready2air', ready);
+  params.set('sort', currentSort);
+  params.set('dir', currentDir);
+  return params.toString();
+}
+
+function exportCsv() {
+  const link = document.createElement('a');
+  link.href = '/api/tracks/export/?' + buildExportQuery();
+  link.download = '';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function currentFilter() {

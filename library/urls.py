@@ -47,6 +47,7 @@ urlpatterns = [
     path('api/playlists/<int:pk>/copy/', views.api_playlist_copy, name='api-playlist-copy'),
     path('api/playlists/<int:pk>/play-now/', views.api_playlist_play_now, name='api-playlist-play-now'),
     path('api/tracks/', views.api_track_list, name='api-track-list'),
+    path('api/tracks/export/', views.api_track_export, name='api-track-export'),
     path('api/tracks/bulk/', views.api_track_bulk, name='api-track-bulk'),
     path('api/tracks/bulk/preview/', views.api_track_bulk_edit_preview, name='api-track-bulk-edit-preview'),
     path('api/tracks/bulk/apply/', views.api_track_bulk_edit_apply, name='api-track-bulk-edit-apply'),

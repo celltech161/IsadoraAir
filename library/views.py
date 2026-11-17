@@ -10,7 +10,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
-from django.http import FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound
+from django.http import (FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound,
+                         StreamingHttpResponse)
 from django.http.request import RawPostDataException
 from django.shortcuts import render
 from django.urls import reverse
@@ -2186,6 +2187,50 @@ def api_track_list(request):
         "pages": paginator.num_pages,
         "per_page": per_page,
     })
+
+
+@require_http_methods(["GET"])
+def api_track_export(request):
+    """Download every Track matching the Library's current filters as a CSV.
+
+    Read-only and side-effect free. It takes the same search/category/ready2air/
+    sort/dir parameters as api_track_list and applies them through the very same
+    filter_tracks() and TRACK_SORT_FIELDS, but ignores page/per_page (and any
+    selection): the file holds ALL matches. Reachable exactly where
+    /api/tracks/ is (the GroupAccess prefix), so it exposes no Track or field
+    the account's Library list does not. See library/services/track_csv_export.py
+    for the column format, rounding, UTF-8 BOM and formula-injection guard.
+
+    Streams: rows come from QuerySet.iterator() in bounded chunks and the body
+    is yielded in bounded batches, so the whole Library is never in memory and
+    no export file is written to disk.
+    """
+    from library.services import track_csv_export as export
+
+    q = request.GET.get("q", "").strip()
+    cat_id = request.GET.get("category")
+    if cat_id and not cat_id.isdecimal():
+        return JsonResponse({"error": "category must be a Category id"}, status=400)
+    ready = request.GET.get("ready2air")
+    ready2air = True if ready == "true" else False if ready == "false" else None
+    qs = filter_tracks(Track.objects.all(), q=q, category_id=cat_id, ready2air=ready2air)
+
+    db_field = TRACK_SORT_FIELDS.get(request.GET.get("sort", "title"), "title")
+    if request.GET.get("dir", "asc") == "desc":
+        db_field = "-" + db_field
+    # "pk" is a deterministic tie-break only (ties are otherwise in arbitrary order, which could
+    # differ between two downloads); it never reorders rows the chosen sort already separates.
+    qs = qs.order_by(db_field, "pk")
+
+    rows = export.export_queryset(qs).iterator(chunk_size=export.ITERATOR_CHUNK_SIZE)
+    response = StreamingHttpResponse(export.stream_rows(rows), content_type="text/csv; charset=utf-8")
+    response["Content-Disposition"] = (
+        f'attachment; filename="isadoraair-library-{_station_local_today().isoformat()}.csv"')
+    response["Cache-Control"] = "no-store"
+    # Tell a buffering reverse proxy (nginx) to pass the stream through instead of spooling a
+    # large export to a temporary file.
+    response["X-Accel-Buffering"] = "no"
+    return response
 
 
 #: r0125: the direct bulk edits /api/tracks/bulk/ used to apply without review (now 410 Gone).
