@@ -103,6 +103,10 @@ CURRENT_TEMP_SCRIPT = str(BASE_DIR / "current_temp.py")
 # _run_alert_coordinator); the headline fingerprint above keeps driving
 # only the current_temp.py trigger.
 WX_WATCHWARN_FILE = DATA_DIR / "active_watches_warnings.json"
+# Outcome of the most recent NWS alerts fetch (r0145): evidence ONLY, so the Weather Health diagnostics can say
+# WHY a stale watch/warning snapshot is stale (the NWS API is failing) instead of just that it is. It never
+# influences what is announced. weather/diagnostics.py reads the same file name (a test pins the two together).
+NWS_ALERT_FETCH_STATUS_FILE = DATA_DIR / "nws_alert_fetch_status.json"
 WX_ALERT_SCRIPT = str(BASE_DIR / "wx_alert.py")
 # Covers the coordinator's own bounded lock wait plus one synthesis/publication.
 COORDINATOR_TIMEOUT_SECONDS = 330
@@ -1030,12 +1034,50 @@ def update_wx_alerts():
         _trigger_current_temp()
 
 
+def _record_alert_fetch(ok, status_code=None, error=None):
+    """Record the outcome of this cycle's NWS alerts fetch in NWS_ALERT_FETCH_STATUS_FILE.
+
+    Evidence for diagnostics only; it must never break or delay the alert cycle, so every failure here is
+    swallowed after a log line. `failing_since` is the first failed attempt of the current unbroken run of
+    failures (carried over from the previous record while it was also a failure), None once a fetch succeeds."""
+    try:
+        now = datetime.now(timezone.utc)
+        failing_since = None
+        if not ok:
+            failing_since = now.isoformat()
+            try:
+                with open(NWS_ALERT_FETCH_STATUS_FILE, "r") as f:
+                    previous = json.load(f)
+                if isinstance(previous, dict) and previous.get("ok") is False \
+                        and isinstance(previous.get("failing_since"), str):
+                    failing_since = previous["failing_since"]
+            except (OSError, ValueError):
+                pass
+        safe_write_json(NWS_ALERT_FETCH_STATUS_FILE, {
+            "ok": bool(ok),
+            "checked_at": now.isoformat(),
+            "status_code": status_code,
+            "error": (str(error)[:200] if error else None),
+            "failing_since": failing_since,
+        })
+    except Exception as e:  # evidence only
+        log.warning("Could not record the NWS alerts fetch outcome: %s", e)
+
+
 def _refresh_wx_alerts():
     """Returns True when the cleaned-headline fingerprint changed (after the
     first run), which only drives the current_temp.py trigger."""
+    snapshot_written = False
+    status_code = None
     try:
         r = session.get(ALERT_URL, timeout=10)
+        status_code = r.status_code
         if r.status_code != 200:
+            # A retrieval failure keeps the previous snapshot (it is not a cancellation); say so, and record it
+            # so Weather Health can explain the resulting stale snapshot.
+            log.warning("NWS alerts API returned HTTP %s; keeping the previous watch/warning snapshot.",
+                        r.status_code)
+            _record_alert_fetch(False, status_code=r.status_code, error=f"HTTP {r.status_code}")
             return False
         alerts = r.json().get("features", [])
 
@@ -1103,6 +1145,8 @@ def _refresh_wx_alerts():
         # content change.
         watchwarn_entries.sort(key=lambda e: (-_alert_severity(e), e.get("event") or "", e.get("key") or ""))
         safe_write_json(WX_WATCHWARN_FILE, watchwarn_entries)
+        snapshot_written = True
+        _record_alert_fetch(True, status_code=200)
 
         warn_text = ", ".join(all_alerts) + "\n" if all_alerts else ""
         safe_write_text(ALERT_DESCRIPTION, warn_text)
@@ -1130,6 +1174,8 @@ def _refresh_wx_alerts():
         return changed
     except Exception as e:
         log.error("Alert update error: %s", e)
+        if not snapshot_written:
+            _record_alert_fetch(False, status_code=status_code, error=f"{type(e).__name__}: {e}")
     return False
 
 # ---------------- RDS & PROCESSED WEATHER ----------------

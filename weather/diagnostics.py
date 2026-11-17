@@ -233,7 +233,8 @@ def get_weather_diagnostics(now=None, data_dir=None, library_root=None) -> Weath
     facts.append(_check_wind_history(data_dir / "wind_history.json", now))
     facts.append(_check_smoothed_wind(data_dir / "smoothed_wind.json", now))
     facts.append(_check_forecast_cache(data_dir / "wx_forecast_cache.json", now))
-    watch_fact = _check_watch_warnings(data_dir / "active_watches_warnings.json", now)
+    watch_fact = _check_watch_warnings(
+        data_dir / "active_watches_warnings.json", now, data_dir / NWS_ALERT_FETCH_STATUS_FILENAME)
     facts.append(watch_fact)
     amber_data_fact = _check_amber_alerts_data(amber_cfg, data_dir / "active_amber_alerts.json", now)
     facts.append(amber_data_fact)
@@ -714,7 +715,64 @@ def _check_forecast_cache(path: Path, now) -> DiagnosticFact:
     )
 
 
-def _check_watch_warnings(path: Path, now) -> DiagnosticFact:
+#: Written by weather_ingest/update_local_wx_data.py (NWS_ALERT_FETCH_STATUS_FILE; a test pins the two names).
+NWS_ALERT_FETCH_STATUS_FILENAME = "nws_alert_fetch_status.json"
+
+
+def _read_nws_alert_fetch_failure(path: Path, now) -> dict[str, Any] | None:
+    """The updater's record of a CURRENTLY failing NWS alerts fetch, or None.
+
+    Explanatory evidence only -- never a state input. It is returned only when the record parses, says the last
+    fetch failed (`ok` is False) and is itself fresh (written within CURRENT_DERIVED_FRESHNESS_SECONDS): a record
+    older than that means the updater has stopped reporting, which is plain staleness, not an NWS outage.
+    Anything missing, malformed or of the wrong type is ignored (never raises)."""
+    try:
+        record = json.loads(path.read_text())
+        if not isinstance(record, dict) or record.get("ok") is not False:
+            return None
+        checked_at = _parse_semantic_timestamp(record.get("checked_at"))
+        if checked_at is None or is_stale(_age_seconds(now, checked_at), CURRENT_DERIVED_FRESHNESS_SECONDS):
+            return None
+        failing_since = _parse_semantic_timestamp(record.get("failing_since")) or checked_at
+        status_code = record.get("status_code")
+        error = record.get("error")
+        return {
+            "status_code": status_code if isinstance(status_code, int) and not isinstance(status_code, bool) else None,
+            "error": error[:200] if isinstance(error, str) and error else None,
+            "checked_at": _iso(checked_at),
+            "failing_since": _iso(failing_since),
+            "failing_seconds": max(0.0, _age_seconds(now, failing_since)),
+        }
+    except Exception:
+        return None
+
+
+def _describe_nws_alert_fetch_failure(failure: dict[str, Any]) -> str:
+    minutes = failure["failing_seconds"] / 60.0
+    if failure["status_code"] not in (None, 200):
+        how = f"HTTP {failure['status_code']}"
+    else:
+        how = failure["error"] or "error"
+    return (f"The NWS alerts fetch has been failing for {minutes:.0f} min ({how}); the last snapshot is kept "
+            "until it succeeds.")
+
+
+def _check_watch_warnings(path: Path, now, fetch_status_path: Path | None = None) -> DiagnosticFact:
+    fact = _check_watch_warnings_snapshot(path, now)
+    if fact.state != "degraded" or fetch_status_path is None:
+        return fact
+    # The snapshot is missing or stale: if the updater is also recording failed NWS fetches, name that as the
+    # likely cause. The state itself is unchanged.
+    failure = _read_nws_alert_fetch_failure(fetch_status_path, now)
+    if failure is None:
+        return fact
+    return dataclasses.replace(
+        fact, summary=f"{fact.summary} {_describe_nws_alert_fetch_failure(failure)}",
+        evidence={**(fact.evidence or {}), "nws_alert_fetch": failure},
+    )
+
+
+def _check_watch_warnings_snapshot(path: Path, now) -> DiagnosticFact:
     key = "watch_warnings"
     data, error = _load_json_file(path)
     if error == "missing":

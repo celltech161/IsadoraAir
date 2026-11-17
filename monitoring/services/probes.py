@@ -921,17 +921,24 @@ def probe_weather(check):
 
     needs_attention = [f.key for f in snapshot.facts if f.state == "needs_attention"]
     degraded = [f.key for f in snapshot.facts if f.state == "degraded"]
+    # r0145: each fact's own one-line summary (e.g. "...stale... The NWS alerts fetch has been failing for 14 min
+    # (HTTP 503)"), so a Recent Events row / notification says WHY, not only which keys. `reason` and the *_keys
+    # lists are unchanged.
+    summaries = {f.key: f.summary for f in snapshot.facts if f.state in ("needs_attention", "degraded")}
 
     if needs_attention:
         return "critical", {
             "reason": f"{len(needs_attention)} Weather fact(s) need attention: {', '.join(needs_attention)}",
             "needs_attention_keys": needs_attention,
             "degraded_keys": degraded,
+            "needs_attention_details": {k: summaries[k] for k in needs_attention},
+            "degraded_details": {k: summaries[k] for k in degraded},
         }
     if degraded:
         return "warning", {
             "reason": f"{len(degraded)} Weather fact(s) degraded: {', '.join(degraded)}",
             "degraded_keys": degraded,
+            "degraded_details": {k: summaries[k] for k in degraded},
         }
     return "ok", {
         "reason": "all Weather facts ready, not_applicable, or optional_disabled",

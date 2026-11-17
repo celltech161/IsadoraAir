@@ -86,6 +86,32 @@ nothing is mixed over, ducked or interrupted, and the Weather Alert Beep is unch
 Already opened or airing audio is never touched: the deck keeps the file it opened (atomic rename; see
 `library/tests/test_wx_alert_gstreamer_single_file.py`).
 
+## Why a stale watch/warning snapshot is stale: NWS fetch status (r0145)
+
+When `api.weather.gov` fails (HTTP 5xx/4xx, a connection error, or an unreadable answer), the NWS poll keeps the
+previous `active_watches_warnings.json` (a retrieval failure is not a cancellation). After 15 minutes that snapshot is
+stale, so Weather Health reports `watch_warnings` and `generated_artifact:wx_alert` as degraded (a stale snapshot,
+even an empty one, is never read as "no active alert"). r0145 makes the cause visible; it changes no announcement
+logic and no state:
+
+* `update_local_wx_data.py` logs `NWS alerts API returned HTTP <code>; keeping the previous watch/warning snapshot.`
+  and records every fetch outcome in `WEATHER_DATA_DIR/nws_alert_fetch_status.json`:
+  `{"ok", "checked_at", "status_code", "error", "failing_since"}` (`failing_since` = first failure of the current
+  unbroken run; null after a success). The file is evidence only and is written with the rest of the cycle's
+  files; failing to write it never affects the cycle.
+* `weather/diagnostics.py` appends the cause to the `watch_warnings` summary only when that fact is already degraded
+  (snapshot missing or stale) AND the status record says the fetch is failing AND the record is itself fresh (written
+  within 15 minutes -- an older record means the updater stopped, which stays plain staleness): e.g. `... Stale: 19 min
+  old (freshness threshold 15 min). The NWS alerts fetch has been failing for 14 min (HTTP 503); the last snapshot is
+  kept until it succeeds.` The fact's evidence carries `nws_alert_fetch`. A fresh snapshot is never degraded by this
+  file.
+* The Weather Health probe (`monitoring.services.probes.probe_weather`) adds `degraded_details` (and, when critical,
+  `needs_attention_details`): each fact's own summary keyed by fact key. `reason` and `degraded_keys` /
+  `needs_attention_keys` are unchanged. Recent Events and notifications therefore show the cause when the row is
+  expanded.
+
+Not covered: `amber_poll.py` has its own failure handling and is unchanged.
+
 ## Known limitations
 
 * An occurrence carried into `_forced_next_items` from a previous hour's log is not restored after an engine crash or
