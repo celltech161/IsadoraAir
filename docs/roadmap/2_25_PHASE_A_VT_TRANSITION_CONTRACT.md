@@ -1,8 +1,9 @@
 # Roadmap 2.25: Evergreen Voice Track transition contract (approved) and Phase A engineering audit
 
-Status: **Phase A accepted (6ad5222). All fifteen operator decisions approved (Phase B0 workorder).
-Phase B0 timing feasibility complete; see `2_25_PHASE_B0_TIMING_FEASIBILITY.md`.** No production engine
-behaviour has changed. Production implementation (B1 onward) needs a separate engineering gate.
+Status: **Phase A accepted (6ad5222). B0 accepted (ced54ed). D1-D15 approved, with the B1-B2 workorder's
+D5, D10, D13 and N1 clarifications. B1-B2 infrastructure implemented, not connected to live transitions;
+see `2_25_PHASE_B1_B2_INFRASTRUCTURE.md`.** No live VT behaviour has changed. B3 and later need separate
+authorization.
 
 - Audited baseline: r0144, canonical `e4003aa7f075b940ec5680bf6864f08530ceed05`, tree
   `ca941ed15e937cbf0508f2b03aa6545fb39f8c01`. It is identical to `/opt/isadoraair` and canonical main at
@@ -137,7 +138,8 @@ S_v + V  ≤  A_I + W − M           speech always ends at least M before the v
 - With neither side eligible, nothing here applies. The **r0144 ordinary path runs unchanged**, and its
   segue lands +0.78 to 0.79 s after Next Start (R0; B0 E01).
 - A VT transition is **exact**. Its music lands at `A_seg` itself, not at r0144's late ordinary point.
-  See note N1 in the B0 report.
+- **N1 (approved):** VT transitions may land precisely at their planned segue boundary. Ordinary non-VT
+  transitions must preserve r0144 timing.
 
 **Admission (B0 result).** Each branch is admitted at its planned instant by a pad offset set before the
 branch starts:
@@ -583,14 +585,14 @@ The exact inventory is proved at release with the import-graph check.
 | D2 | A long intro VT starts first; the incoming music is delayed by `U` so the whole VT fits before Intro Until. | §4 |
 | D3 | An eligible outro VT running past the segue point may hold the incoming until speech ends, subject to bounded failure recovery, operator control and urgent priority. | §5, §7 |
 | D4 | An outro VT without a valid Outro Starts is suppressed, with a diagnostic reason. | §5 |
-| D5 | Start Next and manual deck starts bypass evergreen intro VTs. A deferred Manual-to-Auto handoff bypasses the immediate intro VT. Later automatic transitions are eligible. **Interpretation for review:** the replacement started by Eject counts as a manual start. | §5, §8 |
+| D5 | Start Next and manual deck starts bypass evergreen intro VTs. A deferred Manual-to-Auto handoff bypasses the immediate intro VT. Later automatic transitions are eligible. **Clarified (B1-B2 workorder):** a song started as a direct consequence of an operator Eject is an operator-initiated start, so it bypasses its intro VT. | §5, §8 |
 | D6 | A live mic suppresses pending VTs and fades active speech out in about 50 ms. | §8 |
 | D7 | Outro Starts at or beyond the ordinary segue boundary does not delay the transition. The outro VT is suppressed, with a reason. | §5 |
 | D8 | Start Next during a VT cancels the VT and honours operator intent, with no double advance and no skipped occurrence. | §8 |
 | D9 | Outgoing-deck Eject behaviour is preserved. Ejecting the incoming cancels its intro VT. | §8 |
-| D10 | With no valid Intro Until, the whole VT plays before the song. **Interpretation:** music follows `M` after the VT, i.e. `U = V + M`, the approved formula with `W = 0`. With an insufficient window, the underlap applies. iPortal's marker requirement is preserved. | §4, §5 |
+| D10 | **Clarified:** with no usable Intro Until window, the whole VT plays, then the 150 ms margin, then the song (`U = V + M`). With an insufficient window, the underlap applies. iPortal's marker requirement is preserved. | §4, §5 |
 | D11 | Fixed 150 ms vocal safety margin; no admin setting. | §4 |
 | D12 | The duck anticipates actual speech by the configured ramp, and releases at speech end or cancel. | §5 |
-| D13 | No intro VT replay on interrupted-occurrence resume. No outro VT replay for an occurrence. Suppress where delivery is uncertain. Achieved without a migration. | §5, §10 |
+| D13 | **Clarified:** suppress intro VT replay during interrupted-occurrence recovery. Suppress replay of previously aired **or uncertain** outro VTs for the resumed occurrence. Achieved without a migration. | §5, §10 |
 | D14 | Evergreen VTs may be used on promos and IDs, but never on protected urgent or dedication speech paths. | §5 |
 | D15 | Target ±10-15 ms in the qualified harness; ordinary segue preserved. **Demonstrated in B0:** ±0.1 ms measured (B09). | §4, §9 |
