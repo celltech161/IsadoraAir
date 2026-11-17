@@ -666,7 +666,7 @@ function renderSystemdBody(check) {
     ${workerLine(d)}
     <div class="mon-uptime-row">
       <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
-      ${restartable ? `<button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>` : ""}
+      ${restartable ? `<button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" data-unit="${escapeHtmlAttr(check.systemd_unit || "")}" onclick="restartService(this)">Restart</button>` : ""}
     </div>
     ${renderVersionBadge(check)}
   `;
@@ -748,11 +748,36 @@ async function restartService(btn) {
   const checkId = btn.dataset.checkId;
   const name = btn.dataset.checkName;
   if (!confirm(`Restart ${name}? This may briefly interrupt service.`)) return;
+  const post = async (body) => fetch(`/monitoring/api/restart/${checkId}/`, {
+    method: 'POST',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    body: body,
+  });
   try {
-    const resp = await fetch(`/monitoring/api/restart/${checkId}/`, {
-      method: 'POST',
-      headers: { 'X-CSRFToken': getCookie('csrftoken') },
-    });
+    let resp = await post(null);
+    if (resp.status === 409 || resp.status === 403) {
+      // Roadmap 1.20 (revised): the engine restart safeguard refused. The
+      // server states why; a superuser may override per request, with a reason.
+      let info = {};
+      try { info = await resp.json(); } catch (e) {}
+      const why = info.error || `Restart request for ${name} was refused.`;
+      if (!info.override_available || info.decision === 'override_forbidden') {
+        alert(why);
+        return;
+      }
+      const reason = prompt(`${why}\n\nTo override for this one restart, enter the reason (min 8 characters):`);
+      if (!reason) return;
+      const form = new URLSearchParams();
+      form.set('override', btn.dataset.unit || '');
+      form.set('reason', reason);
+      resp = await post(form);
+      if (!resp.ok) {
+        let again = {};
+        try { again = await resp.json(); } catch (e) {}
+        alert(again.error || `Restart request for ${name} failed.`);
+      }
+      return;
+    }
     if (!resp.ok) alert(`Restart request for ${name} failed.`);
   } catch (e) {
     alert(`Restart request for ${name} failed.`);

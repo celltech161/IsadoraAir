@@ -15,6 +15,8 @@ from hardware.models import (
 from monitoring.models import SystemEvent
 from updatecenter.backend_client import BackendError
 
+from library.tests.engine_restart_state_support import EngineStateFile
+
 
 def _audit_events():
     return [
@@ -30,6 +32,10 @@ def _plain_form():
 
 class AudioPipelineConfigurationAuditTests(TestCase):
     def setUp(self):
+        # Roadmap 1.20 (revised): a restart-triggering save needs a fresh,
+        # quiet engine status. These tests are about audit content, not the
+        # safeguard (see test_engine_restart_safety_1_20 for that).
+        EngineStateFile(self).write()
         self.pipeline = AudioPipeline.load()
         self.ducking = DuckingConfig.load()
         self.remote = RemoteDJAudioInput.load()

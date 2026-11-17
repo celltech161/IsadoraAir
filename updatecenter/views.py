@@ -16,6 +16,8 @@ from isadoraair.maintenance_lock import (
     database_rotation_is_pending,
 )
 
+from library.services import engine_restart_safety
+
 from . import manifest as manifest_mod, planner, release_chain
 from .backend_client import BackendError, PROTOCOL_VERSION, UpdaterClient
 from .job_service import JobSubmissionError, create_job, reconcile_job, submit_job
@@ -156,7 +158,13 @@ def _build_context(request):
     shown_job = active_job or UpdateJob.objects.first()
     readiness = _backend_readiness()
     blockers = _execution_blockers(request, plan, readiness, active_job)
+    # Roadmap 1.20 (revised): only a plan that restarts the engine consults the
+    # engine's status. Presentation only -- start_update re-assesses on POST.
+    engine_restart = None
+    if plan is not None and engine_restart_safety.plan_restarts_engine(plan):
+        engine_restart = engine_restart_safety.assess_engine_restart()
     return {
+        "engine_restart": engine_restart,
         "checkout": checkout,
         "plan": plan,
         "plan_error": plan_error,
@@ -191,6 +199,14 @@ def check_for_updates(request):
     return redirect("updatecenter:dashboard")
 
 
+def _record_override_outcome(request, admission, target, outcome, detail=None):
+    if admission is not None:
+        engine_restart_safety.record_restart_outcome(
+            request.user, admission, entry_point="update_center", target=target,
+            outcome=outcome, detail=detail,
+        )
+
+
 @require_http_methods(["POST"])
 def start_update(request):
     denied = _permission_check(request)
@@ -213,6 +229,33 @@ def start_update(request):
         messages.error(request, "Update is not eligible: " + " ".join(blockers))
         return redirect("updatecenter:dashboard")
 
+    # Roadmap 1.20 (revised): the engine restart safeguard, decided against the
+    # FRESH trusted plan (already matched to the confirmed release + fingerprint
+    # above) and a fresh engine-status read, immediately before any job is
+    # created. A Gunicorn-only plan never reaches this and reads no engine state.
+    admission = None
+    safety_target = None
+    if engine_restart_safety.plan_restarts_engine(fresh_plan):
+        safety_target = {
+            "release": fresh_plan.target_release_id,
+            "plan_fingerprint": fresh_plan.fingerprint,
+            "services_requiring_restart": list(fresh_plan.services_requiring_restart),
+        }
+        admission = engine_restart_safety.admit_engine_restart(
+            request.user,
+            entry_point="update_center",
+            target=safety_target,
+            # The override value names the release being installed: it cannot
+            # be carried over from a page for a different target.
+            override_requested=(
+                request.POST.get("engine_restart_override") == fresh_plan.target_release_id
+            ),
+            reason=request.POST.get("engine_restart_override_reason", ""),
+        )
+        if not admission.allowed:
+            messages.error(request, admission.message)
+            return redirect("updatecenter:dashboard")
+
     try:
         # Shared with backup; exclusive to credential rotation. Holding this
         # through durable root submission closes the admission race: a job
@@ -224,11 +267,19 @@ def start_update(request):
             job = create_job(plan=fresh_plan, user=request.user)
             outcome = submit_job(job)
     except MaintenanceLockError:
+        _record_override_outcome(request, admission, safety_target, "not_submitted_maintenance_lock")
         messages.error(request, "Database credential maintenance is active; retry after it completes.")
         return redirect("updatecenter:dashboard")
     except JobSubmissionError as exc:
+        _record_override_outcome(request, admission, safety_target, "broker_rejected",
+                                 {"error": str(exc)[:200]})
         messages.error(request, f"Protected updater rejected the job: {str(exc)[:300]}")
         return redirect("updatecenter:dashboard")
+    _record_override_outcome(
+        request, admission, safety_target,
+        "submission_uncertain" if outcome.get("submission_uncertain") else "submitted",
+        {"job_id": str(job.id)},
+    )
     if outcome.get("submission_uncertain"):
         messages.warning(
             request,

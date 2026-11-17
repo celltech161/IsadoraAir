@@ -16,6 +16,7 @@ from django.urls import reverse
 
 from authz.models import Capability, GroupRole, Role, RoleCapability
 from library.models import GroupAccess
+from library.tests.engine_restart_state_support import EngineStateFile
 from monitoring.models import MonitorCheck
 
 
@@ -28,6 +29,10 @@ def make_systemd_check(name="isadoraair-engine.service"):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class RestartCheckAuthorizationTests(TestCase):
     def setUp(self):
+        # Roadmap 1.20 (revised): the unit under test is the engine, so these
+        # authorization tests need a fresh, quiet engine status to reach the
+        # broker. The safeguard itself is covered in test_engine_restart_safety_1_20.
+        EngineStateFile(self).write()
         self.check = make_systemd_check()
         self.url = reverse("monitoring:api-restart-check", args=[self.check.pk])
 

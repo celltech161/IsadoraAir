@@ -13,6 +13,7 @@ from django.test import Client, RequestFactory, SimpleTestCase, TestCase, overri
 from django.urls import reverse
 
 from library.models import NavMenuItem
+from library.tests.engine_restart_state_support import EngineStateFile
 from hardware.admin import AudioPipelineAdmin, _alsa_store
 from hardware.models import AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import MonitorCheck
@@ -504,6 +505,7 @@ class PrivilegeCleanupStaticTests(SimpleTestCase):
 
 class HardwareBrokerTests(TestCase):
     def setUp(self):
+        EngineStateFile(self).write()  # roadmap 1.20 (revised): fresh, quiet engine status
         self.model_admin = AudioPipelineAdmin(AudioPipeline, django_admin.AdminSite())
         self.pipeline = AudioPipeline.load()
 
@@ -554,6 +556,7 @@ class HardwareBrokerTests(TestCase):
 @override_settings(SECURE_SSL_REDIRECT=False)
 class MonitoringBrokerTests(TestCase):
     def setUp(self):
+        EngineStateFile(self).write()  # roadmap 1.20 (revised): fresh, quiet engine status
         self.staff = User.objects.create_user("monitor-c", is_staff=True)
         self.client = Client(); self.client.force_login(self.staff)
 

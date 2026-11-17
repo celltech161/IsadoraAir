@@ -3,6 +3,7 @@ import subprocess
 
 from django import forms
 from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
@@ -14,6 +15,7 @@ from .devices import (
 )
 from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import emit_event
+from library.services import engine_restart_safety
 from monitoring.services.config_audit import emit_config_change_event
 from updatecenter.backend_client import BackendError, UpdaterClient
 
@@ -38,6 +40,13 @@ _PIPELINE_APPLY_MODES = {
     "ptt_auto_manual_enabled": "next_ptt_transition",
     "remote_dj_gain_db": "next_remote_dj_session",
 }
+
+# The Audio Pipeline fields whose save restarts the engine (see save_model).
+_RESTART_PIPELINE_FIELDS = frozenset({"sample_rate", "program_gain_db"})
+
+
+def _pipeline_restart_target(restart_fields):
+    return {"unit": "isadoraair-engine.service", "changed_fields": sorted(restart_fields)}
 _AUDIO_INPUT_AUDIT_FIELDS = (
     "name",
     "device",
@@ -485,12 +494,30 @@ class AudioPipelineForm(forms.ModelForm):
                   "Remote DJ connect.",
     )
 
+    # Roadmap 1.20 (revised): explicit, per-save, superuser-only override of the
+    # engine restart safeguard. Never persisted; never a model field.
+    engine_restart_override = forms.BooleanField(
+        required=False,
+        label="Override the engine restart safeguard (superuser)",
+        help_text="Only needed when this save restarts the engine while a microphone "
+                  "or Remote DJ connection is live, or the engine status is "
+                  "unavailable. Applies to this save only.",
+    )
+    engine_restart_override_reason = forms.CharField(
+        required=False, max_length=engine_restart_safety.OVERRIDE_REASON_MAX_LENGTH,
+        label="Override reason",
+        help_text="Required with the override; recorded in the audit trail.",
+    )
+
     class Meta:
         model = AudioPipeline
         fields = [
             "sample_rate", "program_gain_db", "vu_meter_min_db",
             "audio_gap_diagnostics_enabled",
         ]
+
+    # Set by AudioPipelineAdmin.get_form so clean() can see the acting user.
+    request = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -499,6 +526,26 @@ class AudioPipelineForm(forms.ModelForm):
         self.fields["duck_level_db"].initial = ducking.duck_level_db
         self.fields["ptt_auto_manual_enabled"].initial = ducking.ptt_auto_manual_enabled
         self.fields["remote_dj_gain_db"].initial = RemoteDJAudioInput.load().gain_db
+
+    def clean(self):
+        cleaned = super().clean()
+        # Reject a blocked restart-triggering save BEFORE any configuration is
+        # written. save_model() repeats this decision with a fresh assessment
+        # immediately before writing, so a state change between validation and
+        # save is still refused.
+        restarting = _RESTART_PIPELINE_FIELDS & set(self.changed_data)
+        if restarting and not self.errors:
+            admission = engine_restart_safety.admit_engine_restart(
+                getattr(self.request, "user", None), entry_point="audio_pipeline",
+                target=_pipeline_restart_target(restarting),
+                override_requested=bool(cleaned.get("engine_restart_override")),
+                reason=cleaned.get("engine_restart_override_reason", ""),
+                # An authorized override is recorded once, by save_model.
+                audit_override=False,
+            )
+            if not admission.allowed:
+                raise forms.ValidationError(admission.message)
+        return cleaned
 
 
 @admin.register(AudioPipeline)
@@ -533,6 +580,15 @@ class AudioPipelineAdmin(admin.ModelAdmin):
             "fields": ("ducking_enabled", "duck_level_db"),
             "description": "Read fresh by the engine on each PTT toggle -- no restart needed.",
         }),
+        ("Engine restart safeguard", {
+            "fields": ("engine_restart_override", "engine_restart_override_reason"),
+            "description": (
+                "Saving a changed sample rate or program gain restarts the engine. "
+                "That is refused while a microphone or Remote DJ connection is "
+                "live, or while the engine status is unavailable or stale. Only a "
+                "superuser may override, for this save only, with a written reason."
+            ),
+        }),
         ("Remote DJ mic input", {
             "fields": ("remote_dj_gain_db",),
             "description": "Read at session start -- takes effect on the next Remote DJ connect. No restart needed.",
@@ -541,6 +597,12 @@ class AudioPipelineAdmin(admin.ModelAdmin):
 
     class Media:
         js = ["hardware/js/audio_pipeline_confirm.js"]
+
+    def get_form(self, request, obj=None, **kwargs):
+        form_class = super().get_form(request, obj, **kwargs)
+        # Bind the acting request so clean() can apply the restart safeguard
+        # (and the superuser-only override) before anything is saved.
+        return type(form_class.__name__, (form_class,), {"request": request})
 
     def has_add_permission(self, request):
         return not AudioPipeline.objects.exists()
@@ -555,6 +617,24 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         )
 
     def save_model(self, request, obj, form, change):
+        # Roadmap 1.20 (revised): the authoritative restart-safeguard decision,
+        # made with a FRESH assessment before any configuration is written, so a
+        # blocked save modifies nothing even if the engine state changed after
+        # form validation.
+        restart_fields = _RESTART_PIPELINE_FIELDS & set(form.changed_data)
+        admission = None
+        restart_target = _pipeline_restart_target(restart_fields)
+        if restart_fields:
+            admission = engine_restart_safety.admit_engine_restart(
+                getattr(request, "user", None), entry_point="audio_pipeline",
+                target=restart_target,
+                override_requested=bool(form.cleaned_data.get("engine_restart_override")),
+                reason=form.cleaned_data.get("engine_restart_override_reason", ""),
+            )
+            if not admission.allowed:
+                if request is not None:
+                    messages.error(request, admission.message)
+                raise PermissionDenied(admission.message)
         old_pipeline = AudioPipeline.objects.filter(pk=obj.pk).values(
             "sample_rate", "program_gain_db", "audio_gap_diagnostics_enabled"
         ).first() if obj.pk else None
@@ -654,10 +734,19 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         # Only restart the engine if a field that actually requires it
         # changed -- Ducking is read live per PTT, Remote DJ gain per
         # session start, neither needs a rebuild.
-        restart_fields = {"sample_rate", "program_gain_db"}
-        if restart_fields & set(form.changed_data):
+        # (restart_fields was decided, and admitted, at the top of save_model;
+        # this is the single restart request for the save.)
+        if restart_fields:
             try:
                 result = UpdaterClient().restart_operator_service("isadoraair-engine.service")
+                if admission is not None:
+                    engine_restart_safety.record_restart_outcome(
+                        getattr(request, "user", None), admission,
+                        entry_point="audio_pipeline", target=restart_target,
+                        outcome="submitted",
+                        detail={"operation_id": str(result.get("operation_id", ""))[:36],
+                                "state": str(result.get("state"))[:32]},
+                    )
                 if result.get("state") in {"accepted", "running"}:
                     operation_id = str(result.get("operation_id", ""))[:36]
                     if request is not None:
@@ -672,6 +761,12 @@ class AudioPipelineAdmin(admin.ModelAdmin):
                         dedupe_key="hardware|protected_engine_restart_pending",
                     )
             except BackendError as exc:
+                if admission is not None:
+                    engine_restart_safety.record_restart_outcome(
+                        getattr(request, "user", None), admission,
+                        entry_point="audio_pipeline", target=restart_target,
+                        outcome="broker_rejected", detail={"error": str(exc)[:200]},
+                    )
                 if request is not None:
                     messages.error(
                         request,

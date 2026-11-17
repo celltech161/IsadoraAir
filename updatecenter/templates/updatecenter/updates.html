@@ -208,6 +208,21 @@
       {% csrf_token %}
       <input type="hidden" name="confirmed_target_release_id" value="{{ plan.target_release_id }}">
       <input type="hidden" name="confirmed_plan_fingerprint" value="{{ plan.fingerprint }}">
+      {% if engine_restart %}
+      <div id="uc-engine-restart-safety" class="uc-note" data-level="{{ engine_restart.level }}">
+        <strong>Audio engine restart: {{ engine_restart.level|title }}.</strong>
+        {{ engine_restart.summary }}
+        {% if engine_restart.requires_override %}
+          <br>The install will be refused unless a superuser overrides it for this install
+          (the check is repeated when you confirm).
+          {% if request.user.is_superuser %}
+          <label><input type="checkbox" name="engine_restart_override" value="{{ plan.target_release_id }}">
+            Override for {{ plan.target_release_id }} only</label>
+          <label>Reason <input type="text" name="engine_restart_override_reason" maxlength="500" autocomplete="off"></label>
+          {% endif %}
+        {% endif %}
+      </div>
+      {% endif %}
       <button class="uc-btn" type="submit">Install {{ plan.target_release_id }}</button>
     </form>
     <p class="uc-note">The installation plan is verified again after confirmation. Service interruption is expected; automatic rollback is not available.</p>

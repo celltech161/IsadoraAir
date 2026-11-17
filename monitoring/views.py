@@ -16,6 +16,7 @@ from .models import ListenerPeak, MonitorCheck, SystemEvent, emit_event
 from .services import self_health
 from .services.release_status import get_release_status
 from updatecenter.backend_client import BackendError, UpdaterClient
+from library.services import engine_restart_safety
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
@@ -119,6 +120,32 @@ def api_restart_check(request, check_id):
     check = get_object_or_404(MonitorCheck, pk=check_id, kind="systemd")
     if not check.systemd_unit:
         return JsonResponse({"error": "No systemd unit configured for this check"}, status=400)
+    # Roadmap 1.20 (revised): ONLY the engine's own unit is gated; every other
+    # service's restart behaviour is unchanged. Assessed immediately before the
+    # broker request so the judgment is the engine state at this moment.
+    admission = None
+    safety_target = {"unit": check.systemd_unit, "check_id": check.pk}
+    if engine_restart_safety.is_engine_service(check.systemd_unit):
+        # The override must name THIS unit: a form field/value cannot be reused
+        # for another service or carried over from an earlier request.
+        override_requested = request.POST.get("override") == check.systemd_unit
+        admission = engine_restart_safety.admit_engine_restart(
+            request.user,
+            entry_point="monitoring",
+            target=safety_target,
+            override_requested=override_requested,
+            reason=request.POST.get("reason", ""),
+        )
+        if not admission.allowed:
+            status = 403 if admission.code == engine_restart_safety.OVERRIDE_FORBIDDEN else 409
+            return JsonResponse({
+                "ok": False,
+                "error": admission.message,
+                "restart_safety": admission.assessment.as_public_dict(),
+                "decision": admission.code,
+                # UX hint only; the server re-decides on every request.
+                "override_available": bool(request.user.is_superuser),
+            }, status=status)
     try:
         result = UpdaterClient().restart_operator_service(check.systemd_unit)
     except BackendError as exc:
@@ -129,9 +156,20 @@ def api_restart_check(request, check_id):
             detail={"check_id": check.pk, "unit": check.systemd_unit, "error": str(exc)[:500]},
             dedupe_key=f"monitoring|protected_restart_failed|{check.pk}",
         )
+        if admission is not None:
+            engine_restart_safety.record_restart_outcome(
+                request.user, admission, entry_point="monitoring", target=safety_target,
+                outcome="broker_rejected", detail={"error": str(exc)[:200]},
+            )
         return JsonResponse(
             {"ok": False, "error": "Protected restart broker unavailable or request rejected"},
             status=503,
+        )
+    if admission is not None:
+        engine_restart_safety.record_restart_outcome(
+            request.user, admission, entry_point="monitoring", target=safety_target,
+            outcome="submitted",
+            detail={"operation_id": str(result.get("operation_id"))[:36], "state": str(result.get("state"))[:32]},
         )
     return JsonResponse({
         "ok": True,
