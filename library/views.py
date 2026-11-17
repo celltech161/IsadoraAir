@@ -44,7 +44,7 @@ from .services.related_artists import (
     autofill_related_artists_for_queryset, canonicalize_related_artists,
     format_related_artists, resolve_fallback_metadata,
 )
-from .services.track_filters import filter_tracks
+from .services.track_filters import count_distinct_artists, filter_tracks
 from .services.schedule_resolution import (
     detail_counts_for_date, effective_segments, load_hour_rows,
     load_weekly_hour_rows, minute_map,
@@ -2146,6 +2146,9 @@ def api_track_list(request):
     # track_filters.filter_tracks's docstring for exactly what "+" and
     # category_id mean here.
     qs = filter_tracks(qs, q=q, category_id=cat_id, ready2air=ready2air)
+    # Distinct Artists across ALL Tracks matching these same filters (not just
+    # this page), from the very queryset the Track total below is counted on.
+    artist_total = count_distinct_artists(qs)
 
     sort_field = request.GET.get("sort", "title")
     sort_dir = request.GET.get("dir", "asc")
@@ -2178,6 +2181,7 @@ def api_track_list(request):
     return JsonResponse({
         "items": items,
         "total": paginator.count,
+        "artist_total": artist_total,
         "page": page.number,
         "pages": paginator.num_pages,
         "per_page": per_page,

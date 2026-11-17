@@ -1077,6 +1077,14 @@ function bulkApply() {
   runPreview(changes, null);
 }
 
+function libraryCountsLabel(total, artistTotal) {
+  let label = total.toLocaleString() + ' tracks';
+  if (Number.isInteger(artistTotal)) {
+    label += ' \u00b7 ' + artistTotal.toLocaleString() + (artistTotal === 1 ? ' artist' : ' artists');
+  }
+  return label;
+}
+
 async function loadTracks() {
   const resp = await fetch('/api/tracks/?' + buildQuery());
   if (!resp.ok) return;
@@ -1088,8 +1096,10 @@ async function loadTracks() {
   lastTotal = data.total;
   if (filterSelection) filterSelection.total = data.total;
 
+  // Track and unique-Artist totals come from the SAME response (one filter,
+  // one request), so they always change together.
   const stats = document.getElementById('stats');
-  stats.textContent = data.total.toLocaleString() + ' tracks';
+  stats.textContent = libraryCountsLabel(data.total, data.artist_total);
 
   const body = document.getElementById('trackBody');
   const empty = document.getElementById('emptyMsg');

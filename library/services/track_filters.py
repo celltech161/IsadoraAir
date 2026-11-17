@@ -47,3 +47,28 @@ def filter_tracks(qs, q="", category_id=None, ready2air=None):
         qs = qs.filter(ready2air=ready2air)
 
     return qs
+
+
+def count_distinct_artists(qs):
+    """Number of distinct Artist records represented by the Tracks in `qs`.
+
+    `qs` must be the queryset ALREADY narrowed by filter_tracks(), so this
+    count and the Track count (the paginator's count over the very same
+    queryset) can never disagree about which Tracks match. It counts across
+    every matching Track -- never just one page.
+
+    Null Artist references are excluded (Track.artist is currently NOT NULL,
+    so this is a guard, not a behaviour change: a Track without an Artist
+    contributes no Artist, matching the "" the page already shows for it).
+
+    One SELECT COUNT(*) over SELECT DISTINCT artist_id: no join (select_related
+    and any caller ordering are discarded; the category filter's own join
+    duplicates collapse under DISTINCT), nothing materialised in Python.
+    """
+    return (
+        qs.order_by()
+        .filter(artist__isnull=False)
+        .values("artist_id")
+        .distinct()
+        .count()
+    )
