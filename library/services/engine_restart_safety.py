@@ -71,6 +71,7 @@ STATUS_MALFORMED = "status_malformed"
 STATUS_STALE = "status_stale"
 STATUS_FUTURE = "status_timestamp_in_future"
 STATUS_UNSUPPORTED = "status_unsupported"
+STATUS_CONTRADICTORY = "status_contradictory"
 
 _REASON_TEXT = {
     STUDIO_MIC_LIVE: "The studio microphone is live.",
@@ -91,6 +92,7 @@ _REASON_TEXT = {
     STATUS_STALE: "The engine status is stale, so it is not evidence of a safe state.",
     STATUS_FUTURE: "The engine status timestamp is in the future.",
     STATUS_UNSUPPORTED: "The engine status does not carry the fields needed to judge a restart.",
+    STATUS_CONTRADICTORY: "The engine status contradicts itself, so it is not evidence of a safe state.",
 }
 
 _BLOCKING_REASONS = (
@@ -106,11 +108,22 @@ _KNOWN_SLOT_STATES = frozenset({"available", "cleaning", "quarantined", "occupie
 _KNOWN_ATTEMPT_STATUSES = frozenset({"connecting", "connected", "reconnecting", "failed", "ended"})
 _LIVE_ATTEMPT_STATUSES = frozenset({"connecting", "connected", "reconnecting"})
 
+# Transport values PlaybackEngine._write_state publishes ("PLAYING" on every
+# tick, "STOPPED" once at shutdown). Anything else is an engine this module
+# does not understand.
+_KNOWN_TRANSPORTS = frozenset({"PLAYING", "STOPPED"})
+
 # Booleans an engine that can be judged MUST publish.
 _REQUIRED_BOOLEANS = (
-    "mic_live", "remote_dj_connected", "remote_dj_live",
+    "mic_live", "remote_dj_configured", "remote_dj_connected", "remote_dj_live",
     "remote_dj_reconnecting", "manual_mode",
 )
+# Remote DJ lifecycle keys every supported engine publishes on every tick
+# (r0132+ slot, 1.5 attempt evidence). The VALUE may be null, but the KEY
+# must be there: a missing key is an engine (or writer) we cannot judge.
+_REQUIRED_LIFECYCLE_KEYS = ("remote_dj_slot", "remote_dj_connection")
+
+_IDENTITY_MAX_LENGTH = 64
 
 OVERRIDE_REASON_MIN_LENGTH = 8
 OVERRIDE_REASON_MAX_LENGTH = 500
@@ -199,39 +212,52 @@ def assess_engine_restart(*, now: float | None = None, path: Path | None = None)
         return _unknown(STATUS_MALFORMED)
     current = time.time() if now is None else now
     age = current - timestamp
+    identity = dict(observed_at=float(timestamp), age_seconds=round(age, 2))
+
+    # Engine-instance identity is REQUIRED and must be self-consistent: every
+    # supported engine stamps engine_session_id and state_revision =
+    # {"instance": <that same id>, "seq": <positive, increasing int>} on every
+    # write. Without it the snapshot cannot be tied to the running engine.
     instance = state.get("engine_session_id")
-    instance = instance if isinstance(instance, str) and 0 < len(instance) <= 64 else None
     revision = state.get("state_revision")
-    revision_out = None
-    if isinstance(revision, dict):
-        rev_instance, rev_seq = revision.get("instance"), revision.get("seq")
-        revision_out = {
-            "instance": rev_instance if isinstance(rev_instance, str) and len(rev_instance) <= 64 else None,
-            "seq": rev_seq if isinstance(rev_seq, int) and not isinstance(rev_seq, bool) else None,
-        }
-    identity = dict(
-        engine_instance=instance, state_revision=revision_out,
-        observed_at=float(timestamp), age_seconds=round(age, 2),
-    )
+    if "engine_session_id" not in state or "state_revision" not in state:
+        return _unknown(STATUS_UNSUPPORTED, **identity)
+    if not (isinstance(instance, str) and 0 < len(instance) <= _IDENTITY_MAX_LENGTH):
+        return _unknown(STATUS_MALFORMED, **identity)
+    identity["engine_instance"] = instance
+    if not isinstance(revision, dict):
+        return _unknown(STATUS_MALFORMED, **identity)
+    rev_instance, rev_seq = revision.get("instance"), revision.get("seq")
+    if not (isinstance(rev_seq, int) and not isinstance(rev_seq, bool) and rev_seq > 0):
+        return _unknown(STATUS_MALFORMED, **identity)
+    if not isinstance(rev_instance, str):
+        return _unknown(STATUS_MALFORMED, **identity)
+    if rev_instance != instance:
+        return _unknown(STATUS_CONTRADICTORY, **identity)
+    identity["state_revision"] = {"instance": rev_instance, "seq": rev_seq}
+
     if age > ENGINE_STATE_MAX_AGE_SECONDS:
         return _unknown(STATUS_STALE, **identity)
     if age < -ENGINE_STATE_MAX_FUTURE_SECONDS:
         return _unknown(STATUS_FUTURE, **identity)
 
-    if not isinstance(state.get("transport"), str):
+    if "transport" not in state:
+        return _unknown(STATUS_UNSUPPORTED, **identity)
+    if not isinstance(state["transport"], str) or state["transport"] not in _KNOWN_TRANSPORTS:
         return _unknown(STATUS_UNSUPPORTED, **identity)
     for key in _REQUIRED_BOOLEANS:
         if key not in state:
             return _unknown(STATUS_UNSUPPORTED, **identity)
         if not isinstance(state[key], bool):
             return _unknown(STATUS_MALFORMED, **identity)
+    for key in _REQUIRED_LIFECYCLE_KEYS:
+        if key not in state:
+            return _unknown(STATUS_UNSUPPORTED, **identity)
 
-    # Optional-but-validated: an engine older than these fields simply lacks
-    # them, but a PRESENT value of the wrong shape is malformed, not "fine".
-    slot = state.get("remote_dj_slot")
+    slot = state["remote_dj_slot"]
     if slot is not None and slot not in _KNOWN_SLOT_STATES:
         return _unknown(STATUS_MALFORMED, **identity)
-    connection = state.get("remote_dj_connection")
+    connection = state["remote_dj_connection"]
     attempt_status = None
     if connection is not None:
         if not isinstance(connection, dict):
@@ -239,6 +265,16 @@ def assess_engine_restart(*, now: float | None = None, path: Path | None = None)
         attempt_status = connection.get("status")
         if attempt_status not in _KNOWN_ATTEMPT_STATUSES:
             return _unknown(STATUS_MALFORMED, **identity)
+
+    # Cross-field consistency (PlaybackEngine._write_state): the slot is null
+    # exactly when Remote DJ is not built into this engine run, and an engine
+    # without Remote DJ can have no session, attempt, live gate or recovery.
+    if state["remote_dj_configured"]:
+        if slot is None:
+            return _unknown(STATUS_CONTRADICTORY, **identity)
+    elif (slot is not None or connection is not None or state["remote_dj_connected"]
+            or state["remote_dj_live"] or state["remote_dj_reconnecting"]):
+        return _unknown(STATUS_CONTRADICTORY, **identity)
 
     reasons = []
     if state["mic_live"]:
@@ -271,7 +307,8 @@ def assess_engine_restart(*, now: float | None = None, path: Path | None = None)
     else:
         level = SAFE
     facts = {
-        "transport": state["transport"][:32],
+        "transport": state["transport"],
+        "remote_dj_configured": state["remote_dj_configured"],
         "mic_live": state["mic_live"],
         "remote_dj_connected": state["remote_dj_connected"],
         "remote_dj_live": state["remote_dj_live"],

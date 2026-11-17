@@ -161,7 +161,7 @@ class AssessmentTests(SimpleTestCase):
         self.assertEqual(safety.assess_engine_restart().level, safety.UNKNOWN)
 
     def test_missing_required_fields_are_unsupported_not_safe(self):
-        for key in ("mic_live", "remote_dj_connected", "remote_dj_live",
+        for key in ("mic_live", "remote_dj_configured", "remote_dj_connected", "remote_dj_live",
                     "remote_dj_reconnecting", "manual_mode", "transport"):
             with self.subTest(missing=key):
                 state = engine_state()
@@ -172,7 +172,7 @@ class AssessmentTests(SimpleTestCase):
                 self.assertEqual(result.reasons, (safety.STATUS_UNSUPPORTED,))
 
     def test_wrongly_typed_booleans_are_malformed_not_coerced(self):
-        for key in ("mic_live", "remote_dj_connected", "remote_dj_live",
+        for key in ("mic_live", "remote_dj_configured", "remote_dj_connected", "remote_dj_live",
                     "remote_dj_reconnecting", "manual_mode"):
             for bad in ("false", 0, 1, None, "", []):
                 with self.subTest(key=key, bad=bad):
@@ -194,15 +194,20 @@ class AssessmentTests(SimpleTestCase):
             with self.subTest(overrides=overrides):
                 self.assertEqual(self.assess(**overrides).level, safety.UNKNOWN)
 
-    def test_older_engine_without_slot_and_connection_fields_is_judged_on_core_fields(self):
-        state = engine_state()
-        del state["remote_dj_slot"]
-        del state["remote_dj_connection"]
-        self.state_file.write(state)
-        self.assertEqual(safety.assess_engine_restart().level, safety.SAFE)
-        state["remote_dj_connected"] = True
-        self.state_file.write(state)
-        self.assertEqual(safety.assess_engine_restart().level, safety.BLOCKED)
+    def test_engine_without_slot_or_connection_fields_is_unsupported_not_safe(self):
+        # Codex P1 (independent review of 9e70035): every supported producer
+        # publishes both lifecycle keys on every tick, so a missing key is
+        # not "an older engine" to be judged on the core booleans.
+        for missing in (("remote_dj_slot",), ("remote_dj_connection",),
+                        ("remote_dj_slot", "remote_dj_connection")):
+            with self.subTest(missing=missing):
+                state = engine_state()
+                for key in missing:
+                    del state[key]
+                self.state_file.write(state)
+                result = safety.assess_engine_restart()
+                self.assertEqual(result.level, safety.UNKNOWN)
+                self.assertEqual(result.reasons, (safety.STATUS_UNSUPPORTED,))
 
     # ---- no secrets
     def test_audit_and_public_views_never_carry_session_secrets(self):

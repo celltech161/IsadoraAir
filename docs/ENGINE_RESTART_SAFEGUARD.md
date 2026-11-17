@@ -25,14 +25,24 @@ Reads `/run/isadoraair/engine_state.json` (read-only). `level` is one of:
   mic Off); reconnecting; an attempt in `connecting/connected/reconnecting` while the
   engine has not published the session (establishing); slot `occupied` or `cleaning`.
 * **unknown** – missing, unreadable, non-JSON/non-object, stale (> 10 s), timestamp in the
-  future (> 5 s), missing/mistyped required fields (`transport` and the booleans
-  `mic_live`, `remote_dj_connected`, `remote_dj_live`, `remote_dj_reconnecting`,
-  `manual_mode`), or an unrecognised `remote_dj_slot` / `remote_dj_connection.status`.
+  future (> 5 s), or any incomplete, unsupported or contradictory snapshot:
+  * engine identity missing or malformed: `engine_session_id` must be a non-empty string
+    (≤ 64 chars) and `state_revision` must be `{"instance": <the same id>, "seq": <int ≥ 1>}`;
+    a revision from a different instance is contradictory;
+  * `transport` other than the two values the engine writes, `PLAYING` and `STOPPED`;
+  * a missing or mistyped boolean `mic_live`, `remote_dj_configured`, `remote_dj_connected`,
+    `remote_dj_live`, `remote_dj_reconnecting` or `manual_mode`;
+  * a missing `remote_dj_slot` or `remote_dj_connection` key (the value may be null, but
+    every supported engine publishes both keys on every tick), or an unrecognised slot or
+    attempt status;
+  * Remote DJ configured with a null slot, or Remote DJ not configured with any slot,
+    attempt, connection, live gate or reconnect reported.
+
   Unknown is never "safe" and a stale block is also just unknown.
 
-`blocked` and `unknown` require the override. The result carries the engine instance
-(`engine_session_id`, `state_revision`) and observation time; it never copies the Remote DJ
-owner block, attempt ids, tokens or signaling data.
+`blocked` and `unknown` require the override. The result carries the validated engine
+instance (`engine_session_id`, `state_revision`) and observation time; it never copies the
+Remote DJ owner block, attempt ids, tokens or signaling data.
 
 ## Override contract
 
