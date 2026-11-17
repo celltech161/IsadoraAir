@@ -75,6 +75,8 @@ from library.services import wx_alert_playout
 from library.services import deck_fade
 from library.services import start_next_identity
 from library.services import remote_dj_gate_identity
+from library.services import vt_audio
+from library.services import vt_transition
 from library.services import remote_dj_admin_identity
 from library.services.hour_refill_causality import (
     automatic_skip_evidence_from_engine,
@@ -1273,6 +1275,9 @@ def _require_deck_open_authority(method):
         *, continuation_reason_override=None,
         continuation_start_on_first_real=False,
         before_sync=None,
+        scheduled_admission_ns=None,
+        on_scheduled_event=None,
+        reopen=False,
     ):
         # This shared authority scope lasts until the filesrc-backed bin is
         # synchronized with its parent.  An exclusive promotion cannot commit
@@ -1289,6 +1294,9 @@ def _require_deck_open_authority(method):
                 continuation_reason_override=continuation_reason_override,
                 continuation_start_on_first_real=continuation_start_on_first_real,
                 before_sync=before_sync,
+                scheduled_admission_ns=scheduled_admission_ns,
+                on_scheduled_event=on_scheduled_event,
+                reopen=reopen,
             )
     return wrapper
 
@@ -1822,6 +1830,19 @@ class Deck:
         self.seek_gate_valve = None
         self.failed_seek_predecessors = []
         self.failed_seek_retire_after_monotonic = 0.0
+        # Roadmap 2.25 B2 -- scheduled admission (Voice Track transitions
+        # only; see _create_deck(scheduled_admission_ns=...)). None on every
+        # ordinary deck, whose r0144 behaviour is unchanged.
+        #   admission_state: "preparing" (decoding, NOT linked to the mixer)
+        #   -> "scheduled" (linked; first buffer queued for its running time)
+        #   -> "audible" (admission running time reached; accounting starts)
+        #   or "failed".
+        self.scheduled_admission_ns = None
+        self.admission_state = None
+        self.scheduled_ready_ns = None
+        self.scheduled_pending_seconds = 0.0
+        self.scheduled_block = None
+        self.on_scheduled_event = None
 
     def mark_milestone(self, name, *, state=None, now=None):
         current = time.monotonic() if now is None else now
@@ -1888,6 +1909,24 @@ class Deck:
         with self._duration_lock:
             if self.duration_segment_active:
                 self.duration_confirmed_seconds += duration_ns / Gst.SECOND
+            elif self.admission_state in ("preparing", "scheduled"):
+                # 2.25 B2: queued ahead of a scheduled admission. Credited
+                # only if the generation is admitted (it will render then);
+                # discarded if it is cancelled first (it never aired).
+                self.scheduled_pending_seconds += duration_ns / Gst.SECOND
+
+    def activate_scheduled_segment(self, started_at):
+        """2.25 B2: start accounting at the scheduled admission instant and
+        credit the buffers that were queued for it."""
+        with self._duration_lock:
+            if self.duration_segment_active or self.duration_segment_started_at is not None:
+                return False
+            self.duration_segment_active = True
+            self.duration_segment_started_at = started_at
+            self.duration_start_reason = "fresh_air_start"
+            self.duration_confirmed_seconds += self.scheduled_pending_seconds
+            self.scheduled_pending_seconds = 0.0
+            return True
 
     def duration_snapshot(self, *, freeze=False, ended_at=None):
         with self._duration_lock:
@@ -3375,6 +3414,10 @@ class PlaybackEngine:
         for slot in self._output_slots.values():
             if self._output_slot_owns_message_src(slot, message):
                 return self._on_output_error(slot, bus, message)
+        # Roadmap 2.25 B2: scheduled VT branches own their errors (F3).
+        fire = self._vt2_fire_for_message_src(message.src)
+        if fire is not None:
+            fire.handle_bus_error(message)
         return True
 
     def _deck_for_message_src(self, source):
@@ -7409,8 +7452,11 @@ class PlaybackEngine:
                 pass
             return False
 
-    def _schedule_occurrence_air_start_from_probe(self, deck):
+    def _schedule_occurrence_air_start_from_probe(self, deck, air_started_at=None):
         """Streaming-thread-safe one-shot handoff of first-real evidence.
+
+        ``air_started_at`` (2.25 B2) is the exact wall-clock instant of a
+        scheduled generation's admission; ordinary callers omit it.
 
         This method performs only bounded in-memory work, captures the wall
         clock at the observed buffer, and schedules one GLib callback. It must
@@ -7422,7 +7468,8 @@ class PlaybackEngine:
             if deck.air_start_dispatched:
                 return
             deck.air_start_dispatched = True
-            air_started_at = timezone.now()
+            if air_started_at is None:
+                air_started_at = timezone.now()
             # The fresh segment uses the exact Phase-B authoritative air-start
             # timestamp. Activation happens before this buffer proceeds to the
             # deck ghost pad, where its duration is accumulated.
@@ -7742,9 +7789,26 @@ class PlaybackEngine:
         *, continuation_reason_override=None,
         continuation_start_on_first_real=False,
         before_sync=None,
+        scheduled_admission_ns=None,
+        on_scheduled_event=None,
+        reopen=False,
     ):
         track = log_item.track
         filepath = track.filepath
+        # Roadmap 2.25 B2: an explicitly selected VT-transition deck admitted
+        # at a planned running time (media position 0 renders at
+        # ``scheduled_admission_ns``). Ordinary starts never pass it.
+        scheduled = scheduled_admission_ns is not None
+        if scheduled:
+            if resume_position_ns is not None or continuation_reason_override is not None:
+                print(f"  [{slot}] Scheduled admission refused: continuation/seek generations are never scheduled")
+                return None
+            hint = getattr(self, "_resume_hint", None)
+            if hint and hint.get("log_item_id") == log_item.id:
+                # Interrupted-occurrence recovery is an ordinary resume (D13);
+                # leave the hint for the ordinary path.
+                print(f"  [{slot}] Scheduled admission refused: log_item {log_item.id} is a resume")
+                return None
 
         # Auto-resume reuses the same confirmed, buffer-only gated-seek
         # state machine as manual seek. No position-zero buffer can reach
@@ -7755,7 +7819,7 @@ class PlaybackEngine:
             continuation_reason_override
             or ("manual_seek_or_resume" if resume_position_ns is not None else None)
         )
-        if resume_position_ns is None and getattr(self, "_resume_hint", None):
+        if resume_position_ns is None and not scheduled and getattr(self, "_resume_hint", None):
             hint = self._resume_hint
             self._resume_hint = None
             if (
@@ -7815,8 +7879,11 @@ class PlaybackEngine:
             # may produce audio, but it can never count as another play.
             continuation_reason = "already_started_occurrence"
 
-        self._write_now_playing(track)
-        self._write_rbds_category_state(track)
+        if not scheduled:
+            # A scheduled generation is not audible yet: presentation is
+            # written at its admission (_vt2_admit_scheduled_deck).
+            self._write_now_playing(track)
+            self._write_rbds_category_state(track)
 
         src = Gst.ElementFactory.make("filesrc", None)
         src.set_property("location", filepath)
@@ -7882,7 +7949,8 @@ class PlaybackEngine:
         # need extra bookkeeping to land correctly across a
         # silence+real-content boundary, and this bug is specifically
         # about fresh starts on a normal crossfade.
-        silence_primed = resume_position_ns is None
+        silence_primed = resume_position_ns is None and not scheduled
+        scheduled_hold = None
         if silence_primed:
             caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
 
@@ -7916,6 +7984,46 @@ class PlaybackEngine:
             # needed, unlike decodebin's), so the ghost pad's target can
             # be fixed right away instead of waiting for pad-added.
             ghost_pad.set_target(concat_src)
+
+            def on_pad_added(element, pad):
+                if pad.get_current_caps():
+                    struct = pad.get_current_caps().get_structure(0)
+                    if struct.get_name().startswith("audio"):
+                        probe_id = pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, decoder_probe)
+                        probe_handles.append((pad, probe_id))
+                        pad.link(convert.get_static_pad("sink"))
+        elif scheduled:
+            # 2.25 B2 scheduled admission: no silence prime (the planned
+            # offset gives decode its time), the primed path's fixed output
+            # contract, and the first decoded buffer HELD at the bin's edge.
+            # The bin stays unlinked from the mixer until that buffer exists
+            # (_vt2_on_scheduled_deck_ready), so a slow or stalled decode can
+            # never leave an empty pad on the non-live deck mixer (F15).
+            real_stage_src = resample.get_static_pad("src")
+            scheduled_caps = Gst.ElementFactory.make("capsfilter", None)
+            scheduled_caps.set_property("caps", Gst.Caps.from_string(
+                f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"
+            ))
+            deck_bin.add(scheduled_caps)
+            resample.link(scheduled_caps)
+            ghost_pad.set_target(scheduled_caps.get_static_pad("src"))
+
+            def scheduled_hold_probe(pad, info):
+                # Streaming thread: bounded state + one GLib handoff. The
+                # buffer stays blocked here until the GLib side links the
+                # bin and removes this probe.
+                if deck is not None and deck.scheduled_ready_ns is None:
+                    deck.scheduled_ready_ns = self._vt2_running_ns()
+                    GLib.idle_add(self._vt2_on_scheduled_deck_ready, slot, deck.generation)
+                return Gst.PadProbeReturn.OK
+
+            hold_pad = scheduled_caps.get_static_pad("src")
+            scheduled_hold = (
+                hold_pad,
+                hold_pad.add_probe(
+                    Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, scheduled_hold_probe
+                ),
+            )
 
             def on_pad_added(element, pad):
                 if pad.get_current_caps():
@@ -7974,7 +8082,9 @@ class PlaybackEngine:
         def real_stage_probe(pad, info):
             if info.type & Gst.PadProbeType.BUFFER:
                 deck.mark_media_buffer()
-                if not silence_primed and not first_real_marked["done"]:
+                # A scheduled generation's first decoded buffer is readiness,
+                # not air: its accounting starts at admission (B2).
+                if not silence_primed and not scheduled and not first_real_marked["done"]:
                     deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
                     self._schedule_occurrence_air_start_from_probe(deck)
                     if deck.continuation_start_on_first_real:
@@ -8122,10 +8232,15 @@ class PlaybackEngine:
 
         self.main_pipeline.add(deck_bin)
 
-        mixer_pad = self.mixer.request_pad_simple("sink_%u")
-        deck_bin.get_static_pad("src").link(mixer_pad)
+        if scheduled:
+            # Prepared unlinked; linked on readiness (see above).
+            mixer_pad = None
+            deck_bin.get_static_pad("src").set_offset(int(scheduled_admission_ns))
+        else:
+            mixer_pad = self.mixer.request_pad_simple("sink_%u")
+            deck_bin.get_static_pad("src").link(mixer_pad)
 
-        self._apply_pad_offset(deck_bin, internal_position_ns=resume_position_ns or 0)
+            self._apply_pad_offset(deck_bin, internal_position_ns=resume_position_ns or 0)
         with self._lock:
             self._deck_generation_serial += 1
             generation = self._deck_generation_serial
@@ -8144,7 +8259,7 @@ class PlaybackEngine:
         deck.probe_handles = probe_handles
         deck.signal_handles = signal_handles
         deck.occurrence_order = self._assign_occurrence_order(
-            log_item, continuation=continuation_reason is not None
+            log_item, continuation=continuation_reason is not None or reopen
         )
         # Stable, statically-created decoded-audio boundary for gated seeks.
         # The bin ghost pad starts targetless and only acquires this pad from
@@ -8161,6 +8276,15 @@ class PlaybackEngine:
         # computed against), not the silence-inclusive elapsed time.
         silence_shift = SILENCE_PRIME_SECONDS if silence_primed else 0.0
         deck.started_at = time.time() - start_offset + silence_shift
+        if scheduled:
+            # Position/elapsed time follow the planned render of media 0.
+            deck.started_at = time.time() + (
+                int(scheduled_admission_ns) - self._vt2_running_ns()
+            ) / Gst.SECOND
+            deck.scheduled_admission_ns = int(scheduled_admission_ns)
+            deck.admission_state = "preparing"
+            deck.scheduled_block = scheduled_hold
+            deck.on_scheduled_event = on_scheduled_event
 
         # Register object identity and error routing before PLAYING can emit
         # EOS/error. This closes the very-short-ID/startup race in which an
@@ -8189,6 +8313,11 @@ class PlaybackEngine:
             print(f"  [{slot}] Deck for log item {log_item.id} failed to start (state change failure)")
             deck.mark_milestone("SYNC_STATE_FAILED")
             deck.start_failed = True
+        if scheduled:
+            GLib.timeout_add(
+                int(vt_transition.SCHEDULED_DECK_READY_S * 1000),
+                self._vt2_scheduled_deck_readiness_deadline, slot, deck.generation,
+            )
 
         if air_start_eligible:
             print(
@@ -8849,6 +8978,18 @@ class PlaybackEngine:
 
     @_glib_safe(default_return=True)
     def _deck_teardown_tick(self):
+        vt_coordinator = self.__dict__.get("_vt2_teardown")
+        if vt_coordinator is not None:
+            # 2.25 B2: bounded NULL worker for detached scheduled VT branches.
+            vt_coordinator.tick()
+            for event in vt_coordinator.drain_events():
+                if event["kind"] in {"timed_out", "rejected_poisoned", "rejected_full"}:
+                    emit_event(
+                        category="engine", level="error",
+                        title="Voice track branch teardown could not complete after isolation",
+                        detail={"kind": event["kind"], **event.get("metadata", {})},
+                        dedupe_key=f"engine|vt2-teardown|{event['kind']}",
+                    )
         coordinators = getattr(self, "_deck_teardowns", None)
         if not coordinators:
             return True
@@ -9817,6 +9958,243 @@ class PlaybackEngine:
             return audio.path, audio.duration_seconds
         return voicetrack.filepath, voicetrack.duration_seconds
 
+    # ------------------------------------------------------------------
+    # Roadmap 2.25 B2 -- scheduled VT audio infrastructure (DORMANT).
+    # Nothing in the live automatic transition path calls these yet; B3/B4
+    # connect them. See docs/roadmap/2_25_PHASE_B1_B2_INFRASTRUCTURE.md.
+    # ------------------------------------------------------------------
+    def _vt2_running_ns(self):
+        """Pipeline running time now (ns); 0 when the pipeline has no clock."""
+        pipeline = getattr(self, "main_pipeline", None)
+        clock = pipeline.get_clock() if pipeline is not None else None
+        if clock is None:
+            return 0
+        return clock.get_time() - pipeline.get_base_time()
+
+    def _vt2_timer_at(self, running_ns, fn, *args):
+        """Run ``fn(*args)`` on the GLib thread at (not before) running time
+        ``running_ns``. One-shot; the callback's own owner check decides."""
+        delay_ns = max(0, int(running_ns) - self._vt2_running_ns())
+        delay_ms = int(math.ceil(delay_ns / Gst.MSECOND))
+
+        def fire():
+            fn(*args)
+            return False
+        return GLib.timeout_add(delay_ms, fire)
+
+    def _vt2_next_fire_id(self):
+        self._vt2_fire_serial = self.__dict__.get("_vt2_fire_serial", 0) + 1
+        return self._vt2_fire_serial
+
+    def _vt2_teardown_coordinator(self):
+        coordinator = self.__dict__.get("_vt2_teardown")
+        if coordinator is None:
+            coordinator = audio_recovery.BoundedTeardownCoordinator(
+                "vt-fires", timeout_s=5.0, queue_capacity=32
+            )
+            self._vt2_teardown = coordinator
+        return coordinator
+
+    def _vt2_submit_null(self, fire, fire_bin):
+        """Hand a DETACHED VT bin's NULL transition to the bounded worker."""
+        def set_null():
+            result = fire_bin.set_state(Gst.State.NULL)
+            if result == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError(f"set_state(NULL) returned {result}")
+            return result
+        return self._vt2_teardown_coordinator().submit(
+            fire.fire_id, set_null,
+            metadata={"fire_id": fire.fire_id, "direction": fire.owner.direction,
+                      "log_item_id": fire.owner.log_item_id},
+        )
+
+    def _vt2_fire_for_message_src(self, source):
+        for fire in list(self.__dict__.get("_vt2_fires", {}).values()):
+            if not fire.retired and fire.owns(source):
+                return fire
+        return None
+
+    def _vt2_prepare_fire(self, owner, path, gain_db, admission_ns, validated_duration, on_event=None,
+                          before_start=None):
+        """Prepare one scheduled VT fire (B0-qualified admission). Returns the
+        ScheduledVtFire; its ``state`` is FAILED if preparation was refused."""
+        registry = self.__dict__.setdefault("_vt2_fires", {})
+
+        def route(fire, state):
+            if on_event is not None:
+                on_event(fire, state)
+            if state in vt_audio.FireState.TERMINAL:
+                def forget(attempts=[0]):
+                    attempts[0] += 1
+                    if fire.retired or attempts[0] > 50:
+                        if registry.get(fire.fire_id) is fire:
+                            registry.pop(fire.fire_id, None)
+                        return False
+                    return True
+                GLib.timeout_add(20, forget)
+
+        fire = vt_audio.ScheduledVtFire(
+            owner=owner, path=path, gain_db=gain_db, admission_ns=admission_ns,
+            validated_duration=validated_duration, pipeline=self.main_pipeline,
+            mixer=self.fx_submix, rate=self.pipeline_sample_rate,
+            now_ns=self._vt2_running_ns, timer_at=self._vt2_timer_at,
+            null_submit=self._vt2_submit_null, on_event=route, before_start=before_start,
+        )
+        registry[owner.fire_id] = fire
+        fire.prepare()
+        return fire
+
+    def _vt2_prepare_fire_for_voicetrack(self, owner, voicetrack, admission_ns, on_event=None):
+        """Resolve a VoiceTrack exactly as r0144 does (_vt_resolve_audio:
+        validated ProductionMedia first, then the legacy file) and prepare a
+        scheduled fire. A record without playable audio is refused, never
+        fired (record != eligibility)."""
+        path, duration = self._vt_resolve_audio(voicetrack)
+        if not path or not duration or duration <= 0 or not Path(path).is_file():
+            return None
+        return self._vt2_prepare_fire(owner, path, getattr(voicetrack, "gain_db", 0.0) or 0.0,
+                                      admission_ns, duration, on_event=on_event)
+
+    def _vt2_duck_curve(self):
+        """The one speech-owned duck curve on vt_duck_gain (created lazily;
+        never created by the r0144 path, whose stepper is untouched)."""
+        curve = self.__dict__.get("_vt2_duck")
+        if curve is None:
+            curve = vt_audio.VtDuckCurve(self.vt_duck_gain, self._vt2_running_ns)
+            self._vt2_duck = curve
+        return curve
+
+    def _vt2_notify_scheduled(self, deck, kind, reason=""):
+        callback = getattr(deck, "on_scheduled_event", None)
+        if callback is None:
+            return
+        try:
+            callback(deck, kind, reason)
+        except Exception as exc:
+            print(f"  [{deck.slot}] scheduled-deck event handler failed: {exc!r}")
+
+    def _vt2_current_scheduled(self, slot, generation, states):
+        deck = self.decks.get(slot)
+        if (
+            deck is None
+            or deck.generation != generation
+            or deck.retirement_started
+            or getattr(deck, "admission_state", None) not in states
+        ):
+            return None
+        return deck
+
+    @_glib_safe(default_return=False)
+    def _vt2_on_scheduled_deck_ready(self, slot, generation):
+        """First decoded buffer exists (viability proven): link the bin to the
+        deck mixer with its planned offset and release the held buffer."""
+        deck = self._vt2_current_scheduled(slot, generation, ("preparing",))
+        if deck is None:
+            return False
+        lead_ns = deck.scheduled_admission_ns - self._vt2_running_ns()
+        if lead_ns < int(vt_transition.READY_LEAD_S * Gst.SECOND):
+            self._vt2_fail_scheduled_deck(deck, "ready_after_admission")
+            return False
+        mixer_pad = self.mixer.request_pad_simple("sink_%u")
+        ghost = deck.pipeline.get_static_pad("src")
+        ghost.set_offset(deck.scheduled_admission_ns)
+        if ghost.link(mixer_pad) != Gst.PadLinkReturn.OK:
+            self.mixer.release_request_pad(mixer_pad)
+            self._vt2_fail_scheduled_deck(deck, "mixer_link_failed")
+            return False
+        deck.mixer_pad = mixer_pad
+        hold = deck.scheduled_block
+        deck.scheduled_block = None
+        if hold is not None:
+            hold[0].remove_probe(hold[1])
+        deck.admission_state = "scheduled"
+        deck.mark_milestone("VT2_SCHEDULED_LINKED")
+        self._vt2_timer_at(deck.scheduled_admission_ns, self._vt2_admit_scheduled_deck, slot, generation)
+        self._vt2_notify_scheduled(deck, "ready")
+        return False
+
+    @_glib_safe(default_return=False)
+    def _vt2_admit_scheduled_deck(self, slot, generation):
+        """The admission running time has been reached: the generation is now
+        audible. Presentation and the authoritative air start happen here, at
+        the exact admission instant -- never at open or readiness."""
+        deck = self._vt2_current_scheduled(slot, generation, ("scheduled",))
+        if deck is None:
+            return False
+        late_ns = max(0, self._vt2_running_ns() - deck.scheduled_admission_ns)
+        air_started_at = timezone.now() - timedelta(seconds=late_ns / Gst.SECOND)
+        deck.admission_state = "audible"
+        deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
+        self._write_now_playing(deck.track)
+        self._write_rbds_category_state(deck.track)
+        if not (
+            deck.log_item.category_id
+            and deck.log_item.category
+            and deck.log_item.category.code == "Dedications"
+        ):
+            deck.activate_scheduled_segment(air_started_at)
+        self._schedule_occurrence_air_start_from_probe(deck, air_started_at=air_started_at)
+        self._vt2_notify_scheduled(deck, "audible")
+        return False
+
+    @_glib_safe(default_return=False)
+    def _vt2_scheduled_deck_readiness_deadline(self, slot, generation):
+        deck = self._vt2_current_scheduled(slot, generation, ("preparing",))
+        if deck is not None:
+            self._vt2_fail_scheduled_deck(deck, "not_ready_after_open")
+        return False
+
+    def _vt2_fail_scheduled_deck(self, deck, reason):
+        """A scheduled generation that cannot be admitted: retire it (never
+        aired, nothing persisted, no queue advance) and tell the owner, which
+        falls back to an ordinary start (B4)."""
+        deck.admission_state = "failed"
+        deck.mark_milestone("VT2_SCHEDULED_FAILED", state=reason)
+        print(f"  [{deck.slot}] Scheduled admission failed for log item {deck.log_item.id}: {reason}")
+        self._remove_deck(deck, occurrence_terminal=False, termination_reason=f"vt2_{reason}")
+        self._vt2_notify_scheduled(deck, "failed", reason)
+
+    def _vt2_reopen_held_occurrence(self, slot, admission_ns):
+        """Early re-admission by regeneration (B0 E09d): retire the held,
+        never-audible generation and open the SAME claimed LogItem as a fresh
+        scheduled generation. No queue item is consumed, no request scheduling
+        or dedication splice repeats (those live in _start_next_track), and
+        the claim is idempotent. Bounded per occurrence.
+
+        Returns (outcome, deck): "reopened" | "refused" | "exhausted" | "failed"."""
+        deck = self.decks.get(slot)
+        if deck is None or deck.retirement_started or getattr(deck, "admission_state", None) not in (
+            "preparing", "scheduled"
+        ):
+            return "refused", None
+        log_item = deck.log_item
+        if log_item.played_at is not None or deck.air_start_dispatched:
+            return "refused", None
+        playable, why = _log_item_playable(log_item)
+        if not playable:
+            # Keep the held generation (its file is already open and decoded);
+            # never retire it into an unopenable replacement, never advance.
+            print(f"  [{slot}] Re-admission refused for log item {log_item.id}: {why}")
+            return "failed", None
+        attempts = self.__dict__.setdefault("_vt2_reopen_attempts", {})
+        on_deck = {d.log_item.id for d in self.decks.values() if d is not None}
+        for stale in [key for key in attempts if key not in on_deck]:
+            del attempts[stale]
+        count = attempts.get(log_item.id, 0)
+        if count >= vt_transition.REOPEN_MAX_ATTEMPTS:
+            return "exhausted", None
+        attempts[log_item.id] = count + 1
+        callback = deck.on_scheduled_event
+        deck.admission_state = "failed"
+        self._remove_deck(deck, occurrence_terminal=False, termination_reason="vt2_reopen")
+        replacement = self._create_deck(
+            slot, log_item, scheduled_admission_ns=admission_ns,
+            on_scheduled_event=callback, reopen=True,
+        )
+        if replacement is None:
+            return "failed", None
+        return "reopened", replacement
+
     def _vt_maybe_enter(self, outgoing_deck):
         """Called from _poll_position when outgoing hits outro_starts.
         Looks up VTs for the outgoing and incoming tracks; if either
@@ -10743,6 +11121,12 @@ class PlaybackEngine:
     def _get_deck_position(self, deck):
         if deck.paused:
             return deck.paused_position
+        if getattr(deck, "scheduled_admission_ns", None) is not None:
+            # 2.25 B2: a scheduled generation's decoder runs ahead of render;
+            # its position is the planned render timeline (0 until admitted).
+            if deck.started_at:
+                return max(0.0, time.time() - deck.started_at)
+            return 0.0
         if deck.silence_primed:
             # query_position() isn't reliable through concat's internal
             # segment-switch (silence -> real content) — it can report a
@@ -17133,6 +17517,9 @@ class PlaybackEngine:
                     "category": t.category.code if t.category else "",
                     "format": t.format or "",
                     "paused": deck.paused,
+                    # 2.25 B2: None for ordinary decks; a scheduled VT
+                    # generation reports preparing/scheduled/audible/failed.
+                    "admission": getattr(deck, "admission_state", None),
                 }
 
             # Seconds-from-now ETA for each queue item, so the UI can
