@@ -339,6 +339,11 @@
     <label for="be-artist-op">Artist</label>
     <select id="be-artist-op" data-field="artist" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option></select>
     <input type="text" id="be-artist" maxlength="255" disabled aria-label="Artist value">
+    <label for="be-related_artists-op">Related Artists</label>
+    <select id="be-related_artists-op" data-field="related_artists" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="append">Append</option><option value="clear">Clear</option></select>
+    <input type="text" id="be-related_artists" disabled aria-label="Related Artists value" aria-describedby="be-related_artists-note" placeholder="Comma-separated, e.g. David Gilmour, Roger Waters">
+    <span></span><span></span>
+    <span class="be-note" id="be-related_artists-note">Comma-separated names. Append keeps existing entries; duplicates and each Track's primary Artist are left out. Limit 500 characters per Track; nothing is cut off.</span>
     <label for="be-album-op">Album</label>
     <select id="be-album-op" data-field="album" class="be-op" onchange="syncEditorRow(this)"><option value="leave">Leave unchanged</option><option value="set">Set to</option><option value="clear">Clear</option></select>
     <input type="text" id="be-album" maxlength="255" disabled aria-label="Album value">
@@ -650,7 +655,7 @@ const INT_FIELDS = new Set(['year', 'rotation_weight']);
 
 function syncEditorRow(select) {
   const input = document.getElementById('be-' + select.dataset.field);
-  input.disabled = select.value !== 'set';
+  input.disabled = select.value !== 'set' && select.value !== 'append';
   // 3.11: the file-location choice exists only for "Set primary category" (a cleared category has no folder).
   if (select.dataset.field === 'category') document.getElementById('beFileLocation').hidden = select.value !== 'set';
 }
@@ -704,7 +709,7 @@ function collectChanges() {
     if (INT_FIELDS.has(field)) value = raw.trim() === '' ? raw : Number(raw);
     if (field === 'ready2air') value = raw === 'true';
     if (field === 'category') value = parseInt(raw);
-    changes[field] = { op: 'set', value };
+    changes[field] = { op: sel.value === 'append' ? 'append' : 'set', value };
   }
   const addCat = multiValues('be-addcat', true), removeCat = multiValues('be-removecat', true);
   const addHol = multiValues('be-addhol', false), removeHol = multiValues('be-removehol', false);
@@ -791,7 +796,7 @@ function renderPreview(data) {
   }
   body.append(el('p', 'Changes:'));
   const ops = el('ul', undefined, 'be-list');
-  const verbs = { set: 'set to', clear: 'clear', add: 'add', remove: 'remove' };
+  const verbs = { set: 'set to', clear: 'clear', add: 'add', remove: 'remove', append: 'append' };
   data.operations.forEach(o => ops.append(el('li', `${o.label}: ${verbs[o.op] || o.op}${o.op === 'clear' ? '' : ' ' + o.value}`)));
   body.append(ops);
   const summary = el('ul', undefined, 'be-list');

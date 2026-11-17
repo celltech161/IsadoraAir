@@ -6,7 +6,7 @@ previews it, then applies exactly what was previewed:
 * **Change set.**  Every editable field is *leave* (the default: an omitted field never changes anything),
   *set* (a validated value) or *clear* (only where the field may be empty).  Additional categories and
   holidays are only ever *added* or *removed* by name; existing memberships that were not named are
-  never touched.  Values are validated and normalized before anything is written, with the same lookups
+  never touched.  Related Artists also has *append* (see "Related Artists" below).  Values are validated and normalized before anything is written, with the same lookups
   single-Track editing uses (``Artist.get_or_create_ci``, ``Album`` by title within the Track's
   album artist, ``Genre`` by name).
 * **Selection.**  ``ids`` is the rows the operator ticked (on any page); ``filter`` is every Track matching
@@ -30,6 +30,16 @@ previews it, then applies exactly what was previewed:
   every Track as updated, unchanged, refused, stale, missing or failed.  Changes that a bulk edit neither
   reads nor writes (play counts, logs, PlayEvents, cue markers, waveforms) do not make a Track stale.
   Shared lookup rows (a new artist, album or genre) are created once, before the Tracks are written.
+
+**Related Artists.**  ``related_artists`` takes comma-separated names, as the single-Track editor does, and is
+canonicalized by the shared ``library.services.related_artists`` rules (trimmed, deduplicated case-insensitively,
+first spelling wins, order kept, the Track's primary Artist dropped).  *Set to* replaces the list, *append* adds the
+named artists after the existing ones (``merge_related_artists_detailed``: existing entries are kept), *clear*
+empties it.  The primary Artist excluded is the Track's *resulting* one: when the same edit also sets Artist,
+names are normalized against the new Artist.  The value never exceeds the field's limit (500): a change set
+whose own list is too long is refused, and a Track whose appended list would not fit is refused (reported,
+left unchanged) -- names are never truncated or silently dropped.  A list that only differs in formatting from
+the stored one is unchanged.  Like every bulk field this is database metadata only.
 
 Deliberately not done here: audio-file tags are never written (that stays a separate Track Detail
 action), cue markers are never written (they are not editable fields), waveform caches, source audio,
@@ -89,6 +99,8 @@ SESSION_KEY = "library_bulk_edit_previews"
 _TOKEN_SALT = "library.track_bulk_edit.preview.v2"
 
 LEAVE, SET, CLEAR = "leave", "set", "clear"
+#: Related Artists only: add names after the existing ones.
+APPEND = "append"
 #: The file-location policy of a primary-category change (3.11).
 METADATA_ONLY, MOVE_FILES = "metadata_only", "move"
 FILE_LOCATIONS = (METADATA_ONLY, MOVE_FILES)
@@ -112,15 +124,17 @@ class BulkEditError(Exception):
 @dataclass(frozen=True)
 class FieldSpec:
     label: str
-    kind: str                 # text | choice | int | bool | artist | album | genre | category
+    kind: str                 # text | choice | int | bool | artist | album | genre | category | related
     clearable: bool
     empty: object = ""        # the stored value of a cleared field
+    appendable: bool = False  # also accepts {"op": "append", "value": ...}
 
 
 #: The editable fields, in display order.  Per-recording identity (title, ISRC, track and disc numbers,
-#: related artists, file facts) and cue markers are deliberately absent.
+#: file facts) and cue markers are deliberately absent.
 FIELDS = {
     "artist": FieldSpec("Artist", "artist", clearable=False),
+    "related_artists": FieldSpec("Related Artists", "related", clearable=True, appendable=True),
     "album": FieldSpec("Album", "album", clearable=True, empty=None),
     "genre": FieldSpec("Genre", "genre", clearable=True, empty=None),
     "year": FieldSpec("Year", "int", clearable=True, empty=None),
@@ -175,6 +189,26 @@ def _text(name, value, max_length):
     return text
 
 
+def _related_names(value):
+    """The names a Related Artists value lists, canonicalized by the shared rules (no primary Artist yet: that is
+    per Track).  Refuses an empty list and a list that could never fit the field -- never truncates."""
+    from library.services.related_artists import (
+        _related_artists_max_length, canonicalize_related_artists, format_related_artists,
+    )
+    label = FIELDS["related_artists"].label
+    if not isinstance(value, str):
+        raise BulkEditError(f"{label}: expected comma-separated artist names")
+    names = canonicalize_related_artists(value.replace("\x00", ""))
+    if not names:
+        raise BulkEditError(f"{label}: no artist names given -- choose Clear to empty the field")
+    limit = _related_artists_max_length()
+    length = len(format_related_artists(names))
+    if length > limit:
+        raise BulkEditError(f"{label} is too long ({length} characters after cleanup; the limit is {limit}). "
+                            "Remove an entry and try again.")
+    return names
+
+
 def _normalize_set(name, value):
     from library.models import Album, Artist, Category, Genre
     spec = FIELDS[name]
@@ -206,6 +240,8 @@ def _normalize_set(name, value):
         return _text(name, value, Album._meta.get_field("title").max_length)
     if spec.kind == "genre":
         return _text(name, value, Genre._meta.get_field("name").max_length)
+    if spec.kind == "related":
+        return _related_names(value)
     if spec.kind == "category":
         if isinstance(value, bool) or not isinstance(value, int):
             raise BulkEditError(f"{spec.label}: expected a category id")
@@ -245,8 +281,10 @@ def parse_changes(raw) -> tuple[Operation, ...]:
         if name not in raw:
             continue
         entry = raw[name]
-        if not isinstance(entry, dict) or entry.get("op", LEAVE) not in (LEAVE, SET, CLEAR):
-            raise BulkEditError(f"{spec.label}: expected {{\"op\": \"leave\" | \"set\" | \"clear\", \"value\": ...}}")
+        allowed = (LEAVE, SET, CLEAR, APPEND) if spec.appendable else (LEAVE, SET, CLEAR)
+        if not isinstance(entry, dict) or entry.get("op", LEAVE) not in allowed:
+            shape = " | ".join(f'\"{o}\"' for o in allowed)
+            raise BulkEditError(f"{spec.label}: expected {{\"op\": {shape}, \"value\": ...}}")
         op = entry.get("op", LEAVE)
         if op == LEAVE:
             continue
@@ -256,8 +294,8 @@ def parse_changes(raw) -> tuple[Operation, ...]:
             ops.append(Operation(name, CLEAR, None))
         else:
             if "value" not in entry:
-                raise BulkEditError(f"{spec.label}: 'set' needs a value")
-            ops.append(Operation(name, SET, _normalize_set(name, entry["value"])))
+                raise BulkEditError(f"{spec.label}: '{op}' needs a value")
+            ops.append(Operation(name, op, _normalize_set(name, entry["value"])))
     for name, label in MEMBERSHIPS.items():
         if name not in raw:
             continue
@@ -362,12 +400,14 @@ def ids_digest(ids) -> str:
 def edit_state(track, additional, holidays) -> str:
     """Fingerprint of everything a bulk edit reads or writes for this Track (and its file path): a change to
     any of it between preview and apply makes the Track stale.  Play counts, timestamps, cue markers and
-    other columns are deliberately excluded."""
+    other columns are deliberately excluded.  Related Artists are normalized against the primary Artist's
+    *name*, so a rename of that Artist row makes the Track stale too."""
     return _digest([
         track.filepath, track.artist_id, track.album_id, track.album.album_artist if track.album_id else None,
         track.genre_id, track.year, track.composer, track.publisher, track.record_label, track.energy,
         track.vocal_type, track.end_type, track.rotation_weight, track.ready2air, track.category_id,
         sorted(additional), sorted(holidays),
+        track.related_artists, track.artist.name if track.artist_id else None,
     ])[:32]
 
 
@@ -554,6 +594,7 @@ class _Plan:
     changes: list = field(default_factory=list)       # [{"field", "label", "before", "after"}]
     unchanged: set = field(default_factory=set)       # field names already at their target
     folder_stays: bool = False
+    refusal: str | None = None                        # this Track cannot take the change set (left unchanged)
 
     @property
     def empty(self):
@@ -598,10 +639,19 @@ def _plan(track, ops, targets: _Targets, *, current_additional, current_holidays
         return _display(kind, row) if row is not None else f"{requested} (new)"
 
     new_primary = track.category_id
+    # The primary Artist name Related Artists are normalized against: the Track's resulting one.
+    primary_name = track.artist.name if track.artist_id else None
+    related_op = None
     for op in ops:
         if op.field not in FIELDS:
             continue
         spec = FIELDS[op.field]
+        if spec.kind == "related":
+            related_op = op
+            continue
+        if spec.kind == "artist" and op.op == SET:
+            target = targets.artist(op.value)
+            primary_name = target.name if target is not None else op.value
         if spec.kind in ("artist", "album", "genre"):
             if op.op == CLEAR:
                 target = None
@@ -637,6 +687,9 @@ def _plan(track, ops, targets: _Targets, *, current_additional, current_holidays
                 continue
             change(op.field, op.field, new, _display(spec.kind, current), _display(spec.kind, new))
 
+    if related_op is not None:
+        _plan_related(track, related_op, primary_name, plan, change)
+
     # Memberships: only the named entries move.  A Track never lists its own primary category as an
     # additional one (single-Track editing drops it the same way).
     category_ops = {o.op: o.value for o in ops if o.field == "additional_categories"}
@@ -670,6 +723,31 @@ def _plan(track, ops, targets: _Targets, *, current_additional, current_holidays
             "after": ", ".join(sorted(after)) or "(none)",
         })
     return plan
+
+
+def _plan_related(track, op, primary_name, plan, change) -> None:
+    """Related Artists for one Track, through the shared related_artists service (see the module docstring)."""
+    from library.services.related_artists import (
+        _related_artists_max_length, canonicalize_related_artists, format_related_artists,
+        merge_related_artists_detailed,
+    )
+    current = track.related_artists or ""
+    if op.op == CLEAR:
+        new = ""
+    elif op.op == SET:
+        new = format_related_artists(canonicalize_related_artists(format_related_artists(op.value), primary_name))
+    else:
+        new, _appended, skipped = merge_related_artists_detailed(current, op.value, primary_artist_name=primary_name)
+        if skipped:
+            limit = _related_artists_max_length()
+            plan.refusal = (f"Related Artists would exceed {limit} characters; not appended: {', '.join(skipped)}. "
+                            "Nothing was truncated; edit this Track's Related Artists on Track Detail.")
+            return
+    # A list that only differs from the stored one in formatting (spacing, comma style) is not a change.
+    if canonicalize_related_artists(new) == canonicalize_related_artists(current):
+        plan.unchanged.add(op.field)
+        return
+    change(op.field, op.field, new, current.strip() or "(empty)", new or "(empty)")
 
 
 def _memberships(ids):
@@ -711,6 +789,9 @@ def _describe_ops(ops, targets):
                 value = _display("category", targets.category(op.value))
             elif spec.kind == "bool":
                 value = _display("bool", op.value)
+            elif spec.kind == "related":
+                from library.services.related_artists import format_related_artists
+                value = format_related_artists(op.value)
             else:
                 value = str(op.value)
             out.append({"field": op.field, "label": spec.label, "op": op.op, "value": value})
@@ -831,6 +912,8 @@ def _apply_move(track_id, entry, ops, targets, *, user, root, protection, budget
         if edit_state(track, current_additional, current_holidays) != state_then:
             raise m.Stop(m.STALE, "changed since the preview; left as it is")
         plan = _plan(track, ops, targets, current_additional=current_additional, current_holidays=current_holidays)
+        if plan.refusal is not None:
+            raise m.Stop(m.REFUSED, plan.refusal)
         target = plan.columns.get("category_id")
         if target is None or m.destination_for(track.filepath, targets.category(target).code, root) != destination:
             raise m.Stop(m.STALE, "its planned destination changed since the preview; left as it is")
@@ -869,14 +952,16 @@ def preview(selection: Selection, ops, *, user, previews, file_location=METADATA
         plan = _plan(track, ops, targets, current_additional=additional.get(track.pk, set()),
                      current_holidays=holidays.get(track.pk, set()))
         changed_fields = {c["field"] for c in plan.changes}
-        for name, counts in summary.items():
+        # A Track the change set cannot be applied to (Related Artists that would not fit) neither changes nor
+        # "already matches"; it is reported only among the refusals.
+        for name, counts in summary.items() if plan.refusal is None else ():
             counts["change" if name in changed_fields else "unchanged"] += 1
-        if plan.empty:
+        if plan.empty and plan.refusal is None:
             unchanged += 1
             tracks[str(track.pk)] = [state, "unchanged"]
             continue
         title, artist = track.title, track.artist.name if track.artist_id else ""
-        refusal = _guard_refusal(track, plan)
+        refusal = plan.refusal or _guard_refusal(track, plan)
         move = None
         if not refusal and mover is not None and "category_id" in plan.columns:
             move, refusal = mover.plan(track, plan)
@@ -1061,6 +1146,9 @@ def apply(selection: Selection, ops, token, *, user, previews, file_location=MET
                     continue
                 plan = _plan(track, ops, targets, current_additional=current_additional,
                              current_holidays=current_holidays)
+                if plan.refusal is not None:
+                    refused.append({"id": track_id, "title": title, "artist": artist, "reason": plan.refusal})
+                    continue
                 if plan.empty:
                     unchanged += 1
                     continue

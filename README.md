@@ -43,6 +43,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 - Searchable/filterable library UI with per-track cue points, rotation weight, energy level, and RBDS overrides
 - Bulk metadata and category editing:
   - **Fields:** artist, album, genre, year, composer, publisher, record label, energy, vocal type, end type, rotation weight, Ready to Air and primary category, each explicitly *leave*, *set* or *clear*;
+  - **Related Artists:** *leave*, *set*, *append* or *clear* comma-separated names, deduplicated case-insensitively and never repeating the Track's (resulting) primary Artist; a Track whose list would exceed 500 characters is refused, never truncated;
   - **Memberships:** additional categories and holiday tags are added or removed, never replaced;
   - **Selection:** ticked rows across pages, or an explicitly chosen "every Track matching this filter", up to 1,000 per edit;
   - **Preview first:** every edit previews the exact count and before/after values, then applies only with that preview's single-use token;
