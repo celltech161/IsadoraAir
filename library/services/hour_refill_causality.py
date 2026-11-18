@@ -61,6 +61,19 @@ PHASE_POST_AIR = "post_air"
 # 60 seconds of NET deficit. Never applied at cause-capture time.
 REQUEST_MUSIC_TRIGGER_THRESHOLD_SECONDS = 60
 
+def _engine_vt_phase(engine):
+    """'idle' or the stage of the Voice Track transition that constrains
+    transport (roadmap 2.25 B6: the occurrence-owned lifecycle; the r0144
+    ``_vt`` phase dictionary is retired). Unreadable -> not idle (fail closed)."""
+    observe = getattr(type(engine), "_vtt_observed_phase", None)
+    if observe is None:
+        return "idle"
+    try:
+        return str(observe(engine))
+    except Exception:  # noqa: BLE001 -- an observer never raises into playout
+        return "unknown"
+
+
 
 def request_music_threshold_exceeded(net_deficit_seconds):
     """True only for a net deficit strictly greater than 60 seconds."""
@@ -547,7 +560,7 @@ def eject_evidence_from_engine(engine, deck, *, slot, expected_log_item_id, star
         on_air=bool(getattr(deck, "air_start_recorded", False)),
         paused=bool(getattr(deck, "paused", False)),
         other_live_deck=any(other is not deck for other in engine._live_decks()),
-        vt_phase=(getattr(engine, "_vt", None) or {}).get("phase", "idle"),
+        vt_phase=_engine_vt_phase(engine),
         manual_mode=bool(getattr(engine, "manual_mode", False)),
         remote_dj_owner=getattr(engine, "remote_dj_session", None) is not None,
         mic_live=bool(engine._any_mic_live()),
@@ -819,7 +832,7 @@ def start_next_evidence_from_engine(engine, deck, active, *, occurred_at):
         manual_mode=bool(getattr(engine, "manual_mode", False)),
         remote_dj_owner=getattr(engine, "remote_dj_session", None) is not None,
         mic_live=bool(engine._any_mic_live()),
-        vt_phase=(getattr(engine, "_vt", None) or {}).get("phase", "idle"),
+        vt_phase=_engine_vt_phase(engine),
         seek_in_progress=getattr(deck, "gated_seek", None) is not None,
         occurrence_source=_occurrence_source(deck, log_item),
         on_air=bool(getattr(deck, "air_start_recorded", False)),
@@ -1236,7 +1249,7 @@ def media_failure_evidence_from_engine(engine, deck, error_domain, error_code, *
         fresh=bool(getattr(deck, "air_start_eligible", False)) and not getattr(deck, "continuation_reason", None),
         seek_in_progress=getattr(deck, "gated_seek", None) is not None,
         start_next_active=getattr(engine, "_start_next_active", None) is not None,
-        vt_phase=(getattr(engine, "_vt", None) or {}).get("phase", "idle"),
+        vt_phase=_engine_vt_phase(engine),
         other_live_deck=any(other is not deck for other in engine._live_decks()),
         manual_mode=bool(getattr(engine, "manual_mode", False)),
         remote_dj_owner=getattr(engine, "remote_dj_session", None) is not None,

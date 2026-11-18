@@ -50,6 +50,15 @@ SPEECH_CANCEL_FADE_MS = 50         # D6/D8: audible VT speech cancelled by mic, 
 HOLD_MIN_LEAD_S = 0.120            # a scheduled incoming this close to its admission is treated as on air
 START_NEXT_ADMIT_LEAD_S = 0.150    # Start Next re-admits a held claimed occurrence this far ahead
 
+# -- B6 asynchronous lookups (F13) ----------------------------------------------
+LOOKUP_REFRESH_S = 2.0             # a planning answer older than this is re-requested
+LOOKUP_PLAN_MAX_AGE_S = 30.0       # a (tentative) planning answer older than this is not used
+CONFIG_REFRESH_S = 5.0             # VoiceTrackConfig re-read interval (as r0144's 5 s cache)
+LOOKUP_AUTH_MAX_AGE_S = 3.0        # an outro is authorized only by an answer requested this recently
+LOOKUP_PENDING = "vt_lookup_pending"           # no answer yet: not plannable this poll (never sticky)
+LOOKUP_UNAVAILABLE = "vt_lookup_unavailable"   # the worker could not answer in time / at all
+RECORDING_CHANGED = "recording_changed_after_claim"
+
 OUTRO = "outro"
 INTRO = "intro"
 

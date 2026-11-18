@@ -30,6 +30,15 @@ REPO = Path(__file__).resolve().parents[2]
 QUEUE_RELATED = ("track", "track__artist", "track__category", "track__category__kind", "category", "category__kind")
 
 
+
+def _busy_vt_record():
+    """2.25 B6: a VT transition that owns the next start (the r0144 ``_vt``
+    phase dictionary these cases used is deleted)."""
+    record = eng_module.VtTransitionRecord(41, None, duck_db=-6.0, ramp_s=0.3, gap_s=0.2)
+    record.owns_start = True
+    return record
+
+
 class _NoQueries:
     def __init__(self):
         self.calls = []
@@ -112,7 +121,6 @@ class EjectEvidenceHookTests(TestCase):
         engine = object.__new__(eng_module.PlaybackEngine)
         engine._lock = threading.RLock()
         engine.decks = {"A": None, "B": None}
-        engine._vt = {"phase": "idle"}
         engine._start_next_active = None
         engine._next_triggered = False
         engine.manual_mode = False
@@ -199,7 +207,7 @@ class EjectEvidenceHookTests(TestCase):
             "manual": dict(manual_mode=True),
             "local mic live": dict(mic_live=True),
             "remote dj session": dict(remote_dj_session=SimpleNamespace(slot_id=None)),
-            "voice track": dict(_vt={"phase": "outro_playing", "outgoing_track_id": -1}),
+            "voice track": dict(_vtt=_busy_vt_record()),
         }
         for label, state in cases.items():
             with self.subTest(label):

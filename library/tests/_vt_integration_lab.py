@@ -58,6 +58,9 @@ class IntegrationLab:
         self.rate = rate
         self.lab = Lab(testcase, rate=rate, mic_freq=MIC if mic else None)
         self.engine = self.lab.engine
+        # Roadmap 2.25 B6: the real lookup worker thread (F13), not inline.
+        self.engine._vtt_lookup_inline = False
+        self.testcase.addCleanup(self._stop_lookups)
         self.root = self.lab.root
         self.table = {}             # (track_id, position) -> fake VoiceTrack
         self.lookups = []           # (track_id, position) in lookup order
@@ -68,6 +71,11 @@ class IntegrationLab:
         self.start_calls = []       # (running, start kind)
         self._patch()
         self._seams()
+
+    def _stop_lookups(self):
+        service = self.engine.__dict__.get("_vtt_lookup_service")
+        if service is not None:
+            service.stop(2.0)
 
     # -- seams ---------------------------------------------------------------
     def _patch(self):

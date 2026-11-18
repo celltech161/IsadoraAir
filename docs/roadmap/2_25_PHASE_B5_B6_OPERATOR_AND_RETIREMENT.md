@@ -1,6 +1,6 @@
 # Roadmap 2.25 B5-B6: operator controls, live talent, legacy retirement and observability
 
-Status: **B5 committed (operator controls); B6 follows.** B5 completes the operator side of the approved contract
+Status: **B5-B6 engineering-review gate.** B5 completes the operator side of the approved contract
 (D5, D6, D8, D9, D13; F4, F11) on the integrated B3-B4 lifecycle; B6 deletes the r0144 VT phase machine,
 publishes the lifecycle in `engine_state.json` and moves VoiceTrack/VoiceTrackConfig reads off the GLib
 callbacks (F13). Local engineering only: nothing is published, integrated or deployed.
@@ -75,6 +75,68 @@ start a configured gap after the draining speech ends is suppressed (`previous_s
 delayed, never overlapping -- and, for the intro side, sticky for that transition, which keeps the start so
 the song still lands exactly (music-only plan). One duck controller covers both records.
 
-## 2. B6
+## 2. B6 -- retirement, observability, asynchronous lookups
 
-Pending (separate commit).
+### Legacy retirement
+Deleted: `_vt_maybe_enter`, `_vt_on_fire_eos`, `_vt_handle_outgoing_ended`, `_vt_current`,
+`_vt_advance_to_intro_gap`, `_vt_start_intro_phase`, `_vt_start_incoming_now`, `_vt_complete`, `_vt_abort`,
+the legacy stepper `_vt_ramp_duck_to_db`, the FX-bus `_vt_fire_file`, the `vt_kind` dispatch in
+`_fx_fire_completed`, the `_vt` dictionary and `_vt_lock`, the `_vtt_publish` mirror, and the legacy
+branches in `_handle_deck_finished`, the stuck-deck watchdog, Eject and reload. Kept: `_vt_resolve_audio`
+(media resolution) and `vt_duck_gain` (the curve's element).
+
+| Former reader | Now |
+|---|---|
+| Start Next `busy_voice_track` | D8 (above) |
+| Eject of an empty slot | refused while `_vtt_transport_busy()` |
+| Idle-restart guard | `not _vtt_transport_busy()` |
+| Hour Refill projection / causality (`vt_phase`) | `_engine_vt_phase(engine)` -> `_vtt_observed_phase()`; unreadable fails closed |
+| Deck finished / watchdog / Eject `_finish` | `_vtt_outgoing_finished` only |
+| Reload | `_vtt_abort(..., include_draining=True)` + held occurrence discarded |
+
+### engine_state.json `vt_transition` (additive, version 1)
+Additive key `vt_transition` (version 1): `active`, `phase` (the transport-relevant stage or `idle`),
+`transport_busy`, `current` and `draining` records (seq, stage, outgoing / incoming identity: slot,
+LogItem, Track, generation; incoming `preparing` / `held` / `audible` / `released`; per side `status`
+(`none`, `planned`, `suppressed`, `prepared`, `speaking`, `completed`, `cancelled`, `failed`), `reason`,
+`planned_start_at`, and `started_at` / `ended_at` ONLY when speech really reached its admission; plan
+`segue_at`, `music_at`, `hold_until`, `underlap_s`; `owns_next_start`, `urgent_pending`, `unplanned`),
+`held_occurrence`, the last 4 finished transitions with reasons, worker health (teardown availability,
+lookup worker counters) and the last operator refusals. Wall-clock seconds; no paths, no credentials.
+Stages: `planned`, `commit_pending`, `outro_prepared`, `outro_speaking`, `incoming_preparing`,
+`incoming_held`, `outro_speaking_held`, `intro_speaking_held`, `intro_over_music`, `completing`,
+`draining`, `fallback_pending`.
+
+### Asynchronous lookups (F13)
+`library/services/vt_lookup.py`: one daemon worker, a bounded queue (32, `put_nowait`), de-duplication,
+a bounded cache (256), results stamped with the time their request was ISSUED, older answers never
+replacing newer ones, resolver exceptions as unavailable answers, bounded worker restart (3) then
+"unavailable". The GLib thread only enqueues and reads.
+
+* Planning uses cached answers refreshed every 2 s (tentative; at most 30 s old); no answer -> the side
+  is not plannable this poll (never sticky, never "no recording").
+* At the claim the cached answer plans the admission; an authoritative lookup is issued AFTER the claim.
+  The intro fire is prepared only when the scheduled deck is viable AND that answer exists and matches
+  (same media, same duration); removed -> `recording_unplayable`, replaced -> `recording_changed_after_claim`,
+  not in time -> `vt_lookup_unavailable` (held music re-admitted, U = 0 music on its plan).
+* VoiceTrackConfig is read by the worker every 5 s; until its first answer no transition is planned.
+* Failures: one line per minute and one deduplicated operator event.
+
+* A claimed Track the look-ahead never saw (an operator Swap at the claim) is planned without speech; if
+  its authoritative answer arrives in time and the VT fits the intro window (U = 0), the intro is added
+  at the planned music start without moving the music (`late_intro_upgrade`); otherwise no speech.
+* Abnormal recovery outcomes (exhausted / failed re-admission, exhausted or unplayable fallback) emit one
+  deduplicated operator event per occurrence and kind; ordinary suppression reasons are never reported.
+
+## 3. Test-environment findings (no product change)
+
+* **Active Message playout modules (3 modules, 47 tests):** two stacked environment problems.
+  (1) Order dependence: a `TransactionTestCase` without `serialized_rollback` flushes with `post_migrate`,
+  recreating ContentTypes under new primary keys; the next `serialized_rollback` class collides on
+  `(app_label, model)` in `setUpClass` (reproduced in isolation: Q03). (2) Underneath, every test ingests
+  real media through the validation service, which rejects it `unreadable_container`: ffprobe reopens the
+  passed descriptor as `/proc/self/fd/<n>`, and the validator's Landlock "read beneath /" rule (its own
+  mount namespace) does not cover an inode on the test sandbox's mount (Q01/Q04: 47/47 on r0144 and the
+  candidate). The same cause produces the 44 VoiceTrack `MediaRejected` errors (Q02 diagnostic).
+  Executing them needs a separately authorized runner topology change (a validation service sharing the
+  test sandbox's mount namespace) or a disposable VM -- not a fixture edit, and not a product change.

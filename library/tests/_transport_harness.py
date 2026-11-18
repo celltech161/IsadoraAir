@@ -249,9 +249,11 @@ class TransportHarness:
         engine.mic_live = False
         engine.remote_dj_session = None
         engine.dj_slots = []
-        engine._vt = {"phase": "idle"}
-        engine._vt_lock = threading.Lock()
         engine._fx_lock = threading.Lock()
+        # Roadmap 2.25 B6: VT lookups served inline (synchronously, same
+        # semantics: cache, issue-time freshness, authority) in this harness;
+        # the real-audio IntegrationLab and the B6 suite use the worker thread.
+        engine._vtt_lookup_inline = True
         engine._fx_fires = {}
         engine._fx_next_id = 1
 

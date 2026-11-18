@@ -1894,7 +1894,7 @@ class DedicationStartupGateTests(TransactionTestCase):
 # outgoing outro VT still fires first
 # ---------------------------------------------------------------------
 class DedicationVoiceTrackTests(DedicationFixtureMixin, TransactionTestCase):
-    """Roadmap 2.25 B3/B4: the r0144 entry (_vt_maybe_enter) is retired; the
+    """Roadmap 2.25 B3-B6: the r0144 entry is deleted; the
     same two guarantees are now made by the claim-time decision (D14) and the
     independent outgoing side."""
 
@@ -1923,6 +1923,7 @@ class DedicationVoiceTrackTests(DedicationFixtureMixin, TransactionTestCase):
         VoiceTrack.objects.create(track=song_track, position="intro", filepath=str(vt_path), gain_db=0.0)
 
         stand_in = make_engine_stand_in()
+        stand_in._vtt_lookup_inline = True      # 2.25 B6: the lookup served synchronously here
         live = vtt.LiveContext()
         automatic = vtt.StartKind.AUTOMATIC
         # The spliced dedication intro and its forced follow-up (the song) are protected speech paths.

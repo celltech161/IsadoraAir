@@ -660,7 +660,13 @@ class ConsecutiveTransitionTests(_B5Base, SimpleTestCase):
                 lab, out, inc, deck, zero = self.build(out_len=out_len, out_next=out_next, in_cue=cue,
                                                        in_intro=cue + 4.0, intro_vt=1.2, poll=False)
                 engine = lab.engine
-                engine._vtt_plan = lambda *_a, **_k: None        # the look-ahead could not plan it
+                # The look-ahead read the recording (2.25 B6 cache) but could not
+                # plan the transition: the claim decides it (unplanned start).
+                engine._vtt_config()
+                engine._vtt_cached_voicetrack(inc, "intro")
+                self.assertTrue(wait_until(lambda: engine._vtt_cached_voicetrack(inc, "intro") is not None
+                                           and engine._vtt_config() is not None, 2.0))
+                engine._vtt_plan = lambda *_a, **_k: None
                 lab.poll()
                 a_seg = zero + out_next
                 self.wait_claims(lab, [1, 2], timeout=out_len + 6.0)

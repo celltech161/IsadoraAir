@@ -206,7 +206,6 @@ def _make_real_engine():
     engine._mic_bin = None
     engine._output_slots = {}
     engine._resume_hint = None
-    engine._vt = {"phase": "idle", "outgoing_track_id": None}
     engine.manual_mode = False
     engine._manual_hold_pending = False
     engine._next_triggered = False
@@ -1060,8 +1059,7 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         engine.manual_mode = False
         engine._next_triggered = True
         engine._start_next_track = MagicMock()
-        engine._vt = {"phase": "idle", "outgoing_track_id": None}
-        # loop is what _request_restart tries to quit(); MagicMock keeps
+            # loop is what _request_restart tries to quit(); MagicMock keeps
         # the try/except path a no-op instead of an AttributeError.
         engine.loop = MagicMock()
         _init_policy_restart_attrs(engine)

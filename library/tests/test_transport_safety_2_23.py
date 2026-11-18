@@ -37,14 +37,14 @@ def _plan_and_air_outro(testcase, engine, deck):
     testcase.assertIsNotNone(record, "outro VT transition planned")
     testcase.assertTrue(wait_until(
         lambda: record.outro_fire is not None and record.outro_fire.state == "admitted", 3.0))
-    testcase.assertEqual(engine._vt["phase"], "vt_transition")
+    testcase.assertTrue(engine._vtt_transport_busy())
     return record
 
 
 def _vt_released(engine):
     curve = engine.__dict__.get("_vt2_duck")
     value = 1.0 if curve is None else curve.value_at(engine._vt2_running_ns())
-    return engine.__dict__.get("_vtt") is None and engine._vt.get("phase") == "idle" and abs(value - 1.0) < 1e-3
+    return engine.__dict__.get("_vtt") is None and not engine._vtt_transport_busy() and abs(value - 1.0) < 1e-3
 
 
 class EjectOverlapTests(SimpleTestCase):
@@ -172,7 +172,7 @@ class EjectVoiceTrackTests(SimpleTestCase):
 
     def _assert_vt_finished_cleanly(self):
         self.assertTrue(wait_until(lambda: _vt_released(self.engine), 6.0),
-                        f"VT stranded ({self.engine._vt.get('phase')!r})")
+                        f"VT stranded ({self.engine._vtt_observed_phase()!r})")
 
     def test_eject_vt_outgoing_runs_the_vt_transition_exactly_once(self):
         _deck, record = self._enter_vt()
@@ -358,23 +358,13 @@ class VoiceTrackTimerIdentityTests(SimpleTestCase):
         self.assertEqual(self.h.claims, [1, 10])
         self.assertEqual(self.h.live_ids(), [10])
 
-    def test_a_fire_eos_from_another_sequence_cannot_complete_this_one(self):
-        with self.engine._vt_lock:
-            self.engine._vt = {
-                "phase": "intro_playing", "incoming_vt_fire_id": 5,
-                "outgoing_vt_fire_id": None, "incoming_started": True,
-            }
-        self.engine._vt_on_fire_eos("intro", 99)
-        self.assertEqual(self.engine._vt["phase"], "intro_playing")
-        self.engine._vt_on_fire_eos("intro", 5)
-        self.assertEqual(self.engine._vt["phase"], "idle")
-
-    def test_a_newer_duck_ramp_supersedes_an_older_one(self):
-        self.engine._vt_ramp_duck_to_db(-6.0, 300)
-        pump(0.05)
-        self.engine._vt_ramp_duck_to_db(0.0, 40)
-        pump(0.6)
-        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+    def test_the_r0144_phase_machine_and_its_duck_stepper_are_gone(self):
+        # 2.25 B6: the sequence-guarded legacy EOS dispatch and the GLib duck
+        # stepper these tests characterized were deleted with the phase
+        # machine; the occurrence-owned lifecycle and its one curve own both.
+        for name in ("_vt_on_fire_eos", "_vt_ramp_duck_to_db", "_vt_fire_file"):
+            self.assertFalse(hasattr(type(self.engine), name), name)
+        self.assertNotIn("_vt", self.engine.__dict__)
 
 
 class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
@@ -402,11 +392,10 @@ class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
         self.h.queue({"id": 1, "seconds": 30, "outro_starts": None, "next_start": 25},
                      {"id": 2, "seconds": 8})
         deck = _start(self.engine, "A")
-        with patch.object(type(self.engine), "_vt_maybe_enter",
-                          side_effect=AssertionError("entered")) as entered:
-            self._poll_at(deck, 20.0)
-        entered.assert_not_called()
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        # 2.25 B6: the r0144 entry no longer exists at all.
+        self.assertFalse(hasattr(type(self.engine), "_vt_maybe_enter"))
+        self._poll_at(deck, 20.0)
+        self.assertFalse(self.engine._next_triggered)
 
     def _intro_predicted(self, outro_starts):
         # 2.25 B4 (F1): with or without the outgoing's Outro Starts, the
@@ -417,7 +406,6 @@ class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
         deck = _start(self.engine, "A")
         self._poll_at(deck, 20.0)
         record = self.engine.__dict__.get("_vtt")
-        self.assertIn(self.engine._vt["phase"], ("idle", "vt_transition"))
         self.assertIsNotNone(record)
         self.assertTrue(record.owns_start)
         self.assertIsNotNone(record.plan.intro_start)

@@ -30,6 +30,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
 from library.models import HourRefillCause, HourRefillInstall, HourRefillPolicy, LogItem, PlayEvent, PlaylistLog
+import library.services.engine as eng_module
 from library.services import hour_refill_evidence as evidence_mod
 from library.services import hour_refill_install as inst
 from library.services import hour_refill_projection as proj
@@ -44,6 +45,15 @@ from webrequests.models import SongRequest
 
 REPO = Path(__file__).resolve().parents[2]
 ARMED = override_settings(HOUR_REFILL_INSTALL_ARMED=True)
+
+
+
+def _busy_vt_record():
+    """2.25 B6: a VT transition that owns the next start (replaces the
+    deleted r0144 ``_vt`` phase dictionary)."""
+    record = eng_module.VtTransitionRecord(41, None, duck_db=-6.0, ramp_s=0.3, gap_s=0.2)
+    record.owns_start = True
+    return record
 
 
 class _Forbidden:
@@ -668,9 +678,9 @@ class InstallPathTests(RunnerFixtures, TestCase):
         for attribute, value, reason in (
                 ("manual_mode", True, "manual_mode"), ("remote_dj_session", object(), "remote_dj"),
                 ("_next_triggered", True, "transition_pending"), ("_start_next_active", object(), "start_next"),
-                ("_vt", {"phase": "outro"}, "voice_track"), ("_live_fill_in_progress", True, "live_fill_pending")):
+                ("_vtt", _busy_vt_record(), "voice_track"), ("_live_fill_in_progress", True, "live_fill_pending")):
             with self.subTest(reason):
-                saved = getattr(engine, attribute)
+                saved = engine.__dict__.get(attribute)
                 setattr(engine, attribute, value)
                 try:
                     runner = self.make_runner(engine)

@@ -73,7 +73,6 @@ def stand_in(log, items, *, cursor, deck_index, deck_position, forced=()):
     engine._engine_session_id = "eng-b"
     engine.manual_mode = False
     engine.remote_dj_session = None
-    engine._vt = {"phase": "idle"}
     engine._start_next_active = None
     engine._next_triggered = False
     engine._resume_item = None

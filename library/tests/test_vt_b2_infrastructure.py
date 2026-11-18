@@ -133,24 +133,6 @@ class ScheduledFireTimingTests(_B2Base, SimpleTestCase):
                     errs.append(on - admission)
                 self.settle(lab)
 
-    def test_r0144_vt_fire_loses_the_tail_marker_negative_control(self):
-        """The same tail measurement on the unchanged r0144 _vt_fire_file
-        path: proves the test detects premature EOS retirement."""
-        lab = self.lab()
-        path = lab.media("vt-r0144", vt_segments(1.0))
-        cut = []
-        for _rep in range(2):
-            fired = lab.now()
-            lab.engine._vt_fire_file(str(path), 0.0, "intro")
-            pump(1.6)
-            t = lab.trace()
-            tail_on = t.onset(TAIL, after=fired + 0.5, before=fired + 1.3)
-            tail_end = t.end(TAIL, after=tail_on + 0.02) if tail_on is not None else None
-            heard = 0.0 if tail_on is None else tail_end - tail_on
-            cut.append(MARK - heard)
-            report("FIRE r0144_tail_marker", heard=heard, cut=MARK - heard)
-        self.assertGreater(min(cut), 0.03)
-
     def test_voicetrack_resolution_production_media_and_legacy(self):
         lab = self.lab()
         media = lab.media("vt-pm", vt_segments(0.6), fmt="flac")

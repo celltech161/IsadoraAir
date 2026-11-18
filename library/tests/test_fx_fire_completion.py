@@ -11,7 +11,7 @@ fire, leaking it in self._fx_fires forever (confirmed live: a ~6s cart
 still present in state past 70s).
 
 The fix installs a branch-local pad probe (_fx_install_completion_probe,
-called from both _fx_fire and _vt_fire_file) on the last real element's
+called from _fx_fire) on the last real element's
 src pad before it joins fx_submix, mirroring _create_deck's own
 eos_probe (identical problem, identical fix, already proven safe in
 this exact codebase for self.mixer). On EOS it schedules
@@ -48,8 +48,6 @@ def make_stand_in():
     obj.main_pipeline = MagicMock()
     obj.fx_submix = MagicMock()
     obj.pipeline_sample_rate = 44100
-    obj._vt_lock = threading.Lock()
-    obj._vt = {"phase": "idle"}
     return obj
 
 
@@ -181,60 +179,6 @@ class OrdinaryFxNaturalCompletionTests(TransactionTestCase):
 class VtNaturalCompletionTests(TransactionTestCase):
     def setUp(self):
         self.stand_in = make_stand_in()
-
-    def _fire_vt(self, kind="outro"):
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.write(b"\x00" * 16)
-        tmp.close()
-        with _patched_element_factory():
-            fire_id = self.stand_in._vt_fire_file(tmp.name, 0.0, kind)
-        return fire_id
-
-    def test_vt_completion_invokes_vt_on_fire_eos_before_fx_stop(self):
-        fire_id = self._fire_vt(kind="outro")
-        callback, pad = _capture_completion_probe(self.stand_in, fire_id)
-
-        call_order = []
-        original_vt_on_fire_eos = self.stand_in._vt_on_fire_eos
-
-        def spy_vt_on_fire_eos(kind, fid):
-            # Fire must still be present in _fx_fires at the moment VT
-            # state advances -- _vt_handle_outgoing_ended's own check
-            # (outro_fire_id in self._fx_fires) depends on this.
-            call_order.append(("vt_advance", fid in self.stand_in._fx_fires))
-            return original_vt_on_fire_eos(kind, fid)
-
-        def spy_fx_stop(fid):
-            call_order.append(("fx_stop", fid in self.stand_in._fx_fires))
-            return eng_module.PlaybackEngine._fx_stop(self.stand_in, fid)
-
-        with patch.object(self.stand_in, "_vt_on_fire_eos", side_effect=spy_vt_on_fire_eos), \
-             patch.object(self.stand_in, "_fx_stop", side_effect=spy_fx_stop):
-            callback(pad, _fake_eos_probe_info())
-            _drain_glib_idle_queue()
-
-        self.assertEqual(call_order, [("vt_advance", True), ("fx_stop", True)])
-
-    def test_vt_completion_removes_fire_from_state(self):
-        fire_id = self._fire_vt(kind="intro")
-        callback, pad = _capture_completion_probe(self.stand_in, fire_id)
-
-        callback(pad, _fake_eos_probe_info())
-        _drain_glib_idle_queue()
-
-        self.assertNotIn(fire_id, self.stand_in._fx_fires)
-
-    def test_vt_kind_and_fire_id_passed_correctly(self):
-        fire_id = self._fire_vt(kind="outro")
-        callback, pad = _capture_completion_probe(self.stand_in, fire_id)
-
-        with patch.object(self.stand_in, "_vt_on_fire_eos") as mock_advance:
-            callback(pad, _fake_eos_probe_info())
-            _drain_glib_idle_queue()
-
-        mock_advance.assert_called_once_with("outro", fire_id)
-
 
 class DuplicateCompletionTests(TransactionTestCase):
     def setUp(self):

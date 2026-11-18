@@ -112,6 +112,19 @@ class ItemTiming:
             return None
         return max(0.0, end - (self.cue_in or 0.0))
 
+def _engine_vt_phase(engine):
+    """'idle' or the stage of the Voice Track transition that constrains
+    transport (roadmap 2.25 B6: the occurrence-owned lifecycle; the r0144
+    ``_vt`` phase dictionary is retired). Unreadable -> not idle (fail closed)."""
+    observe = getattr(type(engine), "_vtt_observed_phase", None)
+    if observe is None:
+        return "idle"
+    try:
+        return str(observe(engine))
+    except Exception:  # noqa: BLE001 -- an observer never raises into playout
+        return "unknown"
+
+
 
 @dataclass(frozen=True)
 class DeckState:
@@ -284,7 +297,7 @@ def capture_playback_window(engine, *, now=None):
         manual_mode=bool(getattr(engine, "manual_mode", False)),
         remote_dj=getattr(engine, "remote_dj_session", None) is not None,
         mic_live=mic_live,
-        vt_phase=(getattr(engine, "_vt", None) or {}).get("phase", "idle"),
+        vt_phase=_engine_vt_phase(engine),
         start_next_active=getattr(engine, "_start_next_active", None) is not None,
         next_triggered=bool(getattr(engine, "_next_triggered", False)),
         resume_pending=getattr(engine, "_resume_item", None) is not None,

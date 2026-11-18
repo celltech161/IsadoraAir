@@ -21,9 +21,7 @@ request replacement, 700 Hz intro VT, 900 Hz outro VT, 1200 Hz VT head marker.
 from __future__ import annotations
 
 import math
-import shutil
 import struct
-import subprocess
 import time
 import wave
 from types import SimpleNamespace
@@ -118,18 +116,20 @@ def patch_vt_lookup(testcase, table, *, duck_db=-6.0, ramp_ms=40, gap_ms=200):
 
 
 def spy_fires(harness):
-    """Record every VT fire: kind, file, fire id, running time, decks live at that moment."""
+    """Record every VT fire (2.25 B6: the B2 scheduled-fire path; the r0144
+    FX-bus _vt_fire_file is deleted): direction, file, fire id, running time,
+    decks live at that moment."""
     fires = []
-    original = harness.engine._vt_fire_file
+    original = harness.engine._vt2_prepare_fire
 
-    def spy(filepath, gain_db, kind):
-        fire_id = original(filepath, gain_db, kind)
-        fires.append({"kind": kind, "path": str(filepath), "fire_id": fire_id,
+    def spy(owner, path, gain_db, admission_ns, validated_duration, *args, **kwargs):
+        fire = original(owner, path, gain_db, admission_ns, validated_duration, *args, **kwargs)
+        fires.append({"kind": owner.direction, "path": str(path), "fire_id": owner.fire_id,
                       "running": running_seconds(harness.engine), "live": harness.live_ids(),
                       "manual_mode": harness.engine.manual_mode, "mic_live": harness.engine.mic_live})
-        return fire_id
+        return fire
 
-    harness.engine._vt_fire_file = spy
+    harness.engine._vt2_prepare_fire = spy
     return fires
 
 
@@ -376,7 +376,7 @@ class FailedFireTests(SimpleTestCase):
         ended = max(run for run, level in self.h.tone_series(OUT_HZ) if level >= PRESENT) + 0.01
         self.assertEqual(record.outro_fire.state, "failed")
         self.assertTrue(record.done)
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertEqual(self.engine._vtt_observed_phase(), "idle")
         curve = self.engine.__dict__.get("_vt2_duck")
         self.assertAlmostEqual(1.0 if curve is None else curve.value_at(self.engine._vt2_running_ns()), 1.0,
                                places=3)
@@ -396,8 +396,8 @@ class FailedFireTests(SimpleTestCase):
         pump(3.0)
         start_on = onset(self.h, IN_HZ)
         levels = [lvl for run, lvl in self.h.tone_series(IN_HZ) if start_on and run > start_on + 0.5]
-        report("R4b-B4", incoming_peak_level=max(levels), phase=self.engine._vt["phase"])
-        self.assertEqual(self.engine._vt["phase"], "idle", "r0144: intro_playing forever")
+        report("R4b-B4", incoming_peak_level=max(levels), phase=self.engine._vtt_observed_phase())
+        self.assertEqual(self.engine._vtt_observed_phase(), "idle", "r0144: intro_playing forever")
         self.assertGreater(min(levels), 0.35, "incoming music at unity (r0144: ducked for good)")
         self.assertIsNone(self.engine.__dict__.get("_vtt"), "Start Next no longer busy")
 
@@ -511,7 +511,7 @@ class EntryConditionTests(SimpleTestCase):
         pump(0.3)
         poll_at(self.engine, deck, 20.5)
         poll_at(self.engine, deck, 25.5)   # the ordinary trigger point passes
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertEqual(self.engine._vtt_observed_phase(), "idle")
         self.assertEqual(self.h.claims, [1, 2], "the segue is not suppressed")
         pump(0.5)
         self.assertIsNone(self.engine.__dict__.get("_vtt"))
@@ -608,30 +608,6 @@ class TimingMeasurementTests(SimpleTestCase):
         self.assertEqual(ducked_before_speech, [], "no speechless duck (r0144: 3.1 s)")
         self.assertLess(abs(vt_on - segue), 0.02, "VT at the segue (r0144: 2.4 s late)")
         self.assertLess(abs(in_on - segue), 0.02, "the Next Start segue is kept")
-
-    def test_r10_vt_fire_head_latency_and_truncation(self):
-        """A 150 ms 1200 Hz marker then 700 Hz: how late does a fire become audible
-        after the _vt_fire_file call, and how much of its head survives?"""
-        self._harness({})
-        self.h.play()
-        pump(0.5)
-        wav = write_segments(self.h.root / "head.wav", [(0.15, MARKER_HZ), (0.85, INTRO_HZ)])
-        sources = [("wav", wav)]
-        if shutil.which("flac"):
-            flac = self.h.root / "head.flac"
-            subprocess.run(["flac", "-s", "-f", "-o", str(flac), str(wav)], check=True)
-            sources.append(("flac", flac))
-        for label, path in sources:
-            for attempt in range(4):
-                called = running_seconds(self.engine)
-                self.engine._vt_fire_file(str(path), 0.0, "intro")
-                pump(1.6)
-                heard = onset(self.h, MARKER_HZ, after=called - 0.05)
-                marker = present_seconds(self.h, MARKER_HZ, start=called - 0.05, end=called + 1.5)
-                report("R10", media=label, attempt=attempt,
-                       audible_latency=(heard - called) if heard else -1.0,
-                       marker_seconds_heard=marker, marker_seconds_in_file=0.15)
-                self.assertIsNotNone(heard)
 
     def test_r10b_intro_vt_and_incoming_music_follow_the_plan(self):
         """r0144 ended the VT one silence prime early (music 0.56 s after the VT

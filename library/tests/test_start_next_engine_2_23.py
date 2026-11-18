@@ -438,7 +438,7 @@ class StartNextRefusalTests(_StartNextBase):
         self.deck.started_at = time.time() - 60
         with patch.object(type(self.engine), "_get_deck_position", lambda _s, _d: 3.0):
             self.engine._poll_position()
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertEqual(self.engine._vtt_observed_phase(), "idle")
         self.assertEqual(self.settle()["outcome"], "completed")
         self.assertEqual(self.h.claims, [1, 2])
 
@@ -772,7 +772,7 @@ class StartNextMandatoryIdentityTests(_StartNextBase):
         self.assertIsNone(self.deck.volume_control)
         self.assertFalse(self.engine._next_triggered)
         self.assertFalse(self.engine.manual_mode)
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertEqual(self.engine._vtt_observed_phase(), "idle")
 
     def test_each_missing_binding_is_refused_without_effect(self):
         for field in ("client_request_id", "engine_instance", "expected"):

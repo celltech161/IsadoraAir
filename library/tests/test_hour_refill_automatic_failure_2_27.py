@@ -110,6 +110,15 @@ def post_air(**overrides):
 # 1. Pure classification
 # ---------------------------------------------------------------------------
 
+
+def _busy_vt_record():
+    """2.25 B6: a VT transition that owns the next start (the r0144 ``_vt``
+    phase dictionary these cases used is deleted)."""
+    record = eng_module.VtTransitionRecord(41, None, duck_db=-6.0, ramp_s=0.3, gap_s=0.2)
+    record.owns_start = True
+    return record
+
+
 class AutomaticClassificationTests(SimpleTestCase):
     def test_only_the_engines_two_media_reasons_are_skip_evidence(self):
         self.assertEqual(skip_reason_code("file missing on disk: /x/y.mp3"), "file_missing")
@@ -328,7 +337,6 @@ class HookFixtures:
         engine._poison_skip_identities = []
         engine._poison_reported_identities = set()
         engine.current_log = self.log
-        engine._vt = {"phase": "idle"}
         engine._start_next_active = None
         engine._next_triggered = False
         engine.manual_mode = False
@@ -557,7 +565,7 @@ class MediaFailureHookTests(HookFixtures, TestCase):
     def test_ownership_and_generation_exclusions(self):
         cases = {
             "start next active": (dict(_start_next_active={"request_id": "r"}), {}),
-            "voice track": (dict(_vt={"phase": "outro_playing", "outgoing_track_id": -1}), {}),
+            "voice track": (dict(_vtt=_busy_vt_record()), {}),
             "manual": (dict(manual_mode=True), {}),
             "mic": (dict(mic_live=True), {}),
             "remote dj": (dict(remote_dj_session=SimpleNamespace(slot_id=None, connection_attempt=None)), {}),

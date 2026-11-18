@@ -13,13 +13,13 @@ Run only through production/tests/run_with_validation_service.sh.
 
 from __future__ import annotations
 
-import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
 import library.services.engine as eng_module
+from library.services import vt_transition
 from library.services.vt_audio import FireState
 from library.services.vt_transition import Reason, StartKind
 from library.tests._vt_integration_lab import (
@@ -113,7 +113,7 @@ class OutroTimingTests(_OutroBase, SimpleTestCase):
         self.assertTrue(0.25 < music_on - seg < 1.2, music_on - seg)
         self.assertEqual(lab.engine._vtt_outro_delivery_state(1), "aired")
         self.assertIn(StartKind.AUTOMATIC, [k for _t, k in lab.start_calls])
-        self.assertEqual(lab.engine._vt.get("phase"), "idle")
+        self.assertEqual(lab.engine._vtt_observed_phase(), "idle")
         self.assertAlmostEqual(lab.curve_value(), 1.0, places=3)
 
     def test_outro_44100_wav(self):
@@ -210,9 +210,12 @@ class OutroHoldTests(_OutroBase, SimpleTestCase):
 class OutroEligibilityTests(_OutroBase, SimpleTestCase):
     def test_d7_marker_at_or_after_the_segue_is_suppressed_without_delay(self):
         lab, out, inc, deck, zero = self.scenario(outro_at=8.2)
-        side = lab.engine._vtt_outro_side(deck, eng_module._vtt_track_markers(out.track), None,
-                                          lab.engine._vtt_live_context(), lab.now_ns())
-        self.assertEqual(side[3], Reason.OUTRO_MARKER_AT_OR_AFTER_SEGUE)
+        def side():
+            return lab.engine._vtt_outro_side(deck, eng_module._vtt_track_markers(out.track), None,
+                                              lab.engine._vtt_live_context(), lab.now_ns())
+        # 2.25 B6: the lookup worker answers asynchronously (pending first).
+        self.assertTrue(wait_until(lambda: side()[3] != vt_transition.LOOKUP_PENDING, 2.0))
+        self.assertEqual(side()[3], Reason.OUTRO_MARKER_AT_OR_AFTER_SEGUE)
         self.wait_claims(lab, [1, 2])
         pump(1.0)
         tr = lab.trace()
@@ -262,7 +265,7 @@ class OutroEligibilityTests(_OutroBase, SimpleTestCase):
         self.assertTrue(0.25 < music_on - seg < 1.2, "hold released: ordinary segue, no dead air (R4a inverted)")
         self.assertAlmostEqual(lab.curve_value(), 1.0, places=3)
         self.assertGreater(tr.level(OUT, zero + 7.2, zero + 7.9), 0.37, "program back at unity")
-        self.assertEqual(lab.engine._vt.get("phase"), "idle")
+        self.assertEqual(lab.engine._vtt_observed_phase(), "idle")
 
 
 class OutroOperatorTests(_OutroBase, SimpleTestCase):
@@ -385,22 +388,17 @@ class OutroResumeTests(_OutroBase, SimpleTestCase):
 
 
 class LegacyRetirementTests(_OutroBase, SimpleTestCase):
-    def test_legacy_vt_machine_is_never_entered_and_its_stepper_is_inert(self):
+    def test_legacy_vt_machine_is_deleted_and_never_competes(self):
+        # 2.25 B6: the r0144 entry, phases and duck stepper are deleted (B3
+        # retired them; B6 removes them). Only the occurrence-owned lifecycle
+        # plans this transition and only its curve writes vt_duck_gain.
         lab, out, inc, deck, zero = self.scenario()
         engine = lab.engine
-        self.assertFalse(engine._vt_maybe_enter(deck))
-        phases = set()
-        deadline = time.monotonic() + 10.0
-        while lab.claims != [1, 2] and time.monotonic() < deadline:
-            phases.add(engine._vt.get("phase"))
-            pump(0.05)
-        pump(1.0)
-        self.assertLessEqual(phases, {"idle", "vt_transition"}, phases)
-        self.assertIn("vt_transition", phases, "busy mirrored for Start Next / Hour Refill readers")
-        self.assertIsNotNone(engine.__dict__.get("_vt2_duck"))
-        engine._vt_ramp_duck_to_db(-20.0, 40)
-        pump(0.2)
-        self.assertAlmostEqual(lab.duck_value(), 1.0, places=3)
+        for name in ("_vt_maybe_enter", "_vt_ramp_duck_to_db", "_vt_on_fire_eos"):
+            self.assertFalse(hasattr(type(engine), name), name)
+        self.assertNotIn("_vt", engine.__dict__)
+        self.wait_claims(lab, [1, 2])
+        self.assertEqual(len(list(engine.vt_duck_gain.control_bindings)), 1)
 
     def test_poisoned_vt_teardown_worker_suspends_vt_preparation_with_one_event(self):
         events = []

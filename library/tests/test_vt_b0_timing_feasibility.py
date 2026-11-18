@@ -915,32 +915,6 @@ class R0144DeckTailTests(SimpleTestCase):
         report("F14b summary", n=s["n"], min_cut=s["min"], max_cut=s["max"], mean_cut=s["mean"])
 
 
-class R0144TailTruncationTests(SimpleTestCase):
-    """New finding F14 (B0): r0144 _fx_fire_completed tears a VT/FX branch
-    down on its EOS pad probe. EOS is seen when the last buffer is QUEUED in
-    the aggregator pad, so releasing the pad discards the not-yet-rendered
-    tail. Measured on the unchanged production _vt_fire_file path."""
-
-    def test_r0144_vt_fire_tail_is_cut(self):
-        lab = Lab(self)
-        lab.play()
-        shortfalls = []
-        for fmt in ("wav", "flac"):
-            path = lab.media(f"r0144-tail-{fmt}", vt_segments(0.8), fmt=fmt)
-            for _rep in range(3):
-                fired = lab.now()
-                lab.engine._vt_fire_file(str(path), 0.0, "intro")
-                pump(1.4)
-                trace = lab.trace()
-                on = trace.onset(HEAD, after=fired - 0.05, before=fired + 0.5)
-                end = trace.end(SPEECH, after=on + HEAD_S + 0.05)
-                shortfalls.append(0.8 - (end - on))
-                report(f"F14 r0144_vt_tail fmt={fmt}", heard=end - on, file=0.8, tail_cut=0.8 - (end - on))
-        s = stats(shortfalls)
-        report("F14 summary", n=s["n"], min_cut=s["min"], max_cut=s["max"], mean_cut=s["mean"])
-        self.assertGreater(s["min"], 0.005)     # characterization: the r0144 tail is cut
-
-
 class E12cBoundedPreparationTests(TransitionMixin, SimpleTestCase):
     """12c. A direct-admission incoming whose decode stalls leaves an empty
     deck-mixer pad, and the non-live deck mixer waits on it (F15). The

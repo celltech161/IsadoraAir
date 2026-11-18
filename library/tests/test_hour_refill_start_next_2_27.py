@@ -82,6 +82,15 @@ def observation(**overrides):
 # 1. Pure classification
 # ---------------------------------------------------------------------------
 
+
+def _busy_vt_record():
+    """2.25 B6: a VT transition that owns the next start (the r0144 ``_vt``
+    phase dictionary these cases used is deleted)."""
+    record = eng_module.VtTransitionRecord(41, None, duck_db=-6.0, ramp_s=0.3, gap_s=0.2)
+    record.owns_start = True
+    return record
+
+
 class StartNextClassificationTests(SimpleTestCase):
     def test_the_eligible_cut_is_one_envelope_with_exact_identity(self):
         envelope, reason = classify_start_next_observation(observation())
@@ -245,7 +254,6 @@ class HookFixtures:
         engine = object.__new__(eng_module.PlaybackEngine)
         engine._lock = threading.RLock()
         engine.decks = {"A": None, "B": None}
-        engine._vt = {"phase": "idle"}
         engine._start_next_active = None
         engine._start_next_restoring = None
         engine._next_triggered = True
@@ -412,7 +420,7 @@ class StartNextHookTests(HookFixtures, TestCase):
             "manual": dict(manual_mode=True),
             "remote dj": dict(remote_dj_session=SimpleNamespace(slot_id=None, connection_attempt=None)),
             "local mic": dict(mic_live=True),
-            "voice track": dict(_vt={"phase": "outro_playing", "outgoing_track_id": -1}),
+            "voice track": dict(_vtt=_busy_vt_record()),
         }
         for label, state in at_cut.items():
             with self.subTest(f"{label} at the cut"):

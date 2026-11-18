@@ -101,7 +101,7 @@ class FxFiresStateSerializationTests(TransactionTestCase):
         self.assertGreaterEqual(result[0]["elapsed_seconds"], 0.0)
 
     def test_vt_fires_excluded_no_cart_id(self):
-        # _vt_fire_file's fires always carry cart_id=None -- no
+        # A fire without a cart id (historically the r0144 VT fires) -- no
         # dashboard button to match, must never appear.
         self.stand_in._fx_fires[1] = {"cart_id": None, "vt_kind": "outro", "started_at": time.time()}
         self.assertEqual(self.stand_in._fx_fires_state(), [])
