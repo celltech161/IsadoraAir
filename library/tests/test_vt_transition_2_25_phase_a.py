@@ -537,7 +537,12 @@ class ShortOutgoingTests(SimpleTestCase):
         self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 6.0))
         pump(1.0)
         self.assertIn((1002, "intro"), self.lookups)
-        record = self.engine.__dict__.get("_vtt") or self.engine.__dict__["_vtt_history"][-1]
+        # 2.25 B5: once its incoming is audible the record drains (only its
+        # speech remains) while the next transition may already be planned.
+        record = next(r for r in (self.engine.__dict__.get("_vtt_draining"), self.engine.__dict__.get("_vtt"),
+                                  *reversed(self.engine.__dict__.get("_vtt_history", ())))
+                      if r is not None and r.committed and r.incoming_selection is not None
+                      and r.incoming_selection.get("log_item_id") == 2)
         self.assertTrue(wait_until(lambda: record.intro_fire is not None and record.intro_fire.state == "ended",
                                    2.0), "F8: the 3 s item's successor airs its intro VT")
 

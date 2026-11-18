@@ -405,20 +405,22 @@ class StartNextRefusalTests(_StartNextBase):
         self.deck = _start(self.engine, "A")
         pump(0.4)
 
-    def test_an_active_voice_track_transition_is_refused(self):
-        # Roadmap 2.25 B3: the production poll's planning step prepares the
-        # outro VT (the r0144 _vt_maybe_enter entry is retired). Start Next
-        # stays refused while VT speech is prepared or audible (bounded by
-        # the transition deadlines; the D8 cancel-and-advance policy is B5).
+    def test_an_active_voice_track_transition_is_cancelled_and_start_next_advances_once(self):
+        # Roadmap 2.25 B5 (D8): the production poll's planning step prepares
+        # the outro VT; Start Next is no longer refused busy_voice_track. The
+        # VT speech is cancelled and the established Start Next advances
+        # exactly once (no second claim, no skipped occurrence).
         self.engine._vtt_poll(self.deck)
         record = self.engine.__dict__.get("_vtt")
         self.assertIsNotNone(record)
         self.assertIsNotNone(record.outro_fire)
-        self.assertEqual(self.engine._vt["phase"], "vt_transition")
+        fire = record.outro_fire
         self.send()
-        record = self.last()
-        self.assertEqual((record["outcome"], record["reason"]), ("rejected", "busy_voice_track"))
-        self.assertEqual(self.h.claims, [1])
+        self.assertIn(fire.state, ("cancelled", "ended"))
+        self.assertTrue(record.done)
+        self.assertIn("start_next", [name for _t, name, _d in record.events])
+        self.assertEqual(self.settle()["outcome"], "completed")
+        self.assertEqual(self.h.claims, [1, 2])
 
     def test_a_seek_in_flight_is_refused(self):
         self.deck.gated_seek = {"phase": "seeking"}

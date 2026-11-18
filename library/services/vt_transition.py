@@ -45,6 +45,11 @@ TRANSITION_GRACE_S = 3.0           # transition deadline after its planned end (
 URGENT_FADE_MS = 50                # audible outro limited at the segue for an urgent item (section 5)
 OUTRO_DELIVERY_MEMORY = 512        # bounded in-process outro delivery record (D13)
 
+# -- B5 operator controls ------------------------------------------------------
+SPEECH_CANCEL_FADE_MS = 50         # D6/D8: audible VT speech cancelled by mic, Start Next, operator command
+HOLD_MIN_LEAD_S = 0.120            # a scheduled incoming this close to its admission is treated as on air
+START_NEXT_ADMIT_LEAD_S = 0.150    # Start Next re-admits a held claimed occurrence this far ahead
+
 OUTRO = "outro"
 INTRO = "intro"
 

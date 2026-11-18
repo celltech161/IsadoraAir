@@ -233,7 +233,7 @@ class IntroFailureTests(_IntroBase, SimpleTestCase):
         self.assertIn("readmit", lab.event_names(record))
         self.assertLess(music_on - failed_at, 0.5, "no dead air for U (held music re-admitted)")
         self.assertLess(music_on, a_seg + 1.65 - 0.5)
-        self.assertLess(tr.present(SPEECH, a_seg - 1.0, lab.now()), 0.011)
+        self.assertIsNone(tr.onset(SPEECH, after=a_seg - 1.0), "no sustained speech (leakage-safe)")
         self.assertAlmostEqual(lab.curve_value(), 1.0, places=3)
         starts = [a for a in lab.air_starts if a["log_item_id"] == 2]
         self.assertEqual(len(starts), 1, "one air start (the regenerated generation)")
@@ -516,6 +516,10 @@ class IntroOperatorTests(_IntroBase, SimpleTestCase):
         self.assertLess(tr.present(FOREIGN, command, lab.now()), 0.011)
 
     def test_mic_before_and_during_intro_speech(self):
+        # Roadmap 2.25 B5: the mic hold (Manual) no longer admits the held
+        # claimed song at once (the B4 intermediate behaviour). Speech is
+        # cancelled / faded (D6); the song is held until the mic is released,
+        # then starts as the deferred handoff (no intro VT, D5).
         for offset in (-0.2, 0.3):
             with self.subTest(offset=offset):
                 lab, out, inc, deck, zero = self.build(in_cue=0.25, in_intro=1.75, intro_vt=3.0)
@@ -526,13 +530,19 @@ class IntroOperatorTests(_IntroBase, SimpleTestCase):
                 lab.mic(True)
                 pump(2.0)
                 tr = lab.trace()
-                speech = tr.present(SPEECH, command + 0.07, lab.now())
-                music_on = tr.onset(MUSIC, after=a_seg - 0.5)
-                report("B4-mic", offset=offset, speech_after_command=speech, music_vs_command=music_on - command)
                 self.assertIsNone(tr.onset(SPEECH, after=command + 0.07),
                                   "no recorded speech while a mic is live (D6)")
-                self.assertLess(music_on - command, 0.45, "held music re-admitted at once")
+                self.assertIsNone(tr.onset(MUSIC, after=a_seg - 0.5), "mic hold: the claimed song is held")
+                self.assertEqual(lab.engine._vtt_held_occurrence["log_item"].id, 2)
                 self.assertAlmostEqual(lab.curve_value(), 1.0, places=3)
+                release = lab.now()
+                lab.mic(False)
+                pump(1.2)
+                tr = lab.trace()
+                music_on = tr.onset(MUSIC, after=release)
+                report("B4-mic", offset=offset, music_after_mic_release=music_on - release)
+                self.assertLess(music_on - release, 0.8, "released with the mic hold")
+                self.assertIsNone(tr.onset(HEAD, after=release), "deferred handoff: no intro VT (D5)")
                 lab.lab.stop()
                 lab.engine.running = False
 
@@ -573,14 +583,17 @@ class IntroCycleTests(_IntroBase, SimpleTestCase):
         resources = lab.lab.resources
         lab.settle(0.5)
         self.assertTrue(wait_until(lambda: lab.claims[:4] == [1, 2, 3, 4], 8.0))
-        # Baseline between transitions: one deck, no transition, no fire.
-        self.assertTrue(wait_until(lambda: lab.record() is None and None in engine.decks.values()
-                                   and not engine.__dict__.get("_vt2_fires"), 6.0))
+        # Baseline between transitions: one deck, no live VT fire. (2.25 B5:
+        # the next transition may already be planned while the previous intro
+        # drains, so a planned record is allowed here.)
+        def quiet():
+            return None in engine.decks.values() and not engine.__dict__.get("_vt2_fires") \
+                and engine.__dict__.get("_vtt_draining") is None
+        self.assertTrue(wait_until(quiet, 6.0))
         lab.settle(0.3)
         before = resources()
         self.assertTrue(wait_until(lambda: lab.claims[:9] == list(range(1, 10)), 40.0), lab.claims)
-        self.assertTrue(wait_until(lambda: lab.record() is None and None in engine.decks.values()
-                                   and not engine.__dict__.get("_vt2_fires"), 8.0))
+        self.assertTrue(wait_until(quiet, 8.0))
         lab.settle(0.6)
         after = resources()
         fires = [r.intro_fire for r in lab.history() if r.intro_fire is not None]

@@ -1778,6 +1778,16 @@ class VtTransitionRecord:
         self.deadline_ns = None
         self.done = False
         self.events = []
+        # B5
+        self.incoming_selection = None  # selection context of the claimed incoming (D14, AM accounting)
+        self.urgent_pending = False     # an urgent item was queued behind the claimed incoming (section 5)
+        self.urgent_floor_ns = None     # its re-admission is never before the ordinary segue
+        self.intro_overlap_suppressed = False   # the incoming's intro VT would overlap draining speech (sticky)
+        self.readmit_suspended = False  # a caller is cancelling speech and re-admits itself
+        self.draining = False           # only speech remains: the next transition may be planned
+        self.finish_reason = ""
+        self.created_wall = time.time()
+        self.unplanned_delay_s = None   # intro start after A_seg (or the claim) for an unplanned start
 
     def note(self, now_ns, event, **detail):
         if len(self.events) >= self.MAX_EVENTS:
@@ -7075,6 +7085,9 @@ class PlaybackEngine:
         previous process cannot be surfaced regardless of how it entered
         engine memory (a dedication follow-up placed directly into
         _forced_next_items bypasses the DB-materialization filter)."""
+        held = self._vtt_held_item()
+        if held is not None and not self._is_poison_guarded(held) and _log_item_playable(held)[0]:
+            return held
         for item in self._forced_next_items:
             if self._is_poison_guarded(item):
                 continue
@@ -7115,6 +7128,34 @@ class PlaybackEngine:
         normal cursor/rollover walk -- the caller (_start_next_track)
         uses this to skip web-request scheduling/dedication-insertion
         for an item that's already been through that decision."""
+        # Roadmap 2.25 B5: a CLAIMED occurrence withdrawn from its scheduled
+        # VT admission by a transport hold (Manual, mic hold, pause/seek of
+        # the outgoing) is the next item for the next authorized start --
+        # exactly once, as a forced item (its request scheduling / dedication
+        # decision was already made), never re-claimed or replaced.
+        held = self.__dict__.get("_vtt_held_occurrence")
+        if held is not None:
+            self._vtt_held_occurrence = None
+            item = held["log_item"]
+            self._forced_next_items = [i for i in self._forced_next_items if i.id != item.id]
+            if held.get("active_message_held") is not None:
+                self.__dict__.setdefault("_active_message_held", {})[item.id] = held["active_message_held"]
+            playable, reason = _log_item_playable(item)
+            if self._is_poison_guarded(item):
+                pass
+            elif playable:
+                print(f"  Held occurrence log_item={item.id} handed out ({held.get('reason')})")
+                if held.get("selection"):
+                    self._vtt_held_selection = held["selection"]
+                return item, True
+            else:
+                print(f"  Skipping held occurrence log_item={item.id}: {reason}")
+                emit_event(
+                    category="engine", level="warning", title="Skipped held log item",
+                    detail={"log_item_id": item.id, "reason": reason, "held_for": held.get("reason")},
+                    dedupe_key=f"engine|skip-held|item={item.id}",
+                )
+                self._note_active_message_discard(item)
         # The interrupted occurrence restored at startup precedes EVERYTHING,
         # including forced follow-ups, and is handed out exactly once. It is
         # outside the queue, so no cursor moves; any forced copy of the same
@@ -7259,8 +7300,10 @@ class PlaybackEngine:
         will refuse to select. _is_poison_guarded is the same gate
         _next_queue_item / _peek_playable_at_cursor consult, so the
         preview stays consistent with what actually airs."""
+        held = self._vtt_held_item()
         forced = [
-            it for it in self._forced_next_items
+            it for it in ([held] if held is not None else []) + [
+                i for i in self._forced_next_items if held is None or i.id != held.id]
             if not self._is_poison_guarded(it) and _log_item_playable(it)[0]
         ]
         forced_ids = {it.id for it in forced}
@@ -7356,7 +7399,13 @@ class PlaybackEngine:
         self.__dict__.pop("_claim_contended_item_id", None)
         # Roadmap 2.25 B4: how this occurrence was selected (D14 roles), read
         # by the claim-time VT decision for exactly this LogItem.
-        self._vtt_selection = {"log_item_id": log_item.id, "is_forced": is_forced, "native_held": native_held}
+        self._vtt_selection = {"log_item_id": log_item.id, "is_forced": is_forced, "native_held": native_held,
+                               "active_message_held": held_value}
+        held_selection = self.__dict__.pop("_vtt_held_selection", None)
+        if held_selection and held_selection.get("log_item_id") == log_item.id:
+            # B5: a held claimed occurrence keeps the selection context of its
+            # original hand-out (D14 role), not the forced re-hand-out's.
+            self._vtt_selection = dict(held_selection)
         deck = self._create_deck(slot, log_item)
         if deck is None and self.__dict__.pop("_claim_contended_item_id", None) == log_item.id:
             # The claim could not take the row lock in time: a transient conflict, never a
@@ -7431,6 +7480,9 @@ class PlaybackEngine:
 
     def _next_queue_item_id(self):
         """The id _next_queue_item would hand out next, without consuming anything (forced first)."""
+        held = self._vtt_held_item()
+        if held is not None:
+            return held.id
         if self._forced_next_items:
             return self._forced_next_items[0].id
         if 0 <= self._queue_cursor < len(self.log_items):
@@ -10358,10 +10410,102 @@ class PlaybackEngine:
             self._vtt_start_kind = previous
 
     def _vtt_current(self, seq):
-        record = self.__dict__.get("_vtt")
-        if record is None or record.done or record.seq != seq:
+        """The live record ``seq``: the current transition or the draining one."""
+        for record in self._vtt_records():
+            if record.seq == seq:
+                return record
+        return None
+
+    def _vtt_records(self):
+        """Live transition records: the current one (owns planning/starts)
+        and at most one draining one (only its speech remains, B5)."""
+        records = []
+        for key in ("_vtt", "_vtt_draining"):
+            record = self.__dict__.get(key)
+            if record is not None and not record.done:
+                records.append(record)
+        return records
+
+    def _vtt_held_item(self):
+        held = self.__dict__.get("_vtt_held_occurrence")
+        return held["log_item"] if held else None
+
+    def _vtt_incoming_deck(self, record):
+        """The committed incoming generation while it is held (preparing or
+        scheduled, not yet audible), else None."""
+        if record is None or not record.committed or record.incoming is None or record.incoming_audible:
             return None
-        return record
+        deck = record.incoming.get("deck") or self._vtt_bind_incoming(record)
+        if (
+            deck is None or self.decks.get(deck.slot) is not deck or deck.retirement_started
+            or getattr(deck, "admission_state", None) not in ("preparing", "scheduled")
+        ):
+            return None
+        return deck
+
+    def _vtt_incoming_on_air(self, deck, now_ns=None):
+        """True when a scheduled generation renders now or within
+        HOLD_MIN_LEAD_S: it is treated as already on air (never withdrawn or
+        regenerated). A preparing generation is unlinked and cannot render."""
+        state = getattr(deck, "admission_state", None)
+        if state in (None, "audible"):
+            return True
+        if state != "scheduled":
+            return False
+        now_ns = self._vt2_running_ns() if now_ns is None else now_ns
+        return deck.scheduled_admission_ns - now_ns <= int(vt_transition.HOLD_MIN_LEAD_S * Gst.SECOND)
+
+    def _vtt_speech_busy_until_ns(self, exclude=None):
+        """Running ns at which the live speech of every other record ends
+        (a draining previous transition), or None."""
+        ends = []
+        for record in self._vtt_records():
+            if record is exclude:
+                continue
+            for fire in record.fires():
+                if fire.state in vt_audio.FireState.LIVE:
+                    ends.append(int(fire.admission_ns + round((fire.duration or 0.0) * Gst.SECOND)))
+        return max(ends) if ends else None
+
+    def _vtt_hold_occurrence(self, record, reason, *, manual):
+        """Withdraw a held (never-audible) claimed incoming from its scheduled
+        admission and keep the claimed occurrence as the next item for the
+        next authorized start (B5: Manual, mic hold, pause/seek of the
+        outgoing). The claim is never released or recreated; the retired
+        generation never aired (nothing persisted, no queue advance). Returns
+        "held", "on_air" (too close to admission: it airs) or "not_held"."""
+        deck = self._vtt_incoming_deck(record)
+        if deck is None:
+            return "not_held"
+        now_ns = self._vt2_running_ns()
+        if self._vtt_incoming_on_air(deck, now_ns):
+            record.note(now_ns, "hold_on_air", reason=reason,
+                        admission=round(deck.scheduled_admission_ns / Gst.SECOND, 6))
+            return "on_air"
+        log_item = deck.log_item
+        # Release FIRST: cancelling the intro below must never re-admit it.
+        record.incoming = None
+        record.incoming_audible = True
+        self._vtt_intro_cancel(record, f"incoming_held:{reason}")
+        selection = record.incoming_selection
+        deck.on_scheduled_event = None
+        deck.admission_state = "failed"
+        self._remove_deck(deck, occurrence_terminal=False, termination_reason=f"vt_hold_{reason}")
+        self._vtt_held_occurrence = {
+            "log_item": log_item, "slot": deck.slot, "reason": reason, "since": time.time(),
+            "selection": selection, "seq": record.seq,
+            "active_message_held": (selection or {}).get("active_message_held"),
+        }
+        self._next_triggered = False
+        if manual:
+            # The existing Manual hold: the next Auto release starts it (D5:
+            # an ordinary handoff, no intro VT; it is already claimed anyway).
+            self._manual_hold_pending = True
+        record.note(now_ns, "incoming_held", reason=reason, log_item_id=log_item.id, generation=deck.generation)
+        print(f"  VT transition {record.seq}: claimed log item {log_item.id} held ({reason}) -- "
+              f"it is next for the next authorized start")
+        self._vtt_maybe_finish(record)
+        return "held"
 
     def _vtt_live_context(self):
         try:
@@ -10400,12 +10544,16 @@ class PlaybackEngine:
 
     def _vtt_media_zero_ns(self, deck):
         """Running time at which media position 0 of ``deck`` is rendered,
-        when it is exactly known (a scheduled generation's admission, or an
-        unseeked primed generation's pad offset plus its silence prime).
-        None for seek/resume generations (their mapping is estimated)."""
+        when it is exactly known: a scheduled generation's admission, an
+        unseeked primed generation's pad offset plus its silence prime, or a
+        confirmed seek/resume generation's segment mapping (B5). None when it
+        is not exactly known (VT timing then has no authority)."""
         admission = getattr(deck, "scheduled_admission_ns", None)
         if admission is not None:
             return int(admission)
+        confirmed = deck.__dict__.get("vtt_media_zero_ns") if hasattr(deck, "__dict__") else None
+        if isinstance(confirmed, int) and deck.seeked_at is not None:
+            return confirmed       # a confirmed seek / resume / auto-resume generation (B5)
         if (
             deck.silence_primed and deck.seeked_at is None
             and deck.continuation_reason is None and deck.gated_seek is None
@@ -10566,6 +10714,9 @@ class PlaybackEngine:
         transition of the audible outgoing deck. Bounded work: cached
         VoiceTrack reads, one pure plan, at most a few timers."""
         try:
+            draining = self.__dict__.get("_vtt_draining")
+            if draining is not None:
+                self._vtt_maybe_finish(draining)
             record = self.__dict__.get("_vtt")
             if record is not None:
                 self._vtt_validate(record)
@@ -10633,6 +10784,14 @@ class PlaybackEngine:
                 record.outro_reason = record.outro_reason or "vt_teardown_unavailable"
                 self._vtt_release(record, "vt_teardown_unavailable")
             return
+        if self._vtt_media_zero_ns(deck) is None:
+            # B5 (F11): this generation's media -> running-time mapping is not
+            # exactly known (an unconfirmed seek or resume): no VT timing
+            # authority. The ordinary path owns it; never an estimate.
+            if record is not None:
+                record.outro_reason = record.outro_reason or "timing_unverified"
+                self._vtt_release(record, "timing_unverified")
+            return
         markers = _vtt_track_markers(deck.track)
         next_start = vt_transition.effective_next_start(markers)
         if next_start is None or vt_transition.effective_cue_in(markers) is None:
@@ -10655,7 +10814,29 @@ class PlaybackEngine:
         is_forced = bool(self._forced_next_items) and next_item is self._forced_next_items[0]
         next_role = self._vtt_item_role(next_item, is_forced=is_forced)
         intro_side, inc_markers = self._vtt_predict_intro(next_item, next_role, live)
-        if not outro_side.eligible and not intro_side.eligible:
+        busy_ns = self._vtt_speech_busy_until_ns(exclude=record)
+        overlap = record is not None and record.intro_overlap_suppressed
+        if overlap and intro_side.eligible:
+            intro_side = vt_transition.SideEligibility(vt_transition.INTRO, False, "previous_speech_active")
+        if busy_ns is not None:
+            # B5: a draining previous transition still speaks. Two recorded
+            # voices never overlap, and its speech never delays this one:
+            # a side that cannot start a gap after it is suppressed.
+            gap_ns = int(((record.gap_s if record is not None else self._vtt_config()[2]) or 0.0) * Gst.SECOND)
+            if (
+                outro_side.eligible and (record is None or record.outro_fire is None)
+                and outro_at_ns is not None and outro_at_ns < busy_ns + gap_ns
+            ):
+                outro_reason = "previous_speech_active"
+                outro_side = vt_transition.SideEligibility(vt_transition.OUTRO, False, outro_reason)
+                outro_at_ns = None
+            if intro_side.eligible and segue_ns < busy_ns + gap_ns:
+                intro_side = vt_transition.SideEligibility(vt_transition.INTRO, False, "previous_speech_active")
+                # Sticky for this transition: its speech never returns late, and
+                # the transition keeps the start so the song still lands exactly
+                # (a music-only plan) -- speech never delays progression.
+                overlap = True
+        if not outro_side.eligible and not intro_side.eligible and not overlap:
             if record is not None:
                 record.outro_reason = record.outro_reason or outro_reason
                 self._vtt_release(record, outro_reason or intro_side.reason or "nothing_eligible")
@@ -10674,7 +10855,7 @@ class PlaybackEngine:
         )
         plan = vt_transition.plan_transition(inp)
         if record is None:
-            if plan.outro_start is None and plan.intro_start is None and plan.hold_until is None:
+            if plan.outro_start is None and plan.intro_start is None and plan.hold_until is None and not overlap:
                 # Eligible on paper but nothing to plan (e.g. the urgent rule
                 # suppressed the outro): no record, the ordinary path owns it.
                 return
@@ -10688,6 +10869,7 @@ class PlaybackEngine:
                   f"(outro {'eligible' if outro_side.eligible else outro_reason or '-'}, "
                   f"next intro {'predicted' if intro_side.eligible else intro_side.reason or '-'})")
         record.segue_ns = segue_ns
+        record.intro_overlap_suppressed = record.intro_overlap_suppressed or overlap
         record.outro_media = outro_media
         # Diagnostic only: what the look-ahead predicted (never authorizes speech).
         record.predicted = (
@@ -10698,7 +10880,9 @@ class PlaybackEngine:
             record.outro_reason = outro_reason
         record.plan = plan
         self._vtt_apply_outro_plan(record, plan, now_ns)
-        owns = usable_next and (plan.hold_until is not None or plan.intro_start is not None)
+        owns = usable_next and (
+            plan.hold_until is not None or plan.intro_start is not None or record.intro_overlap_suppressed
+        )
         record.owns_start = owns
         if owns:
             first = plan.intro_start if plan.intro_start is not None else plan.music_at
@@ -10838,6 +11022,16 @@ class PlaybackEngine:
                 self._vtt_mark_outro_delivery(record.out_item_id, "aired")
         else:
             record.intro_fire = fire
+        if state == FS.ADMITTED:
+            live = self._vtt_live_context()
+            talent = "mic_live" if live.mic_live else ("remote_dj_live" if live.remote_dj_live else "")
+            if not talent and not live.auto_mode and owner.direction == vt_transition.INTRO:
+                talent = "manual"
+            if talent:
+                # B5 (D6): a live mic that reached the program without passing
+                # through _apply_mic_mode_hold never meets recorded speech.
+                GLib.idle_add(lambda f=fire, r=talent: (
+                    f.cancel(r, fade_ms=vt_transition.SPEECH_CANCEL_FADE_MS), False)[1])
         if state in (FS.READY, FS.ADMITTED) or state in FS.TERMINAL:
             record.note(now_ns, f"{owner.direction}_{state}", fire_id=owner.fire_id, reason=fire.reason)
         if state in FS.TERMINAL:
@@ -10855,7 +11049,7 @@ class PlaybackEngine:
         """A fire ended without completing (failed / cancelled): release what
         it held (contract section 7): a hold ends now, and held music is
         re-admitted rather than waiting for speech that will not come."""
-        if record.done:
+        if record.done or record.readmit_suspended:
             return
         if direction == vt_transition.OUTRO:
             if record.committed:
@@ -10867,28 +11061,34 @@ class PlaybackEngine:
         else:
             self._vtt_intro_failed(record, state)
 
-    def _vtt_refresh_duck(self, record):
-        """The ONE VT duck controller (D12): the speech-owned curve of this
-        transition's live speech. The r0144 stepper never runs (its only
-        callers are retired); the mic duck (duck_gain) is never touched."""
-        if record.duck_db >= 0.0:
-            return
+    def _vtt_refresh_duck(self, record=None, *, release_ramp_s=None):
+        """The ONE VT duck controller (D12): one speech-owned curve for the
+        live speech of every live record (the current transition and a
+        draining one, B5). The mic duck (duck_gain) is never touched."""
+        records = self._vtt_records()
+        if record is not None and record not in records and not record.done:
+            records.append(record)
+        ref = records[0] if records else record
         intervals = []
-        for fire in record.fires():
-            if fire.state in vt_audio.FireState.LIVE:
-                start = fire.admission_ns / Gst.SECOND
-                intervals.append((start, start + fire.duration))
-        owner = ("vtt", record.seq)
-        ramp_ns = int(record.ramp_s * Gst.SECOND)
+        for rec in records:
+            if rec.duck_db >= 0.0:
+                continue
+            for fire in rec.fires():
+                if fire.state in vt_audio.FireState.LIVE:
+                    start = fire.admission_ns / Gst.SECOND
+                    intervals.append((start, start + fire.duration))
+        owner = ("vtt",)
+        ramp_s = ref.ramp_s if ref is not None else (release_ramp_s or 0.0)
+        ramp_ns = int(ramp_s * Gst.SECOND)
         curve = self.__dict__.get("_vt2_duck")
         if not intervals:
             if curve is not None:
                 curve.release(owner, ramp_ns)
             return
         curve = self._vt2_duck_curve()
-        gain = vt_transition.duck_gain_for(record.duck_db)
+        gain = vt_transition.duck_gain_for(min(rec.duck_db for rec in records))
         points = [(int(round(t * Gst.SECOND)), g)
-                  for t, g in vt_transition.duck_points(intervals, record.ramp_s, gain)]
+                  for t, g in vt_transition.duck_points(sorted(intervals), ramp_s, gain)]
         now_ns = self._vt2_running_ns()
         if points and curve.value_at(now_ns) < 0.999 and points[0][0] > now_ns + 2 * ramp_ns:
             # Ducked now but the next speech is later: release first, re-attack later.
@@ -11035,6 +11235,14 @@ class PlaybackEngine:
         role = self._vtt_item_role(log_item, is_forced=is_forced, native_held=native_held)
         live = self._vtt_live_context()
         intro_side = self._vtt_claimed_intro_side(record, log_item, role, previously_claimed, live)
+        if intro_side.eligible:
+            busy_ns = self._vtt_speech_busy_until_ns(exclude=record)
+            segue_floor = max(record.segue_ns if record.segue_ns is not None else now_ns, now_ns)
+            if record.intro_overlap_suppressed or (
+                busy_ns is not None and segue_floor < busy_ns + int(record.gap_s * Gst.SECOND)
+            ):
+                intro_side = vt_transition.SideEligibility(vt_transition.INTRO, False, "previous_speech_active")
+                record.intro_reason = "previous_speech_active"
         fire = record.outro_fire
         if fire is not None and fire.state in vt_audio.FireState.LIVE:
             outro_side = vt_transition.SideEligibility(vt_transition.OUTRO, True, "", fire.duration)
@@ -11069,6 +11277,8 @@ class PlaybackEngine:
             "slot": slot, "item_id": log_item.id, "track_id": getattr(log_item.track, "id", None),
             "generation": None, "deck": None,
         }
+        selection = self.__dict__.get("_vtt_selection") or {}
+        record.incoming_selection = dict(selection) if selection.get("log_item_id") == log_item.id else None
         if reason:
             record.intro_reason = reason
         self._vtt_apply_outro_plan(record, plan, now_ns)
@@ -11181,14 +11391,15 @@ class PlaybackEngine:
             self._vtt_maybe_finish(record)
         self._vtt_publish()
 
-    def _vtt_readmit(self, record, reason, keep_intro=False):
+    def _vtt_readmit(self, record, reason, keep_intro=False, floor_ns=None):
         """Held music waits for speech that will not come (or comes earlier):
         re-admit the SAME claimed occurrence at once by regeneration (B2/B0
         E09d), re-planning its intro VT when ``keep_intro`` (the incoming's
         own side stays eligible when the outro fails). A failed or exhausted
         re-admission keeps the held generation and its original admission
         (bounded by the plan) -- never a second occurrence, never a queue
-        advance, never an unrelated song with this VT."""
+        advance, never an unrelated song with this VT. ``floor_ns``: never
+        earlier than this running time (the ordinary segue, B5 urgent rule)."""
         inc = record.incoming
         if inc is None or record.incoming_audible:
             return "not_needed"
@@ -11204,15 +11415,19 @@ class PlaybackEngine:
             return "not_needed"      # intro speech is audible: its music follows it as planned
         recording = (record.intro_media or (None, None, 0.0))[0]
         keep = bool(
-            keep_intro and record.plan is not None and record.plan.intro_start is not None
+            keep_intro and not record.urgent_pending
+            and record.plan is not None and record.plan.intro_start is not None
             and recording is not None and recording.playable
             and not vt_transition._live_reason(self._vtt_live_context())
         )
         I = vt_transition.INTRO
         side = (vt_transition.SideEligibility(I, True, "", recording.duration) if keep
                 else vt_transition.SideEligibility(I, False, reason))
+        segue_ns = now_ns + int(vt_transition.REOPEN_LEAD_S * Gst.SECOND)
+        if floor_ns is not None:
+            segue_ns = max(segue_ns, int(floor_ns))
         inp = vt_transition.TransitionInput(
-            segue_at=(now_ns + int(vt_transition.REOPEN_LEAD_S * Gst.SECOND)) / Gst.SECOND,
+            segue_at=segue_ns / Gst.SECOND,
             outro=vt_transition.SideEligibility(vt_transition.OUTRO, False, reason), intro=side,
             incoming_markers=_vtt_track_markers(deck.log_item.track),
             gap_s=record.gap_s, duck_db=record.duck_db, ramp_s=record.ramp_s,
@@ -11327,6 +11542,7 @@ class PlaybackEngine:
         if record.done:
             return
         if any(fire.state in vt_audio.FireState.LIVE for fire in record.fires()):
+            self._vtt_maybe_drain(record)
             return
         plan = record.plan
         if (
@@ -11351,10 +11567,42 @@ class PlaybackEngine:
             return           # ordinary fallback start pending
         self._vtt_finish(record, "complete")
 
+    def _vtt_maybe_drain(self, record):
+        """B5: when only this record's live speech remains (its incoming is
+        audible or it never owned the start), it stops owning planning: the
+        next occurrence's transition may be planned at once, constrained to
+        start a gap after this speech ends (no overlapping voices, one duck
+        controller). Bounded: at most one draining record."""
+        if record.draining or self.__dict__.get("_vtt") is not record:
+            return
+        if record.owns_start and not record.committed:
+            return
+        if record.fallback_pending or self._vtt_intro_pending(record):
+            return
+        if record.committed and record.incoming is not None and not record.incoming_audible:
+            return
+        if (
+            not record.committed and not record.outgoing_ended
+            and record.outro_fire is None and record.outro_prepare_at_ns is not None
+        ):
+            return
+        if not record.committed and not record.outgoing_ended and self._vtt_outgoing_current(record) \
+                and self._leading_deck() is record.out_deck:
+            # Its outgoing is still the leading deck: nothing new to plan yet.
+            return
+        previous = self.__dict__.get("_vtt_draining")
+        if previous is not None and not previous.done:
+            self._vtt_finish(previous, "superseded_draining")
+        record.draining = True
+        self._vtt_draining = record
+        self._vtt = None
+        record.note(self._vt2_running_ns(), "draining")
+
     def _vtt_finish(self, record, reason):
         if record.done:
             return
         record.done = True
+        record.finish_reason = reason
         record.commit_serial += 1
         record.outro_prepare_serial += 1
         record.deadline_serial += 1
@@ -11362,114 +11610,293 @@ class PlaybackEngine:
         for fire in record.fires():
             if fire.state in vt_audio.FireState.LIVE:
                 fire.cancel(reason, fade_ms=50)
-        curve = self.__dict__.get("_vt2_duck")
-        if curve is not None:
-            curve.release(("vtt", record.seq), int(record.ramp_s * Gst.SECOND))
         record.note(self._vt2_running_ns(), "finished", reason=reason)
         if self.__dict__.get("_vtt") is record:
             self._vtt = None
+        if self.__dict__.get("_vtt_draining") is record:
+            self._vtt_draining = None
+        self._vtt_refresh_duck(None, release_ramp_s=record.ramp_s)
         history = self.__dict__.setdefault("_vtt_history", deque(maxlen=8))
         history.append(record)
         print(f"  VT transition {record.seq}: finished ({reason})")
         self._vtt_publish()
 
-    def _vtt_abort(self, reason):
+    def _vtt_abort(self, reason, *, include_draining=False):
         """End the current transition at once (reload, planning error,
-        outgoing replaced). Live speech is cancelled (audible speech fades);
-        the duck is released. A held incoming deck keeps its admission or is
-        removed by the caller (reload)."""
-        record = self.__dict__.get("_vtt")
-        if record is None or record.done:
-            return False
-        record.note(self._vt2_running_ns(), "abort", reason=reason)
-        self._vtt_finish(record, f"aborted:{reason}")
-        return True
+        outgoing replaced, Start Next). Live speech is cancelled (audible
+        speech fades); the duck is released. A held incoming deck keeps its
+        admission or is handled by the caller (reload, Start Next)."""
+        records = self._vtt_records() if include_draining else [
+            r for r in (self.__dict__.get("_vtt"),) if r is not None and not r.done]
+        for record in records:
+            record.note(self._vt2_running_ns(), "abort", reason=reason)
+            self._vtt_finish(record, f"aborted:{reason}")
+        return bool(records)
 
     def _vtt_operator_command(self, op, slot):
-        """Minimum lifecycle safety for Eject/Pause/Resume/Seek touching a
-        transition deck (complete operator policy: B5). True = refused
-        (the caller returns without acting)."""
-        record = self.__dict__.get("_vtt")
-        if record is None or record.done:
-            return False
+        """B5 operator transport policy (F11, D9) for Eject / Pause / Resume /
+        Seek touching a transition deck. True = refused (the caller returns
+        without acting).
+
+        * The held (claimed, not yet audible) incoming: Eject cancels its
+          intro VT and releases it first (B4 order, F10); Pause and Seek are
+          refused -- a not-yet-audible generation has no position to pause or
+          seek (Eject it, or Start Next admits it now).
+        * An audible incoming whose intro speech is still live: that speech is
+          cancelled (no replay); the command then acts as usual.
+        * The outgoing: Eject keeps D9 (the outro completes, then the next).
+          Pause / Seek cancel its outro speech (no replay on resume or
+          re-crossing, D13), and a claimed incoming held for this transition is
+          withdrawn and kept as the next item: a paused or repositioned
+          outgoing is a transport hold, never a reason to admit the next song.
+        """
+        now_ns = self._vt2_running_ns()
         deck = self.decks.get(slot)
         if deck is None:
             return False
-        now_ns = self._vt2_running_ns()
-        inc = record.incoming or {}
-        if deck is inc.get("deck") or (deck.on_scheduled_event is not None
-                                       and deck.on_scheduled_event is record.incoming_callback):
-            if op == "eject":
-                # D9/F10: the ejected incoming's intro VT never continues over
-                # its replacement (a manual start, D5: no intro VT). The
-                # incoming is released FIRST so the cancellation can never
-                # re-admit the occurrence being ejected.
-                record.note(now_ns, "incoming_ejected")
-                record.incoming = None
-                record.incoming_audible = True
-                self._vtt_intro_cancel(record, "incoming_ejected")
+        for record in self._vtt_records():
+            inc = record.incoming or {}
+            is_incoming = deck is inc.get("deck") or (
+                getattr(deck, "on_scheduled_event", None) is not None
+                and deck.on_scheduled_event is record.incoming_callback
+            )
+            if is_incoming and not record.incoming_audible:
+                if op == "eject":
+                    # D9/F10: the incoming is released FIRST so the
+                    # cancellation can never re-admit the ejected occurrence.
+                    record.note(now_ns, "incoming_ejected")
+                    record.incoming = None
+                    record.incoming_audible = True
+                    self._vtt_intro_cancel(record, "incoming_ejected")
+                    self._vtt_maybe_finish(record)
+                    return False
+                if getattr(deck, "admission_state", None) in ("preparing", "scheduled"):
+                    print(f"  [{slot}] {op} refused -- deck is scheduled for a Voice Track transition "
+                          f"(not yet audible)")
+                    record.note(now_ns, "operator_refused", op=op)
+                    self._vtt_note_refusal(op, slot, deck)
+                    return True
+            if is_incoming or (record.committed and record.incoming_audible and deck is self._vtt_record_incoming_deck(record)):
+                record.note(now_ns, "incoming_operator", op=op)
+                self._vtt_intro_cancel(record, f"incoming_{op}")
                 self._vtt_maybe_finish(record)
-                return False
-            if getattr(deck, "admission_state", None) in ("preparing", "scheduled"):
-                print(f"  [{slot}] {op} refused -- deck is scheduled for a Voice Track transition "
-                      f"(not yet audible)")
-                record.note(now_ns, "operator_refused", op=op)
-                return True
-            record.note(now_ns, "incoming_operator", op=op)
-            self._vtt_intro_cancel(record, f"incoming_{op}")
-            return False
-        if deck is record.out_deck:
-            if op == "eject":
-                return False     # D9: handled when the outgoing finishes
-            record.note(now_ns, "outgoing_operator", op=op)
-            fire = record.outro_fire
-            if fire is not None and fire.state in vt_audio.FireState.LIVE:
-                fire.cancel(f"outgoing_{op}", fade_ms=50)
-            record.outro_reason = record.outro_reason or f"outgoing_{op}"
-            if not record.committed:
-                self._vtt_abort(f"outgoing_{op}")
+                continue
+            if deck is record.out_deck:
+                if op == "eject":
+                    continue     # D9: handled when the outgoing finishes
+                record.note(now_ns, "outgoing_operator", op=op)
+                fire = record.outro_fire
+                record.outro_reason = record.outro_reason or f"outgoing_{op}"
+                if record.committed and op in ("pause", "seek"):
+                    self._vtt_hold_occurrence(record, f"outgoing_{op}", manual=False)
+                if fire is not None and fire.state in vt_audio.FireState.LIVE:
+                    fire.cancel(f"outgoing_{op}", fade_ms=vt_transition.SPEECH_CANCEL_FADE_MS)
+                if not record.committed:
+                    self._vtt_abort(f"outgoing_{op}")
+                else:
+                    self._vtt_maybe_finish(record)
+        self._vtt_publish()
         return False
 
+    def _vtt_record_incoming_deck(self, record):
+        """The deck that carries this record's incoming occurrence (any
+        admission state), or None."""
+        inc = record.incoming or {}
+        deck = inc.get("deck")
+        if deck is not None:
+            return deck
+        for candidate in self.decks.values():
+            if candidate is not None and getattr(candidate, "on_scheduled_event", None) is record.incoming_callback \
+                    and record.incoming_callback is not None:
+                return candidate
+        fire = record.intro_fire
+        if fire is not None:
+            for candidate in self.decks.values():
+                if candidate is not None and candidate.slot == fire.owner.deck_slot \
+                        and candidate.generation == fire.owner.deck_generation:
+                    return candidate
+        return None
+
+    def _vtt_note_refusal(self, op, slot, deck):
+        refusals = self.__dict__.setdefault("_vtt_refusals", deque(maxlen=8))
+        refusals.append({"op": op, "slot": slot, "log_item_id": getattr(deck.log_item, "id", None),
+                         "at": time.time(), "reason": "scheduled_for_vt_transition"})
+
     def _vtt_live_talent_changed(self):
-        """Minimum D6 safety (complete policy: B5): a live studio mic or
-        Remote DJ gate cancels not-yet-audible speech and fades audible
-        speech; Manual mode cancels not-yet-audible speech and lets audible
-        speech complete. Held music is re-admitted at once (no dead air)."""
-        record = self.__dict__.get("_vtt")
-        if record is None or record.done:
+        """D6 / F4 and the Manual policy (contract section 8, B5). Called
+        after every studio-mic / Remote DJ gate decision (_apply_mic_mode_hold,
+        so the mic hold's own Auto/Manual decision is already made) and on an
+        operator Manual. Never changes the transport mode itself.
+
+        * A live mic or Remote DJ gate: not-yet-audible speech is cancelled,
+          audible speech fades out in ~50 ms (no recorded speech competes with
+          live talent), new fires are refused while it lasts.
+        * Manual (operator, or the mic hold): no VT is planned or admitted;
+          audible outgoing outro speech completes (it belongs to the program
+          already on air); intro speech of a song that is now held is
+          cancelled.
+        * A claimed incoming still held for its admission: in Manual it is
+          withdrawn and kept as the next item for the next authorized start
+          (never admitted automatically); in Auto (talk-over, the mic hold
+          disabled) its admission stays authorized and is re-admitted at once
+          without VT speech."""
+        records = self._vtt_records()
+        if not records:
             return
         live = self._vtt_live_context()
         talent = live.mic_live or live.remote_dj_live
         if live.auto_mode and not talent:
             return
-        reason = "mic_live" if live.mic_live else ("remote_dj_live" if live.remote_dj_live else "not_auto")
+        reason = "mic_live" if live.mic_live else ("remote_dj_live" if live.remote_dj_live else "manual")
         now_ns = self._vt2_running_ns()
-        record.note(now_ns, "live_talent", reason=reason)
-        for fire in record.fires():
-            if fire.state not in vt_audio.FireState.LIVE:
+        fade = vt_transition.SPEECH_CANCEL_FADE_MS
+        for record in records:
+            record.note(now_ns, "live_talent", reason=reason, auto=live.auto_mode)
+            held = self._vtt_incoming_deck(record)
+            if held is not None and not live.auto_mode:
+                self._vtt_hold_occurrence(record, reason, manual=True)
+            for fire in record.fires():
+                if fire.state not in vt_audio.FireState.LIVE:
+                    continue
+                if now_ns < fire.admission_ns:
+                    fire.cancel(reason, fade_ms=0)
+                elif talent:
+                    fire.cancel(reason, fade_ms=fade)
+            if record.done:
                 continue
-            if now_ns < fire.admission_ns:
-                fire.cancel(reason, fade_ms=0)
-            elif talent:
-                fire.cancel(reason, fade_ms=50)
-        if not record.committed:
-            record.outro_reason = record.outro_reason or reason
-            self._vtt_release(record, reason)
-        else:
-            self._vtt_readmit(record, reason)
-        self._vtt_maybe_finish(record)
+            if not record.committed:
+                record.outro_reason = record.outro_reason or reason
+                self._vtt_release(record, reason)
+            elif self._vtt_incoming_deck(record) is not None and live.auto_mode:
+                self._vtt_readmit(record, reason)
+            self._vtt_maybe_finish(record)
         self._vtt_publish()
 
     def _vtt_queue_changed(self, reason):
         """Queue authority changed (urgent insertion): re-evaluate the urgent
-        rule now instead of at the next poll."""
+        rule now instead of at the next poll (section 5, B5).
+
+        * Not yet committed: the plan is re-made (urgent next: no hold, no
+          intro VT; an outro that cannot end by the segue is suppressed or
+          limited there).
+        * Committed with the claimed song still held for VT speech: recorded
+          speech never extends the boundary ahead of a pending urgent item.
+          Not-yet-audible speech is cancelled; audible speech that is holding
+          the song (an outro past the segue, a long intro's underlap) fades out
+          in ~50 ms; the SAME claimed song is re-admitted at once, never
+          before the ordinary segue. Claim order is unchanged: the urgent item
+          follows it (r0137 cursor contract).
+        * The claimed song already audible: nothing changes (no new
+          interruption of a song on air; intro speech over it completes)."""
         record = self.__dict__.get("_vtt")
         if record is None or record.done:
             return
-        record.note(self._vt2_running_ns(), "queue_changed", reason=reason)
+        now_ns = self._vt2_running_ns()
+        record.note(now_ns, "queue_changed", reason=reason)
         if not record.committed and not record.outgoing_ended and self._vtt_outgoing_current(record):
             self._vtt_plan(record.out_deck, record)
             self._vtt_publish()
+            return
+        if reason != "urgent_insert":
+            return
+        held = self._vtt_incoming_deck(record)
+        plan = record.plan
+        if held is None or plan is None:
+            return
+        if plan.hold_until is None and not (plan.underlap or 0.0) > 0:
+            # The VT does not delay the claimed song (U = 0, no hold): its
+            # speech is not holding anything back; the urgent item follows the
+            # song exactly as in r0137. Nothing changes.
+            record.note(now_ns, "urgent_no_extension")
+            return
+        record.urgent_pending = True
+        fade = vt_transition.SPEECH_CANCEL_FADE_MS
+        floor_ns = None
+        if not record.outgoing_ended and record.segue_ns is not None and self._vtt_outgoing_current(record):
+            floor_ns = record.segue_ns
+        # The cancellations below must not re-plan or re-admit on their own:
+        # this method re-admits once, never earlier than the ordinary segue.
+        faded = False
+        record.readmit_suspended = True
+        try:
+            for fire in record.fires():
+                if fire.state not in vt_audio.FireState.LIVE:
+                    continue
+                audible = now_ns >= fire.admission_ns
+                faded = faded or audible
+                fire.cancel("urgent_pending", fade_ms=fade if audible else 0)
+        finally:
+            record.readmit_suspended = False
+        record.urgent_floor_ns = floor_ns
+        if faded:
+            # Regenerate the held deck only after the ~50 ms fade: deck work on
+            # the GLib thread never stretches the cancellation of live speech.
+            self._vt2_timer_at(now_ns + (fade + 10) * Gst.MSECOND, self._vtt_urgent_readmit, record.seq)
+        else:
+            self._vtt_urgent_readmit(record.seq)
+        self._vtt_publish()
+
+    @_glib_safe(default_return=False)
+    def _vtt_urgent_readmit(self, seq):
+        record = self._vtt_current(seq)
+        if record is None:
+            return False
+        floor_ns = getattr(record, "urgent_floor_ns", None)
+        outcome = self._vtt_readmit(record, "urgent_pending", keep_intro=False, floor_ns=floor_ns)
+        record.note(self._vt2_running_ns(), "urgent_release", outcome=outcome,
+                    floor=None if floor_ns is None else round(floor_ns / Gst.SECOND, 6))
+        self._vtt_maybe_finish(record)
+        self._vtt_publish()
+        return False
+        self._vtt_publish()
+
+    def _vtt_start_next_accepted(self, active, held_deck):
+        """D8 (contract section 8, B5): an accepted Start Next during a VT
+        transition. Every live VT speech is cancelled (~50 ms fade when
+        audible, before admission otherwise). A claimed occurrence still held
+        for its scheduled admission is the incoming of this Start Next: it is
+        re-admitted by regeneration (B2: same occurrence, idempotent claim,
+        accounting at its admission) so its music lands at the fade end
+        ("overlap") or at once ("vt_admit"). Nothing else is claimed, so
+        there is exactly one advance; an occurrence already audible keeps
+        the established 2.23 contract."""
+        records = self._vtt_records()
+        if not records and held_deck is None:
+            return
+        now_ns = self._vt2_running_ns()
+        fade = vt_transition.SPEECH_CANCEL_FADE_MS
+        current = self.__dict__.get("_vtt")
+        for record in records:
+            record.note(now_ns, "start_next", request_id=active.get("request_id"), mode=active.get("mode"))
+        if held_deck is not None and current is not None and self._vtt_incoming_deck(current) is held_deck:
+            # Release FIRST: the cancellations below must never re-plan it.
+            current.incoming = None
+            current.incoming_audible = True
+        for record in records:
+            for fire in record.fires():
+                if fire.state in vt_audio.FireState.LIVE:
+                    fire.cancel("start_next", fade_ms=0 if now_ns < fire.admission_ns else fade)
+        if held_deck is not None:
+            lead_ns = int(vt_transition.START_NEXT_ADMIT_LEAD_S * Gst.SECOND)
+            target = now_ns + lead_ns
+            if active.get("mode") == "overlap":
+                cue = vt_transition.effective_cue_in(_vtt_track_markers(held_deck.track)) or 0.0
+                target = max(target, now_ns + int(round((active["fade_ms"] / 1000.0 - cue) * Gst.SECOND)))
+            if held_deck.scheduled_admission_ns <= target + 20 * Gst.MSECOND:
+                outcome, generation = "kept", held_deck.generation
+            else:
+                outcome, new_deck = self._vt2_reopen_held_occurrence(held_deck.slot, target)
+                generation = new_deck.generation if new_deck is not None else held_deck.generation
+            active["vt_admission"] = {
+                "log_item_id": held_deck.log_item.id, "slot": held_deck.slot, "outcome": outcome,
+                "generation": generation,
+                "admission_in_s": round((target - now_ns) / Gst.SECOND, 3) if outcome == "reopened" else round(
+                    (held_deck.scheduled_admission_ns - now_ns) / Gst.SECOND, 3),
+            }
+            active["incoming"] = {"slot": held_deck.slot, "log_item_id": held_deck.log_item.id}
+            print(f"  Start Next {active.get('request_id')}: held claimed log item {held_deck.log_item.id} "
+                  f"admitted ({outcome})")
+        self._vtt_abort("start_next", include_draining=True)
 
     def _vtt_fires_available(self):
         """Whether VT branches can be safely retired. A poisoned or stopping
@@ -11510,8 +11937,12 @@ class PlaybackEngine:
         readers. The legacy phase names are never written, so no legacy
         branch can act on the new lifecycle."""
         record = self.__dict__.get("_vtt")
+        draining = self.__dict__.get("_vtt_draining")
         busy = False
-        if record is not None and not record.done:
+        if draining is not None and not draining.done and any(
+                fire.state in vt_audio.FireState.LIVE for fire in draining.fires()):
+            busy, record = True, draining
+        elif record is not None and not record.done:
             if any(fire.state in vt_audio.FireState.LIVE for fire in record.fires()):
                 busy = True
             elif record.committed and record.incoming is not None and not record.incoming_audible:
@@ -11591,8 +12022,10 @@ class PlaybackEngine:
         outgoing = None
         if record is not None and not record.done:
             if record.committed:
-                # Another transition still owns an incoming or its speech: one
-                # at a time -- this start stays ordinary (no overlapping voices).
+                # Another transition still owns an incoming: one admission at a
+                # time -- this start stays ordinary (no overlapping voices).
+                return None
+            if record.intro_overlap_suppressed:
                 return None
             if record.outgoing_ended or self._vtt_outgoing_current(record):
                 outgoing = record.out_deck        # e.g. an outro-only transition: the gap applies
@@ -11614,26 +12047,36 @@ class PlaybackEngine:
             if other is not None and not other.finished and not other.retirement_started and not other.paused \
                     and getattr(other, "admission_state", None) in (None, "audible"):
                 outgoing = other
-            duck_db, ramp_s, gap_s = self._vtt_config()
+        segue_ns = now_ns + lead_ns
+        a_seg = None
+        if outgoing is not None and not (record is not None and record.outgoing_ended):
+            out_next = vt_transition.effective_next_start(_vtt_track_markers(outgoing.track))
+            if out_next is not None and self._vtt_media_zero_ns(outgoing) is not None:
+                # Exact mapping only (B5): the ordinary trigger fires about C
+                # before A_seg -- land exactly when that is still ahead.
+                a_seg = self._vtt_running_for_media(outgoing, out_next, now_ns)
+                if now_ns + lead_ns <= a_seg <= now_ns + lead_ns + int((cue + 0.5) * Gst.SECOND):
+                    segue_ns = a_seg
+        duck_db, ramp_s, gap_s = (
+            (record.duck_db, record.ramp_s, record.gap_s) if record is not None else self._vtt_config()
+        )
+        busy_ns = self._vtt_speech_busy_until_ns(exclude=record)
+        if busy_ns is not None and segue_ns < busy_ns + int(gap_s * Gst.SECOND):
+            # A draining previous transition still speaks: never two voices,
+            # and never a delayed start for it -- this start stays ordinary.
+            print(f"  Intro VT of log item {log_item.id} suppressed (previous_speech_active)")
+            return None
+        if record is None:
             seq = self.__dict__.get("_vtt_seq", 0) + 1
             self._vtt_seq = seq
             record = VtTransitionRecord(seq, outgoing, duck_db=duck_db, ramp_s=ramp_s, gap_s=gap_s)
             self._vtt = record
             record.note(now_ns, "unplanned", log_item_id=log_item.id)
+        if a_seg is not None:
+            record.segue_ns = a_seg
         record.commit_kind = kind
         record.intro_media = media
         record.intro_reason = ""
-        segue_ns = now_ns + lead_ns
-        if outgoing is not None and not record.outgoing_ended:
-            out_markers = _vtt_track_markers(outgoing.track)
-            out_next = vt_transition.effective_next_start(out_markers)
-            if out_next is not None:
-                a_seg = self._vtt_running_for_media(outgoing, out_next, now_ns)
-                # The ordinary trigger fires about C before A_seg: land exactly
-                # when that is still ahead; an implausible mapping is ignored.
-                if now_ns + lead_ns <= a_seg <= now_ns + lead_ns + int((cue + 0.5) * Gst.SECOND):
-                    segue_ns = a_seg
-                record.segue_ns = a_seg
         fire = record.outro_fire
         if fire is not None and fire.state in vt_audio.FireState.LIVE:
             outro_side = vt_transition.SideEligibility(vt_transition.OUTRO, True, "", fire.duration)
@@ -11647,6 +12090,8 @@ class PlaybackEngine:
             next_is_urgent=False,
         )
         plan, shift, reason = self._vtt_feasible_plan(inp, now_ns / Gst.SECOND, allow_intro_drop=False)
+        record.unplanned_delay_s = round(plan.intro_start - (a_seg if a_seg is not None else now_ns) / Gst.SECOND, 6) \
+            if plan.intro_start is not None else None
         return self._vtt_bind_plan(record, slot, log_item, plan, now_ns, shift=shift, reason=reason,
                                    unplanned=True)
 
@@ -11667,6 +12112,8 @@ class PlaybackEngine:
         recording, path, gain = record.intro_media or (None, None, 0.0)
         if talent:
             reason = talent
+        elif record.urgent_pending:
+            reason = "urgent_pending"
         elif not path or recording is None or not recording.playable:
             reason = vt_transition.Reason.RECORDING_UNPLAYABLE
         elif not self._vtt_fires_available():
@@ -12016,9 +12463,20 @@ class PlaybackEngine:
         if self._start_next_restore_in_progress():
             self._start_next_reject(record, "busy_restoring")
             return
-        if self._vt.get("phase", "idle") != "idle":
-            self._start_next_reject(record, "busy_voice_track")
+        # Roadmap 2.25 B5 (D8): an active VT transition is no longer a reason
+        # to refuse. A claimed occurrence still held for its scheduled
+        # admission is the operator's "next": it is admitted now (never a
+        # second queue item); speech is cancelled. Only the bounded ordinary
+        # fallback of a failed scheduled admission is briefly refused.
+        vt_record = self.__dict__.get("_vtt")
+        if vt_record is not None and (vt_record.done or vt_record.draining):
+            vt_record = None
+        if vt_record is not None and vt_record.fallback_pending:
+            self._start_next_reject(record, "busy_transition_recovery")
             return
+        vt_held = self._vtt_incoming_deck(vt_record) if vt_record is not None else None
+        if vt_held is not None and self._vtt_incoming_on_air(vt_held):
+            vt_held = None        # renders now or imminently: an ordinary audible incoming
         occupied = [deck for deck in self.decks.values() if deck is not None]
         if any(deck.gated_seek is not None for deck in occupied):
             self._start_next_reject(record, "busy_seek")
@@ -12042,8 +12500,17 @@ class PlaybackEngine:
         if transitional:
             self._start_next_reject(record, "slot_unavailable")
             return
-        if len(live) == 2:
+        if vt_held is not None and vt_held in live and len(live) == 1:
+            if paused:
+                self._start_next_reject(record, "paused_deck_occupies_slot")
+                return
+            # D8: the outgoing is gone (its outro speech held the claimed
+            # song): admit the held occurrence now; nothing is faded.
+            mode, outgoing, incoming = "vt_admit", None, vt_held
+        elif len(live) == 2:
             mode, outgoing, incoming = "overlap", live[0], live[1]
+            if vt_held is not None and outgoing is vt_held:
+                outgoing, incoming = live[1], live[0]
         elif len(live) == 1:
             if paused:
                 self._start_next_reject(record, "paused_deck_occupies_slot")
@@ -12081,7 +12548,7 @@ class PlaybackEngine:
             **record,
             "user_id": data.get("user_id"),
             "mode": mode,
-            "phase": "advancing" if mode == "overlap" else "fading",
+            "phase": "advancing" if mode in ("overlap", "vt_admit") else "fading",
             "release_manual": release_manual,
             "accepted_monotonic": time.monotonic(),
             "fade_ends_at": record["accepted_at"] + (fade_ms / 1000.0 if outgoing else 0.0),
@@ -12095,7 +12562,7 @@ class PlaybackEngine:
             "incoming_slot": (
                 self._other_slot(outgoing.slot) if mode == "fade_and_start" else None
             ),
-            "incoming_attempted": mode == "overlap",
+            "incoming_attempted": mode in ("overlap", "vt_admit"),
             "fade": control,
             # True while this transition owns the pad's controller program;
             # cleared when it hands the pad back (completion, restore, or the
@@ -12112,14 +12579,18 @@ class PlaybackEngine:
         self._start_next_active = active
         token = request_id
         print(f"  Start Next {token}: accepted ({mode}, fade {fade_ms} ms)")
-        # Roadmap 2.25 B3/B4: an accepted Start Next owns the next start; a
-        # merely planned VT transition (nothing prepared -- otherwise this
-        # command was refused busy_voice_track) must never also commit one.
-        self._vtt_abort("start_next")
+        # Roadmap 2.25 B5 (D8): the accepted Start Next owns the next start.
+        # VT speech is cancelled (~50 ms fade), a held claimed occurrence is
+        # admitted (fade end, or now), and no transition commits another.
+        self._vtt_start_next_accepted(active, vt_held)
         # A started (or already-running) next item satisfies any withheld
         # Manual handoff; leaving the hold armed would make a later Auto
         # release start a second item (Phase 0 hazard 9).
         self._manual_hold_pending = False
+
+        if mode == "vt_admit":
+            self._start_next_finish(token)
+            return
 
         if mode == "start_only":
             paused_deck = active["paused_deck"]
@@ -13473,8 +13944,18 @@ class PlaybackEngine:
         existing safe release path rather than stranding it forever --
         an operator-owned Manual (`_manual_from_mic` already False) is
         never touched by this.
+
+        Roadmap 2.25 B5: the VT lifecycle is told AFTER this method's own
+        Auto/Manual decision (finally), so a held claimed incoming is held by
+        a mic hold and re-admitted only in Auto talk-over; the VT never
+        changes the transport mode itself.
         """
-        self._vtt_live_talent_changed()
+        try:
+            self._apply_mic_mode_hold_inner()
+        finally:
+            self._vtt_live_talent_changed()
+
+    def _apply_mic_mode_hold_inner(self):
         self._ptt_auto_manual_enabled = DuckingConfig.load().ptt_auto_manual_enabled
         if not self._ptt_auto_manual_enabled:
             if self._manual_from_mic:
@@ -17201,6 +17682,16 @@ class PlaybackEngine:
             )
             return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
         self._apply_pad_offset(deck.pipeline, internal_position_ns=internal_running_ns)
+        # Roadmap 2.25 B5 (F11): the exact media -> program running-time
+        # mapping of this confirmed generation (media position p renders at
+        # pad offset + internal running time of p). VT timing after a seek,
+        # resume or restart auto-resume uses it instead of an estimate.
+        try:
+            deck.vtt_media_zero_ns = (
+                int(deck.pipeline.get_static_pad("src").get_offset()) + int(internal_running_ns) - int(achieved_ns)
+            )
+        except Exception:
+            deck.vtt_media_zero_ns = None
         deck.seeked_at = time.time()
         deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
         if not was_paused:
@@ -17545,7 +18036,10 @@ class PlaybackEngine:
         _close_old_connections()
         # Roadmap 2.25 B3/B4: the VT transition belonged to the program being
         # replaced: its speech is cancelled and its duck released.
-        self._vtt_abort("reload_current_log")
+        self._vtt_abort("reload_current_log", include_draining=True)
+        # B5: a claimed occurrence held for the replaced program is not next
+        # in the new one (its claim stays; it never aired).
+        self._vtt_held_occurrence = None
         # Roadmap 2.23 Phase 2a: the VT sequence belonged to the program
         # being replaced; without this its timers could later fire its intro
         # VT and start an extra item, and its duck could stay applied.
