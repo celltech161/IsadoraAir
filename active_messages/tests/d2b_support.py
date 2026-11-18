@@ -15,7 +15,8 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-from django.test import override_settings
+from django.core.management import call_command
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 import library.services.engine as eng_module
@@ -59,6 +60,22 @@ def engine_stand_in(current_log=None, log_items=None, cursor=0):
 
 class Playout(RealAudio):
     """Gate open (test-only), isolated library/waveforms, captured commands."""
+
+    @classmethod
+    def _fixture_setup(cls):
+        # Roadmap 2.25 B7 test isolation (test-only). Django 5.2 restores a
+        # serialized_rollback snapshot ONCE per class, at setUpClass, on top
+        # of whatever the previous class left. A preceding TransactionTestCase
+        # WITHOUT serialized rollback flushes with post_migrate, which
+        # recreates ContentTypes / Permissions under NEW primary keys; loading
+        # the snapshot (original keys) over them collides on (app_label,
+        # model) -- the setUpClass errors seen when these modules run after
+        # such a class. Start from an empty database, as the snapshot assumes.
+        if cls.serialized_rollback and not issubclass(cls, TestCase):
+            for db_name in cls._databases_names(include_mirrors=False):
+                call_command("flush", verbosity=0, interactive=False, database=db_name,
+                             reset_sequences=False, inhibit_post_migrate=True)
+        super()._fixture_setup()
 
     def setUp(self):
         super().setUp()
