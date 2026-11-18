@@ -30,7 +30,9 @@ READY_LEAD_S = 0.050               # a fire must be ready this long before admis
 FIRST_AUDIO_GRACE_S = 1.0          # first-audio deadline after admission
 COMPLETION_GRACE_S = 2.0           # completion deadline after V
 SCHEDULED_DECK_READY_S = 0.100     # scheduled deck readiness deadline after open (F15 bound)
-REOPEN_LEAD_S = 0.100              # re-admission lead for a regenerated held occurrence
+REOPEN_LEAD_S = 0.150              # re-admission lead for a regenerated held occurrence (B7: measured,
+                                   # readiness <= 53 ms in every representative load; 100 ms missed
+                                   # READY_LEAD_S under a busy GLib loop -- see the B7 qualification doc)
 REOPEN_MAX_ATTEMPTS = 2
 
 # -- B3/B4 integration (engine transition coordinator) --------------------------
