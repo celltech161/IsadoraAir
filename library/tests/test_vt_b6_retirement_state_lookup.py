@@ -230,6 +230,38 @@ class ThreadedLookupTests(_ThreadedBase, SimpleTestCase):
         self.assertIn(record.intro_reason, (vt_transition.Reason.RECORDING_UNPLAYABLE, "recording_unplayable"))
         self.assertLess(music_on - a_seg, 0.6, "held music re-admitted, no 1.65 s underlap for nothing")
 
+    def test_a_pre_claim_answer_never_authorizes_a_recording_removed_at_the_claim(self):
+        # The authoritative (post-claim) answer is slow; the only cached answer
+        # at deck readiness predates the claim and still says "playable". It
+        # must not authorize speech: the VT is suppressed at the deadline.
+        state = {"claimed": False}
+
+        def wrap(resolve):
+            def resolver(key, payload):
+                if key[0] == "vt" and state["claimed"]:
+                    time.sleep(2.5)
+                    return vt_transition.Recording(attached=False), None, 0.0
+                return resolve(key, payload)
+            return resolver
+
+        lab, out, inc, deck, zero = self.build_threaded(wrap=wrap, intro_vt=1.2)
+        engine = lab.engine
+        original = engine._claim_playback_occurrence
+
+        def claim_then_remove(item):
+            if item.id == 2:
+                state["claimed"] = True
+            return original(item)
+        engine._claim_playback_occurrence = claim_then_remove
+        a_seg = zero + 8.0
+        self.wait_claims(lab, [1, 2])
+        self.assertTrue(wait_until(lambda: lab.now() > a_seg + 1.5, 8.0))
+        tr = lab.trace()
+        record = lab.last_record()
+        report("B6-pre-claim-answer", intro_reason=record.intro_reason)
+        self.assertIsNone(tr.onset(HEAD, after=a_seg - 1.0), "an answer requested before the claim never authorizes")
+        self.assertEqual(record.intro_reason, vt_transition.LOOKUP_UNAVAILABLE)
+
     def test_a_slow_database_never_holds_the_transition(self):
         state = {"claimed": False}
 
@@ -349,6 +381,11 @@ class StatePublicationTests(_IntroBase, SimpleTestCase):
         text = self.assert_safe(done)
         self.assertEqual(done["recent"][0]["intro"], "completed")
         self.assertEqual(done["phase"], "idle")
+        lookups = done["workers"]["lookups"]
+        self.assertIsNotNone(lookups, "the lookup worker's health is published")
+        self.assertTrue(lookups["alive"])
+        self.assertFalse(lookups["unavailable"])
+        self.assertTrue(done["workers"]["teardown_available"])
         report("B6-state-sample", stage_held=held["current"]["stage"], stage_speaking=speaking["current"]["stage"],
                stage_over=stage, final_bytes=len(text))
         print("\nVT-STATE-SAMPLE " + json.dumps({"held": held, "speaking": speaking, "done": done}, sort_keys=True),

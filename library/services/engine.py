@@ -12123,7 +12123,7 @@ class PlaybackEngine:
         held = self.__dict__.get("_vtt_held_occurrence")
         teardown = self.__dict__.get("_vt2_teardown")
         snapshot = teardown.snapshot() if teardown is not None else None
-        service = self.__dict__.get("_vtt_lookups")
+        service = self.__dict__.get("_vtt_lookup_service")
         history = list(self.__dict__.get("_vtt_history", ()))[-4:]
         return {
             "version": self.VTT_STATE_VERSION,

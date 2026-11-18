@@ -711,6 +711,29 @@ class CommandRaceTests(_B5Base, SimpleTestCase):
         self.assertIsNotNone(tr.onset(THIRD, after=command_at))
         self.assertIsNone(lab.record())
 
+    def test_eject_of_a_held_incoming_during_long_intro_speech_never_reopens_it(self):
+        # Workorder 7 / F10 (B4 order): the held, never-audible incoming is
+        # released BEFORE its intro is cancelled, so the cancellation can never
+        # re-admit the ejected occurrence through the readmission callback.
+        lab, out, inc, deck, zero = self.underlap()
+        engine = lab.engine
+        third = lab.item(3, [(5.0, THIRD)], name="b5-eject-held")
+        engine.log_items.append(third)
+        a_seg = zero + 8.0
+        self.wait_claims(lab, [1, 2])
+        self.assertTrue(wait_until(lambda: lab.now() >= a_seg + 0.4, 10.0))
+        held = lab.deck_of(2)
+        self.assertEqual(held.admission_state, "scheduled")
+        command_at = lab.now()
+        engine._eject_deck(held.slot)
+        pump(2.5)
+        tr = lab.trace()
+        report("B5-eject-held", speech_end_after=self.speech_end(tr, SPEECH, command_at) - command_at)
+        self.assertLess(self.speech_end(tr, SPEECH, command_at) - command_at, FADE_LIMIT)
+        self.assertIsNone(tr.onset(MUSIC, after=a_seg - 0.5), "the ejected occurrence never airs")
+        self.assertEqual(self.air_starts(lab, 2), [])
+        self.assertIsNotNone(tr.onset(THIRD, after=command_at), "the Eject replacement starts")
+
     def test_manual_then_start_next_then_auto_within_one_transition(self):
         lab, out, inc, deck, zero = self.underlap()
         engine = lab.engine
