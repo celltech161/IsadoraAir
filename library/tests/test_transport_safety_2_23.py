@@ -27,6 +27,25 @@ def _start(engine, slot):
     return engine.decks[slot]
 
 
+def _plan_and_air_outro(testcase, engine, deck):
+    """Roadmap 2.25 B3: the production poll's planning step for ``deck``,
+    then wait until its outro VT is audible (the r0144 _vt_maybe_enter entry
+    is retired; this is the integrated replacement)."""
+    engine._vtt_poll(deck)
+    record = engine.__dict__.get("_vtt")
+    testcase.assertIsNotNone(record, "outro VT transition planned")
+    testcase.assertTrue(wait_until(
+        lambda: record.outro_fire is not None and record.outro_fire.state == "admitted", 3.0))
+    testcase.assertEqual(engine._vt["phase"], "vt_transition")
+    return record
+
+
+def _vt_released(engine):
+    curve = engine.__dict__.get("_vt2_duck")
+    value = 1.0 if curve is None else curve.value_at(engine._vt2_running_ns())
+    return engine.__dict__.get("_vtt") is None and engine._vt.get("phase") == "idle" and abs(value - 1.0) < 1e-3
+
+
 class EjectOverlapTests(SimpleTestCase):
     """E1-E4, E6, E9: Eject never consumes an extra occurrence while the
     next item is already entering the program."""
@@ -148,55 +167,42 @@ class EjectVoiceTrackTests(SimpleTestCase):
     def _enter_vt(self):
         deck = _start(self.engine, "A")
         pump(0.4)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
-        self.assertEqual(self.engine._vt["phase"], "outro_playing")
-        self.assertTrue(wait_until(
-            lambda: self.engine.vt_duck_gain.get_property("volume") < 0.6, 1.0))
-        return deck
+        return deck, _plan_and_air_outro(self, self.engine, deck)
 
     def _assert_vt_finished_cleanly(self):
-        self.assertTrue(
-            wait_until(lambda: self.engine._vt.get("phase") == "idle", 6.0),
-            f"VT stranded in {self.engine._vt.get('phase')!r}",
-        )
-        self.assertTrue(wait_until(
-            lambda: abs(self.engine.vt_duck_gain.get_property("volume") - 1.0) < 1e-6, 1.0),
-            "program left VT-ducked")
+        self.assertTrue(wait_until(lambda: _vt_released(self.engine), 6.0),
+                        f"VT stranded ({self.engine._vt.get('phase')!r})")
 
     def test_eject_vt_outgoing_runs_the_vt_transition_exactly_once(self):
-        self._enter_vt()
+        _deck, record = self._enter_vt()
         self.engine._eject_deck("A")
-        pump(0.2)
-        # The incoming item waits for the outro VT, gap and intro VT.
-        self.assertEqual(self.h.claims, [1], "Eject bypassed the VT transition")
+        pump(0.1)
+        # D9 (2.25): the outro VT completes, then the incoming. The incoming
+        # occurrence is claimed now and held (scheduled admission) -- never
+        # audible before the outro ends.
+        self.assertEqual(self.h.claims, [1, 2])
+        incoming = next(d for d in self.engine.decks.values() if d is not None)
+        self.assertIn(incoming.admission_state, ("preparing", "scheduled"), "Eject bypassed the VT transition")
         self._assert_vt_finished_cleanly()
         pump(0.5)
         self.assertEqual(self.h.claims, [1, 2])
         self.assertEqual(self.h.live_ids(), [2])
+        self.assertEqual(record.outro_fire.state, "ended")
 
     def test_eject_of_an_empty_slot_during_the_vt_gap_does_not_double_start(self):
         self._enter_vt()
         self.engine._eject_deck("A")
-        self.assertTrue(wait_until(
-            lambda: self.engine._vt.get("phase") in ("outro_tail", "inter_gap"), 2.0))
-        self.engine._eject_deck("B")
+        pump(0.1)
+        self.assertIsNone(self.engine.decks["A"])
+        self.engine._eject_deck("A")      # delayed Eject of the now-empty outgoing slot
         self.engine._eject_deck("A")
         self._assert_vt_finished_cleanly()
         pump(0.6)
         self.assertEqual(self.h.claims, [1, 2], "VT timer and Eject both started an item")
 
     def test_eject_of_the_incoming_deck_during_its_intro_vt_releases_the_duck(self):
-        # Characterization (E8, unchanged): the replacement starts; the intro VT
-        # completes the sequence and releases the duck when it ends.
-        self._enter_vt()
-        self.engine._eject_deck("A")
-        self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 6.0))
-        incoming_slot = next(s for s, d in self.engine.decks.items() if d is not None)
-        if self.engine._vt.get("phase") == "intro_playing":
-            self.engine._eject_deck(incoming_slot)
-        self._assert_vt_finished_cleanly()
-        pump(0.5)
-        self.assertLessEqual(len(self.h.live_ids()), 1)
+        # E8 becomes a correctness assertion in 2.25 B4 (intro side, F10).
+        self.skipTest("intro side: converted in roadmap 2.25 B4")
 
 
 class VoiceTrackNaturalTransitionTests(SimpleTestCase):
@@ -219,18 +225,21 @@ class VoiceTrackNaturalTransitionTests(SimpleTestCase):
 
     def test_the_teardown_tick_cannot_bypass_or_duplicate_the_vt_incoming_start(self):
         deck = _start(self.engine, "A")
-        pump(0.35)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
+        pump(0.05)
+        record = _plan_and_air_outro(self, self.engine, deck)
         self.assertTrue(wait_until(lambda: self.engine.decks["A"] is None, 3.0))
-        self.assertIn(self.engine._vt["phase"], ("outro_tail", "inter_gap"))
-        # Outro VT still talking (outro_tail), then the gap: no music yet.
-        pump(0.5)
-        self.assertEqual(self.h.claims, [1], "music started under the outro VT / gap")
-        self.assertTrue(wait_until(lambda: self.engine._vt.get("phase") == "idle", 6.0))
-        pump(0.8)
+        # The outro VT outlasts the outgoing (dry speech): the incoming is
+        # claimed by the transition and HELD until the outro ends (D3).
+        pump(0.1)
         self.assertEqual(self.h.claims, [1, 2])
+        incoming = self.engine.decks["B"] or self.engine.decks["A"]
+        self.assertIn(incoming.admission_state, ("preparing", "scheduled"),
+                      "music started under the outro VT")
+        self.assertEqual(record.outro_fire.state, "admitted")
+        self.assertTrue(wait_until(lambda: _vt_released(self.engine), 6.0))
+        pump(0.8)
+        self.assertEqual(self.h.claims, [1, 2], "the teardown tick started a second item")
         self.assertEqual(self.h.live_ids(), [2])
-        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
 
 
 class VoiceTrackWatchdogTests(SimpleTestCase):
@@ -257,18 +266,22 @@ class VoiceTrackWatchdogTests(SimpleTestCase):
     def test_watchdog_retirement_of_the_vt_outgoing_deck_keeps_the_vt_transition(self):
         deck = _start(self.engine, "A")
         pump(0.3)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
+        record = _plan_and_air_outro(self, self.engine, deck)
         deck.mark_milestone("A_DECODER_AUDIO_EOS")   # an EOS that was never handled
         pump(0.1)
         self.engine._check_stuck_decks()
-        pump(0.3)
-        self.assertEqual(self.h.claims, [1], "the watchdog bypassed the VT transition")
-        self.assertEqual(self.h.occupants(), {"A": None, "B": None})
-        self.assertTrue(wait_until(lambda: self.engine._vt.get("phase") == "idle", 6.0),
-                        f"VT stranded in {self.engine._vt.get('phase')!r}")
+        pump(0.2)
+        # Same hand-over as a natural EOS: the outro completes, the incoming
+        # is held for it -- never started next to it.
+        self.assertIsNone(self.engine.decks["A"])
+        self.assertEqual(self.h.claims, [1, 2])
+        incoming = self.engine.decks["B"]
+        self.assertIn(incoming.admission_state, ("preparing", "scheduled"),
+                      "the watchdog bypassed the VT transition")
+        self.assertTrue(wait_until(lambda: _vt_released(self.engine), 6.0))
         pump(0.6)
         self.assertEqual(self.h.claims, [1, 2])
-        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+        self.assertEqual(record.outro_fire.state, "ended")
 
 
 class VoiceTrackTimerIdentityTests(SimpleTestCase):
@@ -298,24 +311,24 @@ class VoiceTrackTimerIdentityTests(SimpleTestCase):
     def test_reload_during_the_vt_gap_cannot_fire_a_stale_vt_or_extra_item(self):
         deck = _start(self.engine, "A")
         pump(0.3)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
-        self.engine._eject_deck("A")   # outgoing ends -> outro_tail -> inter_gap
-        self.assertTrue(wait_until(lambda: self.engine._vt.get("phase") == "inter_gap", 2.0))
+        _plan_and_air_outro(self, self.engine, deck)
+        self.engine._eject_deck("A")   # outgoing ends: the incoming is held for the outro
+        self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 2.0))
         self.engine._dispatch_engine_command({"command": "reload_current_log"})
-        pump(2.0)
-        self.assertEqual(self.h.claims, [1, 10], "a stale VT timer started an extra item")
-        self.assertEqual(self.engine._vt.get("phase"), "idle")
-        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+        pump(2.5)
+        self.assertEqual(self.h.claims, [1, 2, 10], "a stale VT timer started an extra item")
+        self.assertEqual(self.h.live_ids(), [10])
+        self.assertTrue(_vt_released(self.engine))
 
     def test_reload_during_the_outro_releases_the_vt_and_its_duck(self):
         deck = _start(self.engine, "A")
         pump(0.3)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
+        record = _plan_and_air_outro(self, self.engine, deck)
         pump(0.2)
         self.engine._dispatch_engine_command({"command": "reload_current_log"})
         pump(1.5)
-        self.assertEqual(self.engine._vt.get("phase"), "idle")
-        self.assertAlmostEqual(self.engine.vt_duck_gain.get_property("volume"), 1.0)
+        self.assertTrue(_vt_released(self.engine))
+        self.assertEqual(record.outro_fire.state, "cancelled")
         self.assertEqual(self.h.claims, [1, 10])
         self.assertEqual(self.h.live_ids(), [10])
 
@@ -339,9 +352,10 @@ class VoiceTrackTimerIdentityTests(SimpleTestCase):
 
 
 class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
-    """2.25 hypothesis, characterized only (no behaviour change in 2.23):
-    VT entry requires the OUTGOING track's outro marker, so an incoming-only
-    intro VT never airs after a track without one."""
+    """2.23 characterized the r0144 dependency of VT entry on the OUTGOING's
+    outro marker (2.25 F1). Since 2.25 B3 the r0144 entry is retired: the
+    outgoing marker alone never enters a legacy phase or claims the next
+    start (intro behaviour: 2.25 B4)."""
 
     def setUp(self):
         self.h = TransportHarness(self)
@@ -368,13 +382,14 @@ class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
         entered.assert_not_called()
         self.assertEqual(self.engine._vt["phase"], "idle")
 
-    def test_vt_is_entered_once_the_outgoing_has_an_outro_marker(self):
+    def test_an_outgoing_outro_marker_without_an_outro_vt_takes_no_ownership(self):
         self.h.queue({"id": 1, "seconds": 30, "outro_starts": 18.0, "next_start": 25},
                      {"id": 2, "seconds": 8})
         deck = _start(self.engine, "A")
         self._poll_at(deck, 20.0)
-        self.assertEqual(self.engine._vt["phase"], "outro_playing")
-        self.assertTrue(self.engine._next_triggered)
+        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertFalse(self.engine._next_triggered)
+        self.assertIsNone(self.engine.__dict__.get("_vtt"))
 
 
 class OrdinaryAutomaticTransitionRegressionTests(SimpleTestCase):

@@ -4,10 +4,14 @@ _transport_harness.py: real decodebin decks, silence prime, audiomixer request
 pads, the real VT state machine and GLib timers, real VT fires through the FX
 submix).
 
-CHARACTERIZATION ONLY. Every test here asserts the CURRENT r0144 behaviour --
-the defect -- so it passes on r0144 and documents exactly what Phase B must
-change. Phase B inverts each assertion into the transition contract (and keeps
-these scenarios as its negative controls). Nothing here changes the engine.
+Phase A characterized the r0144 defects (each test asserted the defect and
+passed on r0144). Roadmap 2.25 B3/B4 convert them into PERMANENT correctness
+assertions where B3/B4 implement the behaviour; the r0144 defect assertions
+remain in git history (6ad5222) as the negative-control record.
+
+B3 (outgoing side): R4a, R6, R9 and R11 are converted. The intro-side
+characterizations drove the retired r0144 entry (_vt_maybe_enter) and are
+skipped until B4 converts them (B4_PENDING).
 
 Signals (whole-bin Goertzel at multiples of 100 Hz, 10 ms program buffers):
 400 Hz outgoing music, 500 Hz incoming music, 300 Hz urgent insert, 600 Hz
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import math
 import shutil
+import unittest
 import struct
 import subprocess
 import time
@@ -33,6 +38,7 @@ from gi.repository import GLib  # noqa: E402
 from django.test import SimpleTestCase  # noqa: E402
 
 import library.services.engine as eng_module  # noqa: E402
+from library.services import vt_transition  # noqa: E402
 from library.tests._transport_harness import (  # noqa: E402
     RATE,
     TransportHarness,
@@ -69,6 +75,8 @@ INCIDENT_2026_11_16 = {
 }
 
 OUT_HZ, IN_HZ, URGENT_HZ, REQUEST_HZ, INTRO_HZ, OUTRO_HZ, MARKER_HZ = 400, 500, 300, 600, 700, 900, 1200
+B4_PENDING = unittest.skip("intro side: the r0144 entry (_vt_maybe_enter) is retired in roadmap 2.25 B3; "
+                           "this characterization becomes a correctness assertion in B4")
 PRESENT = 0.05   # Goertzel amplitude; a 0.4-amplitude tone reads ~0.4, a -6 dB duck ~0.2
 POLL_STUBS = ("_check_commands", "_check_stuck_decks", "_reload_queue_if_changed",
               "_sweep_active_message_queue", "_warm_track_cache")
@@ -207,6 +215,7 @@ class R1IncidentExactMarkersTests(SimpleTestCase):
                         intro_until=spec["intro_until"] or 0.0)
         self.h.play()
 
+    @B4_PENDING
     def test_incident_markers_never_evaluate_the_incoming_intro_vt(self):
         deck = self.engine._start_next_track(slot="A") or self.engine.decks["A"]
         pump(0.3)
@@ -217,6 +226,7 @@ class R1IncidentExactMarkersTests(SimpleTestCase):
         self.assertEqual(self.h.claims, [1, 2], "the ordinary trigger started '99 Mustang")
         self.assertEqual(self.fires, [], "the valid intro VT did not air")
 
+    @B4_PENDING
     def test_control_the_same_pair_is_evaluated_once_the_outgoing_has_an_outro_marker(self):
         # Negative control for the dependency itself: only the OUTGOING marker changed.
         set_markers(self.items[0], outro_starts=250.0)
@@ -244,6 +254,7 @@ class R1IncidentRealTimeTests(SimpleTestCase):
         start_poll_loop(self, self.engine)
         self.h.play()
 
+    @B4_PENDING
     def test_valid_intro_vt_never_reaches_program_after_an_unmarked_outgoing(self):
         self.engine._start_next_track(slot="A")
         self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 14.0))
@@ -281,6 +292,7 @@ class WrongOccurrenceTests(SimpleTestCase):
         self.assertEqual(self.engine._vt["incoming_track_id"], 1002)
         return deck
 
+    @B4_PENDING
     def test_r2_urgent_insert_during_the_vt_airs_song_2s_intro_vt_over_the_alert(self):
         self._enter()
         urgent = make_item(make_track(self.h.media("urgent", seconds=4.0, freq=URGENT_HZ), 2050,
@@ -298,6 +310,7 @@ class WrongOccurrenceTests(SimpleTestCase):
         self.assertGreater(overlap, 0.5, "song 2's intro VT was not heard over the alert")
         report("R2", alert_onset=alert_on, song2_vt_seconds_over_alert=overlap)
 
+    @B4_PENDING
     def test_r3_request_swap_at_start_airs_the_scheduled_songs_intro_vt_over_the_request(self):
         self._enter()
         replacement = make_item(make_track(self.h.media("request", seconds=5.0, freq=REQUEST_HZ), 3003,
@@ -317,6 +330,7 @@ class WrongOccurrenceTests(SimpleTestCase):
         self.assertGreater(overlap, 0.3)
         report("R3", request_onset=request_on, song2_vt_seconds_over_request=overlap)
 
+    @B4_PENDING
     def test_r3b_dedication_spliced_at_start_puts_two_recorded_voices_on_air(self):
         # The lookahead's dedication check ran before the request was scheduled
         # (it only sees an already-scheduled SongRequest), so song 2's intro VT
@@ -353,25 +367,32 @@ class FailedFireTests(SimpleTestCase):
         self.corrupt = fake_voicetrack(corrupt, 1.0)
         self.fires = spy_fires(self.h)
 
-    def test_r4a_undecodable_outro_vt_strands_playout_in_outro_tail(self):
+    def test_r4a_undecodable_outro_vt_fails_bounded_without_dead_air(self):
+        # r0144: outro_tail forever, dead air, program left ducked (F3).
         patch_vt_lookup(self, {(1001, "outro"): self.corrupt})
         items = self.h.queue({"id": 1, "seconds": 2.5, "freq": OUT_HZ},
                              {"id": 2, "seconds": 6.0, "freq": IN_HZ})
         set_markers(items[0], outro_starts=0.5)
         self.h.play()
         deck = self.engine._start_next_track(slot="A") or self.engine.decks["A"]
-        pump(0.6)
-        self.assertTrue(self.engine._vt_maybe_enter(deck))
-        self.assertTrue(wait_until(lambda: self.engine.decks["A"] is None, 6.0), "outgoing never ended")
-        ended = running_seconds(self.engine)
-        pump(5.0)
-        self.assertEqual(self.engine._vt["phase"], "outro_tail", "r0144 waits forever for the failed fire")
-        self.assertIn(self.fires[0]["fire_id"], self.engine._fx_fires, "failed fire never completes")
-        self.assertEqual(self.h.claims, [1], "nothing started: dead air")
-        self.assertLess(self.engine.vt_duck_gain.get_property("volume"), 0.6, "program left VT-ducked")
-        self.assertLess(present_seconds(self.h, IN_HZ, start=ended), 0.02)
-        report("R4a", dead_air_observed_seconds=5.0, phase=self.engine._vt["phase"])
+        pump(0.05)
+        self.engine._vtt_poll(deck)                 # the production poll's planning step
+        record = self.engine.__dict__.get("_vtt")
+        self.assertIsNotNone(record)
+        self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 6.0), "dead air: nothing started")
+        pump(1.5)
+        ended = max(run for run, level in self.h.tone_series(OUT_HZ) if level >= PRESENT) + 0.01
+        self.assertEqual(record.outro_fire.state, "failed")
+        self.assertTrue(record.done)
+        self.assertEqual(self.engine._vt["phase"], "idle")
+        curve = self.engine.__dict__.get("_vt2_duck")
+        self.assertAlmostEqual(1.0 if curve is None else curve.value_at(self.engine._vt2_running_ns()), 1.0,
+                               places=3)
+        incoming_on = onset(self.h, IN_HZ, after=ended - 0.5)
+        self.assertLess(incoming_on - ended, 0.6, "the next song follows the outgoing (ordinary EOS start)")
+        report("R4a-B3", fire_reason=record.outro_fire.reason, incoming_after_outgoing_end=incoming_on - ended)
 
+    @B4_PENDING
     def test_r4b_undecodable_intro_vt_leaves_the_program_ducked_and_vt_busy(self):
         patch_vt_lookup(self, {(1002, "intro"): self.corrupt})
         items = self.h.queue({"id": 1, "seconds": 2.5, "freq": OUT_HZ},
@@ -409,6 +430,7 @@ class LiveTalentTests(SimpleTestCase):
         set_markers(items[0], outro_starts=1.0)
         self.h.play()
 
+    @B4_PENDING
     def test_r5_mic_hold_during_the_outro_still_fires_the_intro_vt_and_starts_the_next_song(self):
         deck = self.engine._start_next_track(slot="A") or self.engine.decks["A"]
         pump(0.4)
@@ -438,35 +460,57 @@ class EntryConditionTests(SimpleTestCase):
         for name in POLL_STUBS:
             setattr(self.engine, name, lambda *_args, **_kwargs: None)
 
-    def test_r6_outro_marker_at_or_after_the_trigger_loses_the_outro_vt(self):
+    def test_r6_outro_marker_at_or_after_the_segue_is_suppressed_without_delay(self):
+        # r0144: the ordinary segue fired first and the outro VT was lost
+        # silently. Now (D7): suppressed with a reason, segue unchanged.
         self.lookups = patch_vt_lookup(self, {(1001, "outro"): self.outro})
         items = self.h.queue({"id": 1, "seconds": 8, "next_start": 25.0}, {"id": 2, "seconds": 8})
         set_markers(items[0], duration=30.0, outro_starts=26.0)
         self.h.play()
         deck = self.engine._start_next_track(slot="A") or self.engine.decks["A"]
         pump(0.3)
+        side = self.engine._vtt_outro_side(deck, eng_module._vtt_track_markers(deck.track), None,
+                                           self.engine._vtt_live_context(), self.engine._vt2_running_ns())
+        self.assertEqual(side[3], vt_transition.Reason.OUTRO_MARKER_AT_OR_AFTER_SEGUE)
         poll_at(self.engine, deck, 25.0)
         poll_at(self.engine, deck, 26.5)
-        self.assertEqual(self.h.claims, [1, 2], "the ordinary segue started first")
-        self.assertEqual(self.lookups, [], "the outro VT was never evaluated")
-        self.assertEqual(self.fires, [])
+        self.assertEqual(self.h.claims, [1, 2], "the ordinary segue is not delayed")
+        self.assertIsNone(self.engine.__dict__.get("_vtt"))
+        self.assertFalse(self.engine.__dict__.get("_vtt_history"))
 
-    def test_r9_a_resumed_deck_past_its_outro_marker_fires_its_outro_vt_again(self):
-        # After an engine restart the VT state is idle and nothing records that
-        # this occurrence's outro VT already aired; resume continues past the marker.
+    def test_r9_a_resumed_occurrence_never_replays_an_uncertain_outro_vt(self):
+        # r0144: after a restart nothing recorded that the outro aired; the
+        # resumed deck fired it again. Now (D13, no migration): the resume
+        # evidence's position plus its staleness bound reaches Outro Starts,
+        # so delivery is uncertain and the outro is suppressed.
         self.lookups = patch_vt_lookup(self, {(1001, "outro"): self.outro})
-        items = self.h.queue({"id": 1, "seconds": 8, "next_start": 55.0}, {"id": 2, "seconds": 8})
-        set_markers(items[0], duration=60.0, outro_starts=20.0)
+        items = self.h.queue({"id": 1, "seconds": 8, "next_start": 7.5}, {"id": 2, "seconds": 8})
+        set_markers(items[0], outro_starts=4.0)
+        self.engine._resume_item = items[0]
+        self.engine._resume_hint = {"track_id": 1001, "log_item_id": 1, "position": 2.5,
+                                    "saved_position": 2.5, "state_age_seconds": 0.5}
         self.h.play()
-        deck = self.engine._start_next_track(slot="A") or self.engine.decks["A"]
-        pump(0.3)
-        poll_at(self.engine, deck, 40.0)   # resume position, 20 s past the marker
-        self.assertEqual([f["kind"] for f in self.fires], ["outro"])
+        self.engine._start_next_track(slot="A")
+        self.assertTrue(wait_until(lambda: self.engine.decks["A"] is not None
+                                   and self.engine.decks["A"].continuation_reason == "auto_resume"
+                                   and self.engine.decks["A"].gated_seek is None, 8.0))
+        deck = self.engine.decks["A"]
+        for _ in range(8):
+            self.engine._vtt_poll(deck)
+            pump(0.25)
+        side = self.engine._vtt_outro_side(deck, eng_module._vtt_track_markers(deck.track), None,
+                                           self.engine._vtt_live_context(), self.engine._vt2_running_ns())
+        self.assertEqual(side[3], vt_transition.Reason.OUTRO_DELIVERY_UNCERTAIN)
+        self.assertIsNone(self.engine.__dict__.get("_vtt"))
+        self.assertIsNone(self.engine._vtt_outro_delivery_state(1))
 
-    def test_r11_attached_but_unplayable_intro_vt_still_takes_over_the_transition(self):
+    def test_r11_attached_but_unplayable_vt_never_takes_over_the_transition(self):
+        # r0144: an attached record with no playable media entered VT mode,
+        # ducked under no speech and suppressed the segue (F6). Now an attached
+        # record is not eligibility: nothing is owned, ducked or delayed.
         unplayable = SimpleNamespace(gain_db=0.0, playable_audio=lambda: None, filepath="",
                                      duration_seconds=None)
-        self.lookups = patch_vt_lookup(self, {(1002, "intro"): unplayable})
+        self.lookups = patch_vt_lookup(self, {(1002, "intro"): unplayable, (1001, "outro"): unplayable})
         items = self.h.queue({"id": 1, "seconds": 8, "next_start": 25.0}, {"id": 2, "seconds": 8})
         set_markers(items[0], duration=30.0, outro_starts=20.0)
         self.h.play()
@@ -474,11 +518,11 @@ class EntryConditionTests(SimpleTestCase):
         pump(0.3)
         poll_at(self.engine, deck, 20.5)
         poll_at(self.engine, deck, 25.5)   # the ordinary trigger point passes
-        self.assertEqual(self.engine._vt["phase"], "outro_playing")
-        self.assertEqual(self.h.claims, [1], "the segue is suppressed with nothing to air")
-        self.assertTrue(wait_until(lambda: self.engine.vt_duck_gain.get_property("volume") < 0.6, 1.0),
-                        "music ducked under no speech")
-        self.assertEqual(self.fires, [])
+        self.assertEqual(self.engine._vt["phase"], "idle")
+        self.assertEqual(self.h.claims, [1, 2], "the segue is not suppressed")
+        pump(0.5)
+        self.assertIsNone(self.engine.__dict__.get("_vtt"))
+        self.assertIsNone(self.engine.__dict__.get("_vt2_duck"), "never ducked under no speech")
 
 
 class ShortOutgoingTests(SimpleTestCase):
@@ -495,6 +539,7 @@ class ShortOutgoingTests(SimpleTestCase):
         start_poll_loop(self, self.engine)
         self.h.play()
 
+    @B4_PENDING
     def test_r7_intro_vt_after_a_short_item_never_airs(self):
         self.engine._start_next_track(slot="A")
         self.assertTrue(wait_until(lambda: self.h.claims == [1, 2], 6.0))
@@ -541,6 +586,7 @@ class TimingMeasurementTests(SimpleTestCase):
         self.assertGreaterEqual(in_on - intended, 0.0)
         self.assertLess(in_on - intended, 1.5)
 
+    @B4_PENDING
     def test_r8_intro_only_vt_with_an_outro_marker_ducks_a_speechless_tail_and_drops_the_segue(self):
         self._harness({})
         intro = fake_voicetrack(self.h.media("intro-vt", seconds=1.0, freq=INTRO_HZ), 1.0)
@@ -593,6 +639,7 @@ class TimingMeasurementTests(SimpleTestCase):
                        marker_seconds_heard=marker, marker_seconds_in_file=0.15)
                 self.assertIsNotNone(heard)
 
+    @B4_PENDING
     def test_r10b_intro_phase_vt_vs_incoming_music_onset(self):
         """_vt_start_intro_phase with a VT shorter than the intro: VT and deck start
         together; the deck's 0.3 s silence prime and its cue-in follow."""

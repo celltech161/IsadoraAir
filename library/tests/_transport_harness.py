@@ -264,7 +264,7 @@ class TransportHarness:
             return True
 
         engine._claim_playback_occurrence = claim_fixture_occurrence
-        engine._schedule_occurrence_air_start_from_probe = lambda _deck: None
+        engine._schedule_occurrence_air_start_from_probe = lambda _deck, **_kwargs: None
         engine._persist_deck_duration = self._record_duration
         self.duration_closes = []
         engine._schedule_continuation_segment_start = (

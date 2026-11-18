@@ -33,6 +33,18 @@ SCHEDULED_DECK_READY_S = 0.100     # scheduled deck readiness deadline after ope
 REOPEN_LEAD_S = 0.100              # re-admission lead for a regenerated held occurrence
 REOPEN_MAX_ATTEMPTS = 2
 
+# -- B3/B4 integration (engine transition coordinator) --------------------------
+PLAN_HORIZON_S = 45.0              # start planning when the segue is this close
+OUTRO_PREPARE_LEAD_S = 1.0         # prepare the outro fire this long before Outro Starts renders
+MIN_PREPARE_LEAD_S = 0.120         # never prepare a fire for an admission closer than this
+OUTRO_LATE_TOLERANCE_S = 0.250     # a missed outro preparation later than this is suppressed, not fired late
+COMMIT_LEAD_S = 0.600              # planned commit (claim + scheduled deck open) before min(S_v, deck offset)
+UNPLANNED_LEAD_S = 0.300           # an automatic start that finds an eligible intro VT at its claim
+DECK_MIN_LEAD_S = 0.120            # a scheduled deck's media-0 admission must be at least this far ahead
+TRANSITION_GRACE_S = 3.0           # transition deadline after its planned end (contract section 7)
+URGENT_FADE_MS = 50                # audible outro limited at the segue for an urgent item (section 5)
+OUTRO_DELIVERY_MEMORY = 512        # bounded in-process outro delivery record (D13)
+
 OUTRO = "outro"
 INTRO = "intro"
 

@@ -539,48 +539,23 @@ class RealSessionRaceTests(IsolatedMediaRootMixin, TransactionTestCase):
 # ---------------------------------------------------------------------------
 
 class EngineEquivalenceTests(IsolatedMediaRootMixin, TestCase):
+    """2.22B B12 (only media resolution changed), re-expressed for roadmap
+    2.25 B3/B4: the integrated VT path resolves a VoiceTrack through the same
+    _vt_resolve_audio (validated ProductionMedia, then the legacy file), and
+    an attached record is not eligibility (F6)."""
+
     def setUp(self):
         super().setUp()
-        # The engine refreshes its DB connection per transition; inside a test
-        # transaction that would close the test's own connection.
-        patcher = mock.patch("library.services.engine.close_old_connections", lambda: None)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.outgoing = make_track("Outgoing")
         self.incoming = make_track("Incoming", intro=1.0)
 
-    def _engine(self):
+    def _resolve(self, track, position):
         from library.services import engine as eng
-        stand = object.__new__(eng.PlaybackEngine)
-        stand._vt_lock = threading.Lock()
-        stand._vt = {}
-        stand._next_triggered = False
-        stand.fired = []
-        stand._vt_fire_file = lambda path, gain, kind: stand.fired.append((path, gain, kind)) or 1
-        stand._vt_ramp_duck_to_db = lambda *a: None
-        item = mock.Mock(track=self.incoming, id=999999)
-        stand._peek_playable_at_cursor = lambda: item
-        return stand
+        return object.__new__(eng.PlaybackEngine)._vtt_lookup_voicetrack(track, position)
 
-    def _enter(self):
-        stand = self._engine()
-        entered = stand._vt_maybe_enter(mock.Mock(track=self.outgoing))
-        return stand, entered
-
-    def _intro_delay(self, stand):
-        from library.services import engine as eng
-        delays = []
-        with mock.patch.object(eng.GLib, "timeout_add", side_effect=lambda ms, fn: delays.append(ms)):
-            stand._vt_start_intro_phase()
-        return delays[-1]
-
-    def _shape(self, stand):
-        return {key: (value if not isinstance(value, str) or "/" not in value else "PATH")
-                for key, value in stand._vt.items() if key != "incoming_track"}
-
-    def test_legacy_and_production_media_voicetracks_drive_the_vt_path_identically(self):
+    def test_legacy_and_production_media_voicetracks_resolve_identically_for_the_vt_path(self):
         legacy_dir = Path(self.tmp.name)
         out_path = legacy_dir / "out.wav"
         in_path = legacy_dir / "in.wav"
@@ -589,41 +564,38 @@ class EngineEquivalenceTests(IsolatedMediaRootMixin, TestCase):
         out_legacy = make_legacy_vt(self.outgoing, "outro", str(out_path), duration=4.0)
         in_legacy = make_legacy_vt(self.incoming, "intro", str(in_path), duration=4.0)
         VoiceTrack.objects.filter(pk__in=[out_legacy.pk, in_legacy.pk]).update(gain_db=-1.5)
-        legacy_stand, legacy_entered = self._enter()
-        legacy_shape = self._shape(legacy_stand)
-        legacy_fired = list(legacy_stand.fired)
-        legacy_delay = self._intro_delay(legacy_stand)
+        legacy = [self._resolve(self.outgoing, "outro"), self._resolve(self.incoming, "intro")]
 
         # Same rows, same gains -- now bound to validated ProductionMedia takes.
         for vt in (out_legacy, in_legacy):
             take = ingest_take()
             vtm.bind_media(track_id=vt.track_id, position=vt.position, media_id=take.pk, user=None,
                            expected_revision=vtm.revision_of(VoiceTrack.objects.get(pk=vt.pk)))
-        pm_stand, pm_entered = self._enter()
-        pm_shape = self._shape(pm_stand)
-        pm_fired = list(pm_stand.fired)
-        pm_delay = self._intro_delay(pm_stand)
+        bound = [self._resolve(self.outgoing, "outro"), self._resolve(self.incoming, "intro")]
 
-        self.assertTrue(legacy_entered and pm_entered)
-        self.assertAlmostEqual(pm_shape.pop("incoming_vt_duration"), legacy_shape.pop("incoming_vt_duration"),
-                               places=2)                                    # validated decode vs mutagen
-        self.assertEqual(pm_shape, legacy_shape)                            # same state machine values
-        self.assertEqual([(g, k) for _p, g, k in pm_fired], [(g, k) for _p, g, k in legacy_fired])
-        self.assertEqual(pm_delay, legacy_delay)                           # same intro_until fit (4.0 s > 1.0 s)
-        bound = VoiceTrack.objects.get(pk=out_legacy.pk).media
-        self.assertEqual(pm_fired[0][0], str(layout.resolve_storage_path(bound.storage_key)))
-        self.assertEqual(legacy_fired[0][0], str(out_path))
+        for (l_rec, l_path, l_gain), (b_rec, b_path, b_gain) in zip(legacy, bound):
+            self.assertTrue(l_rec.attached and l_rec.playable and b_rec.attached and b_rec.playable)
+            self.assertEqual((l_gain, b_gain), (-1.5, -1.5))
+            self.assertAlmostEqual(b_rec.duration, l_rec.duration, places=2)   # validated decode vs mutagen
+        self.assertEqual(legacy[0][1], str(out_path))
+        media = VoiceTrack.objects.get(pk=out_legacy.pk).media
+        self.assertEqual(bound[0][1], str(layout.resolve_storage_path(media.storage_key)))
 
-    def test_no_voicetrack_still_falls_through_to_the_normal_crossfade(self):
-        stand, entered = self._enter()
-        self.assertFalse(entered)
-        self.assertEqual(stand.fired, [])
+    def test_no_voicetrack_is_not_eligible(self):
+        recording, path, _gain = self._resolve(self.outgoing, "outro")
+        self.assertFalse(recording.attached)
+        self.assertIsNone(path)
 
-    def test_a_voicetrack_with_nothing_playable_behaves_as_before(self):
+    def test_a_voicetrack_with_nothing_playable_is_attached_but_never_eligible(self):
+        from library.services import vt_transition as vtt
         make_legacy_vt(self.outgoing, "outro")             # legacy row whose file is gone
-        stand, entered = self._enter()
-        self.assertTrue(entered)
-        self.assertEqual(stand.fired, [("/nonexistent/legacy.wav", 0.0, "outro")])   # fire skipped downstream
+        recording, path, _gain = self._resolve(self.outgoing, "outro")
+        self.assertTrue(recording.attached)
+        self.assertFalse(recording.playable)
+        self.assertIsNone(path)
+        markers = vtt.Markers(duration=200.0, next_start=190.0, outro_starts=180.0)
+        side = vtt.outro_eligibility(vtt.OutroFacts(recording=recording, markers=markers), vtt.LiveContext())
+        self.assertEqual(side.reason, vtt.Reason.RECORDING_UNPLAYABLE)   # r0144 entered VT mode (F6)
 
 
 class VoiceTrackMigrationClassificationTests(TransactionTestCase):

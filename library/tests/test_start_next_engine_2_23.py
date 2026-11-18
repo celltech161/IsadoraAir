@@ -406,7 +406,15 @@ class StartNextRefusalTests(_StartNextBase):
         pump(0.4)
 
     def test_an_active_voice_track_transition_is_refused(self):
-        self.assertTrue(self.engine._vt_maybe_enter(self.deck))
+        # Roadmap 2.25 B3: the production poll's planning step prepares the
+        # outro VT (the r0144 _vt_maybe_enter entry is retired). Start Next
+        # stays refused while VT speech is prepared or audible (bounded by
+        # the transition deadlines; the D8 cancel-and-advance policy is B5).
+        self.engine._vtt_poll(self.deck)
+        record = self.engine.__dict__.get("_vtt")
+        self.assertIsNotNone(record)
+        self.assertIsNotNone(record.outro_fire)
+        self.assertEqual(self.engine._vt["phase"], "vt_transition")
         self.send()
         record = self.last()
         self.assertEqual((record["outcome"], record["reason"]), ("rejected", "busy_voice_track"))
