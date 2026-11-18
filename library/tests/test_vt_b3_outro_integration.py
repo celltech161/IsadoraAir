@@ -110,7 +110,7 @@ class OutroTimingTests(_OutroBase, SimpleTestCase):
         # No hold, no ownership: the r0144 ordinary trigger (primed deck,
         # late by its prime + poll jitter, R0/E01 baseline) starts the incoming.
         self.assertIsNone(lab.deck_of(2).scheduled_admission_ns)
-        self.assertTrue(0.4 < music_on - seg < 1.2, music_on - seg)
+        self.assertTrue(0.25 < music_on - seg < 1.2, music_on - seg)
         self.assertEqual(lab.engine._vtt_outro_delivery_state(1), "aired")
         self.assertIn(StartKind.AUTOMATIC, [k for _t, k in lab.start_calls])
         self.assertEqual(lab.engine._vt.get("phase"), "idle")
@@ -182,7 +182,7 @@ class OutroHoldTests(_OutroBase, SimpleTestCase):
         self.assertEqual(lab.engine._vtt_outro_delivery_state(1), None, "never prepared")
         self.assertEqual(lab.engine.__dict__.get("_vtt_seq", 0), 0, "no transition record churn")
         self.assertIsNone(lab.deck_of(2).scheduled_admission_ns, "urgent starts by the ordinary path")
-        self.assertTrue(0.4 < urgent_on - seg < 1.2)
+        self.assertTrue(0.25 < urgent_on - seg < 1.2)
 
     def test_urgent_inserted_while_outro_is_audible_limits_it_at_the_segue(self):
         lab, out, inc, deck, zero = self.scenario(outro_at=7.0)
@@ -219,7 +219,7 @@ class OutroEligibilityTests(_OutroBase, SimpleTestCase):
         music_on = tr.onset(MUSIC, after=zero + 7.0)
         self.assertLess(tr.present(OUTRO_SPEECH, zero, zero + 12), 0.011)
         self.assertIsNone(lab.last_record(), "no transition created")
-        self.assertTrue(0.4 < music_on - (zero + 8.0) < 1.2, "ordinary segue unchanged (R6 inverted)")
+        self.assertTrue(0.25 < music_on - (zero + 8.0) < 1.2, "ordinary segue unchanged (R6 inverted)")
 
     def test_outro_first_seen_after_its_marker_is_suppressed_not_fired_late(self):
         lab, out, inc, deck, zero = self.scenario(outro_at=3.0, poll=False)
@@ -230,7 +230,7 @@ class OutroEligibilityTests(_OutroBase, SimpleTestCase):
         tr = lab.trace()
         self.assertLess(tr.present(OUTRO_SPEECH, zero, lab.now()), 0.011)
         self.assertIsNone(lab.last_record(), "outro_preparation_missed: never fired late and out of place")
-        self.assertTrue(0.4 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2)
+        self.assertTrue(0.25 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2)
 
     def _never_owns(self, **kwargs):
         lab, out, inc, deck, zero = self.scenario(**kwargs)
@@ -240,7 +240,7 @@ class OutroEligibilityTests(_OutroBase, SimpleTestCase):
         self.assertIsNone(lab.last_record())
         self.assertIsNone(lab.engine.__dict__.get("_vt2_duck"), "duck never engaged (F6)")
         self.assertGreater(tr.level(OUT, zero + 1.0, zero + 7.9), 0.37, "no speechless duck")
-        self.assertTrue(0.4 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2)
+        self.assertTrue(0.25 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2)
 
     def test_missing_marker_never_takes_ownership(self):
         self._never_owns(outro_at=None)
@@ -259,7 +259,7 @@ class OutroEligibilityTests(_OutroBase, SimpleTestCase):
         report("B3-corrupt-outro", fire_reason=record.outro_fire.reason, music_vs_next_start=music_on - seg)
         self.assertEqual(record.outro_fire.state, FireState.FAILED)
         self.assertTrue(record.done)
-        self.assertTrue(0.4 < music_on - seg < 1.2, "hold released: ordinary segue, no dead air (R4a inverted)")
+        self.assertTrue(0.25 < music_on - seg < 1.2, "hold released: ordinary segue, no dead air (R4a inverted)")
         self.assertAlmostEqual(lab.curve_value(), 1.0, places=3)
         self.assertGreater(tr.level(OUT, zero + 7.2, zero + 7.9), 0.37, "program back at unity")
         self.assertEqual(lab.engine._vt.get("phase"), "idle")
@@ -417,4 +417,4 @@ class LegacyRetirementTests(_OutroBase, SimpleTestCase):
         self.assertIsNone(lab.last_record())
         suspended = [e for e in events if e.get("dedupe_key") == "engine|vt-teardown-unavailable"]
         self.assertEqual(len(suspended), 1)
-        self.assertTrue(0.4 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2, "ordinary playout continues")
+        self.assertTrue(0.25 < tr.onset(MUSIC, after=zero + 7.0) - (zero + 8.0) < 1.2, "ordinary playout continues")

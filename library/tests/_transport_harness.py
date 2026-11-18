@@ -121,6 +121,7 @@ def make_item(track, item_id):
     item.category = None
     item.position = item_id
     item.played_at = None
+    item.playback_claimed_at = None      # unclaimed until the claim seam (a MagicMock would read as claimed)
     return item
 
 

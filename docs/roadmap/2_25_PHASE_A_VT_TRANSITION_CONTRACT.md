@@ -1,9 +1,9 @@
 # Roadmap 2.25: Evergreen Voice Track transition contract (approved) and Phase A engineering audit
 
 Status: **Phase A accepted (6ad5222). B0 accepted (ced54ed). D1-D15 approved, with the B1-B2 workorder's
-D5, D10, D13 and N1 clarifications. B1-B2 infrastructure implemented, not connected to live transitions;
-see `2_25_PHASE_B1_B2_INFRASTRUCTURE.md`.** No live VT behaviour has changed. B3 and later need separate
-authorization.
+D5, D10, D13 and N1 clarifications. B1-B2 accepted at the infrastructure gate. B3-B4 integrate the
+outgoing and incoming sides into the engine (see `2_25_PHASE_B3_B4_INTEGRATION.md`); the contract itself
+is unchanged.** B5 and later need separate authorization.
 
 - Audited baseline: r0144, canonical `e4003aa7f075b940ec5680bf6864f08530ceed05`, tree
   `ca941ed15e937cbf0508f2b03aa6545fb39f8c01`. It is identical to `/opt/isadoraair` and canonical main at

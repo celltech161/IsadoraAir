@@ -1894,27 +1894,50 @@ class DedicationStartupGateTests(TransactionTestCase):
 # outgoing outro VT still fires first
 # ---------------------------------------------------------------------
 class DedicationVoiceTrackTests(DedicationFixtureMixin, TransactionTestCase):
+    """Roadmap 2.25 B3/B4: the r0144 entry (_vt_maybe_enter) is retired; the
+    same two guarantees are now made by the claim-time decision (D14) and the
+    independent outgoing side."""
+
+    def _wav(self, name):
+        # VoiceTrack.save() reads the duration from the file (an empty
+        # placeholder has none and is, correctly, never eligible).
+        import wave
+        path = Path(self._tmpdir.name) / name
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(2)
+            out.setsampwidth(2)
+            out.setframerate(44100)
+            out.writeframes(b"\x00\x00\x00\x00" * 44100)
+        return path
+
     def test_incoming_vt_suppressed_when_dedication_pending(self):
+        from library.services import vt_transition as vtt
         log = self.make_log(date(2027, 5, 7), 5)
         song_track = self.make_track(title="Song")
         song_item = self.make_item(log, 0, track=song_track)
         intro_track = self.make_dedication_track()
         self.make_request(song_track, status="scheduled", log_item=song_item, intro_track=intro_track)
+        intro_item = self.make_dedication_item(log, 1, intro_track)
 
-        vt_path = Path(self._tmpdir.name) / "intro-vt.mp3"
-        vt_path.touch()
+        vt_path = self._wav("intro-vt.wav")
         VoiceTrack.objects.create(track=song_track, position="intro", filepath=str(vt_path), gain_db=0.0)
 
         stand_in = make_engine_stand_in()
-        stand_in._peek_playable_at_cursor = MagicMock(return_value=song_item)
-        outgoing_deck = MagicMock()
-        outgoing_deck.track = self.make_track(title="Outgoing")  # no outro VT configured
-
-        result = eng_module.PlaybackEngine._vt_maybe_enter(stand_in, outgoing_deck)
-
-        self.assertFalse(result, "no VTs remain once the incoming intro VT is suppressed by a pending dedication")
+        live = vtt.LiveContext()
+        automatic = vtt.StartKind.AUTOMATIC
+        # The spliced dedication intro and its forced follow-up (the song) are protected speech paths.
+        self.assertEqual(stand_in._vtt_item_role(intro_item), vtt.ItemRole.DEDICATION_INTRO)
+        followup_role = stand_in._vtt_item_role(song_item, is_forced=True)
+        self.assertEqual(followup_role, vtt.ItemRole.DEDICATION_FOLLOWUP)
+        side, _media = stand_in._vtt_intro_decision(song_item, followup_role, False, live, automatic)
+        self.assertFalse(side.eligible)
+        self.assertEqual(side.reason, vtt.Reason.PROTECTED_DEDICATION)
+        # Control: the same song as an ordinary automatic occurrence keeps its intro VT.
+        side, _media = stand_in._vtt_intro_decision(song_item, vtt.ItemRole.ORDINARY, False, live, automatic)
+        self.assertTrue(side.eligible, side.reason)
 
     def test_outgoing_vt_still_fires_first_despite_pending_dedication(self):
+        from library.services import vt_transition as vtt
         log = self.make_log(date(2027, 5, 7), 6)
         song_track = self.make_track(title="Song2")
         song_item = self.make_item(log, 0, track=song_track)
@@ -1922,24 +1945,16 @@ class DedicationVoiceTrackTests(DedicationFixtureMixin, TransactionTestCase):
         self.make_request(song_track, status="scheduled", log_item=song_item, intro_track=intro_track)
 
         outgoing_track = self.make_track(title="Outgoing2")
-        outgoing_vt_path = Path(self._tmpdir.name) / "outro-vt.mp3"
-        outgoing_vt_path.touch()
-        VoiceTrack.objects.create(track=outgoing_track, position="outro", filepath=str(outgoing_vt_path), gain_db=0.0)
+        outgoing_vt_path = self._wav("outro-vt.wav")
+        VoiceTrack.objects.create(track=outgoing_track, position="outro", filepath=str(outgoing_vt_path),
+                                  gain_db=0.0)
 
         stand_in = make_engine_stand_in()
-        stand_in._vt_lock = threading.RLock()
-        stand_in._peek_playable_at_cursor = MagicMock(return_value=song_item)
-        stand_in._vt_ramp_duck_to_db = MagicMock()
-        stand_in._vt_fire_file = MagicMock(return_value="fire-1")
-        outgoing_deck = MagicMock()
-        outgoing_deck.track = outgoing_track
-
-        result = eng_module.PlaybackEngine._vt_maybe_enter(stand_in, outgoing_deck)
-
-        self.assertTrue(result)
-        self.assertIsNone(stand_in._vt["incoming_vt_filepath"], "incoming intro VT suppressed by the pending dedication")
-        stand_in._vt_fire_file.assert_called_once()
-        self.assertEqual(stand_in._vt["phase"], "outro_playing")
+        recording, path, _gain = stand_in._vtt_lookup_voicetrack(outgoing_track, "outro")
+        self.assertEqual(path, str(outgoing_vt_path))
+        markers = vtt.Markers(duration=200.0, next_start=190.0, outro_starts=180.0)
+        side = vtt.outro_eligibility(vtt.OutroFacts(recording=recording, markers=markers), vtt.LiveContext())
+        self.assertTrue(side.eligible, "the incoming's pending dedication has no bearing on the outgoing side")
 
 
 # ---------------------------------------------------------------------

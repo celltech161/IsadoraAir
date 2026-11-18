@@ -12,6 +12,7 @@ import time
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
+from gi.repository import GLib
 
 from library.tests._transport_harness import (
     TransportHarness,
@@ -200,9 +201,34 @@ class EjectVoiceTrackTests(SimpleTestCase):
         pump(0.6)
         self.assertEqual(self.h.claims, [1, 2], "VT timer and Eject both started an item")
 
-    def test_eject_of_the_incoming_deck_during_its_intro_vt_releases_the_duck(self):
-        # E8 becomes a correctness assertion in 2.25 B4 (intro side, F10).
-        self.skipTest("intro side: converted in roadmap 2.25 B4")
+    def test_eject_of_the_incoming_deck_during_its_intro_vt_cancels_that_vt(self):
+        # E8 (characterized in 2.23: the ejected incoming's intro VT kept
+        # playing over the replacement) -> 2.25 B4 F10/D9: it is cancelled, the
+        # duck is released, and the replacement is an Eject replacement (D5:
+        # no intro VT), started exactly once.
+        for name in ("_check_commands", "_check_stuck_decks", "_reload_queue_if_changed",
+                     "_sweep_active_message_queue", "_warm_track_cache"):
+            setattr(self.engine, name, lambda *_args, **_kwargs: None)
+        source = GLib.timeout_add(250, self.engine._poll_position)
+        self.addCleanup(lambda: GLib.MainContext.default().find_source_by_id(source)
+                        and GLib.source_remove(source))
+        _start(self.engine, "A")
+        self.assertTrue(wait_until(
+            lambda: (self.engine.__dict__.get("_vtt") is not None
+                     and self.engine._vtt.intro_fire is not None
+                     and self.engine._vtt.intro_fire.state == "admitted"), 12.0))
+        record = self.engine._vtt
+        intro_fire = record.intro_fire
+        self.engine._eject_deck(record.incoming["slot"])
+        pump(0.2)
+        self.assertEqual(intro_fire.state, "cancelled")
+        self.assertNotIn("readmit", [name for _t, name, _d in record.events], "the ejected occurrence never re-opens")
+        self._assert_vt_finished_cleanly()
+        self.assertTrue(wait_until(lambda: self.h.claims == [1, 2, 3], 3.0))
+        pump(0.5)
+        self.assertEqual(self.h.claims, [1, 2, 3])
+        replacement = next(d for d in self.engine.decks.values() if d is not None and d.log_item.id == 3)
+        self.assertIsNone(replacement.scheduled_admission_ns, "an Eject replacement has no intro VT (D5)")
 
 
 class VoiceTrackNaturalTransitionTests(SimpleTestCase):
@@ -382,14 +408,27 @@ class IntroOnlyVoiceTrackCharacterizationTests(SimpleTestCase):
         entered.assert_not_called()
         self.assertEqual(self.engine._vt["phase"], "idle")
 
-    def test_an_outgoing_outro_marker_without_an_outro_vt_takes_no_ownership(self):
-        self.h.queue({"id": 1, "seconds": 30, "outro_starts": 18.0, "next_start": 25},
+    def _intro_predicted(self, outro_starts):
+        # 2.25 B4 (F1): with or without the outgoing's Outro Starts, the
+        # incoming's intro VT is predicted for timing (never authorized by the
+        # prediction) and the legacy phase machine is never entered.
+        self.h.queue({"id": 1, "seconds": 30, "outro_starts": outro_starts, "next_start": 25},
                      {"id": 2, "seconds": 8})
         deck = _start(self.engine, "A")
         self._poll_at(deck, 20.0)
-        self.assertEqual(self.engine._vt["phase"], "idle")
+        record = self.engine.__dict__.get("_vtt")
+        self.assertIn(self.engine._vt["phase"], ("idle", "vt_transition"))
+        self.assertIsNotNone(record)
+        self.assertTrue(record.owns_start)
+        self.assertIsNotNone(record.plan.intro_start)
+        self.assertIsNone(record.outro_fire)
         self.assertFalse(self.engine._next_triggered)
-        self.assertIsNone(self.engine.__dict__.get("_vtt"))
+
+    def test_the_intro_side_is_planned_with_an_outgoing_outro_marker(self):
+        self._intro_predicted(18.0)
+
+    def test_the_intro_side_is_planned_without_an_outgoing_outro_marker(self):
+        self._intro_predicted(None)
 
 
 class OrdinaryAutomaticTransitionRegressionTests(SimpleTestCase):
