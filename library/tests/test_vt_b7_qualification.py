@@ -1155,6 +1155,19 @@ class StateCompatibilityTests(_B5Base, SimpleTestCase):
         self.assertIsNotNone(outro["started_at"], "the outro really aired: actual start published")
         self.assertIsNone(current["intro"].get("started_at"), "no intro speech: no actual start")
 
+    def test_a_finished_transition_never_publishes_a_side_as_planned(self):
+        lab, out, inc, deck, zero = self.build(intro_vt=1.2)
+        engine = lab.engine
+        self.assertTrue(wait_until(lambda: lab.record() is not None and lab.record().plan is not None
+                                   and lab.record().plan.intro_start is not None, 10.0))
+        self.assertFalse(lab.record().committed, "planned, not yet committed")
+        engine._vtt_abort("b7_state_probe")
+        state = engine._vtt_state()
+        recent = state["recent"][0]
+        report("B7-state-not-attempted", intro=recent["intro"], finish=recent["finish_reason"])
+        self.assertEqual(recent["intro"], "not_attempted")
+        self.assertNotIn("planned", [r["intro"] for r in state["recent"]] + [r["outro"] for r in state["recent"]])
+
     def test_top_level_state_keys_are_a_superset_of_r0144(self):
         """The keys of the ``state = {...}`` literal json.dump'ed by
         _write_state: every r0144 key remains; the only new one is the

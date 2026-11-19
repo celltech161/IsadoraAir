@@ -12236,6 +12236,13 @@ class PlaybackEngine:
         reason = record.outro_reason if direction == vt_transition.OUTRO else record.intro_reason
         if fire is None:
             status = "suppressed" if reason else ("planned" if planned is not None else "none")
+            if status == "planned" and record.done:
+                # B7: a finished transition never publishes a side as still
+                # planned -- it was never attempted by this transition (released
+                # to the ordinary path before its commit, or ended).
+                status = "not_attempted"
+                reason = ("released_before_commit" if not record.committed
+                          else f"finished:{str(record.finish_reason or '').split(':')[0]}")
             return {"status": status, "reason": reason or None,
                     "planned_start_at": wall(int(round(planned * Gst.SECOND))) if planned is not None else None}
         admitted = any(state == FS.ADMITTED for state, _r, _t in fire.history)
