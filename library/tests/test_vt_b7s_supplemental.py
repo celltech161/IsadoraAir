@@ -173,3 +173,34 @@ class DedicationAndAlertTests(_HeldBase, SimpleTestCase):
         self.assertLess(tr.present(SPEECH, command_at + 0.1, lab.now()), 0.011)
         self.assertLess(tr.present(OUTRO_SPEECH, command_at + 0.1, lab.now()), 0.011)
         self.assertEqual(self.air_starts(lab, 2), [], "the replaced program's held song never airs")
+
+
+class StartNextIrreversibleWindowTests(_HeldBase, SimpleTestCase):
+    """C3 under C7: the window in which a waiting deck can no longer be
+    recalled is now ~30 ms wide, so it is entered deterministically here (the
+    deck mixer has pushed past the admission): with the outgoing gone, Start
+    Next must keep that song's admission -- never fade it as an outgoing and
+    start the following item."""
+
+    def test_start_next_with_only_an_irreversible_waiting_song_keeps_it(self):
+        from library.tests.test_vt_b3_outro_integration import _OutroBase as _O
+        lab, out, inc, deck, zero = _O.scenario(self, out_len=9.0, next_start=8.5, outro_at=8.0)
+        engine = lab.engine
+        engine.log_items.append(lab.item(3, [(5.0, THIRD)], name="b7s-irreversible-third"))
+        self.assertTrue(wait_until(lambda: lab.now() >= zero + 9.2, 12.0))       # outgoing ended
+        held = lab.deck_of(2)
+        self.assertIsNotNone(held)
+        self.assertEqual(held.admission_state, "scheduled")
+        # The deck mixer has pushed output covering the admission (C7 evidence).
+        engine._vt2_mixer_pushed_ns = held.scheduled_admission_ns
+        self.assertTrue(engine._vtt_incoming_on_air(held))
+        self.assertEqual([d.log_item.id for d in engine._live_decks()], [2])
+        command = self.start_next(lab, fade_ms=400)
+        outcome = self.settle_start_next(lab)
+        pump(1.5)
+        report("B7S-irreversible-start-next", mode=outcome["mode"], claims=lab.claims)
+        self.assertEqual(outcome["outcome"], "completed")
+        self.assertEqual(outcome["mode"], "vt_admit", "never treated as the outgoing")
+        self.assertEqual(len(self.air_starts(lab, 2)), 1, "the claimed song airs exactly once")
+        self.assertNotIn(3, lab.claims, "the claimed song is not skipped for the following item")
+        self.assertIsNotNone(command)
