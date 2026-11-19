@@ -104,3 +104,19 @@ hour logs, one short hour every fifth); the Remote DJ media path is a gate stand
 
 See the evidence README: the nine-case loopback procedure, reviewed, with two B7 cases added; not
 run (no isolated off-air hardware; live audio may not be touched).
+
+## 8. Supplemental qualification (B7S)
+
+| Id | Defect | Correction |
+|---|---|---|
+| C7 | A waiting scheduled deck counted as "on air" whenever its admission was within a fixed HOLD_MIN_LEAD_S (120 ms). Measured: withdrawing it rendered NOT ONE sample until the non-live deck mixer had pushed output covering the admission -- the mixer runs 7-16 ms ahead of the clock -- so Manual / the mic hold 20-120 ms before admission let a still-recallable song start (contract violation). | "On air" is decided from pipeline evidence: a src-pad probe records how far the deck mixer has pushed; a scheduled deck is on air when that position plus MIXER_RECALL_GUARD_S (20 ms: one buffer being aggregated, one being pushed while the GLib thread decides) reaches its admission. Measured with the rule (90 cases: Manual idle / busy loop, mic hold): every held deck rendered nothing; every on-air deck played in full with one air start; no partial burst. The latest hold was 29.9 ms before admission (was 120 ms). Start Next keeps a deck it cannot recall (vt_admit, kept); never skips a never-audible occurrence. |
+| C8 | A pending fallback start (C1 token) survived engine shutdown. | `_vtt_shutdown` invalidates the token; the deferred attempt never runs on a stopped engine. |
+
+Evidence-only test tooling in the candidate's test tree (no product effect):
+`measure_vt_b7s_admission_boundary.py` (the boundary sweep), `_vt_b7s_remote_lab.py` +
+`test_vt_b7s_remote_dj_media.py` (the engine's REAL Remote DJ session over a real WebRTC loopback
+connection: ICE limited to 127.0.0.1 through libnice's own API, DTLS-SRTP, Opus both ways, a
+synthetic 3200 Hz remote microphone), `test_vt_b7s_supplemental.py` (held-occurrence authority:
+shutdown, hour adoption, queue reload, dedication follow-up, pending alert through reload),
+`soak_vt_b7s_livefill.py` (the normal live-fill soak on real wall-clock hours) and
+`memsoak_vt_b7s.py` (the portable memory workload run unchanged on r0144 and the candidate).
