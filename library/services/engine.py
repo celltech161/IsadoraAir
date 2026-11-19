@@ -11559,6 +11559,8 @@ class PlaybackEngine:
     def _vtt_fallback_attempt(self, seq, token, attempt):
         record = self._vtt_current(seq) if seq is not None else None
         held = self.__dict__.get("_vtt_held_occurrence")
+        if not getattr(self, "running", True):
+            return False                       # C8: never open a deck on a stopped engine
         if held is None or token is None or held.get("fallback_token") is not token:
             # Taken (Start Next, a hand-out), kept (Manual, pause) or discarded
             # (reload) since this start was deferred: nothing to do.
@@ -12425,6 +12427,11 @@ class PlaybackEngine:
                     fire.cancel("engine_stopped", fade_ms=0)
         self._vtt = None
         self._vtt_draining = None
+        held = self.__dict__.get("_vtt_held_occurrence")
+        if held is not None and held.get("fallback_token") is not None:
+            # B7 supplemental C8: a deferred fallback start never survives
+            # engine shutdown (restart resume owns the claimed occurrence).
+            held["fallback_token"] = None
         service = self.__dict__.get("_vtt_lookup_service")
         if service is not None:
             service.stop(timeout=0.5)
