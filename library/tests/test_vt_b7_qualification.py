@@ -543,9 +543,12 @@ class CombinedHoldTests(_B5Base, SimpleTestCase):
 # ---------------------------------------------------------------------------
 class AdmissionBoundaryTests(_B5Base, SimpleTestCase):
     """Underlap: the held deck's admission (media 0) is A_seg + 1.4, its Cue
-    In (first real audio) at A_seg + 1.65. HOLD_MIN_LEAD_S = 0.120."""
+    In (first real audio) at A_seg + 1.65. B7 supplemental C7: a waiting deck
+    is on air only when the deck mixer has pushed output to within
+    MIXER_RECALL_GUARD_S of its admission (measured irreversible point
+    ~10-20 ms before admission), not within a fixed 120 ms."""
 
-    OFFSETS = (-0.200, -0.135, -0.105, -0.040, 0.060)
+    OFFSETS = (-0.200, -0.135, -0.105, -0.060, 0.060)
 
     def at_offset(self, offset, action):
         lab, out, inc, deck, zero = self.underlap(extra=())
@@ -559,7 +562,9 @@ class AdmissionBoundaryTests(_B5Base, SimpleTestCase):
 
         def fire():
             hit["t"] = lab.now()
-            hit["state"] = getattr(lab.deck_of(2), "admission_state", None)
+            deck = lab.deck_of(2)
+            hit["state"] = getattr(deck, "admission_state", None)
+            hit["on_air"] = deck is None or lab.engine._vtt_incoming_on_air(deck)
             action(lab)
         lab.lab.at(admission + offset, fire)
         self.assertTrue(wait_until(lambda: "t" in hit, 12.0))
@@ -574,14 +579,17 @@ class AdmissionBoundaryTests(_B5Base, SimpleTestCase):
                 tr = lab.trace()
                 music_on = tr.onset(MUSIC, after=a_seg - 0.5)
                 lead = admission - hit["t"]
-                on_air = lead <= vt_transition.HOLD_MIN_LEAD_S
+                on_air = hit["on_air"]          # the engine's own evidence at the command
                 rows.append(f"{offset:+.3f}:lead={lead:.3f}:{'air' if music_on is not None else 'held'}")
+                if lead >= 0.055:
+                    self.assertFalse(on_air, "far from the irreversible point: Manual must hold it (C7)")
                 if on_air:
                     self.assertIsNotNone(music_on, "within the boundary it is on air: never interrupted")
                     self.assertLess(abs(music_on - (a_seg + 1.65)), TOL)
                     self.assertEqual(len(self.air_starts(lab, 2)), 1)
                 else:
-                    self.assertIsNone(music_on, "outside the boundary it is held (nothing rendered)")
+                    self.assertIsNone(music_on, "recallable: held, not one sample rendered")
+                    self.assertLess(lab.trace().present(MUSIC, admission - 0.05, admission + 0.6), 0.005)
                     self.assertEqual(lab.engine.__dict__["_vtt_held_occurrence"]["log_item"].id, 2)
                     self.assertEqual(self.air_starts(lab, 2), [])
                 lab.lab.stop()
@@ -602,8 +610,8 @@ class AdmissionBoundaryTests(_B5Base, SimpleTestCase):
                 self.assertEqual(outcome["outcome"], "completed", outcome)
                 self.assertEqual(len(self.air_starts(lab, 2)), 1, "exactly once")
                 if hit["t"] < admission:
-                    # Never audible yet (held, or within HOLD_MIN_LEAD_S of its
-                    # admission): it is the operator's next -- it airs.
+                    # Never audible yet (recallable, or already irreversible but not
+                    # yet admitted): it is the operator's next -- it airs.
                     self.assertIsNotNone(music_on)
                     self.assertNotIn(3, lab.claims, "never skipped in favour of the next item")
                 else:

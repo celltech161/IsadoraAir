@@ -8506,6 +8506,7 @@ class PlaybackEngine:
             deck.mark_milestone("SYNC_STATE_FAILED")
             deck.start_failed = True
         if scheduled:
+            self._vt2_track_mixer_progress()
             GLib.timeout_add(
                 int(vt_transition.SCHEDULED_DECK_READY_S * 1000),
                 self._vt2_scheduled_deck_readiness_deadline, slot, deck.generation,
@@ -10347,16 +10348,68 @@ class PlaybackEngine:
         return deck
 
     def _vtt_incoming_on_air(self, deck, now_ns=None):
-        """True when a scheduled generation renders now or within
-        HOLD_MIN_LEAD_S: it is treated as already on air (never withdrawn or
-        regenerated). A preparing generation is unlinked and cannot render."""
+        """True when a scheduled generation's audio can no longer be
+        recalled -- it is then on air (never withdrawn or regenerated).
+
+        2.25 B7 supplemental (C7): decided from pipeline EVIDENCE, not from
+        proximity to the scheduled admission. A scheduled generation is
+        linked to the non-live deck mixer with its pad offset; until that
+        mixer has aggregated and pushed output that reaches the admission,
+        every sample of the generation is still upstream and releasing its
+        pad drops it (measured: no sample reaches the program). The mixer's
+        pushed position is tracked by a src-pad buffer probe
+        (``_vt2_mixer_pushed_ns``); the guard covers one buffer being
+        aggregated and one being pushed while the GLib thread decides.
+        Without that evidence (no probe data yet) it falls back to the
+        guard itself measured against the clock -- never the former 120 ms.
+        A preparing generation is unlinked and cannot render."""
         state = getattr(deck, "admission_state", None)
         if state in (None, "audible"):
             return True
         if state != "scheduled":
             return False
+        guard = self._vt2_mixer_guard_ns()
+        pushed = self.__dict__.get("_vt2_mixer_pushed_ns")
+        if pushed is not None:
+            return pushed + guard >= deck.scheduled_admission_ns
         now_ns = self._vt2_running_ns() if now_ns is None else now_ns
-        return deck.scheduled_admission_ns - now_ns <= int(vt_transition.HOLD_MIN_LEAD_S * Gst.SECOND)
+        return deck.scheduled_admission_ns - now_ns <= guard
+
+    def _vt2_mixer_guard_ns(self):
+        try:
+            step = int(self.mixer.get_property("output-buffer-duration"))
+        except Exception:
+            step = 10 * Gst.MSECOND
+        return max(2 * step, int(vt_transition.MIXER_RECALL_GUARD_S * Gst.SECOND))
+
+    def _vt2_track_mixer_progress(self):
+        """Install (once per deck mixer) a src-pad buffer probe recording the
+        running end time the deck mixer has pushed downstream. Streaming
+        thread: one integer store, no locks, no I/O."""
+        mixer = self.mixer
+        if mixer is None or self.__dict__.get("_vt2_mixer_probe_owner") is mixer:
+            return
+        pad = mixer.get_static_pad("src")
+        if pad is None:
+            return
+        engine = self
+
+        def on_buffer(pad, info):
+            buf = info.get_buffer()
+            if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+            end = buf.pts + (buf.duration if buf.duration != Gst.CLOCK_TIME_NONE else 0)
+            event = pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
+            if event is not None:
+                running = event.parse_segment().to_running_time(Gst.Format.TIME, end)
+                if running != Gst.CLOCK_TIME_NONE:
+                    end = running
+            previous = engine.__dict__.get("_vt2_mixer_pushed_ns")
+            if previous is None or end > previous:
+                engine._vt2_mixer_pushed_ns = end
+            return Gst.PadProbeReturn.OK
+        pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        self._vt2_mixer_probe_owner = mixer
 
     def _vtt_speech_busy_until_ns(self, exclude=None):
         """Running ns at which the live speech of every other record ends
@@ -12890,7 +12943,7 @@ class PlaybackEngine:
         vt_held = self._vtt_incoming_deck(vt_record) if vt_record is not None else None
         vt_imminent = None
         if vt_held is not None and self._vtt_incoming_on_air(vt_held):
-            # Renders now or within HOLD_MIN_LEAD_S: never regenerated.
+            # Its audio can no longer be recalled (C7: deck-mixer evidence): never regenerated.
             vt_imminent, vt_held = vt_held, None
         occupied = [deck for deck in self.decks.values() if deck is not None]
         if any(deck.gated_seek is not None for deck in occupied):
@@ -12917,7 +12970,7 @@ class PlaybackEngine:
             return
         if vt_held is None and vt_imminent is not None and live == [vt_imminent] \
                 and getattr(vt_imminent, "admission_state", None) == "scheduled":
-            # 2.25 B7: the claimed song renders within HOLD_MIN_LEAD_S and
+            # 2.25 B7: the claimed song can no longer be recalled (C7) and
             # nothing else is live. It IS the operator's next: it keeps its
             # admission (never faded out as if it were the outgoing, never
             # skipped for the following item).

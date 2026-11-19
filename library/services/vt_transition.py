@@ -49,7 +49,8 @@ OUTRO_DELIVERY_MEMORY = 512        # bounded in-process outro delivery record (D
 
 # -- B5 operator controls ------------------------------------------------------
 SPEECH_CANCEL_FADE_MS = 50         # D6/D8: audible VT speech cancelled by mic, Start Next, operator command
-HOLD_MIN_LEAD_S = 0.120            # a scheduled incoming this close to its admission is treated as on air
+HOLD_MIN_LEAD_S = 0.120            # retired by B7 supplemental C7 (kept for readers; not used for decisions)
+MIXER_RECALL_GUARD_S = 0.020       # C7: deck-mixer output this close to an admission is treated as pushed
 START_NEXT_ADMIT_LEAD_S = 0.150    # Start Next re-admits a held claimed occurrence this far ahead
 
 # -- B6 asynchronous lookups (F13) ----------------------------------------------
