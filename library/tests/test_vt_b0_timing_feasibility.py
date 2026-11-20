@@ -578,11 +578,18 @@ class E09E10CancellationTests(TransitionMixin, SimpleTestCase):
             lab.engine._eject_deck("B", expected_log_item_id=2)
             record["eject_ms"] = (time.monotonic() - began) * 1000
             p.intro_branch.cancel("incoming_ejected", fade_ms=50)
-        p = self.transition(lab, "E09 setup", out_len=1.6, out_ns=1.2, c=0.2, i=1.0, v=2.0,
+        # The VT is ONE continuous tone (HEAD, 2200 Hz: 16 Goertzel bins from MUSIC).
+        # The standard head-then-speech file switches 2200 -> 1000 Hz inside the
+        # held-music window; a 10 ms frame straddling that switch leaks ~0.03
+        # into the 600 Hz bin (1000 Hz is only 4 bins away) -- a false "held
+        # music aired" frame with no held-song PCM (2.25 C10, independent review).
+        # Zero tolerance for held music is unchanged.
+        vt_path = lab.media("e09-intro-continuous", [(2.0, HEAD)])
+        p = self.transition(lab, "E09 setup", out_len=1.6, out_ns=1.2, c=0.2, i=1.0, v=2.0, vt_path=vt_path,
                             actions=[(lambda p: p.s_v + 0.6, eject)], measure=False)
         self.assertAlmostEqual(p.u, 1.35, places=9)
         t = p.trace
-        speech_end = t.end(SPEECH, after=p.s_v + 0.3)
+        speech_end = t.end(HEAD, after=p.s_v + 0.3)
         music = t.present(MUSIC, p.s_v, p.a_i + 2.0)
         pump(1.0)
         after = lab.resources()
