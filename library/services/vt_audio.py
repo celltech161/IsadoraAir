@@ -24,6 +24,7 @@ thread; NULL transitions never run on the GLib thread.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -37,6 +38,14 @@ from library.services import vt_transition  # noqa: E402
 
 NS = Gst.SECOND
 MS = Gst.MSECOND
+
+# Detached VT bins whose NULL transition the bounded worker did NOT accept
+# (poisoned / stopping / full / duplicate / submit error). Nothing else will
+# ever set them to NULL, and a GStreamer element must not be finalized while
+# PLAYING, so they are held here -- explicitly, independent of the fire that
+# owned them -- instead of by a probe-closure reference cycle. Bounded in
+# practice: a poisoned or stopping worker suspends every new VT preparation.
+UNSTOPPED_BINS = []
 
 
 class FireState:
@@ -121,6 +130,13 @@ class ScheduledVtFire:
         self.history = []                # (state, reason, running_ns)
         self.bin = None
         self.mixer_pad = None
+        # Everything a built branch registers that references this fire (the
+        # probe and signal closures capture it) or that keeps it alive (its
+        # pending deadline timers); released at retirement so a retired fire
+        # and its decoding chain can be collected.
+        self._probe_handles = []          # [(pad, probe_id)]
+        self._signal_handles = []         # [(element, handler_id)]
+        self._timer_ids = []              # GLib source ids returned by timer_at
         self._fading = False
         self._before_start = before_start     # construction seam (tests): runs before the bin starts
 
@@ -195,7 +211,7 @@ class ScheduledVtFire:
             sink = conv.get_static_pad("sink")
             if not sink.is_linked():
                 pad.link(sink)
-        dec.connect("pad-added", on_pad_added)
+        self._signal_handles.append((dec, dec.connect("pad-added", on_pad_added)))
 
         token = (self.fire_id, self.serial)
         vol_src = vol.get_static_pad("src")
@@ -218,8 +234,8 @@ class ScheduledVtFire:
                 return Gst.PadProbeReturn.DROP    # never reaches the live submix
             return Gst.PadProbeReturn.OK
 
-        vol_src.add_probe(Gst.PadProbeType.BUFFER, buffer_probe)
-        vol_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, eos_probe)
+        self._probe_handles.append((vol_src, vol_src.add_probe(Gst.PadProbeType.BUFFER, buffer_probe)))
+        self._probe_handles.append((vol_src, vol_src.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, eos_probe)))
 
         self.bin = b
         self.pipeline.add(b)
@@ -235,11 +251,61 @@ class ScheduledVtFire:
             self._fail(token, "state_change_failure")
             return False
         d = self._deadlines
-        self._timer_at(int(d["ready_by"] * NS), self._ready_deadline, token)
-        self._timer_at(self.admission_ns, self._admission, token)
-        self._timer_at(int(d["first_audio_by"] * NS), self._first_audio_deadline, token)
-        self._timer_at(int(d["complete_by"] * NS), self._completion_deadline, token)
+        self._schedule(int(d["ready_by"] * NS), self._ready_deadline, token)
+        self._schedule(self.admission_ns, self._admission, token)
+        self._schedule(int(d["first_audio_by"] * NS), self._first_audio_deadline, token)
+        self._schedule(int(d["complete_by"] * NS), self._completion_deadline, token)
         return True
+
+    def _schedule(self, running_ns, fn, token):
+        """``timer_at`` plus bookkeeping: an id stays in ``_timer_ids`` only
+        until its callback runs (GLib reuses source ids, so a dispatched id is
+        never destroyed later), letting retirement cancel what is still
+        pending."""
+        seen = {"ran": False, "id": None}
+
+        def run(tok):
+            seen["ran"] = True
+            if seen["id"] in self._timer_ids:
+                self._timer_ids.remove(seen["id"])
+            return fn(tok)
+        source = self._timer_at(running_ns, run, token)
+        if isinstance(source, int) and source > 0 and not seen["ran"]:
+            seen["id"] = source
+            self._timer_ids.append(source)
+
+    def _cancel_timers(self):
+        """Destroy this fire's still-pending deadline timers (every one is
+        stale after a terminal transition; left alone they would keep the
+        retired fire alive until their due time)."""
+        context = GLib.MainContext.default()
+        pending, self._timer_ids = self._timer_ids, []
+        for source_id in pending:
+            try:
+                source = context.find_source_by_id(source_id)
+                if source is not None and not source.is_destroyed():
+                    source.destroy()
+            except Exception as exc:
+                self.teardown_errors.append(f"timer: {exc!r}")
+
+    def _release_registrations(self):
+        """Remove the pad probes and disconnect the decoder handler (both
+        capture this fire). GLib thread, after the branch is unlinked: a probe
+        callback already running on a streaming thread finishes normally and
+        its GLib hand-off carries a stale token. Idempotent."""
+        probes, self._probe_handles = self._probe_handles, []
+        for pad, probe_id in probes:
+            try:
+                pad.remove_probe(probe_id)
+            except Exception as exc:
+                self.teardown_errors.append(f"remove_probe: {exc!r}")
+        handlers, self._signal_handles = self._signal_handles, []
+        for element, handler_id in handlers:
+            try:
+                if element.handler_is_connected(handler_id):
+                    element.disconnect(handler_id)
+            except Exception as exc:
+                self.teardown_errors.append(f"disconnect: {exc!r}")
 
     # -- callbacks (GLib thread, owner-checked) ------------------------------
     def _on_ready(self, token):
@@ -275,7 +341,7 @@ class ScheduledVtFire:
             # EOS is seen when the last buffer is QUEUED in the aggregator,
             # not rendered: retire only after the last sample (F14).
             due = max(self._now_ns(), (last or 0)) + self.DRAIN_GUARD_NS
-            self._timer_at(due, self._drained, token)
+            self._schedule(due, self._drained, token)
         return False
 
     def _drained(self, token):
@@ -323,6 +389,7 @@ class ScheduledVtFire:
             self.ignored.append((f"terminal:{state}", self.state))
             return
         self.serial += 1                      # every older timer is now stale
+        self._cancel_timers()
         self.ended_ns = self._now_ns()
         self._mark(state, reason)
         if fade_ms and self.mixer_pad is not None:
@@ -353,9 +420,16 @@ class ScheduledVtFire:
     def _detach(self):
         """Detach first, on the GLib thread: unlink, release the request pad
         (wakes a streaming thread holding a queued future buffer), remove the
-        bin. The NULL transition is handed off; it never runs here."""
+        bin. The NULL transition is handed off; it never runs here.
+
+        Then release what ties the retired fire to its branch: the probes and
+        the decoder handler (closures over this fire) and, once the bounded
+        worker has ACCEPTED the NULL transition (it holds the bin until done),
+        the fire's own bin reference. A bin the worker did not accept is kept
+        (and listed in UNSTOPPED_BINS): it is never finalized while PLAYING."""
         if self.retired or self.bin is None:
             self.retired = True
+            self._release_registrations()
             return
         began = time.monotonic()
         ghost = self.bin.get_static_pad("src")
@@ -374,6 +448,7 @@ class ScheduledVtFire:
             self.pipeline.remove(self.bin)
         except Exception as exc:
             self.teardown_errors.append(f"remove: {exc!r}")
+        self._release_registrations()
         self.detach_ms = (time.monotonic() - began) * 1000.0
         self.retired = True
         try:
@@ -381,6 +456,10 @@ class ScheduledVtFire:
         except Exception as exc:
             self.teardown_errors.append(f"null_submit: {exc!r}")
             self.teardown_outcome = "error"
+        if self.teardown_outcome == "queued":
+            self.bin = None                   # the worker owns it now
+        else:
+            UNSTOPPED_BINS.append((self.fire_id, self.bin))
 
 
 class VtDuckCurve:
@@ -394,11 +473,17 @@ class VtDuckCurve:
     Points are given in pipeline running time and converted to the
     element's stream time with an offset measured from its own segment."""
 
+    IGNORED_HISTORY = 64
+
     def __init__(self, volume_element, now_ns: Callable[[], int]):
         self.element = volume_element
         self._now_ns = now_ns
         self.owner = None
-        self.ignored = []
+        # Diagnostics only (stale/no-owner releases). The curve lives as long
+        # as the engine and a no-owner release happens on every speech-free
+        # duck refresh, so only the most recent entries are kept.
+        self.ignored = deque(maxlen=self.IGNORED_HISTORY)
+        self.ignored_total = 0
         self.points = ()
         self.source = GstController.InterpolationControlSource()
         self.source.set_property("mode", GstController.InterpolationMode.LINEAR)
@@ -468,6 +553,7 @@ class VtDuckCurve:
         Ignored (False) for any owner other than the current one."""
         if owner != self.owner or owner is None:
             self.ignored.append(("release", owner))
+            self.ignored_total += 1
             return False
         now = self._now_ns()
         current = self.value_at(now)
