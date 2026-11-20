@@ -148,6 +148,12 @@ MIC_INPUT_NAME = "Studio Microphone 1"
 
 DUCK_RAMP_MS = 500
 DUCK_RAMP_STEPS = 20  # ~25ms per step -- smooth enough for a loudness fade, not sample-accurate automation
+# 2.25 C10: hard cap on VT bins that exist and are not yet confirmed NULL
+# (live branches + bins the VT teardown coordinator owns). New VT preparation
+# is refused at the cap, and suspended for the process on any teardown that
+# did not complete, so at most this many VT bins can ever be quarantined.
+# Healthy NULL of a detached branch takes ~1 ms; real use needs <= 3.
+VT_MAX_IN_FLIGHT_BINS = 8
 
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 # Restart recovery stays on tmpfs with the existing engine-state snapshot.
@@ -9175,14 +9181,28 @@ class PlaybackEngine:
         if vt_coordinator is not None:
             # 2.25 B2: bounded NULL worker for detached scheduled VT branches.
             vt_coordinator.tick()
+            unhealthy = False
             for event in vt_coordinator.drain_events():
-                if event["kind"] in {"timed_out", "rejected_poisoned", "rejected_full"}:
-                    emit_event(
-                        category="engine", level="error",
-                        title="Voice track branch teardown could not complete after isolation",
-                        detail={"kind": event["kind"], **event.get("metadata", {})},
-                        dedupe_key=f"engine|vt2-teardown|{event['kind']}",
-                    )
+                kind = event["kind"]
+                if kind not in self.VT2_TEARDOWN_UNHEALTHY_EVENTS:
+                    continue
+                unhealthy = True
+                snapshot = vt_coordinator.snapshot()
+                emit_event(
+                    category="engine", level="error",
+                    title=("Voice Track branch teardown did not complete; branch retained in quarantine, "
+                           "Voice Tracks suspended (program playout continues)"),
+                    detail={"teardown_event": kind, "kind": kind, "generation": event.get("generation"),
+                            "reason": event.get("reason"), "error": event.get("error"),
+                            "elapsed_seconds": event.get("elapsed_s"), **event.get("metadata", {}),
+                            "branch_isolated_from_program": True, "voice_tracks_suspended": True,
+                            "program_playout_interrupted": False,
+                            "quarantined_bins": snapshot.get("quarantined"),
+                            "coordinator": snapshot},
+                    dedupe_key=f"engine|vt2-teardown|{kind}",
+                )
+            if unhealthy:
+                self._vtt_fires_available()       # the one de-duplicated suspension event
         coordinators = getattr(self, "_deck_teardowns", None)
         if not coordinators:
             return True
@@ -10081,11 +10101,57 @@ class PlaybackEngine:
             if result == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError(f"set_state(NULL) returned {result}")
             return result
-        return self._vt2_teardown_coordinator().submit(
-            fire.fire_id, set_null,
-            metadata={"fire_id": fire.fire_id, "direction": fire.owner.direction,
-                      "log_item_id": fire.owner.log_item_id},
-        )
+        # retain=: the coordinator owns the bin until NULL is confirmed, or
+        # quarantines it (refused / failed / timed out / abandoned) -- never
+        # only this closure, which a poisoned coordinator discards.
+        metadata = {"fire_id": fire.fire_id, "direction": fire.owner.direction,
+                    "log_item_id": fire.owner.log_item_id}
+        try:
+            return self._vt2_teardown_coordinator().submit(
+                fire.fire_id, set_null, metadata=metadata, retain=fire_bin)
+        except Exception as exc:              # never lose the bin; suspend VT (admission)
+            self._vt2_submit_errors = self.__dict__.get("_vt2_submit_errors", 0) + 1
+            audio_recovery.quarantine("vt-fires", fire.fire_id, "submit_error", fire_bin,
+                                      {**metadata, "error": repr(exc)})
+            try:
+                emit_event(
+                    category="engine", level="error",
+                    title=("Voice Track branch teardown could not be submitted; branch retained in "
+                           "quarantine, Voice Tracks suspended (program playout continues)"),
+                    detail={"teardown_event": "submit_error", "error": repr(exc), **metadata,
+                            "branch_isolated_from_program": True, "voice_tracks_suspended": True,
+                            "program_playout_interrupted": False},
+                    dedupe_key="engine|vt2-teardown|submit_error",
+                )
+            except Exception:
+                pass
+            return "submit_error"
+
+    # Coordinator outcomes after which a VT bin was NOT confirmed NULL.
+    VT2_TEARDOWN_UNHEALTHY_EVENTS = frozenset({
+        "failed", "timed_out", "abandoned_without_start", "rejected_poisoned", "rejected_full",
+        "rejected_stopping", "duplicate_ignored", "late_result_discarded",
+    })
+
+    def _vt2_teardown_admission(self):
+        """(admitted, reason) for building one more VT branch. Persistent
+        refusal once the VT teardown system failed to confirm any NULL
+        (poisoned / stopping / failed / quarantined); transient refusal at
+        VT_MAX_IN_FLIGHT_BINS unconfirmed bins."""
+        if self.__dict__.get("_vt2_submit_errors"):
+            return False, "submit_error"
+        coordinator = self.__dict__.get("_vt2_teardown")
+        snapshot = coordinator.snapshot() if coordinator is not None else {}
+        for key in ("poisoned", "stopping"):
+            if snapshot.get(key):
+                return False, key
+        if snapshot.get("failed") or snapshot.get("quarantined"):
+            return False, "quarantined"
+        live = sum(1 for fire in self.__dict__.get("_vt2_fires", {}).values()
+                   if not fire.retired and fire.bin is not None)
+        if live + int(snapshot.get("owned") or 0) >= VT_MAX_IN_FLIGHT_BINS:
+            return False, "in_flight_limit"
+        return True, ""
 
     def _vt2_fire_for_message_src(self, source):
         for fire in list(self.__dict__.get("_vt2_fires", {}).values()):
@@ -10120,6 +10186,10 @@ class PlaybackEngine:
             null_submit=self._vt2_submit_null, on_event=route, before_start=before_start,
         )
         registry[owner.fire_id] = fire
+        admitted, why = self._vt2_teardown_admission()
+        if not admitted:
+            fire.refuse(f"vt_teardown_unavailable:{why}")      # nothing built
+            return fire
         fire.prepare()
         return fire
 
@@ -12186,15 +12256,20 @@ class PlaybackEngine:
 
     def _vtt_fires_available(self):
         """Whether VT branches can be safely retired. A poisoned or stopping
-        VT teardown worker suspends every new VT preparation (ordinary deck
-        playout is unaffected: decks use their own per-slot coordinators);
-        an operator-visible event is emitted once per process."""
+        VT teardown worker, or any VT teardown that did not confirm NULL
+        (failed / timed out / abandoned / refused -> quarantined), suspends
+        every new VT preparation for the process (ordinary deck playout is
+        unaffected: decks use their own per-slot coordinators); an
+        operator-visible event is emitted once per process. At the in-flight
+        cap new VTs are refused without that event (transient)."""
+        admitted, why = self._vt2_teardown_admission()
+        if admitted:
+            return True
+        if why == "in_flight_limit":
+            self._vtt_in_flight_refusals = self.__dict__.get("_vtt_in_flight_refusals", 0) + 1
+            return False
         coordinator = self.__dict__.get("_vt2_teardown")
-        if coordinator is None:
-            return True
-        snapshot = coordinator.snapshot()
-        if not (snapshot["poisoned"] or snapshot["stopping"]):
-            return True
+        snapshot = coordinator.snapshot() if coordinator is not None else {"poisoned": False, "stopping": False}
         if not self.__dict__.get("_vtt_poison_reported"):
             self._vtt_poison_reported = True
             print("  VT teardown worker unavailable -- Voice Track transitions suspended "
@@ -12204,8 +12279,12 @@ class PlaybackEngine:
                     category="engine", level="error",
                     title="Voice Track transitions suspended: VT teardown worker unavailable",
                     detail={"poisoned": bool(snapshot["poisoned"]), "stopping": bool(snapshot["stopping"]),
+                            "reason": why, "failed": snapshot.get("failed"),
+                            "quarantined_bins": snapshot.get("quarantined"),
+                            "owned_in_flight": snapshot.get("owned"),
                             "active_generation": snapshot.get("active_generation"),
-                            "queue_depth": snapshot.get("queue_depth")},
+                            "queue_depth": snapshot.get("queue_depth"),
+                            "voice_tracks_suspended": True, "program_playout_interrupted": False},
                     dedupe_key="engine|vt-teardown-unavailable",
                 )
             except Exception:

@@ -403,6 +403,33 @@ class SlotCoordinator:
 # ---------------------------------------------------------------------------
 
 
+# Process-lifetime retention for objects whose teardown was NOT confirmed
+# (2.25 C10). A coordinator that was handed ``retain=`` moves the object here
+# when its operation fails, times out, is abandoned or is refused: nothing will
+# ever drive it to a safe state, and a GStreamer element must not be finalized
+# while PLAYING, so it is held until the process exits -- never dropped to
+# satisfy a cap. Callers bound it by admission control (the VT layer caps its
+# in-flight bins and suspends new work on the first entry; see
+# engine.VT_MAX_IN_FLIGHT_BINS).
+_QUARANTINE_LOCK = threading.Lock()
+TEARDOWN_QUARANTINE: list = []
+
+
+def quarantine(owner: str, generation: int, kind: str, obj: Any, metadata: Optional[dict] = None) -> None:
+    """Retain ``obj`` for the life of the process (see TEARDOWN_QUARANTINE)."""
+
+    with _QUARANTINE_LOCK:
+        TEARDOWN_QUARANTINE.append(
+            {"owner": owner, "generation": generation, "kind": kind,
+             "metadata": dict(metadata or {}), "at": time.monotonic(), "obj": obj}
+        )
+
+
+def quarantined(owner: Optional[str] = None) -> list:
+    with _QUARANTINE_LOCK:
+        return [entry for entry in TEARDOWN_QUARANTINE if owner is None or entry["owner"] == owner]
+
+
 @dataclass
 class TeardownRecord:
     """One isolated generation's potentially-blocking teardown call."""
@@ -416,6 +443,7 @@ class TeardownRecord:
     result: Any = None
     exc: Optional[BaseException] = None
     abandoned: bool = False
+    retain: Any = None
 
 
 class BoundedTeardownCoordinator:
@@ -430,6 +458,14 @@ class BoundedTeardownCoordinator:
     capacity queue, and rejects future operations. It never creates a
     replacement thread for a worker Python cannot safely kill. The owner can
     drain structured events from its GLib/main thread for operator reporting.
+
+    Ownership (2.25 C10): a ``retain=`` object passed to :meth:`submit` is
+    held by the coordinator from acceptance until its operation returns
+    normally (``completed``), and only then released. Every other ending --
+    refused at submit, ``failed``, ``timed_out``, ``abandoned_without_start``
+    -- moves it to the process-lifetime :data:`TEARDOWN_QUARANTINE`; a late
+    result after a timeout never releases it. Ownership never depends on the
+    caller's closure, which the coordinator may discard.
     """
 
     def __init__(self, name: str, *, timeout_s: float = 15.0, queue_capacity: int = 4):
@@ -453,6 +489,20 @@ class BoundedTeardownCoordinator:
         self._poison_rejection_reported = False
         self._suppressed_poison_rejections = 0
         self._abandoned_generations = []
+        self._owned = {}                  # generation -> retained object, accepted and not yet completed
+        self._failed = 0
+        self._quarantined = 0
+
+    def _quarantine_locked(self, record: TeardownRecord, kind: str) -> None:
+        """Move a record's retained object to process-lifetime quarantine.
+        Idempotent; touches only this record's own generation entry."""
+        obj, record.retain = record.retain, None
+        if obj is None:
+            return
+        if self._owned.get(record.generation) is obj:
+            del self._owned[record.generation]
+        self._quarantined += 1
+        quarantine(self.name, record.generation, kind, obj, record.metadata)
 
     def _event_locked(self, kind: str, record: TeardownRecord, **fields) -> None:
         self._events.append(
@@ -482,22 +532,31 @@ class BoundedTeardownCoordinator:
         *,
         metadata: Optional[dict] = None,
         now: Optional[float] = None,
+        retain: Any = None,
     ) -> str:
-        """Queue one generation, or reject it without spawning a worker."""
+        """Queue one generation, or reject it without spawning a worker.
+
+        ``retain``: an object whose last reference must not be dropped until
+        the operation completes (see the class docstring). For every outcome
+        returned here the coordinator owns it: ``queued`` -> held until
+        ``completed``; any refusal -> quarantined immediately."""
 
         record = TeardownRecord(
             generation=generation,
             worker_fn=worker_fn,
             metadata=dict(metadata or {}),
             submitted_at=now if now is not None else time.monotonic(),
+            retain=retain,
         )
         with self._condition:
             if self._stopping:
                 self._rejected += 1
+                self._quarantine_locked(record, "rejected_stopping")
                 self._event_locked("rejected_stopping", record)
                 return "rejected_stopping"
             if self._poisoned:
                 self._rejected += 1
+                self._quarantine_locked(record, "rejected_poisoned")
                 # The timeout event already made the restart-required state
                 # operator-visible. Report the first later rejected teardown
                 # once, then expose only counters in snapshot() rather than
@@ -512,12 +571,16 @@ class BoundedTeardownCoordinator:
             if self._active is not None:
                 generations.add(self._active.generation)
             if generation in generations:
+                self._quarantine_locked(record, "duplicate_ignored")
                 self._event_locked("duplicate_ignored", record)
                 return "duplicate"
             if len(self._pending) >= self.queue_capacity:
                 self._rejected += 1
+                self._quarantine_locked(record, "rejected_full")
                 self._event_locked("rejected_full", record)
                 return "rejected_full"
+            if retain is not None:
+                self._owned[generation] = retain
             self._pending.append(record)
             self._event_locked("queued", record, queue_depth=len(self._pending))
             self._start_worker_locked()
@@ -535,6 +598,7 @@ class BoundedTeardownCoordinator:
                 if self._poisoned:
                     record.abandoned = True
                     self._abandoned_generations.append(record.generation)
+                    self._quarantine_locked(record, "abandoned_without_start")
                     self._event_locked("abandoned_without_start", record, reason="coordinator_poisoned")
                     continue
                 self._active = record
@@ -547,9 +611,12 @@ class BoundedTeardownCoordinator:
             else:
                 record.result = result
             completed_at = time.monotonic()
+            released = None
             with self._condition:
                 record.completed_at = completed_at
                 if record.abandoned:
+                    # Its retained object was quarantined at the timeout; a
+                    # late result never releases it.
                     self._event_locked(
                         "late_result_discarded",
                         record,
@@ -557,6 +624,13 @@ class BoundedTeardownCoordinator:
                     )
                     return
                 self._completed += 1
+                if record.exc is not None:
+                    self._failed += 1
+                    self._quarantine_locked(record, "failed")
+                elif record.retain is not None and self._owned.get(record.generation) is record.retain:
+                    # Confirmed: only this generation's own object is released.
+                    released = self._owned.pop(record.generation)
+                    record.retain = None
                 self._event_locked(
                     "failed" if record.exc is not None else "completed",
                     record,
@@ -564,6 +638,10 @@ class BoundedTeardownCoordinator:
                     error=repr(record.exc) if record.exc is not None else None,
                 )
                 self._active = None
+            # Dropped outside the lock. The worker's local record still holds
+            # the operation until its next job, so this is never where the
+            # object is finalized.
+            del released
 
     def tick(self, *, now: Optional[float] = None) -> None:
         """Detect one timeout without waiting for or replacing the worker."""
@@ -581,6 +659,7 @@ class BoundedTeardownCoordinator:
             record.abandoned = True
             self._poisoned = True
             self._abandoned_generations.append(record.generation)
+            self._quarantine_locked(record, "timed_out")
             self._event_locked(
                 "timed_out",
                 record,
@@ -590,6 +669,7 @@ class BoundedTeardownCoordinator:
                 queued = self._pending.popleft()
                 queued.abandoned = True
                 self._abandoned_generations.append(queued.generation)
+                self._quarantine_locked(queued, "abandoned_without_start")
                 self._event_locked("abandoned_without_start", queued, reason="earlier_operation_timed_out")
 
     def drain_events(self) -> list[dict]:
@@ -612,6 +692,9 @@ class BoundedTeardownCoordinator:
                 "rejected": self._rejected,
                 "suppressed_poison_rejections": self._suppressed_poison_rejections,
                 "abandoned_generations": list(self._abandoned_generations),
+                "owned": len(self._owned),
+                "failed": self._failed,
+                "quarantined": self._quarantined,
             }
 
     def stop(self) -> None:

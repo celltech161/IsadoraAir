@@ -34,19 +34,10 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstController", "1.0")
 from gi.repository import GLib, Gst, GstController  # noqa: E402
 
-from library.services import vt_transition  # noqa: E402
+from library.services import audio_recovery, vt_transition  # noqa: E402
 
 NS = Gst.SECOND
 MS = Gst.MSECOND
-
-# Detached VT bins whose NULL transition the bounded worker did NOT accept
-# (poisoned / stopping / full / duplicate / submit error). Nothing else will
-# ever set them to NULL, and a GStreamer element must not be finalized while
-# PLAYING, so they are held here -- explicitly, independent of the fire that
-# owned them -- instead of by a probe-closure reference cycle. Bounded in
-# practice: a poisoned or stopping worker suspends every new VT preparation.
-UNSTOPPED_BINS = []
-
 
 class FireState:
     PLANNED = "planned"        # constructed, nothing built
@@ -86,8 +77,10 @@ class ScheduledVtFire:
     ``now_ns()`` returns pipeline running time; ``timer_at(running_ns, fn,
     *args)`` schedules ``fn`` on the GLib thread at that running time;
     ``null_submit(fire, bin)`` hands the detached bin's NULL transition to a
-    bounded off-thread worker; ``on_event(fire, kind)`` reports lifecycle
-    changes to the owner layer."""
+    bounded off-thread worker AND its ownership: for every outcome it
+    returns, the submit side owns the bin until NULL is confirmed or it is
+    quarantined (engine: BoundedTeardownCoordinator ``retain=``);
+    ``on_event(fire, kind)`` reports lifecycle changes to the owner layer."""
 
     DRAIN_GUARD_NS = 30 * MS
     FADE_STEP_MS = 10
@@ -369,6 +362,15 @@ class ScheduledVtFire:
     def _fail(self, token, reason):
         self._terminal(token, FireState.FAILED, reason, fade_ms=0)
 
+    def refuse(self, reason) -> bool:
+        """Refuse a PLANNED fire before anything is built (owner admission
+        control, e.g. the teardown system cannot safely retire a branch)."""
+        if self.state != FireState.PLANNED:
+            return False
+        self.serial += 1
+        self._mark(FireState.FAILED, reason)
+        return True
+
     def cancel(self, reason="cancelled", fade_ms=50) -> bool:
         """Idempotent. Before admission: detach at once (nothing aired).
         Audible: fade ``fade_ms`` on the submix pad, then detach."""
@@ -423,10 +425,11 @@ class ScheduledVtFire:
         bin. The NULL transition is handed off; it never runs here.
 
         Then release what ties the retired fire to its branch: the probes and
-        the decoder handler (closures over this fire) and, once the bounded
-        worker has ACCEPTED the NULL transition (it holds the bin until done),
-        the fire's own bin reference. A bin the worker did not accept is kept
-        (and listed in UNSTOPPED_BINS): it is never finalized while PLAYING."""
+        the decoder handler (closures over this fire) and the fire's own bin
+        reference -- the submit side owns the bin for every outcome it returns
+        (held until NULL is confirmed, else quarantined for the process
+        lifetime). Only if the submit itself raises does the fire quarantine
+        the bin; a bin is never finalized while PLAYING."""
         if self.retired or self.bin is None:
             self.retired = True
             self._release_registrations()
@@ -456,10 +459,10 @@ class ScheduledVtFire:
         except Exception as exc:
             self.teardown_errors.append(f"null_submit: {exc!r}")
             self.teardown_outcome = "error"
-        if self.teardown_outcome == "queued":
-            self.bin = None                   # the worker owns it now
-        else:
-            UNSTOPPED_BINS.append((self.fire_id, self.bin))
+            audio_recovery.quarantine("vt-fires", self.fire_id, "submit_error", self.bin,
+                                      {"fire_id": self.fire_id, "error": repr(exc)})
+            return
+        self.bin = None                       # owned by the submit side now (see the class docstring)
 
 
 class VtDuckCurve:

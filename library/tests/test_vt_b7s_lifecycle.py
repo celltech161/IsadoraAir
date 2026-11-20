@@ -22,7 +22,7 @@ import weakref
 
 from django.test import SimpleTestCase
 
-from library.services import vt_audio
+from library.services import audio_recovery, vt_audio
 from library.services.vt_audio import FireState
 from library.tests._vt_b0_lab import NS, Gst, pump, report, wait_until
 from library.tests.test_vt_b2_infrastructure import HEAD, MARK, TAIL, TOL, _B2Base, owner, vt_segments
@@ -75,7 +75,7 @@ class FireCollectionTests(_LifecycleBase, SimpleTestCase):
         lab = self.lab()
         engine = lab.engine
         path = lab.media("vt-life", vt_segments(0.6), fmt="flac")
-        unstopped = len(vt_audio.UNSTOPPED_BINS)
+        quarantined = len(audio_recovery.TEARDOWN_QUARANTINE)
         probes, timings = [], []
         for _n in range(6):
             admission = lab.now() + 0.4
@@ -104,7 +104,8 @@ class FireCollectionTests(_LifecycleBase, SimpleTestCase):
             self.assertLessEqual(abs(end_err), TOL)
         self.assertEqual(engine.__dict__.get("_vt2_fires", {}), {})
         self.assertFalse([c for c in engine.main_pipeline.children if c.get_name().startswith("vt2_fire")])
-        self.assertEqual(len(vt_audio.UNSTOPPED_BINS), unstopped)
+        self.assertEqual(len(audio_recovery.TEARDOWN_QUARANTINE), quarantined)
+        self.assertEqual(engine._vt2_teardown_coordinator().snapshot()["owned"], 0)
 
     def test_cancellation_failure_and_shutdown_paths_release_their_resources(self):
         lab = self.lab()
@@ -179,28 +180,32 @@ class FireCollectionTests(_LifecycleBase, SimpleTestCase):
         self.assertLessEqual(abs(tail_end - (admission + 0.8)), TOL)
         self.settle(lab)
 
-    def test_a_teardown_the_worker_did_not_accept_keeps_its_bin_out_of_finalization(self):
+    def test_a_teardown_that_could_not_be_submitted_keeps_its_bin_out_of_finalization(self):
+        """Refusals by the coordinator are covered in test_vt_c10_teardown_ownership;
+        here the submit itself raises, so the fire quarantines its own bin."""
         lab = self.lab()
         engine = lab.engine
         path = lab.media("vt-life-unaccepted", vt_segments(0.6))
 
-        def refused(_fire, _bin):
-            return "rejected_poisoned"
-        held = len(vt_audio.UNSTOPPED_BINS)
+        def broken(_fire, _bin):
+            raise RuntimeError("submit unavailable")
+        held = len(audio_recovery.TEARDOWN_QUARANTINE)
         fire = vt_audio.ScheduledVtFire(
             owner=owner(), path=path, gain_db=0.0, admission_ns=lab.now_ns() + int(0.4 * NS),
             validated_duration=0.6, pipeline=engine.main_pipeline, mixer=engine.fx_submix,
-            rate=lab.rate, now_ns=engine._vt2_running_ns, timer_at=engine._vt2_timer_at, null_submit=refused)
+            rate=lab.rate, now_ns=engine._vt2_running_ns, timer_at=engine._vt2_timer_at, null_submit=broken)
         self.assertTrue(fire.prepare())
         self.assertTrue(wait_until(lambda: fire.state == FireState.ENDED, 3.0))
-        report("LIFECYCLE unaccepted", outcome=fire.teardown_outcome, held=len(vt_audio.UNSTOPPED_BINS) - held)
-        self.assertEqual(fire.teardown_outcome, "rejected_poisoned")
-        self.assertIsNotNone(fire.bin, "a bin nobody will stop is kept (never finalized while PLAYING)")
-        self.assertEqual(vt_audio.UNSTOPPED_BINS[-1], (fire.fire_id, fire.bin))
+        entries = audio_recovery.TEARDOWN_QUARANTINE[held:]
+        report("LIFECYCLE unaccepted", outcome=fire.teardown_outcome, held=len(entries))
+        self.assertEqual(fire.teardown_outcome, "error")
+        self.assertEqual([(e["generation"], e["kind"]) for e in entries], [(fire.fire_id, "submit_error")])
+        self.assertIs(entries[0]["obj"], fire.bin)
+        self.assertEqual(fire.bin.get_state(0)[1], Gst.State.PLAYING, "never finalized while PLAYING")
         self.assertEqual((fire._probe_handles, fire._signal_handles), ([], []))
         self.assertIsNone(fire.mixer_pad)
         fire.bin.set_state(Gst.State.NULL)                    # test cleanup only
-        vt_audio.UNSTOPPED_BINS.pop()
+        del audio_recovery.TEARDOWN_QUARANTINE[held:]
 
 
 class DuckHistoryTests(_LifecycleBase, SimpleTestCase):
