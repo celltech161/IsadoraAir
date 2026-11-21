@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0145",
+  "previous_release_id": "r0144",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Evergreen Voice Tracks: two-sided intro/outro transitions with actual-audio admission, microphone, Remote DJ and urgent-alert precedence, and durable teardown with failure quarantine and VT suspension. Library: Export to .csv of the filtered, sorted Track list. Weather Health says why an NWS watch/warning snapshot is stale. No migration, package, static, unit or protected-runtime change; restart Gunicorn, then the engine, then Monitoring.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
