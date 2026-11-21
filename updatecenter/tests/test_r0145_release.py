@@ -13,8 +13,27 @@ source tip.
 
 r0145 declares no migration and restarts Gunicorn, the engine and Monitoring: those are exactly the long-running
 services that load (or, for Monitoring, run) the changed production code; the changed NWS poller is a scheduled one-shot
-process. Every object named by these tests is reachable from R alone (asserted against an isolated repository that holds
-nothing but R's history).
+process.
+
+What the published history does and does not contain
+----------------------------------------------------
+1. Present in the published ancestry (and therefore in every clone of R): r0144, the 25 integrated engineering commits
+   with their trees, and R. Each integrated commit names the commit it was cherry-picked from in its
+   ``(cherry picked from commit ...)`` trailer.
+2. NOT present in the published ancestry: the original accepted source commits (ENGINEERING_CHAIN's third column and
+   ACCEPTED_*). They are referenced only by those trailers and exist only in the engineering repository; a fresh public
+   clone does not have them. Reachability from R alone is therefore asserted only for the objects of (1).
+3. Provenance comparisons that need those original objects (patch-ID equality with each source commit, the accepted
+   source trees and their ancestry, and byte equality of every changed file with its source tip) run only when every
+   source commit they use exists in the repository under test. When one is genuinely absent the test is SKIPPED with
+   the missing identities named; a skipped comparison is not a performed comparison and is not claimed as one. A
+   source object that exists but does not match is a failure, and an unexpected Git error is an error, never a skip.
+4. Everything that can be proven from the published history alone is asserted unconditionally: the exact 25-commit
+   linear chain on r0144 (parents, trees, no merges, a cherry-pick trailer naming the expected source and a non-empty
+   change in every commit), the trees reproduced at the accepted-source boundaries, the disjoint 49/7/6 workstream file
+   sets and the 62-file inventory derived from the integration boundaries, and R as the metadata-only child. The release
+   chain, manifest, migration, restart, trusted-updater plan and planner-parity contracts are mandatory in every
+   environment.
 """
 from __future__ import annotations
 
@@ -127,6 +146,13 @@ ACCEPTED_NWS_IMPLEMENTATION = ("35e98305054aac4402fba776eead6e7b8a3098be", "48f0
 ACCEPTED_NWS = ("654b7ee9d2fac175167ef00b9ddb11ba8bc19fd0", "c1a8403ff0a82c3f8c7f7670a368d69ad6a20621")
 ENGINEERING = ENGINEERING_CHAIN[-1][0]
 ENGINEERING_TREE = ENGINEERING_CHAIN[-1][1]
+#: Integrated commits that complete each workstream (published): A = roadmap 2.25 (22 commits), B = CSV export, C = NWS.
+VT_INTEGRATED = ENGINEERING_CHAIN[21][0]
+CSV_INTEGRATED = ENGINEERING_CHAIN[22][0]
+NWS_INTEGRATED = ENGINEERING_CHAIN[24][0]
+#: The original accepted source commits. NOT in the published ancestry: referenced only by the integrated commits'
+#: cherry-pick trailers, present only in the engineering repository (see the module docstring).
+SOURCE_COMMITS = tuple(origin for _commit, _tree, origin in ENGINEERING_CHAIN)
 ADDED_FILES = {
     "docs/LIBRARY_CSV_EXPORT.md",
     "docs/roadmap/2_25_PHASE_A_VT_TRANSITION_CONTRACT.md",
@@ -285,6 +311,38 @@ def _blob(commit: str, path: str) -> str | None:
     result = subprocess.run(["git", "-C", str(PROJECT_ROOT), "rev-parse", "-q", "--verify", f"{commit}:{path}"],
                             capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _source_commit_exists(commit: str) -> bool:
+    """True when this exact commit exists in the repository under test, False when it is genuinely absent.
+
+    ``git cat-file -e <40-hex>`` exits 0 for an existing object and 1, silently, for an absent one. Nothing else is
+    "absent": a malformed name or any other failure (repository corruption, permissions, a missing Git) is raised, and
+    so is an existing object that is not a commit, so none of them can pass as an ordinary skip."""
+    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+        raise ValueError(f"not a full lowercase commit SHA: {commit!r}")
+    result = subprocess.run(["git", "-C", str(PROJECT_ROOT), "cat-file", "-e", commit],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        kind = _git("cat-file", "-t", commit)
+        if kind != "commit":
+            raise AssertionError(f"{commit} exists but is a {kind}, not a commit")
+        return True
+    if result.returncode == 1 and not result.stderr.strip():
+        return False
+    raise RuntimeError(f"git cat-file -e {commit} failed unexpectedly (exit {result.returncode}): "
+                       f"{result.stderr.strip()!r}")
+
+
+def _require_sources(test, *commits: str) -> None:
+    """Skip ``test`` only when a needed original accepted source commit is genuinely absent (a public clone)."""
+    missing = [commit for commit in dict.fromkeys(commits) if not _source_commit_exists(commit)]
+    if missing:
+        shown = ", ".join(missing[:5]) + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
+        test.skipTest(
+            f"{len(missing)} of {len(set(commits))} original accepted source commit(s) this comparison needs are "
+            f"absent from this repository (unpublished engineering objects; see the module docstring): {shown}"
+        )
 
 
 def _introducing(path: str = MANIFEST_PATH) -> list[str]:
@@ -462,34 +520,58 @@ class R0145HistoryAndScopeTests(SimpleTestCase):
         self.assertEqual(len(commits), 25)
         self.assertEqual(_git("rev-list", "--reverse", f"{R0144_RELEASE}..{ENGINEERING}").split(), commits)
         parent = R0144_RELEASE
-        for commit, tree, _origin in ENGINEERING_CHAIN:
+        for commit, tree, origin in ENGINEERING_CHAIN:
             self.assertEqual(_git("rev-list", "--parents", "-n", "1", commit).split()[1:], [parent], commit)
             self.assertEqual(_git("rev-parse", f"{commit}^{{tree}}"), tree, commit)
+            # Published provenance: each integrated commit names its accepted source and really changes something.
+            self.assertIn(f"(cherry picked from commit {origin})", _git("log", "-1", "--format=%B", commit), commit)
+            self.assertNotEqual(_changed(f"{commit}^", commit), set(), commit)
             parent = commit
         self.assertEqual(_git("rev-list", "--merges", f"{R0144_RELEASE}..{ENGINEERING}"), "")
         self.assertEqual(_introducing("deploy/releases/r0144.json"), [R0144_RELEASE])
+        # The expected sources, in order, at the workstream boundaries (A: first 22, B: CSV, C: NWS x2).
+        self.assertEqual(len(set(SOURCE_COMMITS)), 25)
+        self.assertEqual(
+            [SOURCE_COMMITS[20], SOURCE_COMMITS[21], *SOURCE_COMMITS[22:]],
+            [ACCEPTED_C10[0], ACCEPTED_VT[0], ACCEPTED_CSV[0], ACCEPTED_NWS_IMPLEMENTATION[0], ACCEPTED_NWS[0]],
+        )
+        # The integrated trees reproduce the accepted C10-remediation and roadmap 2.25 trees (published evidence).
+        self.assertEqual(ENGINEERING_CHAIN[21][1], ACCEPTED_VT[1])
+        self.assertEqual(ENGINEERING_CHAIN[20][1], ACCEPTED_C10[1])
 
     def test_every_commit_is_a_patch_identical_cherry_pick_of_its_accepted_source_in_order(self):
+        """Patch-ID equality with each original accepted source commit (requires those objects).
+
+        A public clone does not have them, so this is skipped there, never faked. The published cherry-pick
+        trailers, the expected source order and the non-empty changes are asserted unconditionally in
+        test_engineering_is_the_exact_linear_chain_on_r0144."""
         origins = [origin for _commit, _tree, origin in ENGINEERING_CHAIN]
+        _require_sources(self, *origins)
         self.assertEqual(origins[:22], _git("rev-list", "--reverse", f"{R0144_RELEASE}..{ACCEPTED_VT[0]}").split())
-        self.assertEqual(origins[22:], [ACCEPTED_CSV[0], ACCEPTED_NWS_IMPLEMENTATION[0], ACCEPTED_NWS[0]])
         self.assertEqual(_git("rev-list", "--merges", f"{R0144_RELEASE}..{ACCEPTED_VT[0]}"), "")
         for commit, _tree, origin in ENGINEERING_CHAIN:
             with self.subTest(commit=commit):
-                self.assertIn(f"(cherry picked from commit {origin})", _git("log", "-1", "--format=%B", commit))
                 self.assertEqual(_patch_id(commit), _patch_id(origin))
-                self.assertNotEqual(_changed(f"{commit}^", commit), set())
 
     def test_accepted_sources_and_trees_are_reproduced(self):
+        """Accepted source trees and ancestry of the original source commits (requires those objects).
+
+        Skipped when they are absent. The integrated trees that reproduce the accepted C10 and roadmap 2.25 trees
+        are asserted unconditionally in the linear-chain test."""
+        _require_sources(self, *(commit for commit, _tree in (ACCEPTED_VT, ACCEPTED_C10, ACCEPTED_CSV,
+                                                              ACCEPTED_NWS_IMPLEMENTATION, ACCEPTED_NWS)))
         for commit, tree in (ACCEPTED_VT, ACCEPTED_C10, ACCEPTED_CSV, ACCEPTED_NWS_IMPLEMENTATION, ACCEPTED_NWS):
             self.assertEqual(_git("rev-parse", f"{commit}^{{tree}}"), tree, commit)
         self.assertEqual(_git("rev-parse", f"{ACCEPTED_CSV[0]}^"), R0144_RELEASE)
         self.assertEqual(_git("rev-parse", f"{ACCEPTED_NWS_IMPLEMENTATION[0]}^"), R0144_RELEASE)
         self.assertEqual(_git("rev-parse", f"{ACCEPTED_NWS[0]}^"), ACCEPTED_NWS_IMPLEMENTATION[0])
-        self.assertEqual(ENGINEERING_CHAIN[21][1], ACCEPTED_VT[1])
-        self.assertEqual(ENGINEERING_CHAIN[20][1], ACCEPTED_C10[1])
 
     def test_workstreams_are_disjoint_and_every_changed_file_equals_its_accepted_source(self):
+        """Source-tip file sets and byte equality of every changed file (requires the original source tips).
+
+        Skipped when they are absent. The disjoint 49/7/6 workstream file sets and the 62-file inventory, derived
+        from the published integration boundaries, are asserted unconditionally in test_change_inventory_is_exact."""
+        _require_sources(self, ACCEPTED_VT[0], ACCEPTED_CSV[0], ACCEPTED_NWS[0])
         sources = {name: _changed(R0144_RELEASE, tip) for name, tip in
                    (("vt", ACCEPTED_VT[0]), ("csv", ACCEPTED_CSV[0]), ("nws", ACCEPTED_NWS[0]))}
         self.assertEqual(sources["vt"] & sources["csv"], set())
@@ -509,6 +591,15 @@ class R0145HistoryAndScopeTests(SimpleTestCase):
         self.assertEqual(_changed(R0144_RELEASE, ENGINEERING, "--diff-filter=DRTC"), set())
         self.assertIn("62 files changed, 19963 insertions(+), 763 deletions(-)",
                       _git("diff", "--shortstat", "--no-renames", R0144_RELEASE, ENGINEERING))
+        # The three workstreams, from the published integration boundaries alone (no unpublished source objects):
+        # A = r0144..VT_INTEGRATED, B = the CSV commit, C = the two NWS commits. Disjoint, and together the inventory.
+        workstreams = {"vt": _changed(R0144_RELEASE, VT_INTEGRATED), "csv": _changed(VT_INTEGRATED, CSV_INTEGRATED),
+                       "nws": _changed(CSV_INTEGRATED, NWS_INTEGRATED)}
+        self.assertEqual((len(workstreams["vt"]), len(workstreams["csv"]), len(workstreams["nws"])), (49, 7, 6))
+        self.assertEqual(workstreams["vt"] & workstreams["csv"], set())
+        self.assertEqual(workstreams["vt"] & workstreams["nws"], set())
+        self.assertEqual(workstreams["csv"] & workstreams["nws"], set())
+        self.assertEqual(workstreams["vt"] | workstreams["csv"] | workstreams["nws"], CHANGE_FILES)
 
     def test_release_is_one_metadata_only_child(self):
         release = _require_release(self)
@@ -754,6 +845,8 @@ class R0145TrustedPlanTests(SimpleTestCase):
 
 class R0145ReachabilityTests(SimpleTestCase):
     def test_every_named_object_is_reachable_from_r_alone(self):
+        """The published objects (r0144, the integrated chain and its trees, R's files and plans) only: the original
+        accepted source commits are, by design, not part of R's history (see the module docstring)."""
         release = _require_release(self)
         with tempfile.TemporaryDirectory() as directory:
             bare = _isolated_repository(Path(directory), release)
