@@ -14,6 +14,13 @@ itself. Thresholds come from healthy measurements (1.21 A evidence, 44.1 and 48 
 <= 0.022 s, progression <= 1.018x, first audio 0.262-0.295 s after the deck exists (a hot-pipeline start: 0.32 s),
 tone present >= 5.21 of 5.5 s. With the r0145 mixer the same 30 s idle leaves the mixer ~30 s behind, catching up
 at ~5.6x with the tone absent for the whole window.
+
+Phase A2 adds: the deck bus is fixed to S16LE from startup (``make_deck_bus_caps``) -- every CAPS event on the deck
+mixer's src must be that one format (the unfixed live mixer negotiated S32LE with no pad and renegotiated to S16LE
+on the first deck, which corrupted deck audio); the item's program PCM is checked sample-wise against a fitted sine
+(no holes, steps or corruption -- not only a spectral classifier); and the PlayEvent commit is correlated with the
+SAME item's own tone reaching the program within a bounded window (each generation has its own frequency).
+Measured healthy (A2 evidence): commit 0.262-0.276 s before program onset; residual <= 0.003 % of the amplitude.
 """
 from __future__ import annotations
 
@@ -39,6 +46,42 @@ MAX_PROGRESSION_RATE = 1.25    # healthy <= 1.018x real time; defect: 5.6-5.9x
 MAX_FIRST_AUDIO_S = 0.6        # healthy 0.262-0.295 s after the deck exists; defect: never within 6 s
 ONSET_MARGIN_OVER_HOT_START_S = 0.1
 MIN_TONE_PRESENT_S = 5.0       # of the 5.5 s after the deck exists; healthy >= 5.21; defect: 0.0
+MAX_COMMIT_TO_PROGRAM_S = 0.5  # PlayEvent commit -> the item's own tone in the program; healthy 0.262-0.276 s
+MAX_RESIDUAL_PCT = 2.0         # per 10 ms frame, residual RMS vs a fitted sine; healthy ~0.003 % (16-bit quantisation)
+MAX_AMPLITUDE_CV_PCT = 1.0     # frame-to-frame amplitude variation over 1 s; healthy 0.0 %
+
+
+def _sine_fit(samples, rate, freq):
+    """Least-squares DC + sine + cosine at ``freq``: (amplitude, residual RMS)."""
+    import math
+    n = len(samples)
+    w = 2 * math.pi * freq / rate
+    c = [math.cos(w * i) for i in range(n)]
+    s = [math.sin(w * i) for i in range(n)]
+    m = sum(samples) / n
+    a = 2 * sum((samples[i] - m) * c[i] for i in range(n)) / n
+    b = 2 * sum((samples[i] - m) * s[i] for i in range(n)) / n
+    resid = math.sqrt(sum((samples[i] - m - a * c[i] - b * s[i]) ** 2 for i in range(n)) / n)
+    return math.hypot(a, b), resid
+
+
+def pcm_integrity(trace, freq, start_s, seconds=1.0):
+    """Raw program samples of one tone, 10 ms frames: (max residual %, amplitude CV %, frames)."""
+    import math
+    rate = trace.rate
+    frame = rate // 100
+    i0 = trace.index_of(start_s)
+    amps, worst = [], 0.0
+    for k in range(int(seconds * 100)):
+        seg = trace.x[i0 + k * frame:i0 + (k + 1) * frame]
+        if len(seg) < frame:
+            break
+        amp, resid = _sine_fit(seg, rate, freq)
+        amps.append(amp)
+        worst = max(worst, 100.0 * resid / amp if amp > 0 else 100.0)
+    mean = sum(amps) / len(amps) if amps else 0.0
+    cv = 100.0 * math.sqrt(sum((v - mean) ** 2 for v in amps) / len(amps)) / mean if mean else 100.0
+    return worst, cv, len(amps)
 
 
 class DeckMixerConstructionTests(SimpleTestCase):
@@ -48,6 +91,10 @@ class DeckMixerConstructionTests(SimpleTestCase):
         self.assertEqual(mixer.get_factory().get_name(), "audiomixer")
         self.assertEqual(mixer.get_name(), "mixer")
         self.assertIs(mixer.get_property("force-live"), True)
+        for rate in (44100, 48000):
+            caps = eng_module.make_deck_bus_caps(rate).get_property("caps").get_structure(0)
+            self.assertEqual((caps.get_value("format"), caps.get_value("rate"), caps.get_value("channels"),
+                              caps.get_value("layout")), ("S16LE", rate, 2, "interleaved"))
         # Nothing else about the aggregator changes (latency changes once truncated outgoing tails).
         plain = Gst.ElementFactory.make("audiomixer", None)
         for name in ("latency", "min-upstream-latency", "start-time-selection", "output-buffer-duration",
@@ -97,6 +144,17 @@ class _ZeroDeckIdle(TransactionTestCase):
         engine = lab.engine
         self.tel = {}
         self._probe(engine.mixer, "deck_mixer")
+        # Every CAPS event on the deck mixer's src from the start of the pipeline (Phase A2: exactly one format).
+        caps_seen = []
+
+        def on_event(_pad, info):
+            event = info.get_event()
+            if event.type == Gst.EventType.CAPS:
+                st = event.parse_caps().get_structure(0)
+                caps_seen.append((st.get_value("format"), st.get_value("rate"), st.get_value("channels"),
+                                  st.get_value("layout")))
+            return Gst.PadProbeReturn.OK
+        engine.mixer.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_event)
         for name in ("_claim_playback_occurrence", "_schedule_occurrence_air_start_from_probe",
                      "_persist_deck_duration", "_roll_over_to_next_hour", "_on_log_exhausted"):
             engine.__dict__.pop(name, None)
@@ -174,9 +232,18 @@ class _ZeroDeckIdle(TransactionTestCase):
         while time.monotonic() < deadline and not (engine._queue_cursor >= len(engine.log_items) and no_deck()):
             pump(0.2)
         self.assertTrue(no_deck(), "the first hour played out and no deck is left")
-        hot_onset = lab.trace().onset(FIRST_TONE, after=hot_created - 0.5)
+        hot_trace = lab.trace()
+        hot_onset = hot_trace.onset(FIRST_TONE, after=hot_created - 0.5)
         self.assertIsNotNone(hot_onset)
         hot_first_audio = hot_onset - hot_created
+        hot_item = items1[0].id
+        self.assertLessEqual(air[hot_item]["boundary"], air[hot_item]["commit"])
+        self.assertLessEqual(air[hot_item]["commit"], hot_onset, "no PlayEvent before the item's own audio")
+        self.assertLessEqual(hot_onset - air[hot_item]["commit"], MAX_COMMIT_TO_PROGRAM_S)
+        worst, cv, frames = pcm_integrity(hot_trace, FIRST_TONE, hot_onset + 0.1)
+        self.assertEqual(frames, 100)
+        self.assertLessEqual(worst, MAX_RESIDUAL_PCT, "hot start: clean program PCM")
+        self.assertLessEqual(cv, MAX_AMPLITUDE_CV_PCT)
 
         # A real zero-deck idle: the engine's own exhausted retry keeps polling; no deck pad exists.
         begin = self._sample()
@@ -233,6 +300,17 @@ class _ZeroDeckIdle(TransactionTestCase):
         self.assertEqual(LogItem.objects.filter(pk=item, playback_claimed_at__isnull=False).count(), 1)
         self.assertIn("boundary", air.get(item, {}))
         self.assertGreaterEqual(air[item]["commit"], air[item]["boundary"])
+        # The SAME generation's audio (its own frequency) reaches the program within a bounded window after commit.
+        self.assertLessEqual(air[item]["commit"], onset, "no PlayEvent before the item's own audio")
+        self.assertLessEqual(onset - air[item]["commit"], MAX_COMMIT_TO_PROGRAM_S)
+        # Raw PCM integrity of that audio (no holes, steps or corrupted samples).
+        worst, cv, frames = pcm_integrity(trace, NEXT_TONE, onset + 0.1)
+        self.assertEqual(frames, 100)
+        self.assertLessEqual(worst, MAX_RESIDUAL_PCT, "post-idle start: clean program PCM")
+        self.assertLessEqual(cv, MAX_AMPLITUDE_CV_PCT)
+        # One deck-bus format from startup through both hours and the idle (Phase A2).
+        self.assertTrue(caps_seen, "the deck mixer negotiated its output")
+        self.assertEqual(set(caps_seen), {("S16LE", self.rate, 2, "interleaved")}, f"deck-bus caps: {caps_seen}")
         self.assertEqual(engine._queue_cursor, len(engine.log_items), "the occurrence advanced the queue once")
         connections.close_all()
 
