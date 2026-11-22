@@ -1336,6 +1336,25 @@ def make_deck_mixer(name="mixer"):
     return Gst.ElementFactory.make("audiomixer", name), False
 
 
+#: Roadmap 1.21 Phase A2: the deck bus's fixed output format (see make_deck_bus_caps).
+DECK_BUS_FORMAT = "S16LE"
+
+
+def make_deck_bus_caps(rate, name="deck_bus_caps"):
+    """The capsfilter linked immediately after the deck mixer (roadmap 1.21 Phase A2).
+
+    A live (force-live) audiomixer with no pad negotiates its src caps from downstream at startup -- S32LE
+    where the downstream accepts a list -- and then renegotiates to the first deck's format while its src task
+    is aggregating; that transition correlated with a native crash on the mixer's src thread and corrupted deck
+    audio (Phase A evidence). Fixing the deck bus to one format from startup means the mixer negotiates once and
+    never changes format; decks are converted to it by their own audioconvert (upstream of the mixer). S16LE is
+    the format the r0145 mixer negotiated from the library's decks. Rate and channels are the pipeline's own."""
+    caps = Gst.ElementFactory.make("capsfilter", name)
+    caps.set_property("caps", Gst.Caps.from_string(
+        f"audio/x-raw,format={DECK_BUS_FORMAT},rate={int(rate)},channels=2,layout=interleaved"))
+    return caps
+
+
 def _glib_safe(default_return=True):
     """Wrap a GLib timer/idle/bus callback so an unhandled exception
     prints a traceback but doesn't silently unschedule the callback.
@@ -5177,6 +5196,8 @@ class PlaybackEngine:
                 )
             except Exception as exc:
                 print(f"  Deck mixer warning event failed: {exc}")
+        # Phase A2: one fixed deck-bus format from startup (make_deck_bus_caps), linked mixer -> here -> vt_duck_gain.
+        self.deck_bus_caps = make_deck_bus_caps(self.pipeline_sample_rate)
         # Tried setting `latency`/`min-upstream-latency` here (to give the
         # aggregator more patience for a newly-linked deck's decode delay)
         # — didn't fix the clipping, and introduced a new regression: it
@@ -5277,7 +5298,7 @@ class PlaybackEngine:
         self.master_mixer = Gst.ElementFactory.make("audiomixer", "master_mixer")
 
         elements = [
-            self.mixer, self.vt_duck_gain, self.duck_gain,
+            self.mixer, self.deck_bus_caps, self.vt_duck_gain, self.duck_gain,
             self.program_fx_mixer, self.master_mixer, convert, resample, capsfilter,
             self.program_gain, self.output_level,
             self._studio_monitor_slot.queue, self._studio_monitor_slot.errorignore,
@@ -5387,7 +5408,8 @@ class PlaybackEngine:
         for el in elements:
             self.main_pipeline.add(el)
 
-        self.mixer.link(self.vt_duck_gain)
+        if not (self.mixer.link(self.deck_bus_caps) and self.deck_bus_caps.link(self.vt_duck_gain)):
+            raise RuntimeError("deck bus: mixer -> deck_bus_caps -> vt_duck_gain could not be linked")
         self.vt_duck_gain.link(self.duck_gain)
 
         # duck_gain feeds one pad on program_fx_mixer; fx_bus_gain will

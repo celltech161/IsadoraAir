@@ -155,6 +155,7 @@ class TransportHarness:
         engine.main_pipeline = Gst.Pipeline.new("transport-2-23-test")
         # The production deck mixer (roadmap 1.21 Phase A: force-live), built by the same helper.
         engine.mixer, _force_live = eng_module.make_deck_mixer("mixer")
+        engine.deck_bus_caps = eng_module.make_deck_bus_caps(RATE)    # as production (1.21 Phase A2)
         engine.vt_duck_gain = Gst.ElementFactory.make("volume", "vt_duck_gain")
         engine.duck_gain = Gst.ElementFactory.make("volume", "duck_gain")
         # Production joins the deck bus, the FX/VT submix and the live mic
@@ -174,10 +175,10 @@ class TransportHarness:
         else:
             sink = Gst.ElementFactory.make("fakesink", "program_sink")
             sink.set_property("sync", sync)
-        for element in (engine.mixer, engine.vt_duck_gain, engine.duck_gain,
+        for element in (engine.mixer, engine.deck_bus_caps, engine.vt_duck_gain, engine.duck_gain,
                         engine.master_mixer, engine.fx_submix, convert, caps, sink):
             engine.main_pipeline.add(element)
-        engine.mixer.link(engine.vt_duck_gain)
+        assert engine.mixer.link(engine.deck_bus_caps) and engine.deck_bus_caps.link(engine.vt_duck_gain)
         engine.vt_duck_gain.link(engine.duck_gain)
         engine.duck_gain.get_static_pad("src").link(
             engine.master_mixer.request_pad_simple("sink_%u"))

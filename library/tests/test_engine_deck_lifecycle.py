@@ -175,11 +175,13 @@ def _make_real_engine():
     engine._lock = threading.RLock()
     engine.main_pipeline = Gst.Pipeline.new("deck-lifecycle-test")
     engine.mixer, _force_live = eng_module.make_deck_mixer("mixer")   # as production (1.21 Phase A)
+    engine.deck_bus_caps = eng_module.make_deck_bus_caps(44100)       # as production (1.21 Phase A2)
     sink = Gst.ElementFactory.make("fakesink", "sink")
     sink.set_property("sync", False)
     engine.main_pipeline.add(engine.mixer)
+    engine.main_pipeline.add(engine.deck_bus_caps)
     engine.main_pipeline.add(sink)
-    engine.mixer.link(sink)
+    assert engine.mixer.link(engine.deck_bus_caps) and engine.deck_bus_caps.link(sink)
     engine._test_output_buffers = 0
 
     def count_output(_pad, info):
