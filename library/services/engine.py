@@ -1308,6 +1308,34 @@ def _require_deck_open_authority(method):
     return wrapper
 
 
+def make_deck_mixer(name="mixer"):
+    """The deck bus ``audiomixer``, constructed with ``force-live=true`` (roadmap 1.21 Phase A).
+
+    A non-live audiomixer stops advancing its output timeline when its last deck pad is released, while
+    master_mixer and the pipeline clock keep running. A deck linked after a long zero-deck idle (pad offset =
+    current running time) then waits behind the mixer regenerating the whole idle span as silence, drained
+    at only ~4.5-5.5x real time: dead air of about idle/4.5 (240 s idle -> ~52 s), with the deck's media
+    never reaching program. Live, the mixer aggregates on the clock even with no pad, so its timeline keeps
+    pace with running time; with no deck its output is digital silence.
+
+    ``force-live`` is construct-only: setting it on a constructed element raises TypeError and leaves it
+    False, so it is passed at construction (Gst.ElementFactory.make_with_properties, GStreamer >= 1.20).
+    Only this mixer changes: master_mixer, the clock and the latency/min-upstream-latency properties
+    (see _build_main_pipeline) are untouched. Returns (mixer, force_live) -- force_live False only if this
+    GStreamer cannot construct it, in which case the r0145 (non-live) mixer is returned so the engine still
+    starts; the caller reports that."""
+    make = getattr(Gst.ElementFactory, "make_with_properties", None)
+    if make is not None:
+        try:
+            mixer = make("audiomixer", ["name", "force-live"], [name, True])
+        except Exception as exc:  # pragma: no cover - depends on the installed GStreamer
+            print(f"  Deck mixer: force-live construction failed ({exc}); using the non-live mixer")
+            mixer = None
+        if mixer is not None and mixer.get_property("force-live") is True:
+            return mixer, True
+    return Gst.ElementFactory.make("audiomixer", name), False
+
+
 def _glib_safe(default_return=True):
     """Wrap a GLib timer/idle/bus callback so an unhandled exception
     prints a traceback but doesn't silently unschedule the callback.
@@ -5134,7 +5162,21 @@ class PlaybackEngine:
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
         self.pipeline_sample_rate = self._resolve_pipeline_sample_rate()
 
-        self.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
+        # Roadmap 1.21 Phase A: the deck mixer is live (force-live, construct-only) so its timeline keeps
+        # advancing through a zero-deck idle -- see make_deck_mixer. One startup line records which mixer
+        # was built; a non-live fallback (GStreamer without construct-time properties) is also an event.
+        self.mixer, self.deck_mixer_force_live = make_deck_mixer("mixer")
+        print(f"  Deck mixer: audiomixer force-live={self.deck_mixer_force_live}")
+        if not self.deck_mixer_force_live:
+            try:
+                emit_event(
+                    category="engine", level="warning",
+                    title="Deck mixer is not live (idle-start catch-up risk)",
+                    detail={"gstreamer": Gst.version_string()},
+                    dedupe_key="engine|deck-mixer-not-live",
+                )
+            except Exception as exc:
+                print(f"  Deck mixer warning event failed: {exc}")
         # Tried setting `latency`/`min-upstream-latency` here (to give the
         # aggregator more patience for a newly-linked deck's decode delay)
         # — didn't fix the clipping, and introduced a new regression: it

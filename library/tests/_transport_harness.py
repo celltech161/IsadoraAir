@@ -153,7 +153,8 @@ class TransportHarness:
         engine._lock = threading.RLock()
         engine.running = True
         engine.main_pipeline = Gst.Pipeline.new("transport-2-23-test")
-        engine.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
+        # The production deck mixer (roadmap 1.21 Phase A: force-live), built by the same helper.
+        engine.mixer, _force_live = eng_module.make_deck_mixer("mixer")
         engine.vt_duck_gain = Gst.ElementFactory.make("volume", "vt_duck_gain")
         engine.duck_gain = Gst.ElementFactory.make("volume", "duck_gain")
         # Production joins the deck bus, the FX/VT submix and the live mic

@@ -174,7 +174,7 @@ def _make_real_engine():
     engine = object.__new__(PlaybackEngine)
     engine._lock = threading.RLock()
     engine.main_pipeline = Gst.Pipeline.new("deck-lifecycle-test")
-    engine.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
+    engine.mixer, _force_live = eng_module.make_deck_mixer("mixer")   # as production (1.21 Phase A)
     sink = Gst.ElementFactory.make("fakesink", "sink")
     sink.set_property("sync", False)
     engine.main_pipeline.add(engine.mixer)
