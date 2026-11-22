@@ -511,14 +511,17 @@ class E02E06IntroTimingTests(TransitionMixin, SimpleTestCase):
                 self.assertLessEqual(abs(p.m["clearance"] - M), TOL)
                 self.assertGreater(p.m["deck_ready_lead_vs_speech"], 0.3)
 
-    def test_e04d_gated_hold_on_the_deck_mixer_starves_the_outgoing(self):
-        """Rejected approach, recorded: holding the incoming behind a blocking
-        probe leaves its deck-mixer pad empty; the non-live deck mixer then
-        waits on it and the outgoing music stops."""
+    def test_e04d_gated_hold_on_the_deck_mixer_cannot_interrupt_the_outgoing(self):
+        """Gated hold of the incoming behind a blocking probe (the approach 2.25
+        rejected). Its deck-mixer pad stays empty. The r0145 NON-LIVE deck mixer
+        waited on that pad and the outgoing music stopped (out_continuity 0.55,
+        tail cut ~0.50 s). Since 1.21 A/A2 the deck mixer is live (force-live,
+        fixed S16LE), so an empty or blocked incoming pad cannot interrupt the
+        outgoing: positive invariant. (Gated hold remains unused by design.)"""
         lab = self.lab()
-        p = self.transition(lab, "E04d gated_underlap (rejected)", out_len=1.6, out_ns=1.2,
+        p = self.transition(lab, "E04d gated_underlap", out_len=1.6, out_ns=1.2,
                             c=0.3, i=1.5, v=2.5, fmt="flac", incoming="gated")
-        self.assertLess(p.m["out_continuity"], 0.9)
+        self.assertGreaterEqual(p.m["out_continuity"], 0.99, "a blocked incoming deck never interrupts the outgoing")
 
     def test_e05_large_cue_in(self):
         for rate, fmt in ((44100, "wav"), (48000, "flac")):
@@ -924,9 +927,12 @@ class R0144DeckTailTests(SimpleTestCase):
 
 class E12cBoundedPreparationTests(TransitionMixin, SimpleTestCase):
     """12c. A direct-admission incoming whose decode stalls leaves an empty
-    deck-mixer pad, and the non-live deck mixer waits on it (F15). The
-    readiness deadline (open + 100 ms) detaches it, which bounds the
-    starvation; the control has no deadline."""
+    deck-mixer pad. The r0145 non-live deck mixer waited on it (F15; control
+    continuity 0.71); since 1.21 A/A2 the live deck mixer does not, so the
+    outgoing stays continuous with or without the deadline. Retained: the
+    readiness deadline (open + 100 ms) still detaches the unready incoming
+    (state failed, within ~150 ms), no VT speech airs for it, and the
+    outgoing loses no more than the deadline in either case."""
 
     def _run(self, mitigate):
         lab = self.lab()
@@ -954,12 +960,17 @@ class E12cBoundedPreparationTests(TransitionMixin, SimpleTestCase):
                vt_head_aired=t.present(HEAD, p.s_v - 0.3, p.s_v + 1.0),
                incoming_state=p.incoming.state, detached_after_open=(
                    record["detached_at"] - p.incoming_created if "detached_at" in record else None))
+        p.e12c_record = record
         return cont, t, p
 
     def test_e12c_readiness_deadline_bounds_deck_mixer_starvation(self):
-        cont_control, _t, _p = self._run(False)
+        cont_control, t_control, p_control = self._run(False)
         cont, t, p = self._run(True)
         span = 2.9
         self.assertLessEqual((1.0 - cont) * span, 0.15)          # bounded by the 100 ms deadline
-        self.assertLess(cont_control, cont)
+        self.assertLessEqual((1.0 - cont_control) * span, 0.15, "no deck-mixer starvation without the deadline")
+        self.assertIn("detached_at", p.e12c_record, "the readiness deadline detaches the unready incoming")
+        self.assertLessEqual(p.e12c_record["detached_at"] - p.incoming_created, 0.15)
+        self.assertEqual(p.incoming.state, "failed")
         self.assertEqual(t.present(HEAD, p.s_v - 0.3, p.s_v + 1.0), 0.0)   # no speech for an unviable deck
+        self.assertEqual(t_control.present(HEAD, p_control.s_v - 0.3, p_control.s_v + 1.0), 0.0)

@@ -344,7 +344,12 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(self.engine._deck_bin_map, {})
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
 
-    def test_audiomixer_ignore_inactive_does_not_retire_previously_active_pad(self):
+    def test_audiomixer_stale_inactive_pad_cannot_block_a_healthy_successor(self):
+        """A deck whose completion never reaches GLib leaves a requested, EOS-less mixer pad. The r0145 non-live
+        mixer (even with ignore-inactive-pads) waited on it and the next deck could not finish until the stale
+        generation was explicitly removed. The live deck mixer (1.21 A/A2) does not wait: the healthy successor
+        finishes while the stale pad still exists; explicit removal still releases the stale pad and map entry, and
+        a further successor is unaffected."""
         prop = self.engine.mixer.find_property("ignore-inactive-pads")
         self.assertIsNotNone(prop)
         self.assertFalse(prop.default_value)
@@ -366,9 +371,14 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.engine.decks["A"] = None
 
         good = self._create(601)
-        self.assertFalse(_wait_until(lambda: good.finished, timeout=0.1))
+        stale_pad = bad.mixer_pad
+        self.assertIn(stale_pad, tuple(self.engine.mixer.sinkpads))
+        self.assertTrue(_wait_until(lambda: good.finished), "the stale pad cannot block a healthy successor")
         self.engine._remove_deck(bad)
-        self.assertTrue(_wait_until(lambda: good.finished))
+        self.assertTrue(_wait_until(lambda: stale_pad not in tuple(self.engine.mixer.sinkpads)))
+        self.assertNotIn(id(bad.pipeline), self.engine._deck_bin_map)
+        after = self._create(602)
+        self.assertTrue(_wait_until(lambda: after.finished))
 
     def test_unprimed_resumed_deck_uses_equivalent_path_without_concat(self):
         deck = self._create(2, primed=False)
@@ -828,12 +838,14 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(self.engine._deck_bin_map, {})
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
 
-    def test_legacy_watchdog_abandonment_can_block_every_later_deck(self):
-        """Execute the pre-fix watchdog exactly, then prove the cascade.
+    def test_legacy_watchdog_abandonment_no_longer_blocks_later_decks(self):
+        """Execute the pre-fix watchdog exactly (logical slot only: bin, map, link and mixer request pad stay live).
 
-        Suppression is at boundary G: decoder/concat/ghost EOS all existed,
-        but no GLib completion handoff was scheduled. Dropping ghost EOS means
-        the still-requested mixer pad never receives EOS.
+        Suppression is at boundary G: decoder/concat/ghost EOS all existed, but no GLib completion handoff was
+        scheduled. Under the r0145 non-live deck mixer that stale pad blocked every later generation (110 of 110
+        abandoned in turn, 111 pads leaked). Under the live deck mixer (1.21 A/A2) later generations are not blocked;
+        retained: every later deck crosses all EOS boundaries and is released, only the stale generation's pad/map
+        entry remains until it is explicitly detached, teardown is bounded, and a fresh deck still completes.
         """
         original_idle_add = GLib.idle_add
 
@@ -863,30 +875,24 @@ class RealDeckTopologyTests(SimpleTestCase):
         for index in range(110):
             deck = self._create(31 + index, slot="A")
             later.append(deck)
-            if not _wait_until(lambda deck=deck: deck.finished, timeout=0.03):
-                # Execute the same legacy watchdog abandonment for every
-                # generation which the stale mixer pad prevents completing.
+            if not _wait_until(lambda deck=deck: deck.finished, timeout=0.5):
+                # The legacy abandonment for a generation the stale pad blocked (none expected now).
                 deck.finished = True
                 self.engine.decks["A"] = None
                 self.engine._next_triggered = False
                 legacy_watchdogs.append(deck)
-        self.assertGreaterEqual(len(legacy_watchdogs), 100)
-        self.assertTrue(all(deck.media_buffer_count > 0 for deck in legacy_watchdogs))
-        self.assertTrue(all("A_DECODER_AUDIO_EOS" not in deck.eos_milestones for deck in legacy_watchdogs))
-        self.assertTrue(all("D_CONCAT_SRC_EOS" not in deck.eos_milestones for deck in legacy_watchdogs))
-        self.assertTrue(all("E_DECK_GHOST_SRC_EOS" not in deck.eos_milestones for deck in legacy_watchdogs))
+        self.assertEqual(legacy_watchdogs, [], "the stale pad blocks no later generation")
+        self.assertTrue(all(deck.media_buffer_count > 0 for deck in later))
+        for boundary in ("A_DECODER_AUDIO_EOS", "D_CONCAT_SRC_EOS", "E_DECK_GHOST_SRC_EOS"):
+            self.assertTrue(all(boundary in deck.eos_milestones for deck in later), boundary)
         mixer_output_delta = self.engine._test_output_buffers - output_before
-        # A small number of already-scheduled mixer buffers may drain before
-        # the stale request pad blocks aggregation. Their exact count is a
-        # GStreamer scheduling detail, not an architectural boundary. The
-        # deterministic legacy-cascade proof is that fewer mixer buffers than
-        # abandoned generations emerge while every decoded generation misses
-        # all three downstream EOS boundaries and retains its pad/map entry.
-        self.assertLess(mixer_output_delta, len(legacy_watchdogs))
-        self.assertEqual(
-            len(tuple(self.engine.mixer.sinkpads)),
-            1 + len(legacy_watchdogs),
-        )
+        self.assertGreater(mixer_output_delta, 0, "the deck mixer kept producing (clock-paced: ~39 x 10 ms here)")
+        # Every later generation was released by the current code; only the stale (abandoned) one remains.
+        self.assertTrue(_wait_until(lambda: len(tuple(self.engine.mixer.sinkpads)) == 1))
+        self.assertEqual(set(self.engine._deck_bin_map), {id(bad.pipeline)})
+        coordinator = self.engine._deck_teardowns["A"]
+        self.assertTrue(_wait_until(lambda: coordinator.snapshot().get("active_generation") is None
+                                    and not coordinator.snapshot().get("queue_depth")), "teardown is bounded")
         print(
             "legacy-cascade-resources "
             f"watchdogs={len(legacy_watchdogs)} pads={len(tuple(self.engine.mixer.sinkpads))} "
