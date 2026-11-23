@@ -904,8 +904,9 @@ SILENCE_PRIME_SECONDS = 0.3
 # station media, at most 0.047 s to the boundary itself in cold-cache synthetic trials (1.21-B1 evidence).
 ORDINARY_FIRST_AUDIO_GRACE_S = 1.0
 # Process-local memory of occurrences whose single first-audio retry is spent (handed out, withdrawn or
-# exhausted): the ordinary cursor never hands them out again in this process. Bounded; oldest evicted.
-FIRST_AUDIO_SPENT_MEMORY = 256
+# exhausted): the ordinary cursor never hands them out again in this process. B1-R2: it is retained for as
+# long as the occurrence's programming authority (its PlaylistLog) is reachable from engine state and released
+# only when that log is demonstrably unreachable (_first_audio_prune_spent); there is no count-based eviction.
 # Only scheduled / fill occurrences are eligible. Operator and engine insertions (urgent, native, dedication
 # intro) and rows without an origin keep their existing handling (fail closed).
 FIRST_AUDIO_ELIGIBLE_ORIGINS = frozenset({
@@ -5787,6 +5788,7 @@ class PlaybackEngine:
 
         self.current_log = log
         self.log_items = items
+        self._first_audio_prune_spent()     # 1.21-B1 (B1-R2): same log keeps its consumed retries; a new one releases the old
         # Advance past anything already played -- an engine restart
         # mid-hour must NOT replay the log from position 0, or we'd
         # start hearing tracks that already aired. Especially bad for
@@ -5852,7 +5854,7 @@ class PlaybackEngine:
         exhausted) is handed out too: only the retry itself, through the forced queue, may open it again."""
         if item.played_at is not None:
             return True
-        if self._first_audio_owns(item.id):
+        if self._first_audio_owns(item):
             return True
         decks = getattr(self, "decks", None) or {}
         return any(
@@ -6347,6 +6349,7 @@ class PlaybackEngine:
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
         self._next_hour_peek_key = None
+        self._first_audio_prune_spent()     # 1.21-B1 (B1-R2)
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
     def _ensure_log_building(
@@ -7177,6 +7180,7 @@ class PlaybackEngine:
             self._next_hour_peek = None
             self._next_hour_peek_at = 0.0
             self._next_hour_peek_key = None
+            self._first_audio_prune_spent()     # 1.21-B1 (B1-R2)
             print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
             return True
         self._try_extend_live_log_async()
@@ -7534,7 +7538,8 @@ class PlaybackEngine:
             # original hand-out (D14 role), not the forced re-hand-out's.
             self._vtt_selection = dict(held_selection)
         deck = self._create_deck(slot, log_item)
-        if deck is None and self.__dict__.pop("_claim_contended_item_id", None) == log_item.id:
+        claim_contended = deck is None and self.__dict__.pop("_claim_contended_item_id", None) == log_item.id
+        if claim_contended:
             # The claim could not take the row lock in time: a transient conflict, never a
             # reason to skip. Put the same occurrence back as next and retry (bounded).
             if self._defer_contended_occurrence(log_item, is_forced, held_value):
@@ -7545,7 +7550,7 @@ class PlaybackEngine:
             self._first_audio_on_open(deck, is_forced, native_held)
         if deck is None:
             # 1.21-B1: a handed-out retry that could not even be opened ends the occurrence (reported once).
-            self._first_audio_retry_not_opened(log_item)
+            self._first_audio_retry_not_opened(log_item, claim_contended)
             # Roadmap 2.23: lets Start Next tell "nothing could be opened"
             # apart from an ordinarily empty queue.
             self._deck_open_failures = getattr(self, "_deck_open_failures", 0) + 1
@@ -7600,7 +7605,13 @@ class PlaybackEngine:
             self._queue_cursor = index
         if held_value is not None:
             self.__dict__.setdefault("_active_message_held", {})[log_item.id] = held_value
-        self._claim_contention = {"item_id": log_item.id, "attempts": attempts}
+        # 1.21-B1 (B1-R1): remember whether THIS start was an unattended automatic one, so the deferred retry
+        # re-enters the same attribution. Nothing is armed here: eligibility is still decided at actual deck
+        # admission (_first_audio_on_open), and this is not part of the first-audio retry budget.
+        self._claim_contention = {
+            "item_id": log_item.id, "attempts": attempts,
+            "first_audio_unattended": bool(self._first_audio_start_unattended()),
+        }
         self._next_triggered = False      # the crossfade trigger may also retry on its next tick
         print(f"  Claim for log_item={log_item.id} contended (attempt {attempts}); it stays next and will be retried")
         try:
@@ -7635,7 +7646,13 @@ class PlaybackEngine:
             return False
         slot = self._free_slot()
         if slot is not None:
-            self._start_next_track(slot=slot)
+            if pending.get("first_audio_unattended"):
+                # B1-R1: the deferred claim retry of an unattended automatic start is itself an unattended
+                # automatic start (only reached past every guard above: running, Auto, same token, still next).
+                with self._first_audio_unattended():
+                    self._start_next_track(slot=slot)
+            else:
+                self._start_next_track(slot=slot)
         return False
 
     # ------------------------------------------------------------------
@@ -7674,18 +7691,61 @@ class PlaybackEngine:
             return True
         return kind is None and bool(self.__dict__.get("_first_audio_unattended_start"))
 
-    def _first_audio_owns(self, item_id):
-        """True when first-audio recovery owns this occurrence (its retry is queued or open, or spent)."""
-        return item_id in (self.__dict__.get("_first_audio_retries") or ()) or item_id in (
-            self.__dict__.get("_first_audio_spent") or ()
-        )
+    def _first_audio_owns(self, item):
+        """True when first-audio recovery owns this occurrence (its retry is queued or open, or spent). A spent
+        entry is the (LogItem id, PlaylistLog id) pair: a row that merely reuses an old id under another log is
+        a different occurrence and inherits nothing."""
+        item_id = item.id
+        if item_id in (self.__dict__.get("_first_audio_retries") or ()):
+            return True
+        spent = self.__dict__.get("_first_audio_spent") or {}
+        return item_id in spent and spent[item_id] == getattr(item, "playlist_log_id", None)
 
-    def _first_audio_spend(self, item_id):
-        spent = self.__dict__.setdefault("_first_audio_spent", OrderedDict())
-        spent[item_id] = True
-        spent.move_to_end(item_id)
-        while len(spent) > FIRST_AUDIO_SPENT_MEMORY:
-            spent.popitem(last=False)
+    def _first_audio_spend(self, item_id, playlist_log_id):
+        """Record that this occurrence's one retry is consumed, then release anything provably unreachable."""
+        self.__dict__.setdefault("_first_audio_spent", {})[item_id] = playlist_log_id
+        self._first_audio_prune_spent()
+
+    def _first_audio_reachable_log_ids(self):
+        """Ids of every PlaylistLog from which engine-owned programming state can still hand out an
+        occurrence: the active log and queue (a reload re-reads the same log), the forced / retry queues, live
+        and held decks, the held VT occurrence, the cached next-hour peek and any live retry record."""
+        ids = set()
+        current = getattr(self, "current_log", None)
+        if current is not None:
+            ids.add(current.id)
+        for item in list(getattr(self, "log_items", None) or ()):
+            ids.add(getattr(item, "playlist_log_id", None))
+        for item in list(getattr(self, "_forced_next_items", None) or ()):
+            ids.add(getattr(item, "playlist_log_id", None))
+        for deck in list((getattr(self, "decks", None) or {}).values()):
+            if deck is not None:
+                ids.add(getattr(getattr(deck, "log_item", None), "playlist_log_id", None))
+        held = self._vtt_held_item()
+        if held is not None:
+            ids.add(getattr(held, "playlist_log_id", None))
+        peek = self.__dict__.get("_next_hour_peek")
+        if isinstance(peek, tuple) and peek and getattr(peek[0], "id", None) is not None:
+            ids.add(peek[0].id)
+        for record in (self.__dict__.get("_first_audio_retries") or {}).values():
+            ids.add(record.get("playlist_log_id"))
+        ids.discard(None)
+        return ids
+
+    def _first_audio_prune_spent(self):
+        """Lifecycle-aware release of consumed-retry authority (B1-R2). Entries are kept while their log is
+        reachable (see _first_audio_reachable_log_ids); they are dropped only once a DIFFERENT log is the
+        active program and nothing else can reach theirs. With no active log nothing is provable: keep all.
+        The retained set is therefore bounded by the occurrences of the logs the engine can still reach,
+        never by an arbitrary count, and a queue of any length keeps every consumed retry."""
+        spent = self.__dict__.get("_first_audio_spent")
+        if not spent or getattr(self, "current_log", None) is None:
+            return 0
+        reachable = self._first_audio_reachable_log_ids()
+        stale = [item_id for item_id, log_id in spent.items() if log_id not in reachable]
+        for item_id in stale:
+            del spent[item_id]
+        return len(stale)
 
     def _first_audio_fresh_generation(self, deck):
         """Fail-closed: ``deck`` is this slot's current, fresh, silence-primed, not-yet-aired generation of a
@@ -7729,7 +7789,7 @@ class PlaybackEngine:
         if (
             is_forced or native_held or self.manual_mode
             or not self._first_audio_start_unattended()
-            or self._first_audio_owns(item.id)
+            or self._first_audio_owns(item)
             or getattr(item, "origin", None) not in FIRST_AUDIO_ELIGIBLE_ORIGINS
             or self._vtt_item_role(item) != vt_transition.ItemRole.ORDINARY
             or not self._first_audio_fresh_generation(deck)
@@ -7818,7 +7878,7 @@ class PlaybackEngine:
             "track_id": deck.track.id, "claimed_at": item.playback_claimed_at,
             "original_generation": deck.generation, "original_slot": deck.slot,
         }
-        self._first_audio_spend(item.id)
+        self._first_audio_spend(item.id, item.playlist_log_id)
         # Behind every forced item (urgent, active message, dedication follow-up, contended claim) and behind
         # the pending Weather/AMBER urgent items the cursor would hand out next (moved, unchanged, into the
         # forced queue exactly as an urgent insertion with a non-empty forced queue is): no urgent or
@@ -7860,7 +7920,7 @@ class PlaybackEngine:
         retry, or the retry is still authorized now); False when a queued retry was withdrawn."""
         record = (self.__dict__.get("_first_audio_retries") or {}).get(item.id)
         if record is None or record["state"] != "pending":
-            if self._first_audio_owns(item.id):
+            if self._first_audio_owns(item):
                 # Already opened, withdrawn or exhausted: only the queued retry itself may reopen it.
                 print(f"  Refusing forced log item id={item.id}: its first-audio retry is already spent")
                 return False
@@ -7915,8 +7975,8 @@ class PlaybackEngine:
         if record is None or record["state"] not in ("pending", "handed_out"):
             return False
         del retries[item_id]
-        self._first_audio_spend(item_id)
         self._forced_next_items = [queued for queued in self._forced_next_items if queued is not record["log_item"]]
+        self._first_audio_spend(item_id, record["playlist_log_id"])
         print(f"  First-audio retry of log_item={item_id} withdrawn: {reason}")
         emit_event(
             category="engine", level="warning", title="First-audio retry withdrawn",
@@ -7930,17 +7990,24 @@ class PlaybackEngine:
         )
         return True
 
-    def _first_audio_retry_not_opened(self, log_item):
+    def _first_audio_retry_not_opened(self, log_item, claim_contended=False):
+        """B1-R3: the handed-out retry never opened its second generation. The underlying cause is kept
+        (a transiently contended claim is not a generic open failure) and the report states that only the
+        original generation ever opened. No second retry: the claim is already held, so the existing
+        contention deferral does not apply to it."""
         retries = self.__dict__.get("_first_audio_retries") or {}
         record = retries.get(getattr(log_item, "id", None))
         if record is None or record["state"] != "handed_out" or record["log_item"] is not log_item:
             return
         del retries[log_item.id]
-        self._first_audio_report_exhausted(log_item, record, None, "first_audio_retry_not_opened")
+        self._first_audio_report_exhausted(
+            log_item, record, None,
+            "first_audio_retry_claim_contended" if claim_contended else "first_audio_retry_not_opened",
+        )
 
     def _first_audio_report_exhausted(self, item, record, deck, reason):
         """The one critical event for an occurrence that will not be retried (again) in this process."""
-        self._first_audio_spend(item.id)
+        self._first_audio_spend(item.id, getattr(item, "playlist_log_id", None))
         track = deck.track if deck is not None else getattr(item, "track", None)
         retry_generation = record.get("retry_generation") if record else None
         print(f"  First-audio recovery exhausted for log_item={item.id}: {reason}")
@@ -7954,7 +8021,10 @@ class PlaybackEngine:
                 "original_generation": record["original_generation"] if record else (deck.generation if deck else None),
                 "original_slot": record["original_slot"] if record else (deck.slot if deck else None),
                 "retry_generation": retry_generation, "retry_slot": record.get("retry_slot") if record else None,
-                "attempts": 2 if record else 1, "reason": reason,
+                # Audio generations that actually opened (the retry may never have opened: retry_opened).
+                "attempts": 2 if retry_generation is not None else 1,
+                "retry_attempted": record is not None, "retry_opened": retry_generation is not None,
+                "reason": reason,
                 "grace_seconds": ORDINARY_FIRST_AUDIO_GRACE_S,
                 "first_real_dispatched": bool(deck is not None and deck.air_start_dispatched),
                 "first_real_milestone": bool(deck is not None and FIRST_REAL_POST_PRIMER_MILESTONE in deck.eos_milestones),
