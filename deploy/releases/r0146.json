@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0146",
+  "previous_release_id": "r0145",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Deck mixer continuity: the deck audiomixer is built live (force-live) with a fixed S16LE deck bus, so its timeline keeps pace through a zero-deck idle and the first song after an idle airs promptly instead of waiting behind a catch-up of about idle/4.5. Test-only: the r0145 release contract skips its three source-object comparisons in a public clone. Restart the engine only; no migration, package, static, unit or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
