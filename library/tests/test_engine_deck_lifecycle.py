@@ -3243,12 +3243,12 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         self._queue(*items)
         self._start()
         self._exhaust_in_order(total)                # items 1..290 each spend their one retry; 291 is open
+        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), total)
+        # The very first (oldest) spent occurrence is still suppressed after 289 later ones were spent.
+        self.assertTrue(self.engine._occurrence_handed_out(items[0]))
         spent = self.engine._first_audio_spent
         self.assertGreater(len(spent), 256)
         self.assertEqual(sorted(spent), list(range(1, total + 1)))
-        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), total)
-        oldest = items[0]
-        self.assertTrue(self.engine._occurrence_handed_out(oldest))
 
         # Explicit reload of the SAME active log: fresh rows, same ids, nothing aired, cursor back at the top.
         fresh = self._log_item_set(1, total + 10, playlist_log_id=7)
