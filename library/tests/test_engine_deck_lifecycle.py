@@ -50,6 +50,11 @@ def _wait_until(predicate, timeout=3.0):
     return False
 
 
+# The fixture's permanent topology: mixer, deck_bus_caps (roadmap 1.21 A2, as production) and sink. Every
+# deck generation must be gone again after churn.
+_PERMANENT_CHILDREN = 3
+
+
 def _pipeline_child_count(pipeline):
     iterator = pipeline.iterate_elements()
     count = 0
@@ -419,7 +424,7 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(self.engine._deck_bin_map, {})
         self.assertEqual(self.engine.decks, {"A": None, "B": None})
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
-        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
+        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), _PERMANENT_CHILDREN)
         self.assertEqual(self.engine._deck_teardowns["A"].snapshot()["worker_starts"], 1)
         self.assertLessEqual(threading.active_count(), threads_start + 1)
         tasks_end = _settled_owned_task_count()
@@ -514,7 +519,7 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(self.engine._deck_bin_map, {})
         self.assertEqual(self.engine.decks, {"A": None, "B": None})
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
-        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
+        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), _PERMANENT_CHILDREN)
         # One additional long-lived worker belongs to the surviving B
         # teardown boundary; it services all 100 retirements.
         self.assertLessEqual(threading.active_count(), threads_start + 1)
@@ -626,7 +631,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                 self.assertEqual(self.engine.decks, {"A": None, "B": None})
                 self.assertEqual(self.engine._deck_bin_map, {})
                 self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
-                self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
+                self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), _PERMANENT_CHILDREN)
                 self.assertIsNone(bad_a.pipeline.get_parent())
                 self.assertIsNone(bad_b.pipeline.get_parent())
                 self.assertEqual(coordinator_a.snapshot()["worker_starts"], 1)
@@ -686,7 +691,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                 self.assertEqual(self.engine.decks, {"A": None, "B": None})
                 self.assertEqual(self.engine._deck_bin_map, {})
                 self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
-                self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
+                self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), _PERMANENT_CHILDREN)
                 # Not one OS thread was created by 100 refused starts. (A
                 # count comparison here also failed when an earlier test's
                 # idle pool threads exited inside this window.)
@@ -961,7 +966,7 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(self.engine._deck_bin_map, {})
         self.assertEqual(self.engine.decks, {"A": None, "B": None})
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
-        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
+        self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), _PERMANENT_CHILDREN)
         self.assertGreater(self.engine._test_output_buffers, output_start)
         self.assertEqual(self.engine._deck_teardowns["A"].snapshot()["worker_starts"], 1)
         self.assertLessEqual(threading.active_count(), threads_start + 1)
