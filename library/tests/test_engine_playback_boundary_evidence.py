@@ -710,7 +710,8 @@ class FirstAudioDeadlineRealGstTests(TransactionTestCase):
         # The deferred contention callback (a real GLib one-shot, never a start of the test's own) opens it.
         self.assertTrue(_wait_until(lambda: len(self._opened_decks()) == 1, timeout=3.0))
         original = self._opened_decks()[0][1]
-        self.assertEqual(original.first_audio_attempt, 1, "the callback's open lost its unattended attribution")
+        self.assertEqual(getattr(original, "first_audio_attempt", 0), 1,
+                         "the callback's open lost its unattended attribution")
         claimed_at = self._row(self.stalled_id).playback_claimed_at
         self.assertIsNotNone(claimed_at)
         recovered = Path(self.temp_dir.name) / "recovered.wav"
