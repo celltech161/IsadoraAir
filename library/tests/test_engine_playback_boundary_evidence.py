@@ -682,6 +682,92 @@ class FirstAudioDeadlineRealGstTests(TransactionTestCase):
         self.assertEqual(self.PlayEvent.objects.count(), 1)
         print(f"b1-real-terminal stalled_start_to_successor_air_commit_s={advanced_after:.3f}", flush=True)
 
+    # -- B1-R1: the deferred claim-contention retry of an unattended start ---------------------------------
+    def _contend_first_claim(self):
+        """The stalled occurrence's first claim loses a row lock (as _claim_playback_occurrence reports a
+        transient lock_not_available): no claim, no deck; the engine defers one bounded retry (GLib, 300 ms)."""
+        real_claim = self.engine._claim_playback_occurrence
+        state = {"contended": 0}
+
+        def claim(log_item):
+            if state["contended"] == 0 and log_item.id == self.stalled_id and log_item.playback_claimed_at is None:
+                state["contended"] += 1
+                return eng_module.CLAIM_CONTENDED
+            return real_claim(log_item)
+
+        self.engine._claim_playback_occurrence = claim
+        return state
+
+    def _opened_decks(self):
+        return [(item_id, deck) for item_id, deck in self.opened if deck is not None]
+
+    def test_contended_claim_then_stalled_start_is_retried_once_and_airs_exactly_once(self):
+        contention = self._contend_first_claim()
+        started = self._start()
+        self.assertEqual(contention["contended"], 1)
+        self.assertEqual(self._opened_decks(), [], "the contended claim opened nothing yet")
+        self.assertIsNone(self._row(self.stalled_id).playback_claimed_at)
+        # The deferred contention callback (a real GLib one-shot, never a start of the test's own) opens it.
+        self.assertTrue(_wait_until(lambda: len(self._opened_decks()) == 1, timeout=3.0))
+        original = self._opened_decks()[0][1]
+        self.assertEqual(original.first_audio_attempt, 1, "the callback's open lost its unattended attribution")
+        claimed_at = self._row(self.stalled_id).playback_claimed_at
+        self.assertIsNotNone(claimed_at)
+        recovered = Path(self.temp_dir.name) / "recovered.wav"
+        _write_wav(recovered, frames=3 * 44100)
+        os.replace(recovered, self.fifo_path)       # the stall clears for whoever opens the media next
+
+        self.assertTrue(_wait_until(lambda: self._aired(self.stalled_id), timeout=5.0),
+                        f"the stalled, contention-deferred occurrence never aired: {original.milestone_snapshot()}")
+        aired_after = time.monotonic() - started
+        self._release_fifo()
+        decks = [deck for _item_id, deck in self._opened_decks()]
+        self.assertEqual(len(decks), 2)
+        retry = decks[1]
+        self.assertTrue(original.first_audio_fenced)
+        self.assertEqual(original.completion_reason, "first_audio_deadline")
+        self.assertIs(retry.log_item, original.log_item)
+        self.assertEqual(retry.first_audio_attempt, 2)
+        row = self._row(self.stalled_id)
+        self.assertEqual(row.playback_claimed_at, claimed_at)
+        self.assertIsNotNone(row.played_at)
+        self.assertEqual(self.PlayEvent.objects.filter(log_item_id_snapshot=self.stalled_id).count(), 1)
+        self.assertEqual(row.track.play_count, 1)
+        self.assertEqual([e["level"] for e in self.events], ["warning"])
+        self.assertIsNone(self.engine._claim_contention)
+        self.assertLess(aired_after, 3.0)
+        print(f"b1-real-contended-recovery start_to_retry_air_commit_s={aired_after:.3f}", flush=True)
+
+    def test_contended_claim_then_double_stall_is_abandoned_once_and_the_successor_plays(self):
+        self._contend_first_claim()
+        started = self._start()
+
+        def settled():
+            decks = [deck for _item_id, deck in self._opened_decks()]
+            retried = [deck for deck in decks if getattr(deck, "first_audio_attempt", 0) == 2]
+            if retried and retried[0].completion_claimed:
+                self._release_fifo()
+                if len(decks) == 2 and all(self.engine._deck_slot_available(s) for s in ("A", "B")):
+                    self.engine._deck_teardown_tick()
+            return self._aired(self.successor_id)
+
+        self.assertTrue(_wait_until(settled, timeout=8.0), "a contended-then-stalled occurrence stranded playout")
+        advanced_after = time.monotonic() - started
+        ids = [item_id for item_id, _deck in self._opened_decks()]
+        self.assertEqual(ids, [self.stalled_id, self.stalled_id, self.successor_id])
+        original, retry, successor = (deck for _item_id, deck in self._opened_decks())
+        self.assertEqual((original.first_audio_attempt, retry.first_audio_attempt, successor.first_audio_attempt),
+                         (1, 2, 1))
+        critical = [e for e in self.events if e["level"] == "critical"]
+        self.assertEqual(len(critical), 1)
+        self.assertEqual((critical[0]["detail"]["attempts"], critical[0]["detail"]["reason"]),
+                         (2, "ordinary_first_audio_deadline_exhausted"))
+        row = self._row(self.stalled_id)
+        self.assertIsNone(row.played_at)
+        self.assertIsNotNone(row.playback_claimed_at)
+        self.assertEqual(self.PlayEvent.objects.count(), 1)
+        print(f"b1-real-contended-terminal start_to_successor_air_commit_s={advanced_after:.3f}", flush=True)
+
     def _successor_aired_after_both_stalls(self):
         """Both stalled generations' NULLs wait on the silent FIFO. Once the retry's completion is claimed the
         writer is closed, the NULLs return, and the existing healthy-teardown resume (_poll_position's
