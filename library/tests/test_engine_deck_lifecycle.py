@@ -2355,3 +2355,620 @@ class PoisonMarkerCrossRestartTests(SimpleTestCase):
             "the preview must not show items playback will refuse")
         self.assertIn(self.item_good.id, preview_ids)
         self.assertIn(self.item_shared_again.id, preview_ids)
+
+
+class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
+    """Roadmap 1.21-B1 -- the ordinary first-audio deadline and its one exact-occurrence retry.
+
+    Deterministic: the engine's real queue, start, completion and retirement code runs; only deck
+    construction (a fresh Deck around a MagicMock bin, claimed as _claim_playback_occurrence claims), the
+    GLib timer registration (captured, fired by the test) and the database re-check at hand-out (covered by
+    the PostgreSQL-backed accounting tests) are substituted. The real-GStreamer never-real-buffer failure and
+    its recovery are in test_engine_playback_boundary_evidence.FirstAudioDeadlineRealGstTests."""
+
+    def setUp(self):
+        from library.models import LogItem
+        from library.services import vt_transition
+
+        self.LogItem = LogItem
+        self.vt = vt_transition
+        marker_dir = tempfile.TemporaryDirectory(prefix="isa-b1-marker.")
+        self.addCleanup(marker_dir.cleanup)
+        self.events = []
+        self.timers = []
+        self.idle = []
+        for active in (
+            patch.object(eng_module, "POLICY_RESTART_MARKER_PATH", Path(marker_dir.name) / "marker.json"),
+            patch.object(eng_module, "emit_event", side_effect=lambda **kw: self.events.append(kw)),
+            patch.object(eng_module, "_log_item_playable", return_value=(True, None)),
+            patch.object(eng_module, "maybe_schedule_song_request", return_value=None),
+            patch.object(eng_module.GLib, "timeout_add",
+                         side_effect=lambda ms, fn, *args: self.timers.append((ms, fn, args)) or 1),
+            patch.object(eng_module.GLib, "idle_add", side_effect=lambda fn, *args: self.idle.append((fn, args)) or 1),
+        ):
+            active.start()
+            self.addCleanup(active.stop)
+        self.engine = self._engine()
+        self.addCleanup(self._no_uncaught)
+
+    # -- fixture ---------------------------------------------------------------------------------------
+    def _engine(self):
+        engine = object.__new__(PlaybackEngine)
+        engine._lock = threading.RLock()
+        engine.decks = {"A": None, "B": None}
+        engine._deck_bin_map = {}
+        engine._deck_generation_serial = 0
+        engine._deck_watchdog_times = eng_module.deque()
+        engine._deck_teardowns = {
+            slot: audio_recovery.BoundedTeardownCoordinator(f"deck-b1-{slot.lower()}-test", timeout_s=0.5,
+                                                            queue_capacity=2)
+            for slot in ("A", "B")
+        }
+        for coordinator in engine._deck_teardowns.values():
+            self.addCleanup(coordinator.stop)
+        engine.mixer = MagicMock()
+        engine.main_pipeline = MagicMock()
+        engine.main_pipeline.remove.return_value = True
+        engine.manual_mode = False
+        engine._manual_hold_pending = False
+        engine._next_triggered = False
+        engine.running = True
+        engine.loop = MagicMock()
+        engine._engine_session_id = "session-b1"
+        engine.current_log = SimpleNamespace(id=7)
+        engine.log_items = []
+        engine._queue_cursor = 0
+        engine._forced_next_items = []
+        engine._resume_item = None
+        engine._resume_hint = None
+        engine._persist_deck_duration = lambda *_args, **_kwargs: True
+        engine._maybe_insert_dedication_intro = lambda item: item
+        engine._on_log_exhausted = MagicMock()
+        engine._roll_over_to_next_hour = lambda: False
+        engine._restore_followup_for_intro = lambda item: True
+        # The database re-check at hand-out is exercised against PostgreSQL in
+        # test_engine_playback_accounting_semantics.FirstAudioRetryAccountingTests.
+        engine._first_audio_retry_refusal = lambda item, record: None
+        _init_policy_restart_attrs(engine)
+        self.opened = []
+
+        def create_deck(slot, log_item, *_args, **_kwargs):
+            # As _claim_playback_occurrence: one-way, the original timestamp survives every reopen.
+            if log_item.playback_claimed_at is None:
+                log_item.playback_claimed_at = eng_module.timezone.now()
+            engine._deck_generation_serial += 1
+            pipeline = MagicMock()
+            pipeline.set_state.return_value = Gst.StateChangeReturn.SUCCESS
+            pipeline.get_static_pad.return_value.unlink.return_value = True
+            deck = Deck(slot, log_item.track, log_item, pipeline, MagicMock(), silence_primed=True,
+                        generation=engine._deck_generation_serial,
+                        air_start_eligible=log_item.played_at is None)
+            engine.decks[slot] = deck
+            engine._deck_bin_map[id(pipeline)] = deck
+            self.opened.append(deck)
+            return deck
+
+        engine._create_deck = create_deck
+        return engine
+
+    def _item(self, item_id, *, origin="default", category_code=None, playlist_log_id=7):
+        track = MagicMock()
+        track.id = item_id * 10
+        track.title = f"B1 track {item_id}"
+        track.filepath = f"/b1/{item_id}.wav"
+        track.duration_seconds = 180.0
+        item = MagicMock()
+        item.id = item_id
+        item.playlist_log_id = playlist_log_id
+        item.position = item_id
+        item.track = track
+        item.track_id = track.id
+        item.played_at = None
+        item.playback_claimed_at = None
+        item.origin = self.LogItem.ORIGIN_GENERATED_SCHEDULE if origin == "default" else origin
+        item.category_id = 1 if category_code else None
+        item.category = SimpleNamespace(code=category_code) if category_code else None
+        return item
+
+    def _queue(self, *items):
+        self.engine.log_items = list(items)
+        self.engine._queue_cursor = 0
+
+    def _start(self, kind="automatic", slot="A"):
+        with self.engine._vtt_starting(kind):
+            self.engine._start_next_track(slot=slot)
+
+    def _deadlines(self):
+        return [(args, fn) for _ms, fn, args in self.timers if fn == self.engine._first_audio_deadline]
+
+    def _fire_deadline(self, deck):
+        matching = [(ms, fn, args) for ms, fn, args in self.timers
+                    if fn == self.engine._first_audio_deadline and args[1] == deck.generation]
+        self.assertEqual(len(matching), 1, "exactly one deadline per armed generation")
+        ms, fn, args = matching[0]
+        self.assertEqual(ms, int(eng_module.ORDINARY_FIRST_AUDIO_GRACE_S * 1000))
+        self.assertEqual(args, (deck.slot, deck.generation, deck.log_item.id))
+        return fn(*args)
+
+    def _titles(self, level=None):
+        return [e["title"] for e in self.events if level is None or e.get("level") == level]
+
+    def _no_uncaught(self):
+        self.assertFalse([t for t in self._titles() if t.startswith("Uncaught exception")], self.events)
+
+    def _settle(self):
+        """Every unoccupied slot's previous bounded NULL has returned (the mock bins return at once)."""
+        self.assertTrue(_wait_until(lambda: all(
+            self.engine.decks[slot] is not None or self.engine._deck_slot_available(slot) for slot in ("A", "B")
+        )))
+
+    def _dispatch_first_real(self, deck):
+        # Exactly what the streaming-thread boundary probe does (its GLib hand-off is captured, not run).
+        deck.mark_milestone(eng_module.FIRST_REAL_POST_PRIMER_MILESTONE)
+        PlaybackEngine._schedule_occurrence_air_start_from_probe(self.engine, deck)
+
+    # -- 1, 2: healthy and slower-but-legitimate starts --------------------------------------------------
+    def test_grace_is_one_second_and_a_healthy_start_makes_the_deadline_inert(self):
+        self.assertEqual(eng_module.ORDINARY_FIRST_AUDIO_GRACE_S, 1.0)
+        item = self._item(1)
+        self._queue(item, self._item(2))
+        self._start()
+        deck = self.opened[0]
+        self.assertEqual(deck.first_audio_attempt, 1)
+        self._dispatch_first_real(deck)                       # first real buffer well inside the grace
+        self.assertEqual(len(self.idle), 1)                   # the authoritative air-start hand-off, once
+        self._fire_deadline(deck)
+        self.assertIs(self.engine.decks["A"], deck)
+        self.assertFalse(deck.finished or deck.completion_claimed or deck.first_audio_fenced)
+        self.assertIn("FIRST_AUDIO_DEADLINE_INERT_FIRST_REAL_WON", deck.eos_milestones)
+        self.assertEqual(self.engine._forced_next_items, [])
+        self.assertEqual(self.events, [])
+
+    def test_slower_but_legitimate_first_audio_at_the_last_moment_is_not_retried(self):
+        """The deadline races dispatch evidence, never a database commit or a wall-clock guess: a first real
+        buffer dispatched any time before the timeout runs (here: just before) wins outright, even with its
+        PlayEvent transaction still pending (played_at None)."""
+        self._queue(self._item(1))
+        self._start()
+        deck = self.opened[0]
+        deck.mark_media_buffer()
+        self._dispatch_first_real(deck)
+        self.assertIsNone(deck.log_item.played_at)
+        self._fire_deadline(deck)
+        self.assertFalse(deck.finished)
+        self.assertNotIn(1, self.engine.__dict__.get("_first_audio_retries", {}))
+
+    # -- 3, 4, 13: timeout -> exact same occurrence retried once ------------------------------------------
+    def test_timeout_fences_retires_and_retries_the_exact_occurrence_once(self):
+        item, nxt = self._item(1), self._item(2)
+        self._queue(item, nxt)
+        self._start()
+        original = self.opened[0]
+        claimed_at = item.playback_claimed_at
+        self.assertIsNotNone(claimed_at)
+        self._fire_deadline(original)
+
+        self._no_uncaught()
+        self.assertTrue(original.first_audio_fenced)
+        self.assertEqual(original.completion_reason, "first_audio_deadline")
+        self.assertTrue(original.finished and original.retirement_started)
+        self.assertIn("M_MIXER_REQUEST_PAD_RELEASE_COMPLETE", original.eos_milestones)
+        self.engine.mixer.release_request_pad.assert_called()
+        # The retry opened immediately on the free slot: the SAME in-memory LogItem, never a new row.
+        self.assertEqual(len(self.opened), 2)
+        retry = self.opened[1]
+        self.assertIs(retry.log_item, item)
+        self.assertEqual(retry.first_audio_attempt, 2)
+        self.assertIs(item.playback_claimed_at, claimed_at)        # the claim timestamp is untouched
+        self.assertEqual(self.engine._queue_cursor, 1)             # never rewound
+        self.assertEqual(self.engine._forced_next_items, [])
+        self.assertEqual([e["level"] for e in self.events], ["warning"])
+        detail = self.events[0]["detail"]
+        self.assertEqual((detail["log_item_id"], detail["original_generation"], detail["attempt"]),
+                         (1, original.generation, 1))
+        self.assertFalse(detail["first_real_dispatched"])
+        self.assertEqual(self.idle, [])                            # no air-start hand-off: nothing recorded
+
+    def test_retry_success_records_one_air_start_and_releases_the_record(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        self._fire_deadline(self.opened[0])
+        retry = self.opened[1]
+        self._dispatch_first_real(retry)
+        self._dispatch_first_real(retry)                   # a duplicate probe call is still one hand-off
+        self.assertEqual(len(self.idle), 1)
+        self.assertEqual(self.idle[0][1][:3], (retry.slot, retry.generation, 1))
+        self._fire_deadline(retry)
+        self.assertFalse(retry.finished)
+        self.assertNotIn(1, self.engine._first_audio_retries)
+        self.assertTrue(self.engine._occurrence_handed_out(retry.log_item))
+        self.assertEqual(self._titles("critical"), [])
+
+    # -- 6, 7, 21: retry failure is terminal, reported once, and playout advances -----------------------
+    def test_second_timeout_is_terminal_reported_once_and_the_successor_plays(self):
+        item, nxt = self._item(1), self._item(2)
+        self._queue(item, nxt)
+        self._start()
+        self._fire_deadline(self.opened[0])
+        retry = self.opened[1]
+        self._settle()
+        self._fire_deadline(retry)
+        self._no_uncaught()
+        self.assertTrue(retry.finished and retry.first_audio_fenced)
+        critical = [e for e in self.events if e["level"] == "critical"]
+        self.assertEqual(len(critical), 1)
+        detail = critical[0]["detail"]
+        self.assertEqual(critical[0]["dedupe_key"], "engine|first-audio-exhausted|1")
+        self.assertEqual(
+            (detail["log_item_id"], detail["track_id"], detail["engine_session_id"], detail["attempts"],
+             detail["original_generation"], detail["retry_generation"], detail["reason"]),
+            (1, 10, "session-b1", 2, self.opened[0].generation, retry.generation,
+             "ordinary_first_audio_deadline_exhausted"))
+        self.assertFalse(detail["first_real_dispatched"] or detail["occurrence_aired"]
+                         or detail["played_at_recorded"])
+        # Exactly two generations of the occurrence, ever; the healthy successor opened next.
+        self.assertEqual([d.log_item.id for d in self.opened], [1, 1, 2])
+        successor = self.opened[2]
+        self.assertEqual(successor.first_audio_attempt, 1)
+        # A duplicate / stale deadline firing changes nothing and reports nothing more.
+        self._fire_deadline(retry)
+        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), 1)
+        # The cursor can never hand the abandoned occurrence out again, even if a reload rewinds onto it.
+        self.engine.decks = {"A": None, "B": None}
+        self.engine._queue_cursor = 0
+        selected, forced = self.engine._next_queue_item()
+        self.assertIs(selected, nxt)
+        self.assertNotIn(1, self.engine._first_audio_retries)
+        self.assertIn(1, self.engine._first_audio_spent)
+
+    def test_spent_memory_is_bounded(self):
+        for item_id in range(eng_module.FIRST_AUDIO_SPENT_MEMORY + 10):
+            self.engine._first_audio_spend(item_id)
+        self.assertEqual(len(self.engine._first_audio_spent), eng_module.FIRST_AUDIO_SPENT_MEMORY)
+        self.assertNotIn(0, self.engine._first_audio_spent)
+
+    # -- 8, 9: stale callbacks and the first-buffer / timeout race ---------------------------------------
+    def test_late_first_real_buffer_of_a_fenced_generation_never_dispatches(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        original = self.opened[0]
+        self._fire_deadline(original)
+        self._dispatch_first_real(original)
+        self.assertEqual([a for f, a in self.idle], [])
+        self.assertFalse(original.air_start_dispatched)
+        self.assertIn("FIRST_REAL_AFTER_FIRST_AUDIO_FENCE", original.eos_milestones)
+
+    def test_stale_deadline_cannot_touch_a_newer_generation_in_the_same_slot(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        old = self.opened[0]
+        self.engine._remove_deck(old, occurrence_terminal=False, termination_reason="test")
+        self.engine.decks["A"] = None
+        replacement = self.engine._create_deck("A", self._item(3))
+        self.assertTrue(_wait_until(lambda: self.engine._deck_slot_available("A")))
+        self._fire_deadline(old)
+        self.assertIs(self.engine.decks["A"], replacement)
+        self.assertFalse(replacement.finished or replacement.completion_claimed or replacement.first_audio_fenced)
+        self.assertEqual(self.engine._forced_next_items, [])
+        self.assertEqual(self.events, [])
+
+    def test_first_buffer_and_deadline_racing_have_exactly_one_winner(self):
+        outcomes = {"first_real": 0, "deadline": 0}
+        switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)                 # interleave the two threads as finely as CPython allows
+        self.addCleanup(sys.setswitchinterval, switch_interval)
+        for round_ in range(300):
+            self.timers.clear()
+            self.idle.clear()
+            self.engine = self._engine()
+            self.engine._handle_deck_finished = MagicMock()       # retirement itself is covered above
+            self._queue(self._item(1000 + round_))
+            self._start()
+            deck = self.opened[-1]
+            barrier = threading.Barrier(2)
+
+            # Stagger which side reaches the shared lock first: 0, ~50 and ~100 microseconds of lead.
+            lead = (round_ % 3) * 0.00005
+
+            def spin(seconds):
+                end = time.perf_counter() + seconds
+                while time.perf_counter() < end:
+                    pass
+
+            def streaming_thread():
+                barrier.wait()
+                self._dispatch_first_real(deck)
+
+            worker = threading.Thread(target=streaming_thread)
+            worker.start()
+            barrier.wait()
+            spin(lead)
+            self._fire_deadline(deck)
+            worker.join(5)
+            dispatched, fenced = deck.air_start_dispatched, deck.first_audio_fenced
+            self.assertNotEqual(dispatched, fenced, f"round {round_}: both or neither won")
+            if dispatched:
+                outcomes["first_real"] += 1
+                self.assertEqual(len(self.idle), 1)
+                self.assertFalse(deck.completion_claimed)
+                self.engine._handle_deck_finished.assert_not_called()
+            else:
+                outcomes["deadline"] += 1
+                self.assertEqual(self.idle, [])
+                self.assertEqual(deck.completion_reason, "first_audio_deadline")
+                self.engine._handle_deck_finished.assert_called_once_with(deck)
+        print(f"b1-race-outcomes {outcomes}", flush=True)
+        self.assertTrue(outcomes["first_real"] and outcomes["deadline"], outcomes)
+
+    # -- 12: already aired / already dispatched occurrences ----------------------------------------------
+    def test_already_aired_or_dispatched_occurrences_never_get_a_deadline_or_retry(self):
+        aired = self._item(1)
+        aired.played_at = eng_module.timezone.now()
+        self.engine._forced_next_items = []
+        self._queue(aired, self._item(2))
+        self._start()
+        # The cursor never hands out an aired row (r0135); the next one opens.
+        self.assertEqual([d.log_item.id for d in self.opened], [2])
+        deck = self.opened[0]
+        deck.air_start_dispatched = True                       # dispatched, commit still pending
+        self._fire_deadline(deck)
+        self.assertFalse(deck.finished)
+
+    # -- eligibility and exclusions ----------------------------------------------------------------------
+    def test_only_fresh_ordinary_unattended_scheduled_generations_are_armed(self):
+        K = self.vt.StartKind
+        armed_cases = {
+            "automatic": dict(kind=K.AUTOMATIC),
+            "return_to_auto_handoff": dict(kind=K.MANUAL_TO_AUTO_HANDOFF),
+            "unattended_unkinded": dict(kind=None, unattended=True),
+            "live_fill": dict(origin=self.LogItem.ORIGIN_LIVE_FILL),
+            "build_fill": dict(origin=self.LogItem.ORIGIN_GENERATED_FILL),
+            "refill_installed": dict(origin=self.LogItem.ORIGIN_REFILL_INSTALLED),
+            "dst_replay": dict(origin=self.LogItem.ORIGIN_DST_REPLAY),
+        }
+        excluded_cases = {
+            "start_next_or_reload_unkinded": dict(kind=None),
+            "manual_start": dict(kind=K.MANUAL),
+            "start_next_kind": dict(kind=K.START_NEXT),
+            "eject_replacement": dict(kind=K.EJECT_REPLACEMENT),
+            "resume": dict(kind=K.RESUME),
+            "continuation": dict(kind=K.CONTINUATION),
+            "manual_mode": dict(manual=True),
+            "operator_inserted": dict(origin=self.LogItem.ORIGIN_OPERATOR_INSERTED),
+            "engine_inserted": dict(origin=self.LogItem.ORIGIN_ENGINE_INSERTED),
+            "no_origin": dict(origin=None),
+            "weather_amber": dict(category="WxAlert"),
+            "dedication_intro": dict(category="Dedications"),
+            "forced_followup": dict(forced=True),
+            "active_message": dict(native=True),
+            "not_primed": dict(deck=dict(silence_primed=False)),
+            "scheduled_vt_admission": dict(deck=dict(admission_state="preparing")),
+            "seek_continuation": dict(deck=dict(continuation_reason="manual_seek_or_resume")),
+            "start_failed": dict(deck=dict(start_failed=True)),
+        }
+        for name, case in {**{k: (True, v) for k, v in armed_cases.items()},
+                           **{k: (False, v) for k, v in excluded_cases.items()}}.items():
+            with self.subTest(name):
+                expect, spec = case
+                self.timers.clear()
+                self.engine = self._engine()
+                self.engine.manual_mode = spec.get("manual", False)
+                origin = spec.get("origin", "default")
+                item = self._item(5, origin=origin, category_code=spec.get("category"))
+                deck_overrides = spec.get("deck", {})
+                original_create = self.engine._create_deck
+
+                def create(slot, log_item, *a, _orig=original_create, _o=deck_overrides, **k):
+                    deck = _orig(slot, log_item)
+                    for attr, value in _o.items():
+                        setattr(deck, attr, value)
+                    return deck
+
+                self.engine._create_deck = create
+                if spec.get("forced"):
+                    self.engine._forced_next_items = [item]
+                    self.engine.log_items = []
+                else:
+                    self._queue(item)
+                if spec.get("native"):
+                    self.engine._active_message_held = {item.id: "attempt-1"}
+                kind = spec.get("kind", K.AUTOMATIC)
+                if spec.get("unattended"):
+                    with self.engine._first_audio_unattended():
+                        self._start(kind=kind)
+                elif kind is None:
+                    self.engine._start_next_track(slot="A")
+                else:
+                    self._start(kind=kind)
+                deck = self.opened[-1]
+                self.assertEqual(bool(self._deadlines()), expect, name)
+                self.assertEqual(deck.first_audio_attempt, 1 if expect else 0, name)
+
+    def test_unattended_marker_is_scoped_and_restored(self):
+        self.assertFalse(self.engine._first_audio_start_unattended())
+        with self.engine._first_audio_unattended():
+            self.assertTrue(self.engine._first_audio_start_unattended())
+            with self.engine._vtt_starting(self.vt.StartKind.START_NEXT):
+                self.assertFalse(self.engine._first_audio_start_unattended())
+        self.assertFalse(self.engine._first_audio_start_unattended())
+
+    # -- 14: Manual / microphone / Remote DJ hold ---------------------------------------------------------
+    def test_manual_or_mic_hold_keeps_the_retry_for_the_next_authorized_start(self):
+        item, nxt = self._item(1), self._item(2)
+        self._queue(item, nxt)
+        self._start()
+        original = self.opened[0]
+        self.engine.manual_mode = True        # operator Manual, or the mic/Remote DJ auto-hold
+        self._fire_deadline(original)
+        self.assertTrue(original.finished)
+        self.assertEqual(len(self.opened), 1, "nothing is forced to play over the hold")
+        self.assertTrue(self.engine._manual_hold_pending)
+        self.assertEqual(self.engine._forced_next_items, [item])
+        self.assertEqual(self.engine._get_upcoming_preview()[:2], [item, nxt])   # the console shows it next
+        # Return to Auto releases the deferred handoff: the retry, with its own deadline.
+        self.assertTrue(_wait_until(lambda: self.engine._free_slot() is not None))
+        self.engine._set_manual_mode(False)
+        self.assertEqual(len(self.opened), 2)
+        self.assertIs(self.opened[1].log_item, item)
+        self.assertEqual(self.opened[1].first_audio_attempt, 2)
+
+    # -- 15: urgent and dedication priority ---------------------------------------------------------------
+    def test_retry_is_queued_behind_forced_items_and_pending_cursor_weather_urgents(self):
+        item = self._item(1)
+        followup, native = self._item(2), self._item(3)
+        urgent = self._item(4, origin=self.LogItem.ORIGIN_ENGINE_INSERTED, category_code="WxAlert")
+        ordinary = self._item(5)
+        self._queue(item, urgent, ordinary)
+        self._start()
+        original = self.opened[0]
+        self.assertEqual(self.engine._queue_cursor, 1)          # the cursor now sits on the pending urgent
+        self.engine._forced_next_items = [followup, native]      # e.g. a dedication follow-up, an active message
+        self.engine.decks["B"] = MagicMock(log_item=self._item(99), finished=False)   # an outgoing still plays
+        self._fire_deadline(original)
+        self.assertEqual(len(self.opened), 1)                    # the outgoing still owns the next start
+        self.assertEqual(self.engine._forced_next_items, [followup, native, urgent, item])
+        # An urgent inserted while the retry is pending goes first, as _insert_urgent_next_inner does.
+        later_urgent = self._item(6, origin=self.LogItem.ORIGIN_ENGINE_INSERTED, category_code="WxAlert")
+        self.engine._forced_next_items.insert(0, later_urgent)
+        order = []
+        for _ in range(6):
+            selected, _forced = self.engine._next_queue_item()
+            if selected is None:
+                break
+            order.append(selected.id)
+            self.engine.decks["A"] = MagicMock(log_item=selected, finished=False)   # "on a deck now"
+        self.assertEqual(order, [6, 2, 3, 4, 1, 5])
+        self.assertEqual(self.engine._first_audio_retries[1]["state"], "handed_out")
+
+    # -- 16: Start Next / Eject ---------------------------------------------------------------------------
+    def test_eject_before_the_deadline_owns_the_completion(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        original = self.opened[0]
+        self.engine._start_next_cancel_for_operator_command = lambda *a: None
+        self.engine._vtt_operator_command = lambda *a: None
+        self.engine._eject_deck("A", expected_log_item_id=1)
+        self.assertEqual(original.completion_reason, "eject")
+        self._fire_deadline(original)
+        self.assertFalse(original.first_audio_fenced)
+        self.assertNotIn(1, self.engine.__dict__.get("_first_audio_retries", {}))
+        self.assertEqual([d.log_item.id for d in self.opened], [1, 2])     # Eject replacement: the next item
+
+    def test_start_next_fading_the_deck_owns_it(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        original = self.opened[0]
+        self.engine._start_next_active = {"outgoing_deck": original}
+        self._fire_deadline(original)
+        self.assertFalse(original.completion_claimed or original.first_audio_fenced)
+        self.assertIn("FIRST_AUDIO_DEADLINE_INERT_OTHER_OWNER", original.eos_milestones)
+
+    def test_start_next_taking_the_queued_retry_opens_it_without_a_deadline_once(self):
+        item = self._item(1)
+        self._queue(item, self._item(2))
+        self._start()
+        self.engine.decks["B"] = MagicMock(log_item=self._item(99), finished=False)
+        self._fire_deadline(self.opened[0])
+        self.assertEqual(self.engine._forced_next_items, [item])
+        self.engine.decks["B"] = None
+        self.assertTrue(_wait_until(lambda: self.engine._free_slot() is not None))
+        self.engine._start_next_track()          # Start Next's incoming start (no start kind)
+        retry = self.opened[-1]
+        self.assertIs(retry.log_item, item)
+        self.assertEqual(retry.first_audio_attempt, 0)
+        self.assertIn("FIRST_AUDIO_RETRY_OPENED_WITHOUT_DEADLINE", retry.eos_milestones)
+        self.assertNotIn(1, self.engine._first_audio_retries)
+        self.assertTrue(self.engine._occurrence_handed_out(item))
+
+    # -- 17, 18: reload and log / hour change ------------------------------------------------------------
+    def test_explicit_reload_withdraws_the_pending_retry(self):
+        item = self._item(1)
+        self._queue(item, self._item(2))
+        self._start()
+        self.engine.decks["B"] = MagicMock(log_item=self._item(99), finished=False)
+        self._fire_deadline(self.opened[0])
+        self.engine.decks["B"] = None
+        self.engine._vtt_abort = lambda *a, **k: None
+        self.engine._start_next_cancel_for_reload = lambda: None
+        self.engine._finish_reload_and_restart_current_log = MagicMock()
+        self.engine._reload_and_restart_current_log()
+        self.assertEqual(self.engine._forced_next_items, [])
+        self.assertNotIn(1, self.engine._first_audio_retries)
+        withdrawn = [e for e in self.events if e["title"] == "First-audio retry withdrawn"]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertEqual(withdrawn[0]["detail"]["reason"], "explicit_reload")
+        self.assertTrue(self.engine._occurrence_handed_out(item))
+
+    def test_a_new_active_log_withdraws_the_retry_at_hand_out(self):
+        del self.engine._first_audio_retry_refusal                 # the real re-check (log test is DB-free)
+        item, nxt = self._item(1), self._item(2)
+        self._queue(item, nxt)
+        self._start()
+        self.engine.decks["B"] = MagicMock(log_item=self._item(99), finished=False)
+        self._fire_deadline(self.opened[0])
+        self.engine.current_log = SimpleNamespace(id=8)             # rollover / takeover / new approved log
+        new_hour = self._item(20, playlist_log_id=8)
+        self._queue(new_hour)
+        selected, _forced = self.engine._next_queue_item()
+        self.assertIs(selected, new_hour)
+        withdrawn = [e for e in self.events if e["title"] == "First-audio retry withdrawn"]
+        self.assertEqual(withdrawn[0]["detail"]["reason"], "active_log_changed")
+
+    def test_retry_is_not_queued_when_the_active_log_changed_before_the_deadline(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        self.engine.current_log = SimpleNamespace(id=8)
+        self.engine.log_items = []
+        self._fire_deadline(self.opened[0])
+        critical = [e for e in self.events if e["level"] == "critical"]
+        self.assertEqual([c["detail"]["reason"] for c in critical], ["active_log_changed"])
+        self.assertEqual(self.engine._forced_next_items, [])
+
+    # -- 19: VT and ordinary crossfade compatibility ----------------------------------------------------
+    def test_crossfade_outgoing_keeps_playing_and_the_trigger_takes_the_retry(self):
+        item = self._item(1)
+        self._queue(item, self._item(2))
+        outgoing = MagicMock(log_item=self._item(99), finished=False)
+        self.engine.decks["B"] = outgoing
+        self._start(slot="A")
+        self._fire_deadline(self.opened[0])
+        self.assertIs(self.engine.decks["B"], outgoing)            # the outgoing is never touched
+        self.assertFalse(self.engine._next_triggered)              # the ordinary trigger re-fires
+        self.assertIs(self.engine._peek_playable_at_cursor(), item)
+        self.assertEqual(self.engine._next_queue_item_id(), item.id)
+
+    def test_vt_outgoing_finish_hand_over_still_applies(self):
+        self._queue(self._item(1), self._item(2))
+        self._start()
+        original = self.opened[0]
+        self.engine._vtt_outgoing_finished = MagicMock(return_value=True)
+        self._fire_deadline(original)
+        self.engine._vtt_outgoing_finished.assert_called_once()
+        self.assertEqual(len(self.opened), 1, "the VT transition owns what starts next")
+
+    # -- 20: a poisoned teardown slot is never reused; a healthy successor still plays --------------------
+    def test_poisoned_slot_is_not_reused_and_the_retry_uses_the_healthy_slot(self):
+        self._queue(self._item(1), self._item(2))
+        self._start(slot="A")
+        original = self.opened[0]
+        release = threading.Event()
+        original.pipeline.set_state.side_effect = lambda _state: release.wait(5) or Gst.StateChangeReturn.SUCCESS
+        self.addCleanup(release.set)
+        self._fire_deadline(original)
+        retry = self.opened[1]
+        self.assertEqual(retry.slot, "B")
+        time.sleep(0.6)                                             # past the coordinator's 0.5 s bound
+        self.engine._deck_teardowns["A"].tick()                     # what _deck_teardown_tick does each poll
+        self.assertTrue(self.engine._deck_teardowns["A"].snapshot()["poisoned"])
+        self.assertFalse(self.engine._deck_slot_available("A"))
+        self._fire_deadline(retry)                                  # the retry also fails: terminal
+        self.assertTrue(_wait_until(lambda: self.engine._deck_slot_available("B"), timeout=3))
+        if len(self.opened) == 2:
+            # B was still returning from NULL when the terminal path asked for a slot: the existing healthy
+            # teardown resume starts the successor (and, A having timed out, requests the 1.8 policy restart).
+            self.engine._deck_teardown_tick()
+            self.assertTrue(self.engine.restart_required)
+        self.assertEqual(len(self.opened), 3)
+        self.assertEqual(self.opened[2].first_audio_attempt, 1)
+        self.assertEqual(self.opened[2].slot, "B")                  # the healthy successor, never slot A
+        self.assertEqual(self.opened[2].log_item.id, 2)

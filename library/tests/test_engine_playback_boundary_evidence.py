@@ -444,3 +444,252 @@ class PauseResumeOneShotTests(_BoundaryTestBase):
         self.assertEqual(deck.eos_milestones[FIRST_REAL_POST_PRIMER_MILESTONE]["count"], 1)
         self.assertIn(FIRST_REAL_POST_PRIMER_MILESTONE, resumed_deck.eos_milestones)
         self.assertEqual(resumed_deck.eos_milestones[FIRST_REAL_POST_PRIMER_MILESTONE]["count"], 1)
+
+
+class FirstAudioDeadlineRealGstTests(TransactionTestCase):
+    """Roadmap 1.21-B1 on real GStreamer and PostgreSQL: the never-real-buffer failure of an ordinary
+    automatic start (the FIFO-with-a-silent-writer technique of NeverRealFailedStartTests: the primer flows,
+    decode never produces a byte, no EOS, no bus error) and its bounded recovery through the engine's real
+    queue, claim, start, first-real boundary, accounting and retirement code. VT admission planning is held
+    out (it has its own suites; scheduled VT admissions are excluded from the deadline by construction).
+
+    Each test's first assertion is the behavioural one, so against unmodified r0146 it fails there: the
+    stalled deck keeps its slot and nothing ever airs (the 1.21-B1 negative control)."""
+
+    def setUp(self):
+        from library.models import Artist, Category, CategoryKind, LogItem, PlaylistLog, Track
+        from library.services import audio_recovery, vt_transition
+
+        self.LogItem, self.PlayEvent, self.Track = LogItem, eng_module.PlayEvent, Track
+        self.vt = vt_transition
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-b1-first-audio.")
+        self.addCleanup(self.temp_dir.cleanup)
+        self.fifo_path = Path(self.temp_dir.name) / "stalls.wav"
+        os.mkfifo(self.fifo_path)
+        self._writer = {}
+
+        def hold_writer_open():
+            self._writer["fd"] = os.open(str(self.fifo_path), os.O_WRONLY)   # never written
+
+        threading.Thread(target=hold_writer_open, daemon=True).start()
+        self.addCleanup(self._release_fifo)
+
+        kind = CategoryKind.objects.create(code="b1music", name="B1 Music")
+        category = Category.objects.create(code="B1MUSIC", name="B1 Music", kind=kind)
+        artist = Artist.objects.create(name="B1 Artist")
+        self.log = PlaylistLog.objects.create(date=eng_module.timezone.localdate(), hour=3, status="approved")
+        successor_path = Path(self.temp_dir.name) / "successor.wav"
+        _write_wav(successor_path, frames=3 * 44100)
+        rows = []
+        for position, path in ((1, self.fifo_path), (2, successor_path)):
+            track = Track.objects.create(
+                filepath=str(path), filename=path.name, title=f"B1 {position}", artist=artist,
+                category=category, ready2air=True, duration_seconds=180.0, next_start_seconds=175.0,
+            )
+            rows.append(LogItem.objects.create(
+                playlist_log=self.log, position=position, scheduled_time=eng_module.timezone.now(),
+                track=track, track_title=track.title, track_artist=artist.name, category=category,
+                origin=LogItem.ORIGIN_GENERATED_SCHEDULE,
+            ))
+        self.stalled_id, self.successor_id = rows[0].id, rows[1].id
+
+        self.events = []
+        for active in (
+            patch.object(eng_module, "emit_event", side_effect=lambda **kw: self.events.append(kw)),
+            patch.object(eng_module, "_log_item_playable", return_value=(True, None)),
+            patch.object(eng_module, "maybe_schedule_song_request", return_value=None),
+        ):
+            active.start()
+            self.addCleanup(active.stop)
+
+        engine = _make_real_engine()
+        for stub in ("_claim_playback_occurrence", "_schedule_occurrence_air_start_from_probe",
+                     "_persist_deck_duration", "_schedule_continuation_segment_start", "_start_next_track"):
+            engine.__dict__.pop(stub)
+        for coordinator in engine._deck_teardowns.values():
+            coordinator.stop()
+        engine._deck_teardowns = {
+            slot: audio_recovery.BoundedTeardownCoordinator(f"deck-b1-real-{slot.lower()}", timeout_s=10.0,
+                                                            queue_capacity=16)
+            for slot in ("A", "B")
+        }
+        engine.running = True
+        engine._engine_session_id = "b1-real-session"
+        engine.current_log = self.log
+        # select_related as production's queue load: no streaming-thread lazy query (see the accounting tests).
+        engine.log_items = list(
+            LogItem.objects.filter(playlist_log=self.log)
+            .select_related("track", "track__artist", "track__album", "category", "category__kind")
+            .order_by("position")
+        )
+        engine._queue_cursor = 0
+        engine._forced_next_items = []
+        engine._resume_item = None
+        engine._maybe_insert_dedication_intro = lambda item: item
+        engine._vtt_admission_for_claim = lambda *_args: None
+        engine._on_log_exhausted = MagicMock()
+        engine._roll_over_to_next_hour = lambda: False
+        self.opened = []
+        real_create = engine._create_deck
+
+        def counting_create(slot, log_item, *args, **kwargs):
+            deck = real_create(slot, log_item, *args, **kwargs)
+            self.opened.append((log_item.id, deck))
+            return deck
+
+        engine._create_deck = counting_create
+        self.engine = engine
+        self.addCleanup(self._cleanup_engine)
+        engine.main_pipeline.get_by_name("sink").set_property("sync", True)    # real-time, as on air
+        engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def _release_fifo(self):
+        fd = self._writer.pop("fd", None)
+        if fd is not None:
+            os.close(fd)
+        else:
+            try:   # a writer still blocked in open() needs a reader to return
+                os.close(os.open(str(self.fifo_path), os.O_RDONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+
+    def _cleanup_engine(self):
+        self._release_fifo()
+        for deck in list(self.engine.decks.values()):
+            if deck is not None:
+                self.engine._remove_deck(deck)
+        _wait_until(lambda: all(self.engine._deck_slot_available(s) for s in ("A", "B")), timeout=10.0)
+        self.engine.main_pipeline.set_state(Gst.State.NULL)
+        for coordinator in self.engine._deck_teardowns.values():
+            coordinator.stop()
+
+    def _start(self):
+        started = time.monotonic()
+        with self.engine._vtt_starting(self.vt.StartKind.AUTOMATIC):
+            self.engine._start_next_track(slot="A")
+        return started
+
+    def _aired(self, item_id):
+        return self.PlayEvent.objects.filter(log_item_id_snapshot=item_id).exists()
+
+    def _row(self, item_id):
+        return self.LogItem.objects.select_related("track").get(pk=item_id)
+
+    def test_stalled_ordinary_start_is_retried_once_and_airs_exactly_once(self):
+        started = self._start()
+        self.assertEqual([item_id for item_id, _deck in self.opened], [self.stalled_id])
+        original = self.opened[0][1]
+        claimed_at = self._row(self.stalled_id).playback_claimed_at
+        self.assertIsNotNone(claimed_at)
+        # The stall clears for whoever opens the media next (e.g. a storage hiccup): the next open of the
+        # same Track path reads real audio. The stalled generation keeps its open, silent FIFO.
+        recovered = Path(self.temp_dir.name) / "recovered.wav"
+        _write_wav(recovered, frames=3 * 44100)
+        os.replace(recovered, self.fifo_path)
+
+        self.assertTrue(_wait_until(lambda: self._aired(self.stalled_id), timeout=4.0),
+                        f"the stalled occurrence never aired: {original.milestone_snapshot()}")
+        aired_after = time.monotonic() - started
+        self._release_fifo()    # lets the stalled generation's bounded NULL return
+
+        self.assertEqual(original.media_buffer_count, 0)
+        self.assertNotIn(FIRST_REAL_POST_PRIMER_MILESTONE, original.eos_milestones)
+        self.assertTrue(original.first_audio_fenced)
+        self.assertEqual(original.completion_reason, "first_audio_deadline")
+        self.assertTrue(original.retirement_started and original.detached_from_mixer)
+        self.assertEqual([item_id for item_id, _deck in self.opened], [self.stalled_id, self.stalled_id])
+        retry = self.opened[1][1]
+        self.assertIs(retry.log_item, original.log_item)
+        self.assertEqual((retry.slot, retry.first_audio_attempt), ("B", 2))
+        self.assertEqual(retry.eos_milestones[FIRST_REAL_POST_PRIMER_MILESTONE]["count"], 1)
+        row = self._row(self.stalled_id)
+        self.assertEqual(row.playback_claimed_at, claimed_at)
+        self.assertIsNotNone(row.played_at)
+        self.assertEqual(self.PlayEvent.objects.filter(log_item_id_snapshot=self.stalled_id).count(), 1)
+        self.assertEqual(self.PlayEvent.objects.count(), 1)
+        self.assertEqual(row.track.play_count, 1)
+        self.assertEqual([e["level"] for e in self.events], ["warning"])
+        # The retry's own deadline is inert (first real audio won) and releases the process-local record.
+        self.assertTrue(_wait_until(lambda: "FIRST_AUDIO_DEADLINE_INERT_FIRST_REAL_WON" in retry.eos_milestones,
+                                    timeout=3.0))
+        self.assertEqual(self.engine._first_audio_retries, {})
+        self.assertTrue(_wait_until(lambda: self.engine._deck_slot_available("A"), timeout=5.0))
+        self.assertLess(aired_after, 2.0)
+        print(f"b1-real-recovery stalled_start_to_retry_air_commit_s={aired_after:.3f} "
+              f"retry_first_real_ms={retry.milestone_snapshot()['milestones'][FIRST_REAL_POST_PRIMER_MILESTONE]['first_ms']}",
+              flush=True)
+
+    def test_slow_but_legitimate_start_inside_the_grace_is_not_retried(self):
+        """The source delivers its first byte 0.6 s after the open (well past every measured legitimate start,
+        inside the 1.0 s grace): it airs once from the original generation and nothing is retried."""
+        media = Path(self.temp_dir.name) / "slow.wav"
+        _write_wav(media, frames=int(0.3 * 44100))                 # < one pipe buffer: never blocks the writer
+        payload = media.read_bytes()
+
+        def deliver_late():
+            deadline = time.monotonic() + 5.0
+            while "fd" not in self._writer and time.monotonic() < deadline:
+                time.sleep(0.001)
+            time.sleep(0.6)
+            fd = self._writer.pop("fd", None)
+            if fd is not None:
+                os.write(fd, payload)
+                os.close(fd)
+
+        started = self._start()
+        threading.Thread(target=deliver_late, daemon=True).start()
+        self.assertTrue(_wait_until(lambda: self._aired(self.stalled_id), timeout=4.0))
+        aired_after = time.monotonic() - started
+        original = self.opened[0][1]
+        self.assertGreater(aired_after, 0.55)
+        self.assertFalse(original.first_audio_fenced)
+        self.assertNotEqual(original.completion_reason, "first_audio_deadline")
+        self.assertEqual(self.PlayEvent.objects.filter(log_item_id_snapshot=self.stalled_id).count(), 1)
+        self.assertTrue(_wait_until(lambda: "FIRST_AUDIO_DEADLINE_INERT_FIRST_REAL_WON" in original.eos_milestones
+                                    or original.completion_claimed, timeout=3.0))
+        self.assertEqual([item_id for item_id, _deck in self.opened][:1], [self.stalled_id])
+        self.assertNotIn(self.stalled_id, [item_id for item_id, _deck in self.opened][1:])
+        self.assertEqual([e for e in self.events if "first-audio" in e.get("dedupe_key", "")], [])
+        print(f"b1-real-slow-legit first_real_commit_s={aired_after:.3f}", flush=True)
+
+    def test_retry_that_also_stalls_is_abandoned_once_and_the_successor_plays(self):
+        started = self._start()
+        self.assertTrue(_wait_until(self._successor_aired_after_both_stalls, timeout=6.0),
+                        "a stalled occurrence stranded unattended playback")
+        advanced_after = time.monotonic() - started
+        ids = [item_id for item_id, _deck in self.opened]
+        self.assertEqual(ids, [self.stalled_id, self.stalled_id, self.successor_id])
+        original, retry, successor = (deck for _item_id, deck in self.opened)
+        for deck in (original, retry):
+            self.assertEqual(deck.media_buffer_count, 0)
+            self.assertTrue(deck.first_audio_fenced and deck.retirement_started)
+            self.assertNotIn(FIRST_REAL_POST_PRIMER_MILESTONE, deck.eos_milestones)
+        self.assertEqual((original.first_audio_attempt, retry.first_audio_attempt, successor.first_audio_attempt),
+                         (1, 2, 1))
+        critical = [e for e in self.events if e["level"] == "critical"]
+        self.assertEqual(len(critical), 1)
+        detail = critical[0]["detail"]
+        self.assertEqual((detail["log_item_id"], detail["attempts"], detail["original_generation"],
+                          detail["retry_generation"], detail["engine_session_id"], detail["reason"]),
+                         (self.stalled_id, 2, original.generation, retry.generation, "b1-real-session",
+                          "ordinary_first_audio_deadline_exhausted"))
+        self.assertFalse(detail["first_real_dispatched"] or detail["occurrence_aired"])
+        row = self._row(self.stalled_id)
+        self.assertIsNone(row.played_at)
+        self.assertIsNotNone(row.playback_claimed_at)
+        self.assertEqual(row.track.play_count, 0)
+        self.assertFalse(self._aired(self.stalled_id))
+        self.assertEqual(self.PlayEvent.objects.count(), 1)
+        print(f"b1-real-terminal stalled_start_to_successor_air_commit_s={advanced_after:.3f}", flush=True)
+
+    def _successor_aired_after_both_stalls(self):
+        """Both stalled generations' NULLs wait on the silent FIFO. Once the retry's completion is claimed the
+        writer is closed, the NULLs return, and the existing healthy-teardown resume (_poll_position's
+        _deck_teardown_tick in production) starts the successor. Attribute-tolerant: on unmodified r0146
+        nothing is ever claimed and this stays False (the negative control)."""
+        retried = [deck for _item_id, deck in self.opened if getattr(deck, "first_audio_attempt", 0) == 2]
+        if retried and retried[0].completion_claimed:
+            self._release_fifo()
+            if len(self.opened) == 2 and all(self.engine._deck_slot_available(s) for s in ("A", "B")):
+                self.engine._deck_teardown_tick()
+        return self._aired(self.successor_id)

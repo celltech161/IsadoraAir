@@ -491,3 +491,103 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
                 for call in emit.call_args_list
             )
         )
+
+
+class FirstAudioRetryAccountingTests(PlaybackAccountingFixture):
+    """Roadmap 1.21-B1 against PostgreSQL: the first-audio deadline never turns dispatched (possibly not yet
+    committed) air evidence into a retry, leaves the established same-generation accounting retry alone, and
+    re-checks the database before a queued retry reopens its occurrence."""
+
+    def armed_deck(self):
+        track, item = self.make_occurrence()
+        item.origin = LogItem.ORIGIN_GENERATED_SCHEDULE
+        item.save(update_fields=["origin"])
+        engine, deck = self.make_engine_deck(track, item)
+        engine.running = True
+        engine.current_log = self.log
+        engine._forced_next_items = []
+        self.assertTrue(engine._claim_playback_occurrence(item))
+        deck.silence_primed = True
+        deck.first_audio_attempt = 1
+        engine._handle_deck_finished = MagicMock()
+        return engine, deck, track, item
+
+    def test_dispatched_but_uncommitted_first_audio_is_never_retried_and_commits_once(self):
+        engine, deck, track, item = self.armed_deck()
+        with patch.object(GLib, "idle_add", return_value=7) as idle_add:
+            engine._schedule_occurrence_air_start_from_probe(deck)
+        item.refresh_from_db()
+        self.assertIsNone(item.played_at)                     # dispatched, commit still pending
+        engine._first_audio_deadline("A", 1, item.id)
+        self.assertFalse(deck.first_audio_fenced or deck.completion_claimed)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertEqual(engine._forced_next_items, [])
+        callback, *args = idle_add.call_args.args
+        callback(*args)
+        track.refresh_from_db()
+        self.assertEqual(track.play_count, 1)
+        self.assertEqual(PlayEvent.objects.filter(log_item_id_snapshot=item.id).count(), 1)
+
+    def test_established_accounting_retry_is_unchanged_and_never_becomes_a_second_generation(self):
+        engine, deck, track, item = self.armed_deck()
+        with patch.object(GLib, "idle_add", return_value=7) as idle_add:
+            engine._schedule_occurrence_air_start_from_probe(deck)
+        callback, *args = idle_add.call_args.args
+        with patch.object(eng_module, "mark_song_requests_aired", side_effect=RuntimeError("transient")), \
+                patch.object(GLib, "timeout_add_seconds", return_value=9) as accounting_retry, \
+                patch.object(eng_module, "emit_event"):
+            callback(*args)                                   # the transaction fails and rolls back
+        accounting_retry.assert_called_once()                 # the same-generation 1 s accounting retry
+        item.refresh_from_db()
+        self.assertIsNone(item.played_at)
+        # The first-audio deadline runs while that retry is pending: dispatched evidence wins.
+        engine._first_audio_deadline("A", 1, item.id)
+        self.assertFalse(deck.first_audio_fenced or deck.completion_claimed)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertEqual(engine._forced_next_items, [])
+        retry_callback, *retry_args = accounting_retry.call_args.args[1:]
+        retry_callback(*retry_args)
+        item.refresh_from_db()
+        track.refresh_from_db()
+        self.assertIsNotNone(item.played_at)
+        self.assertEqual(track.play_count, 1)
+        self.assertEqual(PlayEvent.objects.filter(log_item_id_snapshot=item.id).count(), 1)
+
+    def test_queued_retry_is_rechecked_against_the_database_before_it_reopens(self):
+        def fresh():
+            track, item = self.make_occurrence()
+            engine, _deck = self.make_engine_deck(track, item)
+            engine.current_log = self.log
+            self.assertTrue(engine._claim_playback_occurrence(item))
+            record = {"playlist_log_id": self.log.id, "track_id": track.id,
+                      "claimed_at": item.playback_claimed_at, "original_generation": 1}
+            return engine, track, item, record
+
+        engine, _track, item, record = fresh()
+        self.assertIsNone(engine._first_audio_retry_refusal(item, record))
+
+        engine, _track, item, record = fresh()
+        LogItem.objects.filter(pk=item.pk).update(played_at=timezone.now())
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "already_aired")
+
+        engine, _track, item, record = fresh()
+        LogItem.objects.filter(pk=item.pk).update(playback_claimed_at=timezone.now() + timedelta(seconds=5))
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "claim_changed")
+
+        engine, _track, item, record = fresh()
+        other, _other_item = self.make_occurrence()
+        LogItem.objects.filter(pk=item.pk).update(track=other)
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "track_changed")
+
+        engine, _track, item, record = fresh()
+        LogItem.objects.filter(pk=item.pk).delete()
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "occurrence_deleted")
+
+        engine, _track, item, record = fresh()
+        PlaylistLog.objects.filter(pk=self.log.pk).update(status="draft")
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "log_not_approved")
+        PlaylistLog.objects.filter(pk=self.log.pk).update(status="approved")
+
+        engine, _track, item, record = fresh()
+        engine.current_log = PlaylistLog.objects.create(date=date(2027, 9, 13), hour=11, status="approved")
+        self.assertEqual(engine._first_audio_retry_refusal(item, record), "active_log_changed")
