@@ -52,6 +52,7 @@ from encoders.services.encoder_manager import (
     AIRCHECK_OUTPUT_ID,
     AIRCHECK_TELNET_HOST,
     AIRCHECK_TELNET_PORT,
+    DEFAULT_INPUT_DEVICE,
 )
 from monitoring.models import emit_event
 
@@ -331,7 +332,10 @@ def start_recording():
             filename=str(out_path),
             audio_format=cfg.audio_format,
             bitrate=cfg.effective_bitrate(),
-            source_device=cfg.source_device,
+            # The recorder cuts the default encoder group's single shared
+            # input.alsa source; it never opens a device of its own. Record
+            # that canonical identifier, not the legacy AircheckConfig value.
+            source_device=DEFAULT_INPUT_DEVICE,
             ffmpeg_pid=None,  # legacy field, always None on new sessions
             still_running=True,
         )

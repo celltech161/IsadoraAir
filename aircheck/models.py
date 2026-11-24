@@ -25,8 +25,7 @@ DEFAULT_BITRATE_BY_FORMAT = {
 
 class AircheckConfig(models.Model):
     """Singleton -- one row edited via Django admin. Everything the
-    aircheck recorder needs to spawn ffmpeg (format, bitrate, output
-    directory) plus the source device it should capture from. The
+    aircheck recorder needs (format, bitrate, output directory). The
     manual on/off button on /monitoring/ reads this config each time
     a new session starts, so an admin change takes effect on the
     next Start Recording press without any restart."""
@@ -45,6 +44,10 @@ class AircheckConfig(models.Model):
                    "Ignored for FLAC/WAV. Blank falls back to the "
                    "format's default (64k for HE-AAC, 320k for MP3).",
     )
+    # Legacy column: kept for database and migration compatibility, but not
+    # editable in Admin and not read by the recorder. Aircheck always records
+    # the default encoder group's shared source
+    # (encoders.services.encoder_manager.DEFAULT_INPUT_DEVICE).
     source_device = models.CharField(
         max_length=64, default="airtap",
         help_text="ALSA device the ffmpeg -i argument reads from. "
