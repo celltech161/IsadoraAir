@@ -769,6 +769,104 @@ class FirstAudioDeadlineRealGstTests(TransactionTestCase):
         self.assertEqual(self.PlayEvent.objects.count(), 1)
         print(f"b1-real-contended-terminal start_to_successor_air_commit_s={advanced_after:.3f}", flush=True)
 
+    # -- B1-R2 (second review): a retired log reactivated later never regains a consumed retry -------------
+    def _hold_fifo_writer(self):
+        """A writer for the stalled FIFO again, so any later open of it stalls (never blocks) as before."""
+        def hold():
+            self._writer["fd"] = os.open(str(self.fifo_path), os.O_WRONLY)
+        threading.Thread(target=hold, daemon=True).start()
+
+    def _slots_free(self):
+        return all(self.engine._deck_slot_available(s) for s in ("A", "B")) and not any(self.engine.decks.values())
+
+    def test_retired_log_reactivated_later_never_regains_a_consumed_retry(self):
+        """The reviewer's scenario on real GStreamer and PostgreSQL, through the engine's own approved-log
+        install (_load_log_for), cursor traversal, claim and deck admission: occurrence S (log A) exhausts its
+        one retry; the same log is reloaded; another approved log becomes the active program and every engine
+        reference to log A is retired; then log A -- the SAME PlaylistLog and LogItem rows -- is rescheduled
+        to another hour and reapproved, and installed again. S must not re-enter a deck or receive a second
+        budget; a genuinely new row of log A airs with ordinary eligibility. (Against the reviewed candidate
+        96318b0 S re-enters a deck with a fresh first attempt: the negative control.)"""
+        from library.models import PlaylistLog
+
+        today = self.log.date
+        next_log = PlaylistLog.objects.create(date=today, hour=4, status="approved")
+        # Hour 3 (log A) holds only S; the successor row is the next hour's (log B) programming.
+        self.LogItem.objects.filter(pk=self.successor_id).update(playlist_log=next_log, position=1)
+        self.assertTrue(self.engine._load_log_for(today, 3))
+        self.assertEqual([item.id for item in self.engine.log_items], [self.stalled_id])
+        self._start()
+
+        def exhausted():
+            retried = [deck for _item_id, deck in self.opened if getattr(deck, "first_audio_attempt", 0) == 2]
+            return bool(retried) and retried[0].completion_claimed
+
+        self.assertTrue(_wait_until(exhausted, timeout=5.0), "the stalled occurrence never exhausted its retry")
+        self._release_fifo()                                      # both stalled generations' NULLs may return
+        self.assertTrue(_wait_until(self._slots_free, timeout=10.0))
+        self._hold_fifo_writer()
+        self.assertEqual([item_id for item_id, _deck in self.opened], [self.stalled_id, self.stalled_id])
+        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), 1)
+        claimed_at = self._row(self.stalled_id).playback_claimed_at
+        self.assertIsNotNone(claimed_at)
+
+        # (B) Explicit reload of the same active log: S is passed over, nothing opens.
+        self.assertTrue(self.engine._load_log_for(today, 3))
+        self.assertEqual(self.engine._queue_cursor, 0)
+        self._start()
+        self.assertEqual(len(self.opened), 2, "a same-log reload restored the consumed retry")
+
+        # Log B becomes the active program and airs; every engine reference to log A is retired.
+        self.assertTrue(self.engine._load_log_for(today, 4))
+        self._start()
+        self.assertTrue(_wait_until(lambda: self._aired(self.successor_id), timeout=4.0))
+        successor_deck = self.opened[-1][1]
+        self.engine._remove_deck(successor_deck)
+        self.assertTrue(_wait_until(self._slots_free, timeout=10.0))
+        self.assertFalse(any(getattr(item, "playlist_log_id", None) == self.log.id
+                             for item in list(self.engine.log_items) + list(self.engine._forced_next_items)))
+        self.assertEqual(self.engine._first_audio_retries, {})
+
+        # Log A is rescheduled to hour 5 and reapproved -- the same PlaylistLog and LogItem rows -- and gains
+        # one genuinely new occurrence (a new row); it is installed again as the active program.
+        PlaylistLog.objects.filter(pk=self.log.pk).update(hour=5, status="draft")
+        PlaylistLog.objects.filter(pk=self.log.pk).update(status="approved")
+        stalled_row = self._row(self.stalled_id)
+        fresh_path = Path(self.temp_dir.name) / "fresh.wav"
+        _write_wav(fresh_path, frames=3 * 44100)
+        fresh_track = self.Track.objects.create(
+            filepath=str(fresh_path), filename=fresh_path.name, title="B1 fresh", artist=stalled_row.track.artist,
+            category=stalled_row.track.category, ready2air=True, duration_seconds=180.0, next_start_seconds=175.0,
+        )
+        fresh_id = self.LogItem.objects.create(
+            playlist_log_id=self.log.pk, position=2, scheduled_time=eng_module.timezone.now(), track=fresh_track,
+            track_title=fresh_track.title, track_artist=fresh_track.artist.name, category=stalled_row.category,
+            origin=self.LogItem.ORIGIN_GENERATED_SCHEDULE,
+        ).id
+        self.assertTrue(self.engine._load_log_for(today, 5))
+        self.assertEqual([item.id for item in self.engine.log_items], [self.stalled_id, fresh_id])
+        self.assertEqual(self.engine._queue_cursor, 0)                  # nothing of log A aired: from the top
+        opened_before = len(self.opened)
+        self._start()                                                   # an unattended automatic start
+        admitted = self.opened[opened_before:]
+        self.assertNotIn(self.stalled_id, [item_id for item_id, _deck in admitted],
+                         f"the spent occurrence re-entered a deck: attempts "
+                         f"{[getattr(deck, 'first_audio_attempt', None) for _i, deck in admitted]}")
+        self.assertEqual([item_id for item_id, _deck in admitted], [fresh_id])
+        self.assertEqual(admitted[0][1].first_audio_attempt, 1)         # the new identity: ordinary eligibility
+        self.assertTrue(_wait_until(lambda: self._aired(fresh_id), timeout=4.0))
+        self.assertEqual([item_id for item_id, _deck in self.opened].count(self.stalled_id), 2)
+        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), 1)
+        row = self._row(self.stalled_id)
+        self.assertIsNone(row.played_at)
+        self.assertEqual(row.playback_claimed_at, claimed_at)
+        self.assertFalse(self._aired(self.stalled_id))
+        self.assertEqual(self.engine._first_audio_spent, {(self.log.pk, self.stalled_id)})
+        self.engine._remove_deck(admitted[0][1])
+        self._release_fifo()
+        _wait_until(lambda: "fd" in self._writer, timeout=2.0)
+        self._release_fifo()
+
     def _successor_aired_after_both_stalls(self):
         """Both stalled generations' NULLs wait on the silent FIFO. Once the retry's completion is claimed the
         writer is closed, the NULLs return, and the existing healthy-teardown resume (_poll_position's

@@ -2619,7 +2619,7 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         selected, forced = self.engine._next_queue_item()
         self.assertIs(selected, nxt)
         self.assertNotIn(1, self.engine._first_audio_retries)
-        self.assertIn(1, self.engine._first_audio_spent)
+        self.assertIn((7, 1), self.engine._first_audio_spent)
 
     # -- 8, 9: stale callbacks and the first-buffer / timeout race ---------------------------------------
     def test_late_first_real_buffer_of_a_fenced_generation_never_dispatches(self):
@@ -3068,7 +3068,7 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         self.assertEqual([d.log_item.id for d in self.opened], [1])
         self.assertEqual(self.opened[0].first_audio_attempt, 1)
         self.assertEqual(self.engine._first_audio_retries, {})
-        self.assertNotIn(1, self.engine.__dict__.get("_first_audio_spent", {}))
+        self.assertNotIn((7, 1), self.engine.__dict__.get("_first_audio_spent", set()))
         self._fire_deadline(self.opened[0])
         self.assertEqual(self.opened[1].first_audio_attempt, 2)
 
@@ -3219,7 +3219,8 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         self.assertEqual((critical[0]["attempts"], critical[0]["retry_opened"]), (1, False))
 
     # ======================================================================================================
-    # B1-R2 -- consumed retry authority is retained for the life of its programming authority.
+    # B1-R2 -- consumed retry authority is retained for the life of the engine process (second review:
+    # no lifecycle pruning; only an engine restart resets it).
     # ======================================================================================================
     def _log_item_set(self, first_id, count, playlist_log_id):
         return [self._item(first_id + n, playlist_log_id=playlist_log_id) for n in range(count)]
@@ -3238,8 +3239,28 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
             self._settle()
             self.assertEqual(self.opened[-1].log_item.id, expected + 1)
 
+    def _install(self, log_id, hour, rows):
+        """The engine's real _load_log_for installs ``rows`` as the approved queue of PlaylistLog ``log_id``
+        (only the database read and the takeover-eligibility rule are substituted)."""
+        log = SimpleNamespace(id=log_id, date=None, hour=hour)
+        with patch.object(self.engine, "_approved_log_queue", return_value=(log, list(rows))), patch.object(
+            self.engine, "_log_queue_eligibility", return_value=(True, None)
+        ):
+            self.assertTrue(self.engine._load_log_for(None, hour))
+
+    def _drain_cursor(self):
+        handed_out = []
+        while True:
+            item, _forced = self.engine._next_queue_item()
+            if item is None:
+                return handed_out
+            handed_out.append(item.id)
+
+    def _spent(self):
+        return self.engine.__dict__.get("_first_audio_spent")
+
     def test_more_than_the_old_fifo_limit_of_spent_occurrences_all_stay_suppressed_across_reload(self):
-        total = 290                                  # > 256, the limit of the reviewed candidate's FIFO
+        total = 290                                  # > 256, the limit of the original candidate's FIFO
         items = self._log_item_set(1, total + 10, playlist_log_id=7)
         self._queue(*items)
         self._start()
@@ -3247,19 +3268,15 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), total)
         # The very first (oldest) spent occurrence is still suppressed after 289 later ones were spent.
         self.assertTrue(self.engine._occurrence_handed_out(items[0]))
-        spent = self.engine._first_audio_spent
+        spent = self._spent()
         self.assertGreater(len(spent), 256)
-        self.assertEqual(sorted(spent), list(range(1, total + 1)))
+        self.assertEqual(sorted(spent), [(7, n) for n in range(1, total + 1)])
 
         # Explicit reload of the SAME active log: fresh rows, same ids, nothing aired, cursor back at the top.
         fresh = self._log_item_set(1, total + 10, playlist_log_id=7)
-        log = SimpleNamespace(id=7, date=None, hour=3)
-        with patch.object(self.engine, "_approved_log_queue", return_value=(log, fresh)), patch.object(
-            self.engine, "_log_queue_eligibility", return_value=(True, None)
-        ):
-            self.assertTrue(self.engine._load_log_for(None, 3))
+        self._install(7, 3, fresh)
         self.assertEqual(self.engine._queue_cursor, 0)
-        self.assertEqual(len(self.engine._first_audio_spent), total)        # reload releases nothing
+        self.assertEqual(len(self._spent()), total)                         # reload releases nothing
         for stale in (fresh[0], fresh[100], fresh[total - 1]):
             self.assertTrue(self.engine._occurrence_handed_out(stale), stale.id)
             self.assertTrue(self.engine._first_audio_owns(stale), stale.id)
@@ -3267,88 +3284,182 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         # Normal cursor traversal: every spent occurrence is passed over; unspent ones are not (the live deck is
         # cleared first, so occurrence 291 -- unspent, merely open -- is the first one offered).
         self.engine.decks = {"A": None, "B": None}
-        handed_out = []
-        while True:
-            item, _forced = self.engine._next_queue_item()
-            if item is None:
-                break
-            handed_out.append(item.id)
+        handed_out = self._drain_cursor()
         self.assertEqual(handed_out, list(range(total + 1, total + 11)))
-        self.assertTrue(set(handed_out).isdisjoint(self.engine._first_audio_spent))
+        self.assertTrue(set(handed_out).isdisjoint(item_id for _log_id, item_id in self._spent()))
 
     def test_a_spent_occurrence_is_never_restored_by_an_old_fifo_style_eviction(self):
-        """Recording many more spends than the old limit never forgets an earlier one while its log is active."""
+        """Recording many more spends than the old limit never forgets the earliest one."""
         self._queue(*self._log_item_set(1, 5, playlist_log_id=7))
         for item_id in range(1, 1500):
             self.engine._first_audio_spend(item_id, 7)
-        self.assertEqual(len(self.engine._first_audio_spent), 1499)
+        self.assertEqual(len(self._spent()), 1499)
         self.assertTrue(self.engine._first_audio_owns(self._item(1)))
 
-    def test_consumed_authority_is_reclaimed_only_when_its_log_is_unreachable(self):
+    def test_retired_log_reactivated_later_never_regains_a_consumed_retry(self):
+        """B1-R2 (second review), the reviewer's scenario through the real install, cursor and admission code:
+        an occurrence exhausts its retry; another log becomes active and the original log is retired (nothing
+        engine-owned reaches it any more); then the SAME PlaylistLog and LogItem rows are installed again (a
+        reschedule / reapproval / reactivation). The occurrence is passed over, no deck opens it, and no
+        second budget is armed; the next genuinely unspent row airs with ordinary eligibility."""
+        original_rows = self._log_item_set(1, 3, playlist_log_id=7)
+        self._queue(*original_rows)
+        self._start()
+        self._exhaust_in_order(1)                                           # occurrence (7, 1) is spent
+        self.assertEqual([d.log_item.id for d in self.opened], [1, 1, 2])
+
+        # Another log (8) becomes the active program; every reference to log 7 is retired.
+        self.engine.decks = {"A": None, "B": None}
+        self.engine._forced_next_items = []
+        self._install(8, 4, self._log_item_set(100, 2, playlist_log_id=8))
+        self.assertEqual(self.engine.current_log.id, 8)
+        self._start()
+        self.assertEqual(self.opened[-1].log_item.id, 100)
+        self.engine.decks = {"A": None, "B": None}
+        self._install(9, 5, self._log_item_set(200, 2, playlist_log_id=9))   # and yet another hour after it
+        self.engine.decks = {"A": None, "B": None}
+
+        # Log 7's same rows are installed again (rescheduled / reapproved / reactivated): new in-memory copies,
+        # the same database identities, nothing aired, the cursor back at the top.
+        reactivated = self._log_item_set(1, 3, playlist_log_id=7)
+        self._install(7, 6, reactivated)
+        self.assertEqual(self.engine._queue_cursor, 0)
+        opened_before = len(self.opened)
+        deadlines_before = len(self._deadlines())
+        self._start()                                                       # an unattended automatic start
+        reopened = [d for d in self.opened[opened_before:] if d.log_item.id == 1]
+        self.assertEqual(reopened, [], "the spent occurrence re-entered a deck (restored retry authority)")
+        self.assertEqual([d.log_item.id for d in self.opened if d.log_item.id == 1], [1, 1])
+        admitted = self.opened[-1]
+        self.assertIs(admitted.log_item, reactivated[1])                    # the next row, untouched by B1
+        self.assertEqual(admitted.first_audio_attempt, 1)                   # ordinary eligibility of its own
+        self.assertEqual(len(self._deadlines()), deadlines_before + 1)
+        self.assertEqual(len([e for e in self.events if e["level"] == "critical"]), 1)
+        self.assertNotIn(1, self.engine._first_audio_retries)
+        self.assertEqual(self._spent(), {(7, 1)}, "retiring and reactivating the log released nothing")
+
+    def test_same_log_reload_keeps_consumed_authority_through_cursor_and_admission(self):
+        self._queue(*self._log_item_set(1, 3, playlist_log_id=7))
+        self._start()
+        self._exhaust_in_order(1)
+        self.engine.decks = {"A": None, "B": None}
+        self._install(7, 3, self._log_item_set(1, 3, playlist_log_id=7))  # explicit reload: same log, same rows
+        opened_before = len(self.opened)
+        self._start()
+        self.assertEqual([d.log_item.id for d in self.opened[opened_before:]], [2])
+        self.assertEqual(self._spent(), {(7, 1)})
+
+    def test_consumed_authority_survives_every_log_lifecycle_change(self):
+        """What the previous candidate treated as release points -- the old log unreachable from decks, the
+        forced queue, a VT hold, retry records, the next-hour peek; no active log at all; a later spend --
+        now release nothing."""
         old_items = self._log_item_set(1, 3, playlist_log_id=7)
         self._queue(*old_items)
         for item in old_items:
             self.engine._first_audio_spend(item.id, 7)
         engine = self.engine
-        new_items = self._log_item_set(100, 3, playlist_log_id=8)
-
-        # A different log becomes active, but the old log's occurrence is still held by a live deck.
-        live = MagicMock(log_item=old_items[0], finished=False)
-        engine.decks["A"] = live
         engine.current_log = SimpleNamespace(id=8)
-        engine.log_items = list(new_items)
-        self.assertEqual(engine._first_audio_prune_spent(), 0)
-        self.assertEqual(sorted(engine._first_audio_spent), [1, 2, 3])
-        engine.decks["A"] = None
-        # ...or queued in the forced queue (a pending retry / carried urgent)...
-        engine._forced_next_items = [old_items[1]]
-        self.assertEqual(engine._first_audio_prune_spent(), 0)
+        engine.log_items = self._log_item_set(100, 3, playlist_log_id=8)
         engine._forced_next_items = []
-        # ...or held by a VT hold, or by a live retry record.
-        engine._vtt_held_occurrence = {"log_item": old_items[2], "slot": "A", "reason": "x"}
-        self.assertEqual(engine._first_audio_prune_spent(), 0)
-        engine._vtt_held_occurrence = None
-        retries = engine.__dict__.setdefault("_first_audio_retries", {})
-        retries[3] = {"state": "pending", "log_item": old_items[2], "playlist_log_id": 7}
-        self.assertEqual(engine._first_audio_prune_spent(), 0)
-        retries.clear()
-        self.assertEqual(sorted(engine._first_audio_spent), [1, 2, 3])
+        engine.decks = {"A": None, "B": None}
+        engine._first_audio_spend(100, 8)                                   # a later spend under another log
+        self.assertEqual(self._spent(), {(7, 1), (7, 2), (7, 3), (8, 100)})
+        engine.current_log = None
+        engine.log_items = []
+        engine._first_audio_spend(101, 8)
+        self.assertEqual(len(self._spent()), 5)
+        for item in old_items:
+            self.assertTrue(engine._first_audio_owns(self._item(item.id, playlist_log_id=7)), item.id)
+        self.assertFalse(hasattr(engine, "_first_audio_prune_spent"))       # no lifecycle release path remains
 
-        # Nothing reaches the old log any more: its consumed authority is released, and only it.
-        engine._first_audio_spend(100, 8)                                   # the active log's own entry
-        self.assertEqual(sorted(engine._first_audio_spent), [100])
-
-    def test_without_an_active_log_nothing_is_provable_so_nothing_is_released(self):
-        self.engine._first_audio_spend(1, 7)
-        self.engine.current_log = None
-        self.assertEqual(self.engine._first_audio_prune_spent(), 0)
-        self.assertEqual(list(self.engine._first_audio_spent), [1])
-
-    def test_a_new_log_install_releases_the_old_logs_authority_and_new_occurrences_are_eligible(self):
+    def test_new_programming_identities_are_eligible_and_unrelated_occurrences_inherit_nothing(self):
         total = 40
         items = self._log_item_set(1, total + 2, playlist_log_id=7)
         self._queue(*items)
         self._start()
         self._exhaust_in_order(total)
-        self.assertEqual(len(self.engine._first_audio_spent), total)
-        # Hour transition: item 41 is still on a deck (the outgoing track), so log 7 stays reachable...
-        fresh = self._log_item_set(1, 4, playlist_log_id=8)        # ids COLLIDE with the old log's: reuse
-        new_log = SimpleNamespace(id=8, date=None, hour=4)
-        with patch.object(self.engine, "_approved_log_queue", return_value=(new_log, fresh)), patch.object(
-            self.engine, "_log_queue_eligibility", return_value=(True, None)
-        ):
-            self.engine._load_log_for(None, 4)
-        self.assertEqual(len(self.engine._first_audio_spent), total)
-        for row in fresh:        # an unrelated occurrence reusing an old id inherits nothing
+        self.assertEqual(len(self._spent()), total)
+        # A rebuilt hour: a new log whose rows even REUSE the old ids -- a different occurrence identity.
+        fresh = self._log_item_set(1, 4, playlist_log_id=8)
+        self.engine.decks = {"A": None, "B": None}
+        self._install(8, 4, fresh)
+        self.assertEqual(len(self._spent()), total)                         # nothing released by the install
+        for row in fresh:
             self.assertFalse(self.engine._first_audio_owns(row), row.id)
             self.assertFalse(self.engine._occurrence_handed_out(row), row.id)
-        # ...and once the old log is unreachable the next lifecycle point (here another install) frees it.
-        self.engine.decks = {"A": None, "B": None}
-        with patch.object(self.engine, "_approved_log_queue", return_value=(new_log, fresh)), patch.object(
-            self.engine, "_log_queue_eligibility", return_value=(True, None)
-        ):
-            self.engine._load_log_for(None, 4)
-        self.assertEqual(self.engine._first_audio_spent, {})
-        self.assertEqual(self.engine._queue_cursor, 0)
-        item, _forced = self.engine._next_queue_item()
-        self.assertEqual(item.id, 1)                                # id 1 of log 8 is eligible again
+        # Unspent rows of the ORIGINAL log are unrelated too.
+        self.assertFalse(self.engine._first_audio_owns(items[total + 1]))
+        opened_before = len(self.opened)
+        self._start()
+        admitted = self.opened[opened_before:]
+        self.assertEqual([(d.log_item.playlist_log_id, d.log_item.id) for d in admitted], [(8, 1)])
+        self.assertEqual(admitted[0].first_audio_attempt, 1)                # ordinary B1 eligibility
+
+    def test_healthy_playback_never_populates_spent_authority(self):
+        rows = self._log_item_set(1, 25, playlist_log_id=7)
+        self._queue(*rows)
+        self._start()
+        for expected in range(1, 25):
+            deck = self.opened[-1]
+            self.assertEqual((deck.log_item.id, deck.first_audio_attempt), (expected, 1))
+            self._dispatch_first_real(deck)
+            self._fire_deadline(deck)                                        # inert: first real won
+            deck.claim_completion("eos")
+            self.engine._handle_deck_finished(deck)
+            self._settle()
+        self.assertIsNone(self._spent())
+        self.assertEqual(self.engine._first_audio_retries, {})
+        self.assertEqual([e for e in self.events if "first-audio" in e.get("dedupe_key", "")], [])
+
+    def test_spent_authority_holds_identity_pairs_only(self):
+        self._queue(*self._log_item_set(1, 3, playlist_log_id=7))
+        self._start()
+        self._exhaust_in_order(2)
+        spent = self._spent()
+        self.assertIsInstance(spent, set)
+        self.assertEqual(spent, {(7, 1), (7, 2)})
+        for entry in spent:
+            self.assertIs(type(entry), tuple)
+            self.assertEqual([type(value) for value in entry], [int, int])   # no LogItem / log / deck / media
+
+    def test_a_new_engine_process_starts_with_empty_spent_authority(self):
+        rows = self._log_item_set(1, 3, playlist_log_id=7)
+        self._queue(*rows)
+        self._start()
+        self._exhaust_in_order(1)
+        self.assertEqual(self._spent(), {(7, 1)})
+        self.timers.clear()
+        self.engine = self._engine()                                        # a restarted engine process
+        self.assertIsNone(self._spent())
+        self.assertEqual(self.engine.__dict__.get("_first_audio_retries"), None)
+        self._queue(*self._log_item_set(1, 3, playlist_log_id=7))
+        self._start()
+        self.assertEqual((self.opened[-1].log_item.id, self.opened[-1].first_audio_attempt), (1, 1))
+
+    # -- contention attribution: released with its own record (token-matched) ------------------------------
+    def test_contention_attribution_is_released_when_its_record_clears(self):
+        self._queue(self._item(1), self._item(2))
+        self._contend_creates(1)
+        self._start()
+        self.assertIn("_claim_contention_attribution", self.engine.__dict__)
+        self.engine._retry_contended_occurrence((1, 1))
+        self.assertEqual(self.opened[0].first_audio_attempt, 1)                 # attribution was used first
+        self.assertIsNone(self.engine._claim_contention)
+        self.assertNotIn("_claim_contention_attribution", self.engine.__dict__)
+
+    def test_contention_attribution_is_released_on_the_persistent_contention_skip(self):
+        self._queue(self._item(1), self._item(2))
+        self._contend_creates(eng_module.CLAIM_CONTENTION_MAX_ATTEMPTS + 5, only_item_id=1)
+        self._start()
+        for _ in range(eng_module.CLAIM_CONTENTION_MAX_ATTEMPTS):
+            self._fire_contention()
+        self.assertIsNone(self.engine._claim_contention)
+        self.assertNotIn("_claim_contention_attribution", self.engine.__dict__)
+
+    def test_contention_attribution_release_is_token_matched(self):
+        self.engine._claim_contention_attribution = {"token": (5, 2), "first_audio_unattended": True}
+        for other in ({"item_id": 5, "attempts": 1}, {"item_id": 6, "attempts": 2}, None):
+            self.engine._release_claim_contention_attribution(other)
+            self.assertEqual(self.engine._claim_contention_attribution["token"], (5, 2))
+        self.engine._release_claim_contention_attribution({"item_id": 5, "attempts": 2})
+        self.assertNotIn("_claim_contention_attribution", self.engine.__dict__)
