@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0147",
+  "previous_release_id": "r0146",
+  "minimum_updater_protocol_version": 5,
+  "summary": "First-audio stall recovery (1.21-B1): when an ordinary unattended scheduled start produces no real audio within 1.0 s, the engine reopens the same unaired occurrence once; if that also fails it records one critical event and advances. Not a general silence detector; operator starts are unchanged. Restart the engine only; no migration, package, static, unit, configuration or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
