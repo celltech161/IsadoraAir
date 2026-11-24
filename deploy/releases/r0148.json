@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0148",
+  "previous_release_id": "r0147",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Aircheck source truthfulness (2.0-A): Aircheck Configuration no longer offers an ineffective editable capture-source field and shows the real source, airtap, the default encoder group's shared program feed, read-only; newly created Aircheck sessions record airtap. Existing sessions and the legacy column are unchanged. Restart Gunicorn only; no migration, engine, encoder, Monitoring, static, unit, package or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
