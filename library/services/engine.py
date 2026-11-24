@@ -7605,11 +7605,14 @@ class PlaybackEngine:
             self._queue_cursor = index
         if held_value is not None:
             self.__dict__.setdefault("_active_message_held", {})[log_item.id] = held_value
-        # 1.21-B1 (B1-R1): remember whether THIS start was an unattended automatic one, so the deferred retry
-        # re-enters the same attribution. Nothing is armed here: eligibility is still decided at actual deck
-        # admission (_first_audio_on_open), and this is not part of the first-audio retry budget.
-        self._claim_contention = {
-            "item_id": log_item.id, "attempts": attempts,
+        self._claim_contention = {"item_id": log_item.id, "attempts": attempts}
+        # 1.21-B1 (B1-R1): remember, keyed by the same token, whether THIS start was an unattended automatic one
+        # so the deferred retry re-enters that attribution. (A separate record: the contention record's own
+        # shape is pinned by the existing claim-contention tests.) Nothing is armed here: eligibility is still
+        # decided at actual deck admission (_first_audio_on_open), and contention is not part of the
+        # first-audio retry budget.
+        self._claim_contention_attribution = {
+            "token": (log_item.id, attempts),
             "first_audio_unattended": bool(self._first_audio_start_unattended()),
         }
         self._next_triggered = False      # the crossfade trigger may also retry on its next tick
@@ -7646,7 +7649,8 @@ class PlaybackEngine:
             return False
         slot = self._free_slot()
         if slot is not None:
-            if pending.get("first_audio_unattended"):
+            attribution = self.__dict__.get("_claim_contention_attribution")
+            if attribution is not None and attribution["token"] == token and attribution["first_audio_unattended"]:
                 # B1-R1: the deferred claim retry of an unattended automatic start is itself an unattended
                 # automatic start (only reached past every guard above: running, Auto, same token, still next).
                 with self._first_audio_unattended():
@@ -7669,7 +7673,8 @@ class PlaybackEngine:
     # the database when handed out. If the retry's generation also produces no first audio, the occurrence
     # is abandoned with one critical event and playout advances by the same rules. Never a PlayEvent, a
     # played_at, a play count or a second budget for a timed-out generation. State is process-local
-    # (self._first_audio_retries: at most a few live records; self._first_audio_spent: bounded).
+    # (self._first_audio_retries: at most a few live records; self._first_audio_spent: retained while its log is
+    # reachable, released when it is not -- see _first_audio_prune_spent).
     # ------------------------------------------------------------------
     @contextmanager
     def _first_audio_unattended(self):

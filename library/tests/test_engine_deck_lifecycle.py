@@ -3025,14 +3025,15 @@ class OrdinaryFirstAudioDeadlineTests(SimpleTestCase):
         self._queue(self._item(1), self._item(2))
         self._contend_creates(1)
         self._start()
-        self.assertIs(self.engine._claim_contention["first_audio_unattended"], True)
+        self.assertEqual(self.engine._claim_contention, {"item_id": 1, "attempts": 1})   # shape unchanged
+        self.assertEqual(self.engine._claim_contention_attribution, {"token": (1, 1), "first_audio_unattended": True})
         self.engine._claim_contention = None
         self.timers.clear()
         self.engine = self._engine()
         self._queue(self._item(1), self._item(2))
         self._contend_creates(1)
         self._start(kind=self.vt.StartKind.START_NEXT)
-        self.assertIs(self.engine._claim_contention["first_audio_unattended"], False)
+        self.assertIs(self.engine._claim_contention_attribution["first_audio_unattended"], False)
 
     def test_contended_then_stalled_occurrence_recovers_with_exactly_one_retry(self):
         item, nxt = self._item(1), self._item(2)
