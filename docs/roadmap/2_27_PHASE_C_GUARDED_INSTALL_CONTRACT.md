@@ -121,7 +121,7 @@ lock, file check or hash on GLib.
 | Stage | Situation | Outcome | Database / memory effect |
 | --- | --- | --- | --- |
 | before 9 | The proposal or S1 is stale (S2 differs: reorder, same-count swap, claim, cursor, forced item, deck generation, Play Now, engine restart) | `stale_discarded` | none |
-| before 9 | Ownership changes (Manual, Remote DJ, mic, VT, Start Next, overlap, pause, resume, live fill) | the Phase B outcome (`blocked_transport`, ...) | none |
+| before 9 | Ownership changes (Manual; a live or requested mic; a Remote DJ connection unless every qualified cause is Start Next, r0149; VT, Start Next, overlap, pause, resume, live fill) | the Phase B outcome (`blocked_transport`, ...) | none |
 | 9 | The lock is held by an engine splice or request swap for more than 250 ms | `lock_contended` | none |
 | 10 | The engine advanced or claimed between S2 and the lock; a row was added or reordered by another process; a Track was edited; a new request appeared | `stale_discarded` | rollback; none |
 | 10–11 | Same cause set already installed (concurrent or repeated worker) | `duplicate_install` | rollback; none |
@@ -156,8 +156,8 @@ lock, file check or hash on GLib.
   rules are unchanged: more than 60 s if any qualifying cause is a request,
   more than 30 s for Eject-only sets.
 * **Safety budget:** after the installed items, the window must still have
-  at least **5.0 s + 1.0 s per inserted item** left over (7 s for one track,
-  8 s for two, 9 s with a PSA). Phase B's runway already includes one
+  at least **5.0 s + 1.0 s per inserted item** left over (6 s for one track,
+  7 s for two tracks, 8 s for two tracks plus a PSA). Phase B's runway already includes one
   250 ms poll tick per transition and the trigger clamp. The budget is for
   what it does not model:
   * the first item of the next hour or of the closing block may have a

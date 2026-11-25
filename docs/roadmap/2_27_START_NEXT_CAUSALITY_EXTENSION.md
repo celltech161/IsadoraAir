@@ -65,7 +65,7 @@ are the classifier's abstention reasons):
 | 3 | The claimed deck is `active["outgoing_deck"]`, same slot, generation and LogItem id as `active["outgoing"]`, still mapped in its slot; `completion_reason == "start_next"` | `identity_mismatch` / `not_claimed` |
 | 4 | Incoming was attempted and the phase is `advancing` (an incoming deck started) | `to_silence` / `incoming_not_started` |
 | 5 | No other live deck except this transition's incoming slot | `foreign_live_deck` |
-| 6 | Manual off at accept **and** at the cut; no Remote DJ session at accept or cut; no mic live at accept or cut; VT idle; no gated seek on the deck | `manual_hold` / `remote_dj_owner` / `mic_live` / `vt_transition` / `seek_in_progress` |
+| 6 | Manual off at accept **and** at the cut; no microphone live or requested at accept or at the cut (studio PTT, an open Remote DJ gate, or a connected Remote DJ that has asked for its mic while the gate is held muted); VT idle; no gated seek on the deck. A connected Remote DJ whose mic is Off does **not** exclude (r0149, section 10) | `manual_hold` / `mic_live` / `vt_transition` / `seek_in_progress` |
 | 7 | Deck on air (`air_start_recorded`), not paused, no `continuation_reason` (resume, seek, already-started replay) | `not_on_air` / `paused` / `not_scheduled_occurrence` |
 | 8 | `LogItem.origin == generated_schedule` (loaded field) | `not_scheduled_occurrence` |
 | 9 | Scheduled `LogItem.category.kind.code == "music"` from the **cached** relation (never Track category, never a query) | `not_music` / `identity_unknown` |
@@ -100,7 +100,8 @@ before fade completion (claim lost); position at/after the scheduled end;
 other deck generation; foreign `LogItem.origin` (inserted, build/live fill,
 engine-inserted dedication intro/alert, refill-installed, legacy/unknown);
 continuation (resume, seek, already started); missing cached category/kind,
-Track timing, position; non-music slot; Manual, Remote DJ, mic, VT, gated seek;
+Track timing, position; non-music slot; Manual, a live or requested microphone
+(studio or Remote DJ), VT, gated seek;
 ordinary automatic segue (never this path); force-next/reorder (never this
 path); automatic skip / media-error recovery (separate r0121 item, not built).
 
@@ -214,3 +215,41 @@ No change to fade, cue-in, controller, binding, once-only advance, VT,
 dedication pairing, Manual, Remote DJ or Eject semantics; no automatic-skip /
 media-failure detector; no silence filling; no station policy row, arming or
 PSA residual; no release manifest, companion or historical artifact edits.
+
+## 10. r0149 correction: Start Next with a connected Remote DJ
+
+**Policy.** Start Next is an authorized operator action (capability `playout.start_next`, issued from the Console).
+Its eligibility does not depend on whether a Remote DJ WebRTC session is connected. A Remote DJ that is only
+monitoring is not Manual or microphone-controlled playout.
+
+**What still excludes a Start Next cause:**
+* Manual, at acceptance or at the cut;
+* any live microphone, at acceptance or at the cut;
+* every exclusion in sections 3 and 4.
+
+**Connection presence is still recorded as evidence:** `ownership_at_accept["remote_dj"]` and
+`StartNextObservation.remote_dj_owner`. Neither is a reason any more.
+
+**Microphone state.** `PlaybackEngine._hour_refill_mic_engaged()` is read-only and counts the microphone as live
+when:
+* the studio PTT is live, or a Remote DJ gate is open (`_any_mic_live`, the physical state that ducking and the
+  Manual hold also use); or
+* a connected Remote DJ has asked for its mic (`gate_desired`) while the gate is held physically muted, during
+  reconnect recovery or an emergency latch.
+
+It fails closed: a session whose intent cannot be read counts as live, and a read failure raises. That makes the
+acceptance snapshot `None` (`ownership_unknown`), makes the cut snapshot a `snapshot_error`, and makes the
+projection snapshot `invalid_snapshot`. The method changes nothing: ducking, the Manual hold and the gate are
+untouched.
+
+**Projection and install.** In `transport_block`, Remote DJ presence blocks unless **every** qualified cause is
+Start Next (`remote_dj_connection_permitted`).
+* `project_refill` partitions causes (pure) before the transport check.
+* Eject-only, request-involved, skip, media-failure and mixed sets, and a window with no qualified cause, keep the
+  `remote_dj` block. A set is never filtered to escape it.
+* Causes that do not qualify (for example, still pending) do not take part, exactly as for thresholds.
+* The guarded installer re-runs `project_refill` on its second snapshot, so the same rule applies there. The S1/S2
+  digest does not cover ownership, so a Remote DJ connecting or disconnecting with its mic Off does not by itself
+  invalidate an all-Start-Next install. A mic, Manual, queue, deck or boundary change still does.
+
+**Unchanged:** arithmetic, thresholds, reserve, lead, placement, policy switches, schema, and every other cause type.

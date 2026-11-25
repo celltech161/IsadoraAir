@@ -46,6 +46,12 @@ Approval of one stage does not carry over to the next, or from KOGR to WRJE.
 * **Exact limits do not qualify:** 30.000 s or 60.000 s exactly does not trigger.
 * **Mixed causes:** a set of mixed causes is evaluated only when **every** cause type in it is switched on. It is
   never trimmed to a subset.
+* **Remote DJ (r0149):**
+  * A connected Remote DJ whose microphone is Off does not block a set whose qualifying causes are **all** Start
+    Next.
+  * It still blocks every other set: Eject, request, skip or media-failure causes, or any mix.
+  * A live microphone (studio or Remote DJ), or a Remote DJ that has asked for its microphone while the gate is
+    held muted, blocks every set, as does Manual.
 * **Provisional:** these thresholds, the 20 s minimum insertion lead and the 5 s + 1 s-per-item safety reserve are
   proposals, not approved field values. Cause capture is best effort and never blocks the Eject, substitution,
   Start Next or skip it observes.
@@ -104,12 +110,23 @@ repairs categories.
 **Observation only (dry run)** checked. Evidence capture starts at the same time.
 
 * **Choosing causes:** the five types can be observed together or added one at a time.
-* **Per-type evidence:** each type needs its own evidence, in particular the r0121 types (Start Next, automatic skip,
-  media failure) and their thresholds.
+* **Per-type evidence:** field evidence is required for the cause type proposed for activation, not for every
+  supported type. The r0121 types (Start Next, automatic skip, media failure) each need their own.
 
-**Proposed window:** 14 days or 30 qualifying causes, whichever is later. It must cover weekday and weekend
-programming and at least one partial-hour takeover. The window extends until each cause type to be approved has
-enough qualifying events.
+**Minimum window:** at least **14 days** from the activation timestamp, covering weekday and weekend programming.
+There is no minimum cause count (the earlier "30 qualifying causes" rule is withdrawn). The window extends until:
+* the cause type proposed for activation has captured real causes that the reviewer accepts as sufficient; and
+* every available unique relevant proposal has been reviewed.
+
+**Small samples:** real causes are rare; a station may see a handful in two weeks. A few samples are supporting
+evidence, never statistical assurance. Every report states the number of **independent cause-hours** separately from
+the number of evaluation lines (the runner logs up to six evaluations per cause set: repeated readings of one hour).
+
+**Partial-hour takeovers:**
+* Where the station schedules none, the isolated partial-hour regressions qualify the pilot: the hour-refill
+  projection, proposal and install suites, run on the installed release through the guarded test runner.
+* Before a station deliberately relies on partial-hour takeovers, it needs its own operational qualification of
+  that pattern.
 
 **What to collect (read-only):**
 
@@ -121,47 +138,132 @@ enough qualifying events.
    * `cause_ids` (each cause's type is on its Hour Refill cause record in admin)
    * the status
    * the proposed Track ids
-2. The `PlayEvent` rows of the evaluated hour and of the next hour's first item.
+2. The `PlayEvent` and `PlayEventSegment` rows of the evaluated hour and of the next hour's first item.
 3. The admin page counters, including dropped evidence and live-fill conflicts.
 
-**Timing measurement:** use each evaluation where nobody intervened afterwards in that hour: no Manual, Eject, Start
-Next, request swap, automatic skip, media failure or live fill. The projection error is
+### Timing measurement
 
-`error = actual start of the first item after the runway − (captured_at + committed_runway_seconds)`.
+The measurement compares the **same event** on both sides: the moment the successor of the runway's final committed
+occurrence becomes audible.
 
-* **Meaning:** a positive error means the hour ran longer than projected, which is what the reserve protects against.
-* **Report:** min, median, 95th percentile and max, overall and per cause type. Report separately the cases ending at
-  a protected closer and at a partial-hour takeover.
-* **Reload delay:** not observable without installing. It is first measured in Stage 5 (the adoption field of the
-  status and the journal).
+**Predicted endpoint.** P = `captured_at + committed_runway_seconds`. This is the instant the successor of the final
+committed occurrence F becomes audible, as the engine's own trigger arithmetic models it. Each modelled transition
+includes one 250 ms poll allowance, so P is a slight upper bound.
 
-## Stage 4: go / no-go review for install mode
+**Timestamp semantics (verified in the engine source):**
+* `PlayEventSegment.started_at` (and its `PlayEvent.started_at`) is the wall-clock instant of the deck's first real
+  post-primer buffer. That is media **file position 0**, not the audible start.
+* The engine starts the successor when F reaches file position `next_start − successor cue_in`.
+* The successor decodes from its file start and becomes audible after its own cue-in, which is when F reaches
+  file position `next_start`.
+* So an audible instant is `started_at + cue_in`. Add the cue-in exactly once: the recorded timestamp does not
+  already include it.
+* Physical EOS (`ended_at`, `termination_reason = eos`) is later than the effective transition whenever the file
+  has an outro beyond `next_start`. It is never the comparison point.
+
+**Observed endpoint.** O is one of:
+1. **Successor triggered from F.** The next item started while F was still playing, through the ordinary trigger:
+   O = successor `started_at` + successor `cue_in`. This is **directly observed**.
+2. **Runway exhausted.** Nothing was triggered from F, so the queue ran out:
+   * O = F `started_at` + F's end point (`next_start`, else `duration`).
+   * This is a **reconstructed effective-transition estimate** built from F's observed start and its own markers.
+     It is not an observed successor event, and the report labels it so.
+   * Report F's EOS, and any interval from F's EOS to the next audible item, separately as a **continuity
+     (dead-air) finding**. That interval is never projection error.
+
+`error = O − P`. A positive error means the hour ran longer than projected, which is what the reserve protects against.
+
+**Eligible evaluations:**
+* Use evaluations after which **nothing outside the committed runway aired** in that hour, and no Manual or
+  microphone hold, Eject, further Start Next, request swap, automatic skip, media failure, VT admission or live-fill
+  row reached air.
+* An engine-inserted dedication intro counts as such material.
+* An excluded hour may show an adjusted value (the measured uncommitted airtime removed), labelled as adjusted.
+* One independent sample per cause-hour: its first eligible evaluation. Later evaluations of the same cause-hour
+  are not independent samples.
+
+**Report:**
+* min, median, 95th percentile and max, overall and per cause type, with the number of cause-hours;
+* separately, the cases that end at a protected closer and at a partial-hour takeover;
+* every dead-air or continuity finding, with its own explanation.
+
+**Reload delay:** not observable without installing. It is first measured in Stage 5 (the adoption field of the
+status and the journal).
+
+## Stage 4: go / no-go for a supervised pilot
 
 Go only if **all** of the following hold, with the evidence attached:
 
-* No playback incident attributable to 2.27 during Stage 3. Gaps, stalls, double plays and late IDs from other causes
-  must be explained.
-* Projection error at the 95th percentile ≤ 3 s, and maximum ≤ 5 s. The reserve is 5 s + 1 s per item.
-  * If the maximum exceeds 5 s, either the reserve is raised in code (a reviewed change) or the decision is no-go.
+* **Observation:** the Stage 3 minimum window is complete, with weekday and weekend coverage.
+* **Release:** the station runs a healthy, trusted installed release.
+* **Category audit:** the Stage 2 audit is current and clean, with any operator decisions recorded. An empty
+  `music` category that is legitimately classified is not by itself a failure.
+* **No unintended installs:** none during shadow observation.
+* **Incidents:** no playback incident is attributable to 2.27. Every relevant gap, stall, double play or late ID is
+  explained.
+* **Timing:** projection error on correctly matched events (Stage 3) has a 95th percentile ≤ 3 s and a maximum ≤ 5 s.
+  The reserve is 5 s + 1 s per item.
+  * State the sample size; make no statistical claim from a small one.
+  * A genuine projection defect larger than 5 s is a no-go, unless the reserve is raised in code through a
+    reviewed change.
   * The margin is never lowered to fill more.
-* Advisory proposals respected categories, recency, requests and protected closers, in a manual review of at least
-  10 proposals.
-* Dropped evidence and runner errors are rare and explained.
-* Category audit (Stage 2) clean.
-* Each cause type to be enabled for install has its own qualifying evidence. Its provisional threshold is accepted,
-  or changed through a reviewed code change.
+* **Proposals:** every available unique relevant advisory proposal was reviewed and respected categories, recency,
+  requests, dedication adjacency, protected closers and the reserve.
+* **Cause evidence:** the cause type to be enabled has its own field evidence, and its provisional threshold is
+  accepted or changed through a reviewed code change.
+* **Runner health:** dropped evidence and runner errors are rare and explained.
+* **Nothing unresolved:** no genuine material projection defect, unexplained relevant incident or unsafe category
+  classification remains open.
 
-## Stage 5: install mode (limited)
+Pilot readiness is not operational acceptance; that comes from Stage 5.
+
+## Stage 5: limited install (supervised pilot)
 
 **Approvals needed, in order:**
 
-1. **A host change:** add `HOUR_REFILL_INSTALL_ARMED=True` to the station's `.env`, then restart the engine and
-   Gunicorn at an approved quiet time. The engine restart interrupts audio and ends any Remote DJ session. The page
-   still shows *Observation* (dry run is still checked), and both "host armed" rows read *yes*.
-2. **An operator unchecks Observation only (dry run).** Start with one cause type, preferably the operator Eject
-   cause, which has the fewest side effects. Add others only through separate approvals.
+1. **Configure the approved cause switches** while **Observation only** stays checked.
+2. **A host change:** add `HOUR_REFILL_INSTALL_ARMED=True` to the station's `.env` through the separately authorized
+   station configuration procedure.
+3. **Restart** the engine and Gunicorn at an approved quiet time, with no live microphone and no Remote DJ session.
+   The engine restart interrupts audio and ends any Remote DJ session.
+4. **Verify** that the page still shows *Observation* (dry run is still checked) and that both "host armed" rows
+   read *yes*.
+5. **An operator unchecks Observation only (dry run)**, as a separate authorization. Do it at a time when the
+   current hour has **no** recorded cause, so the first install comes from a new, supervised event.
 
-**Observation window:** 7 days per newly enabled cause type. Watch the page daily.
+**First cause type:** the one with the strongest station evidence. Start Next may be first. A Start Next-only pilot
+uses:
+* Master On, Start Next On;
+* request substitution, operator Eject, automatic skip and media failure Off;
+* residual PSA Off (`HOUR_REFILL_PSA_CATEGORY_ID` unset).
+
+**Unchanged by the pilot:**
+* the strict Start Next-only threshold (more than 30 s);
+* at most two music tracks;
+* the 5 s + 1 s per item reserve, the 20 s insertion lead and zero modelled overrun;
+* media readiness and separation;
+* protected closing blocks;
+* fresh snapshots, CAS and the locked transaction;
+* the Manual and microphone exclusions;
+* live-fill arbitration;
+* host arming and Observation only as independent gates;
+* the disable path below.
+
+**Supervision:**
+* The first installation is directly supervised, in an ordinary music hour.
+* A Start Next pressed from the studio Console, or while a Remote DJ is connected with its microphone Off, is
+  acceptable (r0149).
+
+**After a release that changes cause eligibility** (r0149 for Start Next):
+* Prior observation evidence stays valid, and the 14-day window is not reset.
+* A focused post-installation verification of the newly permitted path is required before the live pilot.
+
+**Observation window:** 7 days of limited installation for each newly enabled cause type. Watch the page daily.
+* A cause type is **operationally accepted** only after at least one real refill has been installed and observed
+  airing correctly.
+* A cause type that has not produced a real installed refill stays in **pilot** status, whatever the elapsed time.
+* Additional cause types need their own evidence review and authorization.
+* Each station is qualified and authorized independently.
 
 **Stop conditions (disable at once, then investigate):**
 

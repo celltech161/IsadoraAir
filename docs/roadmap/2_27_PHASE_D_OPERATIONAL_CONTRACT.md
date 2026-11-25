@@ -270,7 +270,8 @@ approved. The step-by-step packet is
 * Reconciler-written request causes are noticed by polling (≤15 s), not
   instantly.
 * Evaluation per cause set is capped (6) and install attempts per log are
-  capped (3); a long Manual or Remote DJ period can use them up. A missed
+  capped (3); a long Manual or microphone period, or a Remote DJ period
+  for any set that is not all Start Next (r0149), can use them up. A missed
   refill is accepted.
 * The status file is tmpfs and per process: it is empty after a reboot until
   the runner's first write, and counters restart with the engine.

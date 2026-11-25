@@ -119,7 +119,8 @@ would skip them. That biases toward less fill.
 ## 4. Eligibility and outcomes
 
 Evaluated in this order, with no writes for any outcome: `off`, `invalid_snapshot`,
-`wrong_hour`, `blocked_transport` (Manual, Remote DJ, local or remote mic,
+`wrong_hour`, `blocked_transport` (Manual; a connected Remote DJ unless every qualified cause is Start Next,
+r0149; a live or requested local or remote mic,
 VT, Start Next, `_next_triggered`, pending resume, live fill in flight, paused
 deck, two live decks), `unsafe_window` (no live deck, unknown or implausible
 position, unreliable durations, DST, imminent takeover), `no_safe_boundary`,
