@@ -138,8 +138,12 @@ the number of evaluation lines (the runner logs up to six evaluations per cause 
    * `cause_ids` (each cause's type is on its Hour Refill cause record in admin)
    * the status
    * the proposed Track ids
-2. The `PlayEvent` and `PlayEventSegment` rows of the evaluated hour and of the next hour's first item.
+2. The `PlayEvent` and `PlayEventSegment` rows of the evaluated hour and of the next hour's first item, including
+   **every** segment of each occurrence, with its `start_reason`, `evidence_state` and `termination_reason`.
 3. The admin page counters, including dropped evidence and live-fill conflicts.
+4. The other engine journal lines for that hour: `Trigger:`, and every seek, pause, resume or restart-recovery
+   line. `Seek/preroll verified` is the one that records a continuation's confirmed media position. Collect these
+   while the journal still holds them.
 
 ### Timing measurement
 
@@ -150,42 +154,130 @@ occurrence becomes audible.
 committed occurrence F becomes audible, as the engine's own trigger arithmetic models it. Each modelled transition
 includes one 250 ms poll allowance, so P is a slight upper bound.
 
-**Timestamp semantics (verified in the engine source):**
-* `PlayEventSegment.started_at` (and its `PlayEvent.started_at`) is the wall-clock instant of the deck's first real
-  post-primer buffer. That is media **file position 0**, not the audible start.
-* The engine starts the successor when F reaches file position `next_start − successor cue_in`.
-* The successor decodes from its file start and becomes audible after its own cue-in, which is when F reaches
-  file position `next_start`.
-* So an audible instant is `started_at + cue_in`. Add the cue-in exactly once: the recorded timestamp does not
-  already include it.
-* Physical EOS (`ended_at`, `termination_reason = eos`) is later than the effective transition whenever the file
-  has an outro beyond `next_start`. It is never the comparison point.
+#### What the recorded times mean (verified in the engine source)
 
-**Observed endpoint.** O is one of:
-1. **Successor triggered from F.** The next item started while F was still playing, through the ordinary trigger:
-   O = successor `started_at` + successor `cue_in`. This is **directly observed**.
-2. **Runway exhausted.** Nothing was triggered from F, so the queue ran out:
-   * O = F `started_at` + F's end point (`next_start`, else `duration`).
-   * This is a **reconstructed effective-transition estimate** built from F's observed start and its own markers.
-     It is not an observed successor event, and the report labels it so.
-   * Report F's EOS, and any interval from F's EOS to the next audible item, separately as a **continuity
-     (dead-air) finding**. That interval is never projection error.
+* **A segment is one deck generation.** A `PlayEventSegment` records one generation's contribution to program
+  audio. A pause closes it, and a seek, resume or restart recovery plays on in a replacement generation, so one
+  `PlayEvent` can have several segments.
+* **Fresh start (`start_reason = fresh_air_start`).** `started_at` is the wall-clock time of the generation's first
+  real buffer (after any silence primer) as it leaves the deck. The media there is **source position 0**, not the
+  audible start. `PlayEvent.started_at` is the same value.
+* **Continuation (any other `start_reason`).** `started_at` is when the replacement generation's program accounting
+  began. Its source position **can be nonzero, and the segment does not store it**.
+* **Not positions:** `ended_at` is when a generation's contribution closed. `confirmed_duration_seconds` is the
+  amount of audio counted for one segment. Neither gives a source position, and neither does adding segments up: a
+  seek jumps.
+* **Markers:** E, the **effective end point**, is `next_start`, else `duration`. A missing `cue_in` counts as 0.
+  The segment stores no markers. The values that count are those the engine had loaded for that hour. A reviewer
+  reads the Track later, so confirm that `cue_in`, `next_start`, `duration` and the media are unchanged since the
+  hour. If that cannot be confirmed, exclude the sample.
+* **Position to time:** while a generation that started at source position s plays on uninterrupted, source
+  position m (m ≥ s) is reached at `started_at + (m − s)`.
+  * So a fresh start (s = 0) is audible at `started_at + cue_in` and reaches its effective end at
+    `started_at + E`.
+  * **Never count cue-in twice.** E is a source position, so `started_at + cue_in + E` is wrong.
+* **Trigger:** the engine starts a successor when F reaches F's `next_start − successor cue_in` (F's E itself when
+  that value is under 10 s). In the ordinary case the successor becomes audible as F reaches E.
+* **EOS is not the transition.** Physical EOS (`ended_at`, `termination_reason = eos`) comes after the effective
+  transition whenever the file has an outro beyond E. It is never the comparison point.
+* **Not measured:** the small delay between a buffer leaving the deck and being heard.
+
+#### Zero-position eligibility
+
+Use `started_at + cue_in` or `started_at + E` only when **all** of these hold:
+1. the segment's `start_reason` is exactly `fresh_air_start`;
+2. it is that occurrence's first segment, with no pause, seek, resume or restart before the instant being computed;
+3. the segment is not `interrupted`, and its generation was still contributing at that instant (it has no
+   `ended_at`, or `ended_at` is not earlier);
+4. the markers are confirmed as above.
+
+An occurrence with no segment (a dedication intro records no `PlayEvent`) cannot supply an observed time.
+
+#### Observed endpoint
+
+O is one of two kinds. Label every sample, and report the two kinds separately.
+
+1. **Directly observed successor timing.** The ordinary trigger started the next item while F was still playing:
+   * O = successor `started_at` + successor `cue_in`, and the successor must meet zero-position eligibility.
+   * F's own starting position does not enter this formula.
+2. **Reconstructed effective transition endpoint (runway exhausted).** Nothing was triggered from F:
+   * **F fresh:** O = F `started_at` + F's E, with F meeting zero-position eligibility.
+   * **F a continuation:** exclude it, unless **all** of the following hold. Then O = `started_at` + (E − s), and
+     cue-in is not added separately.
+     * The continuation segment opened **before** the evaluation's `captured_at`, so P was projected from the
+       continued deck.
+     * s is the `confirmed_position_ns` (in seconds) of the engine's `Seek/preroll verified` journal line, matched
+       to that LogItem and to the moment the segment opened. A requested or saved position, a `Restoring … at` line
+       or a `Paused at` line is **not** proof.
+     * It is the occurrence's last segment, it played on uninterrupted to E, and s is not past E.
+     * Its `start_reason` is not a `…fallback_zero` reason. Those follow a failed seek; exclude them.
+   * Either way, if F's `ended_at` is **earlier** than the computed O, F never reached E. Compute no value. Report
+     it as a marker or media finding, which must be explained and may be a genuine projection defect.
+   * A reconstruction is built from F's start and markers. It is **not** an observed successor event and cannot show
+     trigger or transition delay, so it is weaker evidence than a direct observation.
 
 `error = O − P`. A positive error means the hour ran longer than projected, which is what the reserve protects against.
 
-**Eligible evaluations:**
-* Use evaluations after which **nothing outside the committed runway aired** in that hour, and no Manual or
-  microphone hold, Eject, further Start Next, request swap, automatic skip, media failure, VT admission or live-fill
-  row reached air.
-* An engine-inserted dedication intro counts as such material.
-* An excluded hour may show an adjusted value (the measured uncommitted airtime removed), labelled as adjusted.
-* One independent sample per cause-hour: its first eligible evaluation. Later evaluations of the same cause-hour
-  are not independent samples.
+**When in doubt, exclude** the sample and give the reason. Do not build a more elaborate reconstruction.
 
-**Report:**
+#### Silence and waiting (never projection error)
+
+When the runway is exhausted, report these intervals separately from the error:
+* **Outro:** from the effective endpoint to F's EOS. This is F's audio, not silence.
+* **Waiting or silence:** from F's EOS to the next item's segment `started_at`, for example while waiting for the
+  next hour's log. It is a **continuity (dead-air) finding** with its own explanation. The next item's own lead-in
+  up to its cue-in can lengthen the audible silence. Check independent evidence, such as the encoder audio monitor.
+
+Comparing P with the next item that happened to air adds the outro and the wait to the error. That is not a
+projection measurement.
+
+#### Eligible evaluations
+
+* Use evaluations after which **nothing outside the committed runway aired** before O, and no Manual or microphone
+  hold, Eject, further Start Next, request swap, automatic skip, media failure, VT admission or live-fill row
+  reached air. An engine-inserted dedication intro counts as such material.
+* **Later interventions invalidate the projection.** Exclude the evaluation if, after its `captured_at` and before
+  O, any of these happens:
+  * a seek, pause or resume;
+  * an engine restart, restart recovery or other replacement of a deck;
+  * an operator edit that removes, replaces or reorders a committed item;
+  * a marker or media change on a committed item.
+
+  Signs include a further or `interrupted` segment on any committed occurrence. Exclude it even when O − P happens
+  to look small. A later evaluation is judged on its own `captured_at`.
+* A connected Remote DJ whose microphone stays Off is not an intervention.
+* Where the **only** disturbance is separately measured added airtime, an excluded hour may also show an adjusted
+  value with that airtime removed, labelled as adjusted. It is not a sample. There is no adjusted value for a seek,
+  resume, removal or hold.
+* Exclusion removes a number from the error statistics only. It never removes a continuity or defect finding from
+  the report.
+* **One independent sample per cause-hour:** its first eligible evaluation. Later evaluations of the same
+  cause-hour are not independent samples.
+
+#### Worked examples (illustrative values, not station evidence)
+
+F has cue_in 2.000, E = 200.000 and duration 208.000, except in example 4.
+
+| # | Case | Evidence | O and error |
+|---|---|---|---|
+| 1a | Fresh, source position 0, successor triggered | The successor (cue_in 0.500) has a `fresh_air_start` segment at 12:03:19.600. P = 12:03:20.300 | Directly observed O = 12:03:19.600 + 0.500 = **12:03:20.100**; error **−0.200 s** |
+| 1b | Fresh, source position 0, runway exhausted | F `fresh_air_start` at 12:00:00.000; audible from 12:00:02.000. P = 12:03:20.300 | Reconstructed O = 12:00:00.000 + 200.000 = **12:03:20.000**; error **−0.300 s**. 12:03:22.000 would count cue-in twice |
+| 2 | Continuation from a known nonzero position | The segment opens at 12:05:00.000, before `captured_at`. Its `Seek/preroll verified` line confirms s = 80.000. It is the last segment and reaches E. P = 12:07:00.250 | Reconstructed (continuation) O = 12:05:00.000 + (200.000 − 80.000) = **12:07:00.000**; error **−0.250 s**. `started_at + E` (12:08:20.000) would be 80 s late |
+| 3 | Continuation from an unknown position | The same segment, but no verified line survives | **Excluded; no value.** A requested or saved position and `confirmed_duration_seconds` do not supply s |
+| 4 | Exhausted runway, then a wait for the next hour | F (E = 100.000) `fresh_air_start` at 12:55:00.000, EOS at 12:56:48.000. The next hour's first segment is at 12:59:30.000. P = 12:56:40.400 | Reconstructed O = **12:56:40.000**; error **−0.400 s**. Separately: 8.000 s of outro, then **162.000 s** waiting (a continuity finding). "Next item − P" (169.600 s) is not projection error |
+| 5 | A later intervention | The evaluation is captured at 12:10:00 with P = 12:45:00.000. At 12:20:00 a committed deck is paused and resumed, which adds a second segment | **Excluded**, whatever O − P would be |
+
+#### Report
+
 * min, median, 95th percentile and max, overall and per cause type, with the number of cause-hours;
+* directly observed and reconstructed samples labelled and counted separately, including continuation
+  reconstructions;
 * separately, the cases that end at a protected closer and at a partial-hour takeover;
+* every excluded cause-hour, with its reason;
 * every dead-air or continuity finding, with its own explanation.
+
+A few cause-hours are **supporting evidence**. They are not a statistically comprehensive qualification, even when
+each is inside the Stage 4 targets.
 
 **Reload delay:** not observable without installing. It is first measured in Stage 5 (the adoption field of the
 status and the journal).

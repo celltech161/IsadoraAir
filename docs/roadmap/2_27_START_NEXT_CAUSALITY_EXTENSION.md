@@ -234,8 +234,12 @@ monitoring is not Manual or microphone-controlled playout.
 when:
 * the studio PTT is live, or a Remote DJ gate is open (`_any_mic_live`, the physical state that ducking and the
   Manual hold also use); or
-* a connected Remote DJ has asked for its mic (`gate_desired`) while the gate is held physically muted, during
-  reconnect recovery or an emergency latch.
+* a connected Remote DJ's desired-On intent (`gate_desired`) is retained while the gate is held physically muted,
+  as can happen during reconnect recovery.
+
+Emergency Mute is **not** such a case. It goes through `_remote_dj_force_gate_off()`, which sets
+`gate_desired=False` and so deliberately cancels the intent, and an On press is refused while the emergency latch is
+set. A session muted that way therefore counts as mic Off unless another microphone is live.
 
 It fails closed: a session whose intent cannot be read counts as live, and a read failure raises. That makes the
 acceptance snapshot `None` (`ownership_unknown`), makes the cut snapshot a `snapshot_error`, and makes the

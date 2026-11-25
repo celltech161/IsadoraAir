@@ -13926,10 +13926,13 @@ class PlaybackEngine:
         """Roadmap 2.27 (r0149 Start Next Remote DJ correction): the microphone
         state hour refill treats as live. True when any microphone is
         physically live (_any_mic_live: the studio PTT or an open Remote DJ
-        gate), and also while a connected Remote DJ has asked for its mic
-        (``gate_desired``) but the gate is held physically muted -- during
-        reconnect recovery or an emergency latch. A connected Remote DJ with
-        its mic Off (monitoring only) is not engaged. A session whose intent
+        gate), and also while a connected Remote DJ's desired-On intent
+        (``gate_desired``) is retained although the gate is held physically
+        muted, as can happen during reconnect recovery. Emergency Mute is not
+        such a case: it goes through _remote_dj_force_gate_off, which sets
+        gate_desired=False and so cancels the intent.
+        A connected Remote DJ with its mic Off (monitoring only) is not
+        engaged. A session whose intent
         cannot be read counts as engaged, and any read failure raises: every
         caller fails closed. Evidence and projection only; never changes
         ducking, Manual hold or the gate."""
