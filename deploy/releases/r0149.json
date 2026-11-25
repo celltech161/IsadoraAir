@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0149",
+  "previous_release_id": "r0148",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Hour Refill Start Next eligibility (2.27): a connected Remote DJ with mic Off no longer excludes an otherwise eligible Start Next. Manual, a live or requested mic, unknown mic state, other causes and mixed sets stay excluded. Hour Refill policy is unchanged; nothing is armed or activated. Restart Gunicorn and the engine (interrupts program audio); no migration, encoder, Monitoring, static, unit, package or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
