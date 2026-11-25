@@ -673,7 +673,9 @@ class MediaFailureTransportTests(TestCase):
         from library.tests._transport_harness import pump, wait_until
 
         garbage = self.h.root / "garbage.wav"
-        garbage.write_bytes(os.urandom(64 * 1024))
+        # Fixed bytes no typefinder matches. Random bytes are sometimes typed
+        # (e.g. as AV1), and that parser posts only the generic stream FAILED.
+        garbage.write_bytes(bytes(64 * 1024))
         ids = self.queue([(garbage, 8.0), (self.tone("next", 8), 8.0)])
         self.h.play()
         self.engine._start_next_track(slot="A")
@@ -683,7 +685,7 @@ class MediaFailureTransportTests(TestCase):
         (evidence,) = self.recorder.offers
         fields = evidence.cause_fields()
         self.assertEqual((fields["log_item_id_snapshot"], fields["failure_phase"]), (ids[0], "pre_air"))
-        self.assertTrue(fields["failure_reason"].startswith(("stream_", "resource_")))
+        self.assertEqual(fields["failure_reason"], "stream_type_not_found")
         self.assertEqual(fields["observed_shortening_seconds"], 8.0)
         self.assertEqual(self.h.claims, ids)                     # the error path advanced as before
 
