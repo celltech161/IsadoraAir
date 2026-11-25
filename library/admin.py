@@ -976,8 +976,9 @@ class HourRefillPolicyForm(forms.ModelForm):
         }
         help_texts = {
             "capture_start_next": "A completed Start Next fade that cut a scheduled music song short and "
-                                  "started the next item. Overlap, start-only, fade to silence, Manual, "
-                                  "Remote DJ and mic transitions are never causes.",
+                                  "started the next item. Overlap, start-only, fade to silence, Manual and "
+                                  "live-microphone (studio or Remote DJ) transitions are never causes; a "
+                                  "connected Remote DJ with the mic off does not prevent one.",
             "capture_automatic_skip": "A scheduled music song skipped because its media file is missing. Poison "
                                       "guards, deleted tracks and other refusals are never causes.",
             "capture_media_failure": "A specific media/decoder error that ended a scheduled music song before or "
