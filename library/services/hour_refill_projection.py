@@ -279,7 +279,9 @@ def capture_playback_window(engine, *, now=None):
             continuation=bool(getattr(deck, "continuation_reason", None)),
         ))
     try:
-        mic_live = bool(engine._any_mic_live())
+        # r0149: _hour_refill_mic_engaged also counts a connected Remote DJ
+        # that has asked for its mic while the gate is held muted.
+        mic_live = bool(engine._hour_refill_mic_engaged())
     except Exception:  # noqa: BLE001
         errors.append("mic_state_unavailable")
         mic_live = True
@@ -635,12 +637,23 @@ class RefillProjection:
         return self.outcome == OUTCOME_ELIGIBLE
 
 
-def transport_block(snapshot):
+def remote_dj_connection_permitted(qualified):
+    """r0149 Start Next Remote DJ correction: a connected Remote DJ does not by
+    itself block a window whose qualified causes are ALL Start Next cuts. Its
+    microphone still does (snapshot.mic_live, checked separately). Any other
+    cause type in the set, or no qualified cause, keeps the connection block:
+    a mixed set is never filtered down to escape it."""
+    return bool(qualified) and all(c.cause_type == CAUSE_START_NEXT for c in qualified)
+
+
+def transport_block(snapshot, qualified=()):
     """(outcome, reason) when on-air ownership or the deck state makes the
-    window unsafe to project, else None."""
+    window unsafe to project, else None. ``qualified`` (partition_causes)
+    decides only whether Remote DJ connection presence blocks."""
     checks = (
         (snapshot.manual_mode, OUTCOME_BLOCKED_TRANSPORT, "manual_mode"),
-        (snapshot.remote_dj, OUTCOME_BLOCKED_TRANSPORT, "remote_dj"),
+        (snapshot.remote_dj and not remote_dj_connection_permitted(qualified),
+         OUTCOME_BLOCKED_TRANSPORT, "remote_dj"),
         (snapshot.mic_live, OUTCOME_BLOCKED_TRANSPORT, "mic_live"),
         (snapshot.vt_phase != "idle", OUTCOME_BLOCKED_TRANSPORT, "voice_track"),
         (snapshot.start_next_active, OUTCOME_BLOCKED_TRANSPORT, "start_next"),
@@ -704,7 +717,10 @@ def project_refill(snapshot, *, causes, boundary, allowance=TRANSITION_ALLOWANCE
     relation = _hour_relation(snapshot, boundary)
     if relation:
         return result(OUTCOME_WRONG_HOUR, relation)
-    blocked = transport_block(snapshot)
+    # Pure; computed before the transport check because Remote DJ presence
+    # blocks every set except an all-Start-Next one (r0149).
+    qualified, excluded = partition_causes(snapshot, causes)
+    blocked = transport_block(snapshot, qualified)
     if blocked:
         return result(blocked[0], blocked[1])
     (deck,) = [d for d in snapshot.decks if d.live]
@@ -743,7 +759,6 @@ def project_refill(snapshot, *, causes, boundary, allowance=TRANSITION_ALLOWANCE
     )
     net = _ms(max(0.0, window - runway.total_seconds))
     overfill = _ms(max(0.0, runway.total_seconds - window))
-    qualified, excluded = partition_causes(snapshot, causes)
     threshold, basis = threshold_for(qualified)
     measured = dict(
         window_seconds=_ms(window), runway=runway, net_shortage_seconds=net, overfill_seconds=overfill,

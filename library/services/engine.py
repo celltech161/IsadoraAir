@@ -13909,15 +13909,34 @@ class PlaybackEngine:
 
     def _start_next_ownership(self):
         """Plain Manual / Remote DJ / mic flags for the refill-cause snapshot
-        (roadmap 2.27, r0121). None if unreadable; never raises."""
+        (roadmap 2.27, r0121). None if unreadable; never raises. "remote_dj"
+        is connection presence, kept as evidence; since the r0149 Start Next
+        correction it no longer excludes a Start Next cause. "mic" is
+        _hour_refill_mic_engaged()."""
         try:
             return {
                 "manual": bool(self.manual_mode),
                 "remote_dj": getattr(self, "remote_dj_session", None) is not None,
-                "mic": bool(self._any_mic_live()),
+                "mic": bool(self._hour_refill_mic_engaged()),
             }
         except Exception:  # noqa: BLE001 -- evidence must never touch playout
             return None
+
+    def _hour_refill_mic_engaged(self):
+        """Roadmap 2.27 (r0149 Start Next Remote DJ correction): the microphone
+        state hour refill treats as live. True when any microphone is
+        physically live (_any_mic_live: the studio PTT or an open Remote DJ
+        gate), and also while a connected Remote DJ has asked for its mic
+        (``gate_desired``) but the gate is held physically muted -- during
+        reconnect recovery or an emergency latch. A connected Remote DJ with
+        its mic Off (monitoring only) is not engaged. A session whose intent
+        cannot be read counts as engaged, and any read failure raises: every
+        caller fails closed. Evidence and projection only; never changes
+        ducking, Manual hold or the gate."""
+        if self._any_mic_live():
+            return True
+        session = getattr(self, "remote_dj_session", None)
+        return session is not None and bool(getattr(session, "gate_desired", True))
 
     def _snapshot_start_next_refill_evidence(self, active, deck):
         """Roadmap 2.27 (r0121), evidence only: right after this transition's

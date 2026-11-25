@@ -703,8 +703,10 @@ def classify_start_next_observation(obs):
         return None, "ownership_unknown"
     if accept["manual"] or obs.manual_mode:
         return None, "manual_hold"
-    if accept["remote_dj"] or obs.remote_dj_owner:
-        return None, "remote_dj_owner"
+    # r0149: a connected Remote DJ (accept["remote_dj"], obs.remote_dj_owner)
+    # is recorded but no longer excludes a Start Next. Its microphone does:
+    # "mic" / mic_live include an open Remote DJ gate and a Remote DJ that
+    # has asked for its mic while the gate is held muted.
     if accept["mic"] or obs.mic_live:
         return None, "mic_live"
     if obs.vt_phase != "idle":
@@ -831,7 +833,7 @@ def start_next_evidence_from_engine(engine, deck, active, *, occurred_at):
         ownership_at_accept=active.get("ownership_at_accept"),
         manual_mode=bool(getattr(engine, "manual_mode", False)),
         remote_dj_owner=getattr(engine, "remote_dj_session", None) is not None,
-        mic_live=bool(engine._any_mic_live()),
+        mic_live=bool(engine._hour_refill_mic_engaged()),  # r0149: includes a muted-but-requested Remote DJ mic
         vt_phase=_engine_vt_phase(engine),
         seek_in_progress=getattr(deck, "gated_seek", None) is not None,
         occurrence_source=_occurrence_source(deck, log_item),
