@@ -362,11 +362,13 @@ class OffParityStructureTests(SimpleTestCase):
         # Phase C adds only the memory-only RefillCoordinator import
         # (hour_refill_install); the engine never calls the installer.
         # Phase D adds the off-thread runner, which the engine only constructs,
-        # starts, stops and wakes.
+        # starts, stops and wakes. r0149 adds one read-only accessor,
+        # _hour_refill_mic_engaged (the microphone state the Start Next
+        # evidence and the projection snapshot read); it changes no state.
         self.assertEqual(names, {"hour_refill_causality", "hour_refill_evidence",
                                  "HourRefillEvidenceRecorder", "_hour_refill_evidence",
                                  "hour_refill_install", "hour_refill_runner", "HourRefillRunner",
-                                 "_hour_refill_runner"})
+                                 "_hour_refill_runner", "_hour_refill_mic_engaged"})
         self.assertNotIn("HourRefillCause", source)
         self.assertNotIn("HourRefillPolicy", source)
 

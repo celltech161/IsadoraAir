@@ -51,6 +51,7 @@ from library.services.hour_refill_causality import (
 from library.services.hour_refill_evidence import HourRefillEvidenceRecorder
 from library.tests.test_hour_refill_eject_worker_2_27 import QUEUE_RELATED, FakeDeck, _NoQueries, _wait
 from library.tests.test_hour_refill_install_2_27 import PERMIT, InstallFixtures
+from library.tests.test_hour_refill_runner_2_27 import RunnerFixtures
 from library.tests.test_hour_refill_projection_2_27 import (
     GOLD, LOG, at, boundary, deck as deck_state, eject, item, snapshot, swap,
 )
@@ -89,6 +90,35 @@ def _busy_vt_record():
     record = eng_module.VtTransitionRecord(41, None, duck_db=-6.0, ramp_s=0.3, gap_s=0.2)
     record.owns_start = True
     return record
+
+
+def connect_remote_dj(engine, *, gate_open=False, desired=None, reconnecting=False):
+    """r0149: a connected Remote DJ as the engine holds it -- a real
+    RemoteDJSession occupying a real RemoteDJSlot whose gate is a real
+    GStreamer ``volume`` element (the element the PTT command writes). The
+    engine's own _any_mic_live / _hour_refill_mic_engaged read it; any fixed
+    boolean stand-in for the mic is removed. Monitoring only by default
+    (gate closed, no mic requested)."""
+    eng_module.Gst.init(None)       # idempotent; this module may run before any GStreamer suite
+    gate = eng_module.Gst.ElementFactory.make("volume", None)
+    gate.set_property("volume", 1.0 if gate_open else 0.0)
+    slot = eng_module.RemoteDJSlot(0, None, None, None, None, gate, None, None)
+    session = eng_module.RemoteDJSession()
+    session.slot_id = 0
+    session.gate_desired = gate_open if desired is None else desired
+    if reconnecting:
+        session.connection_attempt = SimpleNamespace(status="reconnecting")
+    slot.session = session
+    engine.__dict__.pop("_any_mic_live", None)
+    engine.mic_live = engine.__dict__.get("mic_live", False)
+    engine.dj_slots = [slot]
+    engine.remote_dj_session = session
+    return session, slot
+
+
+class _UnreadableGate:
+    def get_property(self, name):
+        raise RuntimeError("gate unreadable")
 
 
 class StartNextClassificationTests(SimpleTestCase):
@@ -150,9 +180,6 @@ class StartNextClassificationTests(SimpleTestCase):
             "manual at accept": (dict(ownership_at_accept={"manual": True, "remote_dj": False, "mic": False}),
                                  "manual_hold"),
             "manual at the cut": (dict(manual_mode=True), "manual_hold"),
-            "remote dj at accept": (dict(ownership_at_accept={"manual": False, "remote_dj": True, "mic": False}),
-                                    "remote_dj_owner"),
-            "remote dj at the cut": (dict(remote_dj_owner=True), "remote_dj_owner"),
             "mic at accept": (dict(ownership_at_accept={"manual": False, "remote_dj": False, "mic": True}),
                               "mic_live"),
             "mic at the cut": (dict(mic_live=True), "mic_live"),
@@ -171,6 +198,32 @@ class StartNextClassificationTests(SimpleTestCase):
             "bool position": (dict(position_seconds=True), "position_unknown"),
         }
         for label, (overrides, reason) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(classify_start_next_observation(observation(**overrides)), (None, reason))
+
+    def test_a_connected_remote_dj_alone_is_not_an_exclusion(self):
+        """r0149: connection presence (at acceptance, at the cut, or both) is
+        recorded but never excludes; Manual and any microphone still do."""
+        eligible = classify_start_next_observation(observation())
+        connected = {"manual": False, "remote_dj": True, "mic": False}
+        for label, overrides in {
+            "connected at accept": dict(ownership_at_accept=connected),
+            "connected at the cut": dict(remote_dj_owner=True),
+            "connected throughout": dict(ownership_at_accept=connected, remote_dj_owner=True),
+        }.items():
+            with self.subTest(label):
+                self.assertEqual(classify_start_next_observation(observation(**overrides)), eligible)
+        for label, (overrides, reason) in {
+            "remote mic at accept": (dict(ownership_at_accept={**connected, "mic": True}), "mic_live"),
+            "remote mic at the cut": (dict(remote_dj_owner=True, mic_live=True), "mic_live"),
+            "manual at accept": (dict(ownership_at_accept={**connected, "manual": True}), "manual_hold"),
+            "manual at the cut": (dict(remote_dj_owner=True, manual_mode=True), "manual_hold"),
+            "ownership malformed": (dict(ownership_at_accept={"manual": False, "mic": False}), "ownership_unknown"),
+            "vt": (dict(remote_dj_owner=True, vt_phase="outro_playing"), "vt_transition"),
+            "seek": (dict(remote_dj_owner=True, seek_in_progress=True), "seek_in_progress"),
+            "paused": (dict(remote_dj_owner=True, paused=True), "paused"),
+            "inserted": (dict(remote_dj_owner=True, occurrence_source="engine_inserted"), "not_scheduled_occurrence"),
+        }.items():
             with self.subTest(label):
                 self.assertEqual(classify_start_next_observation(observation(**overrides)), (None, reason))
 
@@ -418,7 +471,9 @@ class StartNextHookTests(HookFixtures, TestCase):
     def test_ownership_exclusions_at_accept_and_at_the_cut(self):
         at_cut = {
             "manual": dict(manual_mode=True),
-            "remote dj": dict(remote_dj_session=SimpleNamespace(slot_id=None, connection_attempt=None)),
+            # r0149: a session whose mic intent cannot be read counts as a live mic (fail closed).
+            "remote dj session with unreadable mic intent": dict(
+                remote_dj_session=SimpleNamespace(slot_id=None, connection_attempt=None)),
             "local mic": dict(mic_live=True),
             "voice track": dict(_vtt=_busy_vt_record()),
         }
@@ -429,7 +484,7 @@ class StartNextHookTests(HookFixtures, TestCase):
                 for name, value in state.items():
                     setattr(engine, name, value)
                 self.assert_no_cause(engine, outcome=None)
-        for key in ("manual", "remote_dj", "mic"):
+        for key in ("manual", "mic"):
             with self.subTest(f"{key} at accept"):
                 engine = self.engine()
                 ownership = {"manual": False, "remote_dj": False, "mic": False, key: True}
@@ -439,6 +494,98 @@ class StartNextHookTests(HookFixtures, TestCase):
             engine = self.engine()
             self.transition(engine, ownership=None)
             self.assert_no_cause(engine)
+        with self.subTest("remote dj connection alone at accept (r0149: a cause)"):
+            engine = self.engine()
+            self.transition(engine, ownership={"manual": False, "remote_dj": True, "mic": False})
+            self.assertEqual(len(self.complete(engine).offers), 1)
+
+    # -- r0149: Start Next with a connected Remote DJ -------------------------
+    def test_a_monitoring_remote_dj_does_not_exclude_the_cut(self):
+        """The real _start_next_ownership at acceptance and the real
+        _hour_refill_mic_engaged at the cut, reading a real session and gate."""
+        connect = connect_remote_dj
+
+        def disconnect(engine):
+            engine.remote_dj_session = None
+
+        cases = {
+            "connected at accept and at the cut": (connect, None, True),
+            "connects between accept and cut": (None, connect, False),
+            "disconnects between accept and cut": (connect, disconnect, True),
+        }
+        baseline = None
+        for label, (before_accept, before_cut, connected_at_accept) in cases.items():
+            with self.subTest(label):
+                engine = self.engine()
+                if before_accept:
+                    before_accept(engine)
+                self.transition(engine)
+                self.assertEqual(engine._start_next_active["ownership_at_accept"],
+                                 {"manual": False, "remote_dj": connected_at_accept, "mic": False})
+                if before_cut:
+                    before_cut(engine)
+                recorder = self.complete(engine)
+                (evidence,) = recorder.offers
+                self.assertEqual(recorder.snapshot_errors, 0)
+                self.assertEqual(self.outcome(engine)["outcome"], "completed")
+                fields = evidence.cause_fields()
+                identity = {k: fields[k] for k in ("source_key", "log_item_id_snapshot", "deck_slot",
+                                                   "deck_generation", "start_next_request_id",
+                                                   "observed_shortening_seconds", "start_next_position_seconds")}
+                baseline = baseline or identity
+                self.assertEqual(identity, baseline)   # the same exact-occurrence cause as without a Remote DJ
+        engine = self.engine()
+        self.transition(engine)
+        (plain,) = self.complete(engine).offers
+        self.assertEqual(plain.cause_fields()["source_key"], baseline["source_key"])
+
+    def test_a_remote_dj_microphone_or_manual_still_excludes(self):
+        def open_gate(engine, slot):
+            slot.remote_gate.set_property("volume", 1.0)
+            engine.remote_dj_session.gate_desired = True
+
+        cases = {
+            "remote mic open at accept": (dict(gate_open=True), None),
+            "remote mic opens before the cut": ({}, open_gate),
+            "remote mic requested, held muted while reconnecting, at accept": (
+                dict(desired=True, reconnecting=True), None),
+            "remote mic requested while held muted before the cut": (
+                {}, lambda engine, slot: setattr(engine.remote_dj_session, "gate_desired", True)),
+            "studio mic with a monitoring remote dj at the cut": ({}, lambda e, s: setattr(e, "mic_live", True)),
+            "manual with a monitoring remote dj at the cut": ({}, lambda e, s: setattr(e, "manual_mode", True)),
+        }
+        for label, (connection_state, change) in cases.items():
+            with self.subTest(label):
+                engine = self.engine()
+                _session, slot = connect_remote_dj(engine, **connection_state)
+                self.transition(engine)
+                if change:
+                    change(engine, slot)
+                self.assert_no_cause(engine)
+        with self.subTest("studio mic at accept with a monitoring remote dj"):
+            engine = self.engine()
+            connect_remote_dj(engine)
+            engine.mic_live = True
+            self.transition(engine)
+            self.assertTrue(engine._start_next_active["ownership_at_accept"]["mic"])
+            engine.mic_live = False
+            self.assert_no_cause(engine)
+        with self.subTest("unreadable remote gate at accept: ownership unknown"):
+            engine = self.engine()
+            _session, slot = connect_remote_dj(engine)
+            readable, slot.remote_gate = slot.remote_gate, _UnreadableGate()
+            self.transition(engine)
+            self.assertIsNone(engine._start_next_active["ownership_at_accept"])
+            slot.remote_gate = readable                     # readable again (Off) at the cut
+            self.assert_no_cause(engine)
+        with self.subTest("unreadable remote gate at the cut: a snapshot error, no cause"):
+            engine = self.engine()
+            connect_remote_dj(engine)
+            self.transition(engine)
+            engine.dj_slots[0].remote_gate = _UnreadableGate()
+            recorder = self.complete(engine)
+            self.assertEqual((recorder.offers, recorder.snapshot_errors), ([], 1))
+            self.assertEqual(self.outcome(engine)["outcome"], "completed")   # playout unaffected
 
     def test_deck_state_exclusions(self):
         cases = {
@@ -542,6 +689,9 @@ class StartNextHookTests(HookFixtures, TestCase):
     def test_acceptance_records_ownership_and_nothing_else_changes(self):
         engine = self.engine()
         self.assertEqual(engine._start_next_ownership(), {"manual": False, "remote_dj": False, "mic": False})
+        connect_remote_dj(engine)   # r0149: presence is still recorded, as evidence
+        self.assertEqual(engine._start_next_ownership(), {"manual": False, "remote_dj": True, "mic": False})
+        engine.remote_dj_session = None
         engine.manual_mode = True
         self.assertEqual(engine._start_next_ownership()["manual"], True)
         broken = object.__new__(eng_module.PlaybackEngine)   # missing attributes: never raises
@@ -645,6 +795,69 @@ class StartNextTransportTests(TestCase):
 
     def three(self, first_seconds=8):
         return self.queue({"id": 1, "seconds": first_seconds}, {"id": 2, "seconds": 8}, {"id": 3, "seconds": 8})
+
+    # -- r0149: the engine's own persistent Remote DJ slot ---------------------
+    def remote_dj(self):
+        """Build the production persistent Remote DJ slot (_build_dj_slots:
+        silence source, input-selector, gain and gate volume elements, linked
+        into the master mixer before PLAYING) and seat a real RemoteDJSession
+        in it: a connected Remote DJ whose mic is Off (monitoring)."""
+        from library.tests._transport_harness import RATE
+
+        self.engine.pipeline_sample_rate = RATE
+        self.engine._build_dj_slots(1)
+        slot = self.engine.dj_slots[0]
+        session = eng_module.RemoteDJSession()
+        session.slot_id = 0
+        slot.session = session
+        self.engine.remote_dj_session = session
+        return session, slot
+
+    def test_a_monitoring_remote_dj_start_next_is_exactly_one_cause(self):
+        ids = self.three()
+        _session, slot = self.remote_dj()
+        self.h.play()
+        self.start()
+        self.assertEqual(slot.remote_gate.get_property("volume"), 0.0)
+        self.assertEqual(self.engine._start_next_ownership(), {"manual": False, "remote_dj": True, "mic": False})
+        self.send(fade_ms=400)
+        record = self.settle()
+        self.assertEqual((record["outcome"], record["mode"]), ("completed", "fade_and_start"))
+        self.assertEqual(self.snapshots, [("start_next", "fade_and_start", None)])
+        (evidence,) = self.recorder.offers
+        fields = evidence.cause_fields()
+        self.assertEqual((fields["log_item_id_snapshot"], fields["cause_type"]), (ids[0], "start_next"))
+        self.assertIsNotNone(self.engine.remote_dj_session)    # the session was never touched
+
+    def ptt_start_next(self, auto_manual):
+        from hardware.models import DuckingConfig
+
+        config = DuckingConfig.load()
+        config.ptt_auto_manual_enabled = auto_manual
+        config.save()
+        self.three()
+        _session, slot = self.remote_dj()
+        self.h.play()
+        self.start()
+        self.engine._duck_ramp_source_id = None         # production __init__ state the harness omits
+        self.engine._remote_dj_set_gate(True)          # the real Remote DJ PTT path
+        self.assertEqual(slot.remote_gate.get_property("volume"), 1.0)
+        self.assertTrue(self.engine._any_mic_live())
+        self.send(fade_ms=400)
+        record = self.settle()
+        self.assertEqual(self.recorder.offers, [])
+        return record
+
+    def test_remote_dj_push_to_talk_is_never_a_cause(self):
+        record = self.ptt_start_next(auto_manual=False)
+        self.assertEqual(record["outcome"], "completed")
+        self.assertEqual(self.snapshots, [("start_next", "fade_and_start", "mic_live")])
+
+    def test_remote_dj_push_to_talk_with_auto_manual_is_never_a_cause(self):
+        self.ptt_start_next(auto_manual=True)
+        self.assertTrue(self.engine.manual_mode)       # the mic hold put the engine in Manual
+        self.assertTrue(all(reason in ("manual_hold", "mic_live") for _c, _m, reason in self.snapshots),
+                        self.snapshots)
 
     def test_a_completed_fade_and_start_is_exactly_one_cause_with_the_real_position(self):
         ids = self.three()
@@ -1146,6 +1359,53 @@ class StartNextProjectionTests(SimpleTestCase):
         p = self.project(silent, [cut(1, 2)])
         self.assertEqual((p.outcome, p.reasons), ("unsafe_window", ("no_live_deck",)))
 
+    # r0149 -- Remote DJ connection presence and the Start Next correction.
+    def test_remote_dj_connection_permitted_only_for_all_start_next_sets(self):
+        sn, ej = SimpleNamespace(cause_type=CAUSE_START_NEXT), SimpleNamespace(cause_type=CAUSE_OPERATOR_EJECT)
+        rq, unknown = SimpleNamespace(cause_type=CAUSE_REQUEST_SUBSTITUTION), SimpleNamespace(cause_type="x")
+        for qualified, permitted in [((), False), ((sn,), True), ((sn, sn), True), ((sn, ej), False),
+                                     ((sn, rq), False), ((ej,), False), ((rq,), False), ((unknown,), False)]:
+            with self.subTest([c.cause_type for c in qualified]):
+                self.assertIs(proj.remote_dj_connection_permitted(qualified), permitted)
+
+    def test_a_connected_remote_dj_blocks_every_set_except_an_all_start_next_one(self):
+        plain = window([290.0, 290.0])
+        connected = replace(plain, remote_dj=True)
+        expected = self.project(plain, [cut(1, 2)])
+        got = self.project(connected, [cut(1, 2)])
+        self.assertEqual((got.outcome, got.net_shortage_seconds, got.threshold_seconds, got.threshold_basis,
+                          got.snapshot_digest),
+                         (expected.outcome, expected.net_shortage_seconds, expected.threshold_seconds,
+                          expected.threshold_basis, expected.snapshot_digest))
+        self.assertEqual(got.outcome, "eligible")
+        # A non-qualifying extra cause does not participate (nor in the threshold).
+        p = self.project(connected, [cut(1, 2), eject(2, 99)])
+        self.assertEqual((p.outcome, [c.cause_type for c in p.qualified_causes]), ("eligible", ["start_next"]))
+        blocked = {
+            "start next + eject": ([cut(1, 2), eject(2, 1)], dict(), "remote_dj"),
+            "start next + request": ([cut(1, 2), swap(3, 4, 1004)], dict(), "remote_dj"),
+            "eject only": ([eject(2, 1)], dict(), "remote_dj"),
+            "request only": ([swap(3, 4, 1004)], dict(), "remote_dj"),
+            "no qualified cause": ([], dict(), "remote_dj"),
+            "start next still on the deck": ([cut(1, 3)], dict(), "remote_dj"),
+            "start next, remote mic live": ([cut(1, 2)], dict(mic_live=True), "mic_live"),
+            "start next, manual": ([cut(1, 2)], dict(manual_mode=True), "manual_mode"),
+            "start next, voice track": ([cut(1, 2)], dict(vt_phase="outro"), "voice_track"),
+            "start next, transition pending": ([cut(1, 2)], dict(next_triggered=True), "transition_pending"),
+            "start next, live fill pending": ([cut(1, 2)], dict(live_fill_in_progress=True), "live_fill_pending"),
+        }
+        for label, (causes, flags, reason) in blocked.items():
+            with self.subTest(label):
+                p = self.project(replace(connected, **flags), causes)
+                self.assertEqual((p.outcome, p.reasons), ("blocked_transport", (reason,)))
+        paused = replace(connected, decks=(replace(connected.decks[0], paused=True, live=False),))
+        self.assertEqual(self.project(paused, [cut(1, 2)]).reasons, ("paused_deck",))
+        overlap = replace(connected, decks=(connected.decks[0], replace(connected.decks[0], slot="B")))
+        self.assertEqual(self.project(overlap, [cut(1, 2)]).reasons, ("overlap",))
+        # Without a Remote DJ the mixed sets are unchanged (strictest threshold, no block).
+        p = self.project(plain, [cut(1, 2), swap(3, 4, 1004)])
+        self.assertEqual((p.outcome, p.threshold_basis), ("eligible", "request_substitution_present"))
+
     def test_policy_state_allows_each_type_only_with_its_own_switch(self):
         state = runner_mod.PolicyState("observation", "x", request_cause=True, eject_cause=True)
         self.assertFalse(state.allows([CAUSE_START_NEXT]))
@@ -1208,7 +1468,7 @@ class StartNextInstallTests(InstallFixtures, TestCase):
         )
         return HourRefillCause.objects.create(**evidence.cause_fields())
 
-    def cut_engine(self, future=(290.0, 290.0)):
+    def cut_engine(self, future=(290.0, 290.0), *, deck_position=10.0):
         """Phase B's hour (net 389.25 s) with the finished item 1 cut by Start Next."""
         self.next_hour()
         self.row(self.track(240.0), 0, played=True)
@@ -1216,8 +1476,9 @@ class StartNextInstallTests(InstallFixtures, TestCase):
         self.row(self.track(240.0), 2, played=True)
         for i, seconds in enumerate(future):
             self.row(self.track(seconds), 3 + i)
+        self.cut_row = cut_row
         self.start_next_cause(cut_row)
-        return self.engine(cursor=3, deck_index=2, deck_position=10.0)
+        return self.engine(cursor=3, deck_index=2, deck_position=deck_position)
 
     def test_a_start_next_cause_installs_once_with_its_category(self):
         engine = self.cut_engine()
@@ -1281,6 +1542,184 @@ class StartNextInstallTests(InstallFixtures, TestCase):
                 self.assertEqual(self.rows(), before)
         self.assertFalse(HourRefillInstall.objects.exists())
 
+    # -- r0149: a connected Remote DJ whose mic is Off ----------------------------
+    def mixed_engine(self, kind):
+        """Item 0 ejected or item 3 request-swapped, item 1 cut by Start Next; both causes qualify."""
+        self.next_hour()
+        ejected = self.row(self.track(240.0), 0, played=True)
+        cut_row = self.row(self.track(240.0), 1, played=True)
+        self.row(self.track(240.0), 2, played=True)
+        original = self.track(300.0)
+        swapped = self.row(self.track(210.0), 3)
+        self.row(self.track(240.0), 4)
+        self.start_next_cause(cut_row, minute=20)
+        if kind == "eject":
+            self.eject_cause(ejected, minute=10)
+        else:
+            self.request_cause(swapped, original)
+        engine = self.engine(cursor=3, deck_index=2, deck_position=10.0)
+        self.track(250.0), self.track(250.0)
+        return engine
+
+    def test_a_monitoring_remote_dj_does_not_block_the_install_and_rows_are_adopted(self):
+        engine = self.cut_engine()
+        self.track(200.0), self.track(180.0)
+        connect_remote_dj(engine)
+        before = self.rows()
+        result = self.attempt(engine)
+        self.assertEqual(result.status, inst.STATUS_INSTALLED, result.reasons)
+        self.assertEqual(result.placement_mode, "tail_append")
+        ledger = HourRefillInstall.objects.get()
+        self.assertEqual(ledger.cause_ids, [HourRefillCause.objects.get().id])
+        after = self.rows()
+        self.assertEqual(after[:len(before)], before)
+        self.assertEqual([r[0] for r in after[len(before):]], list(result.installed_log_item_ids))
+        self.assertEqual({r[2] for r in after[len(before):]}, {LogItem.ORIGIN_REFILL_INSTALLED})
+        self.assertFalse(LogItem.objects.filter(id__in=result.installed_log_item_ids)
+                         .exclude(playback_claimed_at=None, played_at=None).exists())   # committed, not aired
+        self.assertEqual(self.attempt(engine).status, inst.STATUS_ADOPTION_PENDING)  # never a second install
+        ids, cursor = self.reload(engine)                       # the unchanged engine reload adopts them
+        self.assertEqual((ids, cursor), ([r[0] for r in after], 3))
+        self.assertNotEqual(self.attempt(engine).status, inst.STATUS_INSTALLED)
+        self.assertEqual(HourRefillInstall.objects.count(), 1)
+
+    def test_the_real_policy_gates_still_apply_with_a_monitoring_remote_dj(self):
+        engine = self.cut_engine()
+        self.track(200.0), self.track(180.0)
+        connect_remote_dj(engine)
+        before = self.rows()
+        HourRefillPolicy(enabled=True, capture_operator_eject=True, capture_request_substitution=True,
+                         dry_run_only=False).save()                                       # Start Next switch off
+        with ARMED:
+            self.assertEqual(self.installer(engine).attempt().status, inst.STATUS_POLICY_REFUSED)
+        HourRefillPolicy.objects.filter(pk=1).update(capture_start_next=True, dry_run_only=True)   # observation
+        with ARMED:
+            self.assertEqual(self.installer(engine).attempt().status, inst.STATUS_DRY_RUN_ONLY)
+        HourRefillPolicy.objects.filter(pk=1).update(dry_run_only=False)
+        self.assertEqual(self.installer(engine).attempt().status, inst.STATUS_DRY_RUN_ONLY)       # host not armed
+        HourRefillPolicy.objects.filter(pk=1).update(enabled=False)
+        with ARMED:
+            self.assertEqual(self.installer(engine).attempt().status, inst.STATUS_DRY_RUN_ONLY)   # master off
+        self.assertEqual(self.rows(), before)
+        HourRefillPolicy.objects.filter(pk=1).update(enabled=True)
+        with ARMED:
+            self.assertEqual(self.installer(engine).attempt().status, inst.STATUS_INSTALLED)
+
+    def between_snapshots(self, change, *, connected=True, **connection_state):
+        engine = self.cut_engine()
+        self.track(200.0), self.track(180.0)
+        if connected:
+            connect_remote_dj(engine, **connection_state)
+        before = self.rows()
+        result = self.attempt(engine, hooks={"before_second_snapshot": lambda *a: change(engine)})
+        return result, before
+
+    def test_remote_dj_connecting_or_disconnecting_alone_does_not_invalidate_the_install(self):
+        for label, (connected, change) in {
+            "connects between the snapshots": (False, connect_remote_dj),
+            "disconnects between the snapshots": (True, lambda e: setattr(e, "remote_dj_session", None)),
+        }.items():
+            with self.subTest(label):
+                HourRefillInstall.objects.all().delete()
+                HourRefillCause.objects.all().delete()
+                LogItem.objects.all().delete()
+                PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+                result, _before = self.between_snapshots(change, connected=connected)
+                self.assertEqual(result.status, inst.STATUS_INSTALLED, result.reasons)
+
+    def test_mic_manual_or_transport_changes_between_the_snapshots_block(self):
+        def open_remote_mic(engine):
+            engine.dj_slots[0].remote_gate.set_property("volume", 1.0)
+            engine.remote_dj_session.gate_desired = True
+
+        def unreadable(engine):
+            engine.dj_slots[0].remote_gate = _UnreadableGate()
+
+        cases = {
+            "remote mic opens": (open_remote_mic, proj.OUTCOME_BLOCKED_TRANSPORT, "mic_live"),
+            "remote mic requested while held muted": (
+                lambda e: setattr(e.remote_dj_session, "gate_desired", True), proj.OUTCOME_BLOCKED_TRANSPORT,
+                "mic_live"),
+            "studio mic opens": (lambda e: setattr(e, "mic_live", True), proj.OUTCOME_BLOCKED_TRANSPORT, "mic_live"),
+            "manual": (lambda e: setattr(e, "manual_mode", True), proj.OUTCOME_BLOCKED_TRANSPORT, "manual_mode"),
+            "start next active": (lambda e: setattr(e, "_start_next_active", {"request_id": "r"}),
+                                  proj.OUTCOME_BLOCKED_TRANSPORT, "start_next"),
+            "transition pending": (lambda e: setattr(e, "_next_triggered", True), proj.OUTCOME_BLOCKED_TRANSPORT,
+                                   "transition_pending"),
+            "mic state unreadable": (unreadable, proj.OUTCOME_INVALID_SNAPSHOT, "mic_state_unavailable"),
+            "deck generation": (lambda e: setattr(e.decks["A"], "generation", 41), inst.STATUS_STALE,
+                                "queue_or_deck_changed"),
+            "log changed": (lambda e: setattr(e, "_queue_cursor", 4), inst.STATUS_STALE, "queue_or_deck_changed"),
+            "engine restarted": (lambda e: setattr(e, "_engine_session_id", "eng-restarted"), inst.STATUS_STALE,
+                                 "engine_instance_changed"),
+        }
+        for label, (change, status, reason) in cases.items():
+            with self.subTest(label):
+                HourRefillCause.objects.all().delete()
+                LogItem.objects.all().delete()
+                PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+                result, before = self.between_snapshots(change)
+                self.assertEqual((result.status, reason in result.reasons), (status, True), result.reasons)
+                self.assertEqual(self.rows(), before)
+        self.assertFalse(HourRefillInstall.objects.exists())
+
+    def test_a_monitoring_remote_dj_keeps_every_other_safeguard(self):
+        with self.subTest("below threshold"):
+            engine = self.cut_engine(future=(470.0, 470.0))      # net 29.25 s: not > 30
+            self.track(20.0)
+            connect_remote_dj(engine)
+            result = self.attempt(engine)
+            self.assertEqual(result.status, proj.OUTCOME_BELOW_THRESHOLD, result.reasons)
+        for model in (HourRefillCause, LogItem):
+            model.objects.all().delete()
+        PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+        with self.subTest("insertion lead"):
+            engine = self.cut_engine(future=(), deck_position=225.0)   # 15.25 s to its trigger
+            self.track(600.0)
+            connect_remote_dj(engine)
+            result = self.attempt(engine)
+            self.assertEqual((result.status, result.reasons), (inst.STATUS_UNSAFE, ("insertion_too_soon",)))
+        self.assertFalse(HourRefillInstall.objects.exists())
+
+    def test_a_monitoring_remote_dj_inserts_before_the_protected_closer(self):
+        self.next_hour()
+        self.row(self.track(240.0), 0, played=True)
+        cut_row = self.row(self.track(240.0), 1, played=True)
+        self.row(self.track(240.0), 2, played=True)
+        self.row(self.track(290.0, self.recur), 3)
+        closer_psa = self.row(self.track(60.0, self.psa), 4)
+        closer_legal = self.row(self.track(10.0, self.legal), 5)
+        self.start_next_cause(cut_row)
+        engine = self.engine(cursor=3, deck_index=2, deck_position=10.0)
+        self.track(300.0), self.track(290.0)
+        connect_remote_dj(engine)
+        result = self.attempt(engine)
+        self.assertEqual((result.status, result.placement_mode, result.anchor_log_item_id),
+                         (inst.STATUS_INSTALLED, "insert_before", closer_psa.id), result.reasons)
+        self.assertEqual([r[0] for r in self.rows()][-2:], [closer_psa.id, closer_legal.id])
+
+    def test_mixed_cause_sets_keep_the_remote_dj_block(self):
+        def mixed(kind):
+            return self.mixed_engine(kind)
+
+        for kind in ("request", "eject"):
+            with self.subTest(kind):
+                for model in (HourRefillInstall, HourRefillCause, LogItem):
+                    model.objects.all().delete()
+                PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+                engine = mixed(kind)
+                connect_remote_dj(engine)
+                before = self.rows()
+                result = self.attempt(engine)
+                self.assertEqual((result.status, result.reasons), (proj.OUTCOME_BLOCKED_TRANSPORT, ("remote_dj",)))
+                self.assertEqual(self.rows(), before)
+        # The same request-involved set without a Remote DJ is unchanged (strict 60 s rule, installs).
+        for model in (HourRefillInstall, HourRefillCause, LogItem):
+            model.objects.all().delete()
+        PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+        result = self.attempt(mixed("request"))
+        self.assertEqual(result.status, inst.STATUS_INSTALLED, result.reasons)
+
     def test_a_cut_still_on_the_deck_is_not_counted(self):
         self.next_hour()
         self.row(self.track(240.0), 0, played=True)
@@ -1292,3 +1731,90 @@ class StartNextInstallTests(InstallFixtures, TestCase):
         result = self.attempt(engine)
         self.assertNotEqual(result.status, inst.STATUS_INSTALLED)
         self.assertIn("no_current_hour_cause", result.reasons)
+
+
+# ---------------------------------------------------------------------------
+# 8. r0149: runner and durable cause with a monitoring Remote DJ
+# ---------------------------------------------------------------------------
+
+class StartNextRemoteDjRunnerTests(RunnerFixtures, TestCase):
+    """The Phase D runner (observation and install) with a connected Remote
+    DJ whose mic is Off, against the real policy row."""
+    start_next_cause = StartNextInstallTests.start_next_cause
+    cut_engine = StartNextInstallTests.cut_engine
+    mixed_engine = StartNextInstallTests.mixed_engine
+
+    def setUp(self):
+        self.build()
+
+    def run_once(self, engine, *, dry_run, eject=False, request=False):
+        HourRefillPolicy.objects.all().delete()
+        HourRefillPolicy(enabled=True, dry_run_only=dry_run, capture_start_next=True,
+                         capture_operator_eject=eject, capture_request_substitution=request).save()
+        runner = self.make_runner(engine)
+        with ARMED:
+            runner.run_once()
+        return self.outcome(runner)
+
+    def test_observation_proposes_and_install_mode_installs(self):
+        engine = self.cut_engine()
+        self.track(200.0), self.track(180.0)
+        connect_remote_dj(engine)
+        before = self.rows()
+        outcome = self.run_once(engine, dry_run=True)
+        self.assertEqual(outcome["status"], "proposed", outcome)
+        self.assert_no_writes(before)
+        outcome = self.run_once(engine, dry_run=False)
+        self.assertEqual(outcome["status"], "installed", outcome)
+        self.assertEqual(HourRefillInstall.objects.count(), 1)
+
+    def test_a_live_remote_mic_blocks(self):
+        engine = self.cut_engine()
+        self.track(200.0), self.track(180.0)
+        connect_remote_dj(engine, gate_open=True)
+        before = self.rows()
+        outcome = self.run_once(engine, dry_run=False)
+        self.assertEqual((outcome["status"], outcome["reasons"]), ("blocked_transport", ["mic_live"]))
+        self.assert_no_writes(before)
+
+    def test_mixed_sets_keep_the_remote_dj_block(self):
+        for kind in ("eject", "request"):
+            with self.subTest(kind):
+                for model in (HourRefillInstall, HourRefillCause, LogItem):
+                    model.objects.all().delete()
+                PlaylistLog.objects.exclude(pk=self.log.pk).delete()
+                engine = self.mixed_engine(kind)
+                connect_remote_dj(engine)
+                before = self.rows()
+                outcome = self.run_once(engine, dry_run=False, eject=True, request=True)
+                self.assertEqual((outcome["status"], outcome["reasons"]), ("blocked_transport", ["remote_dj"]))
+                self.assert_no_writes(before)
+
+
+class StartNextRemoteDjCauseWorkerTests(HookFixtures, TransactionTestCase):
+    """The real engine hook and the real evidence worker persist a
+    monitoring-Remote-DJ cut exactly once."""
+
+    def setUp(self):
+        self.build()
+
+    def test_one_durable_cause_and_a_repeat_adds_nothing(self):
+        recorder = HourRefillEvidenceRecorder(read_flags=lambda: (False, False, True), policy_refresh_seconds=60)
+        recorder.start()
+        self.addCleanup(recorder.stop)
+        self.assertTrue(recorder.wait_until_ready(5))
+        engine = self.engine(recorder)
+        connect_remote_dj(engine)
+        self.transition(engine)
+        self.complete(engine)
+        self.assertTrue(_wait(lambda: recorder.counters["recorded"] >= 1), recorder.counters)
+        cause = HourRefillCause.objects.get()
+        self.assertEqual((cause.cause_type, cause.log_item_id_snapshot, cause.start_next_request_id),
+                         ("start_next", self.items[0].id, REQUEST))
+        engine._start_next_completion_due(REQUEST)            # a late timer: the transition is gone
+        engine2 = self.engine(recorder)                        # the same press, replayed
+        connect_remote_dj(engine2)
+        self.transition(engine2)
+        self.complete(engine2)
+        self.assertTrue(_wait(lambda: recorder.counters["duplicate"] >= 1), recorder.counters)
+        self.assertEqual(HourRefillCause.objects.count(), 1)
