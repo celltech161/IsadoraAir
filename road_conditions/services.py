@@ -16,7 +16,7 @@ from django.utils import timezone as dj_timezone
 
 from monitoring.models import emit_event
 
-from .api import CarsApiClient, CarsApiError
+from .api import CarsApiClient, CarsApiEmptyDataset, CarsApiError
 from .models import RoadConditionsSyncRun, RoadEvent
 
 logger = logging.getLogger(__name__)
@@ -519,7 +519,8 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
 
     Returns the same count fields RoadConditionsSyncRun stores, as a
     dict. Raises a CarsApiError subclass (never a bare Exception) for a
-    total fetch failure -- the caller (sync_road_conditions) turns that
+    total fetch failure -- including an empty response to the station's
+    complete (un-narrowed) retrieval, see CarsApiEmptyDataset -- the caller (sync_road_conditions) turns that
     into a nonzero exit code. A per-record parse failure never raises
     out of here; it's counted in result["error_count"] and the overall
     outcome becomes "partial" instead of "success".
@@ -572,6 +573,15 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
     fetch_started = time.monotonic()
     try:
         raw_events = client.get_events(event_classifications=classifications or None)
+        # The station's ordinary complete retrieval only. A deliberately
+        # narrowed run may legitimately match nothing. A non-empty
+        # dataset in which nothing matches this station's coverage is a
+        # real "no conditions" and is handled normally below.
+        if not narrowed and not raw_events:
+            raise CarsApiEmptyDataset(
+                "the CARS API returned an empty event list for the station's complete retrieval; "
+                "treated as a failed retrieval (nothing deactivated)"
+            )
     except CarsApiError as exc:
         result["latency_ms"] = int((time.monotonic() - fetch_started) * 1000)
         result["error_message"] = str(exc)

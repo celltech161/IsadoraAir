@@ -82,6 +82,15 @@ class CarsApiSchemaError(CarsApiError):
     that's handled per-record by services.py, not here."""
 
 
+class CarsApiEmptyDataset(CarsApiError):
+    """The station's complete retrieval returned no events at all. The
+    provider's contract is a bare array with no completeness flag, and it
+    answers an unrecognized filter value with an empty one, so this cannot
+    be told apart from a broken response and is treated as a failed
+    retrieval -- including if KDOT ever genuinely has no events. See
+    services.sync_events()."""
+
+
 class CarsApiClient:
     """Thin wrapper over a requests.Session. One instance per sync run
     is fine -- cheap to construct, and reusing the session across the
