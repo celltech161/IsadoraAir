@@ -435,15 +435,13 @@ class SyncEventsPartialFailureTests(TestCase):
         self.assertEqual(result["created_count"], 1)
         self.assertEqual(RoadEvent.objects.count(), 1)
 
-    def test_all_malformed_is_still_partial_not_failed(self):
-        # A total FETCH failure (network/HTTP/schema) is "failed"; a
-        # fetch that succeeded but whose records all failed to parse
-        # is "partial" -- the distinction the task calls for between a
-        # total API failure and a record-level parse failure.
-        bad = make_unparseable_event()
-        result = sync_events(self.config, client=FakeCarsClient(events=[bad]))
-        self.assertEqual(result["outcome"], "partial")
-        self.assertEqual(result["created_count"], 0)
+    def test_complete_retrieval_with_zero_usable_records_fails(self):
+        with self.assertRaises(CarsApiSchemaError):
+            sync_events(self.config, client=FakeCarsClient(events=[{}]))
+        self.config.refresh_from_db()
+        self.assertIsNone(self.config.last_fetch_succeeded_at)
+        self.assertEqual(RoadConditionsSyncRun.objects.get().outcome, "failed")
+        self.assertEqual(RoadEvent.objects.count(), 0)
 
     def test_empty_complete_retrieval_is_a_failure(self):
         # 1.24-B: the provider answers a broken filter with an empty list
@@ -662,29 +660,15 @@ class IdentityIntegrityTests(TestCase):
         sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-EXISTING")]))
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
-    def test_missing_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_empty_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_event_with_empty_id()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_invalid_type_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_event_with_wrong_type_id()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_non_dict_raw_record_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_non_dict_raw_entry()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
+    def test_all_unidentifiable_responses_preserve_previous_events(self):
+        previous = self.config.last_fetch_succeeded_at
+        for raw in (make_unparseable_event(), make_event_with_empty_id(),
+                    make_event_with_wrong_type_id(), make_non_dict_raw_entry()):
+            with self.subTest(raw=raw), self.assertRaises(CarsApiSchemaError):
+                sync_events(self.config, client=FakeCarsClient(events=[raw]))
+            self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
+            self.config.refresh_from_db()
+            self.assertEqual(self.config.last_fetch_succeeded_at, previous)
 
     def test_identity_untrustworthy_still_imports_other_valid_events(self):
         result = sync_events(self.config, client=FakeCarsClient(events=[

@@ -16,7 +16,7 @@ from django.utils import timezone as dj_timezone
 
 from monitoring.models import emit_event
 
-from .api import CarsApiClient, CarsApiEmptyDataset, CarsApiError
+from .api import CarsApiClient, CarsApiEmptyDataset, CarsApiError, CarsApiSchemaError
 from .models import RoadConditionsSyncRun, RoadEvent
 
 logger = logging.getLogger(__name__)
@@ -453,9 +453,9 @@ def _matches_scope(normalized, counties_filter, routes_filter, corridor_rules, c
     return True
 
 
-def _record_run(config, result, started_at):
+def _record_run(config, result, started_at, *, narrowed):
     """Writes a RoadConditionsSyncRun row and updates
-    RoadConditionsConfiguration's last_fetch_* fields. Only ever
+    statewide last_fetch_* fields for authoritative runs. Only ever
     called for a REAL (non-dry-run) invocation -- a dry run must write
     NOTHING to the database (see sync_events's dry_run branch and
     tests/test_sync.py's DryRunWritesNothingTests), so this function
@@ -469,6 +469,8 @@ def _record_run(config, result, started_at):
         error_count=result["error_count"], latency_ms=result["latency_ms"],
         error_message=result["error_message"],
     )
+    if narrowed:
+        return
     config.last_fetch_attempted_at = started_at
     if result["outcome"] in ("success", "partial"):
         config.last_fetch_succeeded_at = finished_at
@@ -477,6 +479,16 @@ def _record_run(config, result, started_at):
         config.last_error = result["error_message"]
     config.last_record_count = result["fetched_count"]
     config.save(update_fields=["last_fetch_attempted_at", "last_fetch_succeeded_at", "last_error", "last_record_count"])
+
+
+def _record_failed_fetch(config, result, started_at, error, *, narrowed, dry_run):
+    result["error_message"] = str(error)
+    logger.warning("road_conditions: sync fetch failed: %s", error)
+    if not dry_run:
+        _record_run(config, result, started_at, narrowed=narrowed)
+        emit_event(category="road_conditions", level="error", title="CARS API fetch failed",
+                   detail={"error": str(error), "error_type": type(error).__name__, "narrowed": narrowed},
+                   dedupe_key=f"road_conditions|fetch-failed|{type(error).__name__}")
 
 
 def _raw_event_ids(raw_events):
@@ -520,10 +532,10 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
     Returns the same count fields RoadConditionsSyncRun stores, as a
     dict. Raises a CarsApiError subclass (never a bare Exception) for a
     total fetch failure -- including an empty response to the station's
-    complete (un-narrowed) retrieval, see CarsApiEmptyDataset -- the caller (sync_road_conditions) turns that
-    into a nonzero exit code. A per-record parse failure never raises
-    out of here; it's counted in result["error_count"] and the overall
-    outcome becomes "partial" instead of "success".
+    complete retrieval with no usable records. The command exits nonzero.
+    Record errors are counted and the outcome is partial if at least one
+    usable record remains. Diagnostic runs record history without updating
+    statewide freshness or cadence.
 
     `event_classifications_filter`/`county_filter`/`limit` are
     troubleshooting overrides (the management command's --event-type/
@@ -540,9 +552,8 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
     any raw record in the response has a missing/empty/wrong-typed
     event-id, or isn't a JSON object at all -- see _raw_event_ids()'s
     docstring for why an identity-incomplete response can't be trusted
-    to conclude anything is gone. That run is still marked "partial"
-    (each unidentifiable record also fails normalize_event() and is
-    counted in error_count) and every OTHER, identifiable record is
+    to conclude anything is gone. A batch with some usable records is
+    marked "partial", and every OTHER, identifiable record is
     still imported/updated/rescoped normally -- only deactivation is
     suppressed for the whole run. A duplicate event-id within one
     response is resolved deterministically (first occurrence wins,
@@ -584,13 +595,7 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
             )
     except CarsApiError as exc:
         result["latency_ms"] = int((time.monotonic() - fetch_started) * 1000)
-        result["error_message"] = str(exc)
-        logger.warning("road_conditions: sync fetch failed: %s", exc)
-        if not dry_run:
-            emit_event(category="road_conditions", level="error", title="CARS API fetch failed",
-                       detail={"error": str(exc), "error_type": type(exc).__name__},
-                       dedupe_key=f"road_conditions|fetch-failed|{type(exc).__name__}")
-            _record_run(config, result, started_at)
+        _record_failed_fetch(config, result, started_at, exc, narrowed=narrowed, dry_run=dry_run)
         raise
 
     result["latency_ms"] = int((time.monotonic() - fetch_started) * 1000)
@@ -663,6 +668,11 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
             emit_event(category="road_conditions", level="warning", title="Some CARS events failed to parse",
                        detail={"error_count": result["error_count"], "fetched_count": result["fetched_count"], "samples": error_samples},
                        dedupe_key="road_conditions|parse-errors")
+
+    if not narrowed and not seen_in_this_run:
+        error = CarsApiSchemaError("the CARS API returned no usable records in the complete retrieval")
+        _record_failed_fetch(config, result, started_at, error, narrowed=narrowed, dry_run=dry_run)
+        raise error
 
     if identity_untrustworthy:
         # Item: a raw record with no usable stable id means the
@@ -803,6 +813,6 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
         # "didn't match THIS run's override filters" means "gone from
         # KDOT" or "out of the station's REAL configured coverage".
 
-    result["outcome"] = "success" if result["error_count"] == 0 else "partial"
-    _record_run(config, result, started_at)
+        result["outcome"] = "success" if result["error_count"] == 0 else "partial"
+        _record_run(config, result, started_at, narrowed=narrowed)
     return result

@@ -55,6 +55,10 @@ def _due(config, now=None):
     return last is None or last < start, next_start
 
 
+def _narrowed(options):
+    return any(options[key] is not None for key in ("event_type", "county", "limit"))
+
+
 class Command(BaseCommand):
     """Fetches KDOT CARS road events and upserts them into RoadEvent.
     Safe to run manually at any time -- --dry-run reports what would
@@ -138,7 +142,7 @@ class Command(BaseCommand):
             finally:
                 # Every real invocation, including "not due yet" and failed
                 # ones: this is what notices the data going stale.
-                if not options["dry_run"]:
+                if not options["dry_run"] and not _narrowed(options):
                     evaluate_feed()
         finally:
             with connection.cursor() as cur:
@@ -172,7 +176,7 @@ class Command(BaseCommand):
         # (see ogremote-poll.timer).
 
         dry_run = options["dry_run"]
-        narrowed = bool(options["event_type"] or options["county"] or options["limit"] is not None)
+        narrowed = _narrowed(options)
         if narrowed:
             self.stdout.write(self.style.WARNING(
                 "Narrowed run (--event-type/--county/--limit given): the source set this run "

@@ -166,6 +166,23 @@ class FeedNotificationTests(RuntimeScratchMixin, TestCase):
         self.tick()
         self.assertEqual(mail.outbox, [])
 
+    def test_narrowed_empty_sync_does_not_recover_or_consume_full_slot(self):
+        self.failing_sync()
+        first = RoadConditionsConfiguration.load()
+        # Put the full attempt in the previous slot so the diagnostic
+        # request will be the only invocation in the current one.
+        prior_slot = dj_timezone.now() - timedelta(hours=1)
+        RoadConditionsConfiguration.objects.update(last_fetch_attempted_at=prior_slot)
+        self.sync(events=[], args=("--force-full", "--limit", "1"))
+        second = RoadConditionsConfiguration.load()
+        self.assertEqual(second.last_fetch_attempted_at, prior_slot)
+        self.assertEqual(second.last_fetch_succeeded_at, first.last_fetch_succeeded_at)
+        self.assertEqual(second.last_error, first.last_error)
+        self.assertEqual(self.subjects(), [SUBJECT + "WARNING"])
+        self.assertIsNone(self.stamp())
+        self.assertIn("Fetched: 1", self.sync(args=()))
+        self.assertEqual(self.subjects(), [SUBJECT + "WARNING", SUBJECT + "RECOVERED"])
+
     def test_recovery_is_reported_once(self):
         self.failing_sync()
         self.sync()
