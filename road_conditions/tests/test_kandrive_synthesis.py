@@ -14,7 +14,7 @@ from library.models import Artist, Category, CategoryKind, Track
 from road_conditions import synthesis as synthesis_module
 from road_conditions.synthesis import (
     AUDIO_FORMAT_VERSION, LOUDNORM_TARGETS, SynthesisError, _parse_loudnorm_output,
-    build_loudnorm_string, existing_report_is_healthy, hash_file_sha256, retire_road_report,
+    build_loudnorm_string, existing_report_is_healthy, hash_file_sha256,
     road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
 from weather.models import WeatherConfig, WeatherVoicePersona
@@ -756,10 +756,11 @@ class ExistingReportIsHealthyTests(KanDriveSynthesisFixtureMixin, TransactionTes
         Track.objects.filter(filepath=str(road_report_path())).delete()
         self.assertFalse(existing_report_is_healthy(self.FP))
 
-    def test_unhealthy_when_track_is_not_ready2air(self):
+    def test_ready2air_plays_no_part_in_health(self):
+        # 1.24-B: Ready-to-Air belongs to the Library.
         self._publish()
-        retire_road_report()
-        self.assertFalse(existing_report_is_healthy(self.FP))
+        Track.objects.filter(filepath=str(road_report_path())).update(ready2air=False)
+        self.assertTrue(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_text_file_missing(self):
         self._publish()
@@ -785,52 +786,3 @@ class ExistingReportIsHealthyTests(KanDriveSynthesisFixtureMixin, TransactionTes
 class AudioFormatVersionTests(TestCase):
     def test_is_a_plain_integer(self):
         self.assertIsInstance(AUDIO_FORMAT_VERSION, int)
-
-
-class RetireRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
-    def test_noop_when_no_track_exists(self):
-        self.assertFalse(retire_road_report())
-
-    def test_flips_ready2air_false(self):
-        track = synthesize_road_report("Report.", "day", DAY_VOICE)
-        self.assertTrue(track.ready2air)
-
-        self.assertTrue(retire_road_report())
-
-        track.refresh_from_db()
-        self.assertFalse(track.ready2air)
-
-    def test_idempotent_second_call_is_noop(self):
-        synthesize_road_report("Report.", "day", DAY_VOICE)
-        self.assertTrue(retire_road_report())
-        self.assertFalse(retire_road_report())
-
-    def test_does_not_delete_the_file_or_row(self):
-        track = synthesize_road_report("Report.", "day", DAY_VOICE)
-        path = Path(track.filepath)
-        retire_road_report()
-        self.assertTrue(path.exists())
-        self.assertTrue(Track.objects.filter(id=track.id).exists())
-
-    def test_never_touches_a_manually_uploaded_track_in_kandrive_category(self):
-        """A human could upload their own file into the KanDrive
-        category folder for some other reason -- retire_road_report()
-        only ever touches the ONE stable, generator-owned filepath, and
-        must never affect a different Track row even in the same
-        category."""
-        artist, _ = Artist.get_or_create_ci("Some Human")
-        manual_path = Path(self._tmpdir.name) / "manually-uploaded.flac"
-        manual_path.write_bytes(b"human-uploaded content")
-        manual_track = Track.objects.create(
-            filepath=str(manual_path), filename=manual_path.name, format="flac",
-            title="Manually Uploaded Clip", artist=artist,
-            category=Category.objects.get(code="KanDrive"),
-            duration_seconds=12.0, ready2air=True,
-        )
-
-        synthesize_road_report("Report.", "day", DAY_VOICE)
-        retire_road_report()
-
-        manual_track.refresh_from_db()
-        self.assertTrue(manual_track.ready2air, "a manually uploaded track must never be retired by generator logic")
-        self.assertTrue(manual_path.exists())

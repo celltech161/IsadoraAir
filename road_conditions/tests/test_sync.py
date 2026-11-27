@@ -10,7 +10,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from monitoring.models import SystemEvent
-from road_conditions.api import CarsApiError, CarsApiSchemaError, CarsApiTimeout
+from road_conditions.api import CarsApiError, CarsApiSchemaError, CarsApiTimeout, CarsApiEmptyDataset
 from road_conditions.models import RoadConditionsConfiguration, RoadConditionsSyncRun, RoadEvent
 from road_conditions.services import sync_events
 
@@ -333,7 +333,7 @@ class DryRunWritesNothingTests(TestCase):
 
     def test_dry_run_deactivation_scenario_writes_nothing(self):
         before = self._full_snapshot()
-        result = sync_events(self.config, client=FakeCarsClient(events=[]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-OTHER")]), dry_run=True)
         after = self._full_snapshot()
         self.assertEqual(result["deactivated_count"], 1)
         self.assertEqual(before, after)
@@ -445,10 +445,22 @@ class SyncEventsPartialFailureTests(TestCase):
         self.assertEqual(result["outcome"], "partial")
         self.assertEqual(result["created_count"], 0)
 
-    def test_zero_fetched_events_is_success_not_failure(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[]))
-        self.assertEqual(result["outcome"], "success")
-        self.assertEqual(result["fetched_count"], 0)
+    def test_empty_complete_retrieval_is_a_failure(self):
+        # 1.24-B: the provider answers a broken filter with an empty list
+        # too, so the station's complete retrieval never trusts one.
+        with self.assertRaises(CarsApiEmptyDataset):
+            sync_events(self.config, client=FakeCarsClient(events=[]))
+        self.config.refresh_from_db()
+        self.assertIn("empty event list", self.config.last_error)
+        self.assertIsNone(self.config.last_fetch_succeeded_at)
+        self.assertEqual(RoadConditionsSyncRun.objects.get().outcome, "failed")
+
+    def test_empty_narrowed_retrieval_is_still_legitimate(self):
+        for narrowing in ({"event_classifications_filter": ["winterDriving"]},
+                          {"county_filter": "Ottawa"}, {"limit": 5}):
+            with self.subTest(narrowing=narrowing):
+                result = sync_events(self.config, client=FakeCarsClient(events=[]), **narrowing)
+                self.assertEqual((result["outcome"], result["deactivated_count"]), ("success", 0))
 
     def test_partial_parse_still_deactivates_genuinely_absent_events_when_identity_is_trustworthy(self):
         # A "partial" outcome does NOT blanket-disable deactivation for
@@ -702,7 +714,7 @@ class IdentityIntegrityTests(TestCase):
         # Sanity/regression check -- a run with NO identity problems
         # must still deactivate normally (this whole mechanism must
         # not become a blanket "deactivation never happens" bug).
-        result = sync_events(self.config, client=FakeCarsClient(events=[]))
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-OTHER")]))
         self.assertEqual(result["deactivated_count"], 1)
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
