@@ -529,24 +529,27 @@ class SharedTTSSynthesisRoutingTests(KanDriveSynthesisFixtureMixin, TransactionT
         station_patcher.start()
         self.addCleanup(station_patcher.stop)
 
-    def test_whole_report_uses_shared_tts_with_logical_voice_only(self):
+    def test_whole_report_uses_shared_tts_with_the_resolved_voice(self):
         track = synthesize_road_report("Test report text.", "day", DAY_VOICE)
 
         self.assertEqual(len(self.station_calls), 1)
-        self.assertEqual(self.station_calls[0]["voice"], "Claira_Sky")
-        self.assertNotIn("af_jessica", str(self.station_calls[0]["voice"]), "provider id must never be passed")
+        resolved = self.station_calls[0]["voice"]
+        self.assertIsInstance(resolved, ResolvedStationVoice)
+        self.assertEqual((resolved.logical_name, resolved.provider_voice), ("Claira_Sky", "af_jessica"))
         self.assertEqual(self.station_calls[0]["timeout_seconds"], 45)
         self.assertEqual(track.title, "KanDrive Road Report (Claira)")
 
-    def test_every_transition_segment_uses_shared_tts_with_logical_voice_only(self):
+    def test_every_transition_segment_uses_the_same_resolved_voice(self):
         synthesize_road_report(
             "unused when segments given", "day", DAY_VOICE,
             segments=["first item.", "second item.", "third item."],
             transition_sound_path="/fake/path/woosh.wav",
         )
         self.assertEqual(len(self.station_calls), 3)
+        resolved = self.station_calls[0]["voice"]
+        self.assertIsInstance(resolved, ResolvedStationVoice)
         for call in self.station_calls:
-            self.assertEqual(call["voice"], "Claira_Sky")
+            self.assertIs(call["voice"], resolved)
             self.assertEqual(call["timeout_seconds"], 45, "tts_timeout_seconds applies PER segment")
 
     def test_configured_timeout_seconds_value_reaches_every_call(self):
