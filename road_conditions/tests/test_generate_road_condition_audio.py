@@ -785,7 +785,8 @@ class FingerprintSkipBehaviorTests(KanDriveSynthesisFixtureMixin, TransactionTes
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
         call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
 
-        with patch(f"{CMD}.write_road_report_text") as mock_write:
+        from road_conditions import synthesis as synthesis_module
+        with patch.object(synthesis_module, "write_road_report_text") as mock_write:
             call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
             mock_write.assert_not_called()
 
@@ -839,13 +840,17 @@ class ArtifactHealthGuardTests(KanDriveSynthesisFixtureMixin, TransactionTestCas
         self.assertEqual(self._kokoro_call_count, 2)
         self.assertTrue(Track.objects.filter(filepath=str(road_report_path())).exists())
 
-    def test_ready2air_false_forces_regeneration(self):
+    def test_ready2air_cleared_outside_freshness_is_left_alone(self):
+        # 1.24-B: readiness restrictions the freshness mechanism did not
+        # place are preserved, not undone by a re-render.
         self._generate_once()
         Track.objects.filter(filepath=str(road_report_path())).update(ready2air=False)
 
-        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
-        self.assertEqual(self._kokoro_call_count, 2)
-        self.assertTrue(Track.objects.get(filepath=str(road_report_path())).ready2air)
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 1)
+        self.assertIn("held off air", out.getvalue())
+        self.assertFalse(Track.objects.get(filepath=str(road_report_path())).ready2air)
 
     def test_missing_text_file_forces_regeneration(self):
         self._generate_once()
@@ -871,10 +876,11 @@ class RetirementRecoveryRegressionTests(KanDriveSynthesisFixtureMixin, Transacti
       13:00 source recovers -- road conditions themselves never
             changed, so the fingerprint is STILL ABC
 
-    The 13:00 run MUST regenerate/reactivate the report rather than
-    skip merely because the hash matches."""
+    The 13:00 run MUST put the report back on air rather than skip merely
+    because the hash matches. 1.24-B: it does so without rendering, since
+    the retirement is provably its own and the audio verifies."""
 
-    def test_stale_retirement_then_fresh_recovery_regenerates_not_skips(self):
+    def test_stale_retirement_then_fresh_recovery_rearms_without_rendering(self):
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
         config = make_fresh_config()
 
@@ -911,8 +917,8 @@ class RetirementRecoveryRegressionTests(KanDriveSynthesisFixtureMixin, Transacti
         out = StringIO()
         call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
 
-        self.assertEqual(self._kokoro_call_count, 2)  # regenerated, NOT skipped
-        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+        self.assertEqual(self._kokoro_call_count, 1)  # re-armed, not re-rendered
+        self.assertIn("re-armed without synthesis", out.getvalue())
         self.assertTrue(Track.objects.get(filepath=str(road_report_path())).ready2air)
 
 
@@ -940,7 +946,8 @@ class FailureLifecycleFingerprintTests(KanDriveSynthesisFixtureMixin, Transactio
         self.assertIsNone(config.last_report_generated_at)
 
     def test_text_file_write_failure_does_not_update_fingerprint_or_time(self):
-        with patch(f"{CMD}.write_road_report_text", side_effect=OSError("disk full")):
+        from road_conditions import synthesis as synthesis_module
+        with patch.object(synthesis_module, "write_road_report_text", side_effect=OSError("disk full")):
             with self.assertRaises(CommandError):
                 call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
         config = RoadConditionsConfiguration.load()
@@ -1144,26 +1151,17 @@ class FramingAndVoiceChangeForcesRegenerationTests(KanDriveSynthesisFixtureMixin
         call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
         self.assertEqual(self._kokoro_call_count, 2)
 
-    def test_voice_model_change_forces_regeneration(self):
-        # Same slot/name, different model -- the model behind an
-        # announcer name changing must still force regeneration (see
-        # report.compute_report_fingerprint()'s own docstring).
-        voice_v1 = {
-            "engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky",
-            "signoff": "I'm Claira Sky.", "logical_voice_name": "Claira_Sky",
-            "shared_tts": True, "tts_timeout_seconds": 45,
-        }
-        voice_v2 = dict(voice_v1, model="af_jessica_v2")
-
+    def test_voice_model_change_alone_does_not_regenerate(self):
+        voice_v1 = {"engine": "kokoro", "model": "af_jessica", "name": "Claira",
+                    "logical_voice_name": "Claira_Sky", "tts_timeout_seconds": 45}
+        voice_v2 = {**voice_v1, "model": "af_different_model"}
         with patch(f"{CMD}.resolve_voice", return_value=("day", voice_v1)):
             call_command("generate_road_condition_audio", stdout=StringIO())
         self.assertEqual(self._kokoro_call_count, 1)
 
         with patch(f"{CMD}.resolve_voice", return_value=("day", voice_v2)):
-            out = StringIO()
-            call_command("generate_road_condition_audio", stdout=out)
-        self.assertEqual(self._kokoro_call_count, 2)
-        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+            call_command("generate_road_condition_audio", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
 
 
 class PlannedEventTransitionFingerprintTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):

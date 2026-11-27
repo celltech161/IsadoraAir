@@ -108,6 +108,9 @@ class KanDriveSynthesisFixtureMixin:
         self._ffmpeg_should_fail = False
         self._kokoro_call_count = 0
         self._synth_voices = []
+        # What the fake encode writes; a test that must tell two renders
+        # apart changes it.
+        self._flac_payload = b"FAKE-FLAC-CONTENT"
         # loudnorm's own two-pass analysis call (ends "-f null -", no
         # real output file -- see _run_loudnorm_two_pass) is tracked and
         # faked separately from the encode/concat call below, since it
@@ -169,7 +172,7 @@ class KanDriveSynthesisFixtureMixin:
                 # Encode/concat pass -- produces the real output file.
                 if self._ffmpeg_should_fail:
                     raise _sp.CalledProcessError(1, cmd, output=b"", stderr=b"ffmpeg exploded")
-                Path(cmd[-1]).write_bytes(b"FAKE-FLAC-CONTENT")
+                Path(cmd[-1]).write_bytes(self._flac_payload)
                 return _sp.CompletedProcess(cmd, 0)
             else:
                 raise AssertionError(f"unexpected subprocess call: {cmd}")
@@ -181,6 +184,13 @@ class KanDriveSynthesisFixtureMixin:
         duration_patcher = patch.object(synthesis_module, "_probe_duration", return_value=300.0)
         duration_patcher.start()
         self.addCleanup(duration_patcher.stop)
+
+        # The fake FLAC bytes cannot be decoded; the real strict-decode
+        # gate is exercised with real media in
+        # test_kandrive_publication.RealMediaPublicationTests.
+        validate_patcher = patch.object(synthesis_module, "_validate_candidate")
+        validate_patcher.start()
+        self.addCleanup(validate_patcher.stop)
 
         analyze_patcher = patch.object(synthesis_module, "_run_full_analysis", return_value=True)
         analyze_patcher.start()
@@ -591,33 +601,24 @@ class LastKnownGoodPreservationTests(KanDriveSynthesisFixtureMixin, TransactionT
         with patch.object(synthesis_module, "_run_full_analysis", return_value=False):
             with self.assertRaises(SynthesisError):
                 synthesize_road_report("New content.", "night", NIGHT_VOICE)
-        # The file WAS replaced (os.replace already happened by the time
-        # analysis runs) -- this documents that fact rather than hiding it.
+        # 1.24-B: a failure after the replacement restores the previous
+        # audio (distinct content is proven in test_kandrive_publication).
         self.assertEqual(Path(road_report_path()).read_bytes(), b"FAKE-FLAC-CONTENT")
 
 
-class SynthesizeRoadReportNeverWritesTextFileTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
-    """synthesize_road_report() itself must NEVER write or touch
-    road_report.txt -- that responsibility belongs entirely to the
-    CALLER (generate_road_condition_audio.py), which calls
-    write_road_report_text(text) only after synthesize_road_report()
-    has already returned a Track without raising (see this module's own
-    comment at the os.replace() call site). This is what makes
-    road_report.txt represent only a generation cycle that completed
-    successfully start to finish, INCLUDING waveform analysis -- not
-    merely a FLAC that was written before a later Track/analysis
-    failure. An earlier revision of this function wrote the text file
-    itself, immediately after the FLAC's own os.replace() -- these
-    tests replace that revision's own (now-wrong) assertions."""
+class SynthesizeRoadReportTextPublicationTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """road_report.txt is part of the publication (1.24-B): written only
+    after the FLAC, Track and waveform analysis have all succeeded, and
+    left untouched by any earlier failure."""
 
-    def test_successful_synthesis_does_not_create_text_file(self):
+    def test_successful_synthesis_writes_the_exact_script(self):
         synthesize_road_report("Good report.", "day", DAY_VOICE)
-        self.assertFalse(road_report_text_path().exists())
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Good report.")
 
-    def test_repeated_successful_synthesis_still_never_writes_text_file(self):
+    def test_repeated_successful_synthesis_updates_the_script(self):
         synthesize_road_report("First.", "day", DAY_VOICE)
         synthesize_road_report("Second.", "night", NIGHT_VOICE)
-        self.assertFalse(road_report_text_path().exists())
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Second.")
 
     def test_kokoro_failure_leaves_existing_text_file_untouched(self):
         write_road_report_text("Pre-existing text.")
@@ -725,72 +726,60 @@ class HashFileSha256Tests(TestCase):
 
 
 class ExistingReportIsHealthyTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
-    """existing_report_is_healthy() -- the companion artifact-health
-    check used alongside a fingerprint match (see the management
-    command's own skip decision). Exercises the real filesystem/DB
-    state this function reads, via real synthesize_road_report()/
-    write_road_report_text()/retire_road_report() calls (all faked at
-    the Kokoro/ffmpeg subprocess boundary only, via
-    KanDriveSynthesisFixtureMixin) rather than hand-constructing state,
-    so this proves the function agrees with what those real functions
-    actually produce."""
+    """existing_report_is_healthy() verifies the published artifacts
+    against their own provenance, using real state produced by
+    synthesize_road_report() (faked only at the TTS/ffmpeg boundary)."""
 
-    def test_healthy_when_flac_track_ready2air_and_text_all_match(self):
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
-        write_road_report_text(text)
-        self.assertTrue(existing_report_is_healthy(text))
+    FP = "a" * 64
+
+    def _publish(self):
+        return synthesize_road_report("The real final script.", "day", DAY_VOICE, semantic_fingerprint=self.FP)
+
+    def test_healthy_when_audio_track_script_and_provenance_all_verify(self):
+        self._publish()
+        self.assertTrue(existing_report_is_healthy(self.FP))
+
+    def test_unhealthy_for_other_content(self):
+        self._publish()
+        self.assertFalse(existing_report_is_healthy("b" * 64))
+
+    def test_unhealthy_when_published_without_a_fingerprint(self):
+        synthesize_road_report("The real final script.", "day", DAY_VOICE)
+        self.assertFalse(existing_report_is_healthy(""))
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_no_flac_exists_yet(self):
-        self.assertFalse(existing_report_is_healthy("Some expected text."))
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_flac_exists_but_no_track_row(self):
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
-        write_road_report_text(text)
+        self._publish()
         Track.objects.filter(filepath=str(road_report_path())).delete()
-        self.assertFalse(existing_report_is_healthy(text))
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_track_is_not_ready2air(self):
-        # The stale-feed-retirement scenario: retire_road_report()
-        # flips ready2air False without touching the FLAC or text file
-        # at all -- existing_report_is_healthy() must still say False.
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
-        write_road_report_text(text)
+        self._publish()
         retire_road_report()
-        self.assertFalse(existing_report_is_healthy(text))
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_text_file_missing(self):
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
-        # Deliberately never call write_road_report_text() here.
-        self.assertFalse(existing_report_is_healthy(text))
+        self._publish()
+        road_report_text_path().unlink()
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_unhealthy_when_text_file_content_does_not_match(self):
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
+        self._publish()
         write_road_report_text("A completely different script.")
-        self.assertFalse(existing_report_is_healthy(text))
+        self.assertFalse(existing_report_is_healthy(self.FP))
 
     def test_healthy_check_never_writes_or_modifies_anything(self):
-        # Pure read -- calling it (even repeatedly, even when it
-        # returns False) must never itself change DB or filesystem
-        # state; regeneration through the normal pipeline is the only
-        # sanctioned way to fix an unhealthy report.
-        text = "The real final script."
-        synthesize_road_report(text, "day", DAY_VOICE)
-        write_road_report_text(text)
-        track = Track.objects.get(filepath=str(road_report_path()))
-        before_ready2air = track.ready2air
-        before_text = road_report_text_path().read_text(encoding="utf-8")
-
-        existing_report_is_healthy(text)
-        existing_report_is_healthy("mismatched text")  # even a False-returning call
-
-        track.refresh_from_db()
-        self.assertEqual(track.ready2air, before_ready2air)
-        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), before_text)
+        self._publish()
+        def snapshot():
+            return (Track.objects.get(filepath=str(road_report_path())).ready2air,
+                    sorted((p.name, p.read_bytes()) for p in Path(self._tmpdir.name).iterdir() if p.is_file()))
+        before = snapshot()
+        existing_report_is_healthy(self.FP)
+        existing_report_is_healthy("b" * 64)
+        self.assertEqual(snapshot(), before)
 
 
 class AudioFormatVersionTests(TestCase):
