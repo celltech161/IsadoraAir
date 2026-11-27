@@ -1,8 +1,10 @@
 import os
+from typing import NamedTuple
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 from django.utils import timezone as dj_timezone
+from django.utils.dateparse import parse_datetime
 
 from library.models import Track
 from monitoring.models import emit_event
@@ -13,10 +15,8 @@ from road_conditions.report import (
     compose_semantic_script, compute_report_fingerprint, feed_freshness, select_events,
 )
 from road_conditions.synthesis import (
-    HELD, READY, RETIRED_BY_FRESHNESS, SynthesisError, discard_retirement_record,
-    hash_file_sha256, inspect_published_report, rearm_retired_report,
-    recover_interrupted_publication, retire_road_report, road_report_path,
-    synthesize_road_report,
+    ReportSuperseded, SynthesisError, hash_file_sha256, published_report_problem,
+    read_provenance, recover_incomplete_publication, road_report_path, synthesize_road_report,
 )
 from road_conditions.voice import VoiceResolutionError, resolve_voice
 
@@ -32,11 +32,26 @@ from road_conditions.voice import VoiceResolutionError, resolve_voice
 # THIS command with itself just exits immediately.
 GENERATE_ROAD_AUDIO_LOCK_KEY = (0x524F4144, 0x41554449)  # "ROAD"/"AUDI" as int32s, arbitrary
 
+# A render whose content changed while it was being made is redone at once
+# (the change's own trigger may have arrived while this run was busy), but
+# only this many times in one run.
+MAX_RENDER_PASSES = 2
+
+
+class CurrentReport(NamedTuple):
+    """What the report would say now, before any voice is chosen."""
+    events: list
+    event_scripts: list
+    body: str
+    config: RoadConditionsConfiguration
+    transition_sound_path: str | None
+    fingerprint: str
+
 
 class Command(BaseCommand):
     help = (
-        "Generate (or retire) the single, consolidated KanDrive road-report "
-        "audio from currently in-scope RoadEvent rows. See road_conditions/"
+        "Generate the single, consolidated KanDrive road-report audio from "
+        "currently in-scope RoadEvent rows, when its content has changed. See road_conditions/"
         "report.py (event selection + text) and road_conditions/synthesis.py "
         "(shared-TTS synthesis + Track lifecycle) for the actual logic -- this "
         "command is a thin CLI wrapper plus the overlap guard, matching "
@@ -50,7 +65,7 @@ class Command(BaseCommand):
                 "Preview everything a real run would do -- selected events, "
                 "the final script, the resolved voice, the intended category "
                 "and output file, and what existing asset (if any) would be "
-                "replaced or retired -- without writing anything: no TTS "
+                "replaced -- without writing anything: no TTS "
                 "call, no DB write, no file write."
             ),
         )
@@ -66,8 +81,8 @@ class Command(BaseCommand):
             "--force", action="store_true",
             help=(
                 "Generate even though the source feed is stale, failed, or "
-                "disabled (normally the command retires the existing report "
-                "instead of regenerating from data that can no longer be "
+                "disabled (normally the command leaves the existing report as it "
+                "is rather than rendering from data that can no longer be "
                 "trusted as current -- see feed_freshness() in report.py). "
                 "For manual verification only; a real generation cycle "
                 "should never need this."
@@ -91,6 +106,7 @@ class Command(BaseCommand):
             help=(
                 "Override the weather-schedule-resolved persona slot key for "
                 "this run only. Any configured Weather Voice Persona is accepted. "
+                "Renders if the published report is not already in this voice. "
                 "Development/testing use -- production omits this so KanDrive "
                 "automatically uses whichever persona weather's schedule says when "
                 "generation runs. See road_conditions/voice.py."
@@ -144,49 +160,95 @@ class Command(BaseCommand):
             self.stdout.write(build_event_script(event, now))
             return
 
-        freshness = feed_freshness()
-        if freshness != "fresh" and not options["force"]:
-            self.stdout.write(self.style.WARNING(
-                f"Feed freshness is {freshness!r}, not 'fresh' -- skipping generation "
-                "(a report built from stale/unavailable/disabled source data must not "
-                "keep airing as current). Use --force to generate anyway for manual "
-                "verification."
-            ))
-            if dry_run:
-                self.stdout.write("[DRY RUN] Would retire the existing KanDrive report, if any -- not regenerate.")
-                return
-            if retire_road_report():
-                self.stdout.write("Retired the existing KanDrive report (pulled out of rotation eligibility).")
-                emit_event(
-                    category="road_conditions", level="warning", title="KanDrive report retired",
-                    detail={"freshness": freshness},
-                    dedupe_key=f"road_conditions|kandrive-retired|{freshness}",
-                )
-            else:
-                self.stdout.write("No existing KanDrive report to retire.")
+        if not dry_run:
+            self._settle_incomplete_publication()
+
+        if text_only or dry_run:
+            self._preview(options, now, text_only)
             return
 
+        for render_pass in range(1, MAX_RENDER_PASSES + 1):
+            try:
+                self._check_and_render(options, dj_timezone.now())
+                return
+            except ReportSuperseded as exc:
+                self.stdout.write(self.style.WARNING(
+                    f"Discarded the new audio before publishing: {exc}."
+                    + (" Checking again." if render_pass < MAX_RENDER_PASSES else
+                       " Leaving it for the next successful road data retrieval.")
+                ))
+
+    def _settle_incomplete_publication(self):
+        """Needs no road data and no speech synthesis, so it runs first."""
+        outcome = recover_incomplete_publication()
+        if not outcome:
+            return
+        message = {
+            "completed": "Completed an earlier publication that had committed.",
+            "restored": "Restored the previous road report: an earlier publication did not complete.",
+            "discarded": "Removed unfinished audio from an earlier first publication.",
+            "abandoned": "Dropped the record of an earlier unfinished publication: the audio on disk "
+                         "has been replaced since, and is not being overwritten.",
+            "unrestorable": "An earlier publication did not complete and could not be undone; "
+                            "the report will be rendered again.",
+        }[outcome]
+        self.stdout.write(self.style.WARNING(message))
+        if outcome == "completed":
+            self._record_completed_publication()
+        else:
+            emit_event(
+                category="road_conditions", level="warning" if outcome != "unrestorable" else "error",
+                title="KanDrive publication did not complete", detail={"outcome": outcome},
+                dedupe_key=f"road_conditions|kandrive-publication-{outcome}",
+            )
+
+    @staticmethod
+    def _record_completed_publication():
+        """The bookkeeping an interrupted run never reached, taken from what
+        it did commit, so the same report is not rendered a second time."""
+        record, _problem = read_provenance()
+        if record is None or not record["semantic_fingerprint"]:
+            return
+        config = RoadConditionsConfiguration.load()
+        config.last_report_fingerprint = record["semantic_fingerprint"]
+        config.last_report_generated_at = (
+            parse_datetime(record.get("published_at") or "") or dj_timezone.now())
+        config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
+
+    def _freshness_allows(self, options, *, preview=False):
+        """False, having said so, when road data is not fresh. Nothing is
+        changed in that case: not the audio, and not Ready-to-Air."""
+        freshness = feed_freshness()
+        if freshness == "fresh" or options["force"]:
+            return True
+        self.stdout.write(self.style.WARNING(
+            f"Feed freshness is {freshness!r}, not 'fresh' -- skipping generation "
+            "(a report must not be rendered from stale, unavailable or disabled source "
+            "data). The last published report is left as it is: audio and Ready-to-Air "
+            "unchanged. Use --force to generate anyway for manual verification."
+        ))
+        if preview:
+            self.stdout.write("[DRY RUN] Would change nothing.")
+        return False
+
+    def _build_report(self, now, options, *, quiet=False):
+        """Event selection, voice-neutral text and transition sound --
+        everything that determines what the report says and how it is
+        assembled. No voice is resolved here: an unchanged, verified
+        report must not depend on voice configuration at all."""
         events = select_events(now)
-        if options["verbose"]:
+        if options["verbose"] and not quiet:
             for event in events:
                 self.stdout.write(
                     f"  {event.external_id} category={event.headline_category!r} "
                     f"priority={event.priority} route={event.primary_route!r}"
                 )
-
-        try:
-            if events:
-                event_scripts = build_event_scripts(events, now)
-                body = " ".join(event_scripts)
-            else:
-                event_scripts = []
-                body = build_no_events_message()
-        except ReportBuildError as exc:
-            emit_event(
-                category="road_conditions", level="error", title="KanDrive report text generation failed",
-                detail={"error": str(exc)}, dedupe_key="road_conditions|kandrive-report-build-failed",
-            )
-            raise CommandError(str(exc))
+        if events:
+            event_scripts = build_event_scripts(events, now)
+            body = " ".join(event_scripts)
+        else:
+            event_scripts = []
+            body = build_no_events_message()
 
         config = RoadConditionsConfiguration.load()
 
@@ -201,31 +263,21 @@ class Command(BaseCommand):
         transition_sound_fingerprint = None
         if len(events) >= 2 and config.transition_sound_enabled:
             candidate = (config.transition_sound_path or "").strip()
+            problem = f"Transition sound enabled but not found/readable at {candidate!r} -- generating without it."
             if candidate and os.path.exists(candidate):
                 # Hashed on every run the feature is active for -- see
                 # synthesis.hash_file_sha256() on why that is cheap
-                # enough not to need caching. A file that vanishes or
-                # cannot be read degrades like a missing one.
+                # enough not to need caching.
                 try:
                     transition_sound_fingerprint = hash_file_sha256(candidate)
                     transition_sound_path = candidate
                 except OSError as exc:
-                    self.stdout.write(self.style.WARNING(
-                        f"Transition sound became unreadable ({exc}) -- generating without it."
-                    ))
-            else:
-                self.stdout.write(self.style.WARNING(
-                    f"Transition sound enabled but not found/readable at {candidate!r} -- "
-                    "generating without it."
-                ))
+                    problem = f"Transition sound became unreadable ({exc}) -- generating without it."
+            if not transition_sound_path and not quiet:
+                self.stdout.write(self.style.WARNING(problem))
         # What this run would ACTUALLY do, not merely what is configured.
         transition_active = bool(transition_sound_path)
 
-        # The content identity: voice-neutral, computed after event
-        # selection, text composition and transition-sound resolution --
-        # everything that determines what the report says and how it is
-        # assembled. No voice is resolved yet: an unchanged, verified
-        # report must not depend on voice configuration at all.
         fingerprint = compute_report_fingerprint(
             compose_semantic_script(body, config),
             transition_active,
@@ -235,108 +287,136 @@ class Command(BaseCommand):
                 if transition_active else None
             ),
         )
+        return CurrentReport(events, event_scripts, body, config, transition_sound_path, fingerprint)
 
-        existing_fingerprint = config.last_report_fingerprint
+    def _build_report_or_fail(self, now, options):
+        try:
+            return self._build_report(now, options)
+        except ReportBuildError as exc:
+            emit_event(
+                category="road_conditions", level="error", title="KanDrive report text generation failed",
+                detail={"error": str(exc)}, dedupe_key="road_conditions|kandrive-report-build-failed",
+            )
+            raise CommandError(str(exc))
 
-        if not dry_run and recover_interrupted_publication():
-            self.stdout.write(self.style.WARNING(
-                "Restored the previous report audio: an earlier publication was interrupted "
-                "before the Track was updated."
-            ))
-        # Verified against the published audio's own provenance. A
-        # matching fingerprint alone is NEVER sufficient to skip.
-        state = inspect_published_report(fingerprint)
-        unchanged = (
-            not options["regenerate"]
-            and bool(existing_fingerprint) and existing_fingerprint == fingerprint
-            and not state.problem
-        )
-        would_skip = unchanged and state.readiness in (READY, HELD)
-        would_rearm = unchanged and state.readiness == RETIRED_BY_FRESHNESS and freshness == "fresh"
-        reason = self._render_reason(options, state, existing_fingerprint, fingerprint)
+    def _render_reason(self, options, now, report):
+        """Why audio must be rendered, or "" if the published report stands.
+        A matching fingerprint is never enough: the published audio must
+        verify too. Ready-to-Air plays no part."""
+        if options["regenerate"]:
+            return "operator_regenerate"
+        problem = published_report_problem(report.fingerprint)
+        if problem in ("publication_incomplete", "provenance_missing", "provenance_invalid"):
+            return problem
+        existing = report.config.last_report_fingerprint
+        if existing != report.fingerprint:
+            return "content_changed" if existing else "no_previous_report"
+        if problem:
+            return problem
+        # An explicit --voice asks for the report in that voice, as it
+        # always has; the scheduled voice never does.
+        if options["voice"]:
+            slot, voice, text = self._compose_for_voice(options, now, report.body, report.config)
+            if not self._published_in_voice(slot, voice, text):
+                return "explicit_voice"
+        return ""
 
+    @staticmethod
+    def _published_in_voice(slot, voice, text):
+        record, _problem = read_provenance()
+        try:
+            return (record["script"] == text and record["announcer"]["slot"] == slot
+                    and record["voice"]["engine"] == voice.get("engine")
+                    and record["voice"]["provider_voice"] == voice.get("model"))
+        except (KeyError, TypeError):
+            return False
+
+    def _preview(self, options, now, text_only):
+        """--dry-run / --text-only: reads only."""
+        if not self._freshness_allows(options, preview=True):
+            return
+        report = self._build_report_or_fail(now, options)
+        reason = self._render_reason(options, now, report)
+        slot, voice, text = self._compose_for_voice(options, now, report.body, report.config)
         if text_only:
-            _slot, _voice, text = self._compose_for_voice(options, now, body, config)
             self.stdout.write(text)
             return
-
-        if dry_run:
-            slot, voice, text = self._compose_for_voice(options, now, body, config)
-            final_path = road_report_path()
-            self.stdout.write(f"[DRY RUN] Selected {len(events)} event(s).")
-            self.stdout.write(f"[DRY RUN] Voice: slot={slot!r} model={voice['model']!r} name={voice['name']!r}")
-            self.stdout.write("[DRY RUN] Intended category: KanDrive")
-            self.stdout.write(f"[DRY RUN] Intended output file: {final_path}")
-            if transition_sound_path:
-                count = len(compose_report_segments(event_scripts, config, announcer_name=voice["name"]))
-                self.stdout.write(
-                    f"[DRY RUN] Transition sound: {transition_sound_path} "
-                    f"(between {count} items, {count - 1} insertion(s))"
-                )
-            existing = Track.objects.filter(filepath=str(final_path)).first()
-            if existing:
-                self.stdout.write(
-                    f"[DRY RUN] Would replace existing Track id={existing.id} "
-                    f"(currently ready2air={existing.ready2air})."
-                )
-            else:
-                self.stdout.write("[DRY RUN] No existing KanDrive Track -- would create a new one.")
-            self.stdout.write(f"[DRY RUN] Report fingerprint: {fingerprint}")
-            self.stdout.write(f"[DRY RUN] Existing successful fingerprint: {existing_fingerprint or '(none)'}")
-            self.stdout.write(f"[DRY RUN] Would skip generation: {'yes' if would_skip or would_rearm else 'no'}")
-            if would_rearm:
-                self.stdout.write("[DRY RUN] Would re-arm the retired report without rendering.")
-            elif not would_skip:
-                self.stdout.write(f"[DRY RUN] Render reason: {reason}")
-            self.stdout.write("[DRY RUN] Final script:")
-            self.stdout.write(text)
-            return
-
-        if would_skip:
-            if state.readiness == READY:
-                discard_retirement_record()
-                self.stdout.write(
-                    "KanDrive report unchanged since last successful generation; "
-                    f"skipping synthesis and analysis. [fingerprint {fingerprint[:12]}]"
-                )
-            else:
-                self.stdout.write(
-                    "KanDrive report unchanged since last successful generation but held off air "
-                    "(ready2air was cleared outside road-data freshness); leaving it held, "
-                    f"skipping synthesis. [fingerprint {fingerprint[:12]}]"
-                )
-            return
-
-        if would_rearm:
-            if rearm_retired_report(fingerprint):
-                self.stdout.write(
-                    "KanDrive report re-armed without synthesis: road data is fresh again, content "
-                    "is unchanged and the published audio verifies. "
-                    f"[fingerprint {fingerprint[:12]}]"
-                )
-                return
-            reason = "retired_report_not_rearmable"
-
+        final_path = road_report_path()
+        self.stdout.write(f"[DRY RUN] Selected {len(report.events)} event(s).")
+        self.stdout.write(f"[DRY RUN] Voice: slot={slot!r} model={voice['model']!r} name={voice['name']!r}")
+        self.stdout.write("[DRY RUN] Intended category: KanDrive")
+        self.stdout.write(f"[DRY RUN] Intended output file: {final_path}")
+        if report.transition_sound_path:
+            count = len(compose_report_segments(report.event_scripts, report.config, announcer_name=voice["name"]))
+            self.stdout.write(
+                f"[DRY RUN] Transition sound: {report.transition_sound_path} "
+                f"(between {count} items, {count - 1} insertion(s))"
+            )
+        existing = Track.objects.filter(filepath=str(final_path)).first()
+        if existing:
+            self.stdout.write(
+                f"[DRY RUN] Would replace existing Track id={existing.id} "
+                f"(currently ready2air={existing.ready2air})."
+            )
+        else:
+            self.stdout.write("[DRY RUN] No existing KanDrive Track -- would create a new one.")
+        self.stdout.write(f"[DRY RUN] Report fingerprint: {report.fingerprint}")
         self.stdout.write(
-            f"KanDrive render needed: reason={reason} fingerprint={fingerprint[:12]} "
-            f"previous={existing_fingerprint[:12] or 'none'}"
+            f"[DRY RUN] Existing successful fingerprint: {report.config.last_report_fingerprint or '(none)'}")
+        self.stdout.write(f"[DRY RUN] Would skip generation: {'no' if reason else 'yes'}")
+        if reason:
+            self.stdout.write(f"[DRY RUN] Render reason: {reason}")
+        self.stdout.write("[DRY RUN] Final script:")
+        self.stdout.write(text)
+
+    def _check_and_render(self, options, now):
+        if not self._freshness_allows(options):
+            return
+        report = self._build_report_or_fail(now, options)
+        reason = self._render_reason(options, now, report)
+        if not reason:
+            self.stdout.write(
+                "KanDrive report unchanged since last successful generation; "
+                f"skipping synthesis and analysis. [fingerprint {report.fingerprint[:12]}]"
+            )
+            return
+
+        config = report.config
+        self.stdout.write(
+            f"KanDrive render needed: reason={reason} fingerprint={report.fingerprint[:12]} "
+            f"previous={config.last_report_fingerprint[:12] or 'none'}"
         )
 
         # Voice resolved only now that audio is really going to be made.
         # Its name is spoken, so it is resolved before final composition.
-        slot, voice, text = self._compose_for_voice(options, now, body, config)
+        slot, voice, text = self._compose_for_voice(options, now, report.body, config)
         segments = (
-            compose_report_segments(event_scripts, config, announcer_name=self._announcer_name(voice))
-            if transition_active else None
+            compose_report_segments(report.event_scripts, config, announcer_name=self._announcer_name(voice))
+            if report.transition_sound_path else None
         )
+
+        def superseded():
+            """Re-reads the authoritative data just before publication."""
+            if not options["force"] and feed_freshness() != "fresh":
+                return "the road data is no longer fresh"
+            try:
+                current = self._build_report(dj_timezone.now(), options, quiet=True)
+            except ReportBuildError:
+                return "the report can no longer be built"
+            if current.fingerprint != report.fingerprint:
+                return "the report content changed while it was being rendered"
+            return ""
 
         try:
             # Publishes the audio, Track, waveform, road_report.txt and
             # provenance together; see synthesis._publish_report().
             track = synthesize_road_report(
-                text, slot, voice, segments=segments, transition_sound_path=transition_sound_path,
-                semantic_fingerprint=fingerprint,
+                text, slot, voice, segments=segments,
+                transition_sound_path=report.transition_sound_path,
+                semantic_fingerprint=report.fingerprint, superseded=superseded,
             )
+        except ReportSuperseded:
+            raise
         except SynthesisError as exc:
             emit_event(
                 category="road_conditions", level="error", title="KanDrive audio generation failed",
@@ -347,7 +427,7 @@ class Command(BaseCommand):
         # Fingerprint/timestamp persisted ONLY here, after the whole
         # publication has succeeded, so they can never come to describe a
         # cycle that did not complete.
-        config.last_report_fingerprint = fingerprint
+        config.last_report_fingerprint = report.fingerprint
         config.last_report_generated_at = dj_timezone.now()
         try:
             config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
@@ -362,33 +442,10 @@ class Command(BaseCommand):
                 f"published, but failed to persist the generation fingerprint: {exc}"
             )
 
-        if not track.ready2air:
-            self.stdout.write(self.style.WARNING(
-                "The new KanDrive report was published but left held off air: ready2air had been "
-                "cleared outside road-data freshness."
-            ))
-            emit_event(
-                category="road_conditions", level="warning",
-                title="New KanDrive report published but held off air",
-                detail={"track_id": track.id}, dedupe_key="road_conditions|kandrive-held",
-            )
         self.stdout.write(
-            f"Generated KanDrive report: track id={track.id}, {len(events)} event(s), "
+            f"Generated KanDrive report: track id={track.id}, {len(report.events)} event(s), "
             f"voice={voice['name']} ({slot}), duration={track.duration_seconds:.1f}s."
         )
-
-    @staticmethod
-    def _render_reason(options, state, existing_fingerprint, fingerprint):
-        """Why a render is needed, for the journal."""
-        if options["regenerate"]:
-            return "operator_regenerate"
-        if state.problem in ("provenance_missing", "provenance_invalid"):
-            return state.problem
-        if existing_fingerprint != fingerprint:
-            return "content_changed" if existing_fingerprint else "no_previous_report"
-        if state.problem:
-            return state.problem
-        return f"readiness_{state.readiness}"
 
     @staticmethod
     def _announcer_name(voice):

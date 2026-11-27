@@ -45,11 +45,18 @@ final_path (and its Track row) completely untouched -- the last
 known-good report keeps airing rather than going silent or corrupt. A
 failure during publication restores it (see _publish_report()).
 
+Ready-to-Air (1.24-B): this workflow sets ready2air=True when a newly
+rendered, validated report has been published completely. It never
+writes the flag otherwise -- not for failed or stale road data, a failed
+render, an unchanged report, or the feature being disabled. Station
+personnel keep the ordinary Library controls.
+
 Three separate identities (1.24-B):
   * what the report says: report.compute_report_fingerprint(),
     voice-neutral, the only routine reason to render again;
   * how fresh the road data is: RoadConditionsConfiguration.
-    last_fetch_*; stale or failed data retires the report;
+    last_fetch_*; stale or failed data stops new renders and notifies
+    staff (alerts.py) while the last published report stays on air;
   * what is actually on disk: road_report.json beside the audio
     ("provenance") -- the rendered script, hashes, announcer, voice,
     engine, model and settings of the published recording. It is written
@@ -85,6 +92,7 @@ import math
 import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 from typing import NamedTuple
 
@@ -151,6 +159,11 @@ class SynthesisError(Exception):
     module never leaves a partial file at final_path either way."""
 
 
+class ReportSuperseded(SynthesisError):
+    """The road data or report content changed while the audio was being
+    rendered, so the candidate was thrown away before touching anything."""
+
+
 def road_report_path():
     """Public accessor for the single, stable KanDrive output path --
     callers (the management command's preview output) use this rather
@@ -179,11 +192,10 @@ def write_road_report_text(text):
     completely untouched -- it is never truncated or opened for
     in-place writing.
 
-    Called only by _publish_report(), after the FLAC has been replaced,
-    the Track updated AND waveform analysis has succeeded -- so
-    road_report.txt never describes a publication that failed before
-    that point. Never reached from a --dry-run, --text-only or --event-id
-    path, nor from retirement."""
+    Called by _publish_report(), after the FLAC has been replaced, the
+    Track updated AND waveform analysis has succeeded, and by recovery to
+    put the previous script back. Never reached from a --dry-run,
+    --text-only or --event-id path."""
     KANDRIVE_ROOT.mkdir(parents=True, exist_ok=True)
     final_text_path = road_report_text_path()
     pid = os.getpid()
@@ -216,40 +228,24 @@ def hash_file_sha256(path):
 
 
 # ---------------------------------------------------------------------------
-# Published-artifact provenance, health and readiness
+# Published-artifact provenance, health and publication recovery
 # ---------------------------------------------------------------------------
 
 PROVENANCE_VERSION = 1
 KANDRIVE_PROVENANCE_FILENAME = "road_report.json"
-# Written only when road-data freshness itself takes the report off air.
-KANDRIVE_RETIREMENT_FILENAME = "road_report.retired.json"
-# The audio being replaced, kept until its replacement is completely
-# published. Not an audio extension, so library scans ignore it.
+# Both exist only while a publication is incomplete: what to go back to,
+# and the audio being replaced. Neither is an audio extension, so library
+# scans ignore them.
+KANDRIVE_PENDING_FILENAME = "road_report.publishing.json"
 KANDRIVE_PREVIOUS_FILENAME = ".road_report.flac.previous"
-_DURATION_TOLERANCE_SECONDS = 0.5
-
-# ReportState.readiness values.
-READY = "ready"
-RETIRED_BY_FRESHNESS = "retired_by_freshness"  # ours, and nothing has touched the Track row since
-HELD = "held"                  # taken off air by something else: left that way
-UNATTRIBUTED = "unattributed"  # cannot be established: the ordinary recovery render applies
-ABSENT = "absent"              # no Track row yet
-
-
-class ReportState(NamedTuple):
-    # "" only when the audio, script, Track and provenance all verify AND
-    # describe the content asked about.
-    problem: str
-    readiness: str
-    provenance: dict | None
 
 
 def road_report_provenance_path():
     return KANDRIVE_ROOT / KANDRIVE_PROVENANCE_FILENAME
 
 
-def road_report_retirement_path():
-    return KANDRIVE_ROOT / KANDRIVE_RETIREMENT_FILENAME
+def road_report_pending_path():
+    return KANDRIVE_ROOT / KANDRIVE_PENDING_FILENAME
 
 
 def road_report_previous_path():
@@ -287,8 +283,11 @@ def _sha256_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
+def _read_text_or_none(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
 
 
 def read_provenance():
@@ -301,97 +300,47 @@ def read_provenance():
         return None, "provenance_invalid"
     try:
         record = json.loads(raw)
-        track = record["track"]
+        track_id = record["track"]["id"]
         valid = (
             record["provenance_version"] == PROVENANCE_VERSION
             and all(isinstance(record[key], str)
                     for key in ("semantic_fingerprint", "flac_sha256", "script", "script_sha256"))
-            and _is_int(track["id"]) and _is_int(track["cue_marker_revision"])
-            and isinstance(track["duration_seconds"], (int, float))
+            and isinstance(track_id, int) and not isinstance(track_id, bool)
         )
     except (ValueError, KeyError, TypeError):
         valid = False
     return (record, "") if valid else (None, "provenance_invalid")
 
 
-def _published_track(*, lock=False):
-    queryset = Track.objects.filter(filepath=str(_final_path()))
-    if lock:
-        # NO KEY UPDATE: does not block rows that merely reference this Track.
-        queryset = queryset.select_for_update(no_key=True)
-    return queryset.first()
+def _published_track():
+    return Track.objects.filter(filepath=str(_final_path())).first()
 
 
-def _track_row_version(track_id):
-    """PostgreSQL's version stamp of the Track row. EVERY update of the
-    row changes it, which is how a retirement can tell that nothing has
-    touched the Track since."""
-    with connection.cursor() as cur:
-        cur.execute(f"SELECT xmin::text FROM {Track._meta.db_table} WHERE id = %s", [track_id])
-        row = cur.fetchone()
-    return row[0] if row else None
+def published_report_problem(semantic_fingerprint):
+    """"" only if the published audio, script, Track and provenance all
+    verify AND describe `semantic_fingerprint`; otherwise why not.
 
-
-def _provenance_describes_publication(provenance):
-    """True if `provenance` describes the audio now in place, or the audio
-    an interrupted publication was replacing. A record left behind by
-    anything else (such as an older release) proves nothing."""
-    if provenance is None:
-        return False
-    return provenance["flac_sha256"] in {
-        digest for digest in (_sha256_or_none(_final_path()),
-                              _sha256_or_none(road_report_previous_path()))
-        if digest
-    }
-
-
-def _readiness(track, provenance, describes=None):
-    """Why the Track is, or is not, eligible to air.
-
-    A Track that is not ready2air is HELD only on positive evidence: a
-    provenance record of this publication for this Track, and no record
-    that road-data freshness retired it. Anything short of proof is
-    UNATTRIBUTED, so a lost or damaged record can never keep road
-    information off air indefinitely."""
-    if track is None:
-        return ABSENT
-    if track.ready2air:
-        return READY
-    if describes is None:
-        describes = _provenance_describes_publication(provenance)
-    if not describes or provenance["track"]["id"] != track.id:
-        return UNATTRIBUTED
-    try:
-        record = json.loads(road_report_retirement_path().read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return HELD
-    except (OSError, ValueError):
-        return UNATTRIBUTED
-    if (isinstance(record, dict) and record.get("track_id") == track.id
-            and record.get("row_version")
-            and record["row_version"] == _track_row_version(track.id)):
-        return RETIRED_BY_FRESHNESS
-    return UNATTRIBUTED
-
-
-def _artifact_problem(semantic_fingerprint, track, provenance, provenance_problem):
+    Verified against the publication's own provenance, never against a
+    newly composed script, which names whichever announcer is scheduled
+    now. Ready-to-Air plays no part: it belongs to the Library. Read-only."""
+    if road_report_pending_path().exists():
+        return "publication_incomplete"
     final_path = road_report_path()
     if not final_path.exists():
         return "flac_missing"
+    provenance, problem = read_provenance()
     if provenance is None:
-        return provenance_problem
-    if provenance.get("invalidated"):
-        return "previous_publication_incomplete"
+        return problem
     if _sha256_or_none(final_path) != provenance["flac_sha256"]:
         return "flac_mismatch"
-    try:
-        script = road_report_text_path().read_text(encoding="utf-8")
-    except FileNotFoundError:
+    if not road_report_text_path().exists():
         return "text_missing"
-    except (OSError, UnicodeError):
+    script = _read_text_or_none(road_report_text_path())
+    if script is None or not (
+        _sha256_text(script) == provenance["script_sha256"] == _sha256_text(provenance["script"])
+    ):
         return "text_mismatch"
-    if not (_sha256_text(script) == provenance["script_sha256"] == _sha256_text(provenance["script"])):
-        return "text_mismatch"
+    track = _published_track()
     if track is None:
         return "track_missing"
     if track.id != provenance["track"]["id"]:
@@ -401,95 +350,175 @@ def _artifact_problem(semantic_fingerprint, track, provenance, provenance_proble
     return ""
 
 
-def inspect_published_report(semantic_fingerprint):
-    """Verifies the published report against its own provenance -- never
-    against a newly composed script, which names whichever announcer is
-    scheduled now. Read-only."""
-    provenance, provenance_problem = read_provenance()
-    track = _published_track()
-    return ReportState(
-        _artifact_problem(semantic_fingerprint, track, provenance, provenance_problem),
-        _readiness(track, provenance),
-        provenance,
-    )
-
-
 def existing_report_is_healthy(semantic_fingerprint):
-    """True only if the published audio, script, Track and provenance all
-    verify, describe `semantic_fingerprint`, and the Track is eligible to
-    air. A matching stored fingerprint alone is never enough to skip.
-    Repairs nothing."""
-    state = inspect_published_report(semantic_fingerprint)
-    return not state.problem and state.readiness == READY
+    """A matching stored fingerprint alone is never enough to skip a
+    render. Repairs nothing."""
+    return not published_report_problem(semantic_fingerprint)
 
 
-def _write_retirement_record(track_id, row_version):
+def _waveform_witness(track):
     try:
-        _write_json_atomically(road_report_retirement_path(), {
-            "retired_by": "road_data_freshness", "track_id": track_id,
-            "row_version": row_version, "recorded_at": dj_timezone.now().isoformat(),
-        })
-        return True
-    except OSError as exc:
-        logger.warning("road_conditions: could not record the report retirement: %s", exc)
-        return False
+        info = os.stat(track.waveform_path) if track.waveform_path else None
+    except OSError:
+        info = None
+    return [info.st_ino, info.st_size, info.st_mtime_ns] if info else None
 
 
-def discard_retirement_record():
-    _remove_quietly(road_report_retirement_path())
+def _read_pending():
+    try:
+        record = json.loads(road_report_pending_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    keys = {"publication_id", "new_flac_sha256", "previous_flac_sha256", "previous_script",
+            "previous_track"}
+    return record if isinstance(record, dict) and keys <= record.keys() else None
 
 
-def rearm_retired_report(semantic_fingerprint):
-    """Puts a report that road-data freshness retired back on air without
-    rendering. Only when its audio and script verify, its provenance is
-    for exactly `semantic_fingerprint`, its Track is still the same
-    KanDrive FLAC, and the retirement is provably still ours (nothing has
-    updated the Track row since). The caller must already have found the
-    feed fresh. Returns False, changing nothing, otherwise."""
-    with transaction.atomic():
-        track = _published_track(lock=True)
-        state = inspect_published_report(semantic_fingerprint)
-        if track is None or state.problem or state.readiness != RETIRED_BY_FRESHNESS:
-            return False
-        if not (
-            track.format == "flac"
-            and track.category_id == _kandrive_category().id
-            and abs((track.duration_seconds or 0) - state.provenance["track"]["duration_seconds"])
-            <= _DURATION_TOLERANCE_SECONDS
-        ):
-            return False
-        Track.objects.filter(pk=track.pk).update(ready2air=True)
-    discard_retirement_record()
-    return True
-
-
-def recover_interrupted_publication():
-    """After a publication that was killed part-way: if the audio was
-    replaced but the Track row never was, put the previous recorded audio
-    back, so audio, Track and provenance agree again. In every other case
-    nothing is restored; unrecorded audio fails the health check and is
-    rendered again. Returns True if the previous audio was restored.
-
-    Only call while holding the generator's command lock."""
+def _begin_publication(candidate):
+    """Records what to go back to, then replaces the audio; returns the new
+    publication's id. If an earlier publication is still incomplete, its
+    record of the last COMPLETE publication is kept rather than overwritten
+    with a half-published one."""
+    final_path = _final_path()
     previous = road_report_previous_path()
-    final_path = road_report_path()
-    if not previous.exists():
-        return False
+    record = _read_pending()
+    if record is None or not (
+        record["previous_flac_sha256"] is None
+        or _sha256_or_none(previous) == record["previous_flac_sha256"]
+    ):
+        previous.unlink(missing_ok=True)
+        previous_sha256 = None
+        if final_path.exists():
+            os.link(final_path, previous)
+            previous_sha256 = hash_file_sha256(previous)
+        track = _published_track()
+        record = {
+            "previous_flac_sha256": previous_sha256,
+            "previous_script": _read_text_or_none(road_report_text_path()),
+            "previous_track": None if track is None else {
+                "id": track.id, "title": track.title, "duration_seconds": track.duration_seconds,
+                "cue_marker_revision": track.cue_marker_revision, "waveform": _waveform_witness(track),
+            },
+        }
+    # Names this attempt. Only a provenance record carrying it proves that
+    # this publication committed: the audio hash cannot, because a
+    # re-render can be byte-identical to what it replaces.
+    record["publication_id"] = uuid.uuid4().hex
+    record["new_flac_sha256"] = hash_file_sha256(candidate)
+    record["started_at"] = dj_timezone.now().isoformat()
+    _write_json_atomically(road_report_pending_path(), record)
+    # Atomic -- no reader ever sees a partially-written final_path.
+    os.replace(candidate, final_path)
+    return record["publication_id"]
+
+
+def _finish_publication():
+    """The only place this workflow writes Ready-to-Air: after the
+    provenance record has committed the publication. Safe to repeat."""
+    Track.objects.filter(filepath=str(_final_path())).update(ready2air=True)
+    road_report_pending_path().unlink(missing_ok=True)
+    _remove_quietly(road_report_previous_path())
+
+
+def recover_incomplete_publication():
+    """Settles a publication that failed or was killed part-way, without
+    rendering anything. Only call while holding the generator's command
+    lock. Returns:
+
+      ""             nothing was incomplete;
+      "completed"    it had committed: finished (Ready-to-Air enabled);
+      "restored"     the previous recording is back, with its script and
+                     Track metadata (re-analyzed if analysis had changed
+                     markers or waveform). Ready-to-Air is not touched;
+      "discarded"    there was no previous recording: the unfinished
+                     audio was removed;
+      "abandoned"    the audio on disk is neither side of that
+                     publication (something else wrote it, such as an
+                     older release after a rollback): the stale record is
+                     dropped and nothing is overwritten;
+      "unrestorable" it could not be completed. The pending record stays,
+                     so the report keeps failing the health check and is
+                     rendered again."""
+    if not road_report_pending_path().exists():
+        _remove_quietly(road_report_previous_path())
+        return ""
+    record = _read_pending()
+    if record is None:
+        return "unrestorable"
+    final_path = _final_path()
+    current_sha256 = _sha256_or_none(final_path)
     provenance, _problem = read_provenance()
-    if provenance is None:
-        return False
-    if _sha256_or_none(final_path) == provenance["flac_sha256"]:
-        _remove_quietly(previous)          # leftover: the recorded audio is in place
-        return False
-    if _sha256_or_none(previous) != provenance["flac_sha256"]:
-        return False
+    if (provenance is not None
+            and provenance.get("publication_id") == record["publication_id"]
+            and current_sha256 == provenance["flac_sha256"]):
+        _finish_publication()
+        return "completed"
+
+    previous_sha256 = record["previous_flac_sha256"]
+    if current_sha256 not in (None, previous_sha256, record["new_flac_sha256"]):
+        road_report_pending_path().unlink(missing_ok=True)
+        _remove_quietly(road_report_previous_path())
+        return "abandoned"
+    if previous_sha256 is None:
+        if current_sha256 == record["new_flac_sha256"]:
+            final_path.unlink(missing_ok=True)
+        if record["previous_script"] is None:
+            _remove_quietly(road_report_text_path())
+        elif _read_text_or_none(road_report_text_path()) != record["previous_script"]:
+            write_road_report_text(record["previous_script"])
+        before, row = record["previous_track"], _published_track()
+        if before is not None and row is not None and row.id == before["id"]:
+            _restore_track_columns(before, row)
+        road_report_pending_path().unlink(missing_ok=True)
+        return "discarded"
+
+    if current_sha256 != previous_sha256:
+        previous = road_report_previous_path()
+        if _sha256_or_none(previous) != previous_sha256:
+            return "unrestorable"
+        # The kept copy stays until the whole restore has succeeded.
+        restoring = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{os.getpid()}.restore"
+        restoring.unlink(missing_ok=True)
+        os.link(previous, restoring)
+        os.replace(restoring, final_path)
+    script = record["previous_script"]
+    if script is not None and _read_text_or_none(road_report_text_path()) != script:
+        write_road_report_text(script)
+    if not _restore_track(record["previous_track"]):
+        return "unrestorable"
+    road_report_pending_path().unlink(missing_ok=True)
+    _remove_quietly(road_report_previous_path())
+    return "restored"
+
+
+def _restore_track_columns(before, track):
+    """The only two columns a publication changes that vary between reports."""
+    if (track.title, track.duration_seconds) != (before["title"], before["duration_seconds"]):
+        Track.objects.filter(pk=track.pk).update(
+            title=before["title"], duration_seconds=before["duration_seconds"])
+
+
+def _restore_track(before):
+    """Puts back what a publication changes on the Track, and nothing else:
+    never Ready-to-Air or any column it does not write. Cue markers and
+    waveform are recomputed from the restored audio, through the ordinary
+    analysis and cue-marker authority, only if they had changed."""
     track = _published_track()
-    recorded = provenance["track"]
-    if (track is None or track.id != recorded["id"]
-            or track.cue_marker_revision != recorded["cue_marker_revision"]
-            or track.duration_seconds != recorded["duration_seconds"]):
+    if before is None or track is None or track.id != before["id"]:
+        return True
+    _restore_track_columns(before, track)
+    if (track.cue_marker_revision == before["cue_marker_revision"]
+            and _waveform_witness(track) == before["waveform"]):
+        return True
+    try:
+        track.refresh_from_db()
+        analyzed = _run_full_analysis(track)
+    except Exception as exc:  # noqa: BLE001 -- leaves "unrestorable"; the report is rendered again
+        logger.warning("road_conditions: re-analysis of the restored report failed: %s", exc)
         return False
-    os.replace(previous, final_path)
+    if not analyzed:
+        return False
+    _finish_waveform(analyzed)
     return True
 
 
@@ -694,7 +723,7 @@ def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_fla
 
 
 def synthesize_road_report(text, voice_slot, voice, segments=None, transition_sound_path=None,
-                           *, semantic_fingerprint=""):
+                           *, semantic_fingerprint="", superseded=None):
     """Renders `text` through the shared TTS service via
     _synthesize_segment_wav() below, using the already-resolved
     `voice` dict (see road_conditions/voice.py's resolve_voice(), which
@@ -741,14 +770,17 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
     silently produce misleading audio" applies just as much to a
     synthesis-level failure).
 
+    `superseded`, if given, is called once the candidate has been
+    validated and before anything is replaced; a non-empty string raises
+    ReportSuperseded with that reason.
+
     Publication (_publish_report()) covers the FLAC, the Track, waveform
     analysis, road_report.txt and the provenance record, which names
     `semantic_fingerprint` and is written last. Without a
     `semantic_fingerprint` the published report never verifies as
     current.
 
-    Returns the Track instance on success. Its ready2air is False only if
-    an operator hold was in force (see _readiness())."""
+    Returns the Track instance on success, with ready2air=True."""
 
     use_transitions = bool(segments) and len(segments) > 1 and bool(transition_sound_path)
 
@@ -801,6 +833,11 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                 OSError, audio_identity.IdentityUnavailable) as exc:
             raise SynthesisError(f"Shared-TTS/ffmpeg synthesis failed: {exc}") from exc
 
+        if superseded is not None:
+            reason = superseded()
+            if reason:
+                raise ReportSuperseded(reason)
+
         rendering = {
             "audio_format_version": AUDIO_FORMAT_VERSION,
             "loudnorm": LOUDNORM_TARGETS,
@@ -822,70 +859,45 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                 pass
 
 
-_RESTORABLE_TRACK_FIELDS = (
-    "filename", "format", "title", "artist_id", "duration_seconds", "category_id",
-)
-
-
 def _publish_report(candidate, text, voice_slot, voice, duration, semantic_fingerprint, rendering):
     """Replaces the published report with the validated `candidate`.
 
-    Until it succeeds completely the provenance record does not describe
-    the new audio, so nothing half-published can verify as healthy -- even
-    if the process is killed. The replaced audio stays at
-    road_report_previous_path() until then.
+    While it is incomplete a pending record says what to go back to, so a
+    half-published report never verifies as healthy, even if the process
+    is killed. In order: replace the FLAC, update the Track, run waveform
+    analysis, write road_report.txt, write the provenance record (the
+    commit point), then enable Ready-to-Air. A failure before the commit
+    restores the previous recording (recover_incomplete_publication());
+    one after it is completed by the next run.
 
-      1. replace the FLAC, update the Track, run waveform analysis. A
-         failure restores the previous audio and Track fields;
-      2. write road_report.txt, then the provenance record (the commit
-         point). A failure here leaves the new, analyzed audio in place,
-         marked unrecorded, to be rendered again.
-
-    No database transaction spans the analysis: the engine updates this
-    Track row from its main loop when the report starts to air, and must
-    never wait behind a decode."""
+    Ready-to-Air is not written before the commit: it is neither a lock
+    nor part of recovery. No database transaction or row lock spans the
+    decode or analysis: the engine updates this Track row from its main
+    loop when the report starts to air, and must never wait behind them."""
     final_path = _final_path()
-    previous = road_report_previous_path()
-    old_provenance, _problem = read_provenance()
-    # Judged before any file moves, while the record can still be matched.
-    describes = _provenance_describes_publication(old_provenance)
     try:
         flac_sha256 = hash_file_sha256(candidate)
-        flac_bytes = candidate.stat().st_size
-        previous.unlink(missing_ok=True)
-        had_audio = final_path.exists()
-        if had_audio:
-            os.link(final_path, previous)
-        # Atomic -- no reader ever sees a partially-written final_path.
-        os.replace(candidate, final_path)
-    except OSError as exc:
+        publication_id = _begin_publication(candidate)
+    except BaseException as exc:
+        _recover_after_failure(exc)
+        if not isinstance(exc, Exception):
+            raise
         raise SynthesisError(f"KanDrive publication could not start: {exc}") from exc
 
-    row_before = None
-    track = None
-    ready = True
     try:
-        with transaction.atomic():           # short: the row decision and update only
-            row = _published_track(lock=True)
-            if row is not None:
-                row_before = {name: getattr(row, name)
-                              for name in (*_RESTORABLE_TRACK_FIELDS, "ready2air")}
-            # Evaluated now, under the row lock, so a hold placed while
-            # this render was running is honored.
-            ready = _readiness(row, old_provenance, describes) != HELD
-            track, _created = Track.objects.update_or_create(
-                filepath=str(final_path),
-                defaults=dict(
-                    filename=final_path.name,
-                    format="flac",
-                    title=f"KanDrive Road Report ({voice['name']})",
-                    artist=_kandrive_artist(),
-                    duration_seconds=duration,
-                    category=_kandrive_category(),
-                    ready2air=ready,
-                ),
-            )
-
+        # Only the columns a publication owns (update_or_create saves just
+        # these), so anything else changed meanwhile is left alone.
+        track, _created = Track.objects.update_or_create(
+            filepath=str(final_path),
+            defaults=dict(
+                filename=final_path.name,
+                format="flac",
+                title=f"KanDrive Road Report ({voice['name']})",
+                artist=_kandrive_artist(),
+                duration_seconds=duration,
+                category=_kandrive_category(),
+            ),
+        )
         # Full, real analysis -- unlike the Dedications intro pattern, this
         # Track IS meant to crossfade normally in rotation, so it needs
         # actual envelope-based cue points, not a speech-clip opt-out. A
@@ -893,28 +905,18 @@ def _publish_report(candidate, text, voice_slot, voice, duration, semantic_finge
         # builder, so a failed analysis fails the publication.
         analyzed = _run_full_analysis(track)
         if not analyzed:
-            raise SynthesisError(
-                f"KanDrive Track {track.id} was created/updated but waveform analysis failed "
-                "-- the previous report was restored."
-            )
+            raise SynthesisError(f"waveform analysis of the new report (Track {track.id}) failed")
         _finish_waveform(analyzed)
         track.refresh_from_db()
-    except BaseException as exc:
-        _roll_back_publication(track, row_before, ready, had_audio, describes, old_provenance, exc)
-        if isinstance(exc, SynthesisError) or not isinstance(exc, Exception):
-            raise
-        raise SynthesisError(f"KanDrive publication failed: {exc}") from exc
-
-    try:
         write_road_report_text(text)
         _write_json_atomically(road_report_provenance_path(), {
             "provenance_version": PROVENANCE_VERSION,
+            "publication_id": publication_id,
             "semantic_fingerprint": semantic_fingerprint,
             "published_at": dj_timezone.now().isoformat(),
             "script": text,
             "script_sha256": _sha256_text(text),
             "flac_sha256": flac_sha256,
-            "flac_bytes": flac_bytes,
             "announcer": {
                 "slot": voice_slot, "name": voice.get("name"), "full_name": voice.get("full_name"),
             },
@@ -927,24 +929,35 @@ def _publish_report(candidate, text, voice_slot, voice, duration, semantic_finge
             },
             "model": _model_identity(voice),
             "rendering": rendering,
-            "track": _track_snapshot(track),
+            "track": {"id": track.id},
         })
     except BaseException as exc:
-        _invalidate_provenance(old_provenance if describes else None, track, "publication_not_recorded")
+        outcome = _recover_after_failure(exc)
         if not isinstance(exc, Exception):
             raise
-        raise SynthesisError(
-            f"KanDrive audio was published (track id={track.id}) but could not be recorded: {exc}"
-        ) from exc
+        raise SynthesisError(f"KanDrive publication failed ({outcome}): {exc}") from exc
 
-    _remove_quietly(previous)
-    discard_retirement_record()
+    try:
+        _finish_publication()
+    except Exception as exc:
+        raise SynthesisError(
+            f"KanDrive report (Track {track.id}) was published but could not be finished; "
+            f"the next run completes it: {exc}"
+        ) from exc
+    track.refresh_from_db()
     return track
 
 
-def _track_snapshot(track):
-    return {"id": track.id, "duration_seconds": track.duration_seconds,
-            "cue_marker_revision": track.cue_marker_revision}
+def _recover_after_failure(cause):
+    """Never replaces the original error."""
+    try:
+        outcome = recover_incomplete_publication()
+    except Exception as exc:  # noqa: BLE001 -- the pending record remains for the next run
+        logger.error("road_conditions: recovery after %r failed: %s", cause, exc)
+        return "unrestorable"
+    if outcome == "unrestorable":
+        logger.error("road_conditions: could not restore the previous report after %r", cause)
+    return {"": "nothing was replaced"}.get(outcome, f"previous report {outcome}")
 
 
 def _model_identity(voice):
@@ -962,53 +975,6 @@ def _model_identity(voice):
     except Exception as exc:  # noqa: BLE001
         logger.warning("road_conditions: model identity unavailable: %s", exc)
         return {}
-
-
-def _invalidate_provenance(old_provenance, track, reason):
-    """After a failed publication: nothing may verify as healthy, even if
-    the content later reverts to what was last published. With
-    `old_provenance` (a record that described the report before this
-    attempt) a stub for the audio now in place is kept, so an operator
-    hold is still recognized; without it the record is removed."""
-    path = road_report_provenance_path()
-    digest = _sha256_or_none(_final_path())
-    if old_provenance is None or track is None or digest is None:
-        _remove_quietly(path)
-        return
-    try:
-        track.refresh_from_db()
-        _write_json_atomically(path, {
-            "provenance_version": PROVENANCE_VERSION, "invalidated": reason,
-            "semantic_fingerprint": "", "flac_sha256": digest,
-            "script": "", "script_sha256": _sha256_text(""),
-            "track": _track_snapshot(track),
-        })
-    except Exception as exc:  # noqa: BLE001 -- removal is the fail-safe
-        logger.warning("road_conditions: could not invalidate provenance: %s", exc)
-        _remove_quietly(path)
-
-
-def _roll_back_publication(track, row_before, ready_set, had_audio, describes, old_provenance, cause):
-    """Restores the previous audio and Track fields after a failed step 1.
-    Best effort, and it never replaces the original error."""
-    try:
-        final_path = _final_path()
-        if had_audio:
-            os.replace(road_report_previous_path(), final_path)
-        else:
-            final_path.unlink(missing_ok=True)
-        if track is not None:
-            rows = Track.objects.filter(pk=track.pk)
-            if row_before is None:
-                rows.update(ready2air=False)   # a new report that never completed
-            else:
-                rows.update(**{name: row_before[name] for name in _RESTORABLE_TRACK_FIELDS})
-                # Only undo our own readiness change, never a newer one.
-                rows.filter(ready2air=ready_set).update(ready2air=row_before["ready2air"])
-    except Exception as exc:  # noqa: BLE001
-        logger.error("road_conditions: restoring the previous report failed after %r: %s", cause, exc)
-    _invalidate_provenance(old_provenance if describes else None,
-                           track or _published_track(), "publication_failed")
 
 
 def _finish_waveform(analyzed):
@@ -1062,49 +1028,3 @@ def _kandrive_artist():
     from library.models import Artist
     artist, _ = Artist.get_or_create_ci(KANDRIVE_ARTIST_NAME)
     return artist
-
-
-def retire_road_report():
-    """Pulls the existing KanDrive Track out of rotation eligibility
-    (ready2air=False) WITHOUT touching the file or deleting the row --
-    used when road_conditions.report.feed_freshness() is anything
-    other than "fresh" (stale/failed/disabled): the currently-airing
-    report describes conditions from source data that can no longer be
-    trusted as current, so it must stop being presented as such (Step
-    8's "must not leave a stale report rotation-eligible" /
-    "must not announce -- or keep airing -- as current when data
-    freshness is uncertain"). The file and Track row are left in place
-    (not deleted) so a subsequent fresh generation can cleanly
-    update_or_create the same row again -- and so an operator
-    inspecting the library can see exactly what was last actually
-    reported, and when.
-
-    Idempotent: a no-op, returning False, if no KanDrive Track exists
-    yet or it's already ready2air=False.
-
-    Deliberately does NOT touch analysis fields (next_start_seconds,
-    cue_in_seconds, waveform) -- those describe the AUDIO FILE, which
-    hasn't changed; only its rotation eligibility has.
-
-    Records that THIS retirement took the report off air (only when it
-    actually did), so rearm_retired_report() can undo it and nothing
-    else. Retiring never depends on that record: if it cannot be written
-    the report is still retired, and recovery renders again."""
-    final_path = str(_final_path())
-    track_id = (Track.objects.filter(filepath=final_path, ready2air=True)
-                .values_list("id", flat=True).first())
-    if track_id is None:
-        return False
-    # Written before the change, so an interruption leaves an incomplete
-    # record (recovery render), never none (which would look like a hold).
-    if not _write_retirement_record(track_id, None):
-        _remove_quietly(road_report_provenance_path())
-    with transaction.atomic():
-        updated = (Track.objects.filter(pk=track_id, filepath=final_path, ready2air=True)
-                   .update(ready2air=False))
-        row_version = _track_row_version(track_id) if updated else None
-    if not updated:
-        discard_retirement_record()
-        return False
-    _write_retirement_record(track_id, row_version)
-    return True

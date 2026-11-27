@@ -396,7 +396,7 @@ class RoadConditionsConfiguration(models.Model):
     # writes these together, via a single targeted
     # save(update_fields=[...]), after that entire cycle has already
     # succeeded. Never written by --dry-run, --text-only, --event-id,
-    # a skipped/unchanged cycle, a stale/failed/disabled retirement,
+    # a skipped/unchanged cycle, a stale/failed/disabled skip,
     # or any failed cycle -- see that command's own comment at its
     # write site.
     last_report_fingerprint = models.CharField(

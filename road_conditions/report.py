@@ -122,8 +122,10 @@ _SIGNIFICANT_PRIORITY_THRESHOLD = 5
 
 def feed_freshness(config=None):
     """One of "fresh" / "stale" / "failed" / "disabled" -- the signal
-    used to decide whether "no current events" may ever be spoken as an
-    all-clear (see build_no_events_message()). Never conflates a
+    used to decide whether a report may be rendered at all, and so whether
+    "no current events" may ever be spoken as an all-clear (see
+    build_no_events_message()). It never changes a published report or its
+    Ready-to-Air flag. Never conflates a
     failed/stale fetch with "no road problems" -- see the task's own
     explicit requirement on this point."""
     config = config or RoadConditionsConfiguration.load()
@@ -370,9 +372,9 @@ def build_event_scripts(events, now=None):
 
 def build_full_report(events, now=None):
     """Concatenates every event's script, in the already-sorted order.
-    Returns "" for an empty list -- callers decide separately whether
-    that means "retire the existing audio" or "speak a no-advisory
-    message" (see build_no_events_message() / feed_freshness()).
+    Returns "" for an empty list -- callers decide separately whether a
+    no-advisory message may be spoken (see build_no_events_message() /
+    feed_freshness()).
 
     Raises ReportBuildError (naming the specific event) -- see
     build_event_scripts(), which this is a thin wrapper around."""
