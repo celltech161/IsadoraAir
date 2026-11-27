@@ -281,7 +281,7 @@ class ParseFailureProtectionTests(TestCase):
         circular["self"] = circular
         broken["_circular_to_force_a_normalize_crash"] = circular
 
-        result = sync_events(self.config, client=FakeCarsClient(events=[broken]))  # CARS5-OTHER not in this fetch at all
+        result = sync_events(self.config, client=FakeCarsClient(events=[broken, make_event("CARS5-VALID")]))  # CARS5-OTHER is absent
 
         self.assertEqual(result["error_count"], 1)
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-PARSEFAIL").source_active,
@@ -351,7 +351,7 @@ class DryRunWritesNothingTests(TestCase):
 
     def test_dry_run_partial_failure_scenario_writes_nothing(self):
         before = self._full_snapshot()
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         after = self._full_snapshot()
         self.assertEqual(result["error_count"], 1)
         self.assertEqual(result["outcome"], "partial")
@@ -371,7 +371,7 @@ class DryRunWritesNothingTests(TestCase):
         self.assertEqual(RoadConditionsSyncRun.objects.count(), 1)  # only the ONE real run from setUp
 
     def test_dry_run_never_emits_a_system_event_on_parse_errors(self):
-        sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         self.assertFalse(SystemEvent.objects.filter(category="road_conditions").exists())
 
 
@@ -476,7 +476,7 @@ class SyncEventsPartialFailureTests(TestCase):
         circular = {}
         circular["self"] = circular
         broken["_circular_to_force_a_normalize_crash"] = circular
-        result = sync_events(self.config, client=FakeCarsClient(events=[broken]))  # CARS5-WILLVANISH not present at all
+        result = sync_events(self.config, client=FakeCarsClient(events=[broken, make_event("CARS5-VALID")]))  # CARS5-WILLVANISH is absent
         self.assertEqual(result["outcome"], "partial")
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-WILLVANISH").source_active)
         self.assertEqual(result["deactivated_count"], 1)
@@ -703,7 +703,7 @@ class IdentityIntegrityTests(TestCase):
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
     def test_dry_run_identity_untrustworthy_predicts_zero_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         self.assertEqual(result["deactivated_count"], 0)
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 

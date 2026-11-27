@@ -25,9 +25,10 @@ from django.utils import timezone as dj_timezone
 from monitoring.models import NotificationConfig, SystemEvent
 from road_conditions import alerts, trigger
 from road_conditions.api import CarsApiTimeout
+from road_conditions.management.commands import generate_road_condition_audio as generator_command
 from road_conditions.management.commands import sync_road_conditions as sync_command
 from road_conditions.models import RoadConditionsConfiguration, RoadConditionsSyncRun, RoadEvent
-from road_conditions.synthesis import road_report_path, road_report_text_path
+from road_conditions.synthesis import road_report_path, road_report_pending_path, road_report_text_path
 from road_conditions.tests.runtime_paths import patch_runtime_paths
 from road_conditions.tests.test_generate_road_condition_audio import make_fresh_config
 from road_conditions.tests.test_kandrive_synthesis import KanDriveSynthesisFixtureMixin
@@ -370,6 +371,69 @@ class EmptyDatasetAndTriggeredGenerationTests(RuntimeScratchMixin, KanDriveSynth
         self.assertIsNotNone(self.stamp())
         self.generate()
         self.assertIn("not reporting any significant road conditions", road_report_text_path().read_text())
+
+    def dispatch(self):
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dispatched", stdout=out)
+        return out.getvalue()
+
+    def test_unacknowledged_request_is_reissued_on_tick_after_lock_contention(self):
+        self.sync()
+        config = RoadConditionsConfiguration.load()
+        first = self.stamp()
+        other = psycopg2.connect(**connections["default"].get_connection_params())
+        try:
+            with other.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s, %s)", generator_command.GENERATE_ROAD_AUDIO_LOCK_KEY)
+                self.assertIn("already running", self.dispatch())
+                self.assertIsNotNone(trigger.pending_sync(config))
+        finally:
+            other.close()
+        self.tick()
+        self.assertNotEqual(self.stamp(), first)
+        self.dispatch()
+        self.assertIsNone(trigger.pending_sync(config))
+        completed = self.stamp()
+        self.tick()
+        self.assertEqual(self.stamp(), completed)
+
+    def test_older_acknowledgment_preserves_newer_request_and_failure_preserves_it(self):
+        self.sync()
+        first = trigger.pending_sync(RoadConditionsConfiguration.load())
+
+        def new_fetch_during_render(_command, _options, _now):
+            self.sync()
+            return True
+
+        with patch.object(generator_command.Command, "_check_and_render", new_fetch_during_render):
+            self.dispatch()
+        second = trigger.pending_sync(RoadConditionsConfiguration.load())
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second, first)
+        stamp = self.stamp()
+        self.failing_sync()
+        self.tick()
+        self.assertEqual(trigger.pending_sync(RoadConditionsConfiguration.load()), second)
+        self.assertEqual(self.stamp(), stamp)
+        self.assertEqual(self.dispatch(), "")
+        self.sync()
+        self.dispatch()
+        self.assertIsNone(trigger.pending_sync(RoadConditionsConfiguration.load()))
+
+    def test_unrecoverable_local_journal_has_a_bounded_automatic_retry(self):
+        road_report_pending_path().write_text("{}", encoding="utf-8")
+        for _ in range(trigger.MAX_AUTOMATIC_RECOVERY_ATTEMPTS):
+            self.failing_sync()
+            self.assertEqual(trigger.dispatch_mode(), "recover")
+            with self.assertRaisesRegex(CommandError, "recovery is pending"):
+                self.dispatch()
+        exhausted = self.stamp()
+        self.tick(2)
+        self.failing_sync()
+        self.assertEqual(self.stamp(), exhausted)
+        self.assertEqual(self.dispatch(), "")
+        self.assertTrue(road_report_pending_path().exists())
+        self.assertEqual(self._kokoro_call_count, 1)
 
     def test_generator_failure_leaves_the_retrieval_successful_and_the_next_one_recovers(self):
         self.sync(events=[make_event(description="Both lanes are closed.")])

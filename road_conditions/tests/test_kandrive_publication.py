@@ -7,6 +7,9 @@ at the end uses real ffmpeg and real Track analysis; only the speech itself is
 a generated tone. A "killed" publication is simulated by also disabling the
 in-process recovery, since a signal would not run it."""
 import json
+import os
+import signal
+import time
 import shutil
 import subprocess
 import tempfile
@@ -24,21 +27,25 @@ from django.test import TransactionTestCase, override_settings
 from django.utils import timezone as dj_timezone
 
 from isadoraair.tts.models import StationTTSVoice
-from library.models import Category, CategoryKind, Track
+from library.management.commands.analyze_tracks import AnalysisOutcome
+from library.models import Artist, Category, CategoryKind, Track
 from library.services import cue_markers
 from monitoring.models import SystemEvent
-from road_conditions import synthesis as synthesis_module
+from road_conditions import synthesis as synthesis_module, trigger
+from road_conditions.api import CarsApiTimeout
 from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.synthesis import (
     existing_report_is_healthy, hash_file_sha256, published_report_problem, read_provenance,
     road_report_path, road_report_pending_path, road_report_previous_path,
     road_report_provenance_path, road_report_text_path,
 )
+from road_conditions.tests.runtime_paths import patch_runtime_paths
 from road_conditions.tests.test_generate_road_condition_audio import CMD, make_fresh_config
 from road_conditions.tests.test_kandrive_report import make_road_event
 from road_conditions.tests.test_kandrive_synthesis import (
-    KanDriveSynthesisFixtureMixin, ensure_default_weather_voice_personas,
+    KanDriveSynthesisFixtureMixin, ensure_default_weather_voice_personas, fake_analysis_timing,
 )
+from road_conditions.tests.test_sync import FakeCarsClient
 from road_conditions.voice import VoiceResolutionError
 from weather.models import WeatherConfig, WeatherVoicePersona
 
@@ -47,6 +54,29 @@ SKIPPED = "unchanged since last successful generation"
 
 class SimulatedKill(BaseException):
     pass
+
+
+def kill_child_at_publication_step(test):
+    """Run the patched publishing step in a child of the isolated test process."""
+    if not os.environ.get("ISADORAAIR_TEST_SANDBOX"):
+        test.skipTest("requires the validation runner's private PID namespace")
+    connections.close_all()
+    child = os.fork()
+    if child == 0:
+        try:
+            generate("--regenerate")
+        except BaseException:
+            import traceback
+            traceback.print_exc()
+            os._exit(2)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    test.assertTrue(os.WIFSIGNALED(status), status)
+    test.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+
+
+def kill_self(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
 
 
 def use_voice_all_day(slot):
@@ -72,11 +102,9 @@ def track():
 
 def analysis_writes_markers(row, next_start=250.0):
     """Analysis reaching the cue-marker authority, as the real one does."""
-    result = cue_markers.apply_calculation(
-        row.pk, {"next_start_seconds": next_start}, basis_revision=row.cue_marker_revision,
-        source=cue_markers.SOURCE_ANALYSIS, media_replaced=True, duration=row.duration_seconds)
-    assert result.ok, (result.error, result.conflict)
+    outcome = fake_analysis_timing(row, next_start=next_start)
     assert Track.objects.get(pk=row.pk).cue_marker_revision != row.cue_marker_revision
+    return outcome
 
 
 def set_ready(value):
@@ -270,6 +298,33 @@ class ContentIdentityTests(PublishedReportMixin, TransactionTestCase):
 
 
 class ProvenanceTests(PublishedReportMixin, TransactionTestCase):
+    def test_mid_report_remap_keeps_every_segment_on_the_published_voice(self):
+        from isadoraair.tts import station
+
+        make_road_event(external_id="B", headline_category="closure", description="Another road closed.")
+        transition = Path(self._tmpdir.name) / "transition.wav"
+        transition.write_bytes(b"fixture transition sound")
+        set_config(transition_sound_enabled=True, transition_sound_path=str(transition))
+        mapping = WeatherVoicePersona.objects.get(slot="day").tts_voice
+        requests = []
+
+        class FakeProvider:
+            def synthesize(self, request):
+                requests.append(request.voice)
+                request.output_path.write_bytes(b"fixture speech")
+                if len(requests) == 1:
+                    StationTTSVoice.objects.filter(pk=mapping.pk).update(provider_voice="af_heart")
+                return request.output_path
+
+        def render_segment(text, **kwargs):
+            return station.synthesize_station_voice(text, **kwargs, service=FakeProvider())
+
+        with patch.object(synthesis_module, "synthesize_station_voice", side_effect=render_segment):
+            generate()
+        self.assertGreaterEqual(len(requests), 2)
+        self.assertEqual(set(requests), {self.provenance()["voice"]["provider_voice"]})
+        self.assertEqual(requests[0], "af_jessica")
+
     def test_records_what_was_actually_published(self):
         record = self.provenance()
         script = road_report_text_path().read_text(encoding="utf-8")
@@ -281,7 +336,9 @@ class ProvenanceTests(PublishedReportMixin, TransactionTestCase):
         self.assertEqual(record["model"]["filename"], "kokoro-v1.0.onnx")
         self.assertEqual(len(record["model"]["contract_sha256"]), 64)
         self.assertEqual(record["rendering"]["audio_format_version"], 1)
-        self.assertEqual(record["track"], {"id": track().id})
+        self.assertEqual(record["track"]["id"], track().id)
+        self.assertEqual(record["track"]["timing"]["marker_revision"], track().cue_marker_revision)
+        self.assertEqual(record["track"]["timing"]["duration"], track().duration_seconds)
         self.assertTrue(record["published_at"])
         self.assertEqual(self.leftovers(), [])
 
@@ -304,7 +361,6 @@ class ProvenanceTests(PublishedReportMixin, TransactionTestCase):
             (lambda: edit_record(semantic_fingerprint="0" * 64), "provenance_content_mismatch"),
             (lambda: edit_record(track={"id": 10**9}), "track_mismatch"),
             (lambda: Track.objects.filter(filepath=str(road_report_path())).delete(), "track_missing"),
-            (lambda: road_report_pending_path().write_text("{}", encoding="utf-8"), "publication_incomplete"),
         ]
         for damage, reason in cases:
             with self.subTest(reason=reason):
@@ -480,7 +536,7 @@ class ReadyToAirPolicyTests(PublishedReportMixin, TransactionTestCase):
 
                 def observe(row):
                     seen.append(track().ready2air)
-                    return True
+                    return fake_analysis_timing(row)
 
                 with patch.object(synthesis_module, "_run_full_analysis", side_effect=observe):
                     generate("--regenerate")
@@ -500,7 +556,7 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
         row = track()
         return (road_report_path().read_bytes(), road_report_text_path().read_text(encoding="utf-8"),
                 road_report_provenance_path().read_bytes(), row.title, row.duration_seconds,
-                row.ready2air, row.cue_marker_revision, self.fingerprint())
+                row.ready2air, row.cue_in_seconds, row.next_start_seconds, self.fingerprint())
 
     def fail_new_content(self, patcher):
         before = self.snapshot()
@@ -535,8 +591,8 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
             return real_write(path, payload)
 
         stages = {
-            "track update": lambda: patch.object(
-                Track.objects, "update_or_create", side_effect=RuntimeError("db down")),
+            "track lookup": lambda: patch.object(
+                synthesis_module, "_published_track", side_effect=[track(), RuntimeError("db down"), track()]),
             "analysis reports failure": lambda: patch.object(
                 synthesis_module, "_run_full_analysis", return_value=False),
             "analysis raises": lambda: patch.object(
@@ -583,8 +639,7 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
             if len(calls) == 1:                       # the new publication
                 analysis_writes_markers(row, next_start=111.0)
                 raise RuntimeError("crashed after the markers")
-            analysis_writes_markers(row, next_start=250.0)  # the restore
-            return True
+            return analysis_writes_markers(row, next_start=250.0)  # the restore
 
         self.fail_new_content(patch.object(synthesis_module, "_run_full_analysis", side_effect=analysis))
         self.assertEqual([c[0] for c in calls], [b"FLAC-NEW", b"FLAC-ONE"])
@@ -592,6 +647,54 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
         self.assertEqual(track().next_start_seconds, 250.0)
         self.assertEqual(self.renders(), 2)                  # no render to restore
         self.assertEqual(self.leftovers(), [])
+
+    def test_rejected_cues_cannot_commit_even_after_a_successful_decode(self):
+        set_ready(False)
+        before = self.snapshot()
+        result = AnalysisOutcome(True, markers=cue_markers.Result(track().pk, ok=False, conflict="operator edit"))
+        self.fail_new_content(patch.object(synthesis_module, "_run_full_analysis", return_value=result))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_failure_preserves_nonpublication_track_columns_and_concurrent_edits(self):
+        row = track()
+        category = Category.objects.create(code="Other", name="Other", kind=row.category.kind)
+        artist, _ = Artist.get_or_create_ci("Another artist")
+        Track.objects.filter(pk=row.pk).update(category=category, artist=artist, filename="operator-name.flac")
+        set_ready(False)
+
+        def fail_after_operator_edit(row):
+            Track.objects.filter(pk=row.pk).update(title="Operator title", duration_seconds=299, play_count=8)
+            return False
+
+        self.fail_new_content(patch.object(synthesis_module, "_run_full_analysis", side_effect=fail_after_operator_edit))
+        row.refresh_from_db()
+        self.assertEqual((row.category_id, row.artist_id, row.filename),
+                         (category.pk, artist.pk, "operator-name.flac"))
+        self.assertEqual((row.title, row.duration_seconds, row.play_count, row.ready2air),
+                         ("Operator title", 299.0, 8, False))
+
+    def test_rejected_restoration_timing_leaves_recovery_pending(self):
+        self._flac_payload = b"FLAC-NEW"
+        self.change_content()
+        self.assertFalse(road_report_pending_path().exists())
+
+        def analyze(row):
+            if road_report_path().read_bytes() == b"FLAC-NEW":
+                return fake_analysis_timing(row, next_start=111.0)
+            return AnalysisOutcome(True, markers=cue_markers.Result(row.pk, ok=False, conflict="newer cue edit"))
+
+        with patch.object(synthesis_module, "_run_full_analysis", side_effect=analyze), \
+             patch.object(synthesis_module, "write_road_report_text", side_effect=OSError("disk full")):
+            with self.assertRaises(CommandError):
+                generate()
+        self.assertEqual(road_report_path().read_bytes(), b"FLAC-ONE")
+        self.assertTrue(road_report_pending_path().exists())
+        self.assertEqual(published_report_problem(self.fingerprint()), "publication_incomplete")
+        before = self.renders()
+        self.assertIn("Restored the previous road report", generate("--recover-only"))
+        self.assertEqual(self.renders(), before)
+        self.assertEqual(track().next_start_seconds, 250.0)
+        self.assertFalse(road_report_pending_path().exists())
 
     def test_untouched_markers_are_not_reanalyzed_during_restore(self):
         with patch.object(synthesis_module, "_run_full_analysis", return_value=False) as analysis:
@@ -666,7 +769,7 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
         def engine_and_library(result):
             def analysis(row):
                 Track.objects.filter(pk=row.pk).update(play_count=7, last_played_at=aired, energy="upbeat")
-                return result
+                return fake_analysis_timing(row) if result else False
             return analysis
 
         for result in (False, True):
@@ -762,7 +865,7 @@ class PublicationFailureTests(PublishedReportMixin, TransactionTestCase):
                     seen.append(cur.rowcount)
             finally:
                 conn.close()
-            return True
+            return fake_analysis_timing(row)
 
         self.change_content()
         with patch.object(synthesis_module, "_run_full_analysis", side_effect=engine_air_start):
@@ -857,27 +960,25 @@ class InterruptedPublicationTests(PublishedReportMixin, TransactionTestCase):
         self.assertEqual(self.leftovers(), [])
 
     def test_killed_before_the_track_update(self):
-        self.kill_during(Track.objects, "update_or_create")
+        self.kill_during(synthesis_module, "_run_full_analysis")
         self.revert_and_expect_restore_without_rendering()
 
     def test_killed_during_analysis_after_the_track_update(self):
         with patch.object(synthesis_module, "_probe_duration", return_value=301.0):
             self.kill_during(synthesis_module, "_run_full_analysis")
-        self.assertEqual(track().duration_seconds, 301.0)
+        self.assertEqual(track().duration_seconds, 300.0)
         self.revert_and_expect_restore_without_rendering()
         self.assertEqual(track().duration_seconds, 300.0)
 
     def test_killed_after_analysis_changed_the_markers(self):
         def analysis(row):
-            analysis_writes_markers(row, next_start=111.0)
-            return True
+            return analysis_writes_markers(row, next_start=111.0)
 
         with patch.object(synthesis_module, "_run_full_analysis", side_effect=analysis):
             self.kill_during(synthesis_module, "write_road_report_text")
 
         def restore_analysis(row):
-            analysis_writes_markers(row, next_start=250.0)
-            return True
+            return analysis_writes_markers(row, next_start=250.0)
 
         with patch.object(synthesis_module, "_run_full_analysis", side_effect=restore_analysis) as rerun:
             self.revert_and_expect_restore_without_rendering()
@@ -905,32 +1006,64 @@ class InterruptedPublicationTests(PublishedReportMixin, TransactionTestCase):
         self.assertEqual(self.renders(), 2)     # completing it needed no second render
         self.assert_skips()
 
+    def test_real_kill_after_readiness_commit_does_not_repeat_the_update(self):
+        set_ready(False)
+        self.change_content()
+        self._flac_payload = b"NEW-COMMITTED"
+        path_class = type(road_report_pending_path())
+        unlink = path_class.unlink
+
+        def kill_at_cleanup(path, *args, **kwargs):
+            if path == road_report_pending_path():
+                kill_self()
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(path_class, "unlink", kill_at_cleanup):
+            kill_child_at_publication_step(self)
+        self.assertTrue(track().ready2air)
+        self.assertEqual(self.fingerprint(), self.provenance()["semantic_fingerprint"])
+        set_ready(False)
+        before = self.renders()
+        self.assertIn("Completed an earlier publication", generate())
+        self.assertIn(SKIPPED, generate())
+        self.assertEqual(self.renders(), before)
+        self.assertFalse(track().ready2air)
+
+    def test_real_kill_during_db_commit_recovers_fingerprint_without_rendering(self):
+        set_ready(False)
+        self.change_content()
+        before = self.fingerprint()
+        with patch.object(RoadConditionsConfiguration, "save", side_effect=kill_self):
+            kill_child_at_publication_step(self)
+        self.assertEqual(self.fingerprint(), before)
+        self.assertFalse(track().ready2air)
+        self.assertTrue(road_report_pending_path().exists())
+        self.assertIn("Completed an earlier publication", generate("--recover-only"))
+        self.assertTrue(track().ready2air)
+        self.assertEqual(self.fingerprint(), self.provenance()["semantic_fingerprint"])
+        self.assertIn(SKIPPED, generate())
+        self.assertEqual(self.renders(), 1)
+
     def test_restore_then_render_of_the_new_content(self):
-        self.kill_during(Track.objects, "update_or_create")
+        self.kill_during(synthesis_module, "_run_full_analysis")
         out = self.assert_renders("content_changed")
         self.assertIn("Restored the previous road report", out)
         self.assert_skips()
 
     def test_restore_happens_even_while_the_feed_is_down(self):
-        self.kill_during(Track.objects, "update_or_create")
+        self.kill_during(synthesis_module, "_run_full_analysis")
         set_config(last_error="HTTP 503")
         self.assertIn("Restored the previous road report", generate())
         self.assertEqual(road_report_path().read_bytes(), b"FLAC-ONE")
 
-    def test_second_kill_keeps_the_last_complete_recording_as_the_way_back(self):
-        self.kill_during(Track.objects, "update_or_create")
-        with patch.object(synthesis_module, "recover_incomplete_publication", return_value="unrestorable"), \
-             patch(f"{CMD}.recover_incomplete_publication", return_value=""):
-            self._flac_payload = b"FLAC-NEWER"
-            with patch.object(synthesis_module, "_recover_after_failure"), \
-                 patch.object(Track.objects, "update_or_create", side_effect=SimulatedKill()):
-                with self.assertRaises(SimulatedKill):
-                    generate()
-        self.assertEqual(road_report_path().read_bytes(), b"FLAC-NEWER")
+    def test_unrestorable_publication_prevents_a_new_render(self):
+        self.kill_during(synthesis_module, "_run_full_analysis")
+        pending = road_report_pending_path().read_bytes()
+        with patch(f"{CMD}.recover_incomplete_publication", return_value="unrestorable"):
+            with self.assertRaisesRegex(CommandError, "recovery is pending"):
+                generate()
+        self.assertEqual(road_report_pending_path().read_bytes(), pending)
         self.assertEqual(road_report_previous_path().read_bytes(), b"FLAC-ONE")
-        self.change_content("Road closed.")
-        self.assert_skips()
-        self.assertEqual(road_report_path().read_bytes(), b"FLAC-ONE")
 
     def test_killed_first_publication_is_discarded(self):
         Track.objects.filter(filepath=str(road_report_path())).delete()
@@ -947,7 +1080,7 @@ class InterruptedPublicationTests(PublishedReportMixin, TransactionTestCase):
 
     def test_audio_written_by_something_else_is_never_overwritten_by_a_restore(self):
         # e.g. killed, rolled back to r0149 which rendered, then upgraded.
-        self.kill_during(Track.objects, "update_or_create")
+        self.kill_during(synthesis_module, "_run_full_analysis")
         road_report_path().write_bytes(b"WRITTEN-BY-ANOTHER-RELEASE")
         self.change_content("Road closed.")
         with patch.object(synthesis_module, "synthesize_station_voice", side_effect=ValueError("tts down")):
@@ -960,7 +1093,7 @@ class InterruptedPublicationTests(PublishedReportMixin, TransactionTestCase):
         self.assert_skips()
 
     def test_dry_run_does_not_restore(self):
-        self.kill_during(Track.objects, "update_or_create")
+        self.kill_during(synthesis_module, "_run_full_analysis")
         self.assertIn("publication_incomplete", generate("--dry-run"))
         self.assertEqual(road_report_path().read_bytes(), b"FLAC-NEW")
         self.assertTrue(road_report_pending_path().exists())
@@ -1073,6 +1206,32 @@ class RealMediaPublicationTests(TransactionTestCase):
         self.assertIn("Restored the previous road report", out)
         self.assertEqual(self.renders, 2)
         self.assert_whole_again(before)
+
+    def test_real_sigkill_then_failed_sync_dispatches_only_local_recovery(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        for patcher in patch_runtime_paths(runtime):
+            self.addCleanup(patcher.stop)
+        generate()
+        previous = self.state()
+        self.change_to_a_longer_report()
+        with patch.object(synthesis_module, "_run_full_analysis", side_effect=kill_self):
+            kill_child_at_publication_step(self)
+        interrupted = time.monotonic()
+        self.assertNotEqual(hash_file_sha256(road_report_path()), previous["audio"])
+        self.assertEqual(track().duration_seconds, previous["duration"])
+        self.assertEqual(track().next_start_seconds, previous["next_start"])
+        self.assertTrue(track().ready2air)
+        self.assertTrue(road_report_pending_path().exists())
+        client = FakeCarsClient(error=CarsApiTimeout("simulated timeout"))
+        with patch("road_conditions.services.build_client", return_value=client):
+            with self.assertRaises(CommandError):
+                call_command("sync_road_conditions", "--force-full", stdout=StringIO())
+        self.assertEqual(trigger.dispatch_mode(), "recover")
+        self.assertIn("Restored the previous road report", generate("--dispatched"))
+        self.assert_whole_again(previous)
+        self.assertEqual(self.renders, 1)
+        print(f"SIGKILL to previous audio and timing restored: {time.monotonic() - interrupted:.3f}s after immediate fixture sync tick")
 
     def test_real_analysis_failure_restores(self):
         generate()

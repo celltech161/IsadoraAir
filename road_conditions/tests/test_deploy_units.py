@@ -13,6 +13,7 @@ DEFAULT_TRIGGER_PATH = "/run/isadoraair/road_generation.trigger"
 SERVICE_PATH = Path(settings.BASE_DIR) / "deploy/isadoraair-generate-road-condition-audio.service"
 TIMER_PATH = Path(settings.BASE_DIR) / "deploy/isadoraair-generate-road-condition-audio.timer"
 PATH_UNIT_PATH = Path(settings.BASE_DIR) / "deploy/isadoraair-generate-road-condition-audio.path"
+DEPLOY_README = Path(settings.BASE_DIR) / "deploy/README.md"
 RESTORE_PATH = Path(settings.BASE_DIR) / "deploy/restore/90-system-config.sh"
 
 
@@ -25,15 +26,15 @@ class GenerationServiceContractTests(SimpleTestCase):
     def setUp(self):
         self.content = SERVICE_PATH.read_text()
 
-    def test_invokes_exactly_generate_road_condition_audio_with_no_flags(self):
+    def test_invokes_only_the_dispatched_generator(self):
         exec_lines = [
             line.strip() for line in self.content.splitlines()
             if line.strip().startswith("ExecStart=")
         ]
         self.assertEqual(len(exec_lines), 1)
         self.assertTrue(
-            exec_lines[0].endswith("manage.py generate_road_condition_audio"),
-            f"ExecStart must invoke the plain command with no flags, got: {exec_lines[0]!r}",
+            exec_lines[0].endswith("manage.py generate_road_condition_audio --dispatched"),
+            f"ExecStart must invoke the supervised dispatch command, got: {exec_lines[0]!r}",
         )
 
     def test_does_not_contain_force_flag(self):
@@ -105,6 +106,15 @@ class GenerationTriggerContractTests(SimpleTestCase):
         script = RESTORE_PATH.read_text()
         self.assertIn('"$REPO_ROOT"/deploy/*.path', script)
         self.assertIn("*.service|*.timer|*.path)", script)
+
+    def test_fresh_install_creates_the_runtime_directory_before_enabling_the_watcher(self):
+        guide = DEPLOY_README.read_text()
+        self.assertIn("isadoraair-updater.service|isadoraair-tmpfiles.conf) continue", guide)
+        create = guide.index("systemd-tmpfiles --create /etc/tmpfiles.d/isadoraair.conf")
+        watcher = guide.index("enable --now isadoraair-generate-road-condition-audio.path")
+        timer = guide.index("enable --now isadoraair-sync-road-conditions.timer")
+        self.assertLess(create, watcher)
+        self.assertLess(watcher, timer)
 
     def test_sync_unit_does_not_start_the_generator_itself(self):
         # OnSuccess= would also fire after a skipped ("not due") run.

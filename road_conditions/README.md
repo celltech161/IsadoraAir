@@ -247,8 +247,8 @@ KDOT sync timer (isadoraair-sync-road-conditions.timer)
        (RoadConditionsConfiguration.poll_cadence_minutes, 15 min default),
        in slots anchored 7 minutes past the hour (30 min -> :07 and :37)
     -> writes/updates/deactivates RoadEvent rows
-    -> only after a committed retrieval: replaces
-       /run/isadoraair/road_generation.trigger
+    -> wakes the generator for the committed retrieval, an unacknowledged
+       retrieval, or pending local publication recovery
 
 isadoraair-generate-road-condition-audio.path
     -> sees the trigger file replaced and starts
@@ -273,8 +273,8 @@ quarter-hour temperature updates without drifting.
 **Cadence design (Option B, matching this project's own OGRemote
 poller idiom)**: the timer itself fires every ~1 minute, but
 `sync_road_conditions` checks `RoadConditionsConfiguration.poll_cadence_minutes`
-against `last_fetch_attempted_at` and exits cleanly -- writing nothing,
-logging no run -- whenever a sync isn't due yet. `--force-full` bypasses
+against `last_fetch_attempted_at`. A tick that is not due does not
+fetch or record an attempt. It can wake the worker for pending work. `--force-full` bypasses
 this (and the disabled check) for manual verification. This is
 deliberate, not incidental: the live CARS API has **no pagination and
 no ETag/Last-Modified/conditional-request support at all** (checked
@@ -297,13 +297,24 @@ road-condition operations.
 ### KanDrive audio generation
 
 `deploy/isadoraair-generate-road-condition-audio.service` runs
-`generate_road_condition_audio` with no flags (`--force`, `--regenerate`
-and `--voice` are for manual use). The matching `.path` unit starts it
-after every successful sync, whether or not any road event changed, so
-planned work that has started, an earlier failed render, damaged audio
-and template edits are all picked up. A request made while it is already
-running is not queued; the next successful sync makes another.
+`generate_road_condition_audio --dispatched`. Successful authoritative
+sync commits supply the request timestamp, including when no events
+changed. After acquiring its advisory lock, the worker checks that
+snapshot and records its timestamp in `road_generation.ack` beside the
+report. A later sync has its own timestamp and cannot be acknowledged
+by an earlier worker. A failed render is reported and can be retried
+after the next successful sync.
 
+The file in `/run/isadoraair` only wakes the worker. A wakeup lost during a
+running worker, lock contention or a stopped watcher is repeated on a
+subsequent sync tick when the outstanding retrieval is fresh. An outage
+leaves the request outstanding. Restarting with no acknowledgment file
+can check the most recent still-fresh authoritative snapshot once.
+
+Run `manage.py generate_road_condition_audio` directly for a manual check.
+The options `--force`, `--regenerate` and `--voice` are for manual use.
+The option `--recover-only` settles the journal without checking freshness
+or synthesizing.
 **Content only.** The report is rendered again only when what it says
 changes. An announcer shift, persona rename, voice remap or model change
 does not re-render it; the next real change is rendered in whichever
@@ -318,12 +329,21 @@ clear it, it stays cleared until the next new report is published.
 report. It is not rendered from, the last report keeps airing, and
 station staff are notified through Monitoring's Notification Config (one
 message per severity per incident, within its cooldown, plus a recovery
-message). An empty event list for the station's complete retrieval counts
-as a failed retrieval, even if KDOT really had no events.
+message). A complete retrieval with no usable records counts as failed, even if
+KDOT really has no events. Narrowed runs keep diagnostic history without
+advancing the statewide cadence or freshness.
 
-**Publication** validates the new audio before replacing anything. If a
-publication fails or is killed part-way, the next run restores the
-previous recording without rendering.
+**Publication** validates decoded audio before replacement and verifies
+that the cue authority committed timing bound to those samples before
+enabling Ready-to-Air. Readiness and fingerprint bookkeeping commit in
+the same database transaction. The next sync tick can wake the worker
+for recovery only, even with an unavailable or disabled upstream.
+Automatic recovery attempts are capped at three per journal per boot.
+An unresolved journal remains visible in Monitoring, blocks new
+publication, and can be retried with `--recover-only` once the fault is
+corrected. Watcher and sync-timer health are prerequisites for automatic
+recovery. Audio and Track timing may disagree during interruption and
+before restoration.
 
 `TimeoutStartSec=0` on the service deliberately leaves the run duration to
 the application's own internal bounds (per-call shared-TTS timeouts,
@@ -331,24 +351,35 @@ ffmpeg/ffprobe timeouts, the advisory lock) rather than an arbitrary
 systemd start timeout -- a real production report has already measured at
 165.2s of finished audio for 7 events.
 
-### Installing
+### Installation, restore and rollback
 
-```bash
-# Render @@ISA_USER@@/@@ISA_ROOT@@ per deploy/README.md's convention, then:
-sudo cp deploy/isadoraair-sync-road-conditions.service deploy/isadoraair-sync-road-conditions.timer /etc/systemd/system/
-sudo cp deploy/isadoraair-generate-road-condition-audio.service deploy/isadoraair-generate-road-condition-audio.path /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now isadoraair-sync-road-conditions.timer
-sudo systemctl enable --now isadoraair-generate-road-condition-audio.path
-```
+For stations using road reports, follow the rendered-unit and tmpfiles
+steps in [the deploy guide](../deploy/README.md). Start the watcher
+before the sync timer and verify both are enabled and active.
 
-Upgrading from a release that had
-`isadoraair-generate-road-condition-audio.timer`: disable and remove it
-(`sudo systemctl disable --now` it, delete the unit file and any drop-in
-directory, then `daemon-reload`). Never leave both triggers enabled.
+An upgrade from r0149 requires an operator-managed changeover. Quiesce
+the road jobs, install the rendered generator service and path unit,
+disable and remove `isadoraair-generate-road-condition-audio.timer` and
+its obsolete overrides, then reload and enable the watcher before the
+sync timer. Omit `10-toh-stagger.conf`. Verify the old generation timer
+is absent and a successful authoritative sync starts a generation check.
+Repeat the enabled/active and functional checks after reboot.
 
-Review the coverage-area settings and run a few manual `--dry-run`s of
-each command before enabling either unit for the first time.
+The release manifest must declare the changed generator service and
+removed timer. `SYSTEMD_REMOVAL_MANUAL` applies to updates crossing
+the transition. The current updater and protected runtime policy do
+not manage `.path` units. Stage 90 renders the path file on restore.
+Controlled bring-up still needs to enable it.
+
+Before rollback, drain or settle the journal with `--recover-only` and
+save the current road units and report artifacts if those bytes must
+survive. Stop sync and the watcher, remove the path unit, restore r0149
+code and its rendered generation service and timer, reload and enable
+that timer and the sync timer. Verify the old timer is the only
+generation authority. r0149 resumes its prior readiness policy. Keep the
+runtime wakeup and retry files out of backups. The normal application
+backup excludes the music and waveform trees and does not archive live
+road units.
 
 ## What this app does NOT do
 

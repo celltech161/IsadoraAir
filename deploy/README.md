@@ -53,7 +53,9 @@ for f in deploy/*.service deploy/*.timer deploy/*.path deploy/*.conf; do
   [ -f "$f" ] || continue
   # Protected updater bootstrap is separate and must never ride this broad
   # application-unit loop; see updater_runtime/README.md.
-  [ "$(basename "$f")" = "isadoraair-updater.service" ] && continue
+  case "$(basename "$f")" in
+    isadoraair-updater.service|isadoraair-tmpfiles.conf) continue ;;
+  esac
   sed \
     -e "s|@@ISA_USER@@|$ISA_USER|g" \
     -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
@@ -63,6 +65,11 @@ for f in deploy/*.service deploy/*.timer deploy/*.path deploy/*.conf; do
     -e "s|@@OGREMOTE_ROOT@@|$OGREMOTE_ROOT|g" \
     "$f" | sudo tee "/etc/systemd/system/$(basename "$f")" > /dev/null
 done
+
+# Materialize the station-owned road wakeup and TTS runtime directories.
+sed -e "s|@@ISA_USER@@|$ISA_USER|g" deploy/isadoraair-tmpfiles.conf |
+  sudo tee /etc/tmpfiles.d/isadoraair.conf > /dev/null
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/isadoraair.conf
 
 # 3. nginx site (generic replacement-safe default vhosts) + its shared
 # location-block snippet -- isadoraair.nginx `include`s this, so both
@@ -91,9 +98,10 @@ sudo systemctl enable --now isadoraair-web-requests-ingest.timer \
   isadoraair-web-requests-catalog.timer \
   isadoraair-generate-dedication-intros.timer
 # Road conditions (when used): the sync timer polls; the .path unit renders
-# audio after a successful sync. There is no road-audio timer.
-# sudo systemctl enable --now isadoraair-sync-road-conditions.timer \
-#   isadoraair-generate-road-condition-audio.path
+# audio after a successful sync and also dispatches publication recovery.
+# For upgrades, retire the old generation timer before this step.
+# sudo systemctl enable --now isadoraair-generate-road-condition-audio.path
+# sudo systemctl enable --now isadoraair-sync-road-conditions.timer
 # Optional: sudo systemctl enable --now isadoraair-backup.timer
 # Optional: sudo systemctl enable --now 'syndicated-*.timer' 'wx-*.timer'
 sudo systemctl reload nginx

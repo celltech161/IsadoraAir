@@ -18,7 +18,11 @@ from road_conditions.synthesis import (
     road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
 from weather.models import WeatherConfig, WeatherVoicePersona
+from library.management.commands.analyze_tracks import AnalysisOutcome
+from library.services import cue_markers
 from library.tests.cue_marker_support import set_markers
+from isadoraair.tts.request import TTSEngine
+from isadoraair.tts.station import ResolvedStationVoice
 
 
 def ensure_default_weather_voice_personas():
@@ -72,6 +76,18 @@ NIGHT_VOICE = {
     "signoff": "I'm Max Weatherly.", "logical_voice_name": "Max_Weatherly",
     "shared_tts": True, "tts_timeout_seconds": 45,
 }
+
+
+def fake_analysis_timing(track, *, next_start=250.0, cue_in=0.0):
+    duration = synthesis_module._probe_duration(track.filepath)
+    revision = synthesis_module.hash_file_sha256(track.filepath)
+    markers = cue_markers.apply_calculation(
+        track.pk, {"next_start_seconds": next_start, "cue_in_seconds": cue_in},
+        basis_revision=track.cue_marker_revision, source=cue_markers.SOURCE_ANALYSIS,
+        media_replaced=True, audio_revision=revision, duration=duration,
+    )
+    assert markers.ok, (markers.conflict, markers.error)
+    return AnalysisOutcome(True, markers=markers, duration=duration, audio_revision=revision)
 
 
 class KanDriveSynthesisFixtureMixin:
@@ -188,11 +204,14 @@ class KanDriveSynthesisFixtureMixin:
         # The fake FLAC bytes cannot be decoded; the real strict-decode
         # gate is exercised with real media in
         # test_kandrive_publication.RealMediaPublicationTests.
-        validate_patcher = patch.object(synthesis_module, "_validate_candidate")
+        validate_patcher = patch.object(
+            synthesis_module, "_validate_candidate",
+            side_effect=lambda path, duration: synthesis_module.hash_file_sha256(path),
+        )
         validate_patcher.start()
         self.addCleanup(validate_patcher.stop)
 
-        analyze_patcher = patch.object(synthesis_module, "_run_full_analysis", return_value=True)
+        analyze_patcher = patch.object(synthesis_module, "_run_full_analysis", side_effect=fake_analysis_timing)
         analyze_patcher.start()
         self.addCleanup(analyze_patcher.stop)
 
@@ -234,8 +253,7 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
         analysis -- and, unlike dedication intros, this module must
         NOT re-assert next_start_seconds/cue_in_seconds afterward."""
         def fake_analysis(track):
-            set_markers(track.id, next_start_seconds=42.0, cue_in_seconds=3.5)
-            return True
+            return fake_analysis_timing(track, next_start=42.0, cue_in=3.5)
 
         with patch.object(synthesis_module, "_run_full_analysis", side_effect=fake_analysis):
             track = synthesize_road_report("Test report text.", "day", DAY_VOICE)
@@ -248,6 +266,7 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
         voice = {
             **DAY_VOICE, "engine": "piper", "model": "test-piper",
             "logical_voice_name": "Piper_Test",
+            "resolved_voice": ResolvedStationVoice("Piper_Test", TTSEngine.PIPER, "test-piper", "en-us", 1.0),
         }
 
         synthesize_road_report("Test text.", "morning_host", voice)
