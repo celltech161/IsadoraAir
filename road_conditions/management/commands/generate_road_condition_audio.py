@@ -4,7 +4,6 @@ from typing import NamedTuple
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 from django.utils import timezone as dj_timezone
-from django.utils.dateparse import parse_datetime
 
 from library.models import Track
 from monitoring.models import emit_event
@@ -16,20 +15,14 @@ from road_conditions.report import (
 )
 from road_conditions.synthesis import (
     ReportSuperseded, SynthesisError, hash_file_sha256, published_report_problem,
-    read_provenance, recover_incomplete_publication, road_report_path, synthesize_road_report,
+    read_provenance, recover_incomplete_publication, road_report_path, road_report_pending_path,
+    synthesize_road_report,
 )
+from road_conditions import trigger
 from road_conditions.voice import VoiceResolutionError, resolve_voice
 
-# Arbitrary fixed two-integer pair for a command-wide Postgres advisory
-# lock -- same idiom as sync_road_conditions.py's ROAD_CONDITIONS_LOCK_KEY
-# and generate_dedication_intros.py's DEDICATION_LOCK_KEY. This command
-# and sync_road_conditions.py intentionally do NOT share a lock key --
-# they touch different data (RoadEvent rows vs. the KanDrive Track/file)
-# and are meant to run on entirely different, decoupled schedules (see
-# report.py and this command's own help text on "not tied to the 15-
-# minute CARS polling cadence"), so there's no reason a sync in progress
-# should block a generation run or vice versa. An overlapping firing of
-# THIS command with itself just exits immediately.
+# A separate advisory lock serializes generation, publication and recovery.
+# The sync command can commit newer road data while a report is rendering.
 GENERATE_ROAD_AUDIO_LOCK_KEY = (0x524F4144, 0x41554449)  # "ROAD"/"AUDI" as int32s, arbitrary
 
 # A render whose content changed while it was being made is redone at once
@@ -59,6 +52,14 @@ class Command(BaseCommand):
     )
 
     def add_arguments(self, parser):
+        parser.add_argument(
+            "--dispatched", action="store_true",
+            help="Handle only pending work from the road synchronization service.",
+        )
+        parser.add_argument(
+            "--recover-only", action="store_true",
+            help="Settle a pending local publication without checking upstream freshness or synthesizing.",
+        )
         parser.add_argument(
             "--dry-run", action="store_true",
             help=(
@@ -136,7 +137,10 @@ class Command(BaseCommand):
             self.stdout.write("Another generate_road_condition_audio is already running; exiting.")
             return
         try:
-            self._run(options)
+            if options["dispatched"]:
+                self._run_dispatched(options)
+            else:
+                self._run(options)
         finally:
             with connection.cursor() as cur:
                 cur.execute("SELECT pg_advisory_unlock(%s, %s)", GENERATE_ROAD_AUDIO_LOCK_KEY)
@@ -160,17 +164,49 @@ class Command(BaseCommand):
             self.stdout.write(build_event_script(event, now))
             return
 
-        if not dry_run:
-            self._settle_incomplete_publication()
+        if not dry_run and self._settle_incomplete_publication() == "unrestorable":
+            raise CommandError("Road publication recovery is pending")
+        if options["recover_only"]:
+            return
 
         if text_only or dry_run:
             self._preview(options, now, text_only)
             return
 
+        self._render_current_report(options)
+
+    def _run_dispatched(self, options):
+        mode = trigger.dispatch_mode()
+        if mode not in ("generate", "recover"):
+            return
+        if road_report_pending_path().exists():
+            if not trigger.recovery_due(claim=True):
+                return
+            if self._settle_incomplete_publication() == "unrestorable":
+                raise CommandError("Road publication recovery is pending")
+        if mode == "recover" or options["recover_only"]:
+            return
+        config = RoadConditionsConfiguration.load()
+        if feed_freshness(config) != "fresh":
+            return
+        ticket = trigger.pending_sync(config)
+        if ticket is None:
+            return
+        try:
+            completed = self._render_current_report(options)
+        except CommandError:
+            # A real generation attempt failed. A future successful sync may
+            # retry it. Pending publication recovery has its own retry budget.
+            if feed_freshness() == "fresh":
+                trigger.acknowledge_sync(ticket)
+            raise
+        if completed:
+            trigger.acknowledge_sync(ticket)
+
+    def _render_current_report(self, options):
         for render_pass in range(1, MAX_RENDER_PASSES + 1):
             try:
-                self._check_and_render(options, dj_timezone.now())
-                return
+                return self._check_and_render(options, dj_timezone.now())
             except ReportSuperseded as exc:
                 self.stdout.write(self.style.WARNING(
                     f"Discarded the new audio before publishing: {exc}."
@@ -180,7 +216,11 @@ class Command(BaseCommand):
 
     def _settle_incomplete_publication(self):
         """Needs no road data and no speech synthesis, so it runs first."""
-        outcome = recover_incomplete_publication()
+        try:
+            outcome = recover_incomplete_publication()
+        except Exception as exc:
+            self.stderr.write(f"Could not settle the pending road publication: {exc}")
+            outcome = "unrestorable"
         if not outcome:
             return
         message = {
@@ -189,31 +229,16 @@ class Command(BaseCommand):
             "discarded": "Removed unfinished audio from an earlier first publication.",
             "abandoned": "Dropped the record of an earlier unfinished publication: the audio on disk "
                          "has been replaced since, and is not being overwritten.",
-            "unrestorable": "An earlier publication did not complete and could not be undone; "
-                            "the report will be rendered again.",
+            "unrestorable": "An earlier publication could not be settled. Recovery is still pending.",
         }[outcome]
         self.stdout.write(self.style.WARNING(message))
-        if outcome == "completed":
-            self._record_completed_publication()
-        else:
+        if outcome != "completed":
             emit_event(
                 category="road_conditions", level="warning" if outcome != "unrestorable" else "error",
                 title="KanDrive publication did not complete", detail={"outcome": outcome},
                 dedupe_key=f"road_conditions|kandrive-publication-{outcome}",
             )
-
-    @staticmethod
-    def _record_completed_publication():
-        """The bookkeeping an interrupted run never reached, taken from what
-        it did commit, so the same report is not rendered a second time."""
-        record, _problem = read_provenance()
-        if record is None or not record["semantic_fingerprint"]:
-            return
-        config = RoadConditionsConfiguration.load()
-        config.last_report_fingerprint = record["semantic_fingerprint"]
-        config.last_report_generated_at = (
-            parse_datetime(record.get("published_at") or "") or dj_timezone.now())
-        config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
+        return outcome
 
     def _freshness_allows(self, options, *, preview=False):
         """False, having said so, when road data is not fresh. Nothing is
@@ -371,7 +396,7 @@ class Command(BaseCommand):
 
     def _check_and_render(self, options, now):
         if not self._freshness_allows(options):
-            return
+            return False
         report = self._build_report_or_fail(now, options)
         reason = self._render_reason(options, now, report)
         if not reason:
@@ -379,7 +404,7 @@ class Command(BaseCommand):
                 "KanDrive report unchanged since last successful generation; "
                 f"skipping synthesis and analysis. [fingerprint {report.fingerprint[:12]}]"
             )
-            return
+            return True
 
         config = report.config
         self.stdout.write(
@@ -424,28 +449,11 @@ class Command(BaseCommand):
             )
             raise CommandError(str(exc))
 
-        # Fingerprint/timestamp persisted ONLY here, after the whole
-        # publication has succeeded, so they can never come to describe a
-        # cycle that did not complete.
-        config.last_report_fingerprint = report.fingerprint
-        config.last_report_generated_at = dj_timezone.now()
-        try:
-            config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
-        except Exception as exc:
-            # The audio, text and provenance ARE correct and live at this
-            # point -- only the change-detection bookkeeping for the NEXT
-            # run failed to persist. Surfaced as a real CommandError
-            # rather than claiming full success; the worst consequence is
-            # one unnecessary regeneration, never wrong on-air audio.
-            raise CommandError(
-                f"KanDrive audio generated successfully (track id={track.id}) and "
-                f"published, but failed to persist the generation fingerprint: {exc}"
-            )
-
         self.stdout.write(
             f"Generated KanDrive report: track id={track.id}, {len(report.events)} event(s), "
             f"voice={voice['name']} ({slot}), duration={track.duration_seconds:.1f}s."
         )
+        return True
 
     @staticmethod
     def _announcer_name(voice):

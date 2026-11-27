@@ -1,11 +1,9 @@
 [Unit]
 Description=Generate IsadoraAir KanDrive road-condition audio
 After=postgresql.service
-# Started by isadoraair-generate-road-condition-audio.path after each
-# successful road data sync (and by hand when wanted). systemd's default
-# start-rate limit (5 in 10s) must not apply: hitting it leaves the PATH
-# unit failed, which would silently end automatic generation. The path
-# trigger is edge-triggered, so it cannot loop on its own.
+# The path watches committed sync and recovery wakeups. A start-rate
+# failure would disable the watcher. Sync ticks bound repeated wakeups and
+# the worker separately caps recovery attempts for the same journal.
 StartLimitIntervalSec=0
 
 [Service]
@@ -19,7 +17,7 @@ Nice=19
 User=@@ISA_USER@@
 Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@
-ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py generate_road_condition_audio
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py generate_road_condition_audio --dispatched
 EnvironmentFile=@@ISA_ROOT@@/.env
 # Deliberately unbounded, NOT systemd's ordinary 90s default start
 # timeout -- a real production KanDrive report has already measured at

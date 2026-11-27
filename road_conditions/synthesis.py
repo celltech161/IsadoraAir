@@ -93,18 +93,22 @@ import os
 import re
 import subprocess
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import NamedTuple
 
 from django.conf import settings
 from django.db import connection, transaction
 from django.utils import timezone as dj_timezone
+from django.utils.dateparse import parse_datetime
 
 from isadoraair.runtime_components import get_runtime_component
 from isadoraair.tts.errors import TTSError
-from isadoraair.tts.station import synthesize_station_voice
+from isadoraair.tts.station import resolve_station_voice, synthesize_station_voice
 from library.models import AnalysisConfig, Category, Track
 from library.services import audio_identity
+
+from .models import RoadConditionsConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -196,18 +200,17 @@ def write_road_report_text(text):
     Track updated AND waveform analysis has succeeded, and by recovery to
     put the previous script back. Never reached from a --dry-run,
     --text-only or --event-id path."""
-    KANDRIVE_ROOT.mkdir(parents=True, exist_ok=True)
-    final_text_path = road_report_text_path()
-    pid = os.getpid()
-    tmp_text = KANDRIVE_ROOT / f".{KANDRIVE_TEXT_FILENAME}.{pid}.tmp.txt"
+    _write_text_atomically(road_report_text_path(), text)
+
+
+def _write_text_atomically(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp_text.write_text(text, encoding="utf-8")
-        os.replace(tmp_text, final_text_path)
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
     finally:
-        try:
-            tmp_text.unlink()
-        except FileNotFoundError:
-            pass
+        temporary.unlink(missing_ok=True)
 
 
 def hash_file_sha256(path):
@@ -375,31 +378,26 @@ def _read_pending():
 
 
 def _begin_publication(candidate):
-    """Records what to go back to, then replaces the audio; returns the new
-    publication's id. If an earlier publication is still incomplete, its
-    record of the last COMPLETE publication is kept rather than overwritten
-    with a half-published one."""
+    """Record the prior publication before replacing its audio."""
     final_path = _final_path()
     previous = road_report_previous_path()
-    record = _read_pending()
-    if record is None or not (
-        record["previous_flac_sha256"] is None
-        or _sha256_or_none(previous) == record["previous_flac_sha256"]
-    ):
-        previous.unlink(missing_ok=True)
-        previous_sha256 = None
-        if final_path.exists():
-            os.link(final_path, previous)
-            previous_sha256 = hash_file_sha256(previous)
-        track = _published_track()
-        record = {
-            "previous_flac_sha256": previous_sha256,
-            "previous_script": _read_text_or_none(road_report_text_path()),
-            "previous_track": None if track is None else {
-                "id": track.id, "title": track.title, "duration_seconds": track.duration_seconds,
-                "cue_marker_revision": track.cue_marker_revision, "waveform": _waveform_witness(track),
-            },
-        }
+    if road_report_pending_path().exists():
+        raise SynthesisError("An earlier road publication still needs recovery")
+    previous.unlink(missing_ok=True)
+    previous_sha256 = None
+    if final_path.exists():
+        os.link(final_path, previous)
+        previous_sha256 = hash_file_sha256(previous)
+    track = _published_track()
+    record = {
+        "previous_flac_sha256": previous_sha256,
+        "previous_script": _read_text_or_none(road_report_text_path()),
+        "previous_provenance": _read_text_or_none(road_report_provenance_path()),
+        "previous_track": None if track is None else {
+            "id": track.id, "cue_marker_revision": track.cue_marker_revision,
+            "waveform": _waveform_witness(track),
+        },
+    }
     # Names this attempt. Only a provenance record carrying it proves that
     # this publication committed: the audio hash cannot, because a
     # re-render can be byte-identical to what it replaces.
@@ -412,12 +410,77 @@ def _begin_publication(candidate):
     return record["publication_id"]
 
 
+def _publication_time():
+    """Reserve a distinct completion timestamp under the generator advisory lock."""
+    previous = RoadConditionsConfiguration.load().last_report_generated_at
+    now = dj_timezone.now()
+    return max(now, previous + timedelta(microseconds=1)) if previous else now
+
+
+def _timing_matches(track, timing):
+    """Check the cue authority's revision and its binding to the decoded media."""
+    duration = timing["duration"]
+    if (track.cue_marker_revision != timing["marker_revision"] or duration is None
+            or not math.isfinite(duration) or not timing["audio_revision"]):
+        return False
+    cue_in, next_start = track.cue_in_seconds, track.next_start_seconds
+    if cue_in is None or next_start is None or not 0 <= cue_in < next_start <= duration:
+        return False
+    return all(
+        track.cue_marker_state.get(marker, {}).get("audio_revision") == timing["audio_revision"]
+        for marker in ("cue_in_seconds", "next_start_seconds")
+    )
+
+
+def _analyzed_timing(track, analyzed, expected_revision=None):
+    if not analyzed or not analyzed.markers or not analyzed.markers.ok or not analyzed.audio_revision:
+        return None
+    if expected_revision is not None and analyzed.audio_revision != expected_revision:
+        return None
+    track.refresh_from_db()
+    timing = {
+        "marker_revision": analyzed.markers.revision, "duration": analyzed.duration,
+        "audio_revision": analyzed.audio_revision,
+    }
+    return timing if _timing_matches(track, timing) else None
+
+
 def _finish_publication():
-    """The only place this workflow writes Ready-to-Air: after the
-    provenance record has committed the publication. Safe to repeat."""
-    Track.objects.filter(filepath=str(_final_path())).update(ready2air=True)
+    """Finish the exact journaled publication, once, in a short DB transaction.
+
+    The monotonically allocated publication time in provenance is the DB
+    checkpoint for its UUID. Readiness, report metadata and the checkpoint
+    commit together. Replaying cleanup cannot write readiness a second time.
+    """
+    pending = _read_pending()
+    record, _ = read_provenance()
+    if pending is None or record is None or record.get("publication_id") != pending["publication_id"]:
+        return False
+    if record["flac_sha256"] != pending["new_flac_sha256"]:
+        return False
+    published_at = parse_datetime(record["published_at"])
+    fingerprint = record["semantic_fingerprint"]
+    if published_at is None:
+        return False
+    audio_matches = _sha256_or_none(_final_path()) == record["flac_sha256"]
+    script = _read_text_or_none(road_report_text_path())
+    script_matches = script is not None and _sha256_text(script) == record["script_sha256"]
+    with transaction.atomic():
+        config = RoadConditionsConfiguration.objects.select_for_update().get(pk=1)
+        if (config.last_report_generated_at, config.last_report_fingerprint) != (published_at, fingerprint):
+            track = Track.objects.select_for_update().filter(
+                pk=record["track"]["id"], filepath=str(_final_path())).first()
+            timing = record["track"].get("timing")
+            if not (track and timing and audio_matches and script_matches and _timing_matches(track, timing)):
+                return False
+            Track.objects.filter(pk=track.pk).update(
+                title=record["track"]["title"], duration_seconds=timing["duration"], ready2air=True)
+            config.last_report_fingerprint = fingerprint
+            config.last_report_generated_at = published_at
+            config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
     road_report_pending_path().unlink(missing_ok=True)
     _remove_quietly(road_report_previous_path())
+    return True
 
 
 def recover_incomplete_publication():
@@ -450,8 +513,7 @@ def recover_incomplete_publication():
     provenance, _problem = read_provenance()
     if (provenance is not None
             and provenance.get("publication_id") == record["publication_id"]
-            and current_sha256 == provenance["flac_sha256"]):
-        _finish_publication()
+            and current_sha256 == provenance["flac_sha256"] and _finish_publication()):
         return "completed"
 
     previous_sha256 = record["previous_flac_sha256"]
@@ -462,13 +524,7 @@ def recover_incomplete_publication():
     if previous_sha256 is None:
         if current_sha256 == record["new_flac_sha256"]:
             final_path.unlink(missing_ok=True)
-        if record["previous_script"] is None:
-            _remove_quietly(road_report_text_path())
-        elif _read_text_or_none(road_report_text_path()) != record["previous_script"]:
-            write_road_report_text(record["previous_script"])
-        before, row = record["previous_track"], _published_track()
-        if before is not None and row is not None and row.id == before["id"]:
-            _restore_track_columns(before, row)
+        _restore_sidecars(record)
         road_report_pending_path().unlink(missing_ok=True)
         return "discarded"
 
@@ -481,45 +537,47 @@ def recover_incomplete_publication():
         restoring.unlink(missing_ok=True)
         os.link(previous, restoring)
         os.replace(restoring, final_path)
-    script = record["previous_script"]
-    if script is not None and _read_text_or_none(road_report_text_path()) != script:
-        write_road_report_text(script)
-    if not _restore_track(record["previous_track"]):
+    _restore_sidecars(record)
+    if not _restore_track(record["previous_track"]) or _sha256_or_none(final_path) != previous_sha256:
         return "unrestorable"
     road_report_pending_path().unlink(missing_ok=True)
     _remove_quietly(road_report_previous_path())
     return "restored"
 
 
-def _restore_track_columns(before, track):
-    """The only two columns a publication changes that vary between reports."""
-    if (track.title, track.duration_seconds) != (before["title"], before["duration_seconds"]):
-        Track.objects.filter(pk=track.pk).update(
-            title=before["title"], duration_seconds=before["duration_seconds"])
+def _restore_sidecars(record):
+    script = record["previous_script"]
+    if script is None:
+        road_report_text_path().unlink(missing_ok=True)
+    elif _read_text_or_none(road_report_text_path()) != script:
+        write_road_report_text(script)
+    provenance = record.get("previous_provenance")
+    if "previous_provenance" not in record:
+        return
+    path = road_report_provenance_path()
+    if provenance is None:
+        path.unlink(missing_ok=True)
+    elif _read_text_or_none(path) != provenance:
+        _write_text_atomically(path, provenance)
 
 
 def _restore_track(before):
-    """Puts back what a publication changes on the Track, and nothing else:
-    never Ready-to-Air or any column it does not write. Cue markers and
-    waveform are recomputed from the restored audio, through the ordinary
-    analysis and cue-marker authority, only if they had changed."""
+    """Rebind timing through the cue authority when the prior media is restored."""
     track = _published_track()
-    if before is None or track is None or track.id != before["id"]:
+    if before is None:
         return True
-    _restore_track_columns(before, track)
+    if track is None or track.id != before["id"]:
+        return False
     if (track.cue_marker_revision == before["cue_marker_revision"]
             and _waveform_witness(track) == before["waveform"]):
         return True
     try:
-        track.refresh_from_db()
         analyzed = _run_full_analysis(track)
-    except Exception as exc:  # noqa: BLE001 -- leaves "unrestorable"; the report is rendered again
+        _finish_waveform(analyzed)
+        return _analyzed_timing(track, analyzed) is not None
+    except Exception as exc:  # leave the journal pending for recovery
         logger.warning("road_conditions: re-analysis of the restored report failed: %s", exc)
         return False
-    if not analyzed:
-        return False
-    _finish_waveform(analyzed)
-    return True
 
 
 def _probe_duration(path):
@@ -543,6 +601,7 @@ def _validate_candidate(path, duration):
     decoded = identity["frames"] / identity["sample_rate"]
     if abs(decoded - duration) > max(1.0, duration * 0.02):
         raise ValueError(f"rendered report decodes to {decoded:.1f}s, expected {duration:.1f}s")
+    return audio_identity.revision(identity)
 
 
 def build_loudnorm_string(extra_args=""):
@@ -634,7 +693,7 @@ def _synthesize_segment_wav(voice, text, output_wav):
     """Send the same resolved voice to the station API for every segment."""
     synthesize_station_voice(
         text,
-        voice=voice.get("resolved_voice") or voice["logical_voice_name"],
+        voice=voice["resolved_voice"],
         output_path=output_wav,
         timeout_seconds=voice["tts_timeout_seconds"],
     )
@@ -775,6 +834,8 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
 
     try:
         try:
+            if "resolved_voice" not in voice:
+                voice = {**voice, "resolved_voice": resolve_station_voice(voice["logical_voice_name"])}
             # Provenance only; an unusable sound file fails in ffmpeg.
             transition_sound_sha256 = _sha256_or_none(transition_sound_path) if use_transitions else None
             if use_transitions:
@@ -806,7 +867,7 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
 
                 _run_loudnorm_two_pass(build_filter_args, tmp_flac)
                 duration = _probe_duration(tmp_flac)
-            _validate_candidate(tmp_flac, duration)
+            candidate_revision = _validate_candidate(tmp_flac, duration)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, TTSError,
                 OSError, audio_identity.IdentityUnavailable) as exc:
             raise SynthesisError(f"Shared-TTS/ffmpeg synthesis failed: {exc}") from exc
@@ -827,7 +888,7 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
             },
         }
         return _publish_report(
-            tmp_flac, text, voice_slot, voice, duration, semantic_fingerprint, rendering,
+            tmp_flac, text, voice_slot, voice, duration, semantic_fingerprint, rendering, candidate_revision,
         )
     finally:
         for p in cleanup_paths:
@@ -837,7 +898,7 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                 pass
 
 
-def _publish_report(candidate, text, voice_slot, voice, duration, semantic_fingerprint, rendering):
+def _publish_report(candidate, text, voice_slot, voice, duration, semantic_fingerprint, rendering, candidate_revision):
     """Replaces the published report with the validated `candidate`.
 
     While it is incomplete a pending record says what to go back to, so a
@@ -863,35 +924,27 @@ def _publish_report(candidate, text, voice_slot, voice, duration, semantic_finge
         raise SynthesisError(f"KanDrive publication could not start: {exc}") from exc
 
     try:
-        # Only the columns a publication owns (update_or_create saves just
-        # these), so anything else changed meanwhile is left alone.
-        track, _created = Track.objects.update_or_create(
-            filepath=str(final_path),
-            defaults=dict(
-                filename=final_path.name,
-                format="flac",
-                title=f"KanDrive Road Report ({voice['name']})",
-                artist=_kandrive_artist(),
-                duration_seconds=duration,
-                category=_kandrive_category(),
-            ),
-        )
-        # Full, real analysis -- unlike the Dedications intro pattern, this
-        # Track IS meant to crossfade normally in rotation, so it needs
-        # actual envelope-based cue points, not a speech-clip opt-out. A
-        # report with no analysis would have no cue points for the log
-        # builder, so a failed analysis fails the publication.
+        # Existing Tracks retain station metadata. Prepare only a new Track
+        # here; title and duration on existing Tracks commit with readiness.
+        title = f"KanDrive Road Report ({voice['name']})"
+        track = _published_track()
+        if track is None:
+            track, _ = Track.objects.get_or_create(filepath=str(final_path), defaults={
+                "filename": final_path.name, "format": "flac", "title": title,
+                "artist": _kandrive_artist(), "duration_seconds": duration, "category": _kandrive_category(),
+            })
         analyzed = _run_full_analysis(track)
-        if not analyzed:
-            raise SynthesisError(f"waveform analysis of the new report (Track {track.id}) failed")
         _finish_waveform(analyzed)
-        track.refresh_from_db()
+        timing = _analyzed_timing(track, analyzed, expected_revision=candidate_revision)
+        if timing is None:
+            raise SynthesisError(f"cue timing for the new report (Track {track.id}) could not be verified")
         write_road_report_text(text)
+        resolved = voice["resolved_voice"]
         _write_json_atomically(road_report_provenance_path(), {
             "provenance_version": PROVENANCE_VERSION,
             "publication_id": publication_id,
             "semantic_fingerprint": semantic_fingerprint,
-            "published_at": dj_timezone.now().isoformat(),
+            "published_at": _publication_time().isoformat(),
             "script": text,
             "script_sha256": _sha256_text(text),
             "flac_sha256": flac_sha256,
@@ -899,15 +952,15 @@ def _publish_report(candidate, text, voice_slot, voice, duration, semantic_finge
                 "slot": voice_slot, "name": voice.get("name"), "full_name": voice.get("full_name"),
             },
             "voice": {
-                "logical_voice_name": voice.get("logical_voice_name"),
-                "engine": voice.get("engine"),
-                "provider_voice": voice.get("model"),
-                "language": voice.get("language"),
-                "speed": voice.get("speed"),
+                "logical_voice_name": resolved.logical_name,
+                "engine": resolved.engine.value,
+                "provider_voice": resolved.provider_voice,
+                "language": resolved.language,
+                "speed": resolved.speed,
             },
-            "model": _model_identity(voice),
+            "model": _model_identity(resolved),
             "rendering": rendering,
-            "track": {"id": track.id},
+            "track": {"id": track.id, "title": title, "timing": timing},
         })
     except BaseException as exc:
         outcome = _recover_after_failure(exc)
@@ -916,12 +969,14 @@ def _publish_report(candidate, text, voice_slot, voice, duration, semantic_finge
         raise SynthesisError(f"KanDrive publication failed ({outcome}): {exc}") from exc
 
     try:
-        _finish_publication()
+        finished = _finish_publication()
     except Exception as exc:
         raise SynthesisError(
-            f"KanDrive report (Track {track.id}) was published but could not be finished; "
-            f"the next run completes it: {exc}"
+            f"KanDrive report (Track {track.id}) could not be finished; recovery is pending: {exc}"
         ) from exc
+    if not finished:
+        outcome = _recover_after_failure("committed artifacts could not be verified")
+        raise SynthesisError(f"KanDrive report (Track {track.id}) could not be finished ({outcome})")
     track.refresh_from_db()
     return track
 
@@ -938,11 +993,11 @@ def _recover_after_failure(cause):
     return {"": "nothing was replaced"}.get(outcome, f"previous report {outcome}")
 
 
-def _model_identity(voice):
+def _model_identity(resolved):
     """The pinned model of the engine that rendered, from the runtime
     component contract. Descriptive only: never blocks a publication."""
-    if voice.get("engine") != "kokoro":
-        return {"id": voice.get("model")}
+    if resolved.engine.value != "kokoro":
+        return {"id": resolved.provider_voice}
     try:
         component = get_runtime_component("kokoro")
         return {
@@ -990,7 +1045,7 @@ def _run_full_analysis(track):
     )
     # A freshly synthesized report replaced this Track's audio: its markers rebind to it.
     return analyze_one_track(row, cfg_values, get_waveforms_dir(), force=True, media_replaced=True,
-                             keep_previous_waveform=True)
+                             keep_previous_waveform=True, update_track_metadata=False)
 
 
 def _kandrive_category():

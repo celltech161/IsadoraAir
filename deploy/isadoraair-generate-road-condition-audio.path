@@ -2,17 +2,9 @@
 Description=Run IsadoraAir road-condition audio generation after a successful road data sync
 
 [Path]
-# The ONLY ordinary automatic trigger for road-condition audio (1.24-B;
-# it replaces isadoraair-generate-road-condition-audio.timer, which must
-# not be installed or enabled alongside it). sync_road_conditions
-# replaces this file after a real upstream retrieval has been committed,
-# and never after a skipped ("not due yet"), failed, dry or narrowed
-# run -- see road_conditions/trigger.py, whose TRIGGER_PATH must match.
-#
-# PathChanged= is edge-triggered: nothing runs without a new request, so
-# a failing generator is not restarted in a loop. A request made while
-# the generator is already running is not queued; the next successful
-# retrieval makes another. The service can also still be started by hand.
+# The edge wakes the worker for committed sync data or pending local recovery.
+# The one-minute sync tick retries lost edges. The worker acknowledges a
+# specific database request only after obtaining the generator lock.
 PathChanged=/run/isadoraair/road_generation.trigger
 Unit=isadoraair-generate-road-condition-audio.service
 

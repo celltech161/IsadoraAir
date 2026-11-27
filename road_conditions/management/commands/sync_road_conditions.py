@@ -9,8 +9,10 @@ from monitoring.models import emit_event
 from road_conditions.alerts import evaluate_feed
 from road_conditions.api import CarsApiError
 from road_conditions.models import RoadConditionsConfiguration
+from road_conditions.report import feed_freshness
 from road_conditions.services import sync_events
-from road_conditions.trigger import request_generation
+from road_conditions.synthesis import road_report_pending_path
+from road_conditions.trigger import pending_sync, recovery_due, request_generation
 
 # Arbitrary fixed two-integer pair for a command-wide Postgres advisory
 # lock -- same idiom as generate_dedication_intros.py's DEDICATION_LOCK_KEY
@@ -137,18 +139,37 @@ class Command(BaseCommand):
             self.stdout.write("Another sync_road_conditions is already running; exiting.")
             return
         try:
+            real_full = not options["dry_run"] and not _narrowed(options)
+            recovery_requested = self._request_local_recovery() if real_full else False
             try:
-                self._run(options)
+                self._run(options, recovery_requested=recovery_requested)
             finally:
                 # Every real invocation, including "not due yet" and failed
                 # ones: this is what notices the data going stale.
-                if not options["dry_run"] and not _narrowed(options):
+                if real_full:
+                    # A generator can be interrupted while this fetch is in flight.
+                    if not recovery_requested:
+                        self._request_local_recovery()
                     evaluate_feed()
         finally:
             with connection.cursor() as cur:
                 cur.execute("SELECT pg_advisory_unlock(%s, %s)", ROAD_CONDITIONS_LOCK_KEY)
 
-    def _run(self, options):
+    def _request_local_recovery(self):
+        try:
+            return recovery_due() and request_generation(recovery_only=True)
+        except (OSError, ValueError) as exc:
+            self.stderr.write(f"Could not check pending road publication: {exc}")
+            return False
+
+    def _retry_pending_generation(self, config):
+        try:
+            if not road_report_pending_path().exists() and feed_freshness(config) == "fresh" and pending_sync(config):
+                request_generation()
+        except (OSError, ValueError) as exc:
+            self.stderr.write(f"Could not check the pending road generation request: {exc}")
+
+    def _run(self, options, *, recovery_requested):
         config = RoadConditionsConfiguration.load()
         if not config.enabled and not options["force_full"]:
             self.stdout.write("Road Conditions Configuration is disabled; nothing to do. (Use --force-full to run anyway.)")
@@ -157,6 +178,8 @@ class Command(BaseCommand):
         if not options["force_full"]:
             due, next_start = _due(config)
             if not due:
+                if not recovery_requested and not options["dry_run"] and not _narrowed(options):
+                    self._retry_pending_generation(config)
                 self.stdout.write(
                     f"Not due yet -- next retrieval slot {timezone.localtime(next_start):%H:%M}, "
                     f"poll_cadence_minutes is {config.poll_cadence_minutes}. "

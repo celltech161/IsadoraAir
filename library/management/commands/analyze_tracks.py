@@ -386,9 +386,11 @@ class AnalysisOutcome:
     previous cache was kept. ``audio_problem`` says why the decoded audio could not be identified
     (the new cache is then displayable but never trusted); empty when it was identified."""
 
-    def __init__(self, analyzed, markers=None, reason="", promotion=None, waveform_error="", audio_problem=""):
+    def __init__(self, analyzed, markers=None, reason="", promotion=None, waveform_error="", audio_problem="",
+                 duration=None, audio_revision=None):
         self.analyzed, self.markers, self.reason, self.promotion = analyzed, markers, reason, promotion
         self.waveform_error, self.audio_problem = waveform_error, audio_problem
+        self.duration, self.audio_revision = duration, audio_revision
 
     @property
     def waveform_installed(self) -> bool:
@@ -419,7 +421,7 @@ def _clear_processed_analysis_request(track_id, basis):
 
 def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None, *,
                       media_replaced=False, source=cue_markers.SOURCE_ANALYSIS, requested_by=None,
-                      override=(), override_confirmed=False, keep_previous_waveform=False):
+                      override=(), override_confirmed=False, keep_previous_waveform=False, update_track_metadata=True):
     """Analyze exactly one track (waveform + cue points + related artists),
     writing results directly to the DB and a waveform JSON file. `row` is
     (track_id, filepath, filename, duration, title, artist_name,
@@ -583,27 +585,32 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     # (or the /track/<pk>/ Reanalyze Track action, which calls this
     # with force=True) can never erase a manually-entered related
     # artist, even one this extractor wouldn't have found on its own.
-    if force or not existing_related:
-        if existing_artist_names_casefolded is None:
-            existing_artist_names_casefolded = load_existing_artist_names_casefolded()
-        discovered = extract_credited_artists(
-            artist_name, title, artist_name,
-            existing_artist_names_casefolded=existing_artist_names_casefolded,
-        )
-        related = merge_related_artists(existing_related, discovered, primary_artist_name=artist_name)
-    else:
-        related = existing_related
+    update_fields = {}
+    if update_track_metadata:
+        if force or not existing_related:
+            if existing_artist_names_casefolded is None:
+                existing_artist_names_casefolded = load_existing_artist_names_casefolded()
+            discovered = extract_credited_artists(
+                artist_name, title, artist_name,
+                existing_artist_names_casefolded=existing_artist_names_casefolded,
+            )
+            update_fields["related_artists"] = merge_related_artists(
+                existing_related, discovered, primary_artist_name=artist_name,
+            )
+        else:
+            update_fields["related_artists"] = existing_related
 
-    if effective_duration and effective_duration != duration:
-        Track.objects.filter(id=track_id).update(duration_seconds=effective_duration)
+        if effective_duration and effective_duration != duration:
+            Track.objects.filter(id=track_id).update(duration_seconds=effective_duration)
 
     # A detector that found nothing writes nothing: a failed detection never nulls a marker.
     calculated = {name: value for name, value in (("cue_in_seconds", cue_in), ("next_start_seconds", next_start))
                   if value is not None}
+    audio_revision = audio_identity.revision(identity)
     marker_result = cue_markers.apply_calculation(
         track_id, calculated, basis_revision=basis["cue_marker_revision"], source=source,
         requested_by=requested_by, override=override, override_confirmed=override_confirmed,
-        media_replaced=media_replaced, audio_revision=audio_identity.revision(identity), duration=effective_duration,
+        media_replaced=media_replaced, audio_revision=audio_revision, duration=effective_duration,
     )
     if not marker_result.ok:
         print(f"  Track {track_id}: calculated cue markers not applied: "
@@ -612,7 +619,6 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
     # envelope (detect_next_start/detect_cue_in walk it; Repick re-picks from it without another
     # decode once the cache is trusted), the audio identity and source witness, and -- added at
     # promotion -- the Track's markers as they stand then, never values the authority did not apply.
-    update_fields = {"related_artists": related}
     promotion, waveform_error = None, ""
     # The mono envelope remains useful for eligible cue-marker calculations,
     # but a cache without stereo samples cannot be drawn.  Keep successful
@@ -639,14 +645,16 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
             print(f"  Waveform cache for track {track_id} not replaced (the previous one is kept): {exc}")
 
     try:
-        Track.objects.filter(id=track_id).update(**update_fields)
+        if update_fields:
+            Track.objects.filter(id=track_id).update(**update_fields)
         _clear_processed_analysis_request(track_id, basis)
     except BaseException:
         if keep_previous_waveform and promotion is not None:
             promotion.undo()
         raise
     return AnalysisOutcome(True, markers=marker_result, promotion=promotion, waveform_error=waveform_error,
-                           audio_problem="" if identity is not None else (identity_problem or "unidentified"))
+                           audio_problem="" if identity is not None else (identity_problem or "unidentified"),
+                           duration=effective_duration, audio_revision=audio_revision)
 
 
 class Command(BaseCommand):
