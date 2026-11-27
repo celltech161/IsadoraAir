@@ -86,20 +86,20 @@ def resolve_station_voice(name: str) -> ResolvedStationVoice:
 
 
 class StationTTSService:
-    """High-level service whose callers supply only a logical voice name."""
+    """Synthesize with a logical name or an already resolved station voice."""
 
     def synthesize(
         self,
         text: str,
         *,
-        voice: str,
+        voice: str | ResolvedStationVoice,
         output_path: str | os.PathLike[str],
         speed: float | None = None,
         language: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         service: TTSService | None = None,
     ) -> Path:
-        resolved = resolve_station_voice(voice)
+        resolved = resolve_station_voice(voice) if isinstance(voice, str) else voice
         request = SynthesisRequest(
             text=text,
             engine=resolved.engine,
@@ -118,7 +118,7 @@ class StationTTSService:
 def synthesize_station_voice(
     text: str,
     *,
-    voice: str,
+    voice: str | ResolvedStationVoice,
     output_path: str | os.PathLike[str],
     speed: float | None = None,
     language: str | None = None,

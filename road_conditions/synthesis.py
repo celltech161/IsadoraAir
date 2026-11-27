@@ -631,32 +631,10 @@ def _run_loudnorm_two_pass(build_filter_args, tmp_flac):
 
 
 def _synthesize_segment_wav(voice, text, output_wav):
-    """Applied identically to the plain single-call path
-    (synthesize_road_report's own body) and every per-segment call in
-    _synthesize_with_transitions() below. Routes through the shared
-    isadoraair.tts.station.synthesize_station_voice() API, passing ONLY
-    voice["logical_voice_name"] -- an operator-selected logical station
-    voice name -- never voice["model"] (which holds the RESOLVED
-    provider voice id, e.g. "af_jessica", kept only for report.
-    compute_report_fingerprint()'s fingerprint authenticity; see
-    voice.py's _resolve_shared_schedule_voice()). Timeout is
-    voice["tts_timeout_seconds"] (RoadConditionsConfiguration.
-    tts_timeout_seconds, applied per call -- i.e. per segment on the
-    transition-sound path, matching that field's own documented
-    intent).
-
-    `voice` is always a road_conditions.voice.resolve_voice()-shaped
-    dict -- that function raises VoiceResolutionError before returning
-    anything else (the direct-Kokoro fallback this used to route to for
-    a legacy/unshaped dict was retired in r0029; that runtime no longer
-    exists).
-
-    Raises isadoraair.tts.errors.TTSError, caught by
-    synthesize_road_report()'s own wrapping try/except and turned into
-    a SynthesisError, non-fatal and last-known-good-preserving."""
+    """Send the same resolved voice to the station API for every segment."""
     synthesize_station_voice(
         text,
-        voice=voice["logical_voice_name"],
+        voice=voice.get("resolved_voice") or voice["logical_voice_name"],
         output_path=output_wav,
         timeout_seconds=voice["tts_timeout_seconds"],
     )

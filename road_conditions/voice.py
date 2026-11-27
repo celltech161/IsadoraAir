@@ -13,12 +13,9 @@ being True (KOGR's real production state):
        facing metadata: display_name/full_name/signoff) -> its
        tts_voice FK (a logical isadoraair.tts.models.StationTTSVoice
        name) -> isadoraair.tts.station.resolve_station_voice() (the
-       authoritative provider/engine resolution). Only the logical
-       name ever reaches the shared TTS API -- see synthesis.py's
-       _synthesize_segment_wav(). The returned voice dict's "model" is
-       populated from the RESOLVED provider_voice (not the logical
-       name) so the published audio's provenance records what actually
-       rendered it. A voice change alone never re-renders an unchanged
+       authoritative provider/engine resolution). The result is pinned
+       for the entire report and passed to the shared TTS API for every
+       segment. The same resolution supplies the provenance fields. A voice change alone never re-renders an unchanged
        report (report.compute_report_fingerprint() is voice-neutral).
 
   LEGACY (tts_use_weather_schedule=False) is RETIRED as of r0029. It
@@ -148,11 +145,8 @@ def _resolve_shared_schedule_voice(config, slot_override, now):
         "name": name,
         "full_name": full_name,
         "signoff": persona.signoff,
-        # The ONLY voice identity synthesis.py's shared-TTS route is
-        # allowed to pass to synthesize_station_voice() -- see this
-        # module's own docstring and synthesis.py's
-        # _synthesize_segment_wav().
         "logical_voice_name": persona.tts_voice.name,
+        "resolved_voice": resolved,
         "shared_tts": True,
         "tts_timeout_seconds": config.tts_timeout_seconds,
     }

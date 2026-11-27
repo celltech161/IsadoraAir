@@ -135,7 +135,7 @@ class KanDriveSynthesisFixtureMixin:
         def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
                                 timeout_seconds=None, service=None):
             self._kokoro_call_count += 1
-            self._synth_voices.append(voice)
+            self._synth_voices.append(getattr(voice, "logical_name", voice))
             if self._kokoro_should_fail:
                 from isadoraair.tts.errors import TTSSynthesisError
                 raise TTSSynthesisError("simulated shared-TTS provider failure")
