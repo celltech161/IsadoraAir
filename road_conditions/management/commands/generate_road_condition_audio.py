@@ -8,13 +8,15 @@ from library.models import Track
 from monitoring.models import emit_event
 from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
-    ReportBuildError, build_event_script, build_event_scripts,
+    ANNOUNCER_PLACEHOLDER, ReportBuildError, build_event_script, build_event_scripts,
     build_no_events_message, compose_report_script, compose_report_segments,
-    compute_report_fingerprint, feed_freshness, select_events,
+    compose_semantic_script, compute_report_fingerprint, feed_freshness, select_events,
 )
 from road_conditions.synthesis import (
-    SynthesisError, existing_report_is_healthy, hash_file_sha256, retire_road_report,
-    road_report_path, synthesize_road_report, write_road_report_text,
+    HELD, READY, RETIRED_BY_FRESHNESS, SynthesisError, discard_retirement_record,
+    hash_file_sha256, inspect_published_report, rearm_retired_report,
+    recover_interrupted_publication, retire_road_report, road_report_path,
+    synthesize_road_report,
 )
 from road_conditions.voice import VoiceResolutionError, resolve_voice
 
@@ -74,9 +76,9 @@ class Command(BaseCommand):
         parser.add_argument(
             "--regenerate", action="store_true",
             help=(
-                "Rebuild the report even though its freshly-computed fingerprint "
-                "matches RoadConditionsConfiguration.last_report_fingerprint and the "
-                "existing FLAC/Track/road_report.txt are otherwise healthy -- i.e. "
+                "Rebuild the report, in the currently scheduled voice, even though its "
+                "content fingerprint matches RoadConditionsConfiguration."
+                "last_report_fingerprint and the published audio verifies -- i.e. "
                 "bypass ONLY the fingerprint-based dedup skip (see report.py's "
                 "compute_report_fingerprint()). Independent of --force: this does "
                 "NOT bypass the stale/failed/disabled freshness gate below -- combine "
@@ -186,35 +188,7 @@ class Command(BaseCommand):
             )
             raise CommandError(str(exc))
 
-        # Voice resolved BEFORE final composition (not after, as an
-        # earlier revision of this command did) -- the final script can
-        # now contain {announcer_name}, so --text-only needs the real
-        # voice to print the exact script that would actually be spoken,
-        # not just the un-framed report body. This does mean --text-only
-        # now depends on voice resolution succeeding too, which is
-        # correct: a preview that can't resolve the real voice can't
-        # show the real final script either.
-        try:
-            slot, voice = resolve_voice(slot_override=options["voice"], now=now)
-        except VoiceResolutionError as exc:
-            raise CommandError(f"Voice resolution failed: {exc}")
-
         config = RoadConditionsConfiguration.load()
-        # Full on-air name ("Claira Sky", not just "Claira") -- matches
-        # how weather's own scripts identify the announcer (wx_forecast.py
-        # splices in voice['signoff'], e.g. "I'm Claira Sky."), rather
-        # than the short voice['name'] used for internal bookkeeping
-        # (ID3 titles, log messages -- see this command's own success
-        # message below, and voice.py's docstring on why `name` exists).
-        # Falls back to the short name if a voice slot is ever missing
-        # full_name (e.g. a future third slot not yet updated in
-        # weather-ingest's lib/voices.py) rather than raising.
-        announcer_name = voice.get("full_name") or voice["name"]
-        text = compose_report_script(body, config, announcer_name=announcer_name)
-
-        if text_only:
-            self.stdout.write(text)
-            return
 
         # Item transition sound -- only meaningful with 2+ events (no
         # boundary to insert one at with 0 or 1). A missing/unreadable
@@ -223,81 +197,81 @@ class Command(BaseCommand):
         # failing the whole cycle; a present-but-corrupt file instead
         # surfaces later as an ordinary SynthesisError from ffmpeg,
         # same as any other synthesis failure.
-        segments = None
         transition_sound_path = None
+        transition_sound_fingerprint = None
         if len(events) >= 2 and config.transition_sound_enabled:
             candidate = (config.transition_sound_path or "").strip()
             if candidate and os.path.exists(candidate):
-                transition_sound_path = candidate
-                segments = compose_report_segments(event_scripts, config, announcer_name=announcer_name)
+                # Hashed on every run the feature is active for -- see
+                # synthesis.hash_file_sha256() on why that is cheap
+                # enough not to need caching. A file that vanishes or
+                # cannot be read degrades like a missing one.
+                try:
+                    transition_sound_fingerprint = hash_file_sha256(candidate)
+                    transition_sound_path = candidate
+                except OSError as exc:
+                    self.stdout.write(self.style.WARNING(
+                        f"Transition sound became unreadable ({exc}) -- generating without it."
+                    ))
             else:
                 self.stdout.write(self.style.WARNING(
                     f"Transition sound enabled but not found/readable at {candidate!r} -- "
                     "generating without it."
                 ))
-
-        # transition_active reflects what this run would ACTUALLY do,
-        # not merely config.transition_sound_enabled -- already true of
-        # transition_sound_path above (None when the file's missing),
-        # but re-derived explicitly here (rather than just truthiness-
-        # testing transition_sound_path again below) so the fingerprint
-        # payload's own field names read clearly at the call site.
-        # Hashed fresh every run the feature is actually active for --
-        # see synthesis.hash_file_sha256()'s own docstring on why this
-        # is cheap enough not to need mtime/size caching. A race where
-        # the file vanishes between the os.path.exists() check above
-        # and this hash (vanishingly unlikely for a static local sound
-        # effect file) degrades the same way a missing file already
-        # does: fall back to plain synthesis rather than raising over a
-        # fingerprinting concern.
+        # What this run would ACTUALLY do, not merely what is configured.
         transition_active = bool(transition_sound_path)
-        transition_sound_fingerprint = None
-        if transition_active:
-            try:
-                transition_sound_fingerprint = hash_file_sha256(transition_sound_path)
-            except OSError as exc:
-                self.stdout.write(self.style.WARNING(
-                    f"Transition sound became unreadable ({exc}) -- generating without it."
-                ))
-                transition_active = False
-                transition_sound_path = None
-                segments = None
 
-        # Fingerprint calculated only now -- immediately before the
-        # skip decision, after event selection, text composition, voice
-        # resolution, AND transition-sound resolution have all already
-        # happened. Moving this earlier would mean deciding "unchanged"
-        # without having looked at everything that actually determines
-        # the resulting audio (see report.compute_report_fingerprint()'s
-        # own docstring).
+        # The content identity: voice-neutral, computed after event
+        # selection, text composition and transition-sound resolution --
+        # everything that determines what the report says and how it is
+        # assembled. No voice is resolved yet: an unchanged, verified
+        # report must not depend on voice configuration at all.
         fingerprint = compute_report_fingerprint(
-            text, slot, voice, transition_active,
+            compose_semantic_script(body, config),
+            transition_active,
             transition_sound_fingerprint=transition_sound_fingerprint,
-            segment_count=len(segments) if transition_active else None,
+            segment_count=(
+                len(compose_report_segments(event_scripts, config, announcer_name=ANNOUNCER_PLACEHOLDER))
+                if transition_active else None
+            ),
         )
-        existing_fingerprint = config.last_report_fingerprint
-        fingerprint_matches = bool(existing_fingerprint) and existing_fingerprint == fingerprint
-        # existing_report_is_healthy() touches the filesystem and DB --
-        # only bother when the cheap checks already indicate a skip is
-        # even possible (fingerprint matches AND --regenerate wasn't
-        # passed); a matching fingerprint alone is NEVER sufficient to
-        # skip on its own (see that function's own docstring -- notably
-        # the stale-feed-retirement-then-recovery case, where the
-        # fingerprint can still match but the Track is no longer
-        # ready2air, and regeneration must happen anyway).
-        would_skip = fingerprint_matches and not options["regenerate"] and existing_report_is_healthy(text)
 
-        final_path = road_report_path()
+        existing_fingerprint = config.last_report_fingerprint
+
+        if not dry_run and recover_interrupted_publication():
+            self.stdout.write(self.style.WARNING(
+                "Restored the previous report audio: an earlier publication was interrupted "
+                "before the Track was updated."
+            ))
+        # Verified against the published audio's own provenance. A
+        # matching fingerprint alone is NEVER sufficient to skip.
+        state = inspect_published_report(fingerprint)
+        unchanged = (
+            not options["regenerate"]
+            and bool(existing_fingerprint) and existing_fingerprint == fingerprint
+            and not state.problem
+        )
+        would_skip = unchanged and state.readiness in (READY, HELD)
+        would_rearm = unchanged and state.readiness == RETIRED_BY_FRESHNESS and freshness == "fresh"
+        reason = self._render_reason(options, state, existing_fingerprint, fingerprint)
+
+        if text_only:
+            _slot, _voice, text = self._compose_for_voice(options, now, body, config)
+            self.stdout.write(text)
+            return
 
         if dry_run:
+            slot, voice, text = self._compose_for_voice(options, now, body, config)
+            final_path = road_report_path()
             self.stdout.write(f"[DRY RUN] Selected {len(events)} event(s).")
             self.stdout.write(f"[DRY RUN] Voice: slot={slot!r} model={voice['model']!r} name={voice['name']!r}")
             self.stdout.write("[DRY RUN] Intended category: KanDrive")
             self.stdout.write(f"[DRY RUN] Intended output file: {final_path}")
             if transition_sound_path:
+                count = len(compose_report_segments(event_scripts, config, announcer_name=voice["name"]))
                 self.stdout.write(
                     f"[DRY RUN] Transition sound: {transition_sound_path} "
-                    f"(between {len(segments)} items, {len(segments) - 1} insertion(s))"
+                    f"(between {count} items, {count - 1} insertion(s))"
                 )
             existing = Track.objects.filter(filepath=str(final_path)).first()
             if existing:
@@ -309,21 +283,59 @@ class Command(BaseCommand):
                 self.stdout.write("[DRY RUN] No existing KanDrive Track -- would create a new one.")
             self.stdout.write(f"[DRY RUN] Report fingerprint: {fingerprint}")
             self.stdout.write(f"[DRY RUN] Existing successful fingerprint: {existing_fingerprint or '(none)'}")
-            self.stdout.write(f"[DRY RUN] Would skip generation: {'yes' if would_skip else 'no'}")
+            self.stdout.write(f"[DRY RUN] Would skip generation: {'yes' if would_skip or would_rearm else 'no'}")
+            if would_rearm:
+                self.stdout.write("[DRY RUN] Would re-arm the retired report without rendering.")
+            elif not would_skip:
+                self.stdout.write(f"[DRY RUN] Render reason: {reason}")
             self.stdout.write("[DRY RUN] Final script:")
             self.stdout.write(text)
             return
 
         if would_skip:
-            self.stdout.write(
-                "KanDrive report unchanged since last successful generation; "
-                "skipping synthesis and analysis."
-            )
+            if state.readiness == READY:
+                discard_retirement_record()
+                self.stdout.write(
+                    "KanDrive report unchanged since last successful generation; "
+                    f"skipping synthesis and analysis. [fingerprint {fingerprint[:12]}]"
+                )
+            else:
+                self.stdout.write(
+                    "KanDrive report unchanged since last successful generation but held off air "
+                    "(ready2air was cleared outside road-data freshness); leaving it held, "
+                    f"skipping synthesis. [fingerprint {fingerprint[:12]}]"
+                )
             return
 
+        if would_rearm:
+            if rearm_retired_report(fingerprint):
+                self.stdout.write(
+                    "KanDrive report re-armed without synthesis: road data is fresh again, content "
+                    "is unchanged and the published audio verifies. "
+                    f"[fingerprint {fingerprint[:12]}]"
+                )
+                return
+            reason = "retired_report_not_rearmable"
+
+        self.stdout.write(
+            f"KanDrive render needed: reason={reason} fingerprint={fingerprint[:12]} "
+            f"previous={existing_fingerprint[:12] or 'none'}"
+        )
+
+        # Voice resolved only now that audio is really going to be made.
+        # Its name is spoken, so it is resolved before final composition.
+        slot, voice, text = self._compose_for_voice(options, now, body, config)
+        segments = (
+            compose_report_segments(event_scripts, config, announcer_name=self._announcer_name(voice))
+            if transition_active else None
+        )
+
         try:
+            # Publishes the audio, Track, waveform, road_report.txt and
+            # provenance together; see synthesis._publish_report().
             track = synthesize_road_report(
                 text, slot, voice, segments=segments, transition_sound_path=transition_sound_path,
+                semantic_fingerprint=fingerprint,
             )
         except SynthesisError as exc:
             emit_event(
@@ -332,61 +344,66 @@ class Command(BaseCommand):
             )
             raise CommandError(str(exc))
 
-        # road_report.txt is written HERE, only now that
-        # synthesize_road_report() has returned a Track without raising
-        # -- i.e. the FLAC was written, the Track row was created/
-        # updated, AND waveform analysis succeeded. This is deliberately
-        # NOT inside synthesize_road_report() itself (see that
-        # function's own docstring): writing it there, right after the
-        # FLAC's own os.replace(), meant a LATER failure in that same
-        # function (the Track DB write, or analysis) could still raise
-        # SynthesisError while road_report.txt had already been
-        # overwritten -- leaving the text file describing a generation
-        # cycle that never actually completed successfully. Calling it
-        # only here means the text file always describes a cycle that
-        # completed successfully start to finish, matching the intended
-        # "represents the last generation that completed successfully"
-        # semantics exactly.
-        try:
-            write_road_report_text(text)
-        except OSError as exc:
-            raise CommandError(
-                f"KanDrive audio generated successfully (track id={track.id}) but failed to "
-                f"write the companion road_report.txt: {exc}"
-            )
-
-        # Fingerprint/timestamp persisted ONLY here -- after synthesis,
-        # FLAC installation, Track update, waveform analysis, AND the
-        # road_report.txt write have ALL already succeeded. A failure
-        # at any earlier point above returns/raises before this line is
-        # ever reached, so last_report_fingerprint/last_report_
-        # generated_at can never come to describe a cycle that didn't
-        # actually complete successfully (same invariant already
-        # established for road_report.txt itself -- see this file's own
-        # comment above and synthesize_road_report()'s docstring).
+        # Fingerprint/timestamp persisted ONLY here, after the whole
+        # publication has succeeded, so they can never come to describe a
+        # cycle that did not complete.
         config.last_report_fingerprint = fingerprint
         config.last_report_generated_at = dj_timezone.now()
         try:
             config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
         except Exception as exc:
-            # The audio and text ARE correct and live at this point --
-            # only the change-detection bookkeeping for the NEXT run
-            # failed to persist. Surfaced as a real CommandError (same
-            # shape as the road_report.txt failure just above) rather
-            # than silently continuing and claiming full success, since
-            # the caller must not be told the generation state was
-            # successfully recorded when it wasn't -- but this is a
-            # narrower failure than either of the two above: the worst
-            # consequence is the next run's fingerprint check incorrectly
-            # missing (a false-negative cache, causing one unnecessary
-            # regeneration), never stale or incorrect on-air audio.
+            # The audio, text and provenance ARE correct and live at this
+            # point -- only the change-detection bookkeeping for the NEXT
+            # run failed to persist. Surfaced as a real CommandError
+            # rather than claiming full success; the worst consequence is
+            # one unnecessary regeneration, never wrong on-air audio.
             raise CommandError(
                 f"KanDrive audio generated successfully (track id={track.id}) and "
-                f"road_report.txt written, but failed to persist the generation "
-                f"fingerprint: {exc}"
+                f"published, but failed to persist the generation fingerprint: {exc}"
             )
 
+        if not track.ready2air:
+            self.stdout.write(self.style.WARNING(
+                "The new KanDrive report was published but left held off air: ready2air had been "
+                "cleared outside road-data freshness."
+            ))
+            emit_event(
+                category="road_conditions", level="warning",
+                title="New KanDrive report published but held off air",
+                detail={"track_id": track.id}, dedupe_key="road_conditions|kandrive-held",
+            )
         self.stdout.write(
             f"Generated KanDrive report: track id={track.id}, {len(events)} event(s), "
             f"voice={voice['name']} ({slot}), duration={track.duration_seconds:.1f}s."
         )
+
+    @staticmethod
+    def _render_reason(options, state, existing_fingerprint, fingerprint):
+        """Why a render is needed, for the journal."""
+        if options["regenerate"]:
+            return "operator_regenerate"
+        if state.problem in ("provenance_missing", "provenance_invalid"):
+            return state.problem
+        if existing_fingerprint != fingerprint:
+            return "content_changed" if existing_fingerprint else "no_previous_report"
+        if state.problem:
+            return state.problem
+        return f"readiness_{state.readiness}"
+
+    @staticmethod
+    def _announcer_name(voice):
+        # Full on-air name ("Claira Sky", not just "Claira") -- matches
+        # how weather's own scripts identify the announcer (wx_forecast.py
+        # splices in voice['signoff'], e.g. "I'm Claira Sky."), rather
+        # than the short voice['name'] used for internal bookkeeping.
+        # Falls back to the short name if a voice slot is ever missing
+        # full_name.
+        return voice.get("full_name") or voice["name"]
+
+    def _compose_for_voice(self, options, now, body, config):
+        try:
+            slot, voice = resolve_voice(slot_override=options["voice"], now=now)
+        except VoiceResolutionError as exc:
+            raise CommandError(f"Voice resolution failed: {exc}")
+        text = compose_report_script(body, config, announcer_name=self._announcer_name(voice))
+        return slot, voice, text

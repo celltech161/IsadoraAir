@@ -17,10 +17,9 @@ being True (KOGR's real production state):
        name ever reaches the shared TTS API -- see synthesis.py's
        _synthesize_segment_wav(). The returned voice dict's "model" is
        populated from the RESOLVED provider_voice (not the logical
-       name) specifically so report.compute_report_fingerprint()'s
-       existing, unchanged voice["model"] field keeps invalidating the
-       fingerprint if an operator repoints the same logical voice at a
-       different provider identity.
+       name) so the published audio's provenance records what actually
+       rendered it. A voice change alone never re-renders an unchanged
+       report (report.compute_report_fingerprint() is voice-neutral).
 
   LEGACY (tts_use_weather_schedule=False) is RETIRED as of r0029. It
   used to bypass the shared TTS service and invoke Kokoro directly via
@@ -128,8 +127,9 @@ def _resolve_shared_schedule_voice(config, slot_override, now):
     silently falls back to a different announcer on any failure --
     every failure mode below is a clear, immediate VoiceResolutionError,
     raised before any text has been composed or any audio synthesized
-    (resolve_voice() is always called first -- see
-    generate_road_condition_audio.py), so a bad/incomplete persona can
+    (resolve_voice() runs only for a real render or a preview, always
+    before synthesis -- see generate_road_condition_audio.py), so a
+    bad/incomplete persona can
     never overwrite the last-known-good report."""
     slot = _resolve_schedule_slot(slot_override, now)
     persona, resolved = _resolve_persona_for_slot(slot)
@@ -138,14 +138,13 @@ def _resolve_shared_schedule_voice(config, slot_override, now):
     voice = {
         "engine": resolved.engine.value,
         # The RESOLVED provider voice identity (e.g. "af_jessica"), not
-        # the logical name -- this is what makes
-        # report.compute_report_fingerprint()'s existing, unchanged
-        # voice["model"] field keep invalidating the fingerprint if an
-        # operator repoints this same logical voice at a different
-        # provider mapping. NEVER passed to a subprocess directly (see
-        # synthesis.py's _synthesize_segment_wav) -- fingerprint
-        # authenticity only.
+        # the logical name -- recorded in the published audio's
+        # provenance (synthesis.py). It does not take part in the report
+        # fingerprint. NEVER passed to a subprocess directly (see
+        # synthesis.py's _synthesize_segment_wav).
         "model": resolved.provider_voice,
+        "language": resolved.language,
+        "speed": resolved.speed,
         "name": name,
         "full_name": full_name,
         "signoff": persona.signoff,
