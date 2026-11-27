@@ -48,8 +48,8 @@ export SYNDICATED_ROOT=$ISA_HOME/syndicated-ingest
 export WEATHER_ROOT=$ISA_ROOT/weather_ingest  # in-tree as of r0048; a legacy pre-r0048 install uses $ISA_HOME/weather-ingest instead
 export OGREMOTE_ROOT=$ISA_HOME/ogremote-ingest
 
-# 2. Render + install every deploy/*.service, *.timer, and *.conf
-for f in deploy/*.service deploy/*.timer deploy/*.conf; do
+# 2. Render + install every deploy/*.service, *.timer, *.path, and *.conf
+for f in deploy/*.service deploy/*.timer deploy/*.path deploy/*.conf; do
   [ -f "$f" ] || continue
   # Protected updater bootstrap is separate and must never ride this broad
   # application-unit loop; see updater_runtime/README.md.
@@ -90,6 +90,10 @@ sudo systemctl enable --now isadoraair-analyze.timer \
 sudo systemctl enable --now isadoraair-web-requests-ingest.timer \
   isadoraair-web-requests-catalog.timer \
   isadoraair-generate-dedication-intros.timer
+# Road conditions (when used): the sync timer polls; the .path unit renders
+# audio after a successful sync. There is no road-audio timer.
+# sudo systemctl enable --now isadoraair-sync-road-conditions.timer \
+#   isadoraair-generate-road-condition-audio.path
 # Optional: sudo systemctl enable --now isadoraair-backup.timer
 # Optional: sudo systemctl enable --now 'syndicated-*.timer' 'wx-*.timer'
 sudo systemctl reload nginx

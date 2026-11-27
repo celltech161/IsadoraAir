@@ -191,7 +191,7 @@ install_rendered() {
   rm -f "$tmp"
 }
 
-# ---- 1. Render + install every deploy/*.service, *.timer, *.conf --------
+# ---- 1. Render + install every deploy/*.service, *.timer, *.path, *.conf --
 # NOTE: deploy/README.md's own documented install loop uses this same
 # broad `deploy/*.conf` glob, which -- followed literally -- ALSO
 # matches asound.conf and isadoraair-locations.conf and would install
@@ -217,7 +217,8 @@ install_rendered() {
 # they are not yet available at this point in the sequence.
 UNIT_COUNT=0
 RENDERED_UNITS=()
-for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/deploy/*.conf; do
+for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/deploy/*.path \
+         "$REPO_ROOT"/deploy/*.conf; do
   [ -f "$f" ] || continue
   case "$(basename "$f")" in
     asound.conf|isadoraair-locations.conf|isadoraair-runtime-tmpfiles.conf) continue ;;
@@ -609,7 +610,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     UNIT_FAIL=0
     for u in "${RENDERED_UNITS[@]}"; do
       case "$u" in
-        *.service|*.timer)
+        *.service|*.timer|*.path)
           if systemd-analyze verify "$u" 2>&1 | grep -qv '^$'; then
             :  # systemd-analyze verify prints warnings for cross-references
                # to units not YET installed (timers referencing services in

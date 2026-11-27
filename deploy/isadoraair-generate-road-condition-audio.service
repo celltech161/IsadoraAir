@@ -1,6 +1,12 @@
 [Unit]
 Description=Generate IsadoraAir KanDrive road-condition audio
 After=postgresql.service
+# Started by isadoraair-generate-road-condition-audio.path after each
+# successful road data sync (and by hand when wanted). systemd's default
+# start-rate limit (5 in 10s) must not apply: hitting it leaves the PATH
+# unit failed, which would silently end automatic generation. The path
+# trigger is edge-triggered, so it cannot loop on its own.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -27,7 +33,7 @@ EnvironmentFile=@@ISA_ROOT@@/.env
 # tts_timeout_seconds (also 600s by default) applied PER shared-TTS
 # call/segment, a 120s ffmpeg loudnorm encode timeout, a 15s ffprobe
 # duration-probe timeout, and its own Postgres advisory lock
-# (GENERATE_ROAD_AUDIO_LOCK_KEY) so an overlapping timer firing just
+# (GENERATE_ROAD_AUDIO_LOCK_KEY) so an overlapping manual run just
 # exits immediately rather than piling up -- see road_conditions/
 # synthesis.py and generate_road_condition_audio.py. Let those
 # application-level bounds govern; a separate, shorter systemd start
