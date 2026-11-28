@@ -75,7 +75,13 @@ from .text_normalize import normalize_for_speech, normalize_route_notation
 # forces every existing "unchanged" report to regenerate on its next
 # cycle, deliberately, without needing an actual source/text/voice
 # change to trigger it. Never derived from a git commit or timestamp.
-REPORT_FINGERPRINT_VERSION = 1
+# 2: voice-neutral semantic fingerprint (1.24-B) -- announcer, voice slot,
+# engine and model no longer take part.
+REPORT_FINGERPRINT_VERSION = 2
+
+# Left literally in the semantic script, so a different announcer never
+# looks like different report content.
+ANNOUNCER_PLACEHOLDER = "{announcer_name}"
 
 # device-status ("automated traffic signals" etc.) is infrastructure/
 # administrative status, not something a motorist needs to plan a
@@ -116,8 +122,10 @@ _SIGNIFICANT_PRIORITY_THRESHOLD = 5
 
 def feed_freshness(config=None):
     """One of "fresh" / "stale" / "failed" / "disabled" -- the signal
-    used to decide whether "no current events" may ever be spoken as an
-    all-clear (see build_no_events_message()). Never conflates a
+    used to decide whether a report may be rendered at all, and so whether
+    "no current events" may ever be spoken as an all-clear (see
+    build_no_events_message()). It never changes a published report or its
+    Ready-to-Air flag. Never conflates a
     failed/stale fetch with "no road problems" -- see the task's own
     explicit requirement on this point."""
     config = config or RoadConditionsConfiguration.load()
@@ -364,9 +372,9 @@ def build_event_scripts(events, now=None):
 
 def build_full_report(events, now=None):
     """Concatenates every event's script, in the already-sorted order.
-    Returns "" for an empty list -- callers decide separately whether
-    that means "retire the existing audio" or "speak a no-advisory
-    message" (see build_no_events_message() / feed_freshness()).
+    Returns "" for an empty list -- callers decide separately whether a
+    no-advisory message may be spoken (see build_no_events_message() /
+    feed_freshness()).
 
     Raises ReportBuildError (naming the specific event) -- see
     build_event_scripts(), which this is a thin wrapper around."""
@@ -466,83 +474,52 @@ def compose_report_segments(body_pieces, config, announcer_name=""):
     return segments
 
 
-def compute_report_fingerprint(text, voice_slot, voice, transition_active,
-                                transition_sound_fingerprint=None, segment_count=None):
-    """SHA-256 hex digest of a deterministic, canonical JSON payload
-    representing the effective on-air artifact this generation cycle
-    would produce -- used by generate_road_condition_audio.py to skip
-    the expensive shared-TTS/ffmpeg/analysis pipeline when nothing that
-    actually affects the resulting audio has changed since the last
-    successful generation (see RoadConditionsConfiguration.
-    last_report_fingerprint / last_report_generated_at).
+def compose_semantic_script(body, config):
+    """The voice-neutral script compute_report_fingerprint() identifies:
+    compose_report_script() with the {announcer_name} token left as it is."""
+    return compose_report_script(body, config, announcer_name=ANNOUNCER_PLACEHOLDER)
 
-    Deliberately fingerprints the FINAL, fully-resolved generation
-    inputs -- never RoadEvent.payload_checksum or any raw KDOT
-    response -- because the on-air result can change for reasons a
-    source checksum alone can't capture: preamble/postamble edits,
-    {announcer_name} resolution, voice slot/model changes, an event's
-    own wording changing purely because wall-clock time crossed its
-    start_time (planned -> in-effect -- see report._planned_prefix()),
-    and transition-sound state. This is also why callers must compute
-    the fingerprint only AFTER event selection, text composition,
-    voice resolution, AND transition-sound resolution have all
-    already happened -- moving the skip decision any earlier would
-    mean deciding "unchanged" without having actually looked at
-    everything that determines the final audio.
 
-    `text` must be the EXACT final composed script (after event
-    selection/ordering, no-events handling, and preamble/postamble/
-    {announcer_name} resolution) -- see compose_report_script()/
-    compose_report_segments() above.
+def compute_report_fingerprint(semantic_text, transition_active,
+                               transition_sound_fingerprint=None, segment_count=None):
+    """SHA-256 hex digest of what the report SAYS and how it is assembled
+    -- the one identity that decides whether routine audio must be
+    rendered again (stored in RoadConditionsConfiguration.
+    last_report_fingerprint and in the published audio's provenance).
 
-    `voice_slot`/`voice['engine']`/`voice['model']` identify the
-    SYNTHESIS identity, not the listener-facing announcer name -- the
-    model behind an announcer name could change without the name
-    itself changing, and that must still force regeneration. `slot` is
-    kept as its own field (not folded into the model string) so a
-    schedule change that resolves the same model under a different
-    slot name is still an explicit, visible difference here.
+    Deliberately voice-neutral: the announcer's name, the voice schedule
+    slot, the TTS engine, the provider voice and the model take no part.
+    An announcer shift, a persona rename, a voice remap or a model change
+    alone must not re-render an unchanged report; it stays in the voice
+    that rendered it until the content changes. What actually rendered
+    the audio is recorded separately (synthesis.py's provenance).
+
+    Deliberately fingerprints the final composed script, never
+    RoadEvent.payload_checksum or a raw KDOT response: preamble/postamble
+    edits, template changes, event order (severity) and an event's own
+    wording changing because wall-clock time crossed its start_time
+    (planned -> in effect -- see _planned_prefix()) all change what is
+    spoken. KDOT's own record timestamps never reach the script.
+
+    `semantic_text` must come from compose_semantic_script(). Runs of
+    whitespace are collapsed, so formatting alone changes nothing.
 
     `transition_active`/`transition_sound_fingerprint`/`segment_count`
-    must reflect the ACTUAL behavior this run would produce, not
-    merely the config's own enabled/path settings -- a configured-but-
-    currently-unusable (missing/unreadable) transition sound must be
-    passed here as `transition_active=False`, exactly matching the
-    plain-synthesis fallback the caller actually performs in that case
-    (see generate_road_condition_audio.py's own transition-sound
-    decision block, which runs BEFORE this function and is what the
-    two arguments here are computed from). `transition_sound_fingerprint`
-    is the transition file's own content hash (see synthesis.
-    hash_file_sha256()) -- content, not pathname, so replacing the
-    file in place while keeping the same configured path still changes
-    the fingerprint. `segment_count` (the number of separately-
-    synthesized, transition-spliced pieces) is included so that a
-    theoretical case where two DIFFERENT event selections happen to
-    join into byte-identical final `text` (extremely unlikely in
-    practice -- every real event script includes its own route/county/
-    KDOT description specifics) still can't produce an identical
-    fingerprint if it would actually insert a different number of
-    transition sounds; irrelevant, and therefore ignored, whenever
-    transition_active is False, since item/segment count has zero
-    effect on a single-shared-TTS-call synthesis.
+    must reflect what this run would ACTUALLY do, not merely the
+    config's enabled/path settings: an unusable transition sound is
+    passed as transition_active=False, matching the plain-synthesis
+    fallback. The sound is identified by content hash (synthesis.
+    hash_file_sha256()), not pathname. `segment_count` is ignored when
+    the transition is inactive.
 
-    `version` is REPORT_FINGERPRINT_VERSION and `audio_format_version`
-    is synthesis.AUDIO_FORMAT_VERSION -- two independent counters (see
-    each constant's own comment) a future change can bump to
-    deliberately force every existing "unchanged" report to regenerate,
-    without needing an actual source/text/voice change to trigger it.
+    `version` (REPORT_FINGERPRINT_VERSION) and `audio_format_version`
+    (synthesis.AUDIO_FORMAT_VERSION) can be bumped to force one
+    deliberate re-render.
 
-    Canonical serialization: sort_keys=True, compact separators
-    (no incidental whitespace), UTF-8 -- so byte-identical inputs
-    always hash identically regardless of dict insertion order."""
+    Canonical serialization: sort_keys=True, compact separators, UTF-8."""
     payload = {
         "version": REPORT_FINGERPRINT_VERSION,
-        "text": text,
-        "voice": {
-            "slot": voice_slot,
-            "engine": voice.get("engine"),
-            "model": voice.get("model"),
-        },
+        "text": " ".join(semantic_text.split()),
         "transition": {
             "active": bool(transition_active),
             "sound_fingerprint": transition_sound_fingerprint if transition_active else None,

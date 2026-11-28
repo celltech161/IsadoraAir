@@ -393,12 +393,9 @@ class RoadConditionsConfiguration(models.Model):
     # the LAST generation cycle that completed successfully start to
     # finish (Kokoro synthesis, FLAC installation, Track update, AND
     # waveform analysis) -- generate_road_condition_audio.py only ever
-    # writes these together, via a single targeted
-    # save(update_fields=[...]), after that entire cycle has already
-    # succeeded. Never written by --dry-run, --text-only, --event-id,
-    # a skipped/unchanged cycle, a stale/failed/disabled retirement,
-    # or any failed cycle -- see that command's own comment at its
-    # write site.
+    # checkpoints these in the same short transaction as Ready-to-Air.
+    # Recovery uses the timestamp and fingerprint to recognize an earlier
+    # completion without changing readiness again.
     last_report_fingerprint = models.CharField(
         max_length=64, blank=True, editable=False,
         help_text=(

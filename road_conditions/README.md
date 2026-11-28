@@ -4,8 +4,8 @@ Ingests Kansas DOT road/construction events from the state's CARS API,
 normalizes them into `RoadEvent` rows, and builds them into a single
 consolidated spoken "KanDrive" road report (`road_conditions/report.py`
 + `road_conditions/synthesis.py`) that airs as an ordinary rotation
-Track. Two independently-scheduled systemd timers drive the pipeline
-end to end -- see "Scheduling" below. Sits alongside Weather
+Track. One systemd polling timer drives the pipeline end to end: a
+successful sync triggers audio generation -- see "Scheduling" below. Sits alongside Weather
 Configuration and AMBER Alert Configuration in Django admin, following
 the same singleton-config pattern as both.
 
@@ -237,28 +237,24 @@ configured scope can deactivate or rescope `RoadEvent` rows.
 
 ## Scheduling
 
-Two systemd timers, deliberately decoupled -- separate advisory locks,
-separate schedules, separate jobs (KDOT ingestion vs. spoken-report
-synthesis), same idiom as `generate_dedication_intros.timer` being
-independent of `web-requests-poll.timer`. Neither is coupled to the
-other's cadence or triggered by the other completing.
+One polling timer drives both jobs. They stay separate services with
+separate advisory locks.
 
 ```text
 KDOT sync timer (isadoraair-sync-road-conditions.timer)
     -> wakes every ~1 minute
     -> sync_road_conditions itself enforces the real cadence
-       (RoadConditionsConfiguration.poll_cadence_minutes, 15 min default)
+       (RoadConditionsConfiguration.poll_cadence_minutes, 15 min default),
+       in slots anchored 7 minutes past the hour (30 min -> :07 and :37)
     -> writes/updates/deactivates RoadEvent rows
+    -> wakes the generator for the committed retrieval, an unacknowledged
+       retrieval, or pending local publication recovery
 
-KanDrive audio timer (isadoraair-generate-road-condition-audio.timer)
-    -> wakes every 5 minutes (its own fixed cadence -- not admin-editable,
-       and not tied to poll_cadence_minutes)
-    -> generate_road_condition_audio composes the current report,
-       resolves the current voice, and computes a fingerprint of the
-       actual on-air artifact that generation would produce
-    -> feed_freshness() + the fingerprint/health check decide whether to
-       retire the existing report, skip synthesis (nothing changed), or
-       actually run shared TTS + ffmpeg
+isadoraair-generate-road-condition-audio.path
+    -> sees the trigger file replaced and starts
+       isadoraair-generate-road-condition-audio.service (no timer)
+    -> generate_road_condition_audio renders only if the report's content
+       changed, or the published audio is missing or invalid
 ```
 
 ### KDOT sync
@@ -267,11 +263,18 @@ KanDrive audio timer (isadoraair-generate-road-condition-audio.timer)
 by a Postgres-advisory-lock overlap-protection idiom (an overlapping
 firing just exits immediately).
 
+**Retrieval times**: each cadence-length slot is anchored 7 minutes
+past the hour and the retrieval happens on the first tick in the slot
+(within about 70 s). With 30 minutes: :07 and :37; with 15: :07, :22,
+:37, :52. The minutes are 7 modulo the greatest common divisor of the
+cadence and 60. This keeps renders clear of the top-of-hour forecasts and
+quarter-hour temperature updates without drifting.
+
 **Cadence design (Option B, matching this project's own OGRemote
 poller idiom)**: the timer itself fires every ~1 minute, but
 `sync_road_conditions` checks `RoadConditionsConfiguration.poll_cadence_minutes`
-against `last_fetch_attempted_at` and exits cleanly -- writing nothing,
-logging no run -- whenever a sync isn't due yet. `--force-full` bypasses
+against `last_fetch_attempted_at`. A tick that is not due does not
+fetch or record an attempt. It can wake the worker for pending work. `--force-full` bypasses
 this (and the disabled check) for manual verification. This is
 deliberate, not incidental: the live CARS API has **no pagination and
 no ETag/Last-Modified/conditional-request support at all** (checked
@@ -293,39 +296,90 @@ road-condition operations.
 
 ### KanDrive audio generation
 
-`deploy/isadoraair-generate-road-condition-audio.service` and `.timer`
-run `generate_road_condition_audio` (no flags -- normal production
-invocation never passes `--force`/`--regenerate`/`--voice`, which exist
-for manual verification only) on a fixed 5-minute check, independent of
-`poll_cadence_minutes`. A 5-minute check means a newly-synced KDOT
-change, or an announcer-persona schedule boundary, reaches the spoken
-report within at most ~5 minutes, and a stale/failed/disabled feed is
-retired promptly -- without costing anything extra on every other tick,
-since `report.compute_report_fingerprint()` / `synthesis.
-existing_report_is_healthy()` skip the whole shared-TTS/ffmpeg
-pipeline whenever nothing that actually affects the resulting audio has
-changed. Its own command-wide advisory lock
-(`GENERATE_ROAD_AUDIO_LOCK_KEY`) means an overlapping firing (a
-genuinely long multi-segment synthesis still in flight) just exits
-immediately. `TimeoutStartSec=0` on the service deliberately leaves the
-run duration to the application's own internal bounds (per-call shared-TTS/
-shared-TTS timeouts, ffmpeg/ffprobe timeouts, the advisory lock) rather
-than an arbitrary systemd start timeout -- a real production report has
-already measured at 165.2s of finished audio for 7 events.
+`deploy/isadoraair-generate-road-condition-audio.service` runs
+`generate_road_condition_audio --dispatched`. Successful authoritative
+sync commits supply the request timestamp, including when no events
+changed. After acquiring its advisory lock, the worker checks that
+snapshot and records its timestamp in `road_generation.ack` beside the
+report. A later sync has its own timestamp and cannot be acknowledged
+by an earlier worker. A failed render is reported and can be retried
+after the next successful sync.
 
-### Installing either timer
+The file in `/run/isadoraair` only wakes the worker. A wakeup lost during a
+running worker, lock contention or a stopped watcher is repeated on a
+subsequent sync tick when the outstanding retrieval is fresh. An outage
+leaves the request outstanding. Restarting with no acknowledgment file
+can check the most recent still-fresh authoritative snapshot once.
 
-```bash
-# Render @@ISA_USER@@/@@ISA_ROOT@@ per deploy/README.md's convention, then:
-sudo cp deploy/isadoraair-sync-road-conditions.service deploy/isadoraair-sync-road-conditions.timer /etc/systemd/system/
-sudo cp deploy/isadoraair-generate-road-condition-audio.service deploy/isadoraair-generate-road-condition-audio.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now isadoraair-sync-road-conditions.timer
-sudo systemctl enable --now isadoraair-generate-road-condition-audio.timer
-```
+Run `manage.py generate_road_condition_audio` directly for a manual check.
+The options `--force`, `--regenerate` and `--voice` are for manual use.
+The option `--recover-only` settles the journal without checking freshness
+or synthesizing.
+**Content only.** The report is rendered again only when what it says
+changes. An announcer shift, persona rename, voice remap or model change
+does not re-render it; the next real change is rendered in whichever
+voice is scheduled then. `road_report.json`, beside the audio, records
+what was actually published and in which voice.
 
-Review the coverage-area settings and run a few manual `--dry-run`s of
-each command before enabling either timer for the first time.
+**Ready-to-Air.** The workflow sets it only when a newly rendered report
+has been published completely. Otherwise it never touches it: if you
+clear it, it stays cleared until the next new report is published.
+
+**Failed or stale road data** does not remove or replace the published
+report. It is not rendered from, the last report keeps airing, and
+station staff are notified through Monitoring's Notification Config (one
+message per severity per incident, within its cooldown, plus a recovery
+message). A complete retrieval with no usable records counts as failed, even if
+KDOT really has no events. Narrowed runs keep diagnostic history without
+advancing the statewide cadence or freshness.
+
+**Publication** validates decoded audio before replacement and verifies
+that the cue authority committed timing bound to those samples before
+enabling Ready-to-Air. Readiness and fingerprint bookkeeping commit in
+the same database transaction. The next sync tick can wake the worker
+for recovery only, even with an unavailable or disabled upstream.
+Automatic recovery attempts are capped at three per journal per boot.
+An unresolved journal remains visible in Monitoring, blocks new
+publication, and can be retried with `--recover-only` once the fault is
+corrected. Watcher and sync-timer health are prerequisites for automatic
+recovery. Audio and Track timing may disagree during interruption and
+before restoration.
+
+`TimeoutStartSec=0` on the service deliberately leaves the run duration to
+the application's own internal bounds (per-call shared-TTS timeouts,
+ffmpeg/ffprobe timeouts, the advisory lock) rather than an arbitrary
+systemd start timeout -- a real production report has already measured at
+165.2s of finished audio for 7 events.
+
+### Installation, restore and rollback
+
+For stations using road reports, follow the rendered-unit and tmpfiles
+steps in [the deploy guide](../deploy/README.md). Start the watcher
+before the sync timer and verify both are enabled and active.
+
+An upgrade from r0149 requires an operator-managed changeover. Quiesce
+the road jobs, install the rendered generator service and path unit,
+disable and remove `isadoraair-generate-road-condition-audio.timer` and
+its obsolete overrides, then reload and enable the watcher before the
+sync timer. Omit `10-toh-stagger.conf`. Verify the old generation timer
+is absent and a successful authoritative sync starts a generation check.
+Repeat the enabled/active and functional checks after reboot.
+
+The release manifest must declare the changed generator service and
+removed timer. `SYSTEMD_REMOVAL_MANUAL` applies to updates crossing
+the transition. The current updater and protected runtime policy do
+not manage `.path` units. Stage 90 renders the path file on restore.
+Controlled bring-up still needs to enable it.
+
+Before rollback, drain or settle the journal with `--recover-only` and
+save the current road units and report artifacts if those bytes must
+survive. Stop sync and the watcher, remove the path unit, restore r0149
+code and its rendered generation service and timer, reload and enable
+that timer and the sync timer. Verify the old timer is the only
+generation authority. r0149 resumes its prior readiness policy. Keep the
+runtime wakeup and retry files out of backups. The normal application
+backup excludes the music and waveform trees and does not archive live
+road units.
 
 ## What this app does NOT do
 
@@ -333,7 +387,7 @@ each command before enabling either timer for the first time.
   `library/services/engine.py`, the GLib main loop, or any real-time
   audio path — this app only ever talks to the CARS API, the shared TTS
   service, and the database, from management commands invoked by
-  systemd timers, same isolation as `generate_dedication_intros`. The
+  systemd units, same isolation as `generate_dedication_intros`. The
   resulting KanDrive Track is an ordinary rotation-eligible Track an
   operator adds to rotations manually, like any other spoken-segment
   Track (WxForecast/WxObs/WxTemp).

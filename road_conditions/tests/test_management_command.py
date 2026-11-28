@@ -3,8 +3,10 @@ wiring, output format, exit-code behavior, and the Postgres advisory-
 lock overlap guard. sync_events() itself is mocked here (its own real
 behavior is covered exhaustively in test_sync.py); these tests are
 about the command's own responsibilities."""
-from datetime import timedelta
+import tempfile
+from datetime import datetime, timedelta, timezone as dt_timezone
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 import psycopg2
@@ -17,6 +19,21 @@ from django.utils import timezone
 from road_conditions.api import CarsApiTimeout
 from road_conditions.management.commands.sync_road_conditions import ROAD_CONDITIONS_LOCK_KEY
 from road_conditions.models import RoadConditionsConfiguration, RoadConditionsSyncRun, RoadEvent
+from road_conditions.tests.runtime_paths import patch_runtime_paths
+
+def setUpModule():
+    """A real sync writes the generation request and the alert state under
+    the station's runtime directory; every test here uses a scratch one."""
+    global _scratch, _patchers
+    _scratch = tempfile.TemporaryDirectory()
+    _patchers = patch_runtime_paths(Path(_scratch.name))
+
+
+def tearDownModule():
+    for patcher in _patchers:
+        patcher.stop()
+    _scratch.cleanup()
+
 
 _SUCCESS_RESULT = dict(
     fetched_count=10, relevant_count=3, created_count=1, updated_count=1,
@@ -246,6 +263,12 @@ class SyncRoadConditionsDueCheckTests(TestCase):
         self.config.enabled = True
         self.config.poll_cadence_minutes = 15
         self.config.save()
+        # "Due" is decided by clock slot, so the clock is fixed: at 12:20
+        # the current 15-minute slot began at 12:07.
+        clock = patch("django.utils.timezone.now",
+                      return_value=datetime(2026, 11, 30, 12, 20, tzinfo=dt_timezone.utc))
+        clock.start()
+        self.addCleanup(clock.stop)
 
     @patch("road_conditions.management.commands.sync_road_conditions.sync_events", return_value=_SUCCESS_RESULT)
     def test_skips_when_not_due(self, mock_sync):
@@ -270,7 +293,7 @@ class SyncRoadConditionsDueCheckTests(TestCase):
         mock_sync.assert_called_once()
 
     @patch("road_conditions.management.commands.sync_road_conditions.sync_events", return_value=_SUCCESS_RESULT)
-    def test_exactly_at_cadence_boundary_is_due(self, mock_sync):
+    def test_attempt_from_the_previous_slot_is_due(self, mock_sync):
         self.config.last_fetch_attempted_at = timezone.now() - timedelta(minutes=15, seconds=1)
         self.config.save()
         call_command("sync_road_conditions", stdout=StringIO())

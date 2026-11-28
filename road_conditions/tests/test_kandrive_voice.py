@@ -256,27 +256,6 @@ class SharedScheduleVoiceResolutionTests(TestCase):
         self.assertNotEqual(voice_after["model"], voice_before["model"])
         self.assertEqual(voice_after["model"], "af_nicole")
 
-    def test_provider_mapping_change_changes_the_actual_report_fingerprint(self):
-        """End-to-end version of the test above, through the real
-        report.compute_report_fingerprint() -- proves the INTEGRATION,
-        not just that resolve_voice() itself returns a different dict.
-        report.py needed zero changes for this: it already fingerprints
-        voice.get("model"), and resolve_voice()'s shared-mode branch
-        populates "model" from the RESOLVED provider identity."""
-        from road_conditions.report import compute_report_fingerprint
-
-        _slot, voice_before = resolve_voice(slot_override="day")
-        fp_before = compute_report_fingerprint("Same script text.", "day", voice_before, False)
-
-        self.claira.provider_voice = "af_nicole"
-        self.claira.save(update_fields=["provider_voice"])
-
-        _slot, voice_after = resolve_voice(slot_override="day")
-        fp_after = compute_report_fingerprint("Same script text.", "day", voice_after, False)
-
-        self.assertEqual(voice_before["logical_voice_name"], voice_after["logical_voice_name"])
-        self.assertNotEqual(fp_before, fp_after, "a provider remap for the same logical voice must invalidate the fingerprint")
-
     def test_missing_persona_row_fails_clearly(self):
         WeatherVoicePersona.objects.filter(slot="day").delete()
         with self.assertRaises(VoiceResolutionError) as ctx:

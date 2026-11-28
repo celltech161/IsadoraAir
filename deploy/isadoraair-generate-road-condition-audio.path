@@ -1,0 +1,12 @@
+[Unit]
+Description=Run IsadoraAir road-condition audio generation after a successful road data sync
+
+[Path]
+# The edge wakes the worker for committed sync data or pending local recovery.
+# The one-minute sync tick retries lost edges. The worker acknowledges a
+# specific database request only after obtaining the generator lock.
+PathChanged=/run/isadoraair/road_generation.trigger
+Unit=isadoraair-generate-road-condition-audio.service
+
+[Install]
+WantedBy=paths.target

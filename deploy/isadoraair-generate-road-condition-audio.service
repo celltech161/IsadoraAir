@@ -1,6 +1,10 @@
 [Unit]
 Description=Generate IsadoraAir KanDrive road-condition audio
 After=postgresql.service
+# The path watches committed sync and recovery wakeups. A start-rate
+# failure would disable the watcher. Sync ticks bound repeated wakeups and
+# the worker separately caps recovery attempts for the same journal.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -13,7 +17,7 @@ Nice=19
 User=@@ISA_USER@@
 Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@
-ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py generate_road_condition_audio
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py generate_road_condition_audio --dispatched
 EnvironmentFile=@@ISA_ROOT@@/.env
 # Deliberately unbounded, NOT systemd's ordinary 90s default start
 # timeout -- a real production KanDrive report has already measured at
@@ -27,7 +31,7 @@ EnvironmentFile=@@ISA_ROOT@@/.env
 # tts_timeout_seconds (also 600s by default) applied PER shared-TTS
 # call/segment, a 120s ffmpeg loudnorm encode timeout, a 15s ffprobe
 # duration-probe timeout, and its own Postgres advisory lock
-# (GENERATE_ROAD_AUDIO_LOCK_KEY) so an overlapping timer firing just
+# (GENERATE_ROAD_AUDIO_LOCK_KEY) so an overlapping manual run just
 # exits immediately rather than piling up -- see road_conditions/
 # synthesis.py and generate_road_condition_audio.py. Let those
 # application-level bounds govern; a separate, shorter systemd start

@@ -159,7 +159,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 
 **Content Ingestion & Integrations**
 - **Weather** (native): NWS-sourced current conditions and forecasts feed RadioText; active watches/warnings can fire a configured FX Cart automatically
-- **Road conditions** (native): KDOT/KanDrive CARS ingestion generates consolidated spoken reports with configurable coverage filters and stale-feed retirement
+- **Road conditions** (native): KDOT/KanDrive CARS ingestion generates consolidated spoken reports with configurable coverage filters and stale-feed notification
 - **Web song requests** (native, `webrequests` app): catalog sync, request lifecycle, and in-place recency-aware queue fulfillment are native features; only the public request *form* lives on a separate listener-facing website — see [`docs/WEB_REQUESTS_INTEGRATION.md`](docs/WEB_REQUESTS_INTEGRATION.md). Optional spoken dedication intros pair with the requested track
 - **Syndicated program ingestion** (companion/external today): provider-specific fetchers that carry outside credentials or scraping logic stay outside the repo; a native, operator-managed recurring-ingestion system is roadmap work
 - **ogremote** (receiving side only, native): the ogremote newsgathering/voiceover product itself is a separate upstream tool; IsadoraAir ships only the integration that receives its uploads and dispatches urgent-replay drops

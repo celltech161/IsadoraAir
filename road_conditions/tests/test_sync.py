@@ -10,7 +10,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from monitoring.models import SystemEvent
-from road_conditions.api import CarsApiError, CarsApiSchemaError, CarsApiTimeout
+from road_conditions.api import CarsApiError, CarsApiSchemaError, CarsApiTimeout, CarsApiEmptyDataset
 from road_conditions.models import RoadConditionsConfiguration, RoadConditionsSyncRun, RoadEvent
 from road_conditions.services import sync_events
 
@@ -281,7 +281,7 @@ class ParseFailureProtectionTests(TestCase):
         circular["self"] = circular
         broken["_circular_to_force_a_normalize_crash"] = circular
 
-        result = sync_events(self.config, client=FakeCarsClient(events=[broken]))  # CARS5-OTHER not in this fetch at all
+        result = sync_events(self.config, client=FakeCarsClient(events=[broken, make_event("CARS5-VALID")]))  # CARS5-OTHER is absent
 
         self.assertEqual(result["error_count"], 1)
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-PARSEFAIL").source_active,
@@ -333,7 +333,7 @@ class DryRunWritesNothingTests(TestCase):
 
     def test_dry_run_deactivation_scenario_writes_nothing(self):
         before = self._full_snapshot()
-        result = sync_events(self.config, client=FakeCarsClient(events=[]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-OTHER")]), dry_run=True)
         after = self._full_snapshot()
         self.assertEqual(result["deactivated_count"], 1)
         self.assertEqual(before, after)
@@ -351,7 +351,7 @@ class DryRunWritesNothingTests(TestCase):
 
     def test_dry_run_partial_failure_scenario_writes_nothing(self):
         before = self._full_snapshot()
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         after = self._full_snapshot()
         self.assertEqual(result["error_count"], 1)
         self.assertEqual(result["outcome"], "partial")
@@ -371,7 +371,7 @@ class DryRunWritesNothingTests(TestCase):
         self.assertEqual(RoadConditionsSyncRun.objects.count(), 1)  # only the ONE real run from setUp
 
     def test_dry_run_never_emits_a_system_event_on_parse_errors(self):
-        sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         self.assertFalse(SystemEvent.objects.filter(category="road_conditions").exists())
 
 
@@ -435,20 +435,30 @@ class SyncEventsPartialFailureTests(TestCase):
         self.assertEqual(result["created_count"], 1)
         self.assertEqual(RoadEvent.objects.count(), 1)
 
-    def test_all_malformed_is_still_partial_not_failed(self):
-        # A total FETCH failure (network/HTTP/schema) is "failed"; a
-        # fetch that succeeded but whose records all failed to parse
-        # is "partial" -- the distinction the task calls for between a
-        # total API failure and a record-level parse failure.
-        bad = make_unparseable_event()
-        result = sync_events(self.config, client=FakeCarsClient(events=[bad]))
-        self.assertEqual(result["outcome"], "partial")
-        self.assertEqual(result["created_count"], 0)
+    def test_complete_retrieval_with_zero_usable_records_fails(self):
+        with self.assertRaises(CarsApiSchemaError):
+            sync_events(self.config, client=FakeCarsClient(events=[{}]))
+        self.config.refresh_from_db()
+        self.assertIsNone(self.config.last_fetch_succeeded_at)
+        self.assertEqual(RoadConditionsSyncRun.objects.get().outcome, "failed")
+        self.assertEqual(RoadEvent.objects.count(), 0)
 
-    def test_zero_fetched_events_is_success_not_failure(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[]))
-        self.assertEqual(result["outcome"], "success")
-        self.assertEqual(result["fetched_count"], 0)
+    def test_empty_complete_retrieval_is_a_failure(self):
+        # 1.24-B: the provider answers a broken filter with an empty list
+        # too, so the station's complete retrieval never trusts one.
+        with self.assertRaises(CarsApiEmptyDataset):
+            sync_events(self.config, client=FakeCarsClient(events=[]))
+        self.config.refresh_from_db()
+        self.assertIn("empty event list", self.config.last_error)
+        self.assertIsNone(self.config.last_fetch_succeeded_at)
+        self.assertEqual(RoadConditionsSyncRun.objects.get().outcome, "failed")
+
+    def test_empty_narrowed_retrieval_is_still_legitimate(self):
+        for narrowing in ({"event_classifications_filter": ["winterDriving"]},
+                          {"county_filter": "Ottawa"}, {"limit": 5}):
+            with self.subTest(narrowing=narrowing):
+                result = sync_events(self.config, client=FakeCarsClient(events=[]), **narrowing)
+                self.assertEqual((result["outcome"], result["deactivated_count"]), ("success", 0))
 
     def test_partial_parse_still_deactivates_genuinely_absent_events_when_identity_is_trustworthy(self):
         # A "partial" outcome does NOT blanket-disable deactivation for
@@ -466,7 +476,7 @@ class SyncEventsPartialFailureTests(TestCase):
         circular = {}
         circular["self"] = circular
         broken["_circular_to_force_a_normalize_crash"] = circular
-        result = sync_events(self.config, client=FakeCarsClient(events=[broken]))  # CARS5-WILLVANISH not present at all
+        result = sync_events(self.config, client=FakeCarsClient(events=[broken, make_event("CARS5-VALID")]))  # CARS5-WILLVANISH is absent
         self.assertEqual(result["outcome"], "partial")
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-WILLVANISH").source_active)
         self.assertEqual(result["deactivated_count"], 1)
@@ -650,29 +660,15 @@ class IdentityIntegrityTests(TestCase):
         sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-EXISTING")]))
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
-    def test_missing_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_empty_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_event_with_empty_id()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_invalid_type_event_id_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_event_with_wrong_type_id()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
-
-    def test_non_dict_raw_record_disables_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_non_dict_raw_entry()]))
-        self.assertEqual(result["deactivated_count"], 0)
-        self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
-        self.assertEqual(result["outcome"], "partial")
+    def test_all_unidentifiable_responses_preserve_previous_events(self):
+        previous = self.config.last_fetch_succeeded_at
+        for raw in (make_unparseable_event(), make_event_with_empty_id(),
+                    make_event_with_wrong_type_id(), make_non_dict_raw_entry()):
+            with self.subTest(raw=raw), self.assertRaises(CarsApiSchemaError):
+                sync_events(self.config, client=FakeCarsClient(events=[raw]))
+            self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
+            self.config.refresh_from_db()
+            self.assertEqual(self.config.last_fetch_succeeded_at, previous)
 
     def test_identity_untrustworthy_still_imports_other_valid_events(self):
         result = sync_events(self.config, client=FakeCarsClient(events=[
@@ -702,12 +698,12 @@ class IdentityIntegrityTests(TestCase):
         # Sanity/regression check -- a run with NO identity problems
         # must still deactivate normally (this whole mechanism must
         # not become a blanket "deactivation never happens" bug).
-        result = sync_events(self.config, client=FakeCarsClient(events=[]))
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event("CARS5-OTHER")]))
         self.assertEqual(result["deactivated_count"], 1)
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
     def test_dry_run_identity_untrustworthy_predicts_zero_deactivation(self):
-        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event()]), dry_run=True)
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_unparseable_event(), make_event("CARS5-VALID")]), dry_run=True)
         self.assertEqual(result["deactivated_count"], 0)
         self.assertTrue(RoadEvent.objects.get(external_id="CARS5-EXISTING").source_active)
 
