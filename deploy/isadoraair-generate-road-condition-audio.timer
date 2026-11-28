@@ -1,0 +1,15 @@
+[Unit]
+Description=Deprecated IsadoraAir road-condition generation timer (compatibility only)
+
+[Timer]
+# The protected updater can activate this name on a catch-up install.
+# An elapsed, non-persistent one-shot has no boot or recurring deadline
+# and remains active/elapsed when enabled. Even a locally added deadline
+# can only start the watcher. A sync or recovery request wakes the worker.
+OnCalendar=2000-01-01 00:00:00 UTC
+Persistent=false
+RemainAfterElapse=yes
+Unit=isadoraair-generate-road-condition-audio.path
+
+[Install]
+WantedBy=timers.target

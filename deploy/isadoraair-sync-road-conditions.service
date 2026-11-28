@@ -1,7 +1,10 @@
 [Unit]
 Description=IsadoraAir KDOT CARS road-conditions sync
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service isadoraair-generate-road-condition-audio.path
 Wants=network-online.target
+# A missing or inactive watcher must fail the scheduled job visibly.
+# Requisite leaves activation of the watcher with the station operator.
+Requisite=isadoraair-generate-road-condition-audio.path
 
 [Service]
 Type=oneshot

@@ -99,7 +99,9 @@ sudo systemctl enable --now isadoraair-web-requests-ingest.timer \
   isadoraair-generate-dedication-intros.timer
 # Road conditions (when used): the sync timer polls; the .path unit renders
 # audio after a successful sync and also dispatches publication recovery.
-# For upgrades, retire the old generation timer before this step.
+# Keep the deprecated generation timer file installed and disabled.
+# Enable the watcher first. Sync fails if the watcher is unavailable.
+# For upgrades, use the release runbook before activating either job.
 # sudo systemctl enable --now isadoraair-generate-road-condition-audio.path
 # sudo systemctl enable --now isadoraair-sync-road-conditions.timer
 # Optional: sudo systemctl enable --now isadoraair-backup.timer

@@ -252,7 +252,7 @@ KDOT sync timer (isadoraair-sync-road-conditions.timer)
 
 isadoraair-generate-road-condition-audio.path
     -> sees the trigger file replaced and starts
-       isadoraair-generate-road-condition-audio.service (no timer)
+       isadoraair-generate-road-condition-audio.service
     -> generate_road_condition_audio renders only if the report's content
        changed, or the published audio is missing or invalid
 ```
@@ -357,29 +357,22 @@ For stations using road reports, follow the rendered-unit and tmpfiles
 steps in [the deploy guide](../deploy/README.md). Start the watcher
 before the sync timer and verify both are enabled and active.
 
-An upgrade from r0149 requires an operator-managed changeover. Quiesce
-the road jobs, install the rendered generator service and path unit,
-disable and remove `isadoraair-generate-road-condition-audio.timer` and
-its obsolete overrides, then reload and enable the watcher before the
-sync timer. Omit `10-toh-stagger.conf`. Verify the old generation timer
-is absent and a successful authoritative sync starts a generation check.
-Repeat the enabled/active and functional checks after reboot.
+The original `isadoraair-generate-road-condition-audio.timer` file stays
+installed as a dormant compatibility unit. Leave it disabled. The road
+sync service requires the watcher to be active and reports a dependency
+failure if it is missing or stopped.
 
-The release manifest must declare the changed generator service and
-removed timer. `SYSTEMD_REMOVAL_MANUAL` applies to updates crossing
-the transition. The current updater and protected runtime policy do
-not manage `.path` units. Stage 90 renders the path file on restore.
-Controlled bring-up still needs to enable it.
+For an upgrade from r0149, follow the [r0150 station runbook](../docs/releases/r0150_installation.md).
+Stage the inactive watcher and tmpfiles while the road jobs are stopped.
+The protected Update Center advances application source and installs the
+three managed templates. Then enable the watcher before sync. Keep the
+legacy compatibility timer disabled and omit `10-toh-stagger.conf`.
 
-Before rollback, drain or settle the journal with `--recover-only` and
-save the current road units and report artifacts if those bytes must
-survive. Stop sync and the watcher, remove the path unit, restore r0149
-code and its rendered generation service and timer, reload and enable
-that timer and the sync timer. Verify the old timer is the only
-generation authority. r0149 resumes its prior readiness policy. Keep the
-runtime wakeup and retry files out of backups. The normal application
-backup excludes the music and waveform trees and does not archive live
-road units.
+Disaster-recovery stage 90 renders both the watcher and the timer file.
+Activation is a separate watcher-first step. For an interrupted upgrade,
+use the runbook's pre-advance unit recovery or the post-advance fix-forward
+and disaster-recovery procedures. Preserve the KanDrive media, waveform,
+publication evidence and live units alongside the station recovery set.
 
 ## What this app does NOT do
 

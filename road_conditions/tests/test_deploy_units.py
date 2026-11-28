@@ -76,8 +76,14 @@ class GenerationTriggerContractTests(SimpleTestCase):
     def setUp(self):
         self.content = PATH_UNIT_PATH.read_text()
 
-    def test_there_is_no_generation_timer_any_more(self):
-        self.assertFalse(TIMER_PATH.exists())
+    def test_deprecated_timer_has_only_an_elapsed_non_persistent_deadline(self):
+        timer = TIMER_PATH.read_text().split("[Timer]", 1)[1].split("[Install]", 1)[0]
+        self.assertCountEqual(directives(timer), [
+            "OnCalendar=2000-01-01 00:00:00 UTC",
+            "Persistent=false",
+            "RemainAfterElapse=yes",
+            f"Unit={PATH_UNIT_PATH.name}",
+        ])
 
     def test_watches_exactly_the_file_the_sync_command_replaces(self):
         from road_conditions import trigger
@@ -116,11 +122,15 @@ class GenerationTriggerContractTests(SimpleTestCase):
         self.assertLess(create, watcher)
         self.assertLess(watcher, timer)
 
-    def test_sync_unit_does_not_start_the_generator_itself(self):
+    def test_sync_requires_an_already_active_watcher_without_dispatching_the_worker(self):
         # OnSuccess= would also fire after a skipped ("not due") run.
         sync = (SERVICE_PATH.parent / "isadoraair-sync-road-conditions.service").read_text()
-        for line in directives(sync):
-            self.assertNotIn("generate-road-condition", line)
+        settings = directives(sync)
+        self.assertIn(f"Requisite={PATH_UNIT_PATH.name}", settings)
+        ordering = next(line for line in settings if line.startswith("After="))
+        self.assertIn(PATH_UNIT_PATH.name, ordering.split("=", 1)[1].split())
+        for line in settings:
+            self.assertNotIn(SERVICE_PATH.name, line)
             self.assertFalse(line.startswith(("OnSuccess=", "ExecStartPost=")))
 
 
